@@ -469,6 +469,85 @@ Apps are scoped by `owner_id`. At scale, tenant isolation requires:
 | Auth | Session-based | OAuth2 / JWT | Sufficient for learning, simpler implementation |
 | Two-database architecture | Separate PostgreSQL instances | Single DB with schemas | Mirrors production reality, security isolation |
 
+## Frontend Architecture
+
+The frontend is a React SPA built with Vite, TypeScript, TanStack Router, Zustand, Tailwind CSS, and @dnd-kit for drag-and-drop. It implements a three-pane visual app builder with a component palette, a grid-based canvas, and a property inspector.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Header                              ← Logo, user menu, login/register links
+├── index.tsx (Dashboard)
+│   ├── AppCard (per app)               ← App name, status badge, last updated, edit/preview/delete actions
+│   ├── Create App Form                 ← Name input with create button
+│   └── Data Source Section             ← List of configured data sources with test/delete, add form
+│       └── DataSourceForm              ← Host, port, database, user, password inputs for PostgreSQL connections
+├── login.tsx / register.tsx            ← Auth forms
+├── app.$appId.edit.tsx (Editor)
+│   └── EditorLayout (DndContext)       ← Three-pane editor with drag-and-drop context
+│       ├── ComponentPalette            ← Left panel: draggable component tiles grouped by category
+│       ├── CanvasArea                  ← Center: 12-column grid with positioned widgets
+│       │   └── WidgetRenderer (per component)  ← Dynamically maps component type to widget React component
+│       │       ├── TableWidget         ← Data table with columns, pagination, search
+│       │       ├── TextWidget          ← Static or bound text display
+│       │       ├── TextInputWidget     ← Text input with label and placeholder
+│       │       ├── NumberInputWidget   ← Numeric input with min/max/step
+│       │       ├── SelectWidget        ← Dropdown with options (static or bound)
+│       │       ├── ButtonWidget        ← Clickable button with label and color
+│       │       ├── ChartWidget         ← Bar/line/pie chart visualization
+│       │       ├── FormWidget          ← Form container with submit
+│       │       └── ContainerWidget     ← Generic container with title
+│       ├── PropertyInspector           ← Right panel: selected component's editable props
+│       │   └── BindingInput            ← Input with {{ }} syntax highlighting for data bindings
+│       └── QueryPanel                  ← Bottom panel: SQL editor, data source selector, results table
+└── app.$appId.preview.tsx (Preview)
+    └── PreviewRenderer                 ← Renders published app version with live query data
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`): Manages user session state. Holds `user` object and `isAuthenticated` flag. Provides `login()`, `register()`, `logout()`, and `checkAuth()`. Follows the same pattern as other projects -- `checkAuth()` is called on mount to validate the session cookie.
+
+**`useEditorStore`** (`stores/editorStore.ts`): The core store for the visual app builder. It manages:
+- **App state**: The current `app` object (containing components, queries, layout) and an `isDirty` flag tracking unsaved changes. `loadApp(appId)` fetches from the API and normalizes the response. `saveApp()` sends the full app state to the server.
+- **Component definitions**: The `componentDefinitions` array loaded from the backend's component registry, providing the palette of available widget types with their default props and schemas.
+- **Component CRUD**: `addComponent(definition, position)` creates a new component with auto-generated ID (e.g., `table1`, `textInput2`), default props from the registry, and grid-appropriate default sizes. `updateComponent`, `removeComponent`, `moveComponent`, and `resizeComponent` mutate the component array immutably.
+- **Selection state**: `selectedComponentId` drives the PropertyInspector -- selecting a component on the canvas shows its editable properties in the right panel. `selectComponent(null)` deselects (triggered by clicking empty canvas space).
+- **Query management**: `addQuery`, `updateQuery`, `removeQuery`, and `selectQuery` manage the app's saved queries. `queryPanelOpen` toggles the bottom panel visibility.
+- **Publishing**: `publishApp()` saves the app first, then creates an immutable version snapshot via the API.
+
+**`useDataStore`** (`stores/dataStore.ts`): Manages runtime data for the app builder. It holds:
+- **Data sources**: The list of configured database connections, loaded via `loadDataSources()`. Provides CRUD operations for managing connections.
+- **Query results**: A `Record<queryName, QueryResult>` mapping query names to their execution results (rows, fields, rowCount, error). `executeQuery()` resolves bindings against the current context, executes against the target database, and stores the result. `queryLoading` tracks per-query loading state.
+- **Component values**: A `Record<componentId, value>` mapping input component IDs to their current values (e.g., `textInput1` -> `"search term"`). Updated by input widgets via `setComponentValue()`.
+- **Binding context builder**: `getBindingContext()` assembles the full context object used for `{{ expression }}` resolution by combining query results (as `{ queryName: { data: rows, fields, rowCount } }`) and component values (as `{ componentId: { value } }`). This context is passed to the binding engine when resolving expressions in component props and query text.
+
+### Routing
+
+TanStack Router file-based routing:
+
+| Route | File | Purpose |
+|-------|------|---------|
+| `/` | `routes/index.tsx` | Dashboard: app list, create app, data source management |
+| `/login` | `routes/login.tsx` | Login form |
+| `/register` | `routes/register.tsx` | Registration form |
+| `/app/$appId/edit` | `routes/app.$appId.edit.tsx` | Three-pane visual editor |
+| `/app/$appId/preview` | `routes/app.$appId.preview.tsx` | Published app preview with live data |
+
+### Data Fetching
+
+The API service (`services/api.ts`) provides typed fetch wrappers grouped by domain: `authApi` (session management), `appsApi` (CRUD, publish, preview, versions), `dataSourcesApi` (CRUD, test connection), `queriesApi` (execute SQL), and `componentsApi` (list component registry definitions). All use `credentials: 'include'` for session cookies. The Vite dev server proxies `/api` to the Express backend at `:3001`.
+
+### Key UI Patterns
+
+- **Drag-and-drop from palette to canvas**: The `EditorLayout` wraps the entire editor in a `DndContext` from @dnd-kit. Components in the `ComponentPalette` are draggable sources. The `CanvasArea` is a droppable target. On drop, the component's grid position is calculated from the pointer coordinates relative to the canvas element, then snapped to grid units (80px per column, 40px per row). A `DragOverlay` shows a preview of the component being dragged.
+- **12-column grid layout**: Components are positioned absolutely on a 12-column grid (960px total width). Each component's `position: { x, y, w, h }` maps to pixel coordinates: `left = x * 80px`, `top = y * 40px`, `width = w * 80px`, `height = h * 40px`. Selected components show move arrows (up/down/left/right) and resize buttons (+W/-W/+H/-H) for keyboard-accessible positioning.
+- **Dynamic widget rendering**: The `WidgetRenderer` uses a `WIDGET_MAP` (a record from component type string to React component) to render the correct widget for each component. Unknown types render a fallback. Each widget receives the `AppComponent` and an `isEditor` flag (to disable interactions in edit mode vs. enable them in preview mode).
+- **Binding input with syntax highlighting**: The `BindingInput` component (`components/editor/BindingInput.tsx`) detects `{{ }}` patterns in text inputs and highlights them visually. This helps users identify which parts of a prop value are dynamic bindings versus static text.
+- **Query panel with live execution**: The `QueryPanel` provides a SQL editor, a data source dropdown, and a results table. Users write SQL with optional `{{ expression }}` bindings (e.g., `WHERE name = '{{ textInput1.value }}'`), select a target database, and click Run. The binding engine resolves expressions against the current context (query results + component values) before executing. Results are displayed in a table and stored in the `dataStore` for use by other components via bindings.
+- **Preview mode**: The preview route loads the published version (not the draft) and renders all components with live data from the target database. Queries marked with `trigger: 'on_load'` execute automatically on page load. Input widgets are fully interactive, and their values feed into binding expressions for other components.
+
 ## Implementation Notes
 
 ### Local Architecture
@@ -550,3 +629,53 @@ All infrastructure runs via Docker Compose (`docker-compose.yml`). The Retool me
 - **Query result caching** with invalidation
 - **REST API data source type** (only PostgreSQL implemented)
 - **File/asset storage** (MinIO/S3 for uploaded images in apps)
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project from first principles, describing what the pattern is, what problem it solves, and how this project uses it.
+
+### Circuit Breaker
+
+A circuit breaker is a resilience pattern that prevents a failing dependency from exhausting your application's resources. When a service you depend on (a database, an API, a message queue) becomes slow or unresponsive, each request to that service ties up a connection and a thread while waiting for a timeout. If your application makes 100 requests per second and the timeout is 10 seconds, within 10 seconds you will have 1,000 blocked requests consuming all available resources. At that point, even requests that do not touch the failing service cannot be served -- the entire application is effectively down because one dependency is sick.
+
+A circuit breaker monitors the error rate of calls to a dependency and has three states. **Closed** is normal operation: requests flow through and the breaker counts successes and failures. **Open** means too many failures have occurred: all requests are immediately rejected ("fail fast") without even attempting the call, giving the dependency time to recover and preventing your application from wasting resources on requests that will fail anyway. **Half-open** is the recovery probe: after a cooldown, the breaker allows one test request. If it succeeds, the circuit closes; if it fails, it reopens.
+
+In this project, an Opossum circuit breaker is available for wrapping external service calls (`src/services/circuitBreaker.ts`). The primary use case is protecting the metadata database: if PostgreSQL becomes slow under heavy load, the breaker prevents the API server from accumulating blocked connections. It is also relevant for target database queries -- if a user's connected database is unreachable, the breaker ensures that the query executor fails fast rather than holding connections open for the full timeout. The breaker opens at 50% error rate, with a 30-second reset timeout and 10-second call timeout.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements from your application over time. Rather than capturing individual events (that is what logging does), metrics capture aggregated statistics: requests per second, 99th percentile latency, current memory usage, queue depth. Prometheus works on a "pull" model -- your application exposes a `/metrics` HTTP endpoint returning all current values in a specific text format, and the Prometheus server scrapes this endpoint at regular intervals.
+
+There are four metric types. **Counters** only increase (total requests, total errors) and are used to calculate rates. **Gauges** go up and down (active connections, memory in use). **Histograms** sort values into configurable buckets (request duration: 0-10ms, 10-50ms, 50-100ms, etc.) enabling percentile calculations like p99. **Summaries** compute percentiles client-side but cannot be aggregated across instances.
+
+This project uses `prom-client` (`src/services/metrics.ts`) to expose HTTP request duration histograms (labeled by method, route, and status code), request counters, and query execution duration histograms (labeled by data source type). The query execution metric is particularly important for a tool builder: it reveals whether target database queries are slow (pointing to query optimization needs or connection pool exhaustion) versus whether the Retool API itself is slow (pointing to metadata database issues). A total apps gauge tracks system growth.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects rather than human-readable text strings. Instead of `"2024-01-16 12:00:00 INFO Query executed: SELECT * FROM customers (45ms, 12 rows)"`, a structured log produces `{"timestamp":"2024-01-16T12:00:00Z","level":"info","event":"query_executed","queryText":"SELECT * FROM customers","duration":45,"rowCount":12,"dataSourceId":"ds-abc","userId":"user-456"}`. Every piece of information is a named field that can be independently filtered, searched, and aggregated.
+
+The critical advantage is debuggability at scale. When a user reports "my query is slow," you need to find the specific query execution across thousands of log lines from multiple API servers. With structured logs, you filter by `userId` and `event=query_executed` and sort by `duration` descending -- a query that takes seconds in a log aggregation system. With text logs, you need regex parsing. Structured logs also enable automatic alerting: fire an alert when the count of `event=query_executed AND duration>5000` exceeds a threshold per minute.
+
+This project uses Pino (`src/services/logger.ts`) for JSON logging with request context (method, path, duration, user ID). The structured format is especially valuable for debugging the query executor, where you need to correlate the binding resolution step, the SQL execution step, and the result serialization step to understand where time is being spent.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. It serves three purposes: preventing brute-force attacks (limiting login attempts to prevent credential stuffing), protecting against accidental abuse (a developer's test script making thousands of API calls in a loop), and ensuring fair resource sharing (preventing one user's expensive queries from consuming all database connections).
+
+The sliding window algorithm counts requests per client (identified by IP address, API key, or session) within a rolling time period. When the count exceeds the limit, the server responds with HTTP 429 (Too Many Requests) and includes headers telling the client when to retry (`Retry-After`) and how many requests remain (`X-RateLimit-Remaining`). Redis is commonly used as the counter store so that rate limits work correctly across multiple API server instances.
+
+This project implements three rate limiting tiers (`src/services/rateLimiter.ts`): 50 requests per 15 minutes for auth endpoints (preventing brute-force login attacks), 100 requests per minute for query execution (protecting target databases from being overwhelmed), and 1,000 requests per 15 minutes for general API calls. The query execution limit is particularly important in a tool builder context: without it, a user could accidentally create an infinite loop of query executions (a button that triggers a query whose result triggers another query), potentially exhausting the target database's connection pool and affecting other applications sharing that database.
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether a service is operational and ready to accept traffic. Health checks are the mechanism by which load balancers decide which servers to route requests to, and orchestration systems (Kubernetes, ECS) decide whether to restart a container or stop sending it traffic.
+
+There are two types. A **liveness** check answers "is the process running?" -- returning 200 if the HTTP server can respond at all. If this fails, the process is crashed or deadlocked and should be restarted. A **readiness** check answers "can this instance serve real requests?" -- it verifies that dependencies (databases, Redis) are reachable. A service can be alive but not ready during startup (before database connections are established) or during a dependency outage.
+
+This project implements `GET /api/health` which verifies metadata database connectivity. In a two-database architecture, this check is important because the metadata database is the critical dependency -- if it is down, the API cannot load apps, authenticate users, or save changes. Target database health is checked per-request via the connection pool (with auto-healing on pool errors), not via a global health check, because each target database is independent and a single target being down should not cause the health check to fail for the entire service.
+
+### Idempotency
+
+An idempotent operation produces the same result no matter how many times it is executed. This property is critical in distributed systems because network failures create uncertainty: if a client sends a request and the connection drops before the response arrives, the client does not know whether the server processed the request. If the client retries, an idempotent operation guarantees the system ends up in the correct state. A non-idempotent retry could create duplicate data (two copies of the same app version) or apply a change twice.
+
+In this project, idempotency is designed into the key operations. App saves (PUT `/api/apps/:id`) send the complete app state (all components, queries, layout) rather than incremental patches. Saving the same full state twice produces the same result. Publishing uses a transactional read-max-then-insert pattern protected by a `UNIQUE(app_id, version_number)` constraint -- if a retry hits the constraint, the server catches the violation and returns the existing version rather than an error, making publish effectively idempotent. Query execution is intentionally not made idempotent for write operations (INSERT, UPDATE, DELETE) because the correct behavior on retry is ambiguous -- the user must decide whether to re-execute, and the UI makes this explicit.

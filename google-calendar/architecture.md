@@ -293,6 +293,170 @@ Events in week/day views use CSS percentage positioning: `top = (startMinutes / 
 | Recurring events | Query-time expansion | Pre-materialized instances | Avoids storing millions of rows |
 | Primary keys | SERIAL (local) | UUID (distributed) | Single-writer DB; switch to UUID for multi-region |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App (TanStack Router)
+├── __root.tsx (RootLayout)
+│   ├── Header: logo, user email, logout button
+│   └── <Outlet /> ──▶ routes
+│
+├── /login (LoginPage)
+│   └── Login form (username + password)
+│
+└── / (CalendarPage)
+    ├── CalendarSidebar
+    │   ├── Create Event button
+    │   ├── MiniCalendar (date picker)
+    │   └── Calendar list with visibility toggles
+    │
+    ├── Toolbar
+    │   ├── DateNavigator (prev/next/today + current date label)
+    │   └── ViewSwitcher (month/week/day toggle)
+    │
+    ├── Calendar View (conditional rendering)
+    │   ├── MonthView (7-column CSS Grid, 6 rows)
+    │   │   └── EventCard (compact pill per event)
+    │   ├── WeekView (7-column time grid, 1440px height)
+    │   │   └── EventCard (absolute-positioned block)
+    │   └── DayView (single-column time grid)
+    │       └── EventCard (absolute-positioned block)
+    │
+    └── EventModal (create/edit form overlay)
+        ├── Title, date/time pickers, calendar selector
+        ├── Color picker (8 colors)
+        ├── Conflict warning banner (amber)
+        └── Delete button (edit mode only)
+```
+
+### Zustand Stores
+
+The frontend uses two Zustand stores that separate concerns cleanly:
+
+**`authStore`** -- Manages user session state. Uses Zustand's `persist` middleware to survive page reloads by storing the `user` object in `localStorage`. The store holds `user`, `isLoading`, and provides `setUser`, `setLoading`, and `logout` actions. The `partialize` option ensures only the user object is persisted, not the loading state.
+
+**`calendarStore`** -- The central state hub for the calendar UI. This is a non-persisted store holding:
+
+- **View state**: `currentDate` (the anchor date for the current view), `view` (month/week/day), and navigation actions (`goToToday`, `goToPrevious`, `goToNext`) that compute the next date using `date-fns` helpers (`addMonths`, `subWeeks`, etc.)
+- **Events array**: Flat list of `CalendarEvent` objects with `setEvents`, `addEvent`, `updateEvent`, `removeEvent` mutators
+- **Calendar visibility**: `calendars` array and `visibleCalendarIds` Set that controls which calendars' events are rendered. `toggleCalendarVisibility` adds or removes IDs from the Set
+- **Modal state**: `isModalOpen`, `modalMode` (create/edit), `selectedEvent`, `modalDate` -- controlled by `openCreateModal`, `openEditModal`, `closeModal` actions
+- **Computed helper**: `getViewDateRange()` returns the `{start, end}` date bounds for the current view. Month view extends from the start-of-week of the first day of the month to the end-of-week of the last day, capturing the "padding days" visible in the grid
+
+### Routing
+
+Uses TanStack Router with file-based routing. Two routes:
+- `/login` -- Login form, redirects to `/` on success
+- `/` (index) -- Main calendar view, redirects to `/login` if not authenticated
+
+The root layout (`__root.tsx`) checks authentication on mount by calling `GET /api/auth/me`. If the session is valid, the user object is stored in `authStore`; otherwise the user is cleared and the login redirect triggers.
+
+### Data Fetching
+
+All API calls go through `services/api.ts`, which provides typed async functions wrapping `fetch` with `credentials: 'include'` for cookie-based session auth. The Vite dev server proxies `/api` requests to the Express backend at port 3000.
+
+**Event loading lifecycle**: When the `CalendarPage` mounts, it loads calendars once. Then, whenever `currentDate`, `view`, or `calendars` change, a `useEffect` calls `getViewDateRange()` to compute the visible window and fetches only events within that range via `GET /api/events?start=...&end=...`. This keeps payloads small -- typically 20-100 events per view regardless of total event count.
+
+**Client-side filtering**: After events are fetched, a `useMemo` filters them by `visibleCalendarIds`. Toggling a calendar's visibility does not trigger a new API call -- it only re-filters the already-fetched events.
+
+### Key UI Patterns
+
+**Calendar grid layout (MonthView)**: A CSS Grid with `grid-cols-7 grid-rows-6` creates the familiar 7x6 month layout. `getMonthDays()` returns 42 dates starting from the start-of-week of the first day of the month, including padding days from adjacent months. Padding days are visually dimmed with `bg-gray-50` and lighter text. Today's date gets a blue circular highlight. Each day cell shows up to 3 `EventCard` pills with a "+N more" overflow indicator.
+
+**Time grid positioning (WeekView/DayView)**: The time grid uses a fixed `min-h-[1440px]` container (60px per hour x 24 hours). Events are positioned absolutely within each day column using percentage calculations: `top = (startMinutes / 1440) * 100%` and `height = (durationMinutes / 1440) * 100%`. This is a pure computation approach -- no DOM measurements, no layout thrashing, naturally responsive to container size. The `getEventPosition` utility in `utils/dateUtils.ts` handles clamping events that start before or end after the visible day.
+
+**Conflict warning display**: The `EventModal` calls `createEvent` or `updateEvent`, which return a `conflicts` array alongside the saved event. If conflicts exist, an amber banner renders inside the modal listing each overlapping event with its time range. The event is still created -- conflicts are warnings, not blockers.
+
+**Calendar visibility toggles**: The sidebar renders each calendar with a colored checkbox. Clicking toggles the calendar's ID in the `visibleCalendarIds` Set, which triggers the `useMemo` filter and instantly hides/shows events without re-fetching. The checkbox background color matches the calendar's color for visual consistency.
+
+## Production-Grade Pattern Deep Dives
+
+This section explains each production-grade pattern referenced in the architecture, written for readers encountering these concepts for the first time.
+
+### Health Checks
+
+A health check is an HTTP endpoint (typically `GET /health`) that reports whether the service is alive and capable of handling requests. Load balancers, container orchestrators (Kubernetes), and monitoring systems poll this endpoint at regular intervals (e.g., every 10 seconds). If the health check fails, the infrastructure stops routing traffic to that instance and may restart it.
+
+A basic health check just returns HTTP 200 to prove the process is running. A more useful health check tests downstream dependencies -- can the service reach the database? Is Redis responding? This prevents a "zombie" scenario where the process is running but cannot actually serve requests because its database connection died.
+
+**How it works in this project**: The Express server exposes `GET /api/health` that returns service status. A load balancer or container orchestrator can use this endpoint to determine whether to route traffic to this instance.
+
+**Why it matters at production scale**: With dozens of service instances behind a load balancer, a single instance with a broken database connection would cause a fraction of requests to fail silently. Health checks detect this and remove the broken instance from the rotation within seconds, maintaining the 99.99% uptime target.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without it, a single misbehaving client (or an attacker) can overwhelm the server with requests, degrading performance for everyone.
+
+**How it works**: The server tracks request counts per client (usually identified by user ID or IP address). When a request arrives, the server checks whether the client has exceeded their allowance. If they have, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. If not, the request proceeds and the counter increments.
+
+Common implementations use Redis for the counters because: (1) Redis is fast enough to check on every request without adding meaningful latency, (2) counters are shared across all server instances (a user hitting server A and server B still accumulates against the same counter), and (3) Redis TTL handles automatic counter expiry.
+
+**Why it matters for a calendar service**: Event creation at production scale could be abused -- a script creating millions of events would bloat the database and trigger excessive conflict checks. Rate limiting event creation to 100/minute per user prevents this while being invisible to normal users who create maybe 5 events per day.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method of restricting system access based on the roles assigned to users, rather than checking permissions for each user individually. Instead of maintaining a per-user permission list ("Alice can edit Calendar X, Bob can view Calendar X"), you define roles ("owner", "editor", "viewer") with associated permissions, and assign users to roles.
+
+**How it works**: Each resource (e.g., a shared calendar) has an access control list mapping users to roles. When a user requests an action (e.g., "edit event in Calendar X"), the system looks up their role for that resource and checks whether the role permits the action. An "owner" can do everything, an "editor" can create/modify events, a "viewer" can only read.
+
+**Why this matters for calendar sharing**: Google Calendar supports sharing calendars with different permission levels. Without RBAC, you would need to check permissions with custom logic for every API endpoint. RBAC centralizes this: add one middleware that looks up the user's role for the requested calendar, then allow or deny based on a simple role-to-permissions mapping. This is mentioned in the architecture as a production-scale feature (not implemented locally because the local version is single-user).
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it.
+
+**How it works step by step**: (1) Application receives a request for data. (2) Check Redis: `GET cache:key`. (3) If found, return the cached value -- this is typically 10-50x faster than a database query. (4) If not found, query PostgreSQL. (5) Store the result in Redis: `SET cache:key value EX 300` (5-minute TTL). (6) Return the result.
+
+**Cache invalidation**: When data changes (event created, updated, or deleted), the application deletes the relevant cache keys so the next read fetches fresh data from the database. The TTL provides a safety net -- even if invalidation is missed, the cache self-corrects within the TTL window.
+
+**Why it matters for calendar reads**: The architecture targets 500K event reads/second at peak. PostgreSQL can handle maybe 10K-50K queries/second depending on complexity. Redis cache absorbs the remaining load, serving cached event lists for frequently viewed date ranges. A user checking their calendar 10 times in a minute hits the database once and Redis 9 times.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-readable JSON objects instead of free-form text strings. Instead of `"User 123 created event 456 in 15ms"`, the log entry is `{"level":"info","userId":123,"eventId":456,"durationMs":15,"action":"event_created","timestamp":"2026-03-18T10:00:00Z"}`.
+
+**Why JSON instead of text**: Free-form text logs require regex patterns to search and analyze. JSON logs can be indexed by any field -- you can query "show me all log entries where durationMs > 1000 and action = event_created" in a log aggregation system (Elasticsearch, Datadog, CloudWatch). This is the difference between spending 30 minutes grepping logs and getting an answer in 5 seconds.
+
+**How Pino works**: Pino is a high-performance Node.js logging library that outputs JSON by default. It supports log levels (trace, debug, info, warn, error, fatal), child loggers (adding persistent context like `service: "calendar"`), and pretty-printing for local development. In production, the JSON output is piped to a log aggregation system.
+
+**Why it matters at scale**: When 50 service instances are running and a user reports "my events didn't load," you need to find the specific request across all instances. Structured logs with a request correlation ID let you filter to that exact request flow. With text logs, this investigation takes hours; with structured logs, minutes.
+
+### Prometheus Metrics
+
+Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics at a `/metrics` HTTP endpoint in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the time-series data for querying and alerting.
+
+**Three metric types that matter**:
+- **Counter**: A number that only goes up. Example: `events_created_total`. You query the *rate* of change to get "events created per second."
+- **Gauge**: A number that goes up and down. Example: `active_websocket_connections`. Shows current state.
+- **Histogram**: Tracks the distribution of values in configurable buckets. Example: `event_query_duration_seconds` with buckets at 0.01, 0.05, 0.1, 0.25, 0.5, 1.0 seconds. Lets you compute percentiles (p50, p95, p99) to understand latency distribution.
+
+**How prom-client works**: The `prom-client` npm package creates a Prometheus metrics registry in the Node.js process. You define metrics (counters, gauges, histograms), instrument your code to update them, and expose the registry at `GET /metrics`. Prometheus scrapes this endpoint and stores the data.
+
+**Why it matters for a calendar service**: The architecture targets p99 read latency < 100ms. Without metrics, you have no way to know if you are meeting this target. Prometheus histograms on event query duration give you exact p99 values, and you can set alerts when p99 exceeds 100ms for 5 consecutive minutes.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing downstream service. It works like an electrical circuit breaker: when failures exceed a threshold, the "circuit opens" and subsequent calls fail immediately without attempting the request. After a cooldown period, the circuit allows one test request through ("half-open"). If the test succeeds, the circuit closes and normal operation resumes. If it fails, the circuit stays open for another cooldown period.
+
+**The three states**:
+1. **Closed** (normal): Requests pass through. Failures are counted. If failures exceed the threshold (e.g., 50% of the last 10 requests), the circuit opens.
+2. **Open** (failing): All requests are immediately rejected or routed to a fallback. No calls are made to the downstream service. This prevents cascading failures.
+3. **Half-open** (testing): After the reset timeout, one request is allowed through. If it succeeds, the circuit closes. If it fails, the circuit reopens.
+
+**Why this matters**: Without a circuit breaker, if Redis goes down, every request would wait for the Redis timeout (e.g., 3 seconds) before failing. With 1000 requests/second, that is 3000 requests stacked up waiting, consuming memory and threads, potentially crashing the application server. A circuit breaker detects the failure after a few requests and starts returning fallback responses immediately, keeping the application responsive.
+
+**Opossum**: The Node.js circuit breaker library used in this repository. It wraps async functions and monitors their success/failure rate. Configuration includes error threshold percentage, timeout per request, and reset timeout. It emits events on state changes, which can drive Prometheus metrics and Pino log entries.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In the context of API design, an idempotent endpoint can safely handle duplicate requests -- if a network timeout causes the client to retry, the server does not create a duplicate resource.
+
+**How idempotency keys work**: The client generates a unique key (typically a UUID) for each operation and sends it as a header (`X-Idempotency-Key`). The server checks Redis for this key before processing: (1) If found, return the cached result from the first execution. (2) If not found, process the request, store the result in Redis with a 24-hour TTL, and return it.
+
+**Why this matters for event creation**: Without idempotency, a network timeout during event creation could cause the client to retry, creating a duplicate event. The user sees two identical meetings at the same time. With idempotency keys, the retry hits the cached result and returns the already-created event. The client cannot distinguish between "the first request succeeded" and "the retry returned the cached result," which is exactly the desired behavior.
+
 ## Implementation Notes
 
 ### Local Setup Diagram

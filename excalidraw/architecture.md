@@ -383,6 +383,71 @@ Pino JSON logger with request tracing (`x-trace-id` header), user context, and q
 | Canvas rendering | Canvas 2D API | WebGL | Simpler API, sufficient for ~5K elements at 60fps |
 | Cursor rendering | DOM overlay (SVG) | Canvas-drawn cursors | Avoids full canvas redraws on cursor movement |
 
+## Frontend Architecture
+
+The frontend is a React SPA built with Vite, TypeScript, TanStack Router, Zustand, and Tailwind CSS. It implements a collaborative whiteboard with HTML5 Canvas rendering, real-time WebSocket collaboration, and shape editing tools.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Header                              ← App logo, user menu, login/register links
+├── index.tsx (DrawingList)
+│   └── Drawing Cards                   ← Grid of user's drawings with title, thumbnail, public/private badge
+├── login.tsx / register.tsx            ← Auth forms
+└── draw.$drawingId.tsx (DrawingPage)
+    ├── Top Bar                         ← Back button, editable title input, collaborator avatars, Share/Save buttons
+    ├── Toolbar                         ← Floating left-side tool palette (select, rect, ellipse, diamond, arrow, line, freehand, text, eraser)
+    ├── PropertiesPanel                 ← Floating right-side panel for selected element (stroke color, fill color, stroke width, opacity, font size)
+    ├── Canvas                          ← Full-screen HTML5 Canvas with pan/zoom, shape rendering, hit testing, drawing interactions
+    ├── CollaboratorCursors             ← DOM overlay layer with SVG cursor arrows for each remote user
+    └── ShareDialog                     ← Modal for managing collaborators (add by username, set view/edit permission, remove)
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`): Manages user authentication with Zustand's `persist` middleware, storing user and authentication state in localStorage under `excalidraw-auth-storage`. Provides `login()`, `register()`, `logout()`, and `checkAuth()` (validates the session cookie against the server). Persisting auth state allows the app to show the correct UI immediately on page load before the server-side session check completes, avoiding a flash of the logged-out state.
+
+**`useCanvasStore`** (`stores/canvasStore.ts`): The core store managing all drawing state. It holds:
+- **Elements**: The array of `ExcalidrawElement` objects (shapes on the canvas), plus `selectedElementId` for the currently selected shape. Element mutations (`addElement`, `updateElement`, `deleteElement`) automatically increment the element's `version` counter and set `updatedAt` to the current timestamp, which are required for CRDT conflict resolution.
+- **Tool state**: `activeTool` (select, rect, ellipse, etc.), `isDrawing` (whether the user is mid-stroke), `drawingStartPoint`, and `currentPoints` (accumulated freehand points during drawing).
+- **Viewport**: `viewState` with `scrollX`, `scrollY`, and `zoom` for the infinite canvas viewport transform.
+- **Style**: `strokeColor`, `fillColor`, `strokeWidth`, `opacity`, `fontSize` -- applied to newly created elements and modifiable on selected elements via the PropertiesPanel.
+- **Cursors**: Array of `Cursor` objects for remote collaborators, updated in real-time via WebSocket. `updateCursor` upserts by userId, `removeCursor` cleans up when a user leaves.
+
+The store does not persist to localStorage because drawing state is loaded from the server (PostgreSQL) when entering a drawing and saved via debounced auto-save. The store acts as the in-memory working copy during a drawing session.
+
+### Routing
+
+TanStack Router file-based routing:
+
+| Route | File | Purpose |
+|-------|------|---------|
+| `/` | `routes/index.tsx` | Drawing list dashboard (user's drawings and public drawings) |
+| `/login` | `routes/login.tsx` | Login form |
+| `/register` | `routes/register.tsx` | Registration form |
+| `/draw/$drawingId` | `routes/draw.$drawingId.tsx` | Full-screen drawing canvas with collaboration |
+
+The root layout (`__root.tsx`) is minimal -- it renders the Header and Outlet. The drawing page (`draw.$drawingId.tsx`) takes over the full viewport height, hiding the standard layout padding.
+
+### Data Fetching and WebSocket Integration
+
+**REST API** (`services/api.ts`): Typed fetch wrapper with `credentials: 'include'` for session cookies. Provides `authApi` (login, register, logout, getMe) and `drawingApi` (list, get, create, update, delete, collaborator management). Used for initial data loading and explicit save operations.
+
+**WebSocket client** (`services/websocket.ts`): A singleton `WebSocketClient` class that manages the real-time collaboration connection. Key design decisions:
+- **Event-based API**: Uses an `on(type, handler)` pattern returning an unsubscribe function, similar to EventEmitter. The DrawingPage component subscribes to events (`room-state`, `shape-add`, `shape-update`, `shape-delete`, `shape-move`, `elements-sync`, `cursor-move`, `user-joined`, `user-left`) in a `useEffect` and unsubscribes on cleanup.
+- **Auto-reconnect with exponential backoff**: On connection loss, the client retries up to 5 times with delays of 1s, 2s, 4s, 8s, 16s. On successful reconnect, it automatically re-joins the room it was in, triggering a fresh state sync from the server.
+- **Room management**: `joinRoom(drawingId, userId, username)` enters a drawing's collaboration room. The server responds with `room-state` containing the full element array. `leaveRoom()` notifies the server on navigation away.
+- **Operation broadcasting**: Typed methods (`sendShapeAdd`, `sendShapeUpdate`, `sendShapeDelete`, `sendShapeMove`, `sendCursorMove`, `sendElementsSync`) send structured messages. The DrawingPage calls these after local state mutations, and the server broadcasts to other room members.
+
+### Key UI Patterns
+
+- **Infinite canvas with pan/zoom**: The `Canvas` component uses `ctx.setTransform(zoom, 0, 0, zoom, scrollX, scrollY)` to map between screen coordinates and world coordinates. Panning is done by holding the middle mouse button or spacebar+drag. Zooming uses the scroll wheel, centered on the cursor position. Grid dots are drawn in screen space (before the transform) so they remain evenly spaced regardless of zoom level.
+- **Shape rendering pipeline**: The `CanvasRenderer` (`renderer/CanvasRenderer.ts`) redraws the entire canvas on every frame. It draws the background grid, applies the viewport transform, then iterates through non-deleted elements calling type-specific renderers from `renderer/shapes.ts` (rect, ellipse, diamond, arrow, line, freehand, text). The selected element gets selection handles (resize corners).
+- **Freehand drawing with path simplification**: Freehand paths accumulate mouse move coordinates into `currentPoints`. On mouse up, the `pathSimplification.ts` utility applies the Ramer-Douglas-Peucker algorithm to reduce point count while preserving the visual shape. This reduces the data size of freehand elements from potentially hundreds of points to a compact representation.
+- **DOM cursor overlay**: Collaborator cursors are rendered as absolutely positioned SVG arrow elements in a DOM layer above the canvas (`CollaboratorCursors`), rather than being drawn on the canvas itself. This avoids triggering a full canvas redraw on every cursor movement (60 times per second per collaborator). Each cursor shows the user's name and is colored using the server-assigned color.
+- **Optimistic local-first editing**: Shape operations are applied to the local Zustand store immediately (for instant feedback), then broadcast via WebSocket. Remote operations arriving via WebSocket update the store, which triggers a canvas re-render. The CRDT merge logic on the server ensures convergence even if operations arrive out of order.
+
 ## Implementation Notes
 
 ### Local Architecture
@@ -459,3 +524,53 @@ Both infrastructure services run via Docker Compose (`docker-compose.yml`). The 
 - Offline mode with local-first sync
 - Copy/paste and group selection
 - WebGL renderer for large drawings (50K+ elements)
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project from first principles, describing what the pattern is, what problem it solves, and how this project uses it.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing external dependency from cascading into a system-wide outage. When your application calls a database, and that database becomes slow or unresponsive, each request waits for the full timeout (e.g., 10 seconds). If your application handles 100 requests per second, within 10 seconds you have 1,000 requests blocked waiting for the database, consuming all available connections and threads. Now even requests that do not need the database cannot be served because the server has exhausted its resources. One slow dependency has brought down everything.
+
+A circuit breaker monitors the success and failure rate of calls to a dependency. It has three states. **Closed** is normal operation: all calls go through, and the breaker tracks the error rate over a rolling window. **Open** means the breaker has tripped: all calls are immediately rejected without attempting the request. This is called "failing fast" -- rather than waiting 10 seconds for a timeout, the client gets an immediate error and can show a fallback or retry later. **Half-open** is the recovery state: after a cooldown period, the breaker lets one test request through. If it succeeds, the circuit closes. If it fails, the circuit reopens.
+
+In this project, an Opossum circuit breaker wraps PostgreSQL database operations (`src/services/circuitBreaker.ts`). If the database becomes slow or unreachable, the breaker opens after 50% of requests fail within a 10-second window, with a 30-second reset timeout before trying again. This protects the Express server from accumulating blocked requests. In-flight WebSocket operations continue to work with in-memory state; only persistence is deferred until the database recovers. The breaker state is exposed as a Prometheus gauge so the monitoring system can alert when the database circuit opens.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system designed for cloud-native applications. Unlike traditional monitoring that pushes metrics to a central server, Prometheus uses a "pull" model: your application exposes a `/metrics` HTTP endpoint that returns all current metric values in a specific text format, and the Prometheus server scrapes this endpoint at regular intervals. This pull model means your application does not need to know where the monitoring server is, and adding new services to monitoring is just a configuration change in Prometheus.
+
+There are four metric types. **Counters** are monotonically increasing values (total requests, total errors) used to compute rates. **Gauges** go up and down (active WebSocket connections, memory usage). **Histograms** distribute values into configurable buckets (request latency: how many requests took 0-10ms, 10-50ms, etc.) and enable percentile calculations like p99. **Summaries** compute percentiles on the client side but cannot be aggregated across instances.
+
+This project uses `prom-client` (`src/services/metrics.ts`) with metrics specific to a collaborative whiteboard: HTTP request duration histograms, active WebSocket connection gauges, WebSocket message counters by type (shape-add, shape-update, cursor-move, etc.), drawing creation counters, auth attempt counters, and circuit breaker state gauges. The WebSocket-specific metrics are particularly important because connection count directly impacts memory usage (each connection holds ~50KB of state) and message throughput determines server CPU load. Monitoring these in real-time allows operators to scale WebSocket servers before they become overloaded.
+
+### Structured Logging
+
+Structured logging means writing log entries as JSON objects with named fields rather than free-form text strings. Instead of `"2024-01-16 12:00:00 INFO User alice joined drawing abc123"`, a structured log emits `{"timestamp":"2024-01-16T12:00:00Z","level":"info","event":"user_joined","userId":"user456","username":"alice","drawingId":"abc123","traceId":"req-789"}`. Each field is independently searchable and filterable by log aggregation systems.
+
+The critical advantage in a collaborative system like this is correlation. When a user reports that their drawing changes disappeared, you need to trace the full lifecycle: the WebSocket message received, the CRDT merge applied, the debounced save triggered (or not triggered), and the PostgreSQL write completed (or failed). With structured logs, you filter by `drawingId=abc123` to see all events for that drawing, then by `traceId` to follow a specific operation through the system. With unstructured text logs, this requires regex parsing across millions of log lines.
+
+This project uses Pino (`src/services/logger.ts`) for JSON logging with request tracing via `x-trace-id` headers. Each request gets a unique ID that is included in all log lines produced during that request's lifecycle, enabling end-to-end tracing from HTTP request through database queries and WebSocket operations.
+
+### Rate Limiting
+
+Rate limiting controls the number of requests a client can make within a time window. In a collaborative whiteboard, rate limiting serves two purposes beyond basic protection. First, it prevents abuse of the authentication system -- without rate limiting on login attempts, an attacker could try millions of passwords per hour using automated tools (credential stuffing). Second, it prevents a single user or script from overwhelming the drawing API with rapid save or create operations that would consume database connections and disk I/O at the expense of other users.
+
+The sliding window algorithm works by tracking a counter per client (identified by IP or session) that increments on each request. When the counter exceeds the limit, the server responds with HTTP 429 (Too Many Requests). The counter resets after the window expires. Redis is used as the counter store so that rate limits work consistently across multiple API server instances.
+
+This project implements Redis-backed sliding window rate limiting (`src/services/rateLimiter.ts`) with separate limits for authentication endpoints (stricter, to prevent brute-force login attacks) and drawing operations (more generous, to allow normal collaborative use). Rate limiting is applied as Express middleware, so it runs before any business logic, rejecting excess requests immediately without consuming database connections or compute resources.
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether a service is functioning correctly. Health checks serve as the connective tissue between your application and the infrastructure that manages it. A load balancer polls health check endpoints to decide which server instances should receive traffic -- if a server fails its health check, the load balancer stops routing requests to it, preventing users from hitting a broken server. Kubernetes uses health checks to decide whether to restart a container (if the liveness check fails) or stop sending it traffic (if the readiness check fails).
+
+There are two levels of health checking. A **basic liveness** check returns 200 if the HTTP server is responsive -- if this fails, the process is likely crashed or deadlocked. A **detailed readiness** check verifies all dependencies: can the service connect to PostgreSQL? Is Redis reachable? These checks distinguish between "the process is running" and "the process can actually serve requests" -- an important distinction during startup (database connections not yet established) or during a dependency outage.
+
+This project provides `GET /api/health` (basic liveness) and `GET /api/health/detailed` (checks PostgreSQL and Redis connectivity). The detailed check returns per-component status, so operators can immediately see which dependency is causing problems rather than debugging from error logs.
+
+### Idempotency
+
+An idempotent operation produces the same result regardless of how many times it is executed. This property is essential in distributed systems where network failures cause uncertainty: if a client sends a request and the connection drops before receiving a response, the client does not know whether the server processed the request. If the client retries, an idempotent operation guarantees correctness. A non-idempotent retry could create duplicate data, charge a credit card twice, or send a notification twice.
+
+In this project, idempotency is built into the CRDT conflict resolution model. Every shape operation carries a client-generated element ID and a monotonically increasing version number. If a WebSocket message is retried due to a reconnection, the CRDT merge logic on the server compares versions: an add for an existing element ID is treated as an update, and an update with a version equal to or lower than the existing element is silently discarded. This means duplicate deliveries never create phantom shapes or revert edits. For REST API operations, database constraints enforce idempotency -- the `UNIQUE(drawing_id, user_id)` constraint on `drawing_collaborators` prevents duplicate entries on retry.

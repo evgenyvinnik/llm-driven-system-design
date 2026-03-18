@@ -610,6 +610,153 @@ For groups with many members across many devices, message delivery uses a two-ph
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+└── <Outlet /> (route-specific content)
+    └── index.tsx (IndexPage)
+        ├── AuthForm (login/register toggle, shown when unauthenticated)
+        └── Messaging Interface (shown when authenticated)
+            ├── ConversationList (sidebar, 280px wide)
+            │   ├── Search/filter conversations
+            │   ├── New conversation button
+            │   └── ConversationItem[] (avatar, name, preview, unread badge)
+            └── ChatView (main content area)
+                ├── Conversation header (name, participant count)
+                ├── Message area (scrollable, date-grouped)
+                │   ├── Date separator labels ("Today", "Jan 15")
+                │   ├── MessageBubble[] (aligned left/right by sender)
+                │   └── TypingIndicator (animated dots with usernames)
+                └── Message input (text field + send button)
+```
+
+### Zustand Stores
+
+**`authStore`** -- Manages user authentication with JWT token persistence. Uses Zustand's `persist` middleware to save only the token to localStorage. On app startup, `checkAuth()` reads the stored token, calls `GET /api/auth/me` to validate it, and restores the user session. Unlike other projects, the auth store also tracks `deviceId` (returned from login/register) for multi-device support -- each login creates a new device record on the server. On successful authentication, the store automatically connects the WebSocket service (`wsService.connect(token)`) so real-time messaging begins immediately. On logout, the store disconnects the WebSocket and clears the token from localStorage.
+
+**`chatStore`** -- The most complex store in the project, managing all messaging state. Key design choices:
+
+- **Map-based message storage**: Messages are stored in a `Map<string, Message[]>` keyed by conversation ID. This provides O(1) lookup by conversation (versus O(n) filtering of a flat array) and allows loading messages for multiple conversations independently.
+- **Optimistic updates**: When sending a message, the store immediately adds a temporary message (with a `temp-*` ID and `status: 'sending'`) to the local state. The user sees their message appear instantly. When the server confirms delivery via WebSocket, the temporary message is replaced with the server-assigned message (real UUID, `status: 'sent'`). This creates the perception of instant messaging even on slow connections.
+- **Conversation reordering**: When a new message arrives, the store moves that conversation to the top of the list (most recent first). This happens for both sent and received messages, keeping the conversation list sorted by last activity.
+- **WebSocket message routing**: The `handleWebSocketMessage` action is a dispatcher that routes incoming WebSocket events to the appropriate state update: `new_message` adds a message, `message_sent` confirms an optimistic update, `typing` updates the typing users map, `reaction_update` modifies message reactions, and `offline_messages` processes batched messages received on reconnect.
+- **Offline queue**: The store has an `offlineQueue` array for messages that could not be sent due to disconnection. (Currently defined but not fully utilized -- the WebSocket service handles its own message queue.)
+
+### Routing
+
+TanStack Router with a minimal route structure. The entire application renders on a single route (`/`). There is no multi-page navigation. The `IndexPage` conditionally renders either the `AuthForm` (when unauthenticated) or the messaging interface (when authenticated). Within the messaging interface, selecting a conversation updates `chatStore.currentConversationId`, which causes the `ChatView` to mount with the selected conversation's messages. On mobile viewports, the sidebar and chat view are mutually exclusive (CSS `hidden`/`block` toggling based on `currentConversationId`).
+
+### Data Fetching
+
+API communication is split across two channels:
+
+**REST API** (`services/api.ts`) -- Used for operations that require request/response semantics: login, register, logout, auth validation, fetching conversation lists, fetching message history (paginated, 50 messages per load), creating conversations, and searching users. The API client wraps `fetch` with automatic token injection from localStorage, JSON parsing, and error handling.
+
+**WebSocket** (`services/websocket.ts`) -- Used for real-time bidirectional communication: sending messages, typing indicators, read receipts, and emoji reactions. The `WebSocketService` class manages connection lifecycle, automatic reconnection with exponential backoff (1s, 2s, 4s, 8s, 16s, max 5 attempts), message queuing for offline scenarios, and keep-alive pings. The service uses a publish/subscribe pattern: consumers call `wsService.subscribe(handler)` to receive incoming messages, and the `useWebSocket` hook bridges this to the chat store.
+
+### Real-Time Updates
+
+Real-time communication uses native WebSocket connections (not Socket.IO or polling):
+
+1. **Connection establishment**: On successful authentication, the auth store calls `wsService.connect(token)`. The WebSocket URL includes the JWT as a query parameter (`ws://host/ws?token=...`). The server validates the token and associates the connection with the user.
+
+2. **Message flow**: When a user sends a message, the chat store creates an optimistic local entry and calls `wsService.sendMessage()`. The WebSocket service sends a `send_message` event to the server. The server persists the message, then broadcasts a `new_message` event to all participants (including the sender). The sender receives a `message_sent` confirmation that replaces the optimistic entry with the server-confirmed message (including the real UUID and timestamp).
+
+3. **Typing indicators**: When the user types in the input field, the `handleTyping` callback in `ChatView` sends a `typing:start` event via WebSocket. A 2-second debounce timeout automatically sends `typing:stop` when the user stops typing. Other participants receive these events and see animated dots with the typing user's name.
+
+4. **Reconnection**: If the WebSocket connection drops, the service automatically attempts to reconnect with exponential backoff. On reconnection, the server sends an `offline_messages` event containing all messages the user missed while disconnected. The chat store processes these and adds them to the appropriate conversation message lists.
+
+5. **Presence**: The server tracks user online/offline status based on WebSocket connection state. When a user connects or disconnects, a `presence:update` event is broadcast to relevant participants.
+
+### Key UI Patterns
+
+- **Split-Pane Messaging Layout**: The main interface uses a desktop split-pane layout with a fixed-width sidebar (320px) for conversations and a flexible main area for the active chat. On mobile, the layout switches between sidebar and chat view based on whether a conversation is selected. A back button in the mobile chat header returns to the conversation list.
+- **Message Bubbles with Alignment**: The `MessageBubble` component renders messages with iMessage-style alignment: the current user's messages are right-aligned with a blue background, and other users' messages are left-aligned with a gray background. Avatars are shown for the first message in a consecutive sequence from the same sender (not repeated for every message).
+- **Date Grouping**: Messages are grouped by date with separator labels. Today's messages show "Today"; older messages show the full date. This provides temporal context without cluttering the message list with timestamps on every bubble.
+- **Typing Indicator**: The `TypingIndicator` component shows animated bouncing dots below the last message when another user is typing. The component displays the typing user's name for context in group conversations. Typing state is ephemeral (managed in a `Map<string, TypingUser[]>` in the chat store) and auto-expires via the 2-second debounce.
+- **Optimistic Message Rendering**: Sent messages appear immediately with a "sending" status. The message bubble shows a subtle visual indicator (slightly faded) until the server confirms delivery, at which point the message transitions to full opacity. This eliminates the perceived latency of network round-trips and makes the messaging experience feel instant.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in the project. Each explanation covers what the pattern is, why it exists, how it works in this project, and what would go wrong without it.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles. Instead of maintaining per-user permission lists, the system checks whether a user's assigned role includes the permission needed for a given action. This creates a scalable, maintainable access control system.
+
+**Why it exists**: In a messaging platform, there are multiple scopes of authorization. A regular user can send messages in conversations they belong to, but cannot read other users' conversations or access system metrics. A group admin can add/remove members and delete messages within their group, but cannot access other groups. A system admin can view platform-wide metrics and manage rate limits. Without RBAC, each of these permission checks would need to be hardcoded per user, making the system brittle and difficult to maintain.
+
+**How it works here**: Authorization operates at two levels. At the system level, the `users` table has a `role` column with values `user` or `system_admin`. System admins can access monitoring endpoints (`/metrics`, `/health`) and manage platform settings. At the conversation level, the `conversation_participants` table has a `role` column with values `admin` or `member`. Group admins can update group settings, add/remove participants, and delete any message in the group. Members can send messages and leave. The middleware chain is: validate session token, extract user from session, check system role (for admin endpoints), then check conversation role (for group-specific actions).
+
+**What goes wrong without it**: Any authenticated user could read messages from any conversation by calling `GET /api/messages/:conversationId` with an arbitrary conversation ID. They could add themselves to private groups, delete other users' messages, or access Prometheus metrics revealing user counts and message volumes. In a messaging app where privacy is a core value proposition, this would be catastrophic.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks Redis before querying the database. On a cache miss, the application queries PostgreSQL, stores the result in Redis with a TTL, and returns it. On a cache hit, the cached value is returned without touching the database. The application manages the cache explicitly -- the database has no knowledge of the cache's existence.
+
+**Why it exists**: Every message send requires verifying that the sender is a participant in the conversation. Without caching, this requires a database query (`SELECT * FROM conversation_participants WHERE conversation_id = ? AND user_id = ?`) for every single message. At 100,000 messages per second, that is 100,000 additional database queries per second just for participant verification. Caching participant sets in Redis reduces this check from 15ms (database round-trip) to 0.5ms (Redis round-trip), and reduces database load by approximately 80%.
+
+**How it works here**: The conversation cache at `backend/src/shared/conversation-cache.ts` stores participant sets per conversation using Redis Sets. When a message is sent, the system checks `SISMEMBER conversation:{id}:participants {userId}` in Redis (O(1) operation). On cache miss, the full participant list is loaded from PostgreSQL and cached. The cache is invalidated when participants are added or removed. Device public keys are also cached with 1-hour TTL (keys change rarely). Session tokens use write-through caching (written to both Redis and PostgreSQL) because session validity must be immediately consistent. Typing indicators and presence data live exclusively in Redis with auto-expiring TTLs (5 seconds for typing, 30 seconds for presence heartbeat).
+
+**What goes wrong without it**: At 100,000 messages per second, each participant check requires a database query. The PostgreSQL connection pool (100 connections) is overwhelmed. Messages are delayed or dropped because the server cannot verify participant membership fast enough. Typing indicators and presence, which require sub-second responsiveness, become useless with 15ms+ latency per check.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text. Each log entry has consistent, named fields (timestamp, level, message, requestId, userId, conversationId, plus domain-specific context) that log aggregation systems can index, search, and alert on without regex parsing.
+
+**Why it exists**: In a messaging system, debugging a delivery failure requires tracing a single message through multiple operations: WebSocket reception, participant verification, database persistence, delivery to each recipient's WebSocket connection, and delivery receipt acknowledgment. With unstructured text logs, correlating these steps for one message among billions requires manual timeline reconstruction. Structured logging enables queries like "show all logs where `messageId=xyz` across all services, sorted by timestamp."
+
+**How it works here**: The project uses Pino for JSON logging at `backend/src/shared/logger.ts`. Each request gets a unique ID propagated through all log entries. Message operations are logged with `conversationId`, `senderId`, `messageId`, and `contentType`. WebSocket events (connect, disconnect, message received, message sent) include the user ID and device ID. Sensitive data (message content, authentication tokens) is explicitly excluded from logs -- the system logs that a message was sent, not what it contained. This is critical for a messaging platform where E2E encryption means the server should never log plaintext content.
+
+**What goes wrong without it**: A user reports they sent a message but the recipient never received it. Support searches for the sender's user ID in text logs and finds 10,000+ log lines across 3 server instances (the user has been active all day). Without structured fields, they cannot determine whether the specific message was received by the WebSocket server, persisted to PostgreSQL, or delivered to the recipient's device. The investigation is unresolvable without structured message-level tracing.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system that scrapes numerical metrics from application endpoints at regular intervals. The application exposes a `/metrics` endpoint with current values for counters (monotonically increasing totals), gauges (point-in-time values), and histograms (value distributions). These metrics power dashboards and automated alerting rules.
+
+**Why it exists**: A messaging platform must answer operational questions in real-time: "How many messages per second are we delivering?" "What is the average delivery latency?" "How many WebSocket connections are active?" "Are we hitting rate limits?" These are aggregate, time-series questions that cannot be answered by searching individual log entries. Metrics enable proactive monitoring: alert when delivery latency exceeds 500ms rather than waiting for users to report "messages are slow."
+
+**How it works here**: The project uses `prom-client` at `backend/src/shared/metrics.ts` to expose messaging-specific metrics. `imessage_messages_total` (counter by status and content type) tracks message volume and delivery success rate. `imessage_message_delivery_duration_seconds` (histogram) monitors delivery latency SLO (target: < 500ms). `imessage_websocket_connections_active` (gauge) tracks concurrent connections. `imessage_cache_hits_total` and `imessage_cache_misses_total` (counters by cache type) measure cache effectiveness for participant lookups and key fetches. `imessage_rate_limit_exceeded_total` (counter by endpoint) detects abuse patterns. `imessage_idempotent_requests_total` (counter by result) tracks duplicate message detection.
+
+**What goes wrong without it**: Message delivery latency gradually increases from 200ms to 2 seconds over a week as the messages table grows and index performance degrades. No one notices until users start complaining on social media. With metrics, an alert would fire when p95 delivery latency exceeds 500ms, triggering investigation before users are affected.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make to an endpoint within a time window. When the limit is exceeded, subsequent requests receive a `429 Too Many Requests` response. This project uses sliding window counters in Redis, meaning the window moves continuously rather than resetting at fixed intervals. The system is designed to fail-open: if Redis is unavailable, requests are allowed through (availability is prioritized over strict rate enforcement).
+
+**Why it exists**: Without rate limiting, a malicious user could spam thousands of messages per second to a conversation, flooding all participants' devices with notifications and making the conversation unusable. A bot could call the login endpoint thousands of times with stolen credentials (credential stuffing). A buggy client could retry failed message sends in a tight loop, consuming server resources.
+
+**How it works here**: Rate limiting is implemented at `backend/src/shared/rate-limiter.ts` using Redis sorted sets for sliding window tracking. Five tiers are defined: message sending at 60 per minute per user (prevents spam), attachment uploads at 20 per minute per user (prevents storage abuse), login at 5 per 15 minutes per IP (prevents credential stuffing), device registration at 10 per hour per user (prevents device enumeration), and WebSocket connections at 5 per user (prevents connection exhaustion). The sliding window algorithm uses `ZADD` with timestamps as scores and `ZREMRANGEBYSCORE` to expire old entries, providing more accurate rate tracking than fixed-window counters.
+
+**What goes wrong without it**: A disgruntled user writes a script that sends 1,000 messages per second to an ex-partner's conversation. The recipient's phone receives 1,000 push notifications per second, draining battery and rendering the device unusable. Without rate limiting, the platform enables harassment at scale.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. For message sending, this means that if the same message is submitted twice (due to a network retry, a client bug, or a load balancer retry), only one message appears in the conversation. This is achieved by assigning each message a client-generated ID and checking for duplicates on the server before processing.
+
+**Why it exists**: Network unreliability is the norm for messaging. A user on a subway loses connectivity for 3 seconds. Their device's message queue retries the last message when connectivity returns. The WebSocket reconnection handler replays queued messages. Without idempotency, the recipient sees the same message multiple times, which is confusing and undermines trust in the platform.
+
+**How it works here**: The client generates a `clientMessageId` for each message (format: `temp-{timestamp}-{random}`). The server's idempotency middleware at `backend/src/shared/idempotency.ts` checks this key in both Redis (fast, sub-millisecond) and PostgreSQL's `idempotency_keys` table (durable fallback). The idempotency key format is `{userId}:{conversationId}:{clientMessageId}` with a 24-hour TTL. If a duplicate is detected, the server returns the existing message instead of creating a new one. Delivery receipts use `{messageId}:{deviceId}:delivered` as their idempotency key with a 7-day TTL -- marking the same message as "delivered" multiple times is harmless but wasteful.
+
+**What goes wrong without it**: A user sends "I love you" to their partner. Network timeout. The WebSocket reconnects and replays the message. "I love you" appears twice. While not catastrophic, it erodes trust in the messaging platform's reliability. At scale (5 billion messages per day), even a 0.01% duplicate rate means 500,000 duplicate messages daily, creating a poor user experience across millions of conversations.
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They return structured responses showing the status of each component (database, cache, WebSocket server) with latency measurements. Infrastructure components (load balancers, container orchestrators) consume these endpoints to make automated decisions about traffic routing and instance lifecycle.
+
+**Why it exists**: A messaging server might be running and accepting TCP connections, but unable to deliver messages because the PostgreSQL connection pool is full, Redis (used for session validation and participant caching) is unreachable, or the WebSocket upgrade handler is broken. Without health checks, the load balancer continues routing new WebSocket connections to this broken instance. Users connect but their messages are silently dropped.
+
+**How it works here**: Three health endpoints are implemented at `backend/src/shared/health.ts`. `GET /health/live` is a liveness probe that confirms the process is alive (always returns 200 unless the process is deadlocked). `GET /health/ready` is a readiness probe that tests PostgreSQL and Redis connectivity with sub-second timeout. `GET /health` is a deep health check that reports detailed status for each component (PostgreSQL connectivity + latency, Redis connectivity + latency, WebSocket connection count) and overall status as `ok` or `degraded`. The load balancer uses `/health/ready` to determine whether to route traffic to an instance. Kubernetes would use `/health/live` for restart decisions and `/health/ready` for traffic routing.
+
+**What goes wrong without it**: A messaging server's Redis connection drops. Session validation fails, so all authenticated requests return 401. WebSocket connections are rejected because token validation queries Redis. The load balancer does not know the instance is broken because the TCP port is still open. New users are routed to the broken instance and cannot connect. Meanwhile, existing connections on other instances work fine, making the problem appear intermittent ("sometimes messaging works, sometimes it does not") and very difficult to diagnose.
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local setup, what production patterns are implemented, what was simplified, and what was omitted.

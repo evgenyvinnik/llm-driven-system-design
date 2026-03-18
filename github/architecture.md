@@ -720,6 +720,81 @@ This section documents the actual local setup and maps production concepts to th
 | Git operations | simple-git + isomorphic-git for bare repository management | `backend/src/services/git.ts` |
 | Graceful shutdown | SIGTERM/SIGINT handlers with connection draining | `backend/src/index.ts` |
 
+### Production Pattern Deep Dives
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before.
+
+**Circuit Breaker (`backend/src/shared/circuitBreaker.ts`):**
+
+A circuit breaker prevents an application from repeatedly calling a failing service, which would waste resources and create cascading failures. The analogy is electrical: when current exceeds a safe threshold, the breaker trips and cuts the circuit.
+
+In this project, circuit breakers wrap all Git operations (clone, branches, commits, tree, diff, merge, push). Git operations are particularly vulnerable to cascading failures because they involve filesystem I/O and can be slow under load. If the disk becomes saturated or a bare repository is corrupted, every request that touches that repository would hang for the full timeout duration (30 seconds), consuming API server threads.
+
+The breaker has three states: **Closed** (requests flow normally), **Open** (requests are rejected immediately with a fallback response), and **Half-Open** (one test request is allowed to check if the problem is resolved). Configuration: 50% error threshold, 30-second reset timeout, 5-request minimum volume (to avoid tripping on a single failure). Each Git operation gets its own breaker instance with independent state -- a failure in `merge` does not affect `tree` browsing.
+
+When a breaker is open, the API returns an appropriate error (e.g., 503 Service Unavailable for merge operations). Users can still browse issues, discussions, and cached repository metadata. Admin endpoints expose breaker status and allow manual reset. The breaker state is tracked via a Prometheus gauge (`github_circuit_breaker_state`: 0 = closed, 1 = open, 2 = half-open) and a trip counter (`github_circuit_breaker_trips_total`).
+
+**Prometheus Metrics (`backend/src/shared/metrics.ts`):**
+
+Prometheus is a pull-based monitoring system. The application exposes all collected metrics at `GET /metrics` in Prometheus's text-based exposition format. A Prometheus server scrapes this endpoint at regular intervals and stores the data as time series for querying, graphing, and alerting.
+
+This project exposes 15+ custom metrics across four categories:
+
+- **HTTP metrics**: Request duration histogram (bucketed by method, route, status code) and request counter. These enable latency percentile calculations (p50, p95, p99) per endpoint.
+- **Git metrics**: Operation duration histogram (bucketed by operation type: push, clone, merge, diff) and operation counter (labeled by success/failure/timeout/rejected). This reveals which operations are slowest and which fail most often.
+- **Cache metrics**: Cache hit/miss counters by cache type (repo metadata, file trees, PR diffs) and cache operation duration. The hit ratio indicates whether the cache is effective or just consuming memory.
+- **Business metrics**: PR creation and merge counters (labeled by merge strategy), issue creation and closure counters, webhook delivery counters (by status and event type).
+
+These metrics enable data-driven decisions: if `github_git_operation_duration_seconds{operation="diff"}` p95 exceeds 5 seconds, the team knows to investigate repository size or disk performance. If `github_cache_hits_total` ratio drops below 50%, the TTL or cache size may need adjustment.
+
+**Structured Logging (`backend/src/shared/logger.ts`):**
+
+Structured logging emits log entries as JSON objects rather than unstructured text strings. A traditional log like `"Error: Failed to merge PR #42 for repo acme/widgets"` is readable but hard to query programmatically. A structured log emits `{"level":"error","event":"merge_failed","repo":"acme/widgets","prNumber":42,"error":"conflict in src/main.ts","requestId":"abc123","userId":7,"timestamp":"..."}`.
+
+This project uses Pino with request middleware that attaches a request context (request ID, user ID, IP address, user agent) to all downstream log entries. Pretty-print mode is enabled in development (human-readable colored output) and disabled in production (raw JSON for log aggregation systems).
+
+Key events logged include: repository CRUD operations (with owner, name, visibility), Git operations (with duration, repository path, operation type), PR merges (with strategy, additions, deletions, changed files), authentication events (login success/failure, with IP and user agent for security auditing), and search queries (with query text, result count, latency, language filter).
+
+**RBAC -- Role-Based Access Control (`backend/src/middleware/auth.ts` + collaborators table):**
+
+RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles, rather than granting permissions directly to individual users. This simplifies permission management: instead of configuring 100 individual user permissions, you define 5 roles and assign users to them.
+
+This project implements two layers of RBAC:
+
+1. **Platform roles** (`users.role`): `user` and `admin`. Admin users can access system-wide admin endpoints (audit logs, circuit breaker management). Regular users can create repositories, submit PRs, and file issues.
+
+2. **Repository roles** (`collaborators.permission`): `read`, `triage`, `write`, `maintain`, and `admin`. These are modeled after GitHub's actual permission levels. A repository owner has implicit admin access. Organization members get access based on their org role. External collaborators are explicitly added with a specific permission level. The `collaborators` table stores `(repo_id, user_id, permission)` tuples.
+
+Permission checks happen in middleware: the auth middleware verifies the session and attaches the user to the request. Route-specific middleware then checks whether the user has the required permission for the target repository by querying the collaborators table (or checking ownership). Private repositories return 404 (not 403) to unauthorized users, preventing information leakage about the repository's existence.
+
+**Idempotency (`backend/src/shared/idempotency.ts`):**
+
+Idempotency ensures that performing the same operation multiple times produces the same result as performing it once. This matters for operations with side effects: creating an issue, merging a PR, or delivering a webhook.
+
+Consider what happens without idempotency: a user clicks "Create Issue" but the network is slow. They click again. Without protection, two identical issues are created. With idempotency, the second request detects that the first request already created the issue and returns the existing issue instead of creating a duplicate.
+
+This project stores idempotency keys in a dedicated PostgreSQL table (`idempotency_keys`) with the operation type, resulting resource ID, and response body. When a request includes an idempotency key, the server checks the table first. If a matching key exists, the stored response is returned without re-executing the operation. Keys have an hourly TTL and are cleaned up by a background job.
+
+The database-backed approach (rather than Redis) is deliberate: idempotency keys must survive Redis restarts because a lost key could allow a duplicate operation. The trade-off is slightly higher latency for the key lookup (milliseconds for a PostgreSQL query vs. sub-millisecond for Redis), which is negligible compared to the operation itself.
+
+**Redis Cache-Aside (`backend/src/shared/cache.ts`):**
+
+Cache-aside is a caching pattern where the application checks the cache before querying the primary data source. On a miss, the application queries the source, writes the result to the cache, and returns it. On a hit, the cached data is returned directly.
+
+In this project, three types of data are cached: repository metadata (stars count, forks count, description), file trees (directory listing for a specific branch and path), and PR diffs (computed diff output). File trees and PR diffs are expensive to compute because they require Git CLI operations on the filesystem.
+
+Cache invalidation follows different strategies per data type: repository metadata is invalidated on star/unstar and fork operations. File trees are invalidated on push events (the tree has changed). PR diffs are not explicitly invalidated because the diff for a specific PR number and commit SHA is immutable -- once computed, it never changes.
+
+**Health Checks (`backend/src/index.ts`):**
+
+Health check endpoints report whether the application is functioning correctly, serving three different audiences:
+
+- **`GET /health`**: A comprehensive health report that checks PostgreSQL connectivity, Redis connectivity, and circuit breaker states. Returns a JSON object with individual dependency statuses, latency measurements, uptime, and application version. Used by operations dashboards and on-call engineers.
+
+- **`GET /health/live`** (liveness probe): Returns HTTP 200 if the server process is running. Used by Kubernetes to detect hung processes. A failure triggers a container restart. This endpoint does not check external dependencies because a database outage should not cause the application to restart -- that would create a restart storm across all instances.
+
+- **`GET /health/ready`** (readiness probe): Checks whether PostgreSQL and Redis are reachable. Used by the load balancer to decide whether to route traffic to this instance. During startup, the application is live but not ready (database connections are being established). During a Redis outage, the application is live but not ready (session management is broken).
+
 ### What Was Simplified or Substituted
 
 | Production Concept | Local Substitute |
@@ -756,25 +831,60 @@ This section documents the actual local setup and maps production concepts to th
 
 ### Frontend Architecture
 
-The frontend uses React 19 + TypeScript + Vite + TanStack Router + Zustand + Tailwind CSS.
+The frontend is a React 19 + TypeScript application built with Vite, using TanStack Router for file-based routing, Zustand for state management, and Tailwind CSS for styling. It replicates GitHub's dark-themed UI with repository browsing, file viewing, pull request management, issue tracking, discussions, and code search.
 
-Key components:
-- `CodeViewer.tsx` -- syntax-highlighted file content viewer
-- `DiffViewer.tsx` -- side-by-side diff display for PRs
-- `FileTree.tsx` -- repository file browser with directory navigation
-- `Header.tsx` -- global navigation with search
-- `IssueCard.tsx` -- issue list item
-- `RepoCard.tsx` -- repository list card with stats
+**Component Hierarchy:**
 
-Routes follow GitHub's URL structure:
-- `/:owner/:repo` -- repository overview
-- `/:owner/:repo/tree/:branch/*` -- file tree browsing
-- `/:owner/:repo/blob/:branch/*` -- file content viewing
-- `/:owner/:repo/pulls` -- PR list
-- `/:owner/:repo/pull/:number` -- PR detail with diff
-- `/:owner/:repo/issues` -- issue list
-- `/:owner/:repo/issues/:number` -- issue detail
-- `/:owner/:repo/discussions` -- discussions
-- `/search` -- code search
-- `/new` -- create repository
-- `/login`, `/register` -- authentication
+```
+__root.tsx (global Header + Outlet)
+├── index.tsx (dashboard: repository list with RepoCard components)
+├── $owner.$repo.tsx (repository overview)
+│   ├── FileTree (sortable directory listing with breadcrumb navigation)
+│   ├── README rendering (raw pre-formatted text)
+│   └── Tab navigation (Code, Issues, PRs, Discussions, Settings)
+├── $owner.$repo.tree.$branch.$.tsx (directory browsing at any path)
+│   └── FileTree (with path-based breadcrumb)
+├── $owner.$repo.blob.$branch.$.tsx (file content viewing)
+│   └── CodeViewer (syntax-highlighted code with line numbers)
+├── $owner.$repo.pulls.tsx (PR list with state filtering)
+├── $owner.$repo.pull.$number.tsx (PR detail)
+│   └── DiffViewer (unified diff with addition/deletion highlighting)
+│       └── FileDiffSummary (per-file change stats bar)
+├── $owner.$repo.issues.tsx (issue list with IssueCard components)
+├── $owner.$repo.issues.$number.tsx (issue detail with comments)
+├── $owner.$repo.discussions.tsx (discussion list)
+├── search.tsx (code search with language/repo filters)
+├── new.tsx (create repository form)
+├── login.tsx
+└── register.tsx
+```
+
+**Zustand Store -- `useAuthStore`:**
+
+A single store manages authentication state. It holds the current user, loading flag, and error message. Actions include `login`, `register`, `logout`, `checkAuth`, and `clearError`. Unlike the Gmail project, this store does not use Zustand's `persist` middleware; instead, the session ID is stored in `localStorage` manually by the API client and sent as an `X-Session-Id` header on every request. The `checkAuth` action calls `GET /api/auth/me` on mount to validate the stored session.
+
+**API Client Pattern:**
+
+The API layer uses a class-based `ApiClient` singleton (exported as `api`) rather than the function-based pattern used in other projects. The class encapsulates session management: on login, the server returns a `sessionId`, which the client stores in `localStorage` and attaches to every subsequent request as an `X-Session-Id` header. This differs from the cookie-based approach in Gmail/LeetCode because GitHub's session model uses explicit header-based session tokens.
+
+The `ApiClient` exposes methods organized by domain: repositories (`getRepos`, `getRepo`, `createRepo`, `deleteRepo`, `getTree`, `getFileContent`, `getCommits`, `getBranches`), pull requests (`getPulls`, `getPull`, `getPullDiff`, `createPull`, `mergePull`, `addReview`), issues (`getIssues`, `getIssue`, `createIssue`, `updateIssue`), discussions, users, and search.
+
+**Repository Browsing:**
+
+The repository overview page (`$owner.$repo.tsx`) fetches four pieces of data on mount: repository metadata, file tree for the default branch, latest commit, and README content. The `FileTree` component sorts entries (directories first, then files, alphabetically), renders each as a table row with a folder/file icon (from lucide-react), and links directories to the `tree` route and files to the `blob` route. Path-based breadcrumb navigation shows the current location within the repository.
+
+**Code Viewer:**
+
+`CodeViewer` renders syntax-highlighted source code using `highlight.js`. It detects the language from the file extension (via a manual mapping of 20+ extensions to language names), splits the content into lines, and renders each line in a table row with line numbers. The table-based layout enables potential future features like click-to-link-to-line.
+
+**Diff Viewer:**
+
+`DiffViewer` parses a unified diff string, classifying each line by its prefix: `+` (addition, green background), `-` (deletion, red background), `@@` (hunk header), `+++`/`---` (file header), or context (no highlight). The `FileDiffSummary` component shows per-file statistics with a green/red proportional bar.
+
+**Star Toggle (Optimistic Update):**
+
+The repository page implements optimistic star toggling. Clicking "Star" immediately updates the local state (`isStarred` flag and `stars_count`), then sends the API request. If the request fails, the error is logged but the state is not reverted (a pragmatic trade-off for a non-critical action).
+
+**Routing:**
+
+TanStack Router with file-based routing. Route parameters use TanStack's `$param` naming convention in filenames. The URL structure mirrors GitHub: `/$owner/$repo` for the repository overview, `/$owner/$repo/tree/$branch/$path` for directory browsing, `/$owner/$repo/blob/$branch/$path` for file viewing. This produces clean, shareable URLs that map directly to repository content.

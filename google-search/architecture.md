@@ -435,6 +435,49 @@ Backend scripts for offline processing:
 - `npm run build-index` -- Index crawled documents into Elasticsearch
 - `npm run calculate-pagerank` -- Compute PageRank from link graph
 
+### Frontend Architecture
+
+The frontend is a React 19 + TypeScript application built with Vite, using TanStack Router for file-based routing and Zustand for state management. It replicates Google's two-page search experience: a landing page with a centered search box, and a results page with a header-mounted search box and paginated results.
+
+**Component Hierarchy:**
+
+```
+__root.tsx (bare Outlet, no global layout)
+├── index.tsx (HomePage)
+│   └── SearchBox (large, centered, with autocomplete)
+├── search.tsx (SearchPage)
+│   ├── SearchBox (small, header-mounted)
+│   └── SearchResults
+│       └── SearchResultItem (per-result: title, URL breadcrumb, snippet, metadata)
+└── admin.tsx (AdminPage)
+    ├── StatCard (URLs, documents, links, queries)
+    └── ActionButton (crawl, index, PageRank triggers)
+```
+
+**Zustand Store -- `useSearchStore`:**
+
+A single store manages the entire search lifecycle. It holds the current query string, search results (or null), loading and error states, and a list of recent searches persisted to `localStorage`. The `search` action calls the API, updates results, and appends the query to recent searches. This store is consumed by both the home page (to access `recentSearches`) and the search results page (to execute queries and display results).
+
+**Data Fetching Pattern:**
+
+The frontend uses direct `fetch` calls organized in a `services/api.ts` module, split into `searchApi` (search, autocomplete, popular searches, related searches) and `adminApi` (stats, seed URLs, crawl, index build, PageRank). There is no global data-fetching library (no React Query or SWR). The search page reads query parameters (`q` and `page`) from the URL via TanStack Router's `validateSearch`, then triggers a search via `useEffect` when parameters change. This means search state is URL-driven: sharing a URL reproduces the exact same search results.
+
+**Autocomplete with Debounce (`useAutocomplete` hook):**
+
+A custom hook manages the autocomplete lifecycle. It debounces user keystrokes (200ms), sends a request to `/search/autocomplete`, and maintains a list of suggestions with keyboard navigation (ArrowUp/ArrowDown/Escape). The `SearchBox` component combines these suggestions with recent searches in a dropdown, showing recent searches when the suggestions list is empty and the input is focused. The dropdown closes on outside click via a `mousedown` event listener on `document`.
+
+**Search Result Rendering:**
+
+Each `SearchResultItem` displays a domain favicon placeholder, a URL breadcrumb (protocol stripped), a clickable title rendered with `dangerouslySetInnerHTML` to support Elasticsearch highlight markup (`<em>` tags), a snippet (also with `innerHTML` for highlights), and metadata (PageRank score, index date, external link). This mirrors Google's SERP layout.
+
+**Admin Dashboard:**
+
+The admin page uses local React state (no Zustand) because its state is ephemeral and page-scoped. It fetches stats on mount, displays them in a grid of `StatCard` components, shows top pages by PageRank in a table, and provides action buttons to trigger crawl, index, and PageRank operations. A status banner shows action results and auto-refreshes stats after 2 seconds.
+
+**Routing:**
+
+TanStack Router with file-based routing. Three routes: `/` (home), `/search` (results with `q` and `page` search params), and `/admin` (dashboard). The root route is a bare `Outlet` with no global layout, since the home page and search page have completely different layouts (centered vs. left-aligned with header).
+
 ### Production Patterns Actually Implemented
 
 | Pattern | File Path | Description |
@@ -450,6 +493,56 @@ Backend scripts for offline processing:
 | Indexer | `backend/src/services/indexer.ts` | Tokenization, stemming (natural library), Elasticsearch bulk indexing |
 | Search service | `backend/src/services/search.ts` | Query parsing (phrases, exclusions, site filter), BM25 via ES, snippet generation |
 | Tokenizer | `backend/src/utils/tokenizer.ts` | Stopword removal, Porter stemming via `natural` library |
+
+### Production Pattern Deep Dives
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before. Understanding *why* each pattern exists is as important as understanding *how* it works.
+
+**Circuit Breaker (`backend/src/shared/circuitBreaker.ts`):**
+
+A circuit breaker is a stability pattern borrowed from electrical engineering. In an electrical system, a circuit breaker detects excessive current and cuts the circuit to prevent a fire. In software, it detects repeated failures when calling an external service (like Elasticsearch or PostgreSQL) and stops making calls to that service for a cooldown period.
+
+Without a circuit breaker, if Elasticsearch goes down, every search request would wait for a connection timeout (typically 30 seconds), tying up server threads and creating a cascading failure where the API server itself becomes unresponsive. The circuit breaker has three states: **Closed** (normal operation -- requests pass through), **Open** (failures exceeded threshold -- requests fail immediately without attempting the call), and **Half-Open** (after a cooldown period, one test request is allowed through to check if the service has recovered). This implementation uses the Opossum library and configures separate breakers for Elasticsearch, PostgreSQL, and Redis. Each breaker opens after 3-5 failures and resets after 5-30 seconds. When a breaker is open, the fallback behavior differs per service: search returns empty results, crawl state updates are queued for retry, and cache misses fall through to the database. A Prometheus gauge tracks each breaker's state, enabling alerting on prolonged outages.
+
+**Redis Cache-Aside (`backend/src/shared/` -- integrated in search service):**
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately. If not (a "miss"), the application queries the primary data source, stores the result in the cache with a time-to-live (TTL), and returns it.
+
+In this project, search query results are cached in Redis with the query string as the key. When a user searches for "javascript tutorial," the search service first checks Redis. If cached results exist and have not expired, they are returned in sub-millisecond time. If not, the query goes to Elasticsearch, results are formatted, stored in Redis with a TTL, and then returned. The TTL ensures stale results are eventually replaced. This pattern is distinct from "write-through" caching (where every write updates the cache) and "write-behind" (where writes go to the cache first and are asynchronously persisted). Cache-aside is appropriate here because search results are read-heavy, tolerance for staleness is high (a few minutes), and there is no need to invalidate individual cache entries when documents are re-indexed.
+
+**Structured Logging (`backend/src/shared/logger.ts`):**
+
+Structured logging means emitting log entries as machine-parsable JSON objects instead of free-form text strings. A traditional log line like `"2024-01-15 Search query 'react hooks' returned 42 results in 15ms"` is human-readable but difficult to filter, aggregate, or alert on programmatically. A structured log emits the same information as `{"timestamp":"2024-01-15T...","level":"info","event":"query_executed","query":"react hooks","resultCount":42,"durationMs":15,"cacheHit":false,"traceId":"abc123"}`.
+
+This implementation uses the Pino library, which produces JSON logs with nanosecond timestamps and minimal serialization overhead. Each log entry includes a trace ID (propagated via the `x-trace-id` HTTP header) that links all log entries for a single request across services. Key events logged include `crawl_complete` (URL, HTTP status, links extracted), `query_executed` (query text, result count, latency, cache hit), and `index_rebuild` (document count, duration). In a production environment, these JSON logs would be shipped to a log aggregation service (like Elasticsearch/Kibana or Datadog) where engineers can filter by trace ID to reconstruct the full lifecycle of a single request across multiple services.
+
+**Prometheus Metrics (`backend/src/shared/metrics.ts`):**
+
+Prometheus is a pull-based monitoring system. The application exposes a `/metrics` HTTP endpoint that returns all collected metrics in a text-based format. A Prometheus server periodically scrapes this endpoint (typically every 15 seconds) and stores the time-series data for querying and alerting.
+
+There are four metric types: **Counters** (monotonically increasing values, like `search_queries_total`), **Gauges** (values that go up and down, like `crawl_frontier_size` or `circuit_breaker_state`), **Histograms** (distributions of values, like `search_query_latency_seconds` which tracks how many queries fell into each latency bucket), and **Summaries** (similar to histograms but compute quantiles on the client side). This project exposes crawl throughput, query latency (bucketed by cache hit/miss), cache hit ratio, frontier backlog size, and circuit breaker state. These metrics enable SLI-based alerting: for example, "alert if query p95 latency exceeds 500ms for 2 consecutive minutes."
+
+**Rate Limiting (`backend/src/shared/rateLimiter.ts`):**
+
+Rate limiting restricts how many requests a client can make within a time window. Without rate limiting, a single user (or bot) could overwhelm the search service with thousands of queries per second, degrading performance for all other users.
+
+This implementation uses Redis as the backing store for rate limit counters, which means the limits are enforced consistently across multiple API server instances. Each request increments a counter keyed by `ratelimit:{endpoint}:{clientId}` with a TTL equal to the window duration. If the counter exceeds the threshold, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. Different endpoints have different limits: search allows 60 requests per minute (generous for interactive use, restrictive enough to prevent scraping), while admin endpoints allow only 10 per minute. The Redis-backed approach is superior to in-memory rate limiting because it works across multiple server instances -- if the API is scaled to 5 instances behind a load balancer, the rate limit is still enforced globally.
+
+**Idempotency (`backend/src/shared/idempotency.ts`):**
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. This is critical for operations that have side effects, like crawling a URL or indexing a document.
+
+Consider what happens without idempotency: a crawler instance picks up URL X, starts fetching it, but the process crashes before marking the URL as crawled. Another instance picks up URL X and fetches it again. Now the same page is indexed twice, wasting resources and potentially creating duplicate results. The idempotency implementation uses Redis `SET NX EX` (set-if-not-exists with expiry) to acquire a lock keyed by `crawl:{urlHash}:{scheduledAt}`. If the lock already exists, the crawl job is skipped. For document indexing, idempotency is achieved differently: Elasticsearch document IDs are deterministically derived from URL hashes, so re-indexing the same URL produces an upsert rather than a duplicate. For PageRank updates, new scores are written to a staging table and atomically swapped into the active table, preventing partial updates.
+
+**Health Checks (`backend/src/shared/health.ts`):**
+
+Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They serve three distinct purposes:
+
+1. **Liveness probe (`/healthz`)**: Answers "is the process alive?" A simple HTTP 200 response. If this fails, the orchestrator (Kubernetes) kills and restarts the container. This catches situations where the process is hung (deadlocked, infinite loop) but the OS has not killed it.
+
+2. **Readiness probe (`/ready`)**: Answers "is the application ready to serve traffic?" This checks whether PostgreSQL, Redis, and Elasticsearch connections are established. If this fails, the load balancer stops routing traffic to this instance but does not restart it. This is used during startup (while the application is establishing database connections) and during dependency outages (PostgreSQL goes down temporarily).
+
+3. **Detailed health (`/health`)**: Returns a JSON object with the status of every dependency, connection pool utilization, and latency measurements. This is used by operations dashboards and alerting systems, not by the orchestrator.
 
 ### What Was Simplified or Substituted
 

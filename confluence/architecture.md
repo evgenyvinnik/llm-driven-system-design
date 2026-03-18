@@ -458,6 +458,72 @@ At extreme scale (100M+ pages):
 | Rich text editor | contentEditable | Tiptap/ProseMirror | No extra dependency, sufficient for learning |
 | Macro rendering | Server + client | Server-only SSR | Interactive macros possible on client side |
 
+## Frontend Architecture
+
+The frontend is a React SPA built with Vite, TypeScript, TanStack Router, Zustand, and Tailwind CSS. It replicates core Confluence workflows: browsing spaces, navigating page trees, viewing and editing wiki content, comparing version diffs, threaded commenting, full-text search with highlighted results, and content approval.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Header                              ← Top bar with logo, search input, user menu, login/register links
+├── index.tsx (Dashboard)
+│   ├── SpaceCard (per space)           ← Space name, key, page count; links to space view
+│   ├── Recent Pages List               ← Recently updated pages across all spaces
+│   └── Search Results (when ?q=)       ← Highlighted results from Elasticsearch
+├── login.tsx / register.tsx            ← Auth forms
+├── space.$spaceKey.tsx (SpacePage)
+│   ├── SpaceSidebar                    ← Collapsible page tree sidebar
+│   │   └── PageTreeItem (recursive)   ← Expandable tree nodes with nesting
+│   └── Space Overview                  ← Space name, description, metadata, page count
+├── space.$spaceKey.page.$slug.tsx (PageView)
+│   ├── BreadcrumbNav                   ← Ancestor chain: Space > Parent > Current
+│   ├── ApprovalBanner                  ← Pending/approved/rejected status bar with actions
+│   ├── PageViewer                      ← Renders content_html with wiki styling
+│   │   └── MacroRenderer              ← Renders info/warning/note/code/toc macro blocks
+│   ├── VersionList                     ← Version history timeline with version numbers and authors
+│   ├── VersionDiff                     ← Side-by-side diff viewer (green=added, red=removed)
+│   └── CommentSection                  ← Threaded comments with reply, resolve/unresolve, delete
+│       └── Comment (recursive)         ← Nested reply tree
+└── space.$spaceKey.page.$slug.edit.tsx (PageEdit)
+    └── PageEditor                      ← Rich text editor with formatting toolbar
+        └── TemplatePicker              ← Modal to select a page template for new pages
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`): Manages user session state. Holds the `user` object (or null if not logged in) and a `loading` flag. Provides `checkAuth()` (called on app mount in the root layout to restore the session via `GET /api/v1/auth/me`), `login()`, `register()`, and `logout()`. On login/register success, the user object is stored in the Zustand state. On logout or auth check failure, it is cleared to null. The store does not use persistence middleware -- session continuity relies on the server-side cookie.
+
+**`useWikiStore`** (`stores/wikiStore.ts`): Manages wiki content state across spaces and pages. Holds `spaces` (list of all spaces), `currentSpace` (the active space), `currentPage` (the currently viewed page), `pageTree` (hierarchical tree for the sidebar), and `recentPages` (dashboard recent activity). Key actions include `loadSpaces()` for the dashboard, `loadPageTree(spaceKey)` for the sidebar, and `loadPage(spaceKey, slug)` for viewing a page. The store separates space-level loading from page-level loading so that navigating between pages within a space does not re-fetch the tree. Write operations (create, update, delete pages) are handled directly via the API service without going through the store, since they trigger navigation that reloads the relevant data.
+
+### Routing
+
+TanStack Router file-based routing with nested space/page routes:
+
+| Route | File | Purpose |
+|-------|------|---------|
+| `/` | `routes/index.tsx` | Dashboard: recent pages, space list, search results (when `?q=` present) |
+| `/login` | `routes/login.tsx` | Login form |
+| `/register` | `routes/register.tsx` | Registration form |
+| `/space/$spaceKey` | `routes/space.$spaceKey.tsx` | Space overview with sidebar page tree |
+| `/space/$spaceKey/page/$slug` | `routes/space.$spaceKey.page.$slug.tsx` | Page viewer with versions, diff, comments, approval |
+| `/space/$spaceKey/page/$slug/edit` | `routes/space.$spaceKey.page.$slug.edit.tsx` | Page editor with formatting toolbar |
+
+The root layout (`__root.tsx`) calls `checkAuth()` on mount and shows a loading spinner until the auth check completes. It renders the `Header` (with a search form that navigates to `/?q=`) and an `Outlet` for child routes.
+
+### Data Fetching
+
+The API service (`services/api.ts`) is a typed `fetch` wrapper with `credentials: 'include'` for cookie-based session auth. It provides functions grouped by domain: auth (register, login, logout, getMe), spaces (list, get, create), pages (CRUD, tree, by-slug, recent, labels), versions (history, diff, restore), search, comments (threaded CRUD, resolve), templates, and approvals (request, review, pending, by-page). All functions return typed responses matching the backend API. Error handling extracts the `error` field from JSON error responses.
+
+### Key UI Patterns
+
+- **Wiki page tree sidebar**: The `SpaceSidebar` renders a collapsible tree using recursive `PageTreeItem` components. Each item shows its children indented, with expand/collapse toggles. The tree is loaded once when entering a space and persists as you navigate between pages within that space.
+- **Rich text editor**: The `PageEditor` uses `contentEditable` with `document.execCommand` for formatting (bold, italic, headings, lists, links). A toolbar provides quick-insert buttons for macros (info, warning, note, code, toc). Content is saved as HTML. A `TemplatePicker` modal lets users start from a template when creating new pages.
+- **Version diff viewer**: The `VersionDiff` component displays a side-by-side comparison of two page versions. Added lines are highlighted in green, removed lines in red, and unchanged lines are shown for context. Users select two versions from the `VersionList` timeline to compare.
+- **Threaded comments with resolve**: The `CommentSection` renders top-level comments with nested replies. Each comment can be replied to (creating a child comment), resolved/unresolved (toggling a visual indicator), or deleted. Resolved comments are visually muted.
+- **Search with highlighted snippets**: When a search query is present in the URL (`?q=`), the Dashboard switches to search results mode, displaying Elasticsearch results with HTML-highlighted title and content snippets using `dangerouslySetInnerHTML`.
+- **Approval workflow banner**: The `ApprovalBanner` appears at the top of the page viewer when a page has a pending, approved, or rejected approval. It shows the status, reviewer, and provides action buttons (approve/reject for reviewers, request approval for authors).
+
 ## Implementation Notes
 
 ### Local Architecture
@@ -528,3 +594,63 @@ All infrastructure runs via Docker Compose (`docker-compose.yml`). The API serve
 - Audit logging
 - Content replication across data centers
 - Kubernetes orchestration
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project from first principles, describing what the pattern is, what problem it solves, and how this project uses it.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents a failing dependency from dragging down the entire system. When your application calls an external service (a database, a search engine, a message queue), that call can fail in two ways: fast failure (connection refused, immediate error) or slow failure (the service accepts the connection but takes 30 seconds to respond). Slow failures are far more dangerous because each pending request holds a thread, a connection, and memory. If your application makes 100 requests per second to a service that takes 30 seconds to respond, you will have 3,000 pending requests consuming resources within 30 seconds -- enough to crash your own application even though the downstream service is the one with the problem.
+
+A circuit breaker monitors the error rate of calls to a dependency. When the error rate crosses a threshold, the breaker "opens" and immediately rejects all calls to that dependency without even attempting the request. This is called "failing fast." After a cooldown period, the breaker enters a "half-open" state and allows one probe request through. If the probe succeeds, the circuit closes and normal traffic resumes. If the probe fails, the circuit reopens for another cooldown.
+
+In this project, Opossum circuit breakers wrap calls to Elasticsearch and RabbitMQ (`src/services/circuitBreaker.ts`). When Elasticsearch goes down, the breaker opens after 50% of requests fail, and the search endpoint falls back to PostgreSQL ILIKE queries. Without the breaker, search requests would hang for the full timeout duration (10 seconds each), causing the API server to run out of connections and affecting all endpoints -- not just search. The breaker ensures that Elasticsearch failures only degrade search quality (losing relevance scoring and highlighting) rather than bringing down page viewing, editing, and comments. The breaker resets after 30 seconds to check if Elasticsearch has recovered.
+
+### Prometheus Metrics
+
+Prometheus is a monitoring system that collects numerical measurements from your application over time. Unlike logging (which captures individual events), metrics capture aggregated statistics: how many requests per second, what is the 99th percentile latency, how much memory is being used right now. Prometheus works on a "pull" model -- your application exposes a `/metrics` HTTP endpoint that returns all current metric values in a specific text format, and the Prometheus server scrapes this endpoint at regular intervals (typically every 15 seconds).
+
+There are four metric types. **Counters** only go up and are used for things like total requests or total errors -- you derive rates from them. **Gauges** go up and down and represent current values like active connections or queue depth. **Histograms** track the distribution of values across configurable buckets (e.g., request latency buckets: 0-10ms, 10-50ms, 50-100ms, 100ms+), enabling percentile calculations. **Summaries** are similar but compute percentiles on the client side.
+
+This project uses `prom-client` (`src/services/metrics.ts`) to expose HTTP request duration histograms (with method, route, and status code labels), request counters, page operation counters by type (create, update, delete, move), and search latency histograms. These metrics enable dashboards showing requests per second by route, p99 latency trends, and page edit frequency. Default Node.js runtime metrics (CPU usage, memory, event loop lag, garbage collection) are included automatically.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Traditional logging produces lines like `"2024-01-16 12:00:00 INFO Page updated: Getting Started in space ENG"`. Structured logging produces `{"timestamp":"2024-01-16T12:00:00Z","level":"info","event":"page_updated","pageId":"abc123","title":"Getting Started","spaceKey":"ENG","userId":"user456","responseTime":45}`. Each piece of information is a separate field that can be filtered, searched, and aggregated by log management systems like Elasticsearch/Kibana, Datadog, or Grafana Loki.
+
+The key benefit is queryability at scale. When you have 50 API servers each producing thousands of log lines per second, finding "all page updates in the ENG space that took more than 100ms" requires either regex parsing (slow, fragile) or structured field queries (fast, reliable). Structured logs also enable automatic alerting: you can set up an alert that fires when the count of `event=page_update AND responseTime>500` exceeds a threshold.
+
+This project uses Pino (`src/services/logger.ts`), a high-performance JSON logger for Node.js. HTTP request logging is handled by pino-http, which generates a unique request ID for each request and includes method, URL, status code, response time, and user context. The request ID enables tracing a single request across log lines -- from authentication middleware through page update logic to search indexing -- which is essential for debugging production issues.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without it, a single client -- whether a malicious attacker or a developer's buggy script running in a tight loop -- can consume all server resources, degrading service for every other user. Rate limiting provides three protections: defense against brute-force attacks (limiting login attempts prevents credential stuffing), protection against accidental abuse (a misconfigured CI pipeline making thousands of API calls), and fair resource allocation (no single user monopolizes the search index or database connections).
+
+The most common algorithm is the sliding window: for each client (identified by IP address or user ID), count the number of requests within a rolling time window. When the count exceeds the limit, reject the request with HTTP 429 (Too Many Requests). The response includes a `Retry-After` header telling the client when to try again, and `X-RateLimit-Remaining` showing how many requests are left in the current window.
+
+This project uses Redis-backed sliding window rate limiting (`src/services/rateLimiter.ts`) with two tiers: 500 requests per 15 minutes for general API endpoints, and 20 requests per 15 minutes for authentication endpoints (login, register). The tighter auth limit prevents brute-force password guessing -- at 20 attempts per 15 minutes, an attacker would need days to try even a small password dictionary. Redis is used as the backing store (rather than in-memory counters) so that rate limits work correctly across multiple API server instances behind a load balancer.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is operational. They serve two critical functions in production: load balancers use health checks to route traffic only to healthy instances (removing crashed or overloaded servers from the rotation), and orchestration systems like Kubernetes use them to decide whether to restart a container.
+
+There are two types of health check. A **liveness** check answers "is the process running and responsive?" -- returning 200 if the HTTP server can respond at all. If this fails, the process is likely deadlocked or crashed and should be restarted. A **readiness** check answers "can this instance serve real requests?" -- it verifies that the database connection pool is active, Redis is reachable, and other dependencies are functional. A service can be alive but not ready (e.g., during startup while it establishes database connections). Load balancers should only send traffic to instances passing both checks.
+
+This project implements `GET /api/health` as a combined health check that verifies service status. During deployment, a load balancer would poll this endpoint every few seconds and stop sending requests to an instance that returns non-200 responses, ensuring users are never routed to a server that cannot complete their requests.
+
+### RBAC (Role-Based Access Control)
+
+Role-Based Access Control is an authorization model where permissions are not assigned directly to individual users but instead assigned to roles, and users are assigned to roles. Instead of maintaining a list of "Alice can edit page X, Bob can view page X, Carol can admin page X," RBAC defines roles (admin, member, viewer) with specific permissions (admins can edit and delete, members can edit, viewers can only read), and assigns users to roles within a specific scope (Alice is an admin in the Engineering space, Bob is a member).
+
+RBAC simplifies permission management at scale. With direct user-permission assignments, adding a new page requires creating permission entries for every user who should access it. With RBAC, you assign the page to a space, and every user with a role in that space automatically gets the appropriate access. When someone joins a team, you give them a role in the relevant spaces rather than enumerating hundreds of individual resource permissions. When someone leaves, removing their role revokes all associated access in one operation.
+
+In this project, RBAC is implemented at the space level via the `space_members` table (`src/db/init.sql`). Each row maps a user to a space with a role: `admin`, `member`, or `viewer`. The role is enforced by a CHECK constraint and stored as a VARCHAR(20). Space admins can manage members and modify space settings. Members can create and edit pages within the space. Viewers can read pages but cannot create or modify content. The routes (`src/routes/spaces.ts`) check the user's role before allowing space modifications, and page operations check space membership before allowing reads or writes. This is a simplified model -- production Confluence would add page-level permissions, group-based roles (assign a role to "Engineering Team" rather than individual users), and permission inheritance through the page tree hierarchy.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application manages the cache explicitly, rather than the cache being transparent to the application. The pattern works in three steps: (1) the application checks the cache first; (2) if the data is in the cache (a "hit"), return it immediately; (3) if the data is not in the cache (a "miss"), query the database, store the result in the cache with a TTL, and then return it. On write operations, the application updates the database and then invalidates (deletes) the relevant cache entries, so the next read will re-populate the cache with fresh data.
+
+The key insight of cache-aside is that the cache is populated on demand. You do not need to pre-load the cache or keep it in sync with every database change. Frequently accessed data naturally stays cached because it is re-populated on every miss. Rarely accessed data does not waste cache memory because it expires via TTL and is never re-populated. The trade-off is that the first request after a cache miss or invalidation pays the full database query cost.
+
+In this project, the page service (`src/services/pageService.ts`) uses Redis cache-aside with 120-second TTL for three key read paths: individual page lookup by ID (`page:{id}:data`), page lookup by slug (`space:{spaceId}:slug:{slug}`), and the page tree for a space (`space:{spaceId}:tree`). On reads, `cacheGet` checks Redis first; on cache miss, the service queries PostgreSQL and stores the result with `cacheSet(key, data, 120)`. On writes (page update, move, delete, label change), the service invalidates all related cache keys using `cacheDelPattern` with wildcard patterns (`page:{id}:*` and `space:{spaceId}:*`). This pattern-based invalidation ensures that any derived cache entries (page data, slug lookup, tree) are cleared when the source data changes, at the cost of potentially over-invalidating (clearing the tree cache even when only a page's content changed, not its position).

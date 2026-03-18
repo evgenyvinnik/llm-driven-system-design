@@ -389,6 +389,172 @@ Storing only non-empty cells reduces storage by 99%+ for typical spreadsheets. A
 | JSONB for format | Flexible, no migrations | Typed columns | New formatting options without schema changes |
 | Edit history | Full forward + inverse ops | Snapshot-based undo | Supports collaborative undo without conflicts |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App (direct rendering, no router)
+├── Toolbar
+│   ├── Title bar: logo, spreadsheet title (read-only), collaborator avatars, connection indicator
+│   └── Formula bar: cell reference (e.g., "A1"), raw value display
+│
+├── SpreadsheetGrid
+│   ├── Column headers (frozen, sticky top)
+│   │   └── Letter labels (A, B, ..., Z) via getColumnLetter()
+│   ├── Row headers (frozen, sticky left)
+│   │   └── Numeric labels (1, 2, ..., 1000)
+│   ├── Virtualized cell grid (TanStack Virtual)
+│   │   └── Cell (memoized)
+│   │       ├── View mode: displays computedValue with formatting
+│   │       └── Edit mode: inline <input> with commit/cancel
+│   └── CollaboratorCursors (overlay)
+│       ├── Cursor outlines (colored borders per collaborator)
+│       ├── Name labels (floating above cursor cell)
+│       └── Selection overlays (semi-transparent colored regions)
+│
+└── WebSocket connection lifecycle (managed in useEffect)
+```
+
+### Zustand Store
+
+The application uses a single large Zustand store (`useSpreadsheetStore`) that manages all state and WebSocket communication. This is a deliberate design choice for a real-time collaborative app -- splitting into multiple stores would require cross-store synchronization that adds complexity without benefit.
+
+**Connection state**: `spreadsheetId`, `isConnected`, `ws` (the raw WebSocket instance). The `connect` action establishes a WebSocket connection and registers the `handleWebSocketMessage` handler for all incoming events.
+
+**Document state**: `title`, `sheets` (array of sheet tabs), `activeSheetId`. These are populated from the `STATE_SYNC` message received on connect.
+
+**Cell data (sparse map)**: `cells` is a `Map<string, CellData>` keyed by `"row-col"` strings (e.g., `"5-3"` for row 5, column 3). Only non-empty cells exist in the map. `CellData` holds `rawValue` (what the user typed, may be a formula), `computedValue` (evaluated result), and optional `format` (bold, italic, color, etc.). The `setCell` action performs an optimistic local update, then sends a `CELL_EDIT` message to the server.
+
+**Selection state**: `activeCell` (single cell with blue outline), `selection` (CellRange for multi-cell highlight), `isSelecting` (true during mouse drag). Selection is tracked as start/end coordinates that can form rectangles in any direction -- the `isSelected` helper normalizes min/max to check containment.
+
+**Collaborator presence**: `collaborators` is a `Map<string, Collaborator>` mapping user IDs to their name, assigned color, cursor position, and selection range. This is updated by `USER_JOINED`, `USER_LEFT`, `CURSOR_MOVED`, and `SELECTION_CHANGED` WebSocket messages.
+
+**Dimension tracking**: `columnWidths` and `rowHeights` are `Map<number, number>` storing only non-default dimensions (default: 100px width, 32px height). This mirrors the sparse storage pattern from the database.
+
+**Edit mode**: `editingCell` and `editValue` track inline editing. `startEditing` loads the cell's `rawValue` into the edit buffer. `commitEdit` writes it back via `setCell`. `cancelEdit` discards changes.
+
+### Routing
+
+No router is used. The `App` component reads the spreadsheet ID from URL query parameters (`?id=xxx`). If no ID is present, a new UUID is generated and pushed into the URL via `history.replaceState`. The user's name is stored in `localStorage` and prompted for on first visit. This single-page approach works because a spreadsheet application has only one view -- the grid.
+
+### Data Fetching
+
+All data flows through WebSocket, not REST. On mount, the `connect` action establishes a WebSocket connection to `ws://localhost:3001/ws?spreadsheetId=xxx&name=Alice`. The server responds with a `STATE_SYNC` message containing the complete spreadsheet state: all non-empty cells, sheet metadata, column/row dimensions, and active collaborators. From this point forward, all updates are bidirectional via WebSocket messages:
+
+- **Client to server**: `CELL_EDIT`, `CURSOR_MOVE`, `SELECTION_CHANGE`, `RESIZE_COLUMN`, `RESIZE_ROW`, `RENAME_SHEET`
+- **Server to client**: `STATE_SYNC`, `CELL_UPDATED`, `CURSOR_MOVED`, `SELECTION_CHANGED`, `USER_JOINED`, `USER_LEFT`, `COLUMN_RESIZED`, `ROW_RESIZED`
+
+Cell edits use **optimistic updates**: the local `cells` map is updated immediately before the WebSocket message is sent. If the server confirms a different computed value (e.g., formula evaluation), the `CELL_UPDATED` message overwrites the local value. This provides instant visual feedback for the editing user while maintaining consistency.
+
+### Key UI Patterns
+
+**Virtualized grid (TanStack Virtual)**: The grid uses two virtualizers -- one for rows (vertical) and one for columns (horizontal). With `MAX_ROWS = 1000` and `MAX_COLS = 26`, only the cells visible in the viewport (plus an overscan buffer of 10 rows and 5 columns) are rendered as DOM nodes. A full grid would create 26,000 DOM elements; virtualization renders ~200. Each virtualized item provides `start` (pixel offset) and `size` (dimension), which are applied as absolute positioning styles on each `Cell` component.
+
+**Frozen headers**: Column headers (A, B, C...) use `position: sticky; top: 0` to remain visible during vertical scrolling. Row headers (1, 2, 3...) use `position: sticky; left: 0` for horizontal scrolling. The top-left corner cell is doubly sticky (`z-index: 30`) to stay fixed in both directions.
+
+**Cell memoization**: The `Cell` component is wrapped in `React.memo` with a custom comparator that checks only `rowIndex` and `colIndex`. Cell data is read from the Zustand store via selectors inside the component, so the memo prevents re-renders when unrelated cells change. This is critical for performance -- without memoization, editing one cell would trigger re-renders of all ~200 visible cells.
+
+**Inline cell editing**: Double-clicking a cell enters edit mode, rendering an `<input>` element inside the cell. The input auto-focuses and selects all text. Enter commits the edit and moves down. Tab commits and moves right. Escape cancels. Typing any printable character on a non-editing active cell starts editing with that character as the initial value, matching Google Sheets behavior.
+
+**Keyboard navigation**: Arrow keys move the active cell. Enter toggles between edit mode and navigation. Tab moves right (Shift+Tab moves left). These are handled by a global `keydown` listener that checks whether the user is currently typing in an input.
+
+**Collaborator cursor overlays**: The `CollaboratorCursors` component renders absolutely-positioned elements over the grid showing each remote collaborator's cursor (colored border) and name label (colored badge above the cell). Selection ranges are shown as semi-transparent colored overlays. Position calculation sums row heights and column widths up to the target cell, accounting for any custom dimensions.
+
+**Column letter conversion**: The `getColumnLetter` function converts 0-based indices to spreadsheet column letters (0 -> A, 25 -> Z, 26 -> AA, 27 -> AB). It uses a modular arithmetic approach that handles multi-letter columns naturally.
+
+## Production-Grade Pattern Deep Dives
+
+This section explains each production-grade pattern referenced in the architecture, written for readers encountering these concepts for the first time.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it.
+
+**How it works step by step**: (1) Application receives a request for data. (2) Check Redis: `GET cache:key`. (3) If found, return the cached value -- this is typically 10-50x faster than a database query. (4) If not found, query PostgreSQL. (5) Store the result in Redis: `SET cache:key value EX 300` (5-minute TTL). (6) Return the result.
+
+**Cache invalidation**: When data changes (cell edited), the application deletes or updates the relevant cache keys. The TTL provides a safety net -- even if invalidation is missed, the cache self-corrects within the TTL window.
+
+**Write-through variant in this project**: This project uses write-through caching for cells -- when a cell is edited, the cache is updated at the same time as the database write. This ensures all subsequent reads from any server instance see the latest value without waiting for cache expiry. The write-through pattern trades slightly higher write latency (one extra Redis call per write) for perfectly fresh reads. See `src/shared/cache.ts`.
+
+**Why it matters for spreadsheets**: Active spreadsheets are read far more than they are written. A spreadsheet with 50 collaborators generates 50 reads per cell update (each collaborator's initial state sync). Without caching, every collaborator joining would query PostgreSQL for all cells. With caching, only the first join hits the database; subsequent joins read from Redis.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In the context of API design, an idempotent endpoint can safely handle duplicate requests -- if a network timeout causes the client to retry, the server does not process the operation twice.
+
+**How idempotency keys work**: The client generates a unique key (typically a UUID) for each operation and sends it with the request. The server checks Redis for this key before processing: (1) If found, return the cached result from the first execution. (2) If not found, process the request, store the result in Redis with a 24-hour TTL, and return it.
+
+**How it works in this project**: Cell edits sent via WebSocket include a client-generated request ID. The server checks `idempotency:{key}` in Redis before processing. If the key exists, the cached result is returned without re-applying the edit. If not, the edit is processed, and the result is stored. This prevents duplicate cell updates from WebSocket reconnection retries. See `src/shared/idempotency.ts`.
+
+**Why this matters for spreadsheets**: Consider a user editing cell A1 to "100". The WebSocket message is sent, but the connection drops before the acknowledgment arrives. The client reconnects and retries. Without idempotency, the edit history would record two entries for the same change, corrupting the undo stack. With idempotency, the retry returns the cached result and no duplicate history entry is created.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing downstream service. It works like an electrical circuit breaker: when failures exceed a threshold, the "circuit opens" and subsequent calls fail immediately without attempting the request. After a cooldown period, the circuit allows one test request through ("half-open"). If it succeeds, the circuit closes. If it fails, the circuit reopens.
+
+**The three states**:
+1. **Closed** (normal): Requests pass through. Failures are counted. If failures exceed the threshold (e.g., 50% of the last 5 requests), the circuit opens.
+2. **Open** (failing): All requests are immediately rejected or routed to a fallback function. No calls are made to the downstream service. This prevents wasting time and resources on calls that will fail.
+3. **Half-open** (testing): After the reset timeout (e.g., 30 seconds), one request is allowed through. If it succeeds, the circuit closes and normal operation resumes. If it fails, the circuit reopens for another timeout period.
+
+**How it works in this project**: Three circuit breakers protect different dependencies: Redis pub/sub (1-second timeout, falls back to single-server mode), database queries (5-second timeout), and WebSocket broadcast (2-second timeout, silent failure with client resync). When Redis pub/sub fails, cell edits still work locally but are not broadcast to other server instances. State changes are tracked via Prometheus gauges and logged via Pino. See `src/shared/circuitBreaker.ts`.
+
+**Why this matters for spreadsheets**: A spreadsheet collaboration server depends on Redis for pub/sub (broadcasting edits to all servers) and PostgreSQL for persistence. If Redis goes down, without a circuit breaker, every cell edit would wait for the Redis timeout before failing. With 50 concurrent editors making rapid edits, this creates a backlog of stalled requests that can crash the server. The circuit breaker detects the failure after a few requests and immediately starts using the fallback (local-only broadcast), keeping the application responsive.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-readable JSON objects instead of free-form text strings. Instead of `"User Alice edited cell A1"`, the log entry is `{"level":"info","service":"sheets","userId":"abc-123","action":"cell_edit","row":0,"col":0,"value":"100","timestamp":"2026-03-18T10:00:00Z"}`.
+
+**Why JSON instead of text**: Free-form text logs require complex regex patterns to search and analyze. JSON logs can be indexed by any field in a log aggregation system (Elasticsearch, Datadog, CloudWatch). Finding all slow database queries becomes a filter query instead of a grep command. This is the difference between spending 30 minutes investigating an issue and getting an answer in seconds.
+
+**How Pino works**: Pino is a high-performance Node.js logging library that outputs JSON by default. It supports log levels (trace, debug, info, warn, error, fatal), child loggers (adding persistent context fields like `service: "sheets"` or `component: "websocket"`), and pretty-printing for local development via `pino-pretty`. Request logging is handled by `pino-http`, which automatically logs request method, URL, status code, and response time -- with auto-filtering of noisy health check and metrics endpoints. See `src/shared/logger.ts`.
+
+**Why it matters at scale**: When multiple WebSocket gateway instances are running and a user reports "my cell edit disappeared," you need to trace that specific edit across all instances. Structured logs with a spreadsheet ID and user ID let you filter to the exact event flow. With text logs, this investigation requires reading thousands of lines; with structured logs, it is a 5-second query.
+
+### Prometheus Metrics
+
+Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics at a `/metrics` HTTP endpoint in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the time-series data for querying and alerting.
+
+**Three metric types that matter**:
+- **Counter**: A number that only goes up. Example: `sheets_cell_edits_total`. You query the *rate* of change to get "cell edits per second."
+- **Gauge**: A number that goes up and down. Example: `sheets_websocket_connections`. Shows current state.
+- **Histogram**: Tracks the distribution of values in configurable buckets. Example: `sheets_message_processing_seconds` with buckets at 0.001, 0.005, 0.01, 0.05, 0.1 seconds. Lets you compute percentiles (p50, p95, p99) to understand latency distribution.
+
+**How it works in this project**: The backend defines 20+ metrics covering WebSocket connections, message latency, cell edit throughput, formula calculation duration, cache hit rates, database query latency, circuit breaker state, idempotency tracking, and error counts. These are registered with `prom-client` and exposed at `GET /metrics`. Express middleware automatically tracks HTTP request counts and duration. See `src/shared/metrics.ts`.
+
+**Why it matters for spreadsheets**: The architecture targets p99 < 200ms for cell edit persistence and broadcast. Without metrics, you have no way to know whether you are meeting this target. A histogram on message processing time gives you exact p99 values, and you can set alerts when p99 exceeds 200ms for 5 consecutive minutes. The WebSocket connection gauge tells you how many users are currently connected, which directly correlates with memory usage and fan-out cost.
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether the service is alive and capable of handling requests. Load balancers, container orchestrators (Kubernetes), and monitoring systems poll this endpoint at regular intervals. If the health check fails, the infrastructure stops routing traffic to that instance and may restart it.
+
+**Two levels of health checks**:
+- **Liveness** (`GET /health`): "Is the process running?" Returns HTTP 200 if the server can respond at all. Used to detect crashed or frozen processes.
+- **Readiness** (`GET /ready`): "Can this instance handle requests?" Checks downstream dependencies (PostgreSQL connectivity, Redis connectivity) with latency measurements. Returns HTTP 200 only when both are reachable. Used by Kubernetes to determine when a newly started instance is ready to receive traffic, and to stop routing traffic to an instance whose database connection died.
+
+**How it works in this project**: `GET /health` returns basic service status. `GET /ready` actively tests PostgreSQL and Redis connectivity with `SELECT 1` and `PING` commands, measures their latency, and returns a detailed JSON response with per-dependency status. Both endpoints update Prometheus gauges so health state is visible in dashboards. See `src/index.ts`.
+
+**Why it matters for real-time collaboration**: A WebSocket server with a broken database connection would accept new collaborator connections but fail to load or persist any cell data. Without readiness checks, the load balancer would happily route users to this broken instance. With readiness checks, the instance is removed from rotation within one health check interval, and users are routed to healthy instances.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without it, a single misbehaving client (or an attacker) can overwhelm the server with requests, degrading performance for everyone.
+
+**How it works**: The server tracks request counts per client (usually identified by user ID or IP address). When a request arrives, the server checks whether the client has exceeded their allowance. If they have, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. If not, the request proceeds and the counter increments.
+
+**Common implementations**: Fixed window (count requests in the current minute, reset at the boundary), sliding window (count requests in the last 60 seconds), and token bucket (accumulate tokens at a fixed rate, each request consumes one). Redis is typically used to store counters because it is fast and shared across all server instances.
+
+**Why it matters for spreadsheets**: A malicious client could send thousands of `CELL_EDIT` WebSocket messages per second, triggering database writes, cache updates, formula recalculations, and broadcast fan-out for each one. Rate limiting cell edits to a reasonable rate (e.g., 60 per minute per user) prevents this abuse while being invisible to normal users who edit one cell at a time.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method of restricting system access based on the roles assigned to users, rather than checking permissions for each user individually. Instead of maintaining a per-user permission list, you define roles ("owner", "editor", "viewer", "commenter") with associated permissions, and assign users to roles for each resource.
+
+**How it works**: Each resource (e.g., a spreadsheet) has an access control list mapping users to roles. When a user requests an action (e.g., "edit cell in Spreadsheet X"), the system looks up their role for that resource and checks whether the role permits the action. An "owner" can do everything including sharing and deleting. An "editor" can modify cells but cannot delete the spreadsheet. A "viewer" can only read. A "commenter" can read and add comments but not modify cells.
+
+**Why this matters for spreadsheets**: Google Sheets supports sharing documents with different permission levels. Without RBAC, each API endpoint would need custom permission-checking logic. RBAC centralizes this: a single middleware looks up the user's role for the requested spreadsheet and allows or denies based on a role-to-permissions mapping. This is mentioned in the architecture as a production-scale feature -- the local implementation uses simple session-based access where any authenticated user can edit any spreadsheet.
+
 ## Implementation Notes
 
 ### Local Setup Diagram

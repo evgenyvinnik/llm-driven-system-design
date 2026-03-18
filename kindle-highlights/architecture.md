@@ -581,6 +581,197 @@ Downstream services (PostgreSQL, Redis, Elasticsearch at scale) are protected by
 | Session storage | Redis tokens | JWT | Immediate revocation, server-controlled expiry |
 | Search (production) | Elasticsearch | PostgreSQL LIKE | 10x faster for large datasets; PG fallback available |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App (TanStack Router)
+├── __root.tsx (RootLayout)
+│   ├── Header: nav links (Library, Trending, Export), user greeting, logout
+│   ├── <Outlet /> ──▶ routes
+│   └── Footer
+│
+├── / (LandingPage)
+│   └── Welcome content with login/register CTAs
+│
+├── /login (LoginPage)
+│   └── Email + password form
+│
+├── /register (RegisterPage)
+│   └── Email + username + password form
+│
+├── /library (LibraryPage)
+│   ├── View toggle: Books | All Highlights
+│   ├── Search bar (full-text search)
+│   ├── BooksView
+│   │   └── Book cards (grid layout: title, author, highlight count, last read)
+│   └── HighlightsView
+│       └── HighlightCard (blockquote with color styling + note)
+│
+├── /books/$bookId (BookDetailPage)
+│   ├── Book title + author header
+│   ├── Tab bar: My Highlights | Popular | Friends
+│   ├── MyHighlightCard (with inline note editing, delete)
+│   ├── PopularHighlightCard (passage text + reader count)
+│   └── FriendHighlightCard (avatar + username + passage)
+│
+├── /trending (TrendingPage)
+│   └── Trending highlights across all books
+│
+└── /export (ExportPage)
+    └── Format selector (Markdown/CSV/JSON) + export button
+```
+
+### Zustand Store
+
+A single Zustand store (`useStore`) with `persist` middleware manages all global state:
+
+**Auth state**: `user` (User object or null), `isAuthenticated` (derived boolean). The `persist` middleware stores only `user` and `isAuthenticated` in `localStorage` under the key `kindle-highlights-storage`, so the user stays logged in across page reloads. The `logout` action clears the localStorage `sessionId`, resets user state, and empties cached data arrays.
+
+**Highlights state**: `highlights` array with `setHighlights`, `addHighlight`, `removeHighlight`, and `updateHighlightInStore` mutators. Highlights are loaded from the API on page navigation and cached in the store for immediate rendering.
+
+**Library state**: `library` (array of Book objects with highlight counts) with `setLibrary`. Loaded alongside highlights on the library page.
+
+**UI state**: `selectedBookId` (currently viewed book) and `searchQuery` (search input value). These are persisted across navigation so the search bar retains its value when switching between views.
+
+### Routing
+
+TanStack Router with file-based routing provides six routes:
+- `/` -- Landing page (unauthenticated welcome)
+- `/login` -- Login form, stores session ID in `localStorage` on success
+- `/register` -- Registration form
+- `/library` -- User's books and highlights (requires auth)
+- `/books/$bookId` -- Book detail with tabbed highlight views (requires auth)
+- `/trending` -- Trending highlights across the platform (requires auth)
+- `/export` -- Export highlights in multiple formats (requires auth)
+
+The root layout provides navigation links that change based on `isAuthenticated` -- unauthenticated users see Login/Sign Up, authenticated users see Library/Trending/Export.
+
+### Data Fetching
+
+All API calls go through `api/client.ts`, a typed API client module. Authentication uses Bearer tokens -- the session ID is stored in `localStorage` and attached as an `Authorization: Bearer {sessionId}` header on every request. The Vite dev server proxies `/api` requests to the four backend services.
+
+**Library page loading**: On mount, the library page calls `getLibrary()` and `getHighlights()` in parallel via `Promise.all`. Both results are stored in the Zustand store. Subsequent visits to the library page re-fetch to ensure freshness.
+
+**Book detail page loading**: Uses `Promise.all` to fetch three data sets simultaneously: the user's highlights for this book (`getHighlights({bookId})`), popular highlights (`getPopularHighlights(bookId)`), and friends' highlights (`getFriendsHighlights(bookId)`). Each is stored in local component state (not the global store) because these are page-specific and do not need to persist across navigation.
+
+**Search**: The library page search form updates `searchQuery` in the store and triggers a re-fetch of highlights with the search parameter. The backend performs full-text search via PostgreSQL.
+
+### Key UI Patterns
+
+**Color-coded highlights**: Each highlight has a `color` field (yellow, green, blue, pink). The frontend maps these to CSS classes like `highlight-yellow` that apply background colors to blockquote elements. This creates the familiar Kindle highlighting experience where different colors serve different purposes (important passages, questions, favorites).
+
+**Three-tab book detail view**: The `BookDetailPage` uses a tab bar to switch between "My Highlights," "Popular," and "Friends" views. Each tab has a count badge showing how many highlights exist. The tabs load all data upfront (via the parallel `Promise.all` fetch) rather than lazy-loading per tab, since highlight lists are small enough that the bandwidth cost is negligible.
+
+**Inline note editing**: `MyHighlightCard` supports inline editing of the note field. Clicking "Edit" toggles the card into edit mode, showing a textarea pre-filled with the existing note. "Save" calls `updateHighlight` and updates local state. "Cancel" reverts to view mode. This avoids opening a separate modal for a simple text edit.
+
+**Popular highlights with social proof**: `PopularHighlightCard` displays the passage text in a yellow-tinted blockquote with a footer showing "N readers highlighted this passage." This count comes from the aggregation service's batch-synced Redis counters.
+
+**Friend highlight attribution**: `FriendHighlightCard` shows the friend's avatar (first letter of username in a circle) and username above the highlighted passage. This creates a social reading experience where you can see what your friends found interesting in the same book.
+
+**Multi-format export**: The export page lets users choose between Markdown, CSV, and JSON formats. The API returns the formatted text directly (not JSON-wrapped), and the frontend displays or downloads it.
+
+## Production-Grade Pattern Deep Dives
+
+This section explains each production-grade pattern referenced in the architecture, written for readers encountering these concepts for the first time.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately without touching the database. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it.
+
+**How it works step by step**: (1) A request arrives for popular highlights of a book. (2) Check Redis: `GET popular:{bookId}`. (3) If found, deserialize and return -- this takes ~0.2ms versus ~5ms for a database query. (4) If not found, query PostgreSQL's `popular_highlights` table. (5) Store the result in Redis: `SET popular:{bookId} value EX 300` (5-minute TTL). (6) Return the result.
+
+**Cache invalidation**: For popular highlights, the cache naturally expires every 5 minutes, which aligns with the aggregation worker's batch sync interval. For user-specific data, cache keys are deleted on write operations (create, update, delete highlight).
+
+**How it works in this project**: Popular highlights for each book are cached in Redis with a 5-minute TTL. The aggregation service updates these counts every 5 minutes, so the cache TTL matches the data freshness interval. See `src/shared/cache.ts`.
+
+**Why it matters for reading platforms**: The architecture targets 100K reads/second for popular highlights of bestselling books. A Harry Potter title might have millions of readers checking "what others highlighted." Without caching, each request would run a `SELECT ... ORDER BY highlight_count DESC LIMIT 10` query against PostgreSQL, which at 100K QPS would overwhelm the database. Redis serves these cached results with sub-millisecond latency.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. For API design, this means a duplicate request (caused by network retries, client-side double-taps, or load balancer request duplication) does not create duplicate data.
+
+**How idempotency keys work**: The client generates a unique key (typically a UUID) for each highlight creation and sends it as a header. The server checks Redis for this key before processing: (1) If found, return the cached result from the first execution. (2) If not found, create the highlight, store the result in Redis with a 24-hour TTL, and return it.
+
+**Two-layer deduplication in this project**: First, Redis is checked for the idempotency key (fast path). Second, the `idempotency_key` column in the PostgreSQL `highlights` table provides database-level deduplication within a transaction. This double-check handles the case where Redis is unavailable -- the database constraint still prevents duplicates.
+
+**Why this matters for highlight sync**: Consider a user highlighting a passage on their Kindle. The device sends a create request, but the cellular connection drops before the response arrives. The device queues the request for retry. When connectivity returns, it retries. Without idempotency, the user now has two identical highlights in their library. With idempotency keys, the retry hits the cached result and returns the already-created highlight.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing downstream service. It works like an electrical circuit breaker: when failures exceed a threshold, the "circuit opens" and subsequent calls fail immediately without attempting the request. After a cooldown period, the circuit allows one test request through ("half-open"). If it succeeds, the circuit closes and normal operation resumes.
+
+**The three states**:
+1. **Closed** (normal): Requests flow through normally. Failures are counted. If failures exceed the threshold (e.g., 50% of the last 5 requests fail), the circuit opens.
+2. **Open** (failing): All requests are immediately routed to a fallback function without attempting the downstream call. This prevents a failing service from dragging down the caller with timeout delays.
+3. **Half-open** (testing): After the reset timeout (e.g., 30 seconds), one request is allowed through to test whether the downstream service has recovered. If it succeeds, the circuit closes. If it fails, the circuit reopens.
+
+**Fallback behaviors in this project**: Redis read failures fall back to returning null (cache miss, continue to PostgreSQL). Redis write failures fall back to queuing the write in a PostgreSQL fallback table. PostgreSQL read failures return cached data if available, or an error. Elasticsearch failures (at production scale) fall back to PostgreSQL `ILIKE` search.
+
+**Why this matters for a reading platform**: The highlight service depends on both PostgreSQL and Redis. If Redis goes down, every highlight creation would wait for the Redis timeout (e.g., 1-3 seconds) before falling through to the database path. With 10K highlights/second at scale, that is 10K-30K seconds of accumulated waiting per second -- the server would quickly exhaust its connection pool and crash. A circuit breaker detects the failure after a few requests and starts skipping Redis entirely, keeping highlight creation fast.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-readable JSON objects instead of free-form text strings. Instead of `"User alice created highlight in The Great Gatsby"`, the entry is `{"level":"info","service":"highlight","userId":"abc-123","bookId":"def-456","highlightId":"ghi-789","action":"highlight_created","durationMs":12}`.
+
+**Why JSON instead of text**: In production with multiple service instances generating thousands of log lines per second, searching free-form text is impractical. JSON logs can be indexed by any field in a log aggregation system. Finding "all highlight creations that took longer than 500ms" becomes a filter query instead of a regex search through millions of lines.
+
+**How Pino works in this project**: Pino outputs JSON in production mode and pretty-prints in development mode. Each service creates a child logger with the service name as context (`createLogger('highlight')`, `createLogger('sync')`). This means every log line from the highlight service automatically includes `"service":"highlight"`, making it trivial to filter logs by service. See `src/shared/logger.ts`.
+
+**Key events logged**: `highlight_created` (userId, bookId, highlightId, location, durationMs), `sync_pushed` (userId, deviceCount, queuedCount), `aggregation_completed` (booksProcessed, durationMs), `privacy_changed` (userId, oldSettings, newSettings). Each event includes enough context to reconstruct what happened without needing to correlate with other log lines.
+
+**Why it matters for sync debugging**: When a user reports "my highlight didn't sync to my other device," you need to trace the event through four microservices (highlight creation -> sync push -> device queue -> WebSocket delivery). With structured logs and a shared userId, you can filter to that user's events across all services and see exactly where the sync chain broke.
+
+### Prometheus Metrics
+
+Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics at a `/metrics` HTTP endpoint. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the time-series data for querying, dashboards, and alerting.
+
+**Three metric types that matter**:
+- **Counter**: A number that only goes up. Example: `highlights_created_total{book_id}`. The *rate* of change tells you how many highlights are being created per second.
+- **Gauge**: A number that goes up and down. Example: `websocket_active_connections`. Shows how many devices are currently connected for sync.
+- **Histogram**: Tracks the distribution of values across configurable buckets. Example: `highlight_operation_duration_seconds` with buckets at 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5 seconds. Lets you compute percentiles -- "p99 highlight creation latency is 180ms."
+
+**SLIs defined in this project**: Highlight creation latency (target: p99 < 200ms), cross-device sync latency (target: p95 < 2s), popular highlights cache hit rate (target: > 90%), API availability (target: 99.5% successful responses). Each SLI maps to a specific Prometheus metric.
+
+**Why it matters for a sync platform**: The architecture promises < 2 second cross-device sync. Without metrics measuring the time from highlight creation to WebSocket delivery, you cannot verify this promise. A histogram on sync latency gives you exact p95 values. If p95 drifts above 2 seconds, an alert fires before users notice degradation.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without it, a single misbehaving client can overwhelm the server.
+
+**How it works**: The server tracks request counts per client (identified by user ID or IP address). Each incoming request checks the counter. If exceeded, the server returns HTTP 429 (Too Many Requests). If not, the request proceeds and the counter increments. Counters are typically stored in Redis for cross-server sharing.
+
+**Rate limits defined in this project**:
+- Highlight creation: 100/minute per user (prevents automated bulk creation)
+- Auth attempts: 5/minute per IP (prevents brute-force password guessing)
+- Export: 10/hour per user (exports are expensive database queries)
+- Search: 30/minute per user (search queries are CPU-intensive)
+- Global API: 1000/minute per user (general abuse protection)
+
+**Why different limits for different endpoints**: Not all operations cost the same. Creating a highlight involves a database write, cache update, Redis counter increment, and sync event broadcast -- it is 10x more expensive than reading a highlight. Export requires scanning and formatting potentially thousands of highlights. Rate limits should reflect the actual cost of each operation.
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether the service is alive and capable of handling requests. Load balancers and container orchestrators poll this endpoint to decide where to route traffic.
+
+**How it works in this project**: Each of the four microservices exposes a health endpoint. A basic check just returns HTTP 200 to prove the process is running. A more thorough check tests downstream dependencies -- can this service reach PostgreSQL? Is Redis responding? If either is down, the service reports unhealthy, and the load balancer stops sending it traffic.
+
+**Why health checks matter for microservices**: With four separate services (highlight, sync, aggregation, social), a failure in one should not cascade to the others. If the aggregation worker's PostgreSQL connection dies, the health check fails, and the orchestrator restarts just that service without affecting highlight creation or sync.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method of restricting system access based on roles assigned to users rather than per-user permission lists. You define roles (e.g., "owner", "friend", "public") with associated permissions and assign users to roles for each resource.
+
+**How it applies to this project**: The privacy system functions as a simplified RBAC model. Each highlight has a `visibility` field that acts as a role assignment:
+- `private`: Only the owner can see it (owner role)
+- `friends`: Owner and users in the `follows` table can see it (friend role)
+- `public`: Everyone can see it, and it is included in aggregation counts (public role)
+
+The `user_privacy_settings` table sets default visibility for new highlights, which users can override per-highlight. Query-time enforcement JOINs the highlights table with the follows table and privacy settings to filter results based on the requesting user's relationship to the highlight owner.
+
+**Why per-highlight rather than per-user visibility**: Users want fine-grained control. A reader might share a profound quote publicly while keeping personal annotations private within the same book. Per-user settings establish the default; per-highlight overrides enable this flexibility without requiring a complex RBAC middleware.
+
 ## Implementation Notes
 
 This section maps the production architecture to the actual local implementation, documenting production-grade patterns used, simplifications, and omissions.

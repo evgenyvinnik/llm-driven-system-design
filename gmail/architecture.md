@@ -628,6 +628,60 @@ This section maps the production architecture above to the actual local implemen
                     └────────────────┘
 ```
 
+### Frontend Architecture
+
+The frontend is a React 19 + TypeScript application built with Vite, using TanStack Router for file-based routing, Zustand for state management, and Tailwind CSS for styling. It replicates Gmail's three-panel layout: a sidebar with labels, a thread list, and a thread detail view.
+
+**Component Hierarchy:**
+
+```
+__root.tsx (RootLayout -- auth gate + Gmail shell)
+├── Header (search bar, user menu)
+├── Sidebar (compose button, label navigation with unread counts)
+├── ComposeModal (floating compose window, minimizable)
+├── index.tsx (redirects to INBOX)
+├── label.$labelName.tsx (ThreadList for selected label)
+│   └── ThreadList (virtualized via @tanstack/react-virtual)
+│       └── ThreadListItem (subject, sender, snippet, star, timestamp)
+├── thread.$threadId.tsx (ThreadView)
+│   └── MessageCard (per-message: sender, timestamp, body, reply)
+├── login.tsx
+└── register.tsx
+```
+
+**Zustand Stores:**
+
+Two stores manage the application state:
+
+1. **`useAuthStore`** (persisted to `localStorage` via Zustand `persist` middleware): Holds the current user, authentication status, and loading flag. Provides `login`, `register`, `logout`, and `checkAuth` actions. The `persist` middleware serializes `user` and `isAuthenticated` to `localStorage`, so refreshing the page does not force a re-login. The `checkAuth` action validates the session against the server on mount.
+
+2. **`useMailStore`**: The core mail state. Holds the thread list, current thread detail, labels, unread counts per label, current label filter, current page, compose modal visibility, and loading state. Key patterns:
+   - **Optimistic updates**: When the user stars a thread, the store immediately updates the local state (`threads.map(...)`) before sending the API request. If the request fails, the store reverts to the previous state. The same pattern applies to archive and trash operations, where the thread is immediately removed from the list and restored on failure.
+   - **Centralized data fetching**: All API calls flow through store actions (`fetchThreads`, `fetchThread`, `fetchLabels`, `fetchUnreadCounts`), keeping data-fetching logic out of components.
+   - **Label-driven navigation**: `setCurrentLabel` resets the page to 1 and clears the current thread, then `fetchThreads` loads threads filtered by that label.
+
+**Data Fetching Pattern:**
+
+All API calls are centralized in `services/api.ts`, which exports separate API objects (`authApi`, `threadApi`, `messageApi`, `labelApi`, `draftApi`, `searchApi`, `contactApi`). Each API object wraps a shared `fetchApi` helper that sets `Content-Type: application/json`, includes credentials (`credentials: 'include'` for cookie-based sessions), and handles error responses by parsing the JSON error body. There is no React Query or SWR; data fetching is imperative through Zustand store actions.
+
+**Email Threading UI:**
+
+The `ThreadList` component uses `@tanstack/react-virtual` to virtualize the thread list. Each row is estimated at 40px, with 5 rows of overscan. The virtualizer positions items absolutely within a container whose height equals `virtualizer.getTotalSize()`. Pagination is server-side: the toolbar shows "1-25 of 142" and provides next/previous buttons that call `fetchThreads` with the next page number.
+
+The `ThreadView` component loads a full thread (all messages ordered by `created_at`) and renders each message as a `MessageCard`. Opening a thread automatically marks it as read via `threadApi.updateState`.
+
+**Compose Modal:**
+
+The `ComposeModal` is a floating window (positioned `fixed bottom-0 right-20`) that can be minimized to a title bar. It manages its own local state for recipients (To, CC, BCC), subject, and body. The `ContactAutocomplete` component provides type-ahead contact suggestions by querying `/api/v1/contacts?q=term`. CC and BCC fields are hidden by default and shown via toggle buttons, matching Gmail's behavior.
+
+**Search:**
+
+The `SearchBar` component in the `Header` accepts Gmail-style search operators (`from:`, `to:`, `has:attachment`). Search results are displayed as a thread list. The search API returns results with relevance-ordered threads.
+
+**Routing:**
+
+TanStack Router with file-based routing. Key routes: `/` (redirects to INBOX), `/label/$labelName` (thread list filtered by label), `/thread/$threadId` (thread detail), `/login`, and `/register`. The root layout includes an auth gate: unauthenticated users see only the `Outlet` (login/register pages), while authenticated users see the full Gmail shell (Header + Sidebar + main content + ComposeModal).
+
 ### Production-Grade Patterns Implemented
 
 | Pattern | Library | File Path | Purpose |
@@ -639,6 +693,60 @@ This section maps the production architecture above to the actual local implemen
 | Health checks | custom | `backend/src/routes/` | Liveness, readiness, detailed dependency checks |
 | Optimistic locking | PostgreSQL version column | `backend/src/services/draftService.ts` | Draft conflict detection via conditional UPDATE with 409 response |
 | Background indexing | polling worker | `backend/src/workers/search-indexer.ts` | Polls PostgreSQL for new messages, indexes into Elasticsearch with `visible_to` privacy filter |
+
+### Production Pattern Deep Dives
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before.
+
+**Circuit Breaker (`backend/src/services/circuitBreaker.ts`):**
+
+A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service. Imagine Elasticsearch goes down. Without a circuit breaker, every search request waits for a TCP connection timeout (often 30 seconds), consuming a server thread the entire time. With hundreds of concurrent requests, the API server quickly exhausts its thread pool and becomes unresponsive -- even though the rest of the application (sending emails, listing threads) works fine. This is called a "cascading failure."
+
+The circuit breaker tracks the success/failure ratio of recent calls. When the failure rate exceeds a threshold (50% in this project), the breaker "opens" and immediately rejects all subsequent calls without attempting them. After a cooldown period (30 seconds), the breaker enters a "half-open" state where it allows a single test request through. If that request succeeds, the breaker closes and resumes normal operation. If it fails, the breaker reopens for another cooldown cycle.
+
+In this project, the circuit breaker wraps Elasticsearch calls. When it opens, search returns empty results with a `fallback: true` flag so the frontend can display "Search temporarily unavailable." All other email operations (send, receive, label management, drafts) continue working. The breaker state is exposed as a Prometheus gauge (`gmail_circuit_breaker_state`), enabling operations teams to see when and how often Elasticsearch outages occur.
+
+**Redis Cache-Aside (integrated in thread and label services):**
+
+Cache-aside is a caching pattern where the application checks the cache before querying the database. On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns the data. On a cache hit, the data is returned directly from the cache without touching the database.
+
+In this project, thread lists are cached in Redis with a 30-second TTL. When a user opens their inbox, the API checks Redis first. If the inbox data is cached and fresh, it is returned in under a millisecond. If not, the API executes the thread list query (which involves JOINs across `threads`, `thread_user_state`, `thread_labels`, and `labels`), caches the result, and returns it. Cache entries are invalidated explicitly when the user performs a state change (star, archive, trash) or when a new message arrives.
+
+The 30-second TTL is a trade-off: too short and the cache provides little benefit; too long and users see stale data (e.g., a thread still appearing as unread after being read in another tab). For email, a 30-second staleness window is acceptable because users refresh manually when they expect new mail.
+
+**Structured Logging (`backend/src/services/logger.ts`):**
+
+Structured logging emits log entries as machine-parsable JSON rather than free-form text. Instead of `"User alice sent email to bob, 23ms"`, the logger emits `{"level":"info","event":"email_sent","userId":"abc","recipients":["bob"],"durationMs":23,"traceId":"xyz"}`.
+
+This project uses the Pino library, which is chosen for its speed (Pino serializes JSON faster than most alternatives by avoiding expensive string formatting). Every HTTP request is assigned a trace ID via the `x-trace-id` header. This trace ID is attached to every log entry generated during that request, making it possible to reconstruct the full lifecycle of a request by filtering logs on the trace ID. Pino-http middleware automatically logs request start and completion with method, URL, status code, and duration.
+
+Key events logged: email send (sender, recipient count, thread creation vs. reply), search query (query text, result count, latency, Elasticsearch vs. cache), draft conflict (draft ID, expected version vs. actual version), and rate limit hits (endpoint, client IP). In production, these logs would feed into a centralized system (e.g., Datadog, Elasticsearch/Kibana) for real-time dashboards and alerting.
+
+**Prometheus Metrics (`backend/src/services/metrics.ts`):**
+
+Prometheus is a monitoring system where the application exposes metrics at an HTTP endpoint (`/metrics`), and a Prometheus server periodically scrapes this endpoint to collect time-series data for dashboards and alerting.
+
+Metrics come in four types: **Counters** only go up (e.g., `gmail_emails_sent_total`), **Gauges** go up and down (e.g., `gmail_circuit_breaker_state`), **Histograms** track distributions by bucketing values (e.g., `gmail_http_request_duration_seconds` with buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s), and **Summaries** compute percentiles client-side. Histograms are preferred over summaries because they can be aggregated across multiple server instances.
+
+This project tracks HTTP request duration and count (labeled by method, route, status code), email send count, search query count and duration, draft version conflicts, messages indexed into Elasticsearch, circuit breaker state, and rate limit violations. These metrics enable SLI-based alerting: for example, "if p95 inbox load latency exceeds 200ms for 5 minutes, page the on-call engineer."
+
+**Rate Limiting (`backend/src/services/rateLimiter.ts`):**
+
+Rate limiting caps the number of requests a client can make within a time window. Without it, a single client could overwhelm the server with requests, degrading service for all users.
+
+This project uses `express-rate-limit` with `rate-limit-redis` as the backing store. Redis is used instead of in-memory storage so that rate limits are shared across multiple API server instances. If the API is scaled to 3 instances behind a load balancer, a user cannot bypass the limit by having requests routed to different instances.
+
+Each endpoint has a different limit based on its cost: login is limited to 5 attempts per minute (brute-force protection), email sending is limited to 50 per hour (prevents spam), search is limited to 60 per minute (prevents scraping), and general API calls are limited to 1000 per minute. When a client exceeds the limit, the server returns HTTP 429 with a `Retry-After` header indicating how many seconds the client should wait.
+
+**Health Checks (`backend/src/routes/`):**
+
+Health checks are HTTP endpoints that report whether the application is functioning correctly. They serve different audiences and purposes:
+
+- **`/api/health`** (simple liveness): Returns HTTP 200 if the process is alive. Used by the orchestrator (Kubernetes) to detect hung processes. If this fails, the container is killed and restarted.
+- **`/api/health/detailed`** (dependency check): Connects to PostgreSQL and Redis, measures round-trip latency, and reports the status of each dependency. Used by load balancers to decide whether to route traffic to this instance. If PostgreSQL is unreachable, this returns unhealthy, and the load balancer stops sending requests.
+- **`/api/health/live`** (process check): Confirms the process is running. Distinct from the liveness probe in that it checks only the Node.js event loop, not external dependencies.
+
+The distinction between liveness and readiness is important: during a database migration, the process is alive (liveness = healthy) but not ready to serve traffic (readiness = unhealthy). The load balancer should stop routing to it but should not restart it.
 
 ### What Was Simplified
 

@@ -522,6 +522,62 @@ This section maps the production architecture above to the actual local implemen
 └────────┘ └──────┘ └─────────┘
 ```
 
+### Frontend Architecture
+
+The frontend is a React + TypeScript application built with Vite, using React Router DOM v6 for routing, Zustand for state management, and Tailwind CSS for styling. It replicates LeetCode's dark-themed coding workspace with a split-pane layout: problem description on the left, code editor on the right.
+
+**Component Hierarchy:**
+
+```
+main.tsx (RootLayout -- Navbar + Outlet, auth check on mount)
+├── HomePage (landing page with stats and call-to-action)
+├── ProblemsPage (virtualized problem catalog)
+│   └── DifficultyBadge (Easy/Medium/Hard color-coded pill)
+├── ProblemPage (split-pane coding workspace)
+│   ├── Left Panel: problem description + submissions tab
+│   │   ├── ReactMarkdown (renders problem description, examples, constraints)
+│   │   ├── DifficultyBadge
+│   │   └── StatusBadge (Accepted/Wrong Answer/TLE/etc.)
+│   └── Right Panel: code editor + test results
+│       ├── CodeEditor (CodeMirror with VS Code dark theme)
+│       ├── TestResults (per-test-case pass/fail display)
+│       └── Action buttons (Run / Submit)
+├── ProgressPage (user solve progress with difficulty breakdown)
+├── AdminPage (platform stats, leaderboard, user management)
+├── LoginPage
+└── RegisterPage
+```
+
+**Zustand Stores:**
+
+1. **`useAuthStore`**: Manages authentication state. Holds the current user (id, username, role), loading flag, and authentication status. The `checkAuth` action calls `GET /api/v1/auth/me` on mount (triggered from the `RootLayout`'s `useEffect`) to validate the session cookie. Login and register actions update the store and redirect on success.
+
+2. **`useEditorStore`**: Manages the code editor state across the problem workspace. Holds the selected language (`python` or `javascript`), current code, original starter code (for reset), and loading flags for run/submit operations. The `resetCode` action restores the code to the original starter code, and `setOriginalCode` updates both the original and current code simultaneously (used when switching languages).
+
+**Data Fetching Pattern:**
+
+All API calls are centralized in `services/api.ts`, which exports domain-specific API objects (`authApi`, `problemsApi`, `submissionsApi`, `usersApi`, `adminApi`). A shared `request` helper handles JSON serialization, cookie-based credentials, and error responses. Notably, it includes a custom `RateLimitError` class that captures the `retryAfter` value from HTTP 429 responses, allowing the UI to display how long the user must wait before retrying.
+
+**Problem List Virtualization:**
+
+The `ProblemsPage` uses `@tanstack/react-virtual` to render only the visible problem rows. Each row is estimated at 48px with 10 rows of overscan. The virtualizer positions items absolutely within a container whose height equals `rowVirtualizer.getTotalSize()`. This enables smooth 60fps scrolling even with thousands of problems. Client-side search filtering runs on the full problem list, and the virtualizer re-renders based on the filtered count.
+
+**Split-Pane Problem Workspace:**
+
+The `ProblemPage` uses a 50/50 horizontal split layout (`w-1/2` on each panel). The left panel has tabbed navigation between "Description" (rendered with `react-markdown`) and "Submissions" (the user's submission history for this problem). The right panel contains the code editor, a fixed-height test results panel (256px), and action buttons.
+
+**Code Editor Integration:**
+
+The `CodeEditor` component wraps `@uiw/react-codemirror` with the VS Code dark theme. It dynamically loads the correct language extension (`@codemirror/lang-python` or `@codemirror/lang-javascript`) based on the selected language. The editor supports line numbers, bracket matching, auto-completion, code folding, and multiple selections. The component is controlled: code content flows through the `value` prop and changes via the `onChange` callback.
+
+**Submission Polling:**
+
+When a user submits code, the API returns a 202 Accepted with a submission ID. The frontend then polls `GET /api/v1/submissions/:id/status` every 1 second to check execution progress. The polling displays real-time updates: "Running test 3 of 10..." during execution, "Accepted! Runtime: 45ms" on success, or the error status (Wrong Answer, TLE, Runtime Error) on failure. Polling stops when the status is no longer `pending` or `running`, with a maximum of 60 attempts as a safety limit. After completion, the submissions list is automatically refreshed.
+
+**Routing:**
+
+React Router DOM v6 with a `createBrowserRouter` configuration (not TanStack Router, a deliberate deviation from the repository default documented in the project CLAUDE.md). Routes: `/` (home), `/problems` (catalog), `/problems/:slug` (workspace), `/progress` (user stats), `/admin` (admin dashboard), `/login`, `/register`. The `RootLayout` component wraps all routes with a `Navbar` and triggers `checkAuth` on mount.
+
 ### Production-Grade Patterns Implemented
 
 | Pattern | Library | File Path | Purpose |
@@ -534,6 +590,88 @@ This section maps the production architecture above to the actual local implemen
 | Health checks | custom | `backend/src/routes/` | Liveness, readiness, dependency checks |
 | Kafka queue | kafkajs | `backend/src/shared/kafka.ts` | Optional queue-based execution for production-scale decoupling |
 | Virtualized list | @tanstack/react-virtual | `frontend/src/` | Problem catalog renders only visible rows for 60fps scrolling |
+
+### Production Pattern Deep Dives
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before.
+
+**Circuit Breaker (`backend/src/shared/circuitBreaker.ts`):**
+
+A circuit breaker prevents an application from repeatedly calling a failing service, avoiding resource waste and cascading failures. The analogy is electrical: when current exceeds a safe threshold, the breaker trips and cuts the circuit to prevent damage.
+
+In this project, the circuit breaker wraps Docker container execution -- the most failure-prone operation. The Docker daemon can become unavailable (out of memory, disk full, daemon crash), and without a breaker, every submission would spawn a container that hangs for 60 seconds before timing out. With 50 concurrent users submitting, that means 50 threads blocked for 60 seconds each, exhausting the API server's capacity.
+
+The breaker has three states: **Closed** (requests flow normally, Docker containers are spawned), **Open** (requests are rejected immediately with a 503 response and "retry later" message), and **Half-Open** (after a 30-second cooldown, one test submission is allowed through to check if Docker has recovered). The breaker opens when the failure rate exceeds 50% with at least 5 requests in the measurement window.
+
+When the breaker is open, the user experience degrades gracefully: users can still browse problems, view their submission history, check the leaderboard, and access their profile. Only new code submissions fail fast. The breaker state is exposed as a Prometheus gauge (`circuit_breaker_state`), enabling operations teams to detect and respond to Docker outages.
+
+**Rate Limiting (`backend/src/shared/rateLimiter.ts`):**
+
+Rate limiting restricts how many requests a client can make within a time window. Without it, a single user could submit code thousands of times per minute, spawning thousands of Docker containers and exhausting system resources (each container uses 256MB of memory).
+
+This project implements per-endpoint rate limiting with four tiers:
+
+- **Submissions (10/minute)**: The most expensive operation. Each submission spawns a Docker container with 256MB memory, runs user code against all test cases, and writes results to the database. Allowing unlimited submissions would let a single user consume 2.5GB+ of memory.
+- **Code runs (30/minute)**: Less expensive than submissions because they only run against sample test cases and do not persist results.
+- **General API (100/minute)**: Prevents scraping of problem descriptions and solutions.
+- **Auth endpoints (5/15 minutes)**: Brute-force protection for login attempts.
+
+The implementation uses `express-rate-limit`, which stores request counts in memory by default. For multi-instance deployments, a Redis-backed store would be needed to enforce limits globally. When a client exceeds the limit, the server returns HTTP 429 (Too Many Requests). The frontend's API client has a custom `RateLimitError` class that parses the `retryAfter` value, allowing the UI to display "Please wait X seconds before trying again."
+
+**Idempotency (`backend/src/shared/idempotency.ts`):**
+
+Idempotency ensures that performing the same operation multiple times has the same effect as performing it once. For a code submission platform, the critical scenario is: a user clicks "Submit," the network is slow, they click again. Without idempotency protection, two identical Docker containers are spawned, two submission records are created, and the user sees duplicate entries in their history.
+
+This project uses content-hash-based deduplication rather than client-generated idempotency keys. The hash is computed from `userId + problemSlug + normalizedCode + language`. Before creating a new submission, the server checks Redis for a matching hash (with a 5-minute TTL via `SET NX EX 300`). If found, the server returns the existing submission ID without spawning a new container.
+
+Content hashing is preferred over client-generated UUIDs because the deduplication target is identical code. A client-generated UUID would be different on each click, defeating the purpose. The 5-minute TTL is a trade-off: within 5 minutes, identical code returns the cached result (which is correct because identical code produces identical output). After 5 minutes, the hash expires and a fresh submission can be created.
+
+**Prometheus Metrics (`backend/src/shared/metrics.ts`):**
+
+Prometheus is a pull-based monitoring system. The application exposes metrics at `GET /metrics` in a text format that a Prometheus server scrapes at regular intervals (typically every 15 seconds). The scraped data is stored as time series for graphing, dashboarding (Grafana), and alerting.
+
+Metrics come in four types, each suited for different measurement needs:
+
+- **Counters** (only go up): `submissions_total` (labeled by status: accepted, wrong_answer, TLE, etc.), `http_requests_total` (by method, route, status code). Used to track throughput and error rates.
+- **Histograms** (bucket values into ranges): `http_request_duration_seconds` (with buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s), `code_execution_duration_seconds`, `submission_duration_seconds`. Used to compute percentiles: "what is the p95 execution time?"
+- **Gauges** (go up and down): `docker_containers_active` (how many containers are currently running), `postgresql_connections` (current pool utilization), `circuit_breaker_state`. Used to track current system state and set capacity alerts.
+
+These metrics enable critical alerts: if `docker_containers_active` exceeds 10, the system is approaching resource exhaustion and should stop accepting submissions. If `submission_status{status="system_error"}` rate exceeds 5%, Docker may be failing and the operations team should investigate.
+
+**Structured Logging (`backend/src/shared/logger.ts`):**
+
+Structured logging emits log entries as machine-parsable JSON objects rather than free-form text strings. Instead of `"User alice submitted Python solution for two-sum, took 234ms, accepted"`, the logger emits `{"level":"info","event":"submission_complete","userId":"abc","problemSlug":"two-sum","language":"python","durationMs":234,"status":"accepted","testsPassed":5,"testsTotal":5}`.
+
+This project uses the Pino library, chosen for its speed. Pino avoids synchronous string formatting and instead serializes JSON directly. Each log entry includes contextual fields: `userId` (who triggered the action), `submissionId` (which submission), `problemSlug` (which problem), and `durationMs` (how long it took).
+
+Log levels are used deliberately: **ERROR** for system failures (Docker daemon unreachable, database connection lost), **WARN** for rate limit hits and slow queries (>1s), **INFO** for business events (submission created, user registered), and **DEBUG** for request-level details (disabled in production). In a production environment, these JSON logs would be shipped to a log aggregation service where engineers can search, filter, and build dashboards.
+
+**RBAC -- Role-Based Access Control (Security section):**
+
+RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles. Rather than checking "can user X access endpoint Y" for every user individually, the system defines roles with specific permission sets and assigns users to those roles.
+
+This project has two roles:
+
+| Role | Permissions |
+|------|-------------|
+| `user` | View problems, submit code, run tests, view own submissions, track own progress |
+| `admin` | All user permissions + create/edit/delete problems, view all users, access system stats, view leaderboard |
+
+Role checking happens in Express middleware. The `requireAuth` middleware verifies the session and attaches the user to the request. Route-specific middleware (e.g., `requireAdmin`) checks `req.user.role === 'admin'` and returns 403 Forbidden if the check fails. Anonymous users (no session) can still view problem descriptions and the leaderboard, but cannot submit code or access user-specific features.
+
+The RBAC model is stored in the database (`users.role` column with a CHECK constraint: `role IN ('user', 'admin')`). This is simpler than a full permission table but sufficient for this domain. A more complex system (like GitHub's repository-level permissions) would need a separate `permissions` table with `(user_id, resource_type, resource_id, permission_level)` tuples.
+
+**Health Checks (`backend/src/routes/`):**
+
+Health check endpoints report whether the application and its dependencies are functioning correctly. They serve three distinct purposes with three different endpoints:
+
+- **`GET /health`** (detailed check): Measures PostgreSQL and Redis connectivity with round-trip latency. Returns a JSON object with individual dependency statuses, connection pool usage, and uptime. Used by operations dashboards and on-call engineers to diagnose issues.
+
+- **`GET /health/live`** (liveness probe): Returns HTTP 200 if the server process is alive. Used by Kubernetes to detect hung processes (deadlock, infinite loop, unresponsive event loop). If this fails, the orchestrator kills and restarts the container. This endpoint intentionally does not check external dependencies: a PostgreSQL outage should not trigger container restarts across the entire fleet.
+
+- **`GET /health/ready`** (readiness probe): Checks whether PostgreSQL and Redis are reachable. Used by the load balancer to decide whether to route traffic to this instance. During startup (while the server is establishing database connections) and during dependency outages, this returns unhealthy and the load balancer stops routing traffic -- but the container is not restarted.
+
+The liveness/readiness distinction prevents a common failure mode: if PostgreSQL goes down and the health check triggers container restarts, all API instances restart simultaneously, creating a thundering herd that overwhelms PostgreSQL when it comes back up. With separate probes, the instances stay alive (liveness = healthy) but stop accepting traffic (readiness = unhealthy), and resume gracefully when PostgreSQL recovers.
 
 ### What Was Simplified
 

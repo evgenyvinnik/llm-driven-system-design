@@ -453,6 +453,61 @@ The `HotKeyDetector` identifies keys receiving > 1% of traffic in 60-second wind
 | Cluster communication | HTTP/JSON | Binary protocol (RESP) | Easier to debug, test with curl; trade-off is overhead |
 | Admin auth | API key header | OAuth, mTLS | Sufficient for internal service; simple to configure |
 
+## Frontend Architecture
+
+The frontend is a React SPA built with Vite, TypeScript, TanStack Router, Zustand, and Tailwind CSS. It serves as an admin dashboard for monitoring and interacting with the distributed cache cluster.
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Header                         ← Global nav with links to Dashboard, Keys, Cluster, Test
+├── index.tsx (Dashboard)
+│   ├── StatsCard (x8)             ← Total keys, hit rate, memory, active nodes, misses, sets, deletes, evictions
+│   ├── NodeCard (per node)        ← Per-node health indicator with stats (hit rate, memory, entries)
+│   └── Hash Ring Info             ← Virtual node count and active node list
+├── keys.tsx (KeysPage)
+│   ├── KeyListItem (per key)      ← Key name with View/Delete actions
+│   └── Key Details Panel          ← Value inspector, TTL, node location
+├── cluster.tsx (ClusterPage)
+│   ├── Coordinator Info           ← Port, uptime, virtual nodes, active nodes
+│   ├── Add Node Form              ← URL input to add a node to the cluster
+│   ├── NodeCard (per node)        ← Same card as Dashboard, plus Remove button
+│   └── Hash Ring Visualization    ← Color-coded node badges showing ring membership
+└── test.tsx (TestPage)
+    ├── Operations Form            ← Key/value/TTL inputs with SET, GET, DELETE, INCR, LOCATE buttons
+    ├── Bulk Operations            ← Insert 100 test keys button
+    └── Results Console            ← Terminal-style scrolling log of operation results
+```
+
+### Zustand Store
+
+**`useCacheStore`** (`stores/cache-store.ts`): A single store manages all dashboard state. It holds `clusterInfo` (node list, hash ring metadata), `clusterStats` (aggregated and per-node statistics), and `keys` (key listing with per-node counts). The store provides `refreshAll()` which fetches cluster info, stats, and keys in parallel via `Promise.all`. An `autoRefresh` toggle enables a 5-second polling interval on the Dashboard page -- the `useEffect` in `Dashboard` sets up and tears down the interval based on this flag. Individual pages (Keys, Cluster, Test) manage their own local state with `useState` rather than the global store, since their data is page-specific and does not need to persist across navigation.
+
+### Routing
+
+TanStack Router file-based routing with four routes:
+
+| Route | File | Purpose |
+|-------|------|---------|
+| `/` | `routes/index.tsx` | Dashboard with cluster overview, stats cards, and node health grid |
+| `/keys` | `routes/keys.tsx` | Key browser with pattern search, value inspector, and flush |
+| `/cluster` | `routes/cluster.tsx` | Cluster management: add/remove nodes, force health checks, hash ring visualization |
+| `/test` | `routes/test.tsx` | Interactive cache operations: SET/GET/DELETE/INCR/LOCATE with a results console |
+
+The root layout (`__root.tsx`) wraps all routes with `Header` and a centered `max-w-7xl` content area.
+
+### Data Fetching
+
+The API service (`services/api.ts`) is a thin `fetch` wrapper using a `fetchJson<T>` helper that prepends `/api`, sets `Content-Type: application/json`, and throws on non-200 responses. All functions are grouped in a `cacheApi` object. There is no authentication -- the cache admin dashboard is a public interface. The Vite dev server proxies `/api` requests to the coordinator at `:3000`.
+
+### Key UI Patterns
+
+- **Auto-refreshing dashboard**: The Dashboard polls every 5 seconds when `autoRefresh` is enabled, showing live cluster health. The user can toggle auto-refresh and manually trigger a refresh.
+- **Key browser with detail panel**: The Keys page uses a master-detail layout. Selecting a key fetches both the value (`cacheApi.get`) and its node location (`cacheApi.locateKey`) in parallel, displaying TTL, value (JSON-formatted for objects), and which cache node stores it.
+- **Terminal-style results console**: The Test page appends timestamped operation results to a scrolling `<pre>` block styled as a dark terminal, allowing users to see a history of operations and their outcomes.
+- **Hash ring visualization**: The Cluster page displays active nodes as color-coded pills using a rotating palette of 6 colors, making it easy to visually distinguish nodes in the ring.
+
 ## Implementation Notes
 
 This section maps the production architecture above to what is actually running locally, documenting production-grade patterns implemented, simplifications made, and what was omitted.
@@ -530,3 +585,53 @@ All services run as Node.js processes using `tsx watch` for hot reload. No exter
 - **Multi-region**: No geographic distribution or cross-datacenter replication.
 - **Kubernetes**: No container orchestration, health-based pod replacement, or horizontal pod autoscaling.
 - **Consensus protocol**: No Raft/Paxos for ring state agreement across coordinators.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project from first principles, describing what the pattern is, what problem it solves, and how this project uses it.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern borrowed from electrical engineering. In an electrical system, a circuit breaker trips to prevent a short circuit from causing a fire. In software, a circuit breaker wraps calls to an external service and monitors for failures. When failures exceed a threshold, the circuit "opens" and immediately rejects all subsequent calls for a cooldown period, rather than letting them pile up and wait for timeouts. This prevents a slow or crashed dependency from consuming all your threads, connections, or memory -- a failure mode called cascading failure, where one sick service brings down everything that depends on it.
+
+The circuit breaker has three states. **Closed** is the normal state: requests flow through, and the breaker tracks the error rate. **Open** means the breaker has tripped: all requests are immediately rejected with a fast failure, giving the downstream service time to recover instead of being hammered with retries. **Half-open** is the recovery probe: after a cooldown period, the breaker allows one test request through. If it succeeds, the circuit closes and normal traffic resumes. If it fails, the circuit reopens for another cooldown period.
+
+In this project, the coordinator uses Opossum circuit breakers for every communication path to each cache node (`backend/src/shared/circuit-breaker.ts`). The breaker opens when 50% of requests fail within a 10-second window (with a minimum of 5 requests to avoid false positives from small samples). When open, the coordinator immediately returns `{ success: false, circuitOpen: true }` instead of waiting 5 seconds for a timeout on a dead node. The breaker resets after 30 seconds to try one test request. Each state transition is logged via Pino and exposed as a Prometheus gauge (`circuit_breaker_state`), so the dashboard can show which nodes have tripped breakers.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that works by "pulling" metrics from your application. Your application exposes a `/metrics` HTTP endpoint that returns all current metric values in a specific text format. A Prometheus server periodically scrapes this endpoint (typically every 15 seconds), stores the data points, and makes them queryable for dashboards and alerts.
+
+There are four metric types. **Counters** only go up (total requests, total errors) and are useful for computing rates. **Gauges** go up and down (current memory usage, active connections, cache entries). **Histograms** track the distribution of values by putting them into configurable buckets (request latency: how many requests took 0-1ms, 1-5ms, 5-10ms, etc.), which lets you compute percentiles like p99. **Summaries** are similar to histograms but calculate percentiles on the client side.
+
+This project uses the `prom-client` library to expose 25+ metrics at `/metrics` on both the coordinator and each cache node (`backend/src/shared/metrics.ts`). Cache performance metrics include hit/miss counters and a latency histogram with buckets from 0.1ms to 100ms. Capacity metrics track current entries and memory usage as gauges. The hot key detector exposes per-key access counts for keys exceeding 1% of traffic. Cluster health metrics show healthy vs total nodes. Circuit breaker state is exposed as a gauge (0=closed, 0.5=half-open, 1=open). Rebalance progress and snapshot lifecycle are also tracked. Default Node.js metrics (CPU, memory, event loop lag) are included automatically.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable data (typically JSON) rather than free-form text strings. Instead of `"2024-01-16 12:00:00 INFO Cache hit for key user:123 on node-1"`, a structured log emits `{"timestamp":"2024-01-16T12:00:00Z","level":"info","component":"cache","event":"cache_hit","key":"user:123","node":"node-1"}`. Each piece of information is a separate field that can be filtered, searched, and aggregated by log management systems (Elasticsearch/Kibana, Datadog, Grafana Loki).
+
+The key benefit is queryability. With unstructured logs, finding all cache misses on node-2 requires regex parsing. With structured logs, it is a simple field filter: `component=cache AND event=cache_miss AND node=node-2`. Structured logs also enable automatic dashboards -- you can count events by type, compute error rates by component, and set up alerts on specific field combinations.
+
+This project uses Pino (`backend/src/shared/logger.ts`), a high-performance JSON logger for Node.js. It creates component-based child loggers (cache, cluster, admin, persistence, rebalance, circuit-breaker) that automatically include the component name in every log line. HTTP request logging is handled by pino-http, which generates a unique request ID for each request and includes method, URL, status code, and response time. Sensitive headers like `X-Admin-Key` are automatically redacted from logs. Health check and metrics endpoints are excluded from access logs to reduce noise -- these endpoints are called every few seconds by monitoring systems and would overwhelm the log output.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without rate limiting, a single client (whether malicious or buggy) can consume all server resources, degrading service for everyone else. Rate limiting serves three purposes: protecting against denial-of-service attacks, preventing accidental resource exhaustion (a developer's script running in a tight loop), and enforcing fair usage across clients.
+
+The most common algorithm is the sliding window: track the number of requests from each client (identified by IP address, API key, or user ID) within a rolling time window. When the count exceeds the limit, reject the request with HTTP 429 (Too Many Requests) and include a `Retry-After` header telling the client when to try again. More sophisticated algorithms include token bucket (allows bursts up to a maximum, then rate-limits) and leaky bucket (smooths traffic to a constant rate).
+
+In this project, admin endpoints are rate limited to 10 requests per minute (`backend/src/shared/auth.ts`). This prevents brute-force attacks against the admin API key and protects against accidental damage from rapid-fire admin operations (flushing cache, adding/removing nodes). The rate limiter is implemented as Express middleware that tracks request counts per client IP using an in-memory store.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether a service is alive and ready to accept traffic. They serve two audiences: load balancers use health checks to decide which backend instances should receive traffic, and orchestration systems (Kubernetes, ECS) use them to decide whether to restart a container.
+
+There are two types. A **liveness** check answers "is the process running and not deadlocked?" -- it returns 200 if the HTTP server can respond at all. A **readiness** check answers "can this instance actually serve requests?" -- it verifies that all dependencies (database connections, cache connections, downstream services) are reachable. A service might be alive but not ready (e.g., still warming up its cache, or a database connection is down). Load balancers should only route traffic to instances that pass both checks.
+
+This project implements both: `GET /health` is the liveness check (returns 200 if the process is running), and `GET /health/ready` is the readiness check (verifies connectivity to all cache nodes). The coordinator's health monitor uses the cache nodes' `/health` endpoints to detect failures: it polls every 5 seconds and marks a node as unhealthy after 3 consecutive failures (15 seconds). When a node is marked unhealthy, it is removed from the hash ring so requests are rerouted to surviving nodes. When health checks start passing again, the node is re-added to the ring.
+
+### Idempotency
+
+An operation is idempotent if performing it multiple times produces the same result as performing it once. This is critical in distributed systems where network failures can cause retries. If a client sends a SET request and the response is lost due to a network timeout, the client does not know whether the server processed the request. If the client retries, an idempotent operation guarantees the system ends up in the correct state regardless of how many times the request was delivered.
+
+Cache operations are naturally idempotent by design: GET is a read (always safe to retry), SET with the same key and value produces the same state regardless of repetition, and DELETE on a non-existent key is a no-op that returns success. This means clients can safely retry any cache operation on timeout without risk of data corruption or duplication. The coordinator does not need to maintain an idempotency key store or deduplication log because the operations themselves are inherently safe to replay.

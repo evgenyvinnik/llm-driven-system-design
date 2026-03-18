@@ -654,6 +654,160 @@ Virtual waiting room capacity is configurable per event via `max_concurrent_shop
 | Session storage | Cookie + Redis | JWT | Simple revocation, no token rotation |
 | Availability cache | Dynamic TTL (5s/30s) | Fixed TTL | Balance accuracy vs DB load by event status |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Header (navigation, auth status, event search)
+├── <Outlet /> (route-specific content)
+│   ├── index.tsx (EventListPage)
+│   │   └── EventCard[] (event browsing grid with filters)
+│   ├── events/$eventId.tsx (EventDetailPage)
+│   │   ├── WaitingRoom (virtual queue UI for high-demand events)
+│   │   ├── Section selector (venue section grid with availability counts)
+│   │   ├── SeatMap (interactive seat grid for selected section)
+│   │   └── CheckoutSummary (selected seats, timer, purchase actions)
+│   ├── login.tsx (LoginPage with registration)
+│   ├── orders.index.tsx (OrderHistoryPage)
+│   └── orders.$orderId.tsx (OrderDetailPage)
+└── (no footer -- full-height layout)
+```
+
+### Zustand Stores
+
+**`auth.store`** -- Manages user authentication with session-based auth. Unlike the hotel-booking project which uses JWT, this project stores session IDs in localStorage and sends them via `X-Session-Id` headers. The `checkAuth()` action reads the session ID from localStorage and validates it against `GET /api/v1/auth/me`. Login stores the session ID received from the server. There is no Zustand persistence middleware because the session ID is managed directly in localStorage.
+
+**`ticket.store`** -- The core workflow store that manages the entire ticket purchasing pipeline: seat selection, reservation, waiting room queue, and checkout. This store is significantly more complex than typical CRUD stores because it coordinates multiple stateful operations.
+
+Key state:
+- `selectedSeats` -- Array of `Seat` objects the user has clicked (local only, max 10). These are not yet reserved on the server.
+- `reservation` -- Server-confirmed reservation with an expiration timestamp. Seats are held with 10-minute TTL.
+- `queueStatus` -- Virtual waiting room position and estimated wait time. Non-null when the user is in a queue.
+- `checkoutTimer` -- Countdown in seconds until reservation expires. Drives the urgency display in the UI.
+
+The store manages a `setInterval`-based countdown timer for the reservation expiry. When `startCheckoutTimer` is called with an expiration timestamp, it calculates remaining seconds every 1 second and updates `checkoutTimer`. When the timer reaches zero, it automatically clears the reservation and selected seats, showing an "expired" error.
+
+### Routing
+
+TanStack Router with file-based routing. The route structure is flat with a single dynamic segment for events (`/events/$eventId`). The event detail page is the most complex route, containing conditional rendering based on event status:
+- **Upcoming**: Shows the on-sale date with no purchase UI
+- **On Sale (queue enabled)**: Shows "Enter Waiting Room" button, then the `WaitingRoom` component while waiting, then the seat map once admitted
+- **On Sale (no queue)**: Shows section selection and seat map immediately
+- **Sold Out**: Shows "Sold Out" badge with no purchase UI
+
+### Data Fetching
+
+API communication is organized into four domain-specific API modules (`authApi`, `eventsApi`, `seatsApi`, `queueApi`, `checkoutApi`) that all share a common `fetchApi` wrapper. The wrapper handles session ID injection, credentials inclusion, and error response parsing. Data fetching is done in `useEffect` hooks.
+
+Two polling patterns exist on the event detail page:
+1. **Seat availability polling**: Refreshes section availability every 10 seconds when the event is on sale. This provides near-real-time seat map accuracy without WebSocket complexity.
+2. **Queue status polling**: Checks queue position every 2 seconds when the user is in a waiting room. Faster polling is acceptable here because the response is small (position and wait estimate) and timely updates matter for user experience.
+
+### Real-Time Updates
+
+The frontend does not use WebSocket connections. Instead, it relies on two polling strategies:
+- 10-second interval for seat availability (acceptable staleness for map display)
+- 2-second interval for queue position (users expect responsive queue updates)
+
+The reservation expiry countdown is a client-side timer, not server-driven.
+
+### Key UI Patterns
+
+- **Interactive Seat Map**: The `SeatMap` component renders a grid of seats organized by row. Each seat is a clickable button color-coded by pricing tier (VIP=purple, Premium=blue, Standard=green, Economy=gray) and status (Selected=blue, Sold=dark gray, Held=yellow). Seats are sorted by row letter and seat number. A stage indicator and color legend provide spatial context.
+- **Virtual Waiting Room**: The `WaitingRoom` component shows queue position with a large number display, estimated wait time, and animated bouncing dots to indicate the system is working. Users can leave the queue voluntarily. The component receives queue status from the ticket store, which polls the server every 2 seconds.
+- **Checkout Timer**: When seats are reserved, the `CheckoutSummary` component shows a countdown timer. The timer is driven by the ticket store's `checkoutTimer` state, which decrements every second. Visual urgency increases as time decreases (color changes from normal to warning). If the timer expires, the reservation is automatically cleared and the user must select seats again.
+- **Section-First Navigation**: The event detail page uses a two-step selection flow. First, the user selects a venue section from a grid showing available/total counts and price ranges. Then, the seat map loads for that section. A "Back to sections" button allows switching sections, which also clears the current seat selection.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in the project. Each explanation covers what the pattern is, why it exists, how it works in this project, and what would go wrong without it.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles. Instead of maintaining per-user permission lists, the system checks whether a user's role includes the required permission. This creates manageable access control that scales with the number of users without increasing administrative overhead.
+
+**Why it exists**: In a ticketing platform, regular users should be able to browse events and buy tickets, but they should not be able to create events, modify venues, or view other users' orders. Without RBAC, every endpoint would need custom per-user authorization logic, and adding a new admin would require manually copying permissions from an existing admin.
+
+**How it works here**: The `users` table has a `role` column with values `user` or `admin`. Auth middleware extracts the user from their session and attaches it to the request. Route-level middleware then checks `req.user.role` before allowing access to admin endpoints (creating events, managing venues, viewing all orders). Regular users can only view their own orders. The admin role is strictly additive -- admins have all user permissions plus management capabilities.
+
+**What goes wrong without it**: Any authenticated user could create fake events, modify seat prices, or access other customers' order history. A malicious user could create a fake high-demand event to harvest personal information during "checkout."
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks Redis before querying the database. On a cache miss, the application queries PostgreSQL, stores the result in Redis with a TTL, and returns it. On a cache hit, the cached value is returned without touching the database. The database remains the source of truth, and the cache is a transparent performance layer.
+
+**Why it exists**: During a high-demand on-sale, the event detail page and seat availability endpoint receive 20,000 requests per second. Every request querying PostgreSQL for event details and seat counts would require 20,000+ database queries per second, overwhelming the connection pool and causing cascading timeouts. Cache-aside absorbs 95%+ of read traffic for event details and availability.
+
+**How it works here**: Event details are cached with 60-second TTL (events change rarely). Venue details use 5-minute TTL (venues never change during an on-sale). Seat availability uses dynamic TTL: 5 seconds during active on-sales (when availability changes rapidly) and 30 seconds for normal browsing (when seat status is stable). Session data is cached in Redis with 24-hour TTL. On cache miss, the application queries PostgreSQL and populates the cache. On seat status change (reservation, purchase, expiry), the affected availability cache entries are explicitly invalidated so the next request fetches fresh data.
+
+**What goes wrong without it**: During a 20,000 RPS on-sale, every request hits PostgreSQL directly. The database's 100-connection pool is exhausted within seconds. Queries queue up, request timeouts cascade, and the entire system becomes unresponsive. Users see "Service Unavailable" errors during the highest-traffic, highest-revenue moments.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service. It operates in three states: CLOSED (requests flow normally, failures are counted), OPEN (requests are immediately rejected with a fallback response, no calls to the failing service), and HALF-OPEN (a limited number of test requests are allowed through to check if the service has recovered). This prevents a single dependency failure from cascading into a full system outage.
+
+**Why it exists**: When the payment gateway goes down during a high-demand on-sale, thousands of checkout requests per minute would all wait for the payment timeout (e.g., 10 seconds) before failing. Each waiting request holds a database connection, an event loop slot, and memory. Within seconds, the server runs out of resources and cannot serve any requests -- including seat browsing and queue management that do not need the payment service. The circuit breaker detects the failure pattern and fails fast, preserving resources for operations that can still succeed.
+
+**How it works here**: The project implements a custom circuit breaker (not Opossum) at `backend/src/shared/circuit-breaker.ts` with configurable thresholds. The payment circuit breaker opens after 5 consecutive failures and resets after 30 seconds. When open, checkout requests receive an immediate "Payment service temporarily unavailable" response instead of hanging for 10 seconds. The health check endpoint includes circuit breaker state so operators can see whether the payment service is healthy. A Redis fallback circuit breaker handles seat locking: if Redis fails, the system falls back to PostgreSQL advisory locks (`pg_try_advisory_lock`), which work but with higher latency (~20ms vs ~1ms) and more connection pool pressure.
+
+**What goes wrong without it**: Payment gateway has a 30-second outage during a Taylor Swift on-sale. 5,000 concurrent checkout requests each wait 10 seconds for the timeout. 50,000 request-seconds of capacity is consumed doing nothing. The API server's event loop is blocked, health checks fail, the load balancer marks the server as unhealthy, and users in the waiting room are bounced to a different server, losing their queue position.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Each log entry has consistent fields like `timestamp`, `level`, `message`, `requestId`, `userId`, and domain-specific context. This allows log aggregation systems to index, search, filter, and alert on specific fields without regex pattern matching.
+
+**Why it exists**: In a ticketing system, debugging a failed checkout requires correlating multiple operations: queue admission, seat lock acquisition, seat reservation, payment processing, and order creation. With unstructured text logs, an engineer would need to grep for a session ID across millions of log lines and manually reconstruct the timeline. Structured logging enables queries like "show all logs where `eventId=abc` and `event=checkout_failed` in the last hour, sorted by timestamp."
+
+**How it works here**: The project uses Pino for JSON logging with business-specific event loggers. Six event types have dedicated structured logging: `seat_reserved` and `seat_released` include seat ID, section, row, and event context. `checkout_completed` and `checkout_failed` include order ID, total amount, and payment status. `lock_contention` logs when a seat lock attempt fails (indicating high demand). `oversell_prevented` is a critical alert logged when the system detects and prevents a double-sale. Each log entry includes the request ID for end-to-end tracing of a single user's journey from queue to purchase.
+
+**What goes wrong without it**: A user reports they were charged but did not receive order confirmation. The support team searches logs for the user's email and finds 200+ log lines across 3 server instances. Without structured fields, they cannot determine whether the payment succeeded, whether the order was created, or whether the seat status was updated. The investigation takes 2 hours instead of 2 minutes.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system where the application exposes numerical metrics at a `/metrics` endpoint, and a Prometheus server scrapes this endpoint at regular intervals. Metrics are categorized as counters (monotonically increasing totals), gauges (point-in-time values), histograms (distributions of values across configurable buckets), and summaries (pre-calculated percentiles). These metrics power dashboards and automated alerting.
+
+**Why it exists**: Metrics answer questions that logs cannot: "What is the current checkout success rate?" "How does seat lock latency compare to yesterday?" "Is the queue growing or shrinking?" These are aggregate, time-series questions that require numerical data collected continuously, not individual request traces.
+
+**How it works here**: The project exposes 15+ metrics using the `prom-client` library. Ticketing-specific metrics include `seats_reserved_total` and `seats_sold_total` (counters by event), `checkout_completed_total` and `checkout_failed_total` (counters by event and failure reason), `checkout_duration_seconds` (histogram), `queue_length` and `active_sessions` (gauges by event), and `seat_lock_attempts_total` (counter by success/failure). Infrastructure metrics include standard HTTP request counters, Redis operation latency, and circuit breaker state. The SLO targets defined earlier (seat map load < 200ms p95, checkout < 2s p95) are monitored via the histogram metrics.
+
+**What goes wrong without it**: During a high-demand on-sale, the checkout success rate drops from 99% to 60% over 10 minutes. No one notices because there are no dashboards and no alerts. The problem is discovered 2 hours later when social media complaints trend. Post-mortem reveals that the seat lock Redis key had a misconfigured TTL, and 40% of locks were expiring before checkout completed -- a metric that would have triggered an alert within 1 minute if monitored.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make to an endpoint within a time window. When a client exceeds the allowed number of requests, subsequent requests receive a `429 Too Many Requests` HTTP response until the window resets. Limits are typically tracked per user or per IP using atomic counters in Redis with TTL-based expiration.
+
+**Why it exists**: Ticketing is particularly vulnerable to abuse. Scalper bots can send thousands of seat reservation requests per second to snatch up tickets before legitimate fans. Without rate limiting, a single bot could reserve all seats in a venue section within milliseconds of the on-sale starting. Rate limiting also protects against accidental abuse, like a buggy mobile app that retries failed requests in a tight loop.
+
+**How it works here**: Five rate limit tiers are defined. Auth endpoints are limited to 10 requests per minute per IP (prevents credential stuffing). Seat reservation is limited to 20 per minute per user (prevents bot-driven seat hoarding). Checkout is limited to 5 per minute per user (prevents payment flooding). Queue join is limited to 5 per minute per user (prevents queue manipulation). All other endpoints default to 100 per minute. The limits are defined in the architecture but enforced via Redis counters in the rate limiting middleware.
+
+**What goes wrong without it**: A scalper deploys 50 bots that each send 100 seat reservation requests per second when a popular event goes on sale. Within 5 seconds, 25,000 reservation requests lock up every seat in the venue. Legitimate fans in the waiting room are admitted to find zero available seats. All held seats expire 10 minutes later (bots do not complete checkout), but by then fans have left, and the next wave of bot reservations begins.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. For HTTP APIs, this is achieved by generating a deterministic key from the request parameters, storing the result of the first execution, and returning that cached result for all subsequent requests with the same key. The key is typically derived from the user's identity and the specific resources being operated on.
+
+**Why it exists**: Network unreliability is amplified during high-traffic on-sales. Users click "Complete Purchase" and see a loading spinner. The request reaches the server, payment is processed, but the response is lost due to a network blip. The user clicks again. Without idempotency, the second click creates a second order and charges the user twice for the same seats. Load balancers also retry requests on upstream timeouts, creating server-initiated duplicates.
+
+**How it works here**: The checkout endpoint generates an idempotency key from `checkout:{sessionId}:{eventId}:{sorted_seat_ids}`. This key is checked in Redis first (fast path, sub-millisecond) and the PostgreSQL `idempotency_keys` table second (durable fallback). If found, the cached order is returned. If not found, the checkout proceeds normally and stores the result in both Redis (24-hour TTL) and PostgreSQL. The deterministic key format ensures that the same user attempting to buy the same seats produces the same key, regardless of how many times they click "Pay."
+
+**What goes wrong without it**: A user buys 4 tickets for $400 total. Network timeout causes a retry. Two orders are created, two $400 charges appear on their credit card. The 4 seats are now in 2 different orders. Customer support must manually refund one order and reconcile inventory. At scale (50,000 checkouts during a major on-sale), even a 0.1% duplicate rate means 50 double-charged customers per event.
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They return structured responses showing the status of each component (database, cache, circuit breakers) with latency measurements. Load balancers use health checks to route traffic away from unhealthy instances. Container orchestrators use them to restart failing containers. Monitoring systems use them to track dependency health over time.
+
+**Why it exists**: A ticketing server might be running (process alive, port open) but unable to serve requests because the Redis connection used for seat locks is broken, or the PostgreSQL connection pool is exhausted. Without health checks, the load balancer continues sending 20,000 RPS to this broken instance, and every request fails. Health checks allow the infrastructure to detect partial failures and automatically redirect traffic to healthy instances.
+
+**How it works here**: Three health endpoints are implemented. `GET /health` is a deep health check that tests PostgreSQL (runs `SELECT 1`, measures latency), Redis (runs `PING`, measures latency), and reports the payment circuit breaker state. `GET /ready` is a readiness probe that performs quick DB and Redis connectivity checks. `GET /live` is a liveness probe that simply confirms the process is alive. The deep health check returns component-level status objects with latency in milliseconds and an overall `ok`/`degraded` status. The load balancer polls `/ready` every 5 seconds and removes instances that fail 3 consecutive checks.
+
+**What goes wrong without it**: During a high-demand on-sale, one of three API servers experiences a Redis connection failure. Seat locking falls back to PostgreSQL advisory locks (slower but functional). However, without health checks, the load balancer does not know this instance is degraded. It continues sending 33% of traffic there. Users hitting this server experience 20x slower seat locking, causing timeouts and failed reservations, while the other two servers have spare capacity. The problem appears intermittent ("sometimes checkout works, sometimes it does not") and is extremely difficult to diagnose without health telemetry.
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local implementation: what production patterns are implemented, what was simplified, and what was omitted.

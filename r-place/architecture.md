@@ -511,6 +511,182 @@ This reduces message fan-out by 90%+ for large canvases.
 | Background jobs | RabbitMQ | Cron jobs | Decouples snapshot timing from API server load |
 | Session storage | Redis + cookie | JWT | Immediate revocation, server-controlled expiry |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App (direct rendering, no router)
+├── Header
+│   ├── Title: "r/place"
+│   ├── Toolbar (zoom controls: zoom in, zoom out, reset)
+│   └── AuthPanel
+│       ├── Login/Register forms (unauthenticated)
+│       ├── Guest login button
+│       └── User info + logout (authenticated)
+│
+├── Canvas (main interactive area)
+│   ├── HTML5 <canvas> element (pixel rendering)
+│   ├── Hover indicator (white border on hovered pixel at zoom >= 2x)
+│   ├── Notification banner (placement feedback, errors)
+│   ├── Zoom indicator (bottom-right, e.g., "500%")
+│   └── Coordinates display (bottom-left, e.g., "(120, 340)")
+│
+└── Footer
+    ├── ColorPalette (16-color grid with selection ring)
+    └── CooldownTimer (countdown display when rate-limited)
+```
+
+### Zustand Store
+
+A single Zustand store (`useAppStore`) manages all client-side state with no persistence middleware -- the canvas state is ephemeral and always fetched fresh from the server on load.
+
+**User state**: `user` (User object or null), `isAuthenticated`, `isLoading`. Auth actions (`login`, `register`, `logout`, `loginAnonymous`) call the REST API and then reconnect the WebSocket to associate the new session.
+
+**Canvas state**: `config` (server-provided canvas dimensions, cooldown duration, and 16-color palette), `canvas` (a `Uint8Array` where each byte represents one pixel's color index, 0-15). The `setCanvas` action decodes a base64-encoded string from the server into the byte array. The `updatePixel` action modifies a single byte at `offset = y * width + x`.
+
+**View state**: `selectedColor` (currently chosen palette color, default: red/index 5), `hoveredPixel` (coordinates under the cursor, or null), `zoom` (clamped between 0.5x and 20x), `panOffset` (pixel offset for drag-panning). These are purely local UI state -- they are not sent to the server.
+
+**Cooldown state**: `cooldown` (CooldownStatus with `canPlace`, `remainingSeconds`, `nextPlacement` timestamp) and `cooldownTimer` (interval ID for countdown). When a pixel is successfully placed, the server responds with the `nextPlacement` timestamp. A `setInterval` updates `remainingSeconds` every second until the cooldown expires. The timer is cleaned up and restarted on each new cooldown to avoid stale intervals.
+
+**Pixel placement flow**: The `placePixel` action checks authentication and cooldown before calling the REST API. On success, it starts the cooldown timer. The actual canvas update comes via the WebSocket broadcast (the server publishes the pixel update to all subscribers, including the sender).
+
+### Routing
+
+No router is used. The application is a single-view pixel canvas that fills the entire viewport. The `App` component calls `initialize()` on mount, which loads canvas configuration, checks authentication, and establishes the WebSocket connection. There are no URL-based routes -- the entire UI is always visible.
+
+### Data Fetching
+
+The frontend uses a split communication strategy:
+
+**REST API** (`services/api.ts`): Used for authentication (register, login, logout, guest), canvas configuration (`GET /api/v1/canvas/info`), pixel placement (`POST` to the API which enforces rate limiting and idempotency), and history queries. All requests use `credentials: 'include'` for cookie-based session auth.
+
+**WebSocket** (`services/websocket.ts`): Used for real-time data delivery. A singleton `WebSocketService` class manages the connection lifecycle with automatic reconnection using exponential backoff (base delay 1 second, doubled each attempt, max 10 attempts). On connect, the server sends the full canvas state as a base64-encoded byte array. Subsequently, individual pixel updates arrive as `{type: "pixel", data: {x, y, color}}` messages, and the store updates the local `Uint8Array` in place.
+
+**WebSocket message types handled**:
+- `canvas`: Full canvas state (base64 binary), received on connect
+- `pixel`: Single pixel update, applied to the local byte array
+- `pixels`: Batch of pixel updates (array), each applied sequentially
+- `cooldown`: Updated cooldown status from the server
+- `connected`: Confirmation of successful WebSocket connection
+
+**Reconnection flow**: When the WebSocket disconnects, the `attemptReconnect` method uses exponential backoff. On successful reconnection, the server sends a fresh `canvas` message, ensuring the client converges to the current state even after extended disconnection.
+
+### Key UI Patterns
+
+**HTML5 Canvas rendering**: The pixel grid is rendered using the HTML5 Canvas API rather than DOM elements. The `renderCanvas` function iterates through every pixel in the `Uint8Array`, maps each byte to a hex color from the server-provided palette, and calls `ctx.fillRect(x, y, 1, 1)` for each pixel. The canvas element's dimensions match the grid size (e.g., 500x500), while CSS `width` and `height` are multiplied by the zoom factor. The `imageRendering: 'pixelated'` CSS property ensures sharp edges when zoomed in, preventing the browser from anti-aliasing the pixel art.
+
+**Zoom and pan**: Mouse wheel events adjust the `zoom` state (clamped to 0.5x-20x). The canvas CSS dimensions scale with zoom, creating a natural zoom effect. Panning is initiated by middle-click or right-click drag -- the `dragStart` coordinates are tracked, and mouse movement updates `panOffset` which applies a CSS `transform: translate()` to the canvas container. Right-click context menu is suppressed to enable right-click panning.
+
+**Pixel hover indicator**: When `zoom >= 2` (zoomed in enough to see individual pixels), a white-bordered div is absolutely positioned over the hovered pixel. Its position is computed as `left = x * zoom, top = y * zoom` with `width = zoom, height = zoom`. At low zoom levels, the indicator is hidden because individual pixels are too small to target meaningfully.
+
+**Coordinate-to-pixel mapping**: The `getCanvasCoords` function converts mouse event coordinates to pixel coordinates by: (1) getting the canvas element's bounding rect, (2) subtracting the element's position from the mouse position, (3) dividing by zoom, (4) flooring to integer. It returns null if the coordinates are outside the canvas bounds.
+
+**16-color palette**: The `ColorPalette` component renders a flex-wrapped grid of color buttons. The selected color gets a white ring with offset (using Tailwind's `ring-2 ring-white ring-offset-2`) and a slight scale increase. Colors come from the server's `config.colors` array rather than being hardcoded, allowing the server to change the palette without a frontend deploy.
+
+**Cooldown timer**: The `CooldownTimer` component reads `cooldown.remainingSeconds` from the store and displays a countdown. When `canPlace` is true, it shows "Ready" or a green indicator. The countdown updates every second via the `setInterval` managed in the store's `updateCooldown` action.
+
+**Notification system**: Ephemeral notifications (e.g., "Pixel placed!", "Please sign in", "Wait 3s") are managed as local state in the `Canvas` component. They auto-dismiss after 2-3 seconds using `setTimeout`. Positioned as a centered banner at the top of the canvas area.
+
+## Production-Grade Pattern Deep Dives
+
+This section explains each production-grade pattern referenced in the architecture, written for readers encountering these concepts for the first time.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing downstream service. The name comes from electrical circuit breakers: when too much current flows (too many failures), the breaker trips to prevent damage (cascading failure).
+
+**The three states**:
+1. **Closed** (normal operation): Requests pass through to the downstream service. Each failure is counted. When failures exceed a threshold (e.g., 50% of the last 5 requests), the circuit "opens."
+2. **Open** (protection mode): All requests are immediately routed to a fallback function. No calls are made to the downstream service. This prevents a slow or failing service from consuming the caller's resources (threads, connections, memory) while waiting for timeouts.
+3. **Half-open** (recovery test): After a reset timeout (e.g., 30 seconds), the circuit allows exactly one request through. If it succeeds, the circuit closes and normal operation resumes. If it fails, the circuit reopens for another timeout period.
+
+**How it works in this project**: Redis operations (canvas reads, rate limit checks, idempotency lookups, pub/sub publishing) are all wrapped in Opossum circuit breakers configured with 50% error threshold, 5-request volume threshold, 5-second timeout, and 30-second reset timeout. Each breaker has a fallback function defining degraded behavior:
+- Canvas read fails -> return empty canvas (client shows blank)
+- Rate limit check fails -> allow the placement (fail-open for better UX)
+- Event write fails -> pixel is placed in Redis, PostgreSQL insert is queued for retry
+- Pub/sub publish fails -> local server broadcasts to its own WebSocket clients only
+
+State changes (open/close/half-open) emit Prometheus gauge updates and Pino log entries for monitoring.
+
+**Why this matters for r/place**: The system's hot path is: check rate limit (Redis) -> update canvas (Redis) -> write event (PostgreSQL) -> publish update (Redis pub/sub). If Redis goes down, without a circuit breaker, every pixel placement would wait 5 seconds for the Redis timeout, then fail. With 100 concurrent users each trying to place pixels, that is 100 requests stacked up every 5 seconds, each consuming a connection and an event loop tick. The circuit breaker detects the failure after 3-5 requests and starts immediately using fallbacks, keeping the server responsive.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In the context of pixel placement, this means a duplicate placement request (caused by network retries, client-side double-clicks, or load balancer request duplication) does not place the pixel twice or create duplicate history entries.
+
+**How idempotency keys work in this project**: Each pixel placement generates a key from `userId + x + y + color` (or a client-provided `X-Idempotency-Key` header). Before processing, the server checks Redis: `GET idempotency:pixel:{key}`. If found, the cached result (success/failure, next placement time) is returned immediately. If not found, the placement is processed normally, and the result is stored in Redis with a 10-second TTL. The short TTL covers the retry window without conflicting with the 5-second cooldown. See `src/shared/idempotency.ts`.
+
+**Fail-open behavior**: If Redis is unavailable (circuit breaker open), the idempotency check is skipped and the request is allowed through. This is acceptable because: (1) duplicate placements on the same pixel produce the same visual result (same color at same position), (2) the only side effect is a duplicate PostgreSQL history entry, which is harmless.
+
+**Why this matters**: Consider a user placing a pixel. The WebSocket/HTTP request is sent, but the response is lost due to a network glitch. The client retries. Without idempotency, the retry would succeed but also reset the cooldown timer (the user now has to wait another 5 seconds). With idempotency, the retry returns the cached result including the original cooldown timestamp, so the user's cooldown is not extended.
+
+### Prometheus Metrics
+
+Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics at a `/metrics` HTTP endpoint in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the data as time series for querying, dashboarding, and alerting.
+
+**Three metric types**:
+- **Counter**: A monotonically increasing number. Example: `rplace_pixels_placed_total{color}` counts pixel placements by color. Querying the *rate* tells you placements per second.
+- **Gauge**: A number that goes up and down. Example: `rplace_active_websocket_connections` shows how many users are currently connected. `rplace_circuit_breaker_state{name}` shows whether each circuit breaker is closed (0), half-open (0.5), or open (1).
+- **Histogram**: Tracks value distributions in configurable buckets. Example: `rplace_pixel_placement_duration_seconds` with buckets at 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 seconds. Lets you compute percentiles: "p95 pixel placement takes 12ms."
+
+**Metrics defined in this project** (15+ total): pixel placement counters by color, placement latency histogram, WebSocket connection gauge, active users gauge (placed a pixel in last 5 minutes), rate limit hit counter, HTTP request counters and latency histograms by method/path/status, Redis and PostgreSQL operation counters with latency histograms, circuit breaker state gauges, idempotency cache hit counter, and snapshot creation counter. Includes Express middleware that automatically tracks HTTP metrics. See `src/shared/metrics.ts`.
+
+**Why metrics matter for r/place**: The architecture targets pixel placement acknowledgment < 50ms (p95) and broadcast to all users < 100ms (p95). Without histograms on placement latency and broadcast latency, you cannot verify these targets. The rate limit hits counter tells you how many users are bumping against the cooldown -- if this spikes, the cooldown duration might be too short. The WebSocket connection gauge directly correlates with memory usage and helps capacity planning.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-readable JSON objects instead of free-form text. Instead of `"User abc placed pixel at (100, 200) with color 5 in 8ms"`, the entry is `{"level":"info","traceId":"1710745200-abc123","userId":"abc","x":100,"y":200,"color":5,"latencyMs":8,"event":"pixel_placed"}`.
+
+**Why JSON instead of text**: When 3 API server instances are each processing 20 pixel placements per second and generating hundreds of log lines per second, searching free-form text becomes impossible. JSON logs can be indexed by any field: "show me all pixel placements by user abc where latencyMs > 100" is a trivial query in a log aggregation system but requires complex regex with text logs.
+
+**How Pino works in this project**: Pino outputs JSON in production and pretty-prints in development via `pino-pretty`. Dedicated helper functions provide consistent log structure: `logPixelPlaced(traceId, userId, x, y, color, latencyMs)`, `logRateLimitHit(traceId, userId, remainingSeconds)`, `logWebSocketConnect(userId, username, totalConnections)`, `logCircuitBreakerOpen(circuitName, error)`. Each includes a `traceId` (generated as `timestamp-random`) that links all operations within a single request. See `src/shared/logger.ts`.
+
+**Trace ID propagation**: Each incoming request (HTTP or WebSocket message) generates a unique trace ID. This ID is included in every log entry and Prometheus metric label for that request. When debugging "why did user X's pixel placement take 500ms?", you filter logs by the trace ID and see every step: idempotency check (2ms), rate limit check (1ms), canvas update (3ms), PostgreSQL insert (490ms -- found the bottleneck), pub/sub publish (1ms).
+
+### Rate Limiting
+
+Rate limiting restricts how frequently a client can perform an action. For r/place, this is the core fairness mechanism: without it, bots could paint over the canvas faster than humans could respond.
+
+**How it works in this project**: Redis `SET ratelimit:user:{userId} "1" NX EX 5` provides atomic, race-condition-free per-user cooldown enforcement. The `NX` flag means "set only if the key does not exist" -- if the key already exists (user is on cooldown), the SET returns nil and the placement is rejected. The `EX 5` flag sets a 5-second TTL, after which the key auto-expires and the user can place again.
+
+**Why SET NX EX is better than alternatives**: (1) It is a single atomic Redis command -- no read-then-write race condition exists, even if two requests from the same user arrive on different servers within the same millisecond. (2) The TTL handles cleanup automatically -- no background job needed to expire old keys. (3) It naturally works across multiple server instances because they all share the same Redis.
+
+**Remaining cooldown calculation**: When a placement is rejected, the server uses `PTTL ratelimit:user:{userId}` (millisecond TTL) to tell the client exactly how many seconds remain. The client displays this as a countdown timer.
+
+**Why rate limiting matters for collaborative art**: Without the 5-second cooldown, a single bot could repaint the entire 500x500 canvas (250,000 pixels) in seconds. The cooldown limits each user to 12 placements per minute, ensuring that the canvas evolves as a collaborative effort. The cooldown also bounds the maximum write throughput: 100K concurrent users / 5 seconds = 20K placements/second, which is within the system's design capacity.
+
+### Health Checks
+
+A health check is an HTTP endpoint that reports whether the service is alive and capable of handling requests. Load balancers, container orchestrators, and monitoring systems poll this endpoint to decide where to route traffic and when to restart instances.
+
+**Two levels in this project**:
+- **Liveness** (`GET /health`): Returns HTTP 200 if the process is running. Used to detect crashed or frozen processes.
+- **Readiness** (`GET /health/ready`): Tests Redis connectivity (`PING`), PostgreSQL connectivity (`SELECT 1`), and returns HTTP 200 only when both are reachable. Includes latency measurements and uptime in the response body.
+
+**Why readiness checks matter for WebSocket servers**: A WebSocket server with a broken Redis connection would accept new client connections but fail to place any pixels (rate limit check fails, canvas update fails, pub/sub publish fails). Without a readiness check, the load balancer would route new users to this broken instance. Users would see the canvas load but every placement would fail with a generic error. The readiness check catches this: Redis is unreachable, the instance reports not-ready, and the load balancer stops sending new connections.
+
+### Redis Cache-Aside
+
+Cache-aside is a caching strategy where the application checks the cache before querying the database. For r/place, this pattern is implicit in the architecture: the canvas state *lives* in Redis as the primary store, and PostgreSQL serves as the persistence layer.
+
+**How it works**: The canvas byte array in Redis is the authoritative real-time state. Pixel placements update Redis first (via `SETRANGE`), then asynchronously log to PostgreSQL's `pixel_events` table. On server restart, if the Redis canvas is empty, the latest PostgreSQL snapshot is loaded into Redis to restore state.
+
+**Why Redis is the primary store (not a cache)**: For r/place, latency is critical -- users expect to see their pixel appear within 100ms. Redis `SETRANGE` for a single byte takes ~0.1ms. A PostgreSQL `UPDATE` for the same operation takes ~2ms. With 20K placements/second, Redis handles the write load effortlessly while PostgreSQL would struggle with row-level locking on a single canvas row. Redis serves as both the hot data store and the pub/sub bus for broadcasting updates.
+
+### RBAC (Role-Based Access Control)
+
+RBAC restricts system access based on roles assigned to users. Instead of per-user permission lists, you define roles with associated capabilities and assign users to roles.
+
+**How it works in this project**: Three roles are defined in the `users.role` column:
+- **Guest** (anonymous): Can place pixels and view the canvas. No persistent identity across sessions.
+- **User** (registered): Can place pixels, view canvas, and view placement history. Has a persistent username.
+- **Admin**: All user capabilities plus: reset canvas, ban/unban users, change cooldown settings, view system statistics.
+
+Admin endpoints (`/api/v1/admin/*`) are protected by middleware that checks `user.role === 'admin'`. Non-admin users receive HTTP 403 Forbidden.
+
+**Why RBAC instead of per-user permissions**: The permission model is simple enough that per-user lists would work, but RBAC is cleaner to implement and extend. Adding a "moderator" role (can ban users but not reset canvas) requires adding one role definition, not updating every moderator's permission list.
+
 ## Implementation Notes
 
 This section maps the production architecture to the actual local implementation, documenting production-grade patterns used, simplifications, and omissions.

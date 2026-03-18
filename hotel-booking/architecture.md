@@ -562,6 +562,155 @@ Each circuit breaker has a fallback: payment queues for later, availability retu
 | Reservation hold | 15-minute expiry | Instant confirm/reject | Payment processing needs time window |
 | Pricing model | Base + date overrides | Algorithmic pricing | Simple to implement, easy for hotel admins |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (RootLayout)
+├── Header (navigation, auth status, admin link)
+├── <Outlet /> (route-specific content)
+│   ├── index.tsx (HomePage)
+│   │   └── SearchBar (variant="hero")
+│   ├── search.tsx (SearchResultsPage)
+│   │   ├── SearchBar (variant="compact")
+│   │   └── HotelCard[] (search results grid)
+│   ├── hotels.$hotelId.tsx (HotelDetailPage)
+│   │   ├── AvailabilityCalendar
+│   │   └── RoomTypeCard[] (room types with pricing)
+│   ├── booking.tsx (BookingPage)
+│   ├── bookings.index.tsx (MyBookingsPage)
+│   │   └── BookingCard[] (booking history)
+│   ├── bookings.$bookingId.tsx (BookingDetailPage)
+│   ├── login.tsx / register.tsx (AuthPages)
+│   ├── admin.index.tsx (AdminDashboard)
+│   │   ├── HotelSelector
+│   │   ├── StatsGrid
+│   │   ├── CreateHotelModal
+│   │   ├── DashboardHotelCard[]
+│   │   └── BookingsTable
+│   └── admin.hotels.$hotelId.tsx (AdminHotelPage)
+│       ├── HotelHeader
+│       ├── AdminRoomTypeCard[]
+│       ├── RoomTypeModal
+│       └── PricingModal
+└── Footer (static footer content)
+```
+
+### Zustand Stores
+
+**`authStore`** -- Manages user authentication state with persistence. Stores the JWT token in localStorage via Zustand's `persist` middleware, but only persists the token itself (not the full user object). On app startup, `checkAuth()` validates the stored token by calling `GET /api/v1/auth/me` and restores the user session if the token is still valid. Supports three roles: `user`, `hotel_admin`, and `admin`. The store also synchronizes the token with the API service singleton so all subsequent fetch calls include the `Authorization` header.
+
+**`searchStore`** -- Maintains search parameters (city, dates, guests, rooms, sort order, pagination) as a single object with merge-based updates. The `setParams` action performs shallow merge, allowing individual fields to be updated without resetting others. Used by the `SearchBar` component to persist search criteria across navigation (e.g., user clicks into a hotel detail page and navigates back to search results without losing filters). Does not persist to localStorage -- search state resets on page refresh.
+
+### Routing
+
+TanStack Router with file-based routing. Routes are organized into two groups:
+
+- **Guest routes**: `/` (home), `/search` (results), `/hotels/$hotelId` (detail), `/booking` (checkout), `/bookings` (history), `/bookings/$bookingId` (detail), `/login`, `/register`
+- **Admin routes**: `/admin` (dashboard), `/admin/hotels/$hotelId` (hotel management with room types and pricing)
+
+The root layout (`__root.tsx`) renders the `Header` and `Footer` around an `<Outlet />`. There is no route-level authentication guard; instead, individual pages check `useAuthStore().isAuthenticated` and redirect to `/login` when needed.
+
+### Data Fetching
+
+All API communication flows through a centralized `ApiService` class (`services/api.ts`) that wraps `fetch` with automatic JSON parsing, error handling, and auth header injection. The service is a singleton instance exported as `api`. There is no React Query or SWR -- data fetching happens in `useEffect` hooks within route components, storing results in local `useState`. This means there is no automatic cache invalidation, background refetching, or stale-while-revalidate behavior. The search results page calls `api.searchHotels()` on mount and when search params change. The hotel detail page calls `api.getHotel()` with optional date parameters to include availability data.
+
+### Key UI Patterns
+
+- **Availability Calendar**: The `AvailabilityCalendar` component fetches per-day availability and pricing data for a room type and month. It renders a calendar grid where each day cell shows the available room count and nightly price. Days with no availability are grayed out. Clicking a date sets check-in or check-out in the search store, enabling a visual date-selection flow.
+- **Dynamic Pricing Display**: Room type cards show per-night prices that may differ from the base price when date-specific overrides are in effect. The `PricingModal` in the admin dashboard lets hotel admins set individual date overrides.
+- **Booking Status Lifecycle**: The `BookingCard` component renders different action buttons based on booking status. A `reserved` booking shows "Confirm" and "Cancel" buttons with the remaining hold time. A `confirmed` booking shows the cancellation policy. A `completed` booking shows a review submission form.
+- **Admin Dashboard**: The admin section uses a hotel selector dropdown for multi-property admins, a stats grid showing key metrics (total bookings, revenue, occupancy), and a bookings table with status filtering.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in the project. Each explanation covers what the pattern is, why it exists, how it works in this project, and what would go wrong without it.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles. Instead of checking "can user X do action Y?" for every user individually, the system checks "does user X have a role that includes permission Y?" This creates a layer of indirection that simplifies permission management.
+
+**Why it exists**: Without RBAC, you would need to maintain a per-user permission list. If you have 10,000 hotel admins and want to add a new permission (e.g., "export booking reports"), you would need to update 10,000 records. With RBAC, you update the `hotel_admin` role once. RBAC also prevents privilege escalation -- a regular user cannot access admin endpoints because the middleware rejects their role before the request reaches business logic.
+
+**How it works here**: The `users` table has a `role` column with values `user`, `hotel_admin`, or `admin`. The auth middleware reads the session, attaches the user object (including role) to the request, and route-level middleware checks `req.user.role`. For example, `POST /api/v1/admin/hotels` requires `hotel_admin` or `admin`. Hotel admins can only manage their own hotels (the query filters by `owner_id = req.user.id`), so RBAC is combined with resource-level ownership checks.
+
+**What goes wrong without it**: Any authenticated user could create hotels, modify pricing, or view other users' bookings. A malicious user could set room prices to $0 or cancel other guests' reservations.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache miss, the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it. On a cache hit, the application returns the cached value without touching the database at all. The cache is "aside" from the main data path -- the database does not know the cache exists.
+
+**Why it exists**: Database queries for availability checking involve complex SQL with `generate_series` and aggregate functions across date ranges. At 500 search requests per second, every search triggering these queries per hotel would overwhelm the database. Cache-aside reduces database load by serving repeated queries from Redis (sub-millisecond response) instead of PostgreSQL (5-20ms per query). The TTL ensures stale data eventually refreshes without manual invalidation for every read.
+
+**How it works here**: Availability data is cached with keys like `availability:{hotel_id}:{room_type_id}:{checkIn}:{checkOut}` and a 5-minute TTL. When a user searches for hotels, the system checks Redis first for each hotel's availability. On a miss, it runs the PostgreSQL availability query and stores the result. When a booking is created, cancelled, or expires, the system explicitly invalidates the affected cache keys so the next request sees fresh data. Hotel detail pages and search result caches have their own TTLs (10 minutes and 2 minutes respectively).
+
+**What goes wrong without it**: At 500 RPS, every search triggers availability queries for 20+ hotels. Each availability query joins bookings with a date range cross-product. The database would see 10,000+ complex queries per second, causing connection pool exhaustion and p95 latency spikes above 2 seconds.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service. It works like an electrical circuit breaker: when the failure rate exceeds a threshold, the breaker "opens" and immediately rejects subsequent requests without attempting the call. After a cooldown period, the breaker enters a "half-open" state where it allows a limited number of test requests. If those succeed, the breaker "closes" and normal traffic resumes. If they fail, the breaker opens again.
+
+**Why it exists**: Without a circuit breaker, when an external service (like Elasticsearch or a payment gateway) goes down, every incoming request still attempts to call it. Each attempt waits for the full timeout (e.g., 10 seconds) before failing. Under load, this causes thread/connection pool exhaustion, cascading timeouts, and eventually takes down the entire application. The circuit breaker short-circuits these requests, returning a failure in milliseconds instead of seconds, and provides a fallback path.
+
+**How it works here**: The project uses the Opossum library to wrap calls to three external dependencies. The Elasticsearch circuit breaker opens after 50% of the last 10 requests fail, with a 20-second reset timeout. Its fallback is PostgreSQL full-text search (slower but functional). The payment circuit breaker opens at 30% failure rate with a 60-second reset. Its fallback queues the booking for later processing. The availability API breaker returns "unavailable" as a fallback. Each breaker exposes Prometheus metrics (`circuit_breaker_state`, `circuit_breaker_failures_total`) so operators can see breaker status on dashboards.
+
+**What goes wrong without it**: If Elasticsearch goes down and search receives 500 RPS, all 500 requests per second wait 5 seconds for the ES timeout, consuming 2,500 concurrent connections. The API server's connection pool and event loop become saturated, causing booking and admin endpoints (which do not use Elasticsearch) to also become unresponsive. A single dependency failure takes down the entire service.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable data structures (typically JSON) rather than free-form text strings. Each log entry is a JSON object with consistent fields like `timestamp`, `level`, `message`, `requestId`, `userId`, `service`, and `duration`. This allows log aggregation systems (ELK stack, Datadog, Splunk) to index, search, and alert on specific fields rather than parsing arbitrary text with regex.
+
+**Why it exists**: Unstructured logs like `"User 123 booked hotel 456 at 2024-01-15"` are human-readable but machine-hostile. You cannot easily count bookings per hotel, filter by user, or correlate a failed booking with the search that preceded it. Structured logging enables queries like "show all log entries where `event=booking_created` and `hotelId=456` and `duration > 1000ms`" -- questions that are unanswerable with grep on text logs.
+
+**How it works here**: The project uses Pino, a high-performance JSON logger for Node.js. Each request gets a unique `requestId` (from the `X-Request-ID` header or auto-generated) that propagates through all log entries for that request. Business events are logged with domain-specific context: `booking_created` includes `bookingId`, `hotelId`, `roomTypeId`, `totalPrice`, and `duration`. The logger is configured at `backend/src/shared/logger.ts` and injected into route handlers via middleware.
+
+**What goes wrong without it**: When a customer reports "my booking failed," the support team greps server logs for their email. They find 50 log lines that mention the email across search, availability, booking, and payment operations. Without structured fields, they cannot determine which booking attempt failed, why it failed, or how long the failure took. Debugging takes hours instead of seconds.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals (typically every 15-30 seconds). The application exposes a `/metrics` endpoint that returns all current metric values in Prometheus text format. Metrics come in four types: counters (monotonically increasing values like total requests), gauges (point-in-time values like active connections), histograms (distributions of values like request latency), and summaries (pre-calculated quantiles).
+
+**Why it exists**: Logs tell you what happened to individual requests. Metrics tell you what is happening to the system overall. "How many bookings per minute are we processing?" "What is the p95 latency for search?" "Is the cache hit rate dropping?" These questions require aggregated numerical data over time, not individual log entries. Metrics also power alerting: "page the on-call engineer when the booking failure rate exceeds 5% for 5 minutes."
+
+**How it works here**: The project uses the `prom-client` library and exposes 16+ metrics at `GET /metrics`. Business metrics include `bookings_created_total` (counter by status), `booking_creation_duration_seconds` (histogram), `search_duration_seconds` (histogram), and `availability_cache_hits_total` / `availability_cache_misses_total` (counters). Infrastructure metrics include `http_requests_total` (counter by method/path/status), `http_request_duration_seconds` (histogram), `db_pool_active` (gauge), and `distributed_lock_acquisitions_total` (counter by success/failure). These metrics feed the alerting thresholds defined in the Observability section.
+
+**What goes wrong without it**: The team discovers the booking system is slow only when customers complain on social media. They have no historical data to determine when the slowdown started, no ability to correlate it with a deployment or traffic spike, and no alerting to catch the problem before customers notice.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make to an endpoint within a time window. When a client exceeds the limit, subsequent requests receive a `429 Too Many Requests` response until the window resets. Rate limits are typically tracked per user, per IP address, or per API key using counters stored in Redis with expiration.
+
+**Why it exists**: Without rate limiting, a single misbehaving client (whether a bug, a bot, or a malicious actor) can consume disproportionate server resources. A script that calls the search endpoint 10,000 times per second would starve legitimate users of capacity. Rate limiting also prevents credential stuffing attacks (testing thousands of stolen passwords against the login endpoint) and mitigates accidental DDoS from buggy client applications that retry in tight loops.
+
+**How it works here**: Four rate limit tiers are defined. Login is limited to 5 requests per minute per IP (prevents brute force). Search is limited to 30 per minute per user (prevents scraping). Booking creation is limited to 10 per minute per user (prevents inventory abuse). All other endpoints default to 100 per minute. Each limit is tracked in Redis with sliding window counters. When a limit is exceeded, the response includes a `Retry-After` header telling the client when to try again.
+
+**What goes wrong without it**: A competitor's bot scrapes hotel pricing by calling the search endpoint 1,000 times per second with different parameters. The Elasticsearch cluster is overwhelmed, search latency for real users exceeds 5 seconds, and the database connection pool is exhausted by cache misses. The attack costs nothing to the attacker and degrades the experience for all legitimate users.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. In the context of HTTP APIs, an idempotent endpoint returns the same response whether called once or ten times with the same parameters. This is achieved by generating a deterministic key from the request parameters, checking whether that key has been seen before, and returning the cached result if it has.
+
+**Why it exists**: Network unreliability makes duplicate requests inevitable. A user clicks "Book Now," the request succeeds on the server, but the response is lost due to a network timeout. The user's browser shows an error and they click again. Without idempotency, the second click creates a second booking and the user is charged twice. Load balancers also retry requests when upstream servers timeout, potentially creating duplicates that the user never initiated.
+
+**How it works here**: The booking endpoint generates an idempotency key from `SHA-256(userId + hotelId + roomTypeId + checkIn + checkOut + roomCount)`. Before processing a new booking, the system checks Redis for a cached result with this key. If found, it returns the existing booking. If not found, it also checks the `idempotency_key` column in the bookings table (which has a unique constraint) as a durable fallback. After successfully creating a booking, the result is cached in Redis with a 24-hour TTL and stored in the database. This two-layer approach (Redis for speed, PostgreSQL for durability) handles the case where Redis restarts between the first and second request.
+
+**What goes wrong without it**: Double-bookings from network retries. The user sees two charges on their credit card. Hotel inventory shows fewer available rooms than reality because the same booking was counted twice. Customer support is overwhelmed with "I was charged twice" tickets.
+
+### Health Checks
+
+**What it is**: Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They return a structured response indicating the status of each component (database, cache, external services) along with latency measurements. Health checks are consumed by load balancers (to route traffic away from unhealthy instances), container orchestrators (to restart failing containers), and monitoring dashboards (to visualize system health).
+
+**Why it exists**: An API server might be running (process alive, accepting TCP connections) but unable to serve requests because its database connection pool is exhausted, Redis is unreachable, or Elasticsearch is not responding. Without health checks, the load balancer continues sending traffic to this unhealthy instance, and every request fails. Health checks allow the infrastructure to detect these partial failures and take corrective action automatically.
+
+**How it works here**: The health check endpoint at `GET /health` tests three components: PostgreSQL (executes `SELECT 1` and measures latency), Redis (executes `PING` and measures latency), and Elasticsearch (checks cluster health). Each component is reported as `ok` or `error` with its latency in milliseconds. The overall status is `ok` only if all components are healthy. The response includes uptime and environment information. This endpoint supports both Kubernetes-style liveness/readiness probes and human-readable status dashboards.
+
+**What goes wrong without it**: A server's PostgreSQL connection pool fills up (100/100 connections in use). The server keeps accepting new HTTP connections from the load balancer but every database query hangs, eventually timing out after 30 seconds. Users see spinning loaders. The load balancer does not know the instance is unhealthy because TCP connections succeed. Other healthy instances exist but receive no additional traffic because the load balancer distributes evenly across all instances including the broken one.
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local implementation: what production patterns are implemented, what was simplified, and what was omitted.

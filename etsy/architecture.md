@@ -567,6 +567,165 @@ When the Elasticsearch circuit breaker opens, search degrades to PostgreSQL `ILI
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (RootComponent)
+├── Header (navigation, search bar, cart badge, auth links, seller link)
+├── <Outlet /> (route-specific content)
+│   ├── index.tsx (HomePage)
+│   │   ├── Category grid (emoji icons, links to category pages)
+│   │   ├── ProductCard[] (trending products grid)
+│   │   └── Sell CTA section
+│   ├── search.tsx (SearchPage)
+│   │   └── ProductCard[] (search results with filters)
+│   ├── product.$productId.tsx (ProductDetailPage)
+│   │   ├── Image gallery
+│   │   ├── Shop info card
+│   │   ├── Add to cart / favorite actions
+│   │   └── Similar products (ES more_like_this)
+│   ├── shop.$shopSlug.tsx (ShopPage)
+│   │   └── ProductCard[] (shop's product listing)
+│   ├── category.$categorySlug.tsx (CategoryPage)
+│   │   └── ProductCard[] (category products)
+│   ├── cart.tsx (CartPage)
+│   │   └── Cart items grouped by shop
+│   ├── checkout.tsx (CheckoutPage)
+│   │   ├── Shipping address form
+│   │   ├── Payment placeholder
+│   │   └── Order summary (grouped by shop)
+│   ├── orders.tsx (OrderHistoryPage)
+│   ├── favorites.tsx (FavoritesPage)
+│   ├── login.tsx / register.tsx (AuthPages)
+│   ├── seller/dashboard.tsx (SellerDashboard)
+│   ├── seller/create-shop.tsx (CreateShopPage)
+│   └── seller/products.new.tsx (AddProductPage)
+└── Footer (static footer with navigation links)
+```
+
+### Zustand Stores
+
+**`authStore`** -- Manages user authentication with cookie-based sessions. Unlike the hotel-booking project which uses JWT, Etsy relies on HTTP-only cookies sent via `credentials: 'include'` on all fetch requests. The store does not persist anything to localStorage because the session cookie handles persistence automatically. The `checkAuth()` action calls `GET /api/auth/me` on app startup (invoked from `__root.tsx`). If the cookie is expired or invalid, the user is set to null.
+
+**`cartStore`** -- Manages the multi-seller shopping cart state. The cart is server-authoritative: every mutation (add, update quantity, remove) sends a request to the backend and then re-fetches the entire cart. The `fetchCart()` action is called in the root component whenever `isAuthenticated` becomes true. The cart response groups items by shop, with per-shop subtotals and shipping, plus a summary object with grand totals. The store's `clearCart()` action both sends a DELETE to the server and sets local state to null.
+
+There is no separate store for search state, favorites, or orders. These features use local `useState` within their route components.
+
+### Routing
+
+TanStack Router with file-based routing. Routes are organized into three groups:
+
+- **Buyer routes**: `/` (home), `/search` (results with query params), `/product/$productId` (detail), `/shop/$shopSlug` (shop profile), `/category/$categorySlug` (category listing), `/cart`, `/checkout`, `/orders`, `/favorites`, `/login`, `/register`
+- **Seller routes**: `/seller/dashboard`, `/seller/create-shop`, `/seller/products/new`
+
+The root layout (`__root.tsx`) initializes both auth and cart state on mount. Auth check runs unconditionally; cart fetch runs only when authenticated. This ensures the cart badge in the header shows the correct count immediately after page load.
+
+### Data Fetching
+
+API communication flows through a lightweight HTTP client (`services/api.ts`) with typed `get`, `post`, `put`, and `delete` methods. All requests include `credentials: 'include'` for cookie-based session management. Data fetching is done in `useEffect` hooks. The homepage fetches trending products and categories in parallel via `Promise.all` to minimize loading time.
+
+There is no client-side caching, no React Query, and no SWR. The search page re-fetches results when query parameters change (via URL search params). The product detail page fetches product info, shop info, and similar products on mount.
+
+### Key UI Patterns
+
+- **Multi-Seller Cart Grouping**: The cart page groups items by shop, showing each shop's name, individual item prices, and per-shop shipping costs. This mirrors the order creation flow where one order is created per shop. The checkout page shows the same grouping with a prominent note: "You will receive N separate shipment(s)."
+- **Category Browsing with Emoji Icons**: The homepage renders categories as a responsive grid of circular icon buttons. Each category slug maps to a hardcoded emoji via `getCategoryEmoji()`. Clicking a category navigates to `/category/$categorySlug` which fetches products filtered by that category.
+- **Favorite Toggle**: Product cards and product detail pages include a heart icon that toggles favorite status. Favoriting sends `POST /api/favorites` with the product ID and type. The favorite state is re-fetched per page load, not tracked globally (no favorites store).
+- **Seller Dashboard**: The seller section provides a shop creation form, product listing management, and an analytics view showing order count and revenue. Sellers navigate between buyer and seller views via the header.
+- **Checkout Flow**: The checkout page validates cart contents, collects a shipping address form, and creates orders via `POST /api/orders/checkout`. The response contains an array of `Order` objects (one per shop). On success, the cart is cleared and the user is redirected to the orders page.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in the project. Each explanation covers what the pattern is, why it exists, how it works in this project, and what would go wrong without it.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles. Rather than checking individual permissions for each user, the system checks whether the user's role grants the required permission. Roles create a reusable, maintainable mapping between users and the actions they can perform.
+
+**Why it exists**: Etsy has three distinct user personas: buyers, sellers (shop owners), and platform admins. Each needs different access. A buyer should be able to browse, favorite, and purchase, but should not be able to modify another seller's product prices. A seller should be able to manage their own shop and products, but should not be able to view other sellers' order data. Without RBAC, every endpoint would need custom authorization logic to determine who can do what.
+
+**How it works here**: The `users` table has a `role` column defaulting to `user`. When a user creates a shop, they gain seller capabilities via ownership checks (the shop's `owner_id` matches their user ID) rather than a separate role. This means RBAC is combined with resource ownership: the API checks both "is this user authenticated?" and "does this user own this shop?" for seller endpoints. Admin routes check `role = 'admin'` for platform-level operations. The middleware pattern is: session validation (is the user logged in?) then role/ownership check (can this user access this resource?).
+
+**What goes wrong without it**: A malicious user could call `PUT /api/shops/123/products/456` to modify another seller's product listing, changing prices, descriptions, or images. They could call `GET /api/shops/123/orders` to view a competitor's sales data. In a marketplace, this would destroy seller trust and make the platform unusable.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks Redis before querying the database. If the data is in Redis (cache hit), it is returned immediately. If not (cache miss), the application queries PostgreSQL or Elasticsearch, stores the result in Redis with a TTL, and returns it. The database remains the source of truth; Redis is a performance optimization layer that the application manages explicitly.
+
+**Why it exists**: Product detail pages, shop profiles, and search results are read far more often than they are written. A popular handmade necklace might be viewed 10,000 times per day but updated once. Without caching, every view generates a database query. At 10,000 search queries per second during the holiday season, the database cannot keep up with the combined load of search, product detail, and availability queries.
+
+**How it works here**: The caching layer at `backend/src/shared/cache.ts` implements cache-aside with stampede prevention. Product details are cached with 5-minute TTL. Shop profiles use 10-minute TTL. Search results use 2-minute TTL (search relevance can change as new products are listed). Inventory counts use a short 30-second TTL because accuracy matters for "only 1 left" signals. Cart contents use write-through caching (written to both Redis and PostgreSQL on every update) because cart state must always reflect the user's latest actions.
+
+**Stampede prevention**: When a popular product's cache expires, hundreds of concurrent requests would all miss cache and hit the database simultaneously. The implementation uses Redis `SETNX` with a 5-second TTL as a lock: only the first request to miss cache acquires the lock and fetches from the database. Subsequent requests wait briefly and retry, finding the now-populated cache. This converts a "thundering herd" of 100 database queries into 1 query plus 99 cache hits.
+
+**What goes wrong without it**: During the holiday season, a viral TikTok features a handmade candle. 50,000 users visit the product page within an hour. Without caching, each visit generates 3+ database queries (product details, shop info, similar products). The database receives 150,000+ queries per hour for a single product, causing connection pool exhaustion and degraded performance for all other products on the platform.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service. Like an electrical circuit breaker, it "trips" when failure rates exceed a threshold, immediately rejecting subsequent requests without attempting the call. After a cooldown period, it allows limited test requests to check if the service has recovered. This prevents a single dependency failure from consuming all server resources and cascading into a total outage.
+
+**Why it exists**: Etsy depends on Elasticsearch for search and "similar products" recommendations, and on a payment gateway for checkout. If Elasticsearch goes down, every search request would wait for the 3-second timeout before failing. At 10,000 search requests per second, that is 30,000 seconds of wasted capacity per second -- the server would be completely unresponsive within moments. The circuit breaker detects the failure pattern and fails fast, allowing the application to serve a degraded but functional experience.
+
+**How it works here**: The project uses the Opossum library with three circuit breakers defined at `backend/src/shared/circuit-breaker.ts`. The Elasticsearch search breaker opens after 50% of the last 10 requests fail, with a 3-second timeout per request and a 15-second reset interval. When open, search falls back to PostgreSQL `ILIKE` queries, which provide basic text matching without synonyms, fuzzy matching, or relevance scoring. The Elasticsearch "similar products" breaker has the same thresholds but falls back to an empty array (showing no recommendations is better than crashing). The payment gateway breaker opens after 25% of 5 requests fail, queuing unpaid orders as `payment_pending` for later processing.
+
+**What goes wrong without it**: Elasticsearch has a 2-minute outage during peak traffic. 10,000 search requests per second each wait 3 seconds for the timeout. The Node.js event loop is blocked processing 30,000 pending requests. The `/api/cart` and `/api/orders/checkout` endpoints (which do not use Elasticsearch) become unresponsive because they share the same event loop. Cart additions fail, checkouts timeout, and revenue is lost for operations that had nothing to do with search.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Each log entry has consistent, named fields (timestamp, level, message, service, requestId, plus domain-specific fields) that log aggregation systems can index, search, and visualize without regex parsing.
+
+**Why it exists**: In a marketplace with thousands of concurrent sellers and buyers, debugging an issue like "seller's product is not appearing in search" requires tracing the product through multiple systems: product creation, Elasticsearch indexing, search query execution, and result ranking. With unstructured text logs, an engineer would need to grep for the product ID across multiple services and manually correlate log lines. Structured logging enables a query like "show all logs where `productId=789` and `service=elasticsearch` in the last hour."
+
+**How it works here**: The project uses Pino for JSON logging at `backend/src/shared/logger.ts`. Three context-specific loggers are created: `orderLogger` (logs checkout operations with order IDs, shop IDs, and amounts), `searchLogger` (logs search queries with query text, filter count, result count, and duration), and `appLogger` (general application events). Each log entry includes the service name, environment, and ISO timestamp. Sensitive data (passwords, payment details) is excluded from logs.
+
+**What goes wrong without it**: A seller reports that their product does not appear in search results. The support team searches logs for the product ID. With text logs like `"Indexed product 789 to Elasticsearch"`, they find the indexing log but cannot determine whether the index operation succeeded, how long it took, or whether the product's search fields (title, tags, description) were populated correctly. With structured logging, they query `productId=789 AND event=es_index` and immediately see the indexed document's field values.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system that collects numerical metrics from applications at regular intervals. The application exposes a `/metrics` endpoint with current metric values. Metrics come in four types: counters (total request count), gauges (current connection count), histograms (latency distributions), and summaries (pre-computed percentiles). These metrics power dashboards for operational visibility and rules for automated alerting.
+
+**Why it exists**: Logs capture individual events. Metrics capture system behavior over time. "What is the average order value this week?" "Is search latency increasing?" "What percentage of cache lookups are hits?" These aggregate questions cannot be answered by searching individual log entries. Metrics also enable SLO tracking: the Etsy architecture defines specific availability and latency targets for search (99.5%, 50ms p50) and checkout (99.95%, 100ms p50). Without metrics, there is no way to measure whether these targets are being met.
+
+**How it works here**: The project uses `prom-client` at `backend/src/shared/metrics.ts` to expose 9 key metrics. Business metrics include `etsy_product_views_total` (counter by category, tracks traffic distribution), `etsy_search_queries_total` (counter by filter presence, measures search usage), `etsy_search_latency_seconds` (histogram by query type, monitors search SLO), `etsy_orders_created_total` (counter by status), and `etsy_order_value_dollars` (histogram, tracks revenue distribution). Infrastructure metrics include `etsy_cache_hits_total` and `etsy_cache_misses_total` (counters by cache type, measure cache effectiveness), `etsy_circuit_breaker_state` (gauge per service), and `etsy_checkout_duration_seconds` (histogram, monitors checkout SLO). The error budget thresholds (22 minutes/month for checkout, 3.6 hours/month for search) are monitored via these metrics.
+
+**What goes wrong without it**: The Elasticsearch synonym filter is missing a new term ("cottagecore") that 5% of users search for. Search result quality drops for those queries, but no one notices because there is no metric tracking "zero-result search queries." The problem persists for months until a product manager manually searches for "cottagecore" and notices the poor results.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make to an endpoint within a time window. When the limit is exceeded, subsequent requests receive a `429 Too Many Requests` response until the window resets. Limits are tracked per user (authenticated) or per IP address (unauthenticated) using atomic counters in Redis.
+
+**Why it exists**: Marketplaces are attractive targets for scraping (competitors extracting pricing data), credential stuffing (testing stolen passwords against seller accounts), and inventory manipulation (bots adding items to cart to block legitimate buyers). Without rate limiting, these attacks consume server resources, degrade performance for legitimate users, and can cause real financial harm to sellers.
+
+**How it works here**: The architecture defines rate limits but the local implementation omits enforcement (noted in the "What Was Simplified" section). At production scale, limits would include: login at 5 per minute per IP (prevents credential stuffing), search at 30 per minute per user (prevents catalog scraping), add-to-cart at 20 per minute per user (prevents inventory hoarding), and checkout at 5 per minute per user (prevents payment flooding). Each limit would use Redis sliding window counters with TTL-based expiration.
+
+**What goes wrong without it**: A competitor deploys a scraping bot that calls `GET /api/search?q=*` with every possible filter combination, downloading the entire product catalog with prices. The Elasticsearch cluster is overwhelmed by the query volume, search latency for real users exceeds 5 seconds, and the scraper obtains competitive intelligence at zero cost.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. For API endpoints that create resources (orders, payments), this is achieved by associating each operation with a unique key. The first request with a given key executes normally and stores the result. Subsequent requests with the same key return the cached result without re-executing the operation.
+
+**Why it exists**: Etsy's checkout creates multiple orders (one per seller) within a single database transaction. If the transaction succeeds but the HTTP response is lost, the user sees an error and clicks "Place Order" again. Without idempotency, the second click creates a second set of orders. The user is charged twice, sellers see duplicate orders, and inventory counts are decremented twice (potentially overselling for unique items with quantity=1).
+
+**How it works here**: The checkout endpoint accepts an `Idempotency-Key` header. The middleware at `backend/src/shared/idempotency.ts` checks for an existing completed operation with that key. If found, the cached response is returned. If a concurrent duplicate request arrives while the first is still processing, it receives a `409 Conflict` response (preventing race conditions). If the first request fails, the key is cleared so the user can retry. This is especially critical for unique items: if a one-of-a-kind handmade ring has quantity=1, a duplicate order would try to set quantity to -1, which is both logically impossible and financially harmful to the seller.
+
+**What goes wrong without it**: A buyer purchases a $500 handmade engagement ring. Network timeout. They click again. Two orders are created, each decrementing quantity by 1. The ring's quantity goes from 1 to -1. The seller receives two orders for an item they can only fulfill once. The second buyer either receives nothing (and leaves a 1-star review) or the seller is forced to refund one order and deal with a customer dispute.
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They return structured status information for each component (database, cache, search engine, circuit breakers) with latency measurements. Infrastructure components (load balancers, container orchestrators, monitoring systems) consume health checks to make automated decisions about traffic routing and instance lifecycle.
+
+**Why it exists**: An Etsy API server might be running but unable to serve useful responses because the PostgreSQL connection pool is full, the Redis cache is unreachable, or Elasticsearch is not responding. Without health checks, the load balancer treats this server as healthy and sends it traffic. Every request fails, but the load balancer does not know. Health checks make application-level health visible to infrastructure so it can take corrective action.
+
+**How it works here**: The `/api/health` endpoint reports overall status (`ok` or `degraded`), PostgreSQL connectivity and latency (via `SELECT 1`), Redis connectivity and latency (via `PING`), and circuit breaker states for Elasticsearch and payment services. The response includes uptime for debugging. A `degraded` status is returned when any component is unhealthy but the server can still handle some requests (e.g., Elasticsearch is down but PostgreSQL is up, so cart and checkout still work). The load balancer polls health every 10 seconds and removes instances that return `error` status for 3 consecutive checks.
+
+**What goes wrong without it**: An Elasticsearch node runs out of disk space. The Etsy API server's ES circuit breaker opens (search falls back to PostgreSQL). The server is functioning but with degraded search. Without health checks, the monitoring team does not know the breaker is open until users report poor search results. With health checks, the monitoring dashboard shows the ES circuit breaker as "open" immediately, triggering an alert to investigate the Elasticsearch cluster.
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local implementation and maps production-scale design to what runs on Docker + Node.js + React.
