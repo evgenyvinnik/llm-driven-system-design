@@ -2,9 +2,10 @@
   "name": "netflix-backend",
   "version": "1.0.0",
   "description": "Netflix clone backend API",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "PORT=3001 tsx watch src/index.ts",
     "dev:server1": "PORT=3001 tsx watch src/index.ts",
     "dev:server2": "PORT=3002 tsx watch src/index.ts",
     "dev:server3": "PORT=3003 tsx watch src/index.ts",
@@ -50,6 +51,7 @@
     "prettier": "^3.2.5",
     "tsx": "^4.7.1",
     "typescript": "^5.3.3",
+    "pino-pretty": "^13.0.0",
     "typescript-eslint": "^8.18.2"
   }
 }

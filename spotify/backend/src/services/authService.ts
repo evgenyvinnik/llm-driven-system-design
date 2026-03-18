@@ -50,7 +50,7 @@ export async function login({ email, password }: { email: string; password: stri
   }
 
   // Return user without password
-  const { _password_hash, ...safeUser } = user;
+  const { password_hash: _password_hash, ...safeUser } = user;
   return safeUser;
 }
 

@@ -26,7 +26,7 @@ const router = Router();
 interface UserRow {
   id: string;
   username: string;
-  profile_picture: string | null;
+  profile_picture_url: string | null;
 }
 
 // Valid reaction types
@@ -91,7 +91,7 @@ router.post('/conversations', requireAuth, requireCassandra, async (req: Authent
     }
 
     // Get user info from PostgreSQL
-    const userQuery = 'SELECT id, username, profile_picture FROM users WHERE id = $1';
+    const userQuery = 'SELECT id, username, profile_picture_url FROM users WHERE id = $1';
     const [senderResult, recipientResult] = await Promise.all([
       pool.query<UserRow>(userQuery, [userId]),
       pool.query<UserRow>(userQuery, [recipientId]),
@@ -112,8 +112,8 @@ router.post('/conversations', requireAuth, requireCassandra, async (req: Authent
     const conversationId = await getOrCreateConversation(
       userId,
       recipientId,
-      { username: sender.username, profilePicture: sender.profile_picture },
-      { username: recipient.username, profilePicture: recipient.profile_picture }
+      { username: sender.username, profilePicture: sender.profile_picture_url },
+      { username: recipient.username, profilePicture: recipient.profile_picture_url }
     );
 
     res.status(201).json({
@@ -121,7 +121,7 @@ router.post('/conversations', requireAuth, requireCassandra, async (req: Authent
       recipient: {
         id: recipient.id,
         username: recipient.username,
-        profilePicture: recipient.profile_picture,
+        profilePicture: recipient.profile_picture_url,
       },
     });
   } catch (error) {

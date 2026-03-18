@@ -80,7 +80,7 @@ router.post('/login', async (req, res) => {
       expires: expiresAt,
     });
 
-    const { _password_hash, ...userWithoutPassword } = user;
+    const { password_hash: _password_hash, ...userWithoutPassword } = user;
     res.json({ user: userWithoutPassword });
   } catch (error) {
     console.error('Login error:', error);

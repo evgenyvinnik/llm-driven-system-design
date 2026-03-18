@@ -226,6 +226,7 @@ export const orderAPI = {
   }) =>
     fetchAPI<{ order: import('../types').Order }>('/orders', {
       method: 'POST',
+      headers: { 'X-Idempotency-Key': crypto.randomUUID() },
       body: JSON.stringify(data),
     }),
 

@@ -166,6 +166,28 @@ router.get('/', optionalAuth, async (req, res) => {
   }
 });
 
+/** GET /api/listings/host/my-listings - Returns all listings owned by the authenticated host. */
+// Get host's listings
+router.get('/host/my-listings', authenticate, requireHost, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT l.*,
+        ST_X(l.location::geometry) as longitude,
+        ST_Y(l.location::geometry) as latitude,
+        (SELECT url FROM listing_photos WHERE listing_id = l.id ORDER BY display_order LIMIT 1) as primary_photo
+      FROM listings l
+      WHERE l.host_id = $1
+      ORDER BY l.created_at DESC`,
+      [req.user!.id]
+    );
+
+    res.json({ listings: result.rows });
+  } catch (error) {
+    log.error({ error }, 'Get host listings error');
+    res.status(500).json({ error: 'Failed to fetch listings' });
+  }
+});
+
 /** GET /api/listings/:id - Returns a single listing with host info, photos, and reviews using cache-aside pattern. */
 // Get single listing - with caching
 router.get('/:id', optionalAuth, async (req, res) => {
@@ -525,28 +547,6 @@ router.put('/:id/availability', authenticate, requireHost, async (req, res) => {
   } catch (error) {
     log.error({ error, listingId: id }, 'Update availability error');
     res.status(500).json({ error: 'Failed to update availability' });
-  }
-});
-
-/** GET /api/listings/host/my-listings - Returns all listings owned by the authenticated host. */
-// Get host's listings
-router.get('/host/my-listings', authenticate, requireHost, async (req, res) => {
-  try {
-    const result = await query(
-      `SELECT l.*,
-        ST_X(l.location::geometry) as longitude,
-        ST_Y(l.location::geometry) as latitude,
-        (SELECT url FROM listing_photos WHERE listing_id = l.id ORDER BY display_order LIMIT 1) as primary_photo
-      FROM listings l
-      WHERE l.host_id = $1
-      ORDER BY l.created_at DESC`,
-      [req.user!.id]
-    );
-
-    res.json({ listings: result.rows });
-  } catch (error) {
-    log.error({ error }, 'Get host listings error');
-    res.status(500).json({ error: 'Failed to fetch listings' });
   }
 });
 

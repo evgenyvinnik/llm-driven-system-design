@@ -34,6 +34,7 @@ router.get('/home', async (req: Request, res: Response, next: NextFunction) => {
 
     const userId = req.session.userId;
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const before = req.query.before as string | undefined;
     const offset = parseInt(req.query.offset as string) || 0;
 
     // Get cached timeline from Redis
@@ -109,25 +110,31 @@ router.get('/home', async (req: Request, res: Response, next: NextFunction) => {
     timelineLatency.observe({ timeline_type: 'home', cache_hit: cacheHit ? 'true' : 'false' }, duration);
     timelineRequestsTotal.inc({ timeline_type: 'home', status: 'success' });
 
+    const mappedTweets = tweets.map((tweet) => ({
+      id: tweet.id.toString(),
+      content: tweet.content,
+      mediaUrls: tweet.media_urls,
+      hashtags: tweet.hashtags,
+      likeCount: tweet.like_count,
+      retweetCount: tweet.retweet_count,
+      replyCount: tweet.reply_count,
+      createdAt: tweet.created_at,
+      author: {
+        id: tweet.author_id,
+        username: tweet.username,
+        displayName: tweet.display_name,
+        avatarUrl: tweet.avatar_url,
+      },
+      isLiked: likeStatus[tweet.id] || false,
+      isRetweeted: retweetStatus[tweet.id] || false,
+    }));
+
+    const lastTweet = tweets[tweets.length - 1];
+    const nextCursor = lastTweet ? new Date(lastTweet.created_at).toISOString() : null;
+
     res.json({
-      tweets: tweets.map((tweet) => ({
-        id: tweet.id.toString(),
-        content: tweet.content,
-        mediaUrls: tweet.media_urls,
-        hashtags: tweet.hashtags,
-        likeCount: tweet.like_count,
-        retweetCount: tweet.retweet_count,
-        replyCount: tweet.reply_count,
-        createdAt: tweet.created_at,
-        author: {
-          id: tweet.author_id,
-          username: tweet.username,
-          displayName: tweet.display_name,
-          avatarUrl: tweet.avatar_url,
-        },
-        isLiked: likeStatus[tweet.id] || false,
-        isRetweeted: retweetStatus[tweet.id] || false,
-      })),
+      tweets: mappedTweets,
+      nextCursor,
     });
   } catch (error) {
     timelineRequestsTotal.inc({ timeline_type: 'home', status: 'error' });
@@ -140,6 +147,7 @@ router.get('/user/:username', async (req: Request, res: Response, next: NextFunc
   try {
     const { username } = req.params;
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const before = req.query.before as string | undefined;
     const offset = parseInt(req.query.offset as string) || 0;
 
     const userResult = await pool.query(
@@ -187,25 +195,31 @@ router.get('/user/:username', async (req: Request, res: Response, next: NextFunc
       }
     }
 
+    const userTweets = result.rows.map((tweet: TweetRow) => ({
+      id: tweet.id.toString(),
+      content: tweet.content,
+      mediaUrls: tweet.media_urls,
+      hashtags: tweet.hashtags,
+      likeCount: tweet.like_count,
+      retweetCount: tweet.retweet_count,
+      replyCount: tweet.reply_count,
+      createdAt: tweet.created_at,
+      author: {
+        id: tweet.author_id,
+        username: tweet.username,
+        displayName: tweet.display_name,
+        avatarUrl: tweet.avatar_url,
+      },
+      isLiked: likeStatus[tweet.id] || false,
+      isRetweeted: retweetStatus[tweet.id] || false,
+    }));
+
+    const lastUserTweet = result.rows[result.rows.length - 1] as TweetRow | undefined;
+    const userNextCursor = lastUserTweet ? new Date(lastUserTweet.created_at).toISOString() : null;
+
     res.json({
-      tweets: result.rows.map((tweet: TweetRow) => ({
-        id: tweet.id.toString(),
-        content: tweet.content,
-        mediaUrls: tweet.media_urls,
-        hashtags: tweet.hashtags,
-        likeCount: tweet.like_count,
-        retweetCount: tweet.retweet_count,
-        replyCount: tweet.reply_count,
-        createdAt: tweet.created_at,
-        author: {
-          id: tweet.author_id,
-          username: tweet.username,
-          displayName: tweet.display_name,
-          avatarUrl: tweet.avatar_url,
-        },
-        isLiked: likeStatus[tweet.id] || false,
-        isRetweeted: retweetStatus[tweet.id] || false,
-      })),
+      tweets: userTweets,
+      nextCursor: userNextCursor,
     });
   } catch (error) {
     next(error);
@@ -216,6 +230,7 @@ router.get('/user/:username', async (req: Request, res: Response, next: NextFunc
 router.get('/explore', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const before = req.query.before as string | undefined;
     const offset = parseInt(req.query.offset as string) || 0;
 
     const result = await pool.query(
@@ -228,25 +243,31 @@ router.get('/explore', async (req: Request, res: Response, next: NextFunction) =
       [limit, offset],
     );
 
+    const exploreTweets = result.rows.map((tweet: TweetRow) => ({
+      id: tweet.id.toString(),
+      content: tweet.content,
+      mediaUrls: tweet.media_urls,
+      hashtags: tweet.hashtags,
+      likeCount: tweet.like_count,
+      retweetCount: tweet.retweet_count,
+      replyCount: tweet.reply_count,
+      createdAt: tweet.created_at,
+      author: {
+        id: tweet.author_id,
+        username: tweet.username,
+        displayName: tweet.display_name,
+        avatarUrl: tweet.avatar_url,
+      },
+      isLiked: false,
+      isRetweeted: false,
+    }));
+
+    const lastExploreTweet = result.rows[result.rows.length - 1] as TweetRow | undefined;
+    const exploreNextCursor = lastExploreTweet ? new Date(lastExploreTweet.created_at).toISOString() : null;
+
     res.json({
-      tweets: result.rows.map((tweet: TweetRow) => ({
-        id: tweet.id.toString(),
-        content: tweet.content,
-        mediaUrls: tweet.media_urls,
-        hashtags: tweet.hashtags,
-        likeCount: tweet.like_count,
-        retweetCount: tweet.retweet_count,
-        replyCount: tweet.reply_count,
-        createdAt: tweet.created_at,
-        author: {
-          id: tweet.author_id,
-          username: tweet.username,
-          displayName: tweet.display_name,
-          avatarUrl: tweet.avatar_url,
-        },
-        isLiked: false,
-        isRetweeted: false,
-      })),
+      tweets: exploreTweets,
+      nextCursor: exploreNextCursor,
     });
   } catch (error) {
     next(error);
@@ -258,6 +279,7 @@ router.get('/hashtag/:tag', async (req: Request, res: Response, next: NextFuncti
   try {
     const { tag } = req.params;
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const before = req.query.before as string | undefined;
     const offset = parseInt(req.query.offset as string) || 0;
 
     const result = await pool.query(
@@ -270,25 +292,31 @@ router.get('/hashtag/:tag', async (req: Request, res: Response, next: NextFuncti
       [tag.toLowerCase(), limit, offset],
     );
 
+    const hashtagTweets = result.rows.map((tweet: TweetRow) => ({
+      id: tweet.id.toString(),
+      content: tweet.content,
+      mediaUrls: tweet.media_urls,
+      hashtags: tweet.hashtags,
+      likeCount: tweet.like_count,
+      retweetCount: tweet.retweet_count,
+      replyCount: tweet.reply_count,
+      createdAt: tweet.created_at,
+      author: {
+        id: tweet.author_id,
+        username: tweet.username,
+        displayName: tweet.display_name,
+        avatarUrl: tweet.avatar_url,
+      },
+      isLiked: false,
+      isRetweeted: false,
+    }));
+
+    const lastHashtagTweet = result.rows[result.rows.length - 1] as TweetRow | undefined;
+    const hashtagNextCursor = lastHashtagTweet ? new Date(lastHashtagTweet.created_at).toISOString() : null;
+
     res.json({
-      tweets: result.rows.map((tweet: TweetRow) => ({
-        id: tweet.id.toString(),
-        content: tweet.content,
-        mediaUrls: tweet.media_urls,
-        hashtags: tweet.hashtags,
-        likeCount: tweet.like_count,
-        retweetCount: tweet.retweet_count,
-        replyCount: tweet.reply_count,
-        createdAt: tweet.created_at,
-        author: {
-          id: tweet.author_id,
-          username: tweet.username,
-          displayName: tweet.display_name,
-          avatarUrl: tweet.avatar_url,
-        },
-        isLiked: false,
-        isRetweeted: false,
-      })),
+      tweets: hashtagTweets,
+      nextCursor: hashtagNextCursor,
     });
   } catch (error) {
     next(error);

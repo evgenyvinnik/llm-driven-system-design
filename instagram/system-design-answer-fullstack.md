@@ -4,11 +4,11 @@
 
 ## Opening Statement
 
-"Today I'll design Instagram, a photo and video sharing social platform. As a full-stack engineer, I'll focus on the end-to-end photo upload flow from client to storage, the integrated feed generation system connecting backend caching with frontend virtualization, story view tracking with real-time updates, and the WebSocket-based direct messaging architecture spanning both client and server."
+"I'll design Instagram focusing on the end-to-end photo upload flow, feed generation connecting backend caching with frontend virtualization, story view tracking with real-time updates, and WebSocket-based direct messaging."
 
 ---
 
-## 📋 Step 1: Requirements Clarification (3-5 minutes)
+## Step 1: Requirements Clarification (3-5 minutes)
 
 ### Functional Requirements
 
@@ -27,13 +27,13 @@
 
 ### Full-Stack Clarifications
 
-- "How do we communicate processing status to the client?" - Polling with status endpoint, optionally WebSocket for instant updates
-- "How do we keep feed fresh across tabs?" - Visibility API to trigger refresh on tab focus
-- "What consistency model for likes?" - Optimistic UI with eventual sync
+- "Processing status to client?" - WebSocket push with polling fallback
+- "Feed freshness across tabs?" - Visibility API triggers refresh on focus
+- "Consistency model for likes?" - Optimistic UI with eventual sync
 
 ---
 
-## 🏗️ Step 2: System Architecture Overview
+## Step 2: System Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -72,55 +72,156 @@
 
 ---
 
-## 📐 Step 3: Shared Type Contracts
+## Step 3: Shared Type Contracts
 
-"Shared types between frontend and backend are critical for a full-stack system. The four core domain types are **User**, **Post**, **Story**, and **Message**."
+### Core Domain Types
 
-| Type | Key Fields | Notes |
-|------|-----------|-------|
-| **User** | id, username, displayName, avatarUrl, follower/following/postCount, isPrivate | UserPreview subset used in feeds |
-| **Post** | id, userId, author, caption, status (processing/published/failed), image URLs (4 sizes), likeCount, isLiked | Status tracks async processing |
-| **Story** | id, userId, mediaUrl, mediaType (image/video), viewCount, expiresAt | 24-hour TTL |
-| **Message** | id, conversationId, senderId, content, contentType (text/image/video/heart) | TimeUUID ordering in Cassandra |
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           User Interface                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  id: string              │  username: string         │  displayName: string │
+│  avatarUrl: string       │  bio: string              │  isPrivate: boolean  │
+│  followerCount: number   │  followingCount: number   │  postCount: number   │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-All list endpoints return cursor-based pagination: `{ items[], nextCursor, hasMore }`.
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Post Interface                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  id: string              │  userId: string           │  author: UserPreview │
+│  caption: string         │  location?: string        │                      │
+│  status: 'processing' | 'published' | 'failed'       │                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Image URLs: thumbnailUrl, smallUrl, mediumUrl, largeUrl                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  likeCount: number       │  commentCount: number     │  isLiked: boolean    │
+│  isSaved: boolean        │  createdAt: string        │                      │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-**WebSocket message types** provide real-time updates across features: `new_message`, `typing`, `read_receipt`, `story_view`, and `post_ready` — each carrying a typed payload that both client and server validate.
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Story Interface                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  id: string              │  userId: string           │  mediaUrl: string    │
+│  mediaType: 'image' | 'video'                        │  viewCount: number   │
+│  expiresAt: string       │  createdAt: string        │                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Message Interface                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  id: string              │  conversationId: string   │  senderId: string    │
+│  content: string         │  contentType: 'text' | 'image' | 'video' | 'heart'
+│  mediaUrl?: string       │  createdAt: string        │                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### WebSocket Message Types
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         WebSocket Message Types                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  new_message   │  payload: Message                                          │
+│  typing        │  payload: { conversationId, userId }                       │
+│  read_receipt  │  payload: { conversationId, messageId }                    │
+│  story_view    │  payload: { storyId, viewerId }                            │
+│  post_ready    │  payload: { postId, urls: PostUrls }                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 📸 Step 4: End-to-End Photo Upload Flow
+## Step 4: End-to-End Photo Upload Flow
 
-### End-to-End Upload Flow
+### Frontend: CreatePost Component
 
 ```
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│   Client     │─────▶│  API Server  │─────▶│  RabbitMQ    │─────▶│ Image Worker │
-│  CreatePost  │      │ POST /posts  │      │  Queue       │      │  (Sharp)     │
-└──────┬───────┘      └──────┬───────┘      └──────────────┘      └──────┬───────┘
-       │                     │                                           │
-  Local preview         Store original                            Generate 4 sizes
-  + progress bar        in MinIO, insert                          (150/320/640/1080)
-  + optimistic post     with status=                              Convert to WebP
-                        'processing'                              Store in MinIO
-       │                     │                                           │
-       │◀────────── Return 202 Accepted ──────────────────────────────────
-       │                                                                 │
-       │◀──────────── WebSocket 'post_ready' ────────────────────────────┘
-       │              (polling fallback: 1s × 30)
-  Replace preview
-  with real URLs
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CreatePost Component                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  State:                                                                      │
+│  ├── file: File | null                                                       │
+│  ├── preview: string | null (local DataURL)                                  │
+│  ├── caption: string                                                         │
+│  ├── uploadProgress: number (0-100)                                          │
+│  └── status: 'idle' | 'uploading' | 'processing'                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  File Selection:                                                             │
+│  ├── User selects file via <input type="file">                               │
+│  ├── FileReader reads as DataURL for local preview                           │
+│  └── Preview displayed immediately (no upload yet)                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Upload Flow:                                                                │
+│  ├── 1. Create FormData with image + caption                                 │
+│  ├── 2. api.createPost(formData, progressCallback)                           │
+│  ├── 3. Set status = 'processing'                                            │
+│  ├── 4. Add optimistic post with local preview URL                           │
+│  ├── 5. Subscribe to WebSocket 'post_ready' event                            │
+│  └── 6. Start polling fallback (1s intervals, 30 max)                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  When post_ready received:                                                   │
+│  ├── Update post status to 'published'                                       │
+│  ├── Replace local preview URLs with processed URLs                          │
+│  └── Unsubscribe from WebSocket event                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Frontend (CreatePost)**: User selects file, FileReader creates local DataURL preview immediately. On submit, FormData uploads with progress callback. An optimistic post appears in the feed instantly. The component subscribes to WebSocket `post_ready` and polls as fallback.
+### Backend: Upload Controller
 
-**Backend (POST /api/v1/posts)**: Behind requireAuth + multer (10MB limit). Generates UUID, stores original in MinIO, inserts post with `status='processing'`, publishes job to RabbitMQ, returns 202 Accepted.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         POST /api/v1/posts                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Middleware: requireAuth, multer (10MB limit, images only)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Request Processing:                                                         │
+│  ├── 1. Generate postId (UUID)                                               │
+│  ├── 2. Store original in MinIO: originals/{date}/{postId}.{ext}             │
+│  ├── 3. Insert post record with status='processing'                          │
+│  ├── 4. Publish to RabbitMQ 'image-processing' queue                         │
+│  └── 5. Return 202 Accepted: { postId, status: 'processing' }                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Queue Job Payload:                                                          │
+│  ├── postId: string                                                          │
+│  ├── userId: string                                                          │
+│  ├── originalKey: string (MinIO path)                                        │
+│  └── traceId: string (for debugging)                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-**Image Worker**: Consumes from queue, fetches original, normalizes with Sharp (auto-orient, strip EXIF), generates 4 resolutions as WebP, uploads to MinIO, updates post to `status='published'`, notifies via WebSocket. On error: marks `status='failed'`, re-throws for DLQ.
+### Backend: Image Processing Worker
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Image Worker                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Consumes from: 'image-processing' queue                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Resolutions Generated:                                                      │
+│  ├── thumbnail: 150×150  (quality: 80)  → story rings, notifications         │
+│  ├── small:     320×320  (quality: 85)  → grid view                          │
+│  ├── medium:    640×640  (quality: 85)  → feed on mobile                     │
+│  └── large:     1080×1080 (quality: 90) → full-screen view                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Processing Steps:                                                           │
+│  ├── 1. Fetch original from MinIO                                            │
+│  ├── 2. Normalize with Sharp: auto-orient (EXIF), strip metadata             │
+│  ├── 3. For each resolution:                                                 │
+│  │      ├── Resize with cover + center                                       │
+│  │      ├── Convert to WebP                                                  │
+│  │      └── Upload to MinIO: processed/{size}/{postId}.webp                  │
+│  ├── 4. Update post: status='published', set all URL columns                 │
+│  └── 5. Notify client via WebSocket 'post_ready'                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Error Handling:                                                             │
+│  ├── Mark post status='failed' on error                                      │
+│  └── Re-throw for queue retry/DLQ handling                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 📰 Step 5: Feed Generation - Backend Cache to Frontend Virtualization
+## Step 5: Feed Generation - Backend Cache to Frontend Virtualization
 
 ### Backend: Feed Service
 
@@ -157,15 +258,62 @@ All list endpoints return cursor-based pagination: `{ items[], nextCursor, hasMo
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Frontend: Feed Store + Virtualized Rendering
+### Frontend: feedStore (Zustand)
 
-**feedStore (Zustand)** manages posts, cursor, hasMore, and loading state. Key actions: `loadFeed()` (initial), `loadMore()` (cursor-based append with concurrency guard), `toggleLike()` (optimistic with rollback on API error), and `addPost()` (prepend optimistic uploads).
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         feedStore State                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  posts: Post[]           │  cursor: string | null    │  hasMore: boolean    │
+│  isLoading: boolean      │  error: string | null     │                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Actions:                                                                    │
+│  ├── loadFeed() - Initial load, replaces posts                               │
+│  ├── loadMore() - Append with cursor, guards against concurrent calls        │
+│  ├── addPost(post) - Prepend new post (optimistic)                           │
+│  ├── updatePost(id, updates) - Patch existing post                           │
+│  ├── toggleLike(postId) - Optimistic with rollback                           │
+│  └── refreshFeed() - Clear and reload                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Optimistic Like Flow:                                                       │
+│  ├── 1. Toggle isLiked, adjust likeCount                                     │
+│  ├── 2. Call api.likePost or api.unlikePost                                  │
+│  └── 3. On error: reverse the toggle                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-**Virtualized feed (HomePage)** uses `@tanstack/react-virtual` with `estimateSize: 600px`, `overscan: 3`, and dynamic measurement via `getBoundingClientRect`. Infinite scroll triggers `loadMore` when within 1000px of bottom. Visibility API refreshes feed on tab focus. Render structure: fixed `<StoryTray />` above a virtualized container where each `<PostCard />` is absolutely positioned.
+### Frontend: Virtualized Feed Component
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HomePage (routes/index.tsx)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  useVirtualizer Configuration:                                               │
+│  ├── count: posts.length                                                     │
+│  ├── getScrollElement: containerRef                                          │
+│  ├── estimateSize: 600px                                                     │
+│  ├── overscan: 3 items above/below viewport                                  │
+│  └── measureElement: dynamic height via getBoundingClientRect               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Effects:                                                                    │
+│  ├── Initial load: useEffect → loadFeed()                                    │
+│  └── Visibility refresh: document.visibilitychange → loadFeed on visible     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Infinite Scroll:                                                            │
+│  ├── handleScroll monitors scrollHeight - scrollTop - clientHeight           │
+│  └── Trigger loadMore when < 1000px from bottom                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Render Structure:                                                           │
+│  ├── <StoryTray /> (not virtualized, always visible)                         │
+│  ├── <div style={{ height: virtualizer.getTotalSize() }}>                    │
+│  │      {virtualItems.map → <PostCard /> with absolute positioning}          │
+│  └── </div>                                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 📖 Step 6: Story View Tracking - Real-Time Updates
+## Step 6: Story View Tracking - Real-Time Updates
 
 ### Backend: Story Routes
 
@@ -201,11 +349,30 @@ All list endpoints return cursor-based pagination: `{ items[], nextCursor, hasMo
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Frontend storyStore (Zustand)** tracks storyUsers, viewer open/close state, current user/story indexes, and a newViewers map. Navigation actions (next/prev story and user) drive the viewer. `markAsSeen()` fires an optimistic update with `api.viewStory`. `subscribeToViews()` listens for WebSocket `story_view` events to show real-time viewer notifications to story owners.
+### Frontend: storyStore (Zustand)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         storyStore State                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  storyUsers: StoryUser[] │  isOpen: boolean          │                      │
+│  currentUserIndex: number│  currentStoryIndex: number│                      │
+│  newViewers: Map<storyId, ViewerInfo[]>              │                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Actions:                                                                    │
+│  ├── loadStories() - Fetch from /stories/feed                                │
+│  ├── openViewer(userIndex) - Set isOpen, reset storyIndex, mark seen         │
+│  ├── closeViewer() - Set isOpen = false                                      │
+│  ├── nextStory() / prevStory() - Navigate within user                        │
+│  ├── nextUser() / prevUser() - Navigate between users                        │
+│  ├── markAsSeen(storyId) - Optimistic update + api.viewStory                 │
+│  └── subscribeToViews() - WebSocket 'story_view' → update newViewers         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 🔌 Step 7: WebSocket Architecture
+## Step 7: WebSocket Architecture
 
 ### Backend: WebSocket Hub
 
@@ -242,15 +409,41 @@ All list endpoints return cursor-based pagination: `{ items[], nextCursor, hasMo
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Frontend: WebSocket Client + Hook
+### Frontend: WebSocket Client
 
-**WebSocketClient** manages connection state, a handler map (`Map<messageType, Set<handler>>`), and reconnection with exponential backoff (max 5 attempts, base 1000ms). On message receipt, it parses JSON and dispatches to registered handlers. The `subscribe(type, handler)` method returns an unsubscribe function.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         WebSocketClient Class                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  State:                                                                      │
+│  ├── ws: WebSocket | null                                                    │
+│  ├── handlers: Map<messageType, Set<handler>>                                │
+│  ├── reconnectAttempts: number (max 5)                                       │
+│  └── reconnectDelay: number (base 1000ms)                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  connect():                                                                  │
+│  ├── Build URL: wss://host/ws or ws://host/ws                                │
+│  ├── onopen: reset reconnectAttempts                                         │
+│  ├── onmessage: parse JSON, dispatch to handlers                             │
+│  ├── onclose: trigger reconnect                                              │
+│  └── onerror: log error                                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  reconnect():                                                                │
+│  ├── Check max attempts                                                      │
+│  ├── Exponential backoff: delay * 2^(attempts-1)                             │
+│  └── setTimeout → connect()                                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  subscribe(type, handler) → unsubscribe function                             │
+│  send(message) → ws.send if OPEN                                             │
+│  disconnect() → close and nullify                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-**useWebSocket hook** wraps the client lifecycle: connects on mount, tracks subscriptions, and unsubscribes all on cleanup. Returns `subscribe()` and `send()` for use in components and stores.
+The `useWebSocket` hook wraps the client: connects on mount, tracks subscriptions for cleanup, and exposes `subscribe(type, handler)` and `send(message)`.
 
 ---
 
-## 💬 Step 8: Direct Messaging - Full Stack
+## Step 8: Direct Messaging - Full Stack
 
 ### Backend: DM Routes with Cassandra
 
@@ -286,98 +479,72 @@ All list endpoints return cursor-based pagination: `{ items[], nextCursor, hasMo
 
 ### Why Cassandra for Messages?
 
-| Aspect | PostgreSQL | Cassandra |
-|--------|------------|-----------|
-| Write Pattern | ACID overhead | Optimized for high writes |
-| Read Pattern | Complex joins | Partition-per-conversation |
-| Ordering | ORDER BY + index | TimeUUID clustering key |
-| Scaling | Vertical | Horizontal (partition by conversation) |
-| TTL | Manual cleanup | Built-in for ephemeral content |
+Messages are write-heavy (100:1 write:read ratio). Cassandra's partition-per-conversation model provides natural horizontal scaling, TimeUUID clustering keys give free time ordering, and built-in TTL handles ephemeral content. PostgreSQL would require ACID overhead per write and manual cleanup jobs.
 
-**Frontend messageStore (Zustand)** holds conversations list, per-conversation message maps, and typing indicators. `sendMessage` creates an optimistic message with `temp-{timestamp}` ID, appends it, calls the API, then replaces with the real message on success (or removes on failure). `subscribeToMessages` listens for WebSocket `new_message` (append + update conversation) and `typing` (set flag, auto-clear after 3s).
+### Frontend: messageStore (Zustand)
 
----
-
-## 🔄 Step 9: Cache Invalidation & Optimistic Updates
-
-**Backend cache invalidation** is event-driven: `onFollowChange` deletes all `feed:{followerId}:*` keys, `onPostCreated` pipeline-deletes initial feed caches for all followers, and `onPostLiked` does a targeted update of the likeCount within the cached post object (preserving TTL).
-
-**Frontend optimistic updates** follow a consistent pattern: apply the UI change immediately via `optimisticFn`, fire the API call, and call `rollbackFn` on error. This is used for likes (toggle + count adjust, reverse on failure), follows (immediate UI toggle), and message sends (temp ID replaced with real ID on success).
-
----
-
-## 🔧 Deep Dive 1: Pull vs Push Feed Generation
-
-"The feed strategy is the highest-impact architectural decision for Instagram. I chose a pull model, and here's the full reasoning."
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Pull (fan-out on read) | Simple implementation, no write amplification, always fresh | Higher read latency, heavier DB load per request |
-| ❌ Push (fan-out on write) | O(1) reads, pre-materialized feed | Celebrity problem: 100M followers = 100M writes per post |
-| ❌ Hybrid | Best latency for all users | Significant complexity, two code paths to maintain |
-
-> "We chose pull because it avoids the celebrity write amplification problem entirely. When a user with 50M followers posts, a push model must write 50M feed entries — that's a multi-second fanout job that delays the post appearing even to the poster. With pull, every user's feed query costs the same: one JOIN across follows and posts, cached for 60 seconds. The trade-off is read latency — a cache miss requires a multi-table JOIN. We mitigate this with a composite index on `(user_id, created_at DESC)` and a circuit breaker that returns an empty feed within 5 seconds rather than letting slow queries cascade. At true Instagram scale (500M DAU), we'd evolve to a hybrid model: pull for users following celebrities (>10K followers), push for normal users. But for the initial design, pull gives us 80% of the value with 20% of the complexity."
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         messageStore State                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  conversations: Conversation[]                                               │
+│  currentConversation: string | null                                          │
+│  messages: Map<conversationId, Message[]>                                    │
+│  isTyping: Map<conversationId, boolean>                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Actions:                                                                    │
+│  ├── loadConversations()                                                     │
+│  ├── loadMessages(conversationId)                                            │
+│  ├── sendMessage(conversationId, content):                                   │
+│  │      ├── Create optimistic message with temp-{timestamp} id               │
+│  │      ├── Append to messages map                                           │
+│  │      ├── Call API, replace temp with real message on success              │
+│  │      └── Remove temp message on failure                                   │
+│  ├── setTyping(conversationId, isTyping) → send via WebSocket                │
+│  └── subscribeToMessages():                                                  │
+│         ├── 'new_message' → append to messages, update conversation          │
+│         └── 'typing' → set isTyping true, clear after 3 seconds              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 🔧 Deep Dive 2: Synchronous Upload vs Async Processing Pipeline
+## Step 9: Cache Invalidation & Optimistic Updates
 
-"The photo upload flow demonstrates a key full-stack trade-off: should the API return after processing is complete, or immediately?"
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Cache Invalidation Events                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  onFollowChange(followerId):                                                 │
+│  └── Delete all keys matching feed:{followerId}:*                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  onPostCreated(authorId):                                                    │
+│  ├── Get all follower IDs                                                    │
+│  └── Pipeline delete feed:{followerId}:initial:20 for each                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  onPostLiked(postId, newLikeCount):                                          │
+│  ├── Get cached post                                                         │
+│  ├── Update likeCount in cached object                                       │
+│  └── Re-set with same TTL                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Async (202 + queue + worker) | Fast acknowledgment (<500ms), scalable workers, retry/DLQ | Client must poll or use WebSocket for completion |
-| ❌ Synchronous (process inline) | Simpler client logic, single request | 3-8 second response time, blocks API thread, no retry |
-| ❌ Client-side resize | Reduces upload size | Inconsistent quality, no server control, battery drain on mobile |
+### Optimistic Update Pattern
 
-> "We return 202 Accepted immediately and process asynchronously because user-perceived upload speed directly impacts posting frequency — Instagram's core engagement metric. If users wait 5 seconds watching a spinner, they post less. With async processing, the client shows the local preview immediately as an optimistic post in the feed. The backend stores the original and queues a job. The image worker generates 4 resolutions (150px to 1080px) as WebP, which typically takes 2-3 seconds per image. The client learns about completion via WebSocket `post_ready`, with a polling fallback for reliability. The trade-off is complexity: we now have two notification channels, a queue to monitor, and a DLQ for failed processing. We also need status tracking in the database (`processing` → `published` → `failed`). But this complexity lives in well-understood infrastructure (RabbitMQ, Sharp), and the alternative — a 5-second blocking API call that can't be retried if Sharp crashes mid-resize — is worse for both UX and reliability."
-
----
-
-## 🔧 Deep Dive 3: Story View Deduplication — Redis + PostgreSQL
-
-"Story views need exact-once counting per user, but also need to be fast enough that viewing a story doesn't feel laggy."
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Redis SET + PostgreSQL write-behind | O(1) dedup check, durable persistence | Two storage systems to keep in sync |
-| ❌ PostgreSQL only (UNIQUE constraint) | Single source of truth | INSERT ON CONFLICT adds ~5ms per view, hot rows under load |
-| ❌ Redis only | Fastest | Data loss on restart, no queryable history for analytics |
-
-> "We use Redis SISMEMBER for the hot path — checking if a viewer has already seen a story is O(1) with a SET per story. If not seen, we SADD the viewer and INCR the view count atomically. Then we persist to PostgreSQL with INSERT ON CONFLICT DO NOTHING as a write-behind. This dual-write means the view endpoint responds in <2ms for duplicates (Redis hit) and <10ms for new views. The PostgreSQL write is for durability and analytics queries — 'who viewed my story' needs a scannable table, not a Redis SET. The trade-off: if Redis crashes between SADD and the PostgreSQL write, we could lose a view record. For story views, this is acceptable — losing 0.01% of view records during a Redis failover doesn't impact the product. We wouldn't make this trade-off for financial data, but for ephemeral content that expires in 24 hours, optimizing for speed over perfect durability is the right call."
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Feed strategy | Pull model | Push / Hybrid | Avoids celebrity write amplification |
-| Upload flow | Async (202 + queue) | Synchronous processing | Fast acknowledgment, scalable workers |
-| Message storage | Cassandra | PostgreSQL | Write-optimized, partition-per-conversation |
-| Story view dedup | Redis + PostgreSQL | PostgreSQL only | O(1) check on hot path, durable persistence |
-| Real-time delivery | WebSocket | SSE / Long polling | Bidirectional, supports typing indicators |
-| Frontend rendering | Virtualized list | Standard DOM | 60fps with thousands of posts |
-| State management | Zustand stores | React Context | Optimistic updates with rollback |
-| Auth | Session + Valkey | JWT | Immediate revocation, simpler for web |
+All interactive actions (likes, follows, message sends) use the same pattern: apply the UI change immediately, fire the API call, and rollback on error. This is already shown in `feedStore.toggleLike` and `messageStore.sendMessage` above.
 
 ---
 
 ## Closing Summary
 
-"I've designed Instagram as a full-stack system with focus on:
+"I've designed Instagram as a full-stack system covering end-to-end photo upload (async processing via RabbitMQ, WebSocket notification), feed generation (cached pull model with frontend virtualization), real-time story views (Redis deduplication, WebSocket push), and DM architecture (Cassandra for messages, Redis pub/sub for cross-server delivery).
 
-1. **End-to-End Photo Upload** - Multipart upload with progress, async processing via RabbitMQ worker, WebSocket notification when ready, polling fallback
-2. **Integrated Feed System** - Backend caching with 60s TTL, circuit breaker protection, frontend virtualization for 60fps scrolling with infinite scroll
-3. **Real-Time Story Views** - Redis-backed deduplication, PostgreSQL persistence, WebSocket notification to story owner
-4. **WebSocket Architecture** - Cross-server delivery via Redis pub/sub, reconnection with exponential backoff, typed message contracts
-
-The key insight for full-stack development is maintaining consistency between optimistic frontend updates and eventual backend state - shared type contracts, proper error rollback, and real-time synchronization via WebSocket create a cohesive experience."
+The key full-stack insight: consistency between optimistic frontend updates and eventual backend state requires shared type contracts, proper error rollback, and real-time WebSocket synchronization."
 
 ---
 
 ## Potential Follow-up Questions
 
-1. **Slow connection uploads?** — Chunked upload with resume, client-side compression, progressive JPEG
-2. **Type safety across stack?** — Shared types package (npm workspace), OpenAPI spec generation, Zod validation
-3. **Dual-database migrations?** — Standard tools for PostgreSQL; Cassandra requires additive-only schema changes with feature flags for rollout
+- **Slow connection uploads?** - Chunked upload with resume, client-side compression, progressive JPEG
+- **Type safety across stack?** - Shared types package (npm workspace), OpenAPI spec generation, Zod validation
+- **Dual database migrations?** - Standard tools for PostgreSQL; Cassandra requires additive-only schema changes with feature flags

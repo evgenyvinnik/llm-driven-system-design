@@ -2,7 +2,8 @@ import Redis from 'ioredis';
 import config from '../config/index.js';
 
 /** Redis client for driver geo-indexing, session tokens, surge pricing cache, and ride state. */
-const redis = new Redis.default(config.redis.url);
+const RedisClient = (Redis as any).default || Redis;
+const redis = new RedisClient(config.redis.url);
 
 redis.on('error', (err: Error): void => {
   console.error('Redis error:', err);

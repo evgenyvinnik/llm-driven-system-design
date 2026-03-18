@@ -45,6 +45,104 @@ interface FollowUserRow {
   created_at: Date;
 }
 
+// Search users
+router.get('/search/users', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { q, limit = '20' } = req.query as { q?: string; limit?: string };
+    const limitNum = parseInt(limit, 10);
+
+    if (!q || q.length < 2) {
+      res.json({ users: [] });
+      return;
+    }
+
+    const result = await query<UserRow>(
+      `SELECT id, username, display_name, profile_picture_url
+       FROM users
+       WHERE username ILIKE $1 OR display_name ILIKE $1
+       ORDER BY follower_count DESC
+       LIMIT $2`,
+      [`%${q}%`, limitNum]
+    );
+
+    res.json({
+      users: result.rows.map((u: UserRow) => ({
+        id: u.id,
+        username: u.username,
+        displayName: u.display_name,
+        profilePictureUrl: u.profile_picture_url,
+      })),
+    });
+  } catch (error) {
+    const err = error as Error;
+    logger.error(
+      {
+        type: 'search_users_error',
+        error: err.message,
+      },
+      `Search users error: ${err.message}`
+    );
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get user's saved posts
+router.get('/me/saved', requireAuth as RequestHandler, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.session.userId!;
+    const { cursor, limit = '12' } = req.query as { cursor?: string; limit?: string };
+    const limitNum = parseInt(limit, 10);
+
+    let queryText = `
+      SELECT p.id, p.caption, p.like_count, p.comment_count, p.created_at, sp.created_at as saved_at,
+             (SELECT media_url FROM post_media WHERE post_id = p.id ORDER BY order_index LIMIT 1) as thumbnail,
+             (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) as media_count
+      FROM saved_posts sp
+      JOIN posts p ON sp.post_id = p.id
+      WHERE sp.user_id = $1
+    `;
+    const params: unknown[] = [userId];
+
+    if (cursor) {
+      queryText += ` AND sp.created_at < $${params.length + 1}`;
+      params.push(cursor);
+    }
+
+    queryText += ` ORDER BY sp.created_at DESC LIMIT $${params.length + 1}`;
+    params.push(limitNum + 1);
+
+    const result = await query<PostRow>(queryText, params);
+
+    const hasMore = result.rows.length > limitNum;
+    const posts = result.rows.slice(0, limitNum);
+
+    res.json({
+      posts: posts.map((p: PostRow) => ({
+        id: p.id,
+        thumbnail: p.thumbnail,
+        likeCount: p.like_count,
+        commentCount: p.comment_count,
+        mediaCount: parseInt(p.media_count, 10),
+        savedAt: p.saved_at,
+      })),
+      nextCursor: hasMore ? posts[posts.length - 1].saved_at : null,
+    });
+  } catch (error) {
+    const err = error as Error;
+    const authReq = req as AuthenticatedRequest;
+    logger.error(
+      {
+        type: 'get_saved_posts_error',
+        error: err.message,
+        userId: authReq.session.userId,
+      },
+      `Get saved posts error: ${err.message}`
+    );
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get user profile
 router.get('/:username', optionalAuth as RequestHandler, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -277,63 +375,6 @@ router.get('/:username/posts', optionalAuth as RequestHandler, async (req: Reque
         username: req.params.username,
       },
       `Get user posts error: ${err.message}`
-    );
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get user's saved posts
-router.get('/me/saved', requireAuth as RequestHandler, async (req: Request, res: Response): Promise<void> => {
-  try {
-    const authReq = req as AuthenticatedRequest;
-    const userId = authReq.session.userId!;
-    const { cursor, limit = '12' } = req.query as { cursor?: string; limit?: string };
-    const limitNum = parseInt(limit, 10);
-
-    let queryText = `
-      SELECT p.id, p.caption, p.like_count, p.comment_count, p.created_at, sp.created_at as saved_at,
-             (SELECT media_url FROM post_media WHERE post_id = p.id ORDER BY order_index LIMIT 1) as thumbnail,
-             (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) as media_count
-      FROM saved_posts sp
-      JOIN posts p ON sp.post_id = p.id
-      WHERE sp.user_id = $1
-    `;
-    const params: unknown[] = [userId];
-
-    if (cursor) {
-      queryText += ` AND sp.created_at < $${params.length + 1}`;
-      params.push(cursor);
-    }
-
-    queryText += ` ORDER BY sp.created_at DESC LIMIT $${params.length + 1}`;
-    params.push(limitNum + 1);
-
-    const result = await query<PostRow>(queryText, params);
-
-    const hasMore = result.rows.length > limitNum;
-    const posts = result.rows.slice(0, limitNum);
-
-    res.json({
-      posts: posts.map((p: PostRow) => ({
-        id: p.id,
-        thumbnail: p.thumbnail,
-        likeCount: p.like_count,
-        commentCount: p.comment_count,
-        mediaCount: parseInt(p.media_count, 10),
-        savedAt: p.saved_at,
-      })),
-      nextCursor: hasMore ? posts[posts.length - 1].saved_at : null,
-    });
-  } catch (error) {
-    const err = error as Error;
-    const authReq = req as AuthenticatedRequest;
-    logger.error(
-      {
-        type: 'get_saved_posts_error',
-        error: err.message,
-        userId: authReq.session.userId,
-      },
-      `Get saved posts error: ${err.message}`
     );
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -577,47 +618,6 @@ router.get('/:username/following', async (req: Request, res: Response): Promise<
         username: req.params.username,
       },
       `Get following error: ${err.message}`
-    );
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Search users
-router.get('/search/users', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { q, limit = '20' } = req.query as { q?: string; limit?: string };
-    const limitNum = parseInt(limit, 10);
-
-    if (!q || q.length < 2) {
-      res.json({ users: [] });
-      return;
-    }
-
-    const result = await query<UserRow>(
-      `SELECT id, username, display_name, profile_picture_url
-       FROM users
-       WHERE username ILIKE $1 OR display_name ILIKE $1
-       ORDER BY follower_count DESC
-       LIMIT $2`,
-      [`%${q}%`, limitNum]
-    );
-
-    res.json({
-      users: result.rows.map((u: UserRow) => ({
-        id: u.id,
-        username: u.username,
-        displayName: u.display_name,
-        profilePictureUrl: u.profile_picture_url,
-      })),
-    });
-  } catch (error) {
-    const err = error as Error;
-    logger.error(
-      {
-        type: 'search_users_error',
-        error: err.message,
-      },
-      `Search users error: ${err.message}`
     );
     res.status(500).json({ error: 'Internal server error' });
   }

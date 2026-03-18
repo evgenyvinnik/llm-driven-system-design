@@ -41,7 +41,7 @@ class WebSocketService {
    */
   connect(token: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
+      const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
 
       this.ws = new WebSocket(wsUrl);
 

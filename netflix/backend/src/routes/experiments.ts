@@ -16,8 +16,8 @@ interface ExperimentRow {
   name: string;
   description: string | null;
   allocation_percent: number;
-  variants: string;
-  target_groups: string;
+  variants: Variant[];
+  target_groups: Record<string, unknown>;
   metrics: string[];
   status: string;
   start_date: Date | null;
@@ -67,8 +67,8 @@ router.get('/', authenticate, async (_req: Request, res: Response) => {
         name: exp.name,
         description: exp.description,
         allocationPercent: exp.allocation_percent,
-        variants: JSON.parse(exp.variants),
-        targetGroups: JSON.parse(exp.target_groups),
+        variants: exp.variants,
+        targetGroups: exp.target_groups,
         metrics: exp.metrics,
         status: exp.status,
         startDate: exp.start_date,
@@ -105,8 +105,8 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
         name: experiment.name,
         description: experiment.description,
         allocationPercent: experiment.allocation_percent,
-        variants: JSON.parse(experiment.variants),
-        targetGroups: JSON.parse(experiment.target_groups),
+        variants: experiment.variants,
+        targetGroups: experiment.target_groups,
         metrics: experiment.metrics,
         status: experiment.status,
         startDate: experiment.start_date,
@@ -175,7 +175,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
         name: experiment.name,
         description: experiment.description,
         allocationPercent: experiment.allocation_percent,
-        variants: JSON.parse(experiment.variants),
+        variants: experiment.variants,
         status: experiment.status,
       },
     });
@@ -351,7 +351,7 @@ function allocateToExperiment(profileId: string, experiment: ExperimentRow): str
   }
 
   // Parse variants
-  const variants: Variant[] = JSON.parse(experiment.variants);
+  const variants: Variant[] = experiment.variants;
 
   // Determine which variant based on weights
   let accumulated = 0;

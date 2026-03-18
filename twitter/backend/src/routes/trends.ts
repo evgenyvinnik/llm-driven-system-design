@@ -75,6 +75,32 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
       });
     }
 
+    res.json({ trends, updatedAt: new Date().toISOString() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/trends/all-time
+router.get('/all-time', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+
+    const result = await pool.query(
+      `SELECT hashtag, COUNT(*) as count
+       FROM hashtag_activity
+       GROUP BY hashtag
+       ORDER BY count DESC
+       LIMIT $1`,
+      [limit],
+    );
+
+    const trends: TrendingHashtag[] = result.rows.map((row: { hashtag: string; count: string }) => ({
+      hashtag: row.hashtag,
+      tweetCount: parseInt(row.count),
+      score: parseInt(row.count),
+    }));
+
     res.json({ trends });
   } catch (error) {
     next(error);

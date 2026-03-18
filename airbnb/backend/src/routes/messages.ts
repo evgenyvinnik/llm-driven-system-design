@@ -88,6 +88,27 @@ router.get('/', authenticate, async (req, res) => {
   }
 });
 
+/** GET /api/messages/unread/count - Returns the total number of unread messages for the authenticated user. */
+// Get unread message count
+router.get('/unread/count', authenticate, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT COUNT(*) as count
+      FROM messages m
+      JOIN conversations c ON m.conversation_id = c.id
+      WHERE (c.host_id = $1 OR c.guest_id = $1)
+        AND m.sender_id != $1
+        AND m.is_read = FALSE`,
+      [req.user!.id]
+    );
+
+    res.json({ count: parseInt(result.rows[0].count) });
+  } catch (error) {
+    console.error('Get unread count error:', error);
+    res.status(500).json({ error: 'Failed to get unread count' });
+  }
+});
+
 /** GET /api/messages/:id - Returns a conversation with all messages and marks unread ones as read. */
 // Get single conversation with messages
 router.get('/:id', authenticate, async (req, res) => {
@@ -179,27 +200,6 @@ router.post('/:id/messages', authenticate, async (req, res) => {
   } catch (error) {
     console.error('Send message error:', error);
     res.status(500).json({ error: 'Failed to send message' });
-  }
-});
-
-/** GET /api/messages/unread/count - Returns the total number of unread messages for the authenticated user. */
-// Get unread message count
-router.get('/unread/count', authenticate, async (req, res) => {
-  try {
-    const result = await query(
-      `SELECT COUNT(*) as count
-      FROM messages m
-      JOIN conversations c ON m.conversation_id = c.id
-      WHERE (c.host_id = $1 OR c.guest_id = $1)
-        AND m.sender_id != $1
-        AND m.is_read = FALSE`,
-      [req.user!.id]
-    );
-
-    res.json({ count: parseInt(result.rows[0].count) });
-  } catch (error) {
-    console.error('Get unread count error:', error);
-    res.status(500).json({ error: 'Failed to get unread count' });
   }
 });
 

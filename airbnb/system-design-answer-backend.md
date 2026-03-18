@@ -6,13 +6,7 @@
 
 ## 📋 Problem Statement
 
-Design the backend infrastructure for a property rental marketplace like Airbnb.
-
-**Key Backend Challenges:**
-- Geographic search with spatial indexing
-- Availability calendar with efficient date-range storage
-- Double-booking prevention under concurrent access
-- Two-sided review system with hidden-until-both-submit semantics
+Design the backend infrastructure for a property rental marketplace like Airbnb, focusing on geographic search, availability calendars, double-booking prevention, and two-sided reviews.
 
 ---
 
@@ -25,7 +19,6 @@ Design the backend infrastructure for a property rental marketplace like Airbnb.
 | Search | Geographic + availability + filter-based discovery |
 | Booking | Reservations with double-booking prevention |
 | Reviews | Two-sided ratings (host and guest) |
-| Messaging | Host-guest communication |
 
 ### Non-Functional Requirements
 | Requirement | Target |
@@ -33,14 +26,7 @@ Design the backend infrastructure for a property rental marketplace like Airbnb.
 | Availability | 99.9% for search |
 | Consistency | Strong for bookings (no double-booking) |
 | Latency | < 200ms for search results |
-| Scale | 10M listings, 1M bookings/day |
-
-### Scale Estimates
-- Active Listings: 10M
-- Daily Bookings: 1M
-- Daily Searches: 50M
-- Average Stay: 3 nights
-- Peak Concurrent Users: 200K
+| Scale | 10M listings, 1M bookings/day, 50M daily searches |
 
 ---
 
@@ -135,11 +121,10 @@ All operations run in a single database transaction.
 
 ### Storage Alternatives
 
-| Approach | Pros | Cons | Decision |
-|----------|------|------|----------|
-| Date ranges | 18x less storage, efficient range queries | Complex split/merge logic | ✅ Chosen |
-| Day-by-day rows | Simple updates | 3.65B rows, slow queries | ❌ Rejected |
-| Bitmap per month | Compact for dense data | Complex for custom pricing | ❌ Rejected |
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Date ranges | 18x less storage, efficient range queries | Complex split/merge logic |
+| ❌ Day-by-day rows | Simple updates | 3.65B rows, slow queries |
 
 ---
 
@@ -147,7 +132,7 @@ All operations run in a single database transaction.
 
 ### PostGIS Spatial Data
 
-Each listing stores location as a GEOGRAPHY point (latitude/longitude in WGS84 coordinate system).
+Each listing stores location as a GEOGRAPHY point (WGS84).
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -203,15 +188,22 @@ Step 4: Rank and Paginate
         └───────────────────────────────────────┘
 ```
 
-Results are ranked by a weighted score combining distance to search center (highest weight), rating and review count (quality signal), price match to budget, and instant-book availability (conversion bonus).
+### Search Ranking Factors
+
+| Factor | Weight | Rationale |
+|--------|--------|-----------|
+| Distance to search center | High | Relevance to location |
+| Rating + review count | Medium | Quality signal and social proof |
+| Price match to budget | Medium | Affordability |
+| Instant book enabled | Bonus | Conversion optimization |
 
 ### Geo Search Alternatives
 
-| Approach | Pros | Cons | Decision |
-|----------|------|------|----------|
-| PostGIS | Single DB, GIST index, accurate distance | Limited to PostgreSQL | ✅ Chosen |
-| Elasticsearch geo | Full-text + geo, facets | Sync complexity | ❌ Rejected |
-| Geohash grid | Simple, cache-friendly | Less accurate at edges | ❌ Rejected |
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ PostGIS | Single DB, GIST index, accurate distance | Limited to PostgreSQL |
+| ❌ Elasticsearch geo | Full-text + geo, facets | Sync complexity |
+| ❌ Geohash grid | Simple, cache-friendly | Less accurate at edges |
 
 ---
 
@@ -251,7 +243,32 @@ User B ─┼─▶ BEGIN TRANSACTION
         │   ROLLBACK with "Dates no longer available" error
 ```
 
-Within the transaction: (1) BEGIN, (2) SELECT listing FOR UPDATE to acquire the row lock, (3) check availability_blocks for overlapping booked ranges, (4) ROLLBACK if conflicts exist, (5) INSERT booking, (6) INSERT availability_block as 'booked', (7) COMMIT.
+### Booking Creation Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Booking Service                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. BEGIN TRANSACTION                                            │
+│     │                                                            │
+│  2. SELECT * FROM listings WHERE id = ? FOR UPDATE               │
+│     │  (Acquire exclusive row lock)                              │
+│     │                                                            │
+│  3. Check availability_blocks for conflicts                      │
+│     │  WHERE status = 'booked'                                   │
+│     │  AND (start_date, end_date) OVERLAPS (check_in, check_out) │
+│     │                                                            │
+│  4. IF conflicts exist → ROLLBACK with error                     │
+│     │                                                            │
+│  5. INSERT INTO bookings (listing_id, guest_id, dates, status)   │
+│     │                                                            │
+│  6. INSERT INTO availability_blocks (listing_id, dates, 'booked')│
+│     │                                                            │
+│  7. COMMIT                                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ### Instant Book vs Request to Book
 
@@ -279,11 +296,11 @@ Within the transaction: (1) BEGIN, (2) SELECT listing FOR UPDATE to acquire the 
 
 ### Lock Strategy Alternatives
 
-| Approach | Pros | Cons | Decision |
-|----------|------|------|----------|
-| Row-level lock (FOR UPDATE) | Simple, single DB | Blocks concurrent readers | ✅ Chosen |
-| Distributed lock (Redis) | Scales beyond single DB | Additional complexity | ❌ Rejected |
-| Optimistic locking (version) | No blocking | Retry storms under contention | ❌ Rejected |
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Row-level lock (FOR UPDATE) | Simple, single DB | Blocks concurrent readers |
+| ❌ Distributed lock (Redis) | Scales beyond single DB | Additional complexity |
+| ❌ Optimistic locking (version) | No blocking | Retry storms under contention |
 
 ---
 
@@ -291,9 +308,7 @@ Within the transaction: (1) BEGIN, (2) SELECT listing FOR UPDATE to acquire the 
 
 ### The Trust Problem
 
-Reviews need protection against retaliation:
-- If guest sees bad host review first, they may leave retaliatory bad review
-- Solution: Hide reviews until BOTH parties submit
+Reviews need retaliation protection: hide reviews until BOTH parties submit, so neither party can see the other's review before writing their own.
 
 ### Review Data Model
 
@@ -333,36 +348,185 @@ Day 8: Host submits review (rating: 5 stars)
            - Update listing.rating and listing.review_count
 ```
 
-Two database triggers handle atomicity: (1) after each review insert, check if both author types exist for the booking — if so, set `is_public = TRUE` for both; (2) after a review becomes public, recalculate the listing's denormalized average rating and review count. The review window opens at checkout and closes after 14 days. Reviews become public when both parties submit or the window closes, whichever comes first.
+### Database Triggers
+
+```
+Trigger 1: check_and_publish_reviews
+├── Fires: AFTER INSERT on reviews
+├── Logic: IF COUNT(DISTINCT author_type) = 2 for booking
+│          THEN SET is_public = TRUE for both reviews
+└── Purpose: Atomically reveal both reviews together
+
+Trigger 2: update_listing_rating
+├── Fires: AFTER UPDATE of is_public on reviews
+├── Logic: IF is_public = TRUE AND author_type = 'guest'
+│          THEN recalculate listing.rating as AVG(all public guest ratings)
+│          AND update listing.review_count
+└── Purpose: Keep denormalized rating accurate
+```
+
+### Review Window Rules
+
+Review window opens at checkout and closes 14 days later. Reviews become public when both submit OR the window closes (whichever first). Only public guest reviews count toward listing ratings.
 
 ---
 
-## 📦 Caching and Async Processing
+## 💾 Deep Dive: Caching Strategy
 
-### Caching Strategy
+### Cache Architecture
 
-Three-tier cache: CDN (images, static assets), Valkey/Redis (listing details, availability, sessions), PostgreSQL as source of truth. We use cache-aside: check Valkey first, fall back to DB, populate cache on miss.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         CDN (CloudFront)                         │
+│     Static assets, listing images, search result pages          │
+│     TTL: 1 hour for images, 5 min for search pages              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Valkey/Redis Cluster                       │
+│     Session cache, listing details, availability snapshots      │
+│     TTL: 15 min listing, 1 min availability, 24h sessions       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   PostgreSQL + PostGIS                           │
+│                 Source of truth for all data                     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-**Cache invalidation:** On listing update, delete `listing:{id}` and nearby search result keys (keyed by geohash). On booking, delete `availability:{listing_id}` and publish event.
+### Cache-Aside Pattern
+
+```
+Get Listing Details:
+
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Client    │────▶│ Listing API  │────▶│   Valkey    │
+└─────────────┘     └──────────────┘     └─────────────┘
+                           │                    │
+                           │  Cache hit? ◀──────┤
+                           │      │             │
+                    Yes ◀──┤      │ No          │
+                           │      │             │
+                           │      ▼             │
+                           │ ┌─────────────┐    │
+                           │ │ PostgreSQL  │    │
+                           │ └─────────────┘    │
+                           │      │             │
+                           │      │ Set cache ──▶
+                           │      │ (TTL: 15min)│
+                           │      │             │
+                           ▼      ▼             │
+                    Return listing data         │
+```
+
+### Cache Invalidation Strategy
+
+```
+On Listing Update:
+├── Delete listing:{id} from cache
+├── Compute geohash of listing location (4-char precision)
+└── Delete search:{geohash}:* keys (invalidate nearby search results)
+
+On Booking Created:
+├── Delete availability:{listing_id} from cache
+└── Publish booking:created event (notify other services)
+```
+
+### TTL Strategy by Data Type
 
 | Data Type | TTL | Rationale |
 |-----------|-----|-----------|
-| Listing details | 15 min | Changes infrequently |
+| Listing details | 15 min | Property details change infrequently |
 | Availability | 1 min | Must be fresh to prevent conflicts |
-| Search results | 5 min | Slightly stale acceptable |
+| Search results | 5 min | Slightly stale is acceptable |
 | User sessions | 24 hours | Long-lived authentication |
 
-### Async Events via RabbitMQ
+---
 
-Non-critical work (notifications, search reindexing, analytics) is handled asynchronously through a topic exchange with routing keys like `booking.created`, `listing.updated`, `review.submitted`. Dedicated workers consume each queue.
+## 📨 Deep Dive: Async Processing with RabbitMQ
 
-Each message carries a unique `eventId`. Workers implement idempotent consumption: check Redis for `processed:{eventId}` before processing, set it with 7-day TTL after success. Failed messages retry up to 3 times before routing to a dead-letter queue for manual investigation.
+### Queue Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       API Services                               │
+│            Listing / Booking / Search / Review                   │
+└─────────────────────────────────────────────────────────────────┘
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     RabbitMQ Exchange                            │
+│                    (Topic Exchange)                              │
+├─────────────────┬─────────────────┬─────────────────────────────┤
+│ booking.created │ listing.updated │ notification.send            │
+│ booking.cancel  │ review.submitted│ search.reindex               │
+└─────────────────┴─────────────────┴─────────────────────────────┘
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ Notification  │    │ Search Index  │    │  Analytics    │
+│   Worker      │    │   Worker      │    │   Worker      │
+└───────────────┘    └───────────────┘    └───────────────┘
+```
+
+Each event message contains an eventId (UUID), eventType (e.g., "booking.created"), timestamp, and a data payload with relevant IDs and dates.
+
+### Idempotent Consumer Pattern
+
+```
+Worker receives message:
+
+1. Extract eventId from message
+        │
+2. Check Redis: processed:{eventId} exists?
+        │
+   ┌────┴────┐
+   │         │
+  Yes       No
+   │         │
+   ▼         ▼
+ ACK msg   Process message
+(skip)          │
+                ▼
+           Set Redis key: processed:{eventId} = 1
+           (TTL: 7 days)
+                │
+                ▼
+           ACK message
+```
+
+### Retry and Dead Letter Queue
+
+Messages retry up to 3 times with incrementing retry count headers. After 3 failures, messages route to a Dead Letter Queue (DLQ) for manual investigation.
+
+---
 
 ## 📊 Observability
 
-Key SLIs: search availability (99.9% target), search p95 latency (<200ms), booking p95 confirmation (<1s), and double-booking rate (must be 0%). We track `http_request_duration_seconds`, `bookings_total`, `search_latency_seconds`, and `cache_hit_ratio` via Prometheus histograms and counters.
+### SLI/SLO Definitions
 
-Distributed tracing (OpenTelemetry) spans each booking request from API Gateway through Booking Service to PostgreSQL and Valkey, with async spans into notification workers. Each span captures operation name, duration, entity IDs, and status.
+| SLI | SLO Target | Alert Threshold |
+|-----|------------|-----------------|
+| Availability (success / total) | 99.9% | < 99.5% for 5 min |
+| Search Latency (p95) | < 200ms | > 500ms for 5 min |
+| Booking Latency (p95) | < 1s | > 2s for 5 min |
+| Double-Booking Rate | 0% | > 0 in 1 hour |
+
+Key Prometheus metrics: `http_request_duration_seconds` (histogram), `bookings_total` (counter by status), `search_latency_seconds` (histogram), `cache_hit_ratio` (gauge).
+
+### Distributed Tracing Flow
+
+```
+Create Booking Request:
+
+[API Gateway] ──span──▶ [Booking Service] ──span──▶ [PostgreSQL]
+      │                        │
+      │                        └──span──▶ [Valkey Cache]
+      │
+      └──span──▶ [Notification Worker] ──span──▶ [Email Service]
+```
 
 ---
 
@@ -378,8 +542,3 @@ Distributed tracing (OpenTelemetry) spans each booking request from API Gateway 
 | Message queue | ✅ RabbitMQ | ❌ Kafka | Sufficient for booking scale |
 | Tracing | ✅ OpenTelemetry | ❌ Zipkin | Vendor-neutral ecosystem |
 
----
-
-## 🚀 Future Enhancements
-
-Key next steps: Elasticsearch for full-text search on listing descriptions, ML-based dynamic pricing, multi-region deployment with read replicas and geo-routing, Kafka migration for higher-throughput event streaming, and Stripe/Adyen payment integration with PCI compliance.

@@ -48,43 +48,44 @@ function calculateDistance(lat1: number, lng1: number, lat2: number, lng2: numbe
  */
 async function findNearbyDrivers(lat: number, lng: number, radiusKm: number = 5): Promise<DriverCandidate[]> {
   // In production, would use Redis GEORADIUS
+  // Use bounding box filter instead of PostGIS (not available in dev)
+  const latDelta = radiusKm / 111.0; // ~111 km per degree latitude
+  const lngDelta = radiusKm / (111.0 * Math.cos(lat * Math.PI / 180));
+
   const result = await query<{
-    id: string;
+    user_id: string;
     name: string;
     current_lat: number;
     current_lng: number;
     rating: number;
   }>(`
-    SELECT d.id, u.name, d.current_lat, d.current_lng, d.rating
+    SELECT d.user_id, u.name, d.current_lat, d.current_lng, u.rating
     FROM drivers d
     JOIN users u ON d.user_id = u.id
-    WHERE d.status = 'available'
+    WHERE d.is_available = TRUE
+      AND d.is_online = TRUE
       AND d.current_lat IS NOT NULL
       AND d.current_lng IS NOT NULL
-      AND ST_DWithin(
-        ST_MakePoint(d.current_lng, d.current_lat)::geography,
-        ST_MakePoint($1, $2)::geography,
-        $3
-      )
-    ORDER BY ST_Distance(
-      ST_MakePoint(d.current_lng, d.current_lat)::geography,
-      ST_MakePoint($1, $2)::geography
-    )
-    LIMIT 10
-  `, [lng, lat, radiusKm * 1000]);
+      AND d.current_lat BETWEEN $1 AND $2
+      AND d.current_lng BETWEEN $3 AND $4
+    LIMIT 20
+  `, [lat - latDelta, lat + latDelta, lng - lngDelta, lng + lngDelta]);
 
-  return result.rows.map(row => {
-    const distance = calculateDistance(lat, lng, row.current_lat, row.current_lng);
-    return {
-      id: row.id,
-      name: row.name,
-      lat: row.current_lat,
-      lng: row.current_lng,
-      rating: row.rating,
-      distance,
-      eta: Math.ceil(distance / 30 * 60), // Assume 30 km/h average speed
-    };
-  });
+  return result.rows
+    .map(row => {
+      const distance = calculateDistance(lat, lng, row.current_lat, row.current_lng);
+      return {
+        id: row.user_id,
+        name: row.name,
+        lat: row.current_lat,
+        lng: row.current_lng,
+        rating: Number(row.rating),
+        distance,
+        eta: Math.ceil(distance / 30 * 60), // Assume 30 km/h average speed
+      };
+    })
+    .filter(d => d.distance <= radiusKm)
+    .slice(0, 10);
 }
 
 /**
@@ -138,8 +139,8 @@ async function handleMatchingRequest(request: MatchingRequest): Promise<void> {
 
   // Create ride record
   const rideResult = await query<{ id: string }>(`
-    INSERT INTO rides (rider_id, driver_id, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, ride_type, status, created_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'matched', NOW())
+    INSERT INTO rides (rider_id, driver_id, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, vehicle_type, status, requested_at, matched_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'matched', NOW(), NOW())
     RETURNING id
   `, [riderId, selectedDriver.id, pickupLat, pickupLng, dropoffLat, dropoffLng, rideType]);
 
@@ -147,8 +148,8 @@ async function handleMatchingRequest(request: MatchingRequest): Promise<void> {
 
   // Update driver status
   await query(`
-    UPDATE drivers SET status = 'busy', current_ride_id = $1 WHERE id = $2
-  `, [rideId, selectedDriver.id]);
+    UPDATE drivers SET is_available = FALSE, updated_at = NOW() WHERE user_id = $1
+  `, [selectedDriver.id]);
 
   // Publish match event
   await publishToExchange(EXCHANGES.RIDE_EVENTS, '', {

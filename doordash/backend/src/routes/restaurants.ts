@@ -74,6 +74,53 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
   }
 });
 
+// Get cuisine types (with caching)
+router.get('/meta/cuisines', async (req: Request, res: Response): Promise<void> => {
+  try {
+    // Try cache first
+    const cached = await getCachedCuisines();
+    if (cached) {
+      res.json({ cuisines: cached });
+      return;
+    }
+
+    // Cache miss
+    const result = await query(
+      `SELECT DISTINCT cuisine_type FROM restaurants WHERE cuisine_type IS NOT NULL ORDER BY cuisine_type`
+    );
+
+    const cuisines = result.rows.map((r: { cuisine_type: string }) => r.cuisine_type);
+
+    // Store in cache
+    await setCachedCuisines(cuisines);
+
+    res.json({ cuisines });
+  } catch (err) {
+    const error = err as Error;
+    logger.error({ error: error.message }, 'Get cuisines error');
+    res.status(500).json({ error: 'Failed to get cuisines' });
+  }
+});
+
+// Get my restaurants (for restaurant owners)
+router.get(
+  '/owner/my-restaurants',
+  requireAuth,
+  requireRole('restaurant_owner', 'admin'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const result = await query(`SELECT * FROM restaurants WHERE owner_id = $1 ORDER BY name`, [
+        req.user!.id,
+      ]);
+      res.json({ restaurants: result.rows });
+    } catch (err) {
+      const error = err as Error;
+      logger.error({ error: error.message }, 'Get my restaurants error');
+      res.status(500).json({ error: 'Failed to get restaurants' });
+    }
+  }
+);
+
 // Get single restaurant with menu (with caching)
 router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -137,54 +184,7 @@ router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// Get cuisine types (with caching)
-router.get('/meta/cuisines', async (req: Request, res: Response): Promise<void> => {
-  try {
-    // Try cache first
-    const cached = await getCachedCuisines();
-    if (cached) {
-      res.json({ cuisines: cached });
-      return;
-    }
-
-    // Cache miss
-    const result = await query(
-      `SELECT DISTINCT cuisine_type FROM restaurants WHERE cuisine_type IS NOT NULL ORDER BY cuisine_type`
-    );
-
-    const cuisines = result.rows.map((r: { cuisine_type: string }) => r.cuisine_type);
-
-    // Store in cache
-    await setCachedCuisines(cuisines);
-
-    res.json({ cuisines });
-  } catch (err) {
-    const error = err as Error;
-    logger.error({ error: error.message }, 'Get cuisines error');
-    res.status(500).json({ error: 'Failed to get cuisines' });
-  }
-});
-
 // Restaurant owner routes
-
-// Get my restaurants (for restaurant owners)
-router.get(
-  '/owner/my-restaurants',
-  requireAuth,
-  requireRole('restaurant_owner', 'admin'),
-  async (req: Request, res: Response): Promise<void> => {
-    try {
-      const result = await query(`SELECT * FROM restaurants WHERE owner_id = $1 ORDER BY name`, [
-        req.user!.id,
-      ]);
-      res.json({ restaurants: result.rows });
-    } catch (err) {
-      const error = err as Error;
-      logger.error({ error: error.message }, 'Get my restaurants error');
-      res.status(500).json({ error: 'Failed to get restaurants' });
-    }
-  }
-);
 
 // Create restaurant
 router.post(

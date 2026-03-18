@@ -10,6 +10,8 @@ CREATE TABLE accounts (
     password_hash VARCHAR(255) NOT NULL,
     subscription_tier VARCHAR(50) DEFAULT 'standard', -- basic, standard, premium
     country VARCHAR(10) DEFAULT 'US',
+    is_admin BOOLEAN DEFAULT FALSE,
+    role VARCHAR(50) DEFAULT 'user',
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -99,8 +101,11 @@ CREATE TABLE viewing_progress (
     completed BOOLEAN DEFAULT FALSE,
     last_watched_at TIMESTAMP DEFAULT NOW(),
     created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(profile_id, video_id, episode_id)
+    CHECK (video_id IS NOT NULL OR episode_id IS NOT NULL)
 );
+
+CREATE UNIQUE INDEX idx_viewing_progress_movie ON viewing_progress(profile_id, video_id) WHERE episode_id IS NULL;
+CREATE UNIQUE INDEX idx_viewing_progress_episode ON viewing_progress(profile_id, episode_id) WHERE video_id IS NULL;
 
 -- Watch history (completed views)
 CREATE TABLE watch_history (

@@ -95,6 +95,51 @@ CREATE TABLE sessions (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Notifications table (for notification worker)
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    body TEXT NOT NULL,
+    data JSONB,
+    read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Analytics daily aggregation (for analytics worker)
+CREATE TABLE analytics_daily (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    metric_type VARCHAR(50) NOT NULL,
+    count INTEGER DEFAULT 0,
+    total_value DECIMAL(12,2) DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (date, metric_type)
+);
+
+-- Analytics hourly aggregation (for analytics worker)
+CREATE TABLE analytics_hourly (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    hour INTEGER NOT NULL CHECK (hour >= 0 AND hour <= 23),
+    rides_completed INTEGER DEFAULT 0,
+    revenue DECIMAL(12,2) DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (date, hour)
+);
+
+-- Driver earnings aggregation (for analytics worker)
+CREATE TABLE driver_earnings (
+    id SERIAL PRIMARY KEY,
+    driver_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    rides_completed INTEGER DEFAULT 0,
+    total_earnings DECIMAL(12,2) DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (driver_id, date)
+);
+
 -- Indexes for performance
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_users_user_type ON users(user_type);
@@ -107,5 +152,12 @@ CREATE INDEX idx_rides_requested_at ON rides(requested_at);
 CREATE INDEX idx_ride_locations_ride ON ride_locations(ride_id);
 CREATE INDEX idx_sessions_token ON sessions(token);
 CREATE INDEX idx_sessions_user ON sessions(user_id);
+
+CREATE INDEX idx_notifications_user ON notifications(user_id);
+CREATE INDEX idx_notifications_read ON notifications(user_id, read);
+CREATE INDEX idx_analytics_daily_date ON analytics_daily(date);
+CREATE INDEX idx_analytics_hourly_date ON analytics_hourly(date);
+CREATE INDEX idx_driver_earnings_driver ON driver_earnings(driver_id);
+CREATE INDEX idx_driver_earnings_date ON driver_earnings(date);
 
 -- Seed data is in db-seed/seed.sql

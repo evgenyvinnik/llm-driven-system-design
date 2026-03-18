@@ -10,6 +10,7 @@ import { createServer } from 'http';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import session from 'express-session';
+import RedisStore from 'connect-redis';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -50,8 +51,9 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Session configuration
+// Session configuration with Redis store
 app.use(session({
+  store: new RedisStore({ client: redis }),
   secret: process.env.SESSION_SECRET || 'your-session-secret',
   resave: false,
   saveUninitialized: false,

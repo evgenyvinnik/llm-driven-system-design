@@ -145,9 +145,14 @@ export const CLEANUP_QUERIES = {
   `,
 
   cleanupHashtagActivity: `
+    WITH old_activity AS (
+      SELECT id FROM hashtag_activity
+      WHERE created_at < NOW() - INTERVAL '${RETENTION_POLICIES.hashtagActivity.retentionDays} days'
+      LIMIT $1
+    )
     DELETE FROM hashtag_activity
-    WHERE created_at < NOW() - INTERVAL '${RETENTION_POLICIES.hashtagActivity.retentionDays} days'
-    LIMIT $1
+    WHERE id IN (SELECT id FROM old_activity)
+    RETURNING id
   `,
 
   getTweetsForArchival: `

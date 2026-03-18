@@ -179,6 +179,67 @@ router.post(
   }) as never
 );
 
+// Get nearby drivers (for map display)
+router.get(
+  '/nearby/drivers',
+  authenticate as never,
+  requireRider as never,
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const { lat, lng, radius = '5' } = req.query as unknown as NearbyQuery;
+
+      if (!lat || !lng) {
+        res.status(400).json({ error: 'Location coordinates are required' });
+        return;
+      }
+
+      const drivers = await locationService.findNearbyDrivers(
+        parseFloat(lat),
+        parseFloat(lng),
+        parseFloat(radius)
+      );
+
+      // Return simplified driver info for privacy
+      res.json({
+        drivers: drivers.map((d) => ({
+          id: d.id,
+          lat: d.lat,
+          lng: d.lng,
+          vehicleType: d.vehicleType,
+        })),
+      });
+    } catch (error) {
+      const err = error as Error;
+      logger.error({ error: err.message }, 'Get nearby drivers error');
+      res.status(500).json({ error: 'Failed to get nearby drivers' });
+    }
+  }) as never
+);
+
+// Get surge info
+router.get(
+  '/surge/info',
+  authenticate as never,
+  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const { lat, lng } = req.query as unknown as SurgeQuery;
+
+      if (!lat || !lng) {
+        res.status(400).json({ error: 'Location coordinates are required' });
+        return;
+      }
+
+      const surgeInfo = await pricingService.getSurgeInfo(parseFloat(lat), parseFloat(lng));
+
+      res.json(surgeInfo);
+    } catch (error) {
+      const err = error as Error;
+      logger.error({ error: err.message }, 'Get surge info error');
+      res.status(500).json({ error: 'Failed to get surge info' });
+    }
+  }) as never
+);
+
 // Get ride status
 router.get(
   '/:rideId',
@@ -379,67 +440,6 @@ router.get(
       const err = error as Error;
       logger.error({ error: err.message }, 'Get rides error');
       res.status(500).json({ error: 'Failed to get ride history' });
-    }
-  }) as never
-);
-
-// Get nearby drivers (for map display)
-router.get(
-  '/nearby/drivers',
-  authenticate as never,
-  requireRider as never,
-  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-    try {
-      const { lat, lng, radius = '5' } = req.query as unknown as NearbyQuery;
-
-      if (!lat || !lng) {
-        res.status(400).json({ error: 'Location coordinates are required' });
-        return;
-      }
-
-      const drivers = await locationService.findNearbyDrivers(
-        parseFloat(lat),
-        parseFloat(lng),
-        parseFloat(radius)
-      );
-
-      // Return simplified driver info for privacy
-      res.json({
-        drivers: drivers.map((d) => ({
-          id: d.id,
-          lat: d.lat,
-          lng: d.lng,
-          vehicleType: d.vehicleType,
-        })),
-      });
-    } catch (error) {
-      const err = error as Error;
-      logger.error({ error: err.message }, 'Get nearby drivers error');
-      res.status(500).json({ error: 'Failed to get nearby drivers' });
-    }
-  }) as never
-);
-
-// Get surge info
-router.get(
-  '/surge/info',
-  authenticate as never,
-  (async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-    try {
-      const { lat, lng } = req.query as unknown as SurgeQuery;
-
-      if (!lat || !lng) {
-        res.status(400).json({ error: 'Location coordinates are required' });
-        return;
-      }
-
-      const surgeInfo = await pricingService.getSurgeInfo(parseFloat(lat), parseFloat(lng));
-
-      res.json(surgeInfo);
-    } catch (error) {
-      const err = error as Error;
-      logger.error({ error: err.message }, 'Get surge info error');
-      res.status(500).json({ error: 'Failed to get surge info' });
     }
   }) as never
 );
