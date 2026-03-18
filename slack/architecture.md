@@ -457,6 +457,118 @@ Client → Server Events:
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The frontend is a React 19 + TypeScript SPA built with Vite, using Slack's characteristic workspace-centric layout:
+
+```
+__root.tsx (<Outlet />)
+├── /login                         → LoginForm (email/password)
+├── /workspace-select              → WorkspaceSelect (list/create/join workspaces)
+├── / (index)                      → Redirect to /login or /workspace-select
+└── /workspace/$workspaceId        → WorkspaceLayout (auth guard + data loading)
+    ├── Sidebar (left)             → Workspace name, search, channels, DMs, user profile
+    ├── Main content (center)      → <Outlet />
+    │   └── /channel/$channelId    → MessageList + message input
+    │       ├── Messages           → Rendered with date dividers, reactions, threads
+    │       └── Typing indicator   → "Alice is typing..."
+    ├── ThreadPanel (right, conditional) → Thread view with parent + replies
+    └── SearchModal (overlay)      → Full-text search with debounced input
+```
+
+The `WorkspaceLayout` route (`/workspace/$workspaceId.tsx`) is the primary authenticated layout. Its `beforeLoad` hook verifies auth, loads workspaces, selects the current workspace, and fetches channels and DMs -- all before rendering. This avoids loading spinners for the core chrome.
+
+### State Management (Zustand)
+
+Six Zustand stores separate concerns by domain:
+
+**`useAuthStore`** -- Current user and loading state. Simple setter-based store with `setUser()` and `setLoading()`.
+
+**`useWorkspaceStore`** -- Workspace list, current workspace, and cached member lists keyed by workspace ID. The `members` record avoids re-fetching workspace members on every channel switch.
+
+**`useChannelStore`** -- Channel list, DM list, and currently selected channel. The `updateUnreadCount()` action updates a specific channel's badge without replacing the entire array, which would cause all channel items to re-render.
+
+**`useMessageStore`** -- Messages keyed by channel ID (`Record<string, Message[]>`), active thread, typing users keyed by channel ID, and reaction management. This is the most complex store:
+- `addMessage()` checks for duplicates (WebSocket may deliver a message the REST response already returned) before appending.
+- `addReaction()` and `removeReaction()` operate on nested arrays within specific messages, using immutable update patterns (map over messages, map over reactions).
+- `setTypingUsers()` manages per-channel typing indicator lists, with automatic 5-second cleanup timers.
+
+**`usePresenceStore`** -- Online/offline status by user ID (`Record<string, boolean>`). Updated by WebSocket presence events. The `updatePresence()` action normalizes the status string into a boolean.
+
+**`useUIStore`** -- UI-only state: sidebar visibility, thread panel visibility, search modal open/closed, search query. These are separated from data stores because they have no API interactions and should not trigger data re-fetches.
+
+**Why six stores instead of one**: Zustand subscriptions are per-store. If all state lived in one store, a typing indicator update would trigger re-renders in every component subscribing to any piece of state. With separate stores, the typing indicator only re-renders components subscribed to `useMessageStore`, and specifically only those that read `typingUsers`. The sidebar (subscribed to `useChannelStore`) does not re-render.
+
+### Routing (TanStack Router)
+
+File-based routing with nested layouts:
+
+```
+routes/
+├── __root.tsx                                     → Root (<Outlet />)
+├── index.tsx                                      → / (redirect)
+├── login.tsx                                      → /login
+├── workspace-select.tsx                           → /workspace-select
+├── workspace/$workspaceId.tsx                     → Layout route (beforeLoad auth guard)
+├── workspace/$workspaceId.index.tsx               → /workspace/:id (default view)
+└── workspace/$workspaceId/channel/$channelId.tsx  → /workspace/:id/channel/:channelId
+```
+
+**Auth guard in `beforeLoad`**: The workspace layout route uses TanStack Router's `beforeLoad` hook for server-side data fetching before the component renders. It calls `authApi.me()`, loads workspaces, selects the current workspace via `workspaceApi.select()`, and fetches channels and DMs. If any of these fail with an authentication error, it throws `redirect({ to: '/login' })`. This is a route-level guard, not a component-level check -- the component never renders without valid data.
+
+**Deep linking**: The URL `/workspace/abc/channel/xyz` fully encodes the application state. A user can share this URL, and the recipient (if authenticated) will load directly into that channel. The `beforeLoad` hook ensures all necessary data is fetched before rendering.
+
+### Data Fetching Pattern
+
+```
+Component (e.g., MessageList)
+  → messageApi.list(channelId, before?, limit?)
+    → request<Message[]>('/messages/channel/' + channelId)
+      → fetch('/api/messages/channel/' + channelId, { credentials: 'include' })
+        → Backend Express API
+```
+
+The API layer (`services/api.ts`) uses a shared `request<T>()` helper that adds `credentials: 'include'` and `Content-Type: application/json` to every request. Six API objects (`authApi`, `workspaceApi`, `channelApi`, `dmApi`, `messageApi`, `searchApi`) provide typed methods for each endpoint.
+
+**Search with debouncing**: The `SearchModal` component uses a 300ms debounce timer (`setTimeout` with cleanup in `useEffect`) to avoid firing a search request on every keystroke. The search API supports filters (channel, user, date range) passed as query parameters.
+
+### Real-Time Updates (WebSocket)
+
+The `useWebSocket` custom hook manages the WebSocket connection lifecycle:
+
+**Connection**: When the workspace layout mounts, it calls `useWebSocket(userId, workspaceId)`. The hook constructs a WebSocket URL (`ws://host/ws?userId=...&workspaceId=...`) and opens a connection.
+
+**Reconnection**: On `onclose`, the hook schedules a reconnection attempt after 3 seconds via `setTimeout`. This handles both intentional disconnects (server restart, deployment) and network blips (Wi-Fi switch, mobile sleep).
+
+**Heartbeat**: A `setInterval` sends a `ping` message every 25 seconds to keep the connection alive. Without heartbeats, intermediate proxies and load balancers may close idle WebSocket connections after 60-120 seconds.
+
+**Message dispatching**: The `handleMessage()` callback routes incoming WebSocket messages to the appropriate Zustand store based on message type:
+- `message` -> `addMessage()` to the message store
+- `message_update` -> `updateMessage()` for edited messages
+- `message_delete` -> `deleteMessage()` to remove from the list
+- `reaction_add` / `reaction_remove` -> update reactions on the specific message
+- `typing` -> add to typing users list with 5-second auto-cleanup timer
+- `presence` -> update presence store with online/offline status
+- `pong` -> heartbeat response (no-op)
+
+**Typing indicators**: The hook exposes a `sendTyping(channelId)` function that sends a `{ type: "typing", payload: { channelId } }` message over the WebSocket. The receiving side adds the user to the channel's typing list and auto-removes them after 5 seconds. The message input calls `sendTyping` on every keypress.
+
+### Key UI Patterns
+
+**Thread panel**: Clicking a message's reply count opens the `ThreadPanel` as a side panel. The panel loads the thread (parent + replies) via `messageApi.getThread()`, stores it in `activeThread`, and renders alongside the message list. Replies sent in the thread panel go through the same `messageApi.send()` with a `thread_ts` parameter. The thread panel closes when the user clicks the X or the `isThreadPanelOpen` flag is toggled in the UI store.
+
+**Channel creation**: The sidebar renders an inline form (toggled by a + button) for creating new channels. The form submits via `channelApi.create()`, appends the new channel to the store, and navigates to it.
+
+**Date dividers**: The message list inserts visual date separators ("Today", "Yesterday", "March 15") between messages from different days, using `shouldShowDateDivider()` utility to compare adjacent message timestamps.
+
+**Hover actions**: Message action buttons (react, reply, edit, delete) are hidden by default and shown on hover via `opacity-0 group-hover:opacity-100`. Edit and delete buttons only appear for the user's own messages (`message.user_id === user?.id`).
+
+**Reaction grouping**: The `groupReactions()` utility aggregates reactions by emoji, counting occurrences and tracking which users reacted. Each reaction badge shows the emoji and count, with visual highlighting for reactions the current user has added.
+
+---
+
 ## Key Design Decisions
 
 ### 1. Thread as Message Attribute vs. Separate Table
@@ -510,6 +622,10 @@ COMMIT;
 
 ### Idempotency
 
+Idempotency solves a fundamental problem in distributed systems: the client cannot distinguish "request failed" from "request succeeded but the response was lost." Consider: a user sends a message, the server persists it and publishes to WebSocket, but the HTTP response times out. The user sees "sending..." and taps retry. Without idempotency, the message appears twice in the channel.
+
+The solution: the client includes a unique `Idempotency-Key` header (UUID) with each request. The server checks Redis for this key before processing. If found, the server returns the cached response from the first processing. If not found, the server processes the request, caches the response in Redis with a 24-hour TTL, and returns it. The TTL ensures keys auto-expire without manual cleanup.
+
 The idempotency middleware prevents duplicate messages from network retries:
 
 1. Client includes `X-Idempotency-Key` header (e.g., `msg:{channelId}:{contentHash}:{timestamp}`)
@@ -545,6 +661,21 @@ This bridges the gap between Redis pub/sub (at-most-once) and the durable messag
 ---
 
 ## Caching
+
+### What Caching Solves (Cache-Aside Pattern)
+
+A PostgreSQL query takes ~5ms. A Redis lookup takes ~0.1ms. When loading a channel, the server queries user profiles, channel metadata, and workspace settings -- data that changes rarely but is read on every request. Without caching, each channel view triggers 5+ database queries. At 10K concurrent users switching channels, that is 50K database queries per second for data that was identical 1 second ago.
+
+The **cache-aside** (lazy-loading) pattern used throughout this project works as follows:
+1. Check Redis for the cached value (`GET channel:{id}`)
+2. **Cache hit**: Return the cached value (0.1ms)
+3. **Cache miss**: Query PostgreSQL (5ms), store the result in Redis with a TTL, return the value
+
+**Cache invalidation**: When data changes (channel topic updated, user profile changed), the server deletes the cache key (`DEL channel:{id}`) rather than updating it. Deletion is safer than update because it avoids race conditions: if two requests update the same key simultaneously, the last write wins. With deletion, the next read simply repopulates from the database.
+
+**TTL (Time-To-Live)**: Every cached value has an expiration time. Even without explicit invalidation, stale data automatically expires. Short TTLs (5 seconds for typing indicators) ensure near-real-time freshness. Longer TTLs (10 minutes for workspace settings) are acceptable for rarely-changing data.
+
+**Why Redis over in-memory Maps**: An in-memory Map is lost when the process restarts. Worse, with 3 API server instances behind a load balancer, each has its own Map with potentially different cached values. Redis is shared across all instances, ensuring cache consistency. Redis also provides atomic operations (`INCR`, `EXPIRE`), eviction policies (LRU), and persistence options.
 
 ### Cache Architecture
 
@@ -607,7 +738,24 @@ The application uses cache-aside (lazy loading) for all cached data:
 
 ## Observability
 
+### What Observability Solves
+
+In a messaging system, a user reports "my messages aren't being delivered." Without observability, debugging involves SSH-ing into servers, grepping log files, and guessing. With observability, you query: "show me the WebSocket connection count for user X" (metrics), "show me all messages sent by user X in the last hour" (logs), and "what's the Redis pub/sub latency?" (metrics). The three pillars -- metrics, logs, health checks -- turn production incidents from hours of investigation into minutes of dashboard queries.
+
 ### Prometheus Metrics
+
+Prometheus is a time-series database that pulls metric data from application endpoints. The `prom-client` library registers metrics in the application, and Prometheus scrapes the `/metrics` endpoint at regular intervals (typically every 15s). These metrics power Grafana dashboards and alerting rules.
+
+**Metric types explained:**
+
+- **Counter** -- Monotonically increasing number. Use for things that only go up: total messages sent, total errors, total requests. To get "messages per second," query `rate(slack_messages_sent_total[5m])`. The rate function computes the per-second increase over the window.
+- **Histogram** -- Distribution of measured values. Use for latency and duration measurements. Prometheus pre-buckets values and supports percentile queries: `histogram_quantile(0.99, slack_http_request_duration_seconds)` gives the p99 latency. This is critical because averages hide outliers -- an average of 20ms could mean 99% at 5ms and 1% at 1.5 seconds.
+- **Gauge** -- Value that goes up and down. Use for current state: active WebSocket connections, queue depth. Unlike counters, gauges represent a point-in-time snapshot.
+
+**Alerting examples:**
+- `rate(slack_http_requests_total{status_code=~"5.."}[5m]) > 0.001` -- error rate exceeds 0.1% for 5 minutes, page the on-call engineer
+- `slack_websocket_connections_active > 50000` -- approaching connection limit per instance, scale horizontally
+- `histogram_quantile(0.99, slack_http_request_duration_seconds[5m]) > 0.5` -- p99 latency exceeds 500ms, investigate database or cache
 
 | Metric | Type | Labels | Purpose |
 |--------|------|--------|---------|
@@ -624,6 +772,12 @@ The application uses cache-aside (lazy loading) for all cached data:
 
 ### Health Checks
 
+Health checks serve two audiences: automated infrastructure (Kubernetes, load balancers) and human operators. They answer distinct questions:
+
+- **Liveness** (`/live`) -- "Is the process running?" A simple HTTP 200 response. If this fails, the process is hung or crashed. Kubernetes kills and restarts the container. This check must be cheap and must not depend on external services -- a process with a dead Redis connection is alive but not ready.
+- **Readiness** (`/ready`) -- "Can this instance handle requests?" Checks Redis and PostgreSQL connectivity. If either is unavailable, this returns 503. The load balancer stops sending traffic to this instance, but does not kill it. This matters: a server reconnecting to Redis should not receive requests, but restarting it would not fix the Redis outage.
+- **Detailed health** (`/health/detailed`) -- Diagnostic endpoint for operators during incidents. Reports Redis latency, PostgreSQL latency, Elasticsearch availability, WebSocket connection count. Too expensive for automated health checking (querying multiple services per check), but invaluable when debugging production issues.
+
 | Endpoint | Purpose | Checks |
 |----------|---------|--------|
 | `GET /health` | Basic liveness | Server is running |
@@ -632,13 +786,20 @@ The application uses cache-aside (lazy loading) for all cached data:
 | `GET /live` | Liveness probe | Process is running |
 | `GET /metrics` | Prometheus scrape | All registered metrics |
 
-### Structured Logging
+### Structured Logging (Pino)
+
+`console.log("message sent")` works during development but is useless in production. With multiple server instances producing thousands of log lines per second, you need to search ("show me all errors for workspace X"), filter by level ("show only errors"), and correlate across requests ("this message send triggered a pub/sub publish -- trace the full flow").
+
+Structured logging means every log entry is a JSON object with consistent fields, not a free-form string. These JSON objects are fed to a log aggregation system (ELK stack: Elasticsearch + Logstash + Kibana, or Datadog) where you can query across millions of log entries in seconds.
+
+**Why Pino**: Pino is the fastest Node.js JSON logger (~5x faster than Winston). It uses a worker thread for string serialization, adding negligible overhead at high throughput. In development, `pino-pretty` formats JSON into readable colored output.
+
+**Log levels** (from most to least verbose): `trace` (function entry/exit), `debug` (cache hits/misses, query details), `info` (request completed, message sent -- the production baseline), `warn` (rate limit hit, degraded state), `error` (5xx, unhandled exceptions), `fatal` (process cannot continue). The level is configurable via environment variable without code changes.
 
 Pino-based structured JSON logging with request-scoped context:
 - **Fields:** `requestId`, `userId`, `workspaceId`, `method`, `path`, `statusCode`, `duration`
 - **Development:** Pretty-printed with `pino-pretty`
 - **Production:** Raw JSON for log aggregation (ELK stack, Datadog)
-- **Log levels:** trace, debug, info, warn, error, fatal
 
 ---
 
@@ -655,6 +816,14 @@ Pino-based structured JSON logging with request-scoped context:
 | WebSocket | Connection dropped | Client auto-reconnects; fetches missed messages via REST |
 
 ### Rate Limiting
+
+Rate limiting protects the system from three threats: abuse (a bot flooding channels with spam), overload (a legitimate integration sending messages faster than the database can handle), and unfair usage (one user consuming a disproportionate share of resources, degrading service for others).
+
+**Sliding Window algorithm** (used here): This implementation uses Redis sorted sets where each request adds a timestamped entry. To check the limit, the server counts entries within the current window (e.g., last 60 seconds). This is more accurate than fixed-window counters, which allow double the rate at window boundaries (e.g., 60 requests at :59 and 60 more at :01 = 120 in 2 seconds). The sliding window smooths this by always looking back exactly N seconds from now.
+
+**Per-user vs per-workspace**: Authenticated users get per-user limits tied to their user ID. This prevents a single user from degrading a workspace's experience. Per-workspace limits (10x individual) protect against coordinated abuse or misconfigured integrations that create multiple users.
+
+**Fails open**: If Redis is down, the rate limiter allows requests through rather than blocking them. This is a deliberate trade-off: it is worse to reject all legitimate traffic (because the rate limiter is broken) than to temporarily allow a few extra requests (because rate limiting is disabled). The Redis outage itself is handled by the circuit breaker and health check systems.
 
 Sliding window rate limiter using Redis sorted sets:
 - Per-user limits by operation type (60 messages/min, 10 channel creates/min, 20 searches/min)

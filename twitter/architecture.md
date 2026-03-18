@@ -402,6 +402,93 @@ GET    /api/trends/all-time     - All-time popular hashtags
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The frontend is a React 19 + TypeScript SPA built with Vite, using Twitter's iconic three-column layout:
+
+```
+__root.tsx
+└── _layout.tsx → Layout component
+    ├── Sidebar (left)       → Navigation links (Home, Explore, Profile, Logout)
+    ├── Main content (center) → <Outlet /> for active route
+    │   ├── / (index)
+    │   │   ├── ComposeTweet  → Tweet composition form (280 char limit)
+    │   │   └── Timeline      → Virtualized tweet list (@tanstack/react-virtual)
+    │   │       └── Tweet     → Single tweet with author, content, engagement actions
+    │   ├── /explore          → Popular tweets ranked by engagement
+    │   ├── /$username        → User profile with follow/unfollow + user timeline
+    │   └── /hashtag/$tag     → Hashtag timeline
+    └── TrendingSidebar (right) → Search bar + trending hashtags + "Who to follow"
+```
+
+The `_layout.tsx` route wraps all authenticated pages in the `Layout` component, which renders the three-column structure. Routes outside the layout (`/login`, `/register`) render full-screen auth forms without the sidebar chrome.
+
+### State Management (Zustand)
+
+Two Zustand stores separate concerns:
+
+**`useAuthStore`** -- Manages authentication state: `user`, `isLoading`, `isInitialized`, `error`. The `checkAuth()` action calls `authApi.getMe()` on app startup to restore the session from the server-side cookie. Unlike Instagram's store, this one does not use the `persist` middleware because the session is server-managed (httpOnly cookie), not client-managed. The `isInitialized` flag distinguishes "haven't checked yet" from "checked and not logged in," preventing a flash of the login page on refresh.
+
+**`useTimelineStore`** -- Manages the tweet feed: `tweets`, `isLoading`, `nextCursor`, `currentFeed`. This store centralizes all timeline operations (home, explore, user, hashtag) behind a single state shape, with `lastFetchParams` tracking which feed type to use for `loadMore()`. This means the Timeline component does not need to know which feed it is displaying -- it just renders `tweets` and calls `loadMore()`.
+
+**Engagement actions** (like, unlike, retweet, unretweet) live in the timeline store, not the Tweet component. When `likeTweet(tweetId)` is called, it fires the API request, waits for the response (which includes the updated count), and calls `updateTweet()` to patch the specific tweet in the array. This ensures the count reflects the server's authoritative value, not a local optimistic increment. The trade-off is a slight delay (100-300ms) before the UI updates, but the count is always accurate.
+
+**Why Zustand over Redux**: The entire state management layer is two files totaling ~180 lines. Redux would require action types, reducers, middleware for async actions (redux-thunk or redux-saga), a store configuration, and a Provider component. For two stores, this boilerplate exceeds the actual state logic. Zustand's `create()` function returns a hook directly -- no providers, no context wrappers, no connect() HOCs.
+
+### Routing (TanStack Router)
+
+File-based routing with a layout route pattern:
+
+```
+routes/
+├── __root.tsx                → Root route (minimal, just <Outlet />)
+├── _layout.tsx               → Layout route (three-column Twitter layout)
+│   ├── _layout/index.tsx     → / (home timeline)
+│   ├── _layout/explore.tsx   → /explore
+│   ├── _layout/$username.tsx → /:username (user profile)
+│   └── _layout/hashtag.$tag.tsx → /hashtag/:tag
+├── login.tsx                 → /login (full-screen)
+└── register.tsx              → /register (full-screen)
+```
+
+**Layout route**: The `_layout` prefix (with underscore) creates a pathless layout route. It does not add a URL segment -- `/` maps to `_layout/index.tsx`, not `/_layout/`. This is TanStack Router's convention for wrapping multiple routes in a shared layout without affecting URLs.
+
+**Auth check**: The root component calls `checkAuth()` on mount and conditionally renders based on `isInitialized`. Protected pages check `user` from the auth store and redirect to `/login` if null.
+
+### Data Fetching Pattern
+
+```
+Component (e.g., HomePage)
+  → useTimelineStore().fetchHomeTimeline()
+    → timelineApi.getHome(limit, cursor)
+      → fetch('/api/timeline/home?limit=50', { credentials: 'include' })
+        → Backend Express API
+```
+
+The API layer (`services/api.ts`) uses individual `async` methods per endpoint rather than a shared request helper. Each method constructs a `URL` object for query parameters, calls `fetch` with `credentials: 'include'`, and passes the response through `handleResponse<T>()` for error extraction.
+
+**Domain separation**: Five API objects (`authApi`, `usersApi`, `tweetsApi`, `timelineApi`, `trendsApi`) group endpoints by resource. The timeline API handles all four feed types (home, user, explore, hashtag) with consistent `{ tweets, nextCursor }` response shapes.
+
+### Virtualization
+
+The `Timeline` component uses `@tanstack/react-virtual` to render tweet lists efficiently. Tweets have variable heights (short text-only tweets vs. tweets with quoted tweets and long engagement counts), so the virtualizer uses `estimateSize: () => 150` with `measureElement` for dynamic height correction.
+
+**Why virtualization matters for Twitter**: A power user following 1000 accounts could have thousands of tweets in their timeline. Without virtualization, scrolling through 5000 tweets would render 5000 DOM nodes, each with avatar, text, action buttons, and engagement counters -- easily 50,000+ DOM elements. The virtualizer maintains at most ~30 DOM nodes (viewport + 5 overscan items above/below), regardless of the total tweet count.
+
+**Infinite scroll**: The scroll handler fires when the user is within 500px of the bottom, calling `onLoadMore()` which triggers the timeline store's `loadMore()` action to fetch the next page.
+
+### Key UI Patterns
+
+**Tweet content parsing**: The `parseContent()` utility in `utils/format.tsx` converts raw tweet text into React elements, transforming `@mentions` into profile links and `#hashtags` into hashtag timeline links. This is done at render time, not at storage time, so the raw text is preserved.
+
+**Sticky header**: The home page header ("Home") uses `sticky top-0 bg-white/85 backdrop-blur-md` for a frosted glass effect that stays at the top during scroll, matching Twitter's native behavior.
+
+**Three-column responsive layout**: The right sidebar (`TrendingSidebar`) is hidden on screens below `lg` breakpoint (`hidden lg:block`), collapsing to a two-column layout on smaller screens.
+
+---
+
 ## Key Design Decisions
 
 ### 1. Hybrid Fanout (Push for Normal Users, Pull for Celebrities)
@@ -438,7 +525,9 @@ GET    /api/trends/all-time     - All-time popular hashtags
 
 ## Consistency and Idempotency
 
-**Idempotency for tweet creation**: The client generates a UUID and sends it as the `Idempotency-Key` header. The server checks Redis for the key before processing. If found, returns the cached response. If not found, processes the request and caches the response with a 24-hour TTL. This prevents duplicate tweets when the client retries after a network timeout.
+**Idempotency for tweet creation**: The problem: a user posts a tweet, the server creates it and triggers fanout, but the HTTP response is lost due to a network timeout. The client shows an error and the user taps "retry." Without idempotency protection, the server creates a second identical tweet -- the user now has two copies. Worse, the fanout worker pushes both to all followers' timelines.
+
+The solution: the client generates a UUID and sends it as the `Idempotency-Key` header with every tweet creation request. The server flow is: (1) check Redis for this key, (2) if found, return the cached response from the first successful processing, (3) if not found, process the request normally, store the response in Redis keyed by the idempotency key with a 24-hour TTL, and return it. The TTL ensures keys auto-expire after the reasonable retry window (no one retries a tweet from yesterday). If Redis is down, the idempotency check degrades gracefully -- the request proceeds without deduplication, accepting the small risk of duplicates over the larger risk of rejecting all tweets.
 
 **Eventual consistency model**: A tweet may appear in some followers' timelines before others (fanout takes time). This is acceptable for a social feed. Users do not expect real-time consistency -- a few seconds of delay is imperceptible.
 
@@ -448,7 +537,22 @@ GET    /api/trends/all-time     - All-time popular hashtags
 
 ## Observability
 
-**Prometheus metrics exposed on `/metrics`:**
+### Prometheus Metrics
+
+Prometheus is a time-series database that periodically scrapes a `/metrics` HTTP endpoint on each service. The application registers metrics using the `prom-client` library, which exposes them in Prometheus's text format. Prometheus stores these as time-series data, enabling queries like "what was the p99 tweet creation latency in the last hour?" and dashboard visualizations in Grafana.
+
+**Three metric types used:**
+
+- **Counter** -- A value that only increases (e.g., `twitter_tweets_created_total`). To get "tweets per second," query `rate(twitter_tweets_created_total[5m])`. Counters never reset except on process restart, so they are safe for rate calculations.
+- **Histogram** -- Measures the distribution of values (e.g., `twitter_timeline_latency_seconds`). Pre-configured buckets capture how many requests fell into each latency range. This enables percentile queries: `histogram_quantile(0.99, ...)` gives the p99 -- the latency below which 99% of requests complete. Averages are misleading because 1% of requests taking 10 seconds is invisible in an average of 50ms.
+- **Gauge** -- A value that goes up and down (e.g., `twitter_fanout_queue_depth`). Represents the current state at scrape time: how many items are queued, how many connections are active, what state the circuit breaker is in.
+
+**The RED method** (Rate, Errors, Duration) is the standard for service monitoring:
+- **Rate**: requests/sec -- detect traffic spikes or drops
+- **Errors**: error rate -- detect service degradation (alert if >0.1% for 5 minutes)
+- **Duration**: latency percentiles -- detect performance regressions (alert if p99 > 500ms for 5 minutes)
+
+**Metrics exposed on `/metrics`:**
 - `twitter_tweets_created_total` (counter, by status: success/error)
 - `twitter_tweet_creation_duration_seconds` (histogram, by status)
 - `twitter_timeline_latency_seconds` (histogram, by timeline_type and cache_hit)
@@ -461,11 +565,27 @@ GET    /api/trends/all-time     - All-time popular hashtags
 - `twitter_db_connection_pool_size` (gauge, by state: total/idle/waiting)
 - `twitter_redis_connection_status` (gauge)
 
-**Structured logging (Pino):**
+### Structured Logging (Pino)
+
+`console.log("tweet created")` is useless in production. With 3 API server instances each logging thousands of lines per second, you need to search ("show me all errors for user 12345"), filter by level ("show only errors, not info"), and correlate across services ("this tweet creation triggered fanout -- trace it"). Structured logging means every log entry is a JSON object with consistent, machine-parseable fields.
+
+**Why Pino**: Pino is the fastest Node.js JSON logger. It defers serialization to a separate worker thread, adding negligible overhead at high throughput. In a service processing 5K requests/second, logger performance matters.
+
+**Child loggers**: Pino supports child loggers that inherit parent fields and add context. A request-scoped child logger might have `{ requestId: "abc", userId: 42 }` automatically attached to every log call within that request. When a fanout operation logs, it includes `{ tweetId: 123, followerCount: 500, operation: "fanout" }` without the caller needing to pass these fields explicitly.
+
+**Log configuration:**
 - JSON format for machine parsing (ELK/Datadog)
 - Request IDs for distributed tracing
 - Child loggers attach context (tweetId, userId, operation) throughout the request lifecycle
 - Log levels: debug (development), info (production), warn (degraded states), error (failures)
+
+### Health Checks
+
+Health checks answer two distinct questions that infrastructure systems (Kubernetes, load balancers) need answered:
+
+- **Liveness** (`/live`) -- "Is the process running?" A simple HTTP 200 response. If this fails, the process is hung or crashed. Kubernetes will kill and restart the container. This check should be cheap and never depend on external services -- a process with a dead database connection is still alive, just not ready.
+- **Readiness** (`/ready`) -- "Can this instance handle requests?" Checks PostgreSQL connectivity and Redis connectivity. If either is down, this returns 503. The load balancer routes traffic away from unready instances, but does not kill them. This distinction matters: a server that lost its database connection should not receive traffic, but killing it would not help -- it needs time to reconnect.
+- **Detailed health** (`/health`) -- Comprehensive diagnostic endpoint for operators. Reports all dependency checks (PostgreSQL, Redis, Kafka), circuit breaker states, connection pool sizes, and latencies. Not used for automated routing decisions -- too expensive to call every 5 seconds.
 
 **Health check endpoints:**
 - `/live` -- liveness probe (is the process running?)
@@ -478,7 +598,13 @@ GET    /api/trends/all-time     - All-time popular hashtags
 
 ### Circuit Breakers (Opossum)
 
-Circuit breakers protect the system when downstream dependencies fail.
+A circuit breaker prevents cascading failures -- the scenario where one failing service takes down the entire system. Without a circuit breaker, if Redis is down, every tweet creation would wait 30 seconds for the fanout timeout, consuming threads and connections. With 1000 concurrent tweet creations, all threads are blocked, and the API server stops responding to any requests -- including health checks, login, and profile views. A single Redis outage cascades into a total system outage.
+
+The circuit breaker wraps calls to downstream services and monitors their failure rate. It has three states:
+
+- **CLOSED** (normal): Requests flow through. The breaker tracks success/failure rates.
+- **OPEN** (fail fast): When failures exceed the threshold, the breaker trips. All subsequent calls immediately return a fallback response (0-1ms) without attempting the downstream call. This is the critical behavior: instead of 1000 threads waiting 30 seconds each, they fail in 1ms each and return a degraded response.
+- **HALF-OPEN** (recovery probe): After a cooldown period, the breaker allows one test request through. Success transitions back to CLOSED (service recovered). Failure transitions back to OPEN (still down, wait longer).
 
 **Redis fanout circuit breaker:**
 - Timeout: 30s (bulk operations are slow)

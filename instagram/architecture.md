@@ -487,13 +487,138 @@ All processed media is served through CDN (CloudFront/Cloudflare):
 - **Server-Sent Events (SSE)** for notifications: unidirectional push for likes, comments, follows, story views
 - **Connection management**: WebSocket connections are load-balanced using sticky sessions (hashed by user ID). Each WS server maintains a local connection registry. Cross-server message delivery uses Redis Pub/Sub -- when user A sends a message to user B who is connected to a different WS server, the message is published to a Redis channel that the target server subscribes to.
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The frontend is a React 19 + TypeScript SPA built with Vite, using a component tree designed around Instagram's content-centric UI:
+
+```
+__root.tsx (Navbar + <Outlet />)
+├── /login, /register         → Auth forms (unprotected)
+├── /create                   → Post creation with file upload + preview
+├── /settings                 → Profile settings
+├── / (index)                 → HomePage
+│   ├── StoryTray             → Horizontal scrollable story rings
+│   │   └── StoryViewer       → Full-screen modal with progress bars, auto-advance
+│   └── Virtualized Feed      → @tanstack/react-virtual
+│       └── PostCard          → Media carousel + like/comment/save/share actions
+│           └── Avatar        → Reusable avatar with story ring indicator
+├── /profile/$username        → Profile page
+│   └── PostGrid              → Grid layout of post thumbnails
+├── /post/$postId             → Single post detail with comments
+└── /explore                  → Discovery grid
+```
+
+The root layout (`__root.tsx`) renders `Navbar` at the top and an `<Outlet />` for the active route. The Navbar contains the Instagram logo, navigation links (home, explore, create, profile), and search. This layout is applied to every page.
+
+### State Management (Zustand)
+
+The project uses a single Zustand store with the `persist` middleware:
+
+**`useAuthStore`** -- Manages authentication state (user object, isLoading, isAuthenticated). Uses Zustand's `persist` middleware to save `user` and `isAuthenticated` to localStorage under `auth-storage`, so the user remains logged in across page refreshes. The `partialize` option ensures only serializable state is persisted (not functions or loading flags).
+
+**Why Zustand over Redux**: Zustand requires no providers, no reducers, no action types. A store is a single `create()` call with state and actions in one object. Components subscribe to exactly the slices they need via selector hooks (`useAuthStore(state => state.user)`), minimizing unnecessary re-renders. For a project with one global store (auth), Redux's boilerplate (createSlice, configureStore, Provider wrapper) is overhead without benefit.
+
+**Why Zustand over React Context**: Context triggers re-renders for every consumer when any part of the context value changes. With auth state, a change to `isLoading` would re-render every component consuming the context, including those that only need `user`. Zustand's selector-based subscriptions avoid this entirely.
+
+**Local component state**: Feed posts, story data, and form inputs use React `useState` because they are page-scoped and do not need to survive navigation. The feed is loaded in `HomePage` and passed to child components via props. This avoids putting ephemeral data into global state.
+
+### Routing (TanStack Router)
+
+File-based routing with TanStack Router and the `@tanstack/router-vite-plugin` for automatic route generation:
+
+```
+routes/
+├── __root.tsx                → Root layout (Navbar + Outlet)
+├── index.tsx                 → / (home feed)
+├── login.tsx                 → /login
+├── register.tsx              → /register
+├── create.tsx                → /create (new post)
+├── settings.tsx              → /settings
+├── explore.tsx               → /explore
+├── post.$postId.tsx          → /post/:postId (single post view)
+└── profile.$username.tsx     → /profile/:username
+```
+
+**Route guards**: The home page checks `isAuthenticated` from the auth store and renders `<Navigate to="/login" />` if the user is not logged in. This is a component-level guard rather than a `beforeLoad` hook, allowing the page to show a loading spinner while the auth check completes.
+
+**Dynamic segments**: `$postId` and `$username` are dynamic route parameters accessed via `Route.useParams()`. TanStack Router provides type-safe params -- accessing `params.postId` in the wrong route is a compile-time error.
+
+### Data Fetching Pattern
+
+The API layer follows a service-object pattern with a shared `request()` helper:
+
+```
+Component (e.g., HomePage)
+  → calls feedApi.getFeed(cursor)
+    → request<T>('/feed', options)
+      → fetch('/api/v1/feed', { credentials: 'include', ... })
+        → Backend Express API
+```
+
+**`services/api.ts`** exports domain-specific API objects (`authApi`, `postsApi`, `feedApi`, `storiesApi`, `usersApi`, `commentsApi`). Each method calls the shared `request<T>()` function, which handles JSON serialization, error extraction, and credentials. A separate `requestFormData<T>()` handles multipart uploads (post creation, avatar updates) without the `Content-Type: application/json` header, letting the browser set the multipart boundary.
+
+**Session-based auth**: All requests include `credentials: 'include'` to send the session cookie. No auth tokens are managed client-side -- the session cookie is httpOnly and managed by the browser.
+
+**Cursor-based pagination**: Feed, comments, followers, and post grids all use cursor pagination. The API returns `{ data: [...], nextCursor: string | null }`. The component stores `nextCursor` in local state and passes it on the next request. When `nextCursor` is null, no more data is available.
+
+### Virtualization
+
+The home feed uses `@tanstack/react-virtual` to efficiently render a potentially unbounded list of posts. Without virtualization, rendering 500 PostCard components (each containing an image, action buttons, and caption) would create 500+ DOM nodes, consuming ~50MB of memory and causing visible jank on scroll.
+
+**How it works**: The virtualizer maintains a window of visible items based on the scroll position of the parent container. Only items within the viewport (plus an `overscan` buffer of 3 items above and below) are rendered to the DOM. As the user scrolls, items entering the viewport are mounted and items leaving are unmounted.
+
+**Dynamic height measurement**: Instagram posts have variable heights (different image aspect ratios, caption lengths, comment counts). The virtualizer uses `estimateSize: () => 600` as an initial guess (header 60px + image 400px + actions 60px + caption 80px), then measures the actual rendered height via `measureElement` using `getBoundingClientRect().height`. This measurement is cached so subsequent scroll passes use the real height.
+
+**Infinite scroll**: A scroll event listener checks if the user is within 500px of the bottom (`scrollHeight - scrollTop - clientHeight < 500`). When triggered, it calls `loadFeed(nextCursor)` to fetch the next page and appends results to the existing array.
+
+### Optimistic Updates
+
+Likes and saves use an optimistic update pattern. When the user taps the heart icon:
+
+1. The UI immediately updates: `setIsLiked(true)` and `setLikeCount(prev => prev + 1)`
+2. The API call fires in the background: `postsApi.like(postId)`
+3. If the API call fails, the UI reverts: `setIsLiked(false)` and `setLikeCount(prev => prev - 1)`
+
+This makes interactions feel instant (0ms perceived latency) instead of waiting 100-300ms for the server round trip. The user sees the heart fill immediately. If the server rejects the request (e.g., rate limit), the heart un-fills. In practice, failures are rare, so the optimistic path is correct 99%+ of the time.
+
+The double-tap-to-like gesture on the image also triggers this flow, with an additional heart animation overlay that fades after 800ms.
+
+### Key UI Patterns
+
+**Story viewer**: The `StoryTray` component renders a horizontal scrollable row of story rings. Clicking a user opens a full-screen modal (`StoryViewer`) that auto-advances through stories on a 5-second timer (100ms intervals incrementing a progress bar by 2%). Tapping the left/right halves of the screen navigates backward/forward. When all stories for a user are viewed, it automatically advances to the next user. Story view tracking fires `storiesApi.view()` when each story becomes visible.
+
+**Media carousel**: `PostCard` supports multi-image posts with left/right navigation arrows and a dot indicator. State tracks `currentMediaIndex`, and each media item checks `mediaType` to render either `<img>` or `<video>`.
+
+**Loading skeletons**: The feed shows 3 placeholder cards with `skeleton` CSS class (pulsing gray blocks) while the initial feed loads, matching the shape of real PostCards.
+
+**Responsive layout**: The feed uses `max-w-lg mx-auto` for a centered single-column layout (Instagram mobile web style). The profile page uses a 3-column post grid. Tailwind utility classes handle responsive breakpoints without custom media queries.
+
 ## Observability
+
+### What Observability Solves
+
+In a distributed system with multiple services (API, image worker, feed generator), a slow request could be caused by any component. Without observability, debugging is guesswork: "Is the database slow? Is the cache down? Is the image worker backed up?" Observability provides three pillars -- metrics (what is happening), logs (why it happened), and traces (where in the call chain it happened) -- that together turn production debugging from hours of manual investigation into minutes of dashboard inspection.
 
 ### Distributed Tracing
 
 Every request receives a `trace_id` (propagated via `x-trace-id` header) that follows the request across services, message queues, and background workers. This enables end-to-end latency analysis: "This feed load took 450ms -- 200ms in PostgreSQL, 150ms in Redis, 100ms in service logic."
 
 ### Prometheus Metrics
+
+Prometheus is a time-series database that scrapes a `/metrics` HTTP endpoint on each service at regular intervals (typically every 15 seconds). It stores numeric measurements over time, enabling queries like "what was the p99 latency over the last hour?" Prometheus itself does not push data -- the application exposes metrics, and Prometheus pulls them. This pull model means a crashed service simply stops being scraped, rather than flooding a metrics pipeline with failure data.
+
+**Three metric types and when to use each:**
+
+- **Counter** -- A monotonically increasing number. Counts things that only go up: total requests, total errors, total posts created. You never reset a counter. To get "requests per second," Prometheus computes the rate of change: `rate(http_requests_total[5m])`.
+- **Histogram** -- Records the distribution of values (e.g., request durations). Prometheus pre-buckets the values, so you can query percentiles: "p99 latency was 450ms." This is critical because averages hide outliers -- an average of 50ms could mean 99% at 10ms and 1% at 4 seconds.
+- **Gauge** -- A value that goes up and down: current connection count, queue depth, circuit breaker state. Unlike counters, gauges represent a point-in-time snapshot.
+
+**The RED method** (Rate, Errors, Duration) is applied across all services:
+- **Rate**: `rate(http_requests_total[5m])` -- requests per second. Sudden drops indicate failures; spikes indicate traffic surges.
+- **Errors**: `rate(http_requests_total{status_code=~"5.."}[5m])` -- error rate. If this exceeds 0.1% for 5 minutes, page the on-call engineer.
+- **Duration**: `histogram_quantile(0.99, http_request_duration_seconds)` -- p99 latency. If this exceeds 500ms for 5 minutes, investigate.
 
 | Metric | Type | Labels | Purpose |
 |--------|------|--------|---------|
@@ -512,13 +637,22 @@ Every request receives a `trace_id` (propagated via `x-trace-id` header) that fo
 | `rate_limit_hits_total` | Counter | action | Abuse detection |
 | `active_sessions` | Gauge | - | Concurrent users |
 
-### Structured Logging (JSON)
+### Structured Logging (Pino)
+
+`console.log("user liked post")` is useless in production. When you have 100 servers each producing thousands of log lines per second, you need to search, filter, and correlate logs programmatically. Structured logging means every log entry is a JSON object with consistent fields, not a free-form string. These JSON logs are fed to a log aggregation system (ELK stack: Elasticsearch + Logstash + Kibana, or Datadog) where you can query: "show me all ERROR logs for user_id=abc123 in the last hour."
+
+**Why Pino over Winston/console.log**: Pino is the fastest Node.js JSON logger (~5x faster than Winston). It achieves this by deferring string serialization to a worker thread. In a high-throughput service processing 10K requests/second, logger overhead matters -- Pino adds ~1ms per 1000 log calls, while Winston adds ~5ms.
+
+**Log levels** control verbosity without code changes:
+- **debug** -- Cache hits/misses, query details. Only enabled in development or when investigating a specific issue.
+- **info** -- Request completed, business events (post created, user followed). The baseline for production.
+- **warn** -- Rate limit hit, circuit breaker half-open, degraded but functional state. Signals that something needs attention but is not broken.
+- **error** -- 5xx responses, unhandled exceptions, service failures. Always triggers alerting.
 
 All services emit structured JSON logs via Pino with:
-- `trace_id` for request correlation
-- `user_id` for user-scoped debugging
-- `duration_ms` for performance tracking
-- Log levels: error (5xx, failures), warn (4xx, rate limits, circuit breakers), info (request completion, business events), debug (cache operations, query details)
+- `trace_id` for request correlation across services -- when a feed load calls the image service, both log entries share the same trace_id
+- `user_id` for user-scoped debugging -- "show me everything this user did in the last hour"
+- `duration_ms` for performance tracking -- identify slow requests without Prometheus
 
 ### Alert Thresholds
 
@@ -535,11 +669,15 @@ All services emit structured JSON logs via Pino with:
 
 ### Circuit Breakers
 
-Using the circuit breaker pattern (Opossum library in production):
+A circuit breaker prevents cascading failures in distributed systems. The problem: if the image processing service goes down, the API server keeps sending requests to it. Each request waits for a timeout (e.g., 30 seconds), consuming a thread/connection. With 1000 concurrent requests, all 1000 threads are blocked waiting for a dead service, and the API server itself becomes unresponsive. One failing service takes down the entire system.
 
-- **CLOSED**: Normal operation, requests flow through
-- **OPEN**: Too many failures (> 50% error rate with minimum 5 requests), requests fail fast with fallback
-- **HALF-OPEN**: After 30-second cooldown, allow one test request to check recovery
+The circuit breaker sits between the caller and the dependency, monitoring failure rates. It has three states:
+
+- **CLOSED** (normal operation): Requests flow through to the downstream service. The breaker counts successes and failures.
+- **OPEN** (service is down, fail fast): When failures exceed a threshold (e.g., >50% error rate), the breaker "trips open." All subsequent requests immediately fail with a fallback response (e.g., return cached data or a 503) without ever calling the downstream service. This is the key insight: failing fast (1ms) is better than failing slow (30s timeout).
+- **HALF-OPEN** (testing recovery): After a cooldown period (e.g., 30 seconds), the breaker allows one test request through. If it succeeds, the breaker transitions back to CLOSED. If it fails, back to OPEN for another cooldown period. This automatic recovery detection means services self-heal without operator intervention.
+
+The local implementation uses the Opossum library, which provides configurable thresholds, timeout values, and fallback functions. Opossum also exposes Prometheus metrics for each breaker (state gauge, trip counter), enabling alerts like "circuit breaker for Cassandra has been OPEN for 5 minutes."
 
 | Service | Timeout | Fallback |
 |---------|---------|----------|
@@ -581,7 +719,11 @@ Failed image processing jobs (after 3 retries) are routed to a dead letter queue
 - **Session revocation**: Revoking a refresh token immediately invalidates all access tokens derived from it
 - **Device management**: Users can see and revoke sessions from specific devices
 
-### Role-Based Access Control
+### Role-Based Access Control (RBAC)
+
+RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles -- not directly to permissions. Without RBAC, you would check `if (user.canDeletePosts && user.canBanUsers && user.canViewStats)` for every admin action, and adding a new permission means updating every user record. With RBAC, you check `if (user.role === 'admin')`, and the role defines what permissions it includes. Adding a new permission only requires updating the role definition, not every user.
+
+In this project, the `users` table has a `role` column (`user`, `admin`, etc.). The auth middleware reads the role from the session, and route-level middleware checks `requireRole('admin')` before allowing access to admin endpoints. The middleware chain works as: authenticate (verify session) -> authorize (check role) -> route handler.
 
 | Role | Permissions |
 |------|-------------|
@@ -591,6 +733,14 @@ Failed image processing jobs (after 3 retries) are routed to a dead letter queue
 | admin | All + delete any content, ban users, view system stats |
 
 ### Rate Limiting
+
+Rate limiting prevents abuse, protects the database from overload, and ensures fair usage across all users. Without it, a single bot could create 10,000 posts per minute, overwhelming the database and degrading service for legitimate users.
+
+**Token Bucket algorithm**: Imagine each user has a bucket that holds N tokens. Each request consumes one token. Tokens are refilled at a fixed rate (e.g., 10 per minute). When the bucket is empty, requests are rejected with HTTP 429 (Too Many Requests). This allows bursts (a user can consume all tokens at once) while enforcing a long-term average rate.
+
+**Sliding Window algorithm** (used here): Counts requests in a rolling time window. More accurate than fixed windows (which allow double the rate at window boundaries). Implemented with Redis sorted sets: each request adds a timestamp, and the count is the number of entries within the window.
+
+**Per-user vs per-IP**: Authenticated users get per-user limits (tied to their user ID). Anonymous requests get per-IP limits (to prevent unauthenticated abuse). Per-user limits are stricter for expensive operations (post creation, follows) and more lenient for reads (feed requests).
 
 Distributed rate limiting via Redis sliding window:
 
@@ -622,6 +772,10 @@ Distributed rate limiting via Redis sliding window:
 ## Consistency and Idempotency
 
 ### Idempotency for Uploads
+
+Idempotency solves the "double-submit" problem. Consider this scenario: a user uploads a photo, the server processes it and creates the post, but the HTTP response is lost due to a network timeout. The client shows an error and the user taps "retry." Without idempotency, the server creates a second identical post. The user now has two copies of the same photo in their feed.
+
+The solution: the client generates a unique ID (UUID) and sends it as the `X-Idempotency-Key` header with the upload request. The server's flow is: (1) check Redis for this key, (2) if found, return the cached response from the first request, (3) if not found, process the request, store the response in Redis with a 24-hour TTL, and return it. The 24-hour TTL means the key auto-expires after the reasonable retry window, keeping Redis memory bounded.
 
 Post creation uses an idempotency key (`X-Idempotency-Key` header). If the client retries a failed upload, the server returns the existing post instead of creating a duplicate. Keys are stored in Redis with 24-hour TTL.
 

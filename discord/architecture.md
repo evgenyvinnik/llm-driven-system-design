@@ -343,7 +343,15 @@ Guild (Server)
 - Attachment limits: 8MB for free users, 50MB for Nitro
 - Content hash deduplication: identical files are stored once
 
-### 9. Caching Strategy
+### 9. Caching Strategy (Cache-Aside Pattern)
+
+Discord's caching follows the cache-aside (lazy-loading) pattern: check cache first, on miss query the database, store the result in cache, return. This pattern reduces database load by orders of magnitude for read-heavy workloads.
+
+**Why caching is essential for Discord**: A PostgreSQL query takes ~5ms. A Redis lookup takes ~0.1ms (50x faster). When a user opens a guild, the client needs the member list, channel list, role definitions, and permission computations. Without caching, every guild open would trigger 5+ database queries. With 15M concurrent users switching between guilds constantly, this would require millions of database queries per second for data that rarely changes.
+
+**Cache invalidation strategy**: When data changes (guild role updated, member added), the server deletes the cache key rather than updating it. Deletion avoids race conditions: if two admin actions update the same role simultaneously, the last delete wins (both clear the cache), and the next read repopulates from the authoritative database. Updating the cache could result in one update overwriting the other, leaving stale data.
+
+**TTL (Time-To-Live)**: Each cached value has an automatic expiration. Even without explicit invalidation, stale data expires. Presence data uses a 60-second TTL -- if a gateway node crashes, its users appear online for at most 60 seconds before the TTL expires and they show as offline.
 
 | Cache | Storage | TTL | Purpose |
 |-------|---------|-----|---------|
@@ -523,6 +531,114 @@ Server → Client:
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+The frontend is a React 19 + TypeScript SPA built with Vite, styled with Tailwind CSS using Discord's dark color palette. The UI mimics Discord's three-panel layout:
+
+```
+__root.tsx (<Outlet />)
+├── /login                    → Login form (nickname-based, no password)
+├── / (index)                 → Redirect to /login or /channels/@me
+└── /channels                 → ChannelsLayout (auth guard)
+    ├── ServerList (left, 64px) → Room icons in vertical strip
+    ├── ChannelSidebar (240px)  → Room details, room list, user panel
+    └── Main content            → <Outlet />
+        ├── /channels/@me       → Welcome screen ("Select a room")
+        └── /channels/$roomId   → RoomView
+            ├── ChannelHeader   → Room name, member count, actions
+            ├── MessageList     → Messages with room welcome banner
+            └── MessageInput    → Text input with Enter-to-send
+```
+
+The `ChannelsLayout` at `/channels` uses a `beforeLoad` hook that checks the Zustand store for an active session. If no session exists, it throws `redirect({ to: '/login' })`. This prevents the layout from rendering without authentication.
+
+### State Management (Zustand)
+
+A single `useChatStore` manages all application state with the `persist` middleware:
+
+**Session state**: `session` (sessionId, userId, nickname), `isConnecting`, `connectionError`. The session is persisted to localStorage under `baby-discord-session` so the user remains logged in across page refreshes. Only the session object is persisted via `partialize` -- rooms and messages are ephemeral and refetched from the server.
+
+**Room state**: `rooms` (list of available rooms with member counts), `currentRoom` (name of the active room), `isLoadingRooms`.
+
+**Message state**: `messages` (array of messages in the current room), `isLoadingMessages`.
+
+**SSE connection**: `eventSource` (the active EventSource instance for real-time messages). This is stored in the Zustand store (not a ref) so that `joinRoom()` and `leaveRoom()` can clean up the connection during room switches.
+
+**Action flow for joining a room:**
+1. `joinRoom(name)` is called
+2. Close existing SSE connection if any (`eventSource.close()`)
+3. Execute `/join` command via HTTP POST
+4. Load room history via `api.getRoomHistory(name)`
+5. Create new SSE connection via `api.createSSEConnection()`
+6. Update store: `{ currentRoom: name, messages: history, eventSource: newSSE }`
+
+**Why a single store**: The Baby Discord frontend is simpler than Slack or Twitter -- no workspaces, no threads, no reactions. A single store with ~15 state fields and ~10 actions is manageable and avoids the overhead of coordinating between multiple stores. The `persist` middleware's `partialize` option keeps the persisted data minimal (session only).
+
+### Routing (TanStack Router)
+
+File-based routing with a channel layout pattern:
+
+```
+routes/
+├── __root.tsx            → Root (<Outlet />)
+├── index.tsx             → / (redirect based on session state)
+├── login.tsx             → /login (LoginForm component)
+├── channels.tsx          → /channels (layout with ServerList + ChannelSidebar)
+│   ├── channels/@me.tsx  → /channels/@me (welcome/home screen)
+│   └── channels/$roomId.tsx → /channels/:roomId (room view)
+```
+
+**Auth guard**: The `/channels` layout route checks `useChatStore.getState().session` in `beforeLoad`. This is a synchronous check against the persisted Zustand state -- no API call needed because the session was restored from localStorage on app load.
+
+**Room navigation**: Clicking a room in the `ServerList` navigates to `/channels/$roomId`. The `RoomView` component calls `joinRoom(roomId)` in a `useEffect` when the route parameter changes. If the room does not exist, it attempts to join anyway (it might have been created by another user) and falls back to `/channels/@me` on failure.
+
+### Data Fetching Pattern
+
+The Baby Discord API is command-based, not RESTful. Most operations go through a generic `/api/command` endpoint:
+
+```
+Component (e.g., ServerList)
+  → useChatStore().createRoom(name)
+    → api.executeCommand(sessionId, "/create room-name")
+      → fetch('/api/command', { body: { sessionId, command } })
+        → Backend ChatHandler.handleInput()
+```
+
+**`services/api.ts`** exports individual functions (not API objects) for each operation: `connect()`, `disconnect()`, `executeCommand()`, `sendMessage()`, `getRooms()`, `getRoomHistory()`, `getSession()`, `createSSEConnection()`. Each function handles its own fetch call and response parsing.
+
+**Session-based auth**: Unlike Slack and Twitter (which use httpOnly cookies), Baby Discord uses explicit session tokens. The `connect()` function returns a `Session` object with a `sessionId`, which is included in every subsequent request as a JSON body field. This is simpler but less secure -- the session token is accessible to JavaScript.
+
+### Real-Time Updates (SSE)
+
+Baby Discord uses Server-Sent Events (SSE) instead of WebSocket for real-time message delivery. SSE is a simpler protocol: the server sends data to the client over a persistent HTTP connection using the `text/event-stream` content type. The browser's native `EventSource` API handles connection management, automatic reconnection, and event parsing.
+
+**Connection lifecycle:**
+1. When `joinRoom()` is called, it creates an `EventSource` pointing to `/api/messages/:room?sessionId=...`
+2. The server keeps the connection open and pushes new messages as SSE events
+3. `EventSource.onmessage` parses each event and calls `addMessage()` to update the Zustand store
+4. When the user leaves the room or switches rooms, `eventSource.close()` terminates the connection
+5. If the connection drops, `EventSource` automatically reconnects (built into the browser API)
+
+**Why SSE over WebSocket**: SSE is unidirectional (server-to-client only), which matches Baby Discord's architecture: messages flow from server to client via SSE, and commands flow from client to server via HTTP POST. WebSocket's bidirectional capability is unnecessary and adds handshake complexity. SSE also provides automatic reconnection built into the browser's `EventSource` API, whereas WebSocket requires manual reconnection logic.
+
+**SSE error handling**: The `createSSEConnection()` function accepts an `onError` callback. Connection errors are logged to the console. Since `EventSource` auto-reconnects, most transient errors (server restart, network blip) resolve without user intervention.
+
+### Key UI Patterns
+
+**Discord-like server icons**: The `ServerList` renders room icons as circular avatars with the room's first letter, arranged vertically in a 64px-wide strip. Active rooms get a `rounded-2xl` shape and indigo background. Hovering transitions from circle to rounded-rectangle (`hover:rounded-2xl`). An active indicator (white pill on the left edge) marks the current room.
+
+**Room auto-refresh**: The `ServerList` polls `refreshRooms()` every 30 seconds to pick up rooms created by other users. This is necessary because SSE only delivers messages for the current room, not room list changes.
+
+**User panel**: The bottom of the `ChannelSidebar` shows the current user's nickname with a disconnect button, styled identically to Discord's user area (dark background, avatar with status indicator).
+
+**Auto-scroll**: The `MessageList` auto-scrolls to the bottom when new messages arrive via `messagesEndRef.scrollIntoView({ behavior: 'smooth' })`. This ensures the user always sees the latest message without manual scrolling.
+
+**System messages**: Messages from the "system" user (join/leave notifications) render in a muted, italicized style without an avatar, distinguishing them from user messages.
+
+---
+
 ## Key Design Decisions
 
 ### 1. WebSocket Gateway vs HTTP Polling for Real-Time
@@ -565,6 +681,11 @@ RBAC with join tables requires 3-4 table joins to answer "can this user do X in 
 - Clients detect gaps in sequence numbers and request missed events via RESUME
 
 **Idempotent Message Sends:**
+
+Idempotency prevents a specific class of bugs caused by network unreliability. The scenario: a user sends a message in a busy channel. The server receives the message, writes it to Cassandra, publishes it to Kafka for delivery to other gateway nodes, and starts building the HTTP response. But the user's network drops before the response arrives. The client shows "sending..." and retries. Without idempotency, the message is written to Cassandra again and published to Kafka again -- the channel now shows the same message twice.
+
+The solution: the client generates a UUID and includes it as the `Idempotency-Key` header. The server checks Redis for this key before processing. If found, it returns the cached response from the first processing. If not found, it processes the message, stores the response in Redis with a 5-minute TTL, and returns it. The short TTL (5 minutes vs 24 hours in other projects) reflects Discord's real-time nature -- retries for a 5-minute-old message are unlikely.
+
 - Clients include an `Idempotency-Key` header (UUID) with message creation
 - Server stores key in Redis with a 5-minute TTL
 - Duplicate sends return the original message without re-persisting
@@ -587,8 +708,17 @@ RBAC with join tables requires 3-4 table joins to answer "can this user do X in 
 - Bot tokens: fixed-format tokens with bot user_id, never expire (revocable by owner)
 - OAuth2 for third-party integrations with granular scopes
 
-**Authorization:**
-- Permission checks at the gateway level before forwarding to services
+**Authorization (Bitfield Permissions):**
+
+Discord uses bitfield-based permissions rather than traditional RBAC (Role-Based Access Control) join tables. In a traditional RBAC system, checking "can user X send messages in channel Y" requires joining users -> member_roles -> roles -> role_permissions -> channel_overrides -- 3-4 database queries. At 100K messages per second, each requiring a permission check, this is too many database round-trips.
+
+Bitfield permissions solve this: each permission is a bit in a 53-bit integer. A user's effective permissions are computed once (when they load a guild) by OR-ing all their role permission bitfields together. Checking a permission is a single bitwise AND: `perms & SEND_MESSAGES !== 0` -- an O(1) operation that executes in nanoseconds, not milliseconds. The computed permission is cached in gateway memory, so message permission checks never hit the database.
+
+**Rate limiting** prevents abuse and ensures fair usage. Two algorithms are commonly used:
+
+- **Token Bucket** (used for bots): Each bot has a bucket that holds N tokens (e.g., 50). Each request consumes one token. Tokens refill at a fixed rate (e.g., 50/second). When the bucket is empty, requests are rejected with HTTP 429 and a `Retry-After` header. This algorithm allows short bursts (a bot can consume all 50 tokens instantly) while enforcing a long-term average rate.
+- **Sliding Window** (used for users): Counts requests in a rolling time window stored in Redis. More accurate than fixed-window counters at the cost of slightly more Redis operations.
+
 - Rate limiting: token bucket per user (50 req/s global) and per bot (varies by endpoint)
 - IP rate limiting for unauthenticated endpoints (login, register)
 
@@ -602,25 +732,64 @@ RBAC with join tables requires 3-4 table joins to answer "can this user do X in 
 
 ## Observability
 
-**Metrics (Prometheus):**
+### What Observability Solves
+
+In a system with gateway nodes, message services, voice servers, and multiple databases, a user reporting "my messages aren't appearing" could be caused by any component. Without observability, debugging requires SSH-ing into each server and reading log files. With observability, you query a centralized dashboard: "what's the Cassandra write latency?" (metrics), "show me all message publishes from user X" (logs), "is gateway node 7 healthy?" (health checks). The three pillars -- metrics, logs, health checks -- transform production incidents from guesswork into systematic diagnosis.
+
+### Prometheus Metrics
+
+Prometheus scrapes a `/metrics` endpoint on each service at regular intervals. The application registers metrics using a client library, and Prometheus stores them as time-series data for querying and alerting.
+
+**Three metric types:**
+- **Counter** -- Monotonically increasing value. Total messages sent, total errors. To get "messages per second," compute `rate(messages_total[5m])`. Never decreases except on process restart.
+- **Histogram** -- Distribution of values (latencies, sizes). Pre-buckets values for percentile queries: `histogram_quantile(0.99, write_latency)` gives the p99 -- the latency below which 99% of writes complete. Critical because averages mask outliers.
+- **Gauge** -- Current value that goes up and down: active connections, queue depth. Represents point-in-time state.
+
+**The RED method** applied to Discord's services:
+- **Rate**: messages/sec, connections/sec -- detect traffic surges or drops indicating outages
+- **Errors**: 4xx and 5xx rates per endpoint -- detect permission issues (4xx) vs service failures (5xx)
+- **Duration**: write latency p50/p99 -- detect Cassandra degradation before users notice
+
+**Metrics by service:**
 - Gateway: connections per node, events dispatched/sec, heartbeat failures, WebSocket errors
 - Message service: messages/sec, write latency (p50/p99), Cassandra query latency
 - Voice: active voice connections, packet loss rate, jitter
 - Presence: updates/sec, Redis latency
 - API: request rate, error rate (4xx, 5xx), latency by endpoint
 
-**Logging:**
+### Structured Logging
+
+`console.log("message sent to channel")` is useless when you have 50 gateway nodes and 20 message service instances. Structured logging means every log entry is a JSON object with consistent, searchable fields. These JSON logs flow through a centralized pipeline (Fluentd -> Elasticsearch -> Kibana) where you can query: "show me all ERROR logs from gateway node 7 in the last hour" or "show all messages from user X that took >500ms."
+
+**Log levels** control what gets recorded without code changes:
+- **DEBUG**: Detailed information for development -- cache hits, query results, state transitions. Disabled in production (too verbose).
+- **INFO**: Normal operations -- message delivered, user connected, request completed. The baseline for production.
+- **WARN**: Degraded state -- heartbeat timeout approaching, connection pool near capacity, rate limit nearing threshold.
+- **ERROR**: Failures -- Cassandra write failed, WebSocket connection dropped unexpectedly, message delivery failed.
+
+**Request correlation**: Every log entry includes a `request_id` field. When a message send traverses gateway -> message service -> Cassandra -> Kafka -> gateway (for delivery), all log entries share the same `request_id`, enabling end-to-end trace reconstruction.
+
+**Logging pipeline:**
 - Structured JSON logging (Pino/Bunyan) with request_id for correlation
-- Log levels: DEBUG for development, INFO/WARN/ERROR in production
 - Centralized logging via Fluentd -> Elasticsearch -> Kibana
 
-**Alerting:**
-- Gateway connection count > 80% capacity -> scale up
-- Message delivery latency p99 > 200ms -> investigate Cassandra/Kafka
-- Voice packet loss > 2% -> check network/voice server capacity
-- Presence Redis latency > 50ms -> scale Redis cluster
+### Alerting
 
-**Health Checks:**
+Alerting converts metric thresholds into actionable notifications. Each alert has a condition (when to fire), a severity (who to notify), and a runbook (what to do).
+
+- Gateway connection count > 80% capacity -> scale up (add gateway nodes)
+- Message delivery latency p99 > 200ms -> investigate Cassandra/Kafka (check compaction, consumer lag)
+- Voice packet loss > 2% -> check network/voice server capacity (potential bandwidth saturation)
+- Presence Redis latency > 50ms -> scale Redis cluster (add nodes or increase instance size)
+
+### Health Checks
+
+Health checks answer two questions that infrastructure systems need:
+
+- **Liveness** -- "Is the process running?" A simple HTTP 200 response. If this fails, the container is hung or crashed. The orchestrator (Kubernetes) kills and restarts it. This check must never depend on external services -- a gateway with a dead Redis connection is alive, just not ready.
+- **Readiness** -- "Can this instance serve traffic?" Checks DB connectivity, Redis connectivity, and upstream dependencies. If any check fails, the load balancer routes traffic away from this instance without killing it. This distinction matters: a gateway reconnecting to Redis should not receive new WebSocket connections, but killing it would disconnect all existing users.
+
+**Health check configuration:**
 - `/health` on every service: DB connectivity, Redis connectivity, upstream dependencies
 - Load balancer routes traffic away from unhealthy nodes within 10s
 
