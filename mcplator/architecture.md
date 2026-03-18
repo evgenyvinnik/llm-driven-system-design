@@ -2,99 +2,95 @@
 
 ## System Overview
 
-A retro-style calculator application enhanced with an AI co-pilot that translates natural language into calculator operations, demonstrating LLM integration patterns for interactive applications.
+A retro-style calculator application enhanced with an AI co-pilot that translates natural language into calculator key-press sequences, demonstrating LLM integration patterns for interactive applications. The calculator engine runs entirely client-side as a finite state machine, while natural language processing is handled by Claude Haiku via a Vercel Edge Function proxy.
+
+**Learning goals:** LLM integration patterns (intent-to-action mapping), Server-Sent Events (SSE) for real-time streaming, edge computing for low-latency API proxying, finite state machine design for UI logic, client-side quota management without user accounts.
 
 ## Requirements
 
 ### Functional Requirements
 
-- Full calculator functionality (basic math, memory, percentage, etc.)
-- Natural language input for calculations
-- Real-time AI responses with animated key presses
-- Shareable calculation URLs
-- Persistent state across sessions
+- Full calculator functionality (basic math, memory, percentage, square root, sign toggle)
+- Natural language input for calculations ("what's 15% of 80")
+- Real-time AI responses with animated key presses on the calculator display
+- Shareable calculation URLs (LMCIFY -- compressed message encoding in URL)
+- Persistent state across sessions (chat history, calculator memory, daily quota)
 
 ### Non-Functional Requirements
 
-- **Latency:** First token < 500ms for AI responses
-- **Reliability:** Graceful degradation without AI connectivity
-- **Cost Efficiency:** Rate limiting for API usage
-- **Security:** API key protection, input sanitization
+- **Latency:** AI first-token response < 500ms (p95) for natural language queries
+- **Reliability:** Calculator fully functional without AI connectivity; graceful degradation when API is unavailable
+- **Cost Efficiency:** Daily request quota per user without requiring authentication; rate limiting at edge function
+- **Security:** Anthropic API key server-side only; user input sanitized and length-limited
+- **Animation:** Key press animations at 60 FPS with natural timing variation
+- **Bundle Size:** < 200 KB gzipped total (excluding lazy-loaded assets)
 
 ## High-Level Architecture
 
-### System Components
-
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CLIENT (Browser)                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌────────────────┐          ┌─────────────────────────────┐   │
-│   │  Calculator    │          │       Chat Interface         │   │
-│   │  ┌──────────┐  │          │  ┌───────────────────────┐  │   │
-│   │  │ LCD      │  │          │  │ Message History       │  │   │
-│   │  │ Display  │  │◀────────▶│  │ (AI + User messages)  │  │   │
-│   │  └──────────┘  │  Key     │  └───────────────────────┘  │   │
-│   │  ┌──────────┐  │  Presses │  ┌───────────────────────┐  │   │
-│   │  │ Keypad   │  │          │  │ Input Field           │  │   │
-│   │  │ Grid     │  │          │  │ (Natural Language)    │  │   │
-│   │  └──────────┘  │          │  └───────────────────────┘  │   │
-│   └────────────────┘          └─────────────────────────────┘   │
-│           │                              │                       │
-│           ▼                              ▼                       │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │              Calculator Engine (State Machine)           │   │
-│   │  - Numeric input handling                                │   │
-│   │  - Operation execution (+, -, ×, ÷, %, √)               │   │
-│   │  - Memory operations (M+, M-, MR, MC)                    │   │
-│   │  - State: accumulator, pending operation, memory         │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                              │                                   │
-│                              ▼                                   │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                  Zustand State Store                     │   │
-│   │  - Calculator state (display, memory, history)           │   │
-│   │  - Chat state (messages, loading, quota)                 │   │
-│   │  - UI state (theme, settings)                            │   │
-│   └────────────────────────────┬────────────────────────────┘   │
-│                                │                                 │
-│                                ▼                                 │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                IndexedDB Persistence                     │   │
-│   │  - Chat history                                          │   │
-│   │  - Calculator memory                                     │   │
-│   │  - Daily usage quota                                     │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└──────────────────────────────┬───────────────────────────────────┘
-                               │ SSE Stream
+┌───────────────────────────────────────────────────────────────────────────┐
+│                          CLIENT (Browser)                                  │
+│                                                                           │
+│  ┌─────────────────┐              ┌──────────────────────────────────┐   │
+│  │   Calculator    │              │        Chat Interface             │   │
+│  │  ┌───────────┐  │              │  ┌────────────────────────────┐  │   │
+│  │  │ LCD       │  │              │  │ Message History            │  │   │
+│  │  │ Display   │  │◀────────────▶│  │ (AI + User messages)      │  │   │
+│  │  └───────────┘  │  Key Press   │  └────────────────────────────┘  │   │
+│  │  ┌───────────┐  │  Animation   │  ┌────────────────────────────┐  │   │
+│  │  │ Keypad    │  │  Queue       │  │ Natural Language Input     │  │   │
+│  │  │ Grid      │  │              │  └────────────────────────────┘  │   │
+│  │  └───────────┘  │              └──────────────────────────────────┘   │
+│  └─────────────────┘                                                     │
+│           │                                                               │
+│           ▼                                                               │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                Calculator Engine (Finite State Machine)            │  │
+│  │  States: READY → ENTERING_NUMBER → PENDING_OPERATION →            │  │
+│  │          ENTERING_NUMBER → SHOWING_RESULT                         │  │
+│  │  Operations: + - x / % sqrt +/- = C AC M+ M- MR MC               │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│           │                                                               │
+│           ▼                                                               │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                     Zustand State Store                            │  │
+│  │  - Calculator: display, accumulator, pending op, memory           │  │
+│  │  - Chat: messages, loading state, streaming tokens                │  │
+│  │  - Quota: daily remaining, last reset date                        │  │
+│  └──────────────────────────┬─────────────────────────────────────────┘  │
+│                              │                                            │
+│                              ▼                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                    IndexedDB Persistence                           │  │
+│  │  - Chat history    - Calculator memory    - Daily usage quota      │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+└──────────────────────────────┬────────────────────────────────────────────┘
+                               │ SSE Stream (POST /api/chat)
                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    SERVER (Vercel Edge Functions)                │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                    /api/chat Endpoint                    │   │
-│   │                                                          │   │
-│   │  1. Receive natural language request                     │   │
-│   │  2. Build prompt with calculator context                 │   │
-│   │  3. Call Claude API with streaming                       │   │
-│   │  4. Parse response for key sequences                     │   │
-│   │  5. Stream SSE events to client                          │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└──────────────────────────────┬───────────────────────────────────┘
-                               │
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     Vercel Edge Functions                                  │
+│                                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                     /api/chat Endpoint                             │  │
+│  │                                                                    │  │
+│  │  1. Validate input (length, rate limit)                           │  │
+│  │  2. Build prompt with calculator context + system instructions    │  │
+│  │  3. Call Claude API with streaming enabled                        │  │
+│  │  4. Parse structured JSON response for key sequences              │  │
+│  │  5. Stream SSE events back to client                              │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+└──────────────────────────────┬────────────────────────────────────────────┘
+                               │ Streaming API Call
                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    EXTERNAL (Anthropic API)                      │
-├─────────────────────────────────────────────────────────────────┤
-│   Claude Haiku 4.5                                               │
-│   - Low latency (~200ms first token)                            │
-│   - Cost efficient for simple requests                          │
-│   - Structured output for key sequences                         │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     Anthropic API (Claude Haiku 4.5)                      │
+│                                                                           │
+│  - First-token latency: ~200ms                                           │
+│  - Cost: $0.25 / 1M input tokens                                        │
+│  - Structured output: { "keys": [...], "explanation": "..." }            │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Flow: AI-Powered Calculation
@@ -103,105 +99,86 @@ A retro-style calculator application enhanced with an AI co-pilot that translate
 User: "what's 15% of 80"
          │
          ▼
-┌─────────────────────────────┐
-│     Chat Input Handler      │
-│  - Capture text input       │
-│  - Update UI (loading)      │
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│      API Request            │
-│  POST /api/chat             │
-│  { message: "15% of 80" }   │
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│    Claude API (Streaming)   │
-│  System prompt: "You are    │
-│  a calculator assistant..." │
-│  User: "15% of 80"          │
-└─────────────────────────────┘
-         │
-         ▼ (SSE Stream)
-┌─────────────────────────────┐
-│    Response Processing      │
-│  Tokens: [8, 0, ×, 1, 5, %] │
-│  Message: "80 × 15% = 12"   │
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│    Key Animation Queue      │
-│  - Animate each key press   │
-│  - Update calculator state  │
-│  - Show result on display   │
-└─────────────────────────────┘
-         │
-         ▼
-Display shows: 12
+┌──────────────────────────┐
+│  Chat Input Handler      │
+│  - Validate input        │
+│  - Check quota           │
+│  - Generate requestId    │
+└──────────┬───────────────┘
+           │ POST /api/chat
+           ▼
+┌──────────────────────────┐
+│  Edge Function Proxy     │
+│  - Rate limit check      │
+│  - Build Claude prompt   │
+│  - Stream response       │
+└──────────┬───────────────┘
+           │ SSE tokens
+           ▼
+┌──────────────────────────┐
+│  Response Parser         │
+│  - Buffer incomplete JSON│
+│  - Extract key sequence  │
+│  - Extract explanation   │
+└──────────┬───────────────┘
+           │ ["8","0","x","1","5","%","="]
+           ▼
+┌──────────────────────────┐
+│  Key Animation Queue     │
+│  - Digit: 100ms delay    │
+│  - Operator: 150ms delay │
+│  - Equals: 200ms delay   │
+│  - requestAnimationFrame │
+└──────────┬───────────────┘
+           │
+           ▼
+Calculator display shows: 12
 ```
 
 ## Core Components
 
-### 1. Calculator Engine
+### 1. Calculator Engine (Finite State Machine)
 
-A state machine managing calculator operations:
+The calculator is implemented as a deterministic FSM with five states:
 
-```typescript
-interface CalculatorState {
-  display: string;           // Current display value
-  accumulator: number;       // Running total
-  pendingOperation: Op;      // Waiting operation
-  memory: number;            // Memory register
-  isNewNumber: boolean;      // Start new number on next input
-}
+| State | Description | Valid Inputs |
+|-------|-------------|-------------|
+| READY | Initial state, display shows 0 | Digits, decimal point |
+| ENTERING_NUMBER | User is typing a number | Digits, decimal, operators, equals |
+| PENDING_OPERATION | Operator pressed, waiting for second operand | Digits, decimal point |
+| SHOWING_RESULT | Equals pressed, result displayed | Digits (start new), operators (chain) |
+| ERROR | Division by zero or overflow | Clear (C/AC) only |
 
-type Operation = '+' | '-' | '×' | '÷' | '%' | '√' | '±' | '=' | 'C' | 'AC' | 'M+' | 'M-' | 'MR' | 'MC';
+**State transitions:**
 ```
+READY + digit ──────────────────▶ ENTERING_NUMBER
+ENTERING_NUMBER + operator ─────▶ PENDING_OPERATION
+PENDING_OPERATION + digit ──────▶ ENTERING_NUMBER
+ENTERING_NUMBER + equals ───────▶ SHOWING_RESULT
+SHOWING_RESULT + digit ─────────▶ ENTERING_NUMBER (new calculation)
+SHOWING_RESULT + operator ──────▶ PENDING_OPERATION (chain)
+ANY + clear ────────────────────▶ READY
+```
+
+Each key press transitions to exactly one new state. The FSM is deterministic and side-effect-free, making it trivially testable: given a state and a key, the output state is always the same.
 
 ### 2. AI Message Processor
 
-Translates LLM responses into calculator actions:
+Translates the LLM's structured JSON response into calculator key-press actions. The processor receives a response like `{ "keys": ["8", "0", "x", "1", "5", "%", "="], "explanation": "80 times 15 percent" }` and feeds the keys one at a time into the calculator engine via the animation queue.
 
-```typescript
-interface AIResponse {
-  message: string;           // Human-readable response
-  keySequence: string[];     // Calculator keys to press
-  explanation?: string;      // Optional explanation
-}
-
-// Example transformation:
-// "what's 15% of 80" → { keySequence: ['8', '0', '×', '1', '5', '%', '='] }
-```
+**Intent-to-action mapping:** The LLM converts ambiguous natural language ("add 2 plus one hundred") into a deterministic sequence of calculator keys (`["2", "+", "1", "0", "0", "="]`). This is the core LLM integration pattern -- using the model for parsing and disambiguation, not for computation.
 
 ### 3. SSE Stream Handler
 
-Client-side streaming with real-time updates:
+The client reads the response body as a ReadableStream, buffering incomplete chunks and parsing complete SSE events. Tokens may arrive split across chunk boundaries, so the parser maintains a buffer and only processes complete `data: ...\n\n` events.
 
-```typescript
-const reader = response.body.getReader();
-const decoder = new TextDecoder();
-
-while (true) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  
-  const chunk = decoder.decode(value);
-  // Parse SSE events and update UI
-  processSSEEvent(chunk);
-}
-```
+SSE was chosen over WebSockets because the communication is unidirectional (server to client), SSE has built-in reconnection, and it works natively with serverless/edge functions that cannot maintain persistent connections.
 
 ### 4. LMCIFY URL Sharing
 
-Compressed message encoding for shareable URLs:
+Messages are gzip-compressed and base64-encoded into a URL query parameter, enabling shareable calculation links without a server-side URL shortener. The shared URL auto-plays the calculation on page load, animating the key presses.
 
-```
-https://mcplator.com/?lmcify=eJxLTc7PLShKLS5JTQYADdUDMw
-                              └── Base64 + gzip compressed message
-```
+URL length limit (~2,000 characters) constrains message length. Gzip compression typically achieves 2-3x reduction, supporting messages up to ~1,500 characters uncompressed.
 
 ## Key Design Decisions
 
@@ -209,644 +186,213 @@ https://mcplator.com/?lmcify=eJxLTc7PLShKLS5JTQYADdUDMw
 
 **Decision:** Use SSE for AI response streaming.
 
-**Rationale:**
-- Simpler than WebSocket (HTTP-based)
-- One-way streaming is sufficient
-- Built-in reconnection
-- Works with serverless functions
+SSE provides a simple, HTTP-based streaming mechanism that is sufficient for the unidirectional flow from server to client. Unlike WebSockets, SSE works naturally with serverless functions (which cannot maintain persistent connections), has built-in reconnection and event ID tracking, and requires no special server infrastructure. The trade-off is one-direction-only communication, but MCPlator only needs server-to-client streaming -- the client sends requests via standard HTTP POST. Using WebSockets here would add connection management complexity (heartbeats, reconnection logic, state synchronization) with no functional benefit.
 
-**Trade-offs:**
-- One direction only (server → client)
-- Limited browser connection pool
+### 2. Edge Functions for API Proxy
 
-### 2. Edge Functions for API Layer
+**Decision:** Vercel Edge Runtime for the `/api/chat` endpoint.
 
-**Decision:** Vercel Edge Runtime for /api/chat endpoint.
+Edge functions run in V8 isolates at the nearest Vercel region to the user, providing ~50ms cold starts (vs ~300ms for Node.js serverless functions). This matters because the edge function is on the critical path between the user's message and Claude's response -- every millisecond of proxy latency adds to perceived AI response time. The trade-off is a restricted runtime (V8 isolate, no Node.js APIs, no filesystem access), but the proxy function is simple enough to not need these capabilities. The 30-second timeout on Vercel's hobby tier is a constraint for very complex prompts, but Claude Haiku typically responds in under 5 seconds.
 
-**Rationale:**
-- Lower latency (runs closer to users)
-- Streaming response support
-- Cost-effective for simple proxying
-- Automatic scaling
+### 3. Claude Haiku for AI Processing
 
-**Trade-offs:**
-- Limited runtime (no Node.js APIs)
-- 30s timeout on Vercel hobby tier
+**Decision:** Use Claude Haiku 4.5 for natural language parsing.
 
-### 3. Claude Haiku for AI
+Haiku provides the lowest first-token latency (~200ms) in the Claude model family, which is critical for a calculator UI where responsiveness directly affects the user experience. The model is cost-efficient ($0.25/1M input tokens) for the simple task of parsing math expressions into key sequences. Larger models (Sonnet, Opus) would provide better reasoning for complex math, but the latency and cost trade-off is not justified when the calculator engine handles the actual computation. The LLM's job is parsing, not computing.
 
-**Decision:** Use Claude Haiku 4.5 model.
+### 4. Client-Side Quota Management
 
-**Rationale:**
-- Low latency (~200ms first token)
-- Cost efficient ($0.25/1M input tokens)
-- Sufficient for simple calculations
-- Good at structured output
+**Decision:** Track daily API usage quota in IndexedDB without user accounts.
 
-**Trade-offs:**
-- Less capable than larger models
-- May struggle with complex math
+Without authentication, server-side rate limiting can only use IP addresses, which are unreliable (shared IPs, VPNs). Client-side quota tracking in IndexedDB provides a reasonable first line of defense: the daily counter resets at midnight, and the UI shows remaining requests. This is easily bypassed by clearing browser storage, but combined with server-side IP-based rate limiting at the edge function, it provides adequate protection for a free-tier personal project. The trade-off vs. server-side session tracking: no cross-device quota enforcement, but also no session management complexity.
 
-### 4. IndexedDB for Persistence
+## API Design
 
-**Decision:** Store chat history and state in IndexedDB.
+### /api/chat
 
-**Rationale:**
-- Large storage quota
-- Structured data support
-- Persists across sessions
-- No server required
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/chat` | Send natural language message, receive streamed key sequence |
 
-**Schema:**
-```typescript
-interface PersistedState {
-  chatHistory: Message[];
-  calculatorMemory: number;
-  dailyQuota: {
-    date: string;
-    remaining: number;
-  };
-}
-```
+**Request:** Message string with requestId for idempotency.
+
+**Response:** SSE stream of tokens, parsed into structured JSON containing `keys` (calculator key sequence) and `explanation` (human-readable description).
+
+**Rate limiting:** IP-based at edge function level, plus client-side daily quota tracking.
+
+## Consistency and Idempotency
+
+### Calculator State (Client-Side)
+
+**Consistency model:** Strong, synchronous, single-client. Each key press transitions the FSM to exactly one new state. No concurrent writes are possible (single browser tab, single-threaded JS event loop). Replaying the same key sequence from the same initial state always produces the same result.
+
+### IndexedDB Persistence (Client-Side)
+
+**Consistency model:** Eventual (async writes, single-client). Writes are debounced at 500ms to avoid overwhelming IndexedDB. Each write uses a UUID for idempotency. Last-write-wins with timestamp ordering. State snapshots are complete -- replaying overwrites previous state entirely.
+
+### API Requests (Server-Side)
+
+**Consistency model:** At-most-once delivery with client-side retry.
+
+The client generates an idempotency key (session ID + timestamp + message hash) before the first request attempt. All retries of the same user action carry the same key. The edge function can optionally cache responses by idempotency key in a KV store (5-minute TTL) to prevent duplicate Claude API calls. Failed requests are safe to retry because the idempotency key ensures deduplication.
 
 ## Security Considerations
 
 ### API Key Protection
 
-- Anthropic API key stored server-side only
-- Edge function proxies requests
-- Rate limiting per client
+The Anthropic API key is stored server-side only, within the Vercel Edge Function's environment variables. The client never sees or transmits the key. All Claude API calls are proxied through the edge function.
 
 ### Input Sanitization
 
-- Validate message length
-- Escape special characters
-- Limit request frequency
+- Message length validated (reject > 500 characters)
+- Special characters escaped before prompt construction
+- Request frequency limited per IP at the edge function
 
 ### Quota Management
 
-- Daily request limits per IP
-- Client-side quota tracking
-- Graceful degradation when exceeded
-
-## Technology Stack
-
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| UI Framework | React 19 | Components |
-| Type Safety | TypeScript 5.9 | Compile-time checks |
-| Build Tool | Vite 7.3 | Fast builds, HMR |
-| State | Zustand | Global state |
-| Styling | CSS Modules + Tailwind | Scoped + utility |
-| Storage | IndexedDB (idb) | Persistence |
-| Backend | Vercel Edge Functions | API proxy |
-| AI | Claude Haiku 4.5 | Natural language |
-| Streaming | SSE | Real-time updates |
-
-## Performance Optimization
-
-### First Token Latency
-
-1. **Edge Functions:** Deploy close to users
-2. **Streaming:** Start rendering before complete
-3. **Model Selection:** Haiku optimized for speed
-
-### Animation Smoothness
-
-1. **requestAnimationFrame:** Smooth key animations
-2. **CSS Transitions:** Hardware-accelerated
-3. **Debounced State:** Batch updates
-
-### Bundle Size
-
-- React lazy loading
-- Tree-shaking unused code
-- CSS purging
-
-## Consistency and Idempotency
-
-### Write Semantics
-
-MCPlator has three categories of writes, each with different consistency requirements:
-
-#### 1. Calculator State (Client-Side)
-
-**Consistency Model:** Strong (synchronous, single-client)
-
-```typescript
-// Calculator operations are atomic within the state machine
-function pressKey(key: string): CalculatorState {
-  // Each key press transitions to exactly one new state
-  // No concurrent writes possible (single browser tab)
-  return calculateNewState(currentState, key);
-}
-```
-
-- **Conflict Resolution:** Not applicable - single writer (one browser tab)
-- **Replay Handling:** Key sequence is deterministic; replaying same keys produces same result
-
-#### 2. IndexedDB Persistence (Client-Side)
-
-**Consistency Model:** Eventual (async writes, single-client)
-
-```typescript
-interface WriteOperation {
-  id: string;           // UUID for idempotency
-  timestamp: number;    // For ordering
-  data: PersistedState;
-}
-
-// Debounced writes to avoid overwhelming IndexedDB
-const persistState = debounce(async (state: PersistedState) => {
-  const writeId = crypto.randomUUID();
-  await db.put('state', {
-    id: writeId,
-    timestamp: Date.now(),
-    data: state
-  });
-}, 500);
-```
-
-- **Idempotency:** Writes use UUID; duplicate writes with same ID are ignored
-- **Conflict Resolution:** Last-write-wins based on timestamp
-- **Replay Handling:** State snapshots are complete; replaying overwrites previous
-
-#### 3. API Requests (Server-Side)
-
-**Consistency Model:** At-most-once delivery (fire-and-forget with user retry)
-
-```typescript
-interface ChatRequest {
-  requestId: string;      // Client-generated UUID for idempotency
-  message: string;
-  timestamp: number;
-}
-
-// Edge function deduplication (optional, using KV store)
-async function handleChat(req: ChatRequest) {
-  const cached = await kv.get(`request:${req.requestId}`);
-  if (cached) {
-    return cached; // Return cached response for duplicate request
-  }
-
-  const response = await callClaude(req.message);
-  await kv.set(`request:${req.requestId}`, response, { ex: 300 }); // 5min TTL
-  return response;
-}
-```
-
-- **Idempotency Key:** `requestId` generated by client before sending
-- **Conflict Resolution:** First request wins; duplicates return cached response
-- **Replay Handling:** Safe to retry failed requests with same `requestId`
-
-### Cross-Tab Consistency (Future Enhancement)
-
-For multi-tab scenarios, use BroadcastChannel API:
-
-```typescript
-const channel = new BroadcastChannel('mcplator-sync');
-
-channel.onmessage = (event) => {
-  if (event.data.type === 'STATE_UPDATE') {
-    // Merge remote state with local state
-    mergeState(event.data.state);
-  }
-};
-
-// Broadcast local changes
-function notifyOtherTabs(state: PersistedState) {
-  channel.postMessage({ type: 'STATE_UPDATE', state });
-}
-```
+- Daily request limits tracked both client-side (IndexedDB) and server-side (IP-based rate limiting)
+- When quota is exceeded, the UI shows a graceful degradation message; the calculator continues to work without AI
+- No user accounts means no per-user server-side quotas -- IP-based limiting is the server-side enforcement mechanism
 
 ## Observability
 
-### Metrics Collection
+### Key Metrics
 
-For local development, use lightweight in-browser metrics with console export:
+| Metric | Type | Alert Threshold |
+|--------|------|-----------------|
+| `ai_request_latency_ms` | Histogram | p95 > 1000ms |
+| `ai_request_total` | Counter | > 100/day (quota) |
+| `ai_request_errors` | Counter | > 5 in 5 minutes |
+| `key_animation_fps` | Gauge | < 30 FPS |
+| `indexeddb_write_latency_ms` | Histogram | p95 > 100ms |
+| `quota_remaining` | Gauge | < 10 requests |
 
-#### Key Metrics
+### Logging
 
-| Metric | Type | Description | Alert Threshold |
-|--------|------|-------------|-----------------|
-| `ai_request_latency_ms` | Histogram | Time from request to first token | p95 > 1000ms |
-| `ai_request_total` | Counter | Total AI API calls | > 100/day (quota) |
-| `ai_request_errors` | Counter | Failed AI requests | > 5 in 5 minutes |
-| `key_animation_fps` | Gauge | Animation frame rate | < 30 FPS |
-| `indexeddb_write_latency_ms` | Histogram | Persistence write time | p95 > 100ms |
-| `quota_remaining` | Gauge | Daily API quota left | < 10 requests |
-
-#### Implementation
-
-```typescript
-// Simple metrics collector for local development
-class MetricsCollector {
-  private metrics: Map<string, number[]> = new Map();
-
-  recordLatency(name: string, durationMs: number) {
-    if (!this.metrics.has(name)) this.metrics.set(name, []);
-    this.metrics.get(name)!.push(durationMs);
-  }
-
-  incrementCounter(name: string) {
-    const current = this.metrics.get(name)?.[0] ?? 0;
-    this.metrics.set(name, [current + 1]);
-  }
-
-  // Export to console for debugging
-  dump() {
-    console.table(Object.fromEntries(this.metrics));
-  }
-
-  // Calculate percentiles
-  getP95(name: string): number {
-    const values = this.metrics.get(name) ?? [];
-    const sorted = values.sort((a, b) => a - b);
-    const idx = Math.floor(sorted.length * 0.95);
-    return sorted[idx] ?? 0;
-  }
-}
-
-export const metrics = new MetricsCollector();
-```
-
-### Logging Strategy
-
-Three log levels with structured output:
-
-```typescript
-interface LogEntry {
-  timestamp: string;
-  level: 'info' | 'warn' | 'error';
-  component: 'calculator' | 'chat' | 'api' | 'storage';
-  message: string;
-  context?: Record<string, unknown>;
-}
-
-// Example usage
-logger.info('chat', 'AI request started', {
-  requestId: 'abc123',
-  messageLength: 42
-});
-
-logger.error('api', 'Claude API failed', {
-  requestId: 'abc123',
-  error: 'rate_limited',
-  retryAfter: 60
-});
-```
-
-#### Log Retention
-
-- **Client-side:** Last 1000 log entries in memory, exportable to file
-- **Server-side (Edge):** Vercel logs retention (7 days on Pro plan)
+Structured log entries with `timestamp`, `level`, `component` (calculator/chat/api/storage), and `message`. Client-side logs are kept in memory (last 1,000 entries) and exportable to file for debugging. Server-side logs use Vercel's built-in log retention.
 
 ### Tracing
 
-Lightweight request tracing for debugging:
-
-```typescript
-interface TraceSpan {
-  traceId: string;
-  spanId: string;
-  parentSpanId?: string;
-  operation: string;
-  startTime: number;
-  endTime?: number;
-  tags: Record<string, string>;
-}
-
-// Trace an AI request end-to-end
-async function tracedChatRequest(message: string) {
-  const traceId = crypto.randomUUID();
-
-  const clientSpan = startSpan(traceId, 'client.sendRequest');
-  const response = await fetch('/api/chat', {
-    headers: { 'X-Trace-Id': traceId }
-  });
-  endSpan(clientSpan);
-
-  const parseSpan = startSpan(traceId, 'client.parseSSE', clientSpan.spanId);
-  await processStream(response);
-  endSpan(parseSpan);
-
-  return traceId; // For debugging
-}
-```
-
-### SLI Dashboard (Console-Based for Local Dev)
-
-```typescript
-function printSLIDashboard() {
-  console.group('MCPlator SLI Dashboard');
-  console.log('AI Request Latency (p95):', metrics.getP95('ai_request_latency_ms'), 'ms');
-  console.log('AI Error Rate:', calculateErrorRate(), '%');
-  console.log('Animation FPS (current):', metrics.getCurrent('key_animation_fps'));
-  console.log('Quota Remaining:', getQuotaRemaining(), 'requests');
-  console.log('IndexedDB Health:', checkIndexedDBHealth() ? 'OK' : 'DEGRADED');
-  console.groupEnd();
-}
-
-// Run every 30 seconds in dev mode
-if (import.meta.env.DEV) {
-  setInterval(printSLIDashboard, 30000);
-}
-```
-
-### Audit Logging
-
-Track security-relevant and quota-impacting events:
-
-```typescript
-interface AuditEntry {
-  timestamp: string;
-  event: 'api_request' | 'quota_exceeded' | 'rate_limited' | 'share_created';
-  details: {
-    requestId?: string;
-    quotaRemaining?: number;
-    shareUrl?: string;
-    ipHash?: string; // Hashed for privacy
-  };
-}
-
-// Stored in IndexedDB with 30-day retention
-async function audit(event: AuditEntry['event'], details: AuditEntry['details']) {
-  const entry: AuditEntry = {
-    timestamp: new Date().toISOString(),
-    event,
-    details
-  };
-  await db.add('audit_log', entry);
-
-  // Cleanup old entries
-  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  await db.delete('audit_log', IDBKeyRange.upperBound(cutoff));
-}
-```
+Lightweight request tracing: the client generates a `traceId` (UUID) for each AI request and passes it via `X-Trace-Id` header. The edge function logs this ID alongside the Claude API call, enabling end-to-end correlation of client request, edge function execution, and Claude API response timing.
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency
+### Retry Strategy
 
-#### API Request Retries
+API requests use exponential backoff with jitter: base delay 1s, multiplier 2x, max delay 10s, max 3 retries. Client errors (4xx except 429) are not retried. Server errors (5xx) and rate limits (429) trigger retries with the same idempotency key.
 
-```typescript
-interface RetryConfig {
-  maxRetries: 3;
-  baseDelayMs: 1000;
-  maxDelayMs: 10000;
-  backoffMultiplier: 2;
-}
+### Circuit Breaker
 
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit & { idempotencyKey: string },
-  config: RetryConfig = defaultConfig
-): Promise<Response> {
-  let lastError: Error;
+A client-side circuit breaker prevents cascading failures when the AI service is degraded:
 
-  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
-    try {
-      const response = await fetch(url, {
-        ...options,
-        headers: {
-          ...options.headers,
-          'Idempotency-Key': options.idempotencyKey
-        }
-      });
+| State | Behavior | Transition |
+|-------|----------|------------|
+| CLOSED | Normal operation, requests pass through | 5 consecutive failures --> OPEN |
+| OPEN | Reject requests immediately, show degradation message | 30s timeout --> HALF_OPEN |
+| HALF_OPEN | Allow one test request | Success --> CLOSED, failure --> OPEN |
 
-      if (response.ok) return response;
+When the circuit is open, the calculator remains fully functional -- only the AI natural language feature is disabled. The degradation message explains that the AI assistant is temporarily unavailable and suggests trying again in 30 seconds.
 
-      // Don't retry client errors (4xx) except 429
-      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-        throw new Error(`Client error: ${response.status}`);
-      }
-
-      // Retry on 5xx and 429
-      lastError = new Error(`Server error: ${response.status}`);
-    } catch (e) {
-      lastError = e as Error;
-    }
-
-    if (attempt < config.maxRetries) {
-      const delay = Math.min(
-        config.baseDelayMs * Math.pow(config.backoffMultiplier, attempt),
-        config.maxDelayMs
-      );
-      await sleep(delay + Math.random() * 100); // Jitter
-    }
-  }
-
-  throw lastError!;
-}
-```
-
-#### Idempotency Key Generation
-
-```typescript
-// Generate before user initiates request, not on retry
-function generateIdempotencyKey(message: string): string {
-  const sessionId = getSessionId(); // From IndexedDB or sessionStorage
-  const timestamp = Date.now();
-  const messageHash = simpleHash(message);
-  return `${sessionId}-${timestamp}-${messageHash}`;
-}
-
-// Use the same key for all retries of the same user action
-async function sendChatMessage(message: string) {
-  const idempotencyKey = generateIdempotencyKey(message);
-  return fetchWithRetry('/api/chat', {
-    method: 'POST',
-    body: JSON.stringify({ message }),
-    idempotencyKey
-  });
-}
-```
-
-### Circuit Breaker Pattern
-
-Prevent cascading failures when AI service is degraded:
-
-```typescript
-enum CircuitState {
-  CLOSED = 'closed',      // Normal operation
-  OPEN = 'open',          // Failing, reject requests
-  HALF_OPEN = 'half_open' // Testing recovery
-}
-
-class CircuitBreaker {
-  private state = CircuitState.CLOSED;
-  private failures = 0;
-  private lastFailureTime = 0;
-  private readonly failureThreshold = 5;
-  private readonly resetTimeoutMs = 30000;
-
-  async execute<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.state === CircuitState.OPEN) {
-      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
-        this.state = CircuitState.HALF_OPEN;
-      } else {
-        throw new Error('Circuit breaker is open - AI service unavailable');
-      }
-    }
-
-    try {
-      const result = await fn();
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure();
-      throw error;
-    }
-  }
-
-  private onSuccess() {
-    this.failures = 0;
-    this.state = CircuitState.CLOSED;
-  }
-
-  private onFailure() {
-    this.failures++;
-    this.lastFailureTime = Date.now();
-    if (this.failures >= this.failureThreshold) {
-      this.state = CircuitState.OPEN;
-      logger.warn('api', 'Circuit breaker opened', { failures: this.failures });
-    }
-  }
-
-  getState(): CircuitState {
-    return this.state;
-  }
-}
-
-export const aiCircuitBreaker = new CircuitBreaker();
-```
-
-#### Usage with Graceful Degradation
-
-```typescript
-async function getAIResponse(message: string): Promise<AIResponse | null> {
-  try {
-    return await aiCircuitBreaker.execute(() => callClaudeAPI(message));
-  } catch (error) {
-    if (aiCircuitBreaker.getState() === CircuitState.OPEN) {
-      // Graceful degradation: show fallback message
-      return {
-        message: "AI assistant is temporarily unavailable. Try again in 30 seconds.",
-        keySequence: [],
-        explanation: "Circuit breaker active"
-      };
-    }
-    throw error;
-  }
-}
-```
-
-### Disaster Recovery (Local Development Focus)
-
-Since MCPlator is a client-side application with edge functions, DR focuses on data preservation and service continuity.
-
-#### Backup Strategy
-
-```typescript
-// Manual export for user data backup
-async function exportUserData(): Promise<Blob> {
-  const data = {
-    version: '1.0',
-    exportedAt: new Date().toISOString(),
-    chatHistory: await db.getAll('messages'),
-    calculatorMemory: await db.get('state', 'memory'),
-    auditLog: await db.getAll('audit_log')
-  };
-  return new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-}
-
-// Import backup
-async function importUserData(file: File): Promise<void> {
-  const text = await file.text();
-  const data = JSON.parse(text);
-
-  // Validate schema version
-  if (data.version !== '1.0') {
-    throw new Error('Unsupported backup version');
-  }
-
-  // Clear existing data
-  await db.clear('messages');
-  await db.clear('audit_log');
-
-  // Restore
-  for (const message of data.chatHistory) {
-    await db.add('messages', message);
-  }
-  await db.put('state', data.calculatorMemory, 'memory');
-
-  logger.info('storage', 'Data restored from backup', {
-    messagesRestored: data.chatHistory.length
-  });
-}
-```
-
-#### Service Continuity
-
-| Failure Scenario | Impact | Mitigation |
-|------------------|--------|------------|
-| Claude API down | No AI responses | Circuit breaker + graceful degradation (calculator still works) |
-| Edge function timeout | Request fails | Client-side retry with exponential backoff |
-| IndexedDB quota exceeded | Can't persist | Prompt user to export and clear old data |
-| Browser storage cleared | Data lost | Regular backup reminders + export button |
-| Vercel region outage | Higher latency | Vercel automatic failover to nearest region |
-
-### Backup/Restore Testing Checklist
-
-Run these tests monthly during development:
-
-```markdown
-## Backup/Restore Test Checklist
-
-- [ ] Export user data with 100+ chat messages
-- [ ] Verify exported JSON is valid and readable
-- [ ] Clear IndexedDB completely
-- [ ] Import backup file
-- [ ] Verify all messages restored correctly
-- [ ] Verify calculator memory restored
-- [ ] Verify audit log restored
-- [ ] Test with corrupted backup file (should fail gracefully)
-- [ ] Test with wrong version backup (should show error)
-```
-
-### Error Recovery Flows
+### Error Recovery Flow
 
 ```
 User Action Failed
         │
         ▼
-┌─────────────────┐
-│ Check Error Type │
-└────────┬────────┘
+┌──────────────────┐
+│  Check Error Type │
+└────────┬─────────┘
          │
-    ┌────┴────┬─────────────┬──────────────┐
-    ▼         ▼             ▼              ▼
-Network   Rate Limit    API Error      Client Error
-    │         │             │              │
-    ▼         ▼             ▼              ▼
-Retry      Wait &        Circuit        Show Error
-with       Show          Breaker        Message
-Backoff    Countdown     Check          (no retry)
-    │         │             │
-    ▼         ▼             ▼
-Success?  Timer Done?   State?
-    │         │             │
-    ▼         ▼             ├─ CLOSED: Retry
-Update    Auto-Retry    ├─ HALF_OPEN: Test Request
-UI                      └─ OPEN: Graceful Degradation
+    ┌────┴────┬──────────────┬────────────────┐
+    ▼         ▼              ▼                ▼
+ Network   Rate Limit    API Error        Client Error
+    │         │              │                │
+    ▼         ▼              ▼                ▼
+ Retry     Wait &        Circuit           Show Error
+ with      Show           Breaker          (no retry)
+ Backoff   Countdown      Check
+    │         │              │
+    ▼         ▼              ├── CLOSED: Retry
+ Success?  Timer Done?    ├── HALF_OPEN: Test
+    │         │              └── OPEN: Degrade
+    ▼         ▼
+ Update    Auto-Retry
+ UI
 ```
 
-## Future Optimizations
+### Service Continuity
 
-- [ ] WebSocket for bidirectional chat
-- [ ] Voice input support
-- [ ] Calculation history
-- [ ] Multiple calculator themes
-- [ ] Scientific calculator mode
-- [ ] Unit conversions
+| Failure Scenario | Impact | Mitigation |
+|------------------|--------|------------|
+| Claude API down | No AI responses | Circuit breaker + graceful degradation (calculator works) |
+| Edge function timeout | Request fails | Client-side retry with exponential backoff |
+| IndexedDB quota exceeded | Cannot persist state | Prompt user to export and clear old data |
+| Browser storage cleared | Data lost | Regular backup reminders + export/import buttons |
+| Vercel region outage | Higher latency | Vercel automatic failover to nearest region |
+
+## Scalability Considerations
+
+### Request Volume
+
+Each AI request costs ~$0.0001 (Haiku pricing at ~400 tokens per request). With a daily quota of 100 requests per user, the cost per user is ~$0.01/day. At 1,000 daily active users, the monthly Claude API cost would be ~$300. Scaling beyond this requires either tighter quotas, user accounts with paid tiers, or switching to a cheaper model.
+
+### Edge Function Scaling
+
+Vercel Edge Functions scale automatically per request with no connection pooling or state management needed. Each invocation is stateless -- the function receives a request, calls Claude, and streams the response. This scales horizontally without architectural changes.
+
+### Client-Side Scaling
+
+The calculator and chat UI run entirely in the browser. There is no server-side state to scale. IndexedDB storage is per-browser and does not grow with user count. The only shared resource is the Claude API, which is metered per-request.
+
+### URL Sharing Scaling
+
+LMCIFY URLs encode the message directly in the URL (no server-side storage). This means sharing scales infinitely with no database or URL shortener service. The constraint is URL length (~2,000 characters), which limits message complexity.
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| AI streaming | SSE | WebSocket | Unidirectional sufficient; SSE works with serverless, has built-in reconnection |
+| API proxy | Vercel Edge Functions | Node.js serverless | ~50ms cold start vs ~300ms; lower latency on critical path |
+| AI model | Claude Haiku 4.5 | GPT-3.5, Sonnet | Lowest first-token latency (~200ms), cost-efficient for parsing tasks |
+| Persistence | IndexedDB (client) | Server-side DB | No user accounts needed; privacy by default; works offline |
+| Quota tracking | Client IndexedDB + server IP rate limit | Server-side per-user quota | No authentication complexity; adequate for free-tier project |
+| State machine | Explicit FSM | Ad-hoc conditionals | Predictable, testable, maps directly to calculator behavior |
+| URL sharing | Gzip + base64 in URL | Server-side URL shortener | No database, no server cost, infinite scaling |
+
+## Implementation Notes
+
+This project is a **design-only entry** in this repository. The implementation lives in an external repository:
+
+**External Repository:** [github.com/evgenyvinnik/MCPlator](https://github.com/evgenyvinnik/MCPlator)
+
+### What the External Implementation Covers
+
+Based on the architecture document and the project's CLAUDE.md, the external repository implements:
+
+- **Retro calculator UI** with Casio-style CSS 3D button effects (perspective and transform, no images)
+- **Calculator engine** as a finite state machine with full arithmetic, memory, percentage, and square root operations
+- **Claude Haiku integration** via Vercel Edge Function proxy, streaming responses over SSE
+- **Natural language parsing:** LLM translates user messages into calculator key sequences, animated on the UI
+- **Key press animation system** with variable timing (100ms digits, 150ms operators, 200ms equals) using `requestAnimationFrame`
+- **LMCIFY URL sharing** with gzip + base64 compression for shareable calculation links
+- **IndexedDB persistence** for chat history, calculator memory, and daily quota tracking
+- **Zustand state management** with CSS Modules + Tailwind hybrid styling
+- **Bun** as package manager and development runtime
+
+### What Is Simplified or Substituted
+
+- **No server-side idempotency cache:** The architecture describes KV-based request deduplication at the edge function, but the implementation may use simpler at-most-once semantics
+- **No Sentry or external monitoring:** Metrics and logging are console-based for local development
+- **No circuit breaker library:** The circuit breaker pattern may be implemented as a simple failure counter rather than a full state machine
+- **IP-based rate limiting only:** No sophisticated abuse detection beyond Vercel's built-in rate limiting
+
+### What Is Omitted
+
+- WebSocket-based bidirectional chat
+- Voice input support
+- Scientific calculator mode
+- Unit conversions
+- Multi-tab synchronization via BroadcastChannel API
+- Server-side audit logging with retention policies
+- Formal SLI dashboard beyond console logging
