@@ -1,17 +1,33 @@
 # Web Crawler - Architecture Design
 
-## 1. Goals and Non-Goals
+## System Overview
 
-### Goals (v1)
-- Crawl public HTML pages over HTTP(S)
-- Discover and deduplicate URLs
-- Obey `robots.txt` and basic politeness rules (rate limiting per domain)
-- Extract page text, metadata, and outgoing links
-- Scale horizontally to millions of pages
-- Provide real-time observability via dashboard
-- Be operable in production
+A distributed web crawling system that discovers, fetches, and extracts content from public HTML pages. The core challenges are URL frontier management with priority-based scheduling, per-domain politeness enforcement, URL deduplication at billion-scale, horizontal worker scaling, and fault-tolerant coordination across distributed crawl workers.
+
+## Requirements
+
+### Functional Requirements
+
+1. **URL Discovery** - Extract and discover new links from crawled pages
+2. **Page Fetching** - Download HTML content from web servers with proper error handling, timeouts, and redirect following
+3. **Content Extraction** - Parse HTML to extract titles, meta descriptions, and outgoing links using Cheerio
+4. **Politeness** - Respect robots.txt directives, implement per-domain rate limiting with configurable crawl delays
+5. **Deduplication** - Avoid crawling duplicate URLs using normalized URL hashing
+6. **Prioritization** - Crawl important pages first (seeds, homepages, shallow pages) using a 3-level priority queue
+
+### Non-Functional Requirements
+
+| Requirement | Target (Production) |
+|-------------|---------------------|
+| Crawl rate | 400+ pages/second |
+| Workers | 80-150 stateless workers |
+| Availability | 99.9% uptime; workers fail independently |
+| Dashboard latency | < 1s updates |
+| Consistency | Eventual (small duplicate window acceptable) |
+| Politeness | Max 1 req/sec per domain by default; respect robots.txt crawl-delay |
 
 ### Non-Goals (v1)
+
 - Full JavaScript rendering (SPA support deferred to v2)
 - PageRank or advanced ranking algorithms
 - Full-text search indexing
@@ -19,151 +35,130 @@
 - Anti-bot evasion or stealth crawling
 - Content storage in object storage (raw HTML archival)
 
----
+## Capacity Estimation
 
-## 2. Requirements
+### Production Scale
 
-### Functional Requirements
+| Metric | Value |
+|--------|-------|
+| Target crawl rate | 400+ pages/second |
+| Workers | 80-150 |
+| Storage per page (metadata) | ~100 bytes URL + ~1KB metadata |
+| URL frontier size | Billions of URLs |
+| robots.txt cache | ~100GB (millions of domains) |
+| Bytes downloaded | ~8 GB/hour at 400 pages/sec x 20KB avg |
+| Daily pages crawled | ~35 million |
 
-1. **URL Discovery**: Extract and discover new links from crawled pages
-2. **Page Fetching**: Download HTML content from web servers with proper error handling
-3. **Content Extraction**: Parse HTML to extract titles, descriptions, and links
-4. **Politeness**: Respect robots.txt, implement per-domain rate limiting
-5. **Deduplication**: Avoid crawling duplicate URLs or duplicate content
-6. **Prioritization**: Crawl important pages first (seeds, shallow pages)
+### Local Development Scale
 
-### Non-Functional Requirements
+| Metric | Value |
+|--------|-------|
+| Crawl rate | 10-50 pages/second |
+| Workers | 3-5 |
+| URL frontier | 100K URLs |
+| Storage per page | ~20KB compressed |
 
-| Requirement | Target (Local) | Target (Production) |
-|-------------|----------------|---------------------|
-| Crawl rate | 10-50 pages/sec | 400+ pages/sec |
-| Workers | 3-5 | 80-150 |
-| Availability | Workers fail independently | 99.9% uptime |
-| Dashboard latency | < 5s updates | < 1s updates |
-| Consistency | Eventual (small duplicate window) | Eventual |
-
----
-
-## 3. Capacity Estimation
-
-| Metric | Local Scale | Production Scale |
-|--------|-------------|------------------|
-| Target crawl rate | 10-50 pages/second | 400+ pages/second |
-| Workers | 3-5 | 80-150 |
-| Storage per page | ~20KB compressed | ~20KB compressed |
-| URL frontier size | 100K URLs | Billions of URLs |
-| URL metadata | 100 bytes/URL | 100 bytes/URL |
-| robots.txt cache | ~1MB | ~100GB |
-
----
-
-## 4. High-Level Architecture
-
-### System Diagram
+## High-Level Architecture
 
 ```
-                    +------------------+
-                    |   Frontend       |
-                    |   Dashboard      |
-                    |   (React/Vite)   |
-                    +--------+---------+
-                             |
-                    +--------v---------+
-                    |   API Server     |
-                    |   (Express.js)   |
-                    |   Port: 3001     |
-                    +--------+---------+
-                             |
-         +-------------------+-------------------+
-         |                   |                   |
-+--------v-------+  +--------v-------+  +--------v-------+
-| Fetcher        |  | Fetcher        |  | Fetcher        |
-| Worker 1       |  | Worker 2       |  | Worker N       |
-+-------+--------+  +--------+-------+  +--------+-------+
-        |                    |                   |
-        +--------------------+-------------------+
-                             |
-        +--------------------+--------------------+
-        |                    |                    |
-+-------v-------+   +--------v--------+  +--------v--------+
-|  URL Frontier |   | Robots Service  |  | Parser/Link     |
-|  (PostgreSQL) |   | (Redis Cache)   |  | Extractor       |
-+-------+-------+   +-----------------+  +--------+--------+
-        |                                         |
-+-------v-------+                        +--------v--------+
-| UrlTable      |                        | URL Ingestion   |
-| (Metadata)    |                        | Service         |
-+---------------+                        +-----------------+
-        |
-+-------v-------+
-| Content Store |
-| (Optional S3) |
-+---------------+
+                           ┌─────────────────────────┐
+                           │    Admin Dashboard       │
+                           │    (React + Vite)        │
+                           │                          │
+                           │  - Crawl stats/charts    │
+                           │  - Frontier management   │
+                           │  - Domain inspection     │
+                           └────────────┬─────────────┘
+                                        │ HTTP
+                                        ▼
+                           ┌─────────────────────────┐
+                           │      API Server          │
+                           │      (Express.js)        │
+                           │                          │
+                           │  - Stats / timeseries    │
+                           │  - Frontier CRUD         │
+                           │  - Seed injection        │
+                           │  - Domain management     │
+                           │  - Auth + RBAC           │
+                           │  - Rate limiting         │
+                           └────────────┬─────────────┘
+                                        │
+              ┌─────────────────────────┼─────────────────────────┐
+              │                         │                         │
+    ┌─────────▼──────────┐   ┌─────────▼──────────┐   ┌─────────▼──────────┐
+    │  Crawler Worker 1  │   │  Crawler Worker 2  │   │  Crawler Worker N  │
+    │                    │   │                    │   │                    │
+    │  ┌──────────────┐  │   │  ┌──────────────┐  │   │  ┌──────────────┐  │
+    │  │ Fetch Page   │  │   │  │ Fetch Page   │  │   │  │ Fetch Page   │  │
+    │  ├──────────────┤  │   │  ├──────────────┤  │   │  ├──────────────┤  │
+    │  │ Parse HTML   │  │   │  │ Parse HTML   │  │   │  │ Parse HTML   │  │
+    │  ├──────────────┤  │   │  ├──────────────┤  │   │  ├──────────────┤  │
+    │  │ Extract Links│  │   │  │ Extract Links│  │   │  │ Extract Links│  │
+    │  ├──────────────┤  │   │  ├──────────────┤  │   │  ├──────────────┤  │
+    │  │ Check Robots │  │   │  │ Check Robots │  │   │  │ Check Robots │  │
+    │  ├──────────────┤  │   │  ├──────────────┤  │   │  ├──────────────┤  │
+    │  │ Circuit Brkr │  │   │  │ Circuit Brkr │  │   │  │ Circuit Brkr │  │
+    │  └──────────────┘  │   │  └──────────────┘  │   │  └──────────────┘  │
+    └─────────┬──────────┘   └─────────┬──────────┘   └─────────┬──────────┘
+              │                         │                         │
+              └─────────────────────────┼─────────────────────────┘
+                                        │
+                    ┌───────────────────┼───────────────────┐
+                    │                   │                   │
+             ┌──────▼───────┐   ┌───────▼────────┐  ┌──────▼───────┐
+             │  PostgreSQL  │   │     Redis      │  │   Kafka      │
+             │              │   │                │  │  (Prod Only) │
+             │ - URL Frontr │   │ - Visited URLs │  │              │
+             │ - Crawled    │   │ - Domain locks │  │ - URL ingest │
+             │   pages      │   │ - Robots cache │  │ - Crawl      │
+             │ - Domains    │   │ - Rate limits  │  │   events     │
+             │              │   │ - Circuit brkr │  │              │
+             └──────────────┘   │ - Sessions     │  └──────────────┘
+                                └────────────────┘
 ```
 
 ### Core Components
 
 | Component | Responsibility |
 |-----------|---------------|
-| **API Server** | RESTful API for dashboard, seed injection, stats |
-| **Fetcher Workers** | Stateless workers that fetch pages |
-| **URL Frontier** | Priority queue deciding what to crawl next |
-| **Robots Service** | Fetch, cache, and query robots.txt rules |
-| **Parser/Extractor** | Extract text, metadata, and links from HTML |
-| **URL Ingestion** | Normalize, deduplicate, and enqueue discovered URLs |
-| **UrlTable** | Central metadata store for all known URLs |
-| **Content Store** | Persist fetched content (v2) |
+| **API Server** | RESTful API for dashboard, seed injection, frontier management, stats, auth/RBAC |
+| **Crawler Workers** | Stateless processes that fetch pages, parse HTML, extract links, and update the frontier |
+| **URL Frontier** | Priority queue (PostgreSQL) deciding what to crawl next; tracks URL state and scheduling |
+| **Robots Service** | Fetch, parse, and cache robots.txt per domain; answer "Is this URL allowed?" |
+| **Parser/Extractor** | Parse HTML DOM with Cheerio; extract title, description, and outgoing links |
+| **URL Ingestion** | Normalize discovered URLs, deduplicate via Redis SET, enqueue eligible URLs |
 
 ### Data Flow
 
-1. Seed URLs are inserted into the UrlTable with high priority
-2. Frontier schedules URLs for fetching based on priority and politeness
-3. Fetcher workers download HTML pages
-4. Parser extracts text, metadata, and links
-5. Discovered links are normalized and deduplicated
-6. New URLs are added back to the frontier
-7. Dashboard polls API for real-time statistics
+```
+1. Seed URLs inserted into url_frontier with high priority
+2. Worker claims a URL: UPDATE url_frontier SET status='in_progress' WHERE ...
+3. Worker checks robots.txt (Redis cache -> PostgreSQL -> fetch if missing)
+4. Worker checks per-domain rate limit (Redis SET NX EX)
+5. Worker fetches page via HTTP with circuit breaker protection
+6. Parser extracts title, description, links from HTML
+7. Discovered links normalized, deduplicated (Redis SISMEMBER), and enqueued
+8. Page metadata stored in crawled_pages
+9. Worker updates url_frontier status to 'completed' or 'failed'
+10. Dashboard polls API for real-time statistics
+```
 
----
+## Database Schema
 
-## 5. URL Frontier
+### URL Frontier
 
-### Responsibilities
-- Decide *what* to crawl next
-- Enforce politeness (per-host rate limits)
-- Track crawl state and scheduling
-- Handle priority-based ordering
-
-### Scheduling Model
-- URLs are grouped by host/domain
-- Each domain has:
-  - Crawl delay (from robots.txt or default 1s)
-  - Next-allowed-fetch timestamp
-  - Lock to prevent concurrent access
-- Frontier selects:
-  - The highest-priority URL from an eligible domain
-  - Domain must not be rate-limited
-
-### Priority Signals
-
-| Level | Score | Criteria |
-|-------|-------|----------|
-| High | 3 | Seed URLs, homepages, shallow pages (depth ≤ 2) |
-| Medium | 2 | Content pages, blog posts, /about, /contact |
-| Low | 1 | Paginated content, archives, deep pages |
-
-### Implementation
+The frontier is the priority queue deciding what to crawl next. URLs are grouped by domain, and each domain has politeness constraints.
 
 ```sql
 -- URL Frontier: Queue of URLs to crawl
 CREATE TABLE url_frontier (
     id SERIAL PRIMARY KEY,
     url TEXT NOT NULL,
-    url_hash VARCHAR(64) NOT NULL UNIQUE,
+    url_hash VARCHAR(64) NOT NULL UNIQUE,    -- SHA-256 of normalized URL
     domain VARCHAR(255) NOT NULL,
-    priority INTEGER DEFAULT 1,      -- 1=low, 2=medium, 3=high
-    depth INTEGER DEFAULT 0,
-    status VARCHAR(20) DEFAULT 'pending',  -- pending, in_progress, completed, failed
+    priority INTEGER DEFAULT 1,               -- 1=low, 2=medium, 3=high
+    depth INTEGER DEFAULT 0,                  -- Crawl depth from seed
+    status VARCHAR(20) DEFAULT 'pending',     -- pending, in_progress, completed, failed
     scheduled_at TIMESTAMP DEFAULT NOW(),
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
@@ -172,34 +167,13 @@ CREATE TABLE url_frontier (
 CREATE INDEX idx_frontier_priority ON url_frontier (priority DESC, scheduled_at ASC);
 CREATE INDEX idx_frontier_domain ON url_frontier (domain);
 CREATE INDEX idx_frontier_status ON url_frontier (status);
+CREATE INDEX idx_frontier_status_priority ON url_frontier (status, priority DESC, scheduled_at ASC)
+    WHERE status = 'pending';
 ```
 
----
+### Crawled Pages
 
-## 6. UrlTable (Metadata Store)
-
-### Purpose
-Central source of truth for all known URLs.
-
-### Logical Schema
-
-| Field | Type | Description |
-|-------|------|-------------|
-| url_hash | VARCHAR(64) | SHA-256 hash of normalized URL (PK) |
-| normalized_url | TEXT | Canonical URL string |
-| domain | VARCHAR(255) | Hostname |
-| status | ENUM | never_crawled / fetched / failed / blocked |
-| http_status | INTEGER | Last HTTP status code |
-| last_crawled_at | TIMESTAMP | When last fetched |
-| next_crawl_at | TIMESTAMP | When eligible for re-crawl |
-| discovered_at | TIMESTAMP | When first seen |
-| content_hash | VARCHAR(64) | Hash of extracted content |
-| error_count | INTEGER | Consecutive failures |
-| title | TEXT | Extracted page title |
-| description | TEXT | Meta description |
-| links_count | INTEGER | Number of outgoing links |
-
-### Implementation
+Metadata about fetched pages. Raw HTML content is not stored in v1 (would go to S3/MinIO in v2).
 
 ```sql
 -- Crawled Pages: Metadata about fetched pages
@@ -211,7 +185,7 @@ CREATE TABLE crawled_pages (
     status_code INTEGER,
     content_type VARCHAR(100),
     content_length INTEGER,
-    content_hash VARCHAR(64),
+    content_hash VARCHAR(64),                 -- SHA-256 of extracted content
     title TEXT,
     description TEXT,
     links_count INTEGER DEFAULT 0,
@@ -224,72 +198,9 @@ CREATE INDEX idx_pages_domain ON crawled_pages (domain);
 CREATE INDEX idx_pages_crawled_at ON crawled_pages (crawled_at DESC);
 ```
 
----
+### Domains
 
-## 7. Fetcher Workers
-
-### Responsibilities
-- Fetch HTML pages via HTTP(S)
-- Respect timeouts and redirects
-- Handle errors gracefully
-- Update URL status in frontier
-
-### Behavior
-
-**Input:** FetchTask(url, domain)
-
-**Output:**
-- Success → FetchedPage(html, headers, status_code)
-- Failure → ErrorEvent(url, error_type, message)
-
-### Constraints
-
-| Constraint | Value |
-|------------|-------|
-| Max redirects | 5 |
-| Request timeout | 30 seconds |
-| Max page size | 10 MB |
-| User-Agent | Identifies crawler with contact info |
-
-### Implementation
-
-```typescript
-interface FetchConfig {
-  timeout: 30000,
-  maxRedirects: 5,
-  maxContentLength: 10 * 1024 * 1024,
-  headers: {
-    'User-Agent': 'MyCrawler/1.0 (+https://example.com/bot)',
-    'Accept': 'text/html,application/xhtml+xml',
-  }
-}
-```
-
----
-
-## 8. Robots Service
-
-### Responsibilities
-- Fetch and parse `robots.txt` per domain
-- Cache rules with TTL
-- Answer: "Is this URL allowed for our User-Agent?"
-- Extract crawl-delay directives
-
-### Behavior
-
-1. On first access to a domain, fetch `/robots.txt`
-2. Parse and cache the result
-3. Frontier queries before scheduling each URL
-4. Respect crawl-delay if specified
-
-### Caching Strategy
-
-| Storage | TTL | Purpose |
-|---------|-----|---------|
-| Redis | 1 hour | Hot cache for active domains |
-| PostgreSQL | Persistent | Backup and analytics |
-
-### Implementation
+Per-domain settings and robots.txt cache.
 
 ```sql
 -- Domains: Per-domain settings and robots.txt cache
@@ -298,1218 +209,379 @@ CREATE TABLE domains (
     domain VARCHAR(255) NOT NULL UNIQUE,
     robots_txt TEXT,
     robots_fetched_at TIMESTAMP,
-    crawl_delay FLOAT DEFAULT 1.0,
+    crawl_delay FLOAT DEFAULT 1.0,            -- Seconds between requests
     page_count INTEGER DEFAULT 0,
-    is_allowed BOOLEAN DEFAULT true
+    is_allowed BOOLEAN DEFAULT true            -- Whether crawling is permitted
 );
 ```
 
+### Priority Signals
+
+| Level | Score | Criteria |
+|-------|-------|----------|
+| High | 3 | Seed URLs, homepages, shallow pages (depth <= 2) |
+| Medium | 2 | Content pages, blog posts, /about, /contact |
+| Low | 1 | Paginated content, archives, deep pages (depth > 5) |
+
+### Redis Data Structures
+
 ```
-# Redis keys
-crawler:domain:{domain}:robots     - Cached robots.txt content
-crawler:domain:{domain}:delay      - Crawl delay for domain
-crawler:domain:{domain}:lock       - Rate limit lock (SET NX EX)
-```
+# URL deduplication (visited URLs set)
+crawler:visited_urls              -> SET of URL hashes (SADD, SISMEMBER)
 
----
+# Per-domain rate limiting locks
+crawler:domain:{domain}:lock      -> SET NX EX (distributed lock with TTL)
 
-## 9. Parser & Link Extractor
+# Per-domain crawl delay
+crawler:domain:{domain}:delay     -> STRING (crawl delay in seconds)
 
-### Responsibilities
-- Parse HTML DOM
-- Extract clean text and metadata
-- Discover and normalize outgoing links
+# Robots.txt cache
+crawler:domain:{domain}:robots    -> STRING (cached robots.txt content, 1h TTL)
 
-### Parsing Steps
+# Circuit breaker state per domain
+crawler:circuit:{domain}          -> STRING (closed/open/half-open, 1h TTL)
 
-1. Parse DOM with Cheerio
-2. Extract:
-   - `<title>` content
-   - `<meta name="description">` content
-   - Visible text
-3. Find links:
-   - `<a href="...">`
-   - `<link href="...">` (canonical, alternate)
-4. Resolve relative URLs to absolute
-5. Drop unsupported schemes (`mailto:`, `javascript:`, `tel:`)
-6. Normalize URLs
-7. Deduplicate per page
+# Worker heartbeats
+crawler:worker:{id}               -> HASH (lastHeartbeat, status, currentUrl)
 
-### Output
+# Active workers set
+crawler:active_workers            -> SET of worker IDs
 
-```typescript
-interface ParsedPage {
-  title: string;
-  description: string;
-  text: string;
-  links: string[];
-  contentHash: string;
-}
+# Crawl statistics
+crawler:stats:pages_crawled       -> Counter (INCR)
+crawler:stats:pages_failed        -> Counter (INCR)
+crawler:stats:bytes_downloaded    -> Counter (INCRBY)
+
+# Session storage
+sess:{session_id}                 -> JSON (userId, role, createdAt)
 ```
 
----
+### URL Normalization Rules
 
-## 10. URL Normalization & Deduplication
+Before hashing, URLs are normalized to prevent duplicate crawling:
 
-### Normalization Rules
-
-1. Lowercase scheme and host
+1. Lowercase scheme and hostname
 2. Remove fragment (`#...`)
 3. Normalize default ports (`:80` for HTTP, `:443` for HTTPS)
 4. Sort query parameters alphabetically
-5. Remove known tracking params (`utm_*`, `ref`, `source`)
-6. Remove trailing slashes (optional, configurable)
+5. Remove known tracking params (`utm_source`, `utm_medium`, `utm_campaign`, `ref`)
+6. Remove trailing slashes
 7. Decode percent-encoded characters where safe
 
-### Deduplication Strategy
-
-**URL-level:**
-- Normalize → SHA-256 hash → lookup in Redis SET
-- O(1) membership check
-
-**Content-level (v2):**
-- Hash extracted text with SimHash
-- Detect near-duplicate pages across URLs
-
-### Implementation
-
-```typescript
-function normalizeUrl(url: string): string {
-  const parsed = new URL(url);
-
-  // Lowercase
-  parsed.protocol = parsed.protocol.toLowerCase();
-  parsed.hostname = parsed.hostname.toLowerCase();
-
-  // Remove fragment
-  parsed.hash = '';
-
-  // Remove default ports
-  if (parsed.port === '80' || parsed.port === '443') {
-    parsed.port = '';
-  }
-
-  // Sort query params, remove tracking
-  const params = new URLSearchParams(parsed.search);
-  const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'ref'];
-  trackingParams.forEach(p => params.delete(p));
-  parsed.search = [...params].sort().map(([k, v]) => `${k}=${v}`).join('&');
-
-  return parsed.toString();
-}
-```
-
-```
-# Redis deduplication
-crawler:visited_urls    - Set of URL hashes (SADD, SISMEMBER)
-```
-
----
-
-## 11. URL Ingestion Service
-
-### Responsibilities
-- Consume discovered URLs from parser
-- Normalize and deduplicate
-- Insert new URLs into UrlTable
-- Enqueue eligible URLs into Frontier
-
-### Backpressure Controls
-
-| Control | Value | Purpose |
-|---------|-------|---------|
-| Max depth | 10 | Prevent crawling infinitely deep |
-| Max URLs per page | 1000 | Prevent link spam |
-| Rate limit per source | 100/sec | Prevent frontier flooding |
-
----
-
-## 12. Distributed Coordination
-
-### Problem
-Multiple workers must coordinate to avoid hitting the same domain concurrently.
-
-### Solution: Redis Distributed Locks
-
-```typescript
-async function acquireDomainLock(domain: string, workerId: string, delaySeconds: number): Promise<boolean> {
-  const lockKey = `crawler:domain:${domain}:lock`;
-  const result = await redis.set(lockKey, workerId, 'NX', 'EX', delaySeconds);
-  return result === 'OK';
-}
-```
-
-### Trade-offs
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| Redis Locks (chosen) | Simple, auto-expiry, distributed | Slightly less efficient than central scheduler |
-| Central Scheduler | Optimal scheduling | Single point of failure |
-| Token Bucket | Smooth rate limiting | More complex implementation |
-
----
-
-## 13. API Design
-
-### Core Endpoints
+## API Design
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/health` | Health check with DB/Redis status |
+| GET | `/health` | Health check with PostgreSQL/Redis status |
 | GET | `/api/stats` | Comprehensive crawl statistics |
 | GET | `/api/stats/timeseries` | Time-series data for charts |
 | GET | `/api/frontier/stats` | Frontier queue statistics |
-| GET | `/api/frontier/urls` | List URLs in frontier |
+| GET | `/api/frontier/urls` | List URLs in frontier (filtered) |
 | POST | `/api/frontier/add` | Add URLs to frontier |
-| POST | `/api/frontier/seed` | Add seed URLs with high priority |
-| POST | `/api/frontier/recover` | Recover stale in-progress URLs |
+| POST | `/api/frontier/seed` | Add seed URLs with high priority (admin) |
+| POST | `/api/frontier/recover` | Recover stale in-progress URLs (admin) |
 | GET | `/api/pages` | List crawled pages with filtering |
 | GET | `/api/domains` | List crawled domains |
 | GET | `/api/domains/:domain/robots` | Get cached robots.txt |
+| GET | `/metrics` | Prometheus metrics endpoint |
 
----
-
-## 14. Observability
-
-### Metrics
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `crawler_pages_fetched_total` | Counter | Total pages fetched |
-| `crawler_pages_per_second` | Gauge | Current crawl rate |
-| `crawler_fetch_success_rate` | Gauge | Success vs failure ratio |
-| `crawler_http_status_*` | Counter | HTTP status distribution |
-| `crawler_frontier_size` | Gauge | URLs pending in frontier |
-| `crawler_robots_denials` | Counter | URLs blocked by robots.txt |
-| `crawler_active_workers` | Gauge | Currently active workers |
-
-### Implementation (Current)
-
-```
-# Redis stats keys
-crawler:stats:pages_crawled        - Counter
-crawler:stats:pages_failed         - Counter
-crawler:stats:bytes_downloaded     - Counter
-crawler:worker:{id}:heartbeat      - Worker last heartbeat
-crawler:active_workers             - Set of active worker IDs
-```
-
-### Dashboard Updates
-- Polling interval: 5 seconds
-- Real-time charts for crawl rate, success rate, status codes
-
-### Alerts (v2)
-
-| Alert | Condition |
-|-------|-----------|
-| High error rate | 4xx/5xx > 20% for 5 minutes |
-| Frontier backlog | Queue growing > 10% per minute |
-| Worker crash | No heartbeat for 2 minutes |
-
----
-
-## 15. Technology Stack
-
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| Runtime | Node.js | Async I/O for network-heavy workload |
-| Language | TypeScript | Type safety, better tooling |
-| Web Framework | Express.js | API server |
-| Database | PostgreSQL | Frontier, metadata, durable storage |
-| Cache | Redis/Valkey | Deduplication, locks, robots cache |
-| HTML Parser | Cheerio | Fast HTML parsing without JS |
-| Robots Parser | robots-parser | robots.txt parsing |
-| HTTP Client | Axios | HTTP requests with timeout support |
-| Frontend | React 19 + Vite | Dashboard UI |
-| Routing | TanStack Router | Type-safe routing |
-| State | Zustand | Lightweight state management |
-| Styling | Tailwind CSS | Utility-first CSS |
-
----
-
-## 16. Deployment Model
-
-### Local Development
-
-```bash
-# Start infrastructure
-docker-compose up -d postgres redis
-
-# Start API server
-npm run dev:server1
-
-# Start workers (separate terminals)
-WORKER_ID=1 npm run dev:worker
-WORKER_ID=2 npm run dev:worker
-WORKER_ID=3 npm run dev:worker
-
-# Start frontend
-cd frontend && npm run dev
-```
-
-### Production (Kubernetes)
-
-- **API Server**: Deployment with 2-3 replicas, HPA
-- **Workers**: Deployment with 10-100 replicas, configurable
-- **PostgreSQL**: StatefulSet or managed RDS
-- **Redis**: StatefulSet or ElastiCache
-
----
-
-## 17. Security Considerations
-
-| Concern | Mitigation |
-|---------|------------|
-| Identification | Clear User-Agent with contact info |
-| Rate limiting | Max 1 req/sec per domain by default |
-| robots.txt | Always checked before crawling |
-| Timeouts | 30s request timeout to prevent hanging |
-| Page size | 10MB limit to prevent memory exhaustion |
-| Dangerous URLs | Skip file:// and other local schemes |
-
-### Authentication and Authorization
-
-For this learning project, we use session-based authentication with Redis-backed sessions. This approach is simpler than JWT/OAuth and sufficient for the admin dashboard use case.
-
-#### Authentication Flow
-
-```
-User → Login Form → POST /api/auth/login → Validate credentials → Create session → Set cookie
-                                                                        ↓
-                                              Redis: session:{sessionId} = { userId, role, createdAt }
-```
-
-#### Session Configuration
-
-```typescript
-// Session middleware configuration
-const sessionConfig = {
-  store: new RedisStore({ client: redisClient }),
-  secret: process.env.SESSION_SECRET || 'dev-secret-change-in-prod',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    sameSite: 'strict'
-  }
-};
-```
-
-#### RBAC Boundaries
+### Authentication and RBAC
 
 | Role | Permissions | Endpoints |
 |------|-------------|-----------|
-| **anonymous** | Read public stats | `GET /health`, `GET /api/stats` |
-| **user** | View dashboard, read all data | `GET /api/*` |
-| **admin** | Full access, modify system | `POST /api/frontier/*`, `DELETE /api/*`, `POST /api/admin/*` |
-
-#### Admin-Only Operations
-
-| Operation | Endpoint | Description |
-|-----------|----------|-------------|
-| Add seed URLs | `POST /api/frontier/seed` | Inject new crawl seeds |
-| Clear frontier | `DELETE /api/frontier` | Remove all pending URLs |
-| Reset domain | `POST /api/admin/domains/:domain/reset` | Re-enable blocked domain |
-| Purge pages | `DELETE /api/admin/pages` | Delete crawled page data |
-| Recover stale | `POST /api/frontier/recover` | Fix stuck in-progress URLs |
-
-#### Middleware Implementation
-
-```typescript
-// Role-based access control middleware
-function requireRole(allowedRoles: string[]) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    if (!req.session?.userId) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-    if (!allowedRoles.includes(req.session.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
-    }
-    next();
-  };
-}
-
-// Usage
-app.post('/api/frontier/seed', requireRole(['admin']), seedController);
-app.get('/api/stats', requireRole(['user', 'admin']), statsController);
-```
+| anonymous | Read public stats | `GET /health`, `GET /api/stats` |
+| user | View dashboard, read all data | `GET /api/*` |
+| admin | Full access, seed URLs, clear frontier | `POST /api/frontier/*`, `DELETE /api/*` |
 
 ### API Rate Limiting
-
-Rate limits protect the API from abuse and ensure fair usage across clients.
 
 | Tier | Limit | Window | Applies To |
 |------|-------|--------|------------|
 | Anonymous | 10 req | 1 min | Unauthenticated requests |
 | User | 100 req | 1 min | Regular authenticated users |
 | Admin | 500 req | 1 min | Admin operations |
-| Seed injection | 10 req | 1 min | `POST /api/frontier/seed` (prevent spam) |
+| Seed injection | 10 req | 1 min | `POST /api/frontier/seed` |
 
-#### Implementation with Redis
+Rate limiting uses Redis sliding window: ZREMRANGEBYSCORE to remove old entries, ZADD to add current request, ZCARD to count requests in window.
 
-```typescript
-// Rate limiter using Redis sliding window
-async function checkRateLimit(key: string, limit: number, windowSeconds: number): Promise<boolean> {
-  const now = Date.now();
-  const windowStart = now - (windowSeconds * 1000);
+## Key Design Decisions
 
-  const multi = redis.multi();
-  multi.zremrangebyscore(key, 0, windowStart);  // Remove old entries
-  multi.zadd(key, now, `${now}-${Math.random()}`);  // Add current request
-  multi.zcard(key);  // Count requests in window
-  multi.expire(key, windowSeconds);  // Set TTL
+### 1. URL Frontier: PostgreSQL vs Kafka
 
-  const results = await multi.exec();
-  const count = results[2][1] as number;
-  return count <= limit;
-}
+**Chosen: PostgreSQL with indexed priority queue.** The frontier needs three operations: enqueue (INSERT), dequeue highest-priority eligible URL (SELECT ... FOR UPDATE SKIP LOCKED), and status update (UPDATE). PostgreSQL handles all three with ACID guarantees and queryable state. Kafka would provide higher throughput but loses queryability -- you cannot inspect or reprioritize URLs already in a Kafka topic, and frontier management (recover stale URLs, clear frontier, inspect queue) requires random access.
 
-// Rate limit middleware
-function rateLimit(limit: number, windowSeconds: number = 60) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const key = `ratelimit:${req.session?.userId || req.ip}`;
-    if (await checkRateLimit(key, limit, windowSeconds)) {
-      next();
-    } else {
-      res.status(429).json({ error: 'Rate limit exceeded', retryAfter: windowSeconds });
-    }
-  };
-}
-```
+**Trade-off acknowledged:** PostgreSQL becomes a bottleneck at >1,000 pages/second because the dequeue operation (`SELECT ... ORDER BY priority DESC, scheduled_at ASC ... FOR UPDATE SKIP LOCKED`) creates contention on the priority index. Production would partition the frontier by domain and use multiple PostgreSQL instances or switch to a dedicated distributed queue (Redis Streams or Kafka with a sidecar state store).
 
----
+### 2. URL Deduplication: Redis SET vs Bloom Filter
 
-## 18. Trade-offs Summary
+**Chosen: Redis SET of URL hashes.** Each normalized URL is SHA-256 hashed (64 bytes) and checked against a Redis SET using SISMEMBER (O(1)). This provides exact deduplication with zero false positives. A Bloom filter would use ~10x less memory but introduces false positives (URLs never crawled because they "look" visited), which means missed pages.
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Frontier storage | PostgreSQL | Kafka | Simpler, queryable, good enough for learning scale |
-| Deduplication | Redis SET | Bloom Filter | Exact dedup, no false positives, acceptable memory |
-| Rate limiting | Redis Lock | Token Bucket | Simpler, domain-level granularity sufficient |
-| HTML parsing | Cheerio | Puppeteer | Much faster, no JS rendering needed for basic crawl |
-| Priority queue | 3-level | Sorted set | Simpler to understand and debug |
+**Trade-off acknowledged:** At 10 billion URLs, Redis SET requires ~640GB RAM (64 bytes x 10B). Production would use a probabilistic approach: Bloom filter for first-pass dedup (accepting ~0.1% false positive rate), with PostgreSQL as the source of truth for exact checks on Bloom-positive URLs. The learning project uses exact dedup because memory is not a constraint at 100K URLs.
 
----
+### 3. Per-Domain Rate Limiting: Redis Locks vs Token Bucket
 
-## 19. Failure Handling and Resilience
+**Chosen: Redis SET NX EX (distributed lock with TTL).** When a worker wants to crawl a domain, it attempts `SET crawler:domain:{domain}:lock {workerId} NX EX {crawlDelay}`. If successful, it proceeds; otherwise, it skips this domain and picks another URL. The TTL equals the domain's crawl-delay (from robots.txt or default 1s), ensuring automatic lock expiry.
 
-### Retry Strategy with Idempotency
+**Trade-off acknowledged:** This is domain-level, not path-level granularity. A domain with crawl-delay=1s allows only 1 req/sec regardless of how many workers exist. Token bucket would allow smoother rate distribution (e.g., 10 req/10s instead of 1 req/s), but adds implementation complexity for marginal benefit. The lock approach also wastes worker cycles when all available domains are locked -- production would use a work-stealing queue per domain shard.
 
-Crawl operations are inherently idempotent: fetching the same URL multiple times produces the same result. However, we need idempotency keys for internal operations to prevent duplicate processing.
+### 4. HTML Parsing: Cheerio vs Puppeteer
 
-#### Idempotency Key Design
+**Chosen: Cheerio (server-side DOM parser).** Cheerio parses HTML in ~5ms vs Puppeteer's ~500ms (launching headless Chrome). For a basic crawler that processes static HTML, Cheerio extracts titles, descriptions, and links 100x faster with 50x less memory. Puppeteer is only needed for JavaScript-rendered SPAs, which are a v2 feature.
 
-```typescript
-// Idempotency key for URL processing
-interface IdempotencyKey {
-  urlHash: string;       // SHA-256 of normalized URL
-  operationType: string; // 'fetch' | 'parse' | 'ingest'
-  timestamp: number;     // Unix timestamp (for deduplication window)
-}
+**Trade-off acknowledged:** ~30% of modern web pages rely on JavaScript for content rendering. A Cheerio-only crawler will extract empty or incomplete content from React/Angular/Vue SPAs. The workaround is to detect empty content and flag those URLs for future Puppeteer processing.
 
-// Redis key: idempotency:{urlHash}:{operationType}
-// Value: { status: 'processing' | 'completed', workerId, startedAt }
-// TTL: 1 hour (allows retry after timeout)
-```
+## Consistency and Idempotency
 
-#### Retry Configuration
+### Idempotency in Crawl Operations
+
+Crawl operations are inherently idempotent: fetching the same URL multiple times produces the same result. However, internal operations need coordination:
+
+- **URL ingestion**: The `url_hash UNIQUE` constraint on url_frontier prevents duplicate URL insertions. `INSERT ... ON CONFLICT (url_hash) DO NOTHING` makes ingestion idempotent.
+- **Page metadata**: `url_hash UNIQUE` on crawled_pages with `ON CONFLICT DO UPDATE` ensures re-crawls update rather than duplicate.
+- **Worker claim**: `UPDATE url_frontier SET status='in_progress' WHERE id = (SELECT id FROM url_frontier WHERE status='pending' ORDER BY priority DESC LIMIT 1 FOR UPDATE SKIP LOCKED)` ensures exactly one worker claims each URL.
+
+### Consistency Model
+
+| Entity | Consistency | Rationale |
+|--------|-------------|-----------|
+| URL frontier state | Strong (PostgreSQL FOR UPDATE) | Worker claims must be exclusive; double-crawling wastes resources |
+| Visited URLs (Redis SET) | Eventual (small duplicate window) | Brief period where two workers may crawl the same URL before SET is updated |
+| robots.txt cache | Eventual (1h TTL) | Stale robots.txt is acceptable; re-fetch hourly |
+| Circuit breaker state | Eventual (Redis, distributed) | Workers share domain failure state with seconds delay |
+
+## Security
+
+| Concern | Mitigation |
+|---------|------------|
+| Crawler identification | Clear User-Agent with contact info |
+| Per-domain rate limiting | Max 1 req/sec per domain by default; respect robots.txt crawl-delay |
+| robots.txt compliance | Always checked before crawling; denied domains skipped |
+| Request timeouts | 30s timeout prevents hanging on unresponsive servers |
+| Page size limit | 10MB max to prevent memory exhaustion |
+| Dangerous URL schemes | Skip `file://`, `javascript:`, `tel:`, `mailto:` |
+| Dashboard auth | Session-based with Redis; admin-only destructive operations |
+| API rate limiting | Tiered limits (anonymous/user/admin) via Redis sliding window |
+| Input sanitization | Helmet middleware, compression, CORS |
+
+## Observability
+
+### Metrics (Prometheus via prom-client)
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `crawler_pages_crawled_total` | Counter | status, worker_id | Crawl throughput |
+| `crawler_crawl_duration_seconds` | Histogram | status, worker_id | Fetch latency distribution |
+| `crawler_bytes_downloaded_total` | Counter | worker_id | Bandwidth consumption |
+| `crawler_links_discovered_total` | Counter | worker_id | Link extraction rate |
+| `crawler_duplicates_skipped_total` | Counter | - | Dedup effectiveness |
+| `crawler_frontier_size` | Gauge | status | Queue depth (pending/in_progress/completed/failed) |
+| `crawler_domains_total` | Gauge | - | Unique domains discovered |
+| `crawler_active_workers` | Gauge | - | Worker fleet size |
+| `crawler_errors_total` | Counter | error_type, worker_id | Error classification |
+| `crawler_http_status_total` | Counter | status_code, worker_id | HTTP status distribution |
+| `crawler_circuit_breaker_state` | Gauge | domain | Per-domain circuit breaker (0=closed, 1=half-open, 2=open) |
+| `crawler_circuit_breaker_transitions_total` | Counter | domain, from, to | Circuit state changes |
+| `crawler_rate_limit_hits_total` | Counter | tier | API rate limit enforcement |
+| `crawler_cleanup_records_total` | Counter | table | Data retention cleanup activity |
+
+### Health Checks
+
+`GET /health` checks PostgreSQL connectivity, Redis connectivity, and returns worker heartbeat status. Used for load balancer integration and Docker health checks.
+
+### Dashboard Updates
+
+The React dashboard polls the API every 5 seconds for real-time charts showing crawl rate, success rate, HTTP status distribution, frontier depth, and active workers.
+
+## Failure Handling
+
+### Circuit Breaker Pattern (Per-Domain)
+
+Each domain gets its own circuit breaker to isolate failures:
+
+- **Closed**: Normal operation; requests pass through
+- **Open**: After 5 consecutive failures; immediately reject requests for 60 seconds
+- **Half-open**: After cooldown, allow 1 test request; close on success, reopen on failure
+
+Circuit breaker state is stored in Redis (`crawler:circuit:{domain}`) so all workers share failure awareness. When a domain's circuit is open, workers skip URLs from that domain and pick another URL, preventing resource waste on failing domains.
+
+Implementation uses Cockatiel library with retry (exponential backoff: 1s, 2s, 4s) wrapping the circuit breaker. Retries happen within a closed circuit; if the circuit opens, retries stop immediately (fail fast).
+
+### Retry Strategy
 
 | Operation | Max Retries | Backoff | Timeout |
 |-----------|-------------|---------|---------|
-| HTTP fetch | 3 | Exponential (1s, 2s, 4s) | 30s |
+| HTTP fetch | 3 | Exponential (1s, 2s, 4s) + jitter | 30s |
 | robots.txt fetch | 2 | Linear (2s, 4s) | 10s |
 | Database write | 3 | Exponential (100ms, 200ms, 400ms) | 5s |
 | Redis operation | 3 | Fixed (100ms) | 1s |
 
-#### Retry Implementation
+Retryable errors: ECONNRESET, ETIMEDOUT, ECONNREFUSED, ENOTFOUND, EAI_AGAIN, EPIPE, EHOSTUNREACH, ENETUNREACH, and HTTP 5xx responses.
 
-```typescript
-async function fetchWithRetry(url: string, options: FetchOptions): Promise<FetchResult> {
-  const maxRetries = 3;
-  const baseDelay = 1000;
+### Worker Failure Recovery
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const response = await axios.get(url, {
-        timeout: 30000,
-        maxRedirects: 5,
-        validateStatus: (status) => status < 500, // Don't retry on 4xx
-      });
-      return { success: true, data: response.data, status: response.status };
-    } catch (error) {
-      const isRetryable = isRetryableError(error);
-      const isLastAttempt = attempt === maxRetries - 1;
+Workers send heartbeats every 30 seconds (`crawler:worker:{id}` with 2-minute TTL). A recovery job runs every 5 minutes to find URLs stuck in `in_progress` state for >5 minutes and reset them to `pending`:
 
-      if (!isRetryable || isLastAttempt) {
-        return { success: false, error: error.message, attempts: attempt + 1 };
-      }
-
-      const delay = baseDelay * Math.pow(2, attempt); // Exponential backoff
-      await sleep(delay + Math.random() * 500); // Add jitter
-    }
-  }
-}
-
-function isRetryableError(error: any): boolean {
-  // Retry on network errors and 5xx responses
-  if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') return true;
-  if (error.response?.status >= 500) return true;
-  return false;
-}
-```
-
-### Circuit Breaker Pattern
-
-Circuit breakers prevent cascading failures when external domains or internal services are degraded.
-
-#### Domain-Level Circuit Breaker
-
-```typescript
-interface CircuitBreakerState {
-  state: 'closed' | 'open' | 'half-open';
-  failureCount: number;
-  lastFailureAt: number;
-  successCount: number;  // For half-open state
-}
-
-// Redis key: circuit:{domain}
-// Configuration per domain
-const circuitConfig = {
-  failureThreshold: 5,       // Open after 5 consecutive failures
-  resetTimeout: 60000,       // Try again after 60 seconds
-  halfOpenSuccesses: 2,      // Close after 2 successes in half-open
-};
-```
-
-#### Circuit Breaker Implementation
-
-```typescript
-class DomainCircuitBreaker {
-  async canRequest(domain: string): Promise<boolean> {
-    const state = await this.getState(domain);
-
-    switch (state.state) {
-      case 'closed':
-        return true;
-
-      case 'open':
-        if (Date.now() - state.lastFailureAt > this.config.resetTimeout) {
-          await this.transitionTo(domain, 'half-open');
-          return true;
-        }
-        return false;
-
-      case 'half-open':
-        return true; // Allow limited requests
-    }
-  }
-
-  async recordSuccess(domain: string): Promise<void> {
-    const state = await this.getState(domain);
-    if (state.state === 'half-open') {
-      state.successCount++;
-      if (state.successCount >= this.config.halfOpenSuccesses) {
-        await this.transitionTo(domain, 'closed');
-      }
-    }
-    state.failureCount = 0;
-    await this.saveState(domain, state);
-  }
-
-  async recordFailure(domain: string): Promise<void> {
-    const state = await this.getState(domain);
-    state.failureCount++;
-    state.lastFailureAt = Date.now();
-
-    if (state.failureCount >= this.config.failureThreshold) {
-      await this.transitionTo(domain, 'open');
-    }
-    await this.saveState(domain, state);
-  }
-}
-```
-
-### Internal Service Circuit Breakers
-
-| Service | Failure Threshold | Reset Timeout | Action When Open |
-|---------|-------------------|---------------|------------------|
-| PostgreSQL | 3 failures | 30s | Queue writes to Redis, log error |
-| Redis | 5 failures | 10s | Fall back to in-memory cache |
-| robots.txt fetch | 3 failures | 60s | Assume disallowed, skip domain |
-
-### Disaster Recovery (Local Development)
-
-For a local learning project, DR focuses on data protection and quick recovery rather than multi-region failover.
-
-#### Backup Strategy
-
-| Component | Backup Method | Frequency | Retention |
-|-----------|---------------|-----------|-----------|
-| PostgreSQL | `pg_dump` | Daily | 7 days |
-| Redis | RDB snapshots | Every 15 min | 24 hours |
-| Configuration | Git repository | On change | Unlimited |
-
-#### Backup Scripts
-
-```bash
-#!/bin/bash
-# backup.sh - Daily backup script
-
-BACKUP_DIR="/backups/crawler/$(date +%Y-%m-%d)"
-mkdir -p "$BACKUP_DIR"
-
-# PostgreSQL backup
-pg_dump -h localhost -U crawler crawler_db | gzip > "$BACKUP_DIR/postgres.sql.gz"
-
-# Redis backup (trigger RDB save and copy)
-redis-cli BGSAVE
-sleep 5
-cp /var/lib/redis/dump.rdb "$BACKUP_DIR/redis.rdb"
-
-# Verify backups
-gzip -t "$BACKUP_DIR/postgres.sql.gz" && echo "PostgreSQL backup verified"
-redis-check-rdb "$BACKUP_DIR/redis.rdb" && echo "Redis backup verified"
-
-# Cleanup old backups (keep 7 days)
-find /backups/crawler -type d -mtime +7 -exec rm -rf {} +
-```
-
-#### Restore Procedure
-
-```bash
-#!/bin/bash
-# restore.sh - Restore from backup
-
-BACKUP_DATE=${1:-$(date +%Y-%m-%d)}
-BACKUP_DIR="/backups/crawler/$BACKUP_DATE"
-
-echo "Restoring from $BACKUP_DIR..."
-
-# Stop workers first
-pkill -f "npm run dev:worker"
-
-# Restore PostgreSQL
-gunzip -c "$BACKUP_DIR/postgres.sql.gz" | psql -h localhost -U crawler crawler_db
-
-# Restore Redis
-redis-cli SHUTDOWN NOSAVE
-cp "$BACKUP_DIR/redis.rdb" /var/lib/redis/dump.rdb
-redis-server /etc/redis/redis.conf
-
-echo "Restore complete. Restart workers manually."
-```
-
-#### Recovery Testing Checklist
-
-Run monthly to validate backup/restore procedures:
-
-- [ ] Restore PostgreSQL backup to test database
-- [ ] Verify URL frontier table row counts match
-- [ ] Verify crawled_pages table integrity
-- [ ] Restore Redis snapshot to test instance
-- [ ] Verify visited URLs set membership
-- [ ] Run health check endpoint
-- [ ] Verify dashboard loads with restored data
-- [ ] Document any issues and update procedures
-
-### Worker Failure Handling
-
-#### Heartbeat and Recovery
-
-```typescript
-// Worker heartbeat (every 30 seconds)
-async function sendHeartbeat(workerId: string): Promise<void> {
-  await redis.hset(`crawler:worker:${workerId}`, {
-    lastHeartbeat: Date.now(),
-    status: 'active',
-    currentUrl: this.currentUrl || null,
-  });
-  await redis.expire(`crawler:worker:${workerId}`, 120); // 2-minute TTL
-}
-
-// Recovery job (runs every 5 minutes)
-async function recoverStaleUrls(): Promise<number> {
-  const staleThreshold = Date.now() - 5 * 60 * 1000; // 5 minutes
-
-  const result = await db.query(`
-    UPDATE url_frontier
-    SET status = 'pending', scheduled_at = NOW()
-    WHERE status = 'in_progress'
-    AND updated_at < $1
-    RETURNING id
-  `, [new Date(staleThreshold)]);
-
-  return result.rowCount;
-}
+```sql
+UPDATE url_frontier
+SET status = 'pending', scheduled_at = NOW()
+WHERE status = 'in_progress'
+AND updated_at < NOW() - INTERVAL '5 minutes'
 ```
 
 ### Graceful Degradation
 
-| Failure Scenario | Degradation Behavior |
-|------------------|---------------------|
-| PostgreSQL down | Stop accepting new URLs, continue with in-memory queue |
-| Redis down | Use PostgreSQL for dedup (slower), skip rate limiting |
-| Single worker crash | Other workers continue, stale URLs recovered |
-| All workers crash | API server continues serving dashboard, no crawling |
-| robots.txt timeout | Skip domain for 1 hour, mark as potentially blocked |
+| Failure | Degradation |
+|---------|-------------|
+| PostgreSQL down | Stop accepting new URLs; continue with in-memory queue if available |
+| Redis down | Use PostgreSQL for dedup (slower); skip rate limiting |
+| Single worker crash | Other workers continue; stale URLs recovered automatically |
+| All workers crash | API server continues serving dashboard; no crawling |
+| robots.txt timeout | Skip domain for 1 hour; mark as potentially blocked |
 
----
+## Scalability Considerations
 
-## 20. Data Lifecycle Policies
+### Horizontal Scaling Path
 
-### Retention and TTL Configuration
+1. **Workers**: Fully stateless; add instances to increase crawl rate linearly. Each worker independently claims URLs from the frontier
+2. **API Server**: Stateless, behind load balancer. 2-3 replicas with HPA
+3. **PostgreSQL**: Partition url_frontier by domain hash for reduced contention. Read replicas for dashboard queries
+4. **Redis**: Redis Cluster for sharded dedup SET at billion-scale. Separate instance for locks/rate limiting
+5. **Kafka** (production): Decouple URL discovery from ingestion; workers publish discovered URLs to Kafka topic; ingestion service consumes and deduplicates
 
-Different data types have different retention requirements based on their value and storage cost.
+### What Breaks First
 
-| Data Type | Retention | TTL Mechanism | Rationale |
-|-----------|-----------|---------------|-----------|
-| URL frontier (pending) | Until crawled | Status change | Must crawl before deletion |
-| URL frontier (completed) | 7 days | Cron job | Keep for debugging, then archive |
-| URL frontier (failed) | 30 days | Cron job | Longer retention for analysis |
-| Crawled pages metadata | 90 days | Cron job | Historical data for re-crawl decisions |
-| Page content (if stored) | 30 days | Object lifecycle | Raw HTML is large, archive or delete |
-| Visited URLs (Redis) | 24 hours | Redis TTL | Memory-bound, URLs re-discovered naturally |
+At ~1,000 pages/second, the PostgreSQL frontier dequeue becomes the bottleneck. The `SELECT ... FOR UPDATE SKIP LOCKED` contends on the priority index. Solutions:
+1. Partition by domain (workers claim a domain shard, not individual URLs)
+2. Use Redis sorted sets as a fast frontier layer, with PostgreSQL as durable backing store
+3. Batch dequeue (claim 10-50 URLs at once)
+
+### Data Lifecycle
+
+| Data Type | Retention | Cleanup Mechanism | Rationale |
+|-----------|-----------|-------------------|-----------|
+| Frontier (pending) | Until crawled | Status change | Must crawl before deletion |
+| Frontier (completed) | 7 days | Daily cron job | Keep for debugging |
+| Frontier (failed) | 30 days | Daily cron job | Longer for failure analysis |
+| Crawled pages metadata | 90 days | Daily cron + archive | Historical data for re-crawl decisions |
+| Visited URLs (Redis SET) | 24 hours TTL | Redis TTL | Memory-bound; URLs re-discovered naturally |
 | Rate limit keys | 1 minute | Redis TTL | Auto-expire after window |
 | Circuit breaker state | 1 hour | Redis TTL | Reset on service restart |
 | robots.txt cache | 1 hour | Redis TTL | Re-fetch periodically |
 | Session data | 24 hours | Redis TTL | Force re-login daily |
-| Stats/timeseries | 7 days | Cron job | Roll up to daily aggregates |
+| Worker heartbeats | 2 minutes | Redis TTL | Auto-expire on worker death |
 
-### Database Cleanup Jobs
+## Trade-offs Summary
 
-```sql
--- cleanup_frontier.sql - Run daily via cron
--- Delete completed URLs older than 7 days
-DELETE FROM url_frontier
-WHERE status = 'completed'
-AND updated_at < NOW() - INTERVAL '7 days';
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Frontier storage | PostgreSQL | Kafka | Queryable, inspectable, manageable; Kafka for >1K pages/sec |
+| URL deduplication | Redis SET (exact) | Bloom Filter | Zero false positives; memory acceptable at learning scale |
+| Rate limiting | Redis SET NX EX | Token Bucket | Simpler; domain-level granularity sufficient |
+| HTML parsing | Cheerio | Puppeteer | 100x faster, 50x less memory; no JS rendering needed for v1 |
+| Priority queue | 3-level (high/med/low) | Redis ZSET with continuous scores | Simpler to understand, debug, and reason about |
+| Circuit breaker | Cockatiel (per-domain) | No circuit breaker | Prevents cascade failures; shared state via Redis |
+| Coordination | Redis distributed locks | Central scheduler | Simple, auto-expiry; no SPOF |
 
--- Delete failed URLs older than 30 days (after export for analysis)
-DELETE FROM url_frontier
-WHERE status = 'failed'
-AND updated_at < NOW() - INTERVAL '30 days';
+## Implementation Notes
 
--- Archive crawled pages older than 90 days
-INSERT INTO crawled_pages_archive
-SELECT * FROM crawled_pages
-WHERE crawled_at < NOW() - INTERVAL '90 days';
+This section maps the production architecture above to the actual local implementation running on Docker + Node.js + React.
 
-DELETE FROM crawled_pages
-WHERE crawled_at < NOW() - INTERVAL '90 days';
-
--- Vacuum to reclaim space (run weekly)
-VACUUM ANALYZE url_frontier;
-VACUUM ANALYZE crawled_pages;
-```
-
-### Cron Schedule
-
-```bash
-# /etc/cron.d/crawler-maintenance
-
-# Daily cleanup at 3 AM
-0 3 * * * crawler psql -f /app/scripts/cleanup_frontier.sql
-
-# Weekly vacuum at 4 AM Sunday
-0 4 * * 0 crawler psql -c "VACUUM ANALYZE;"
-
-# Archive stats daily at midnight
-0 0 * * * crawler /app/scripts/archive_stats.sh
-
-# Backup at 2 AM daily
-0 2 * * * crawler /app/scripts/backup.sh
-```
-
-### Archival to Cold Storage
-
-For a local development setup, "cold storage" means compressed files on disk. In production, this would be S3 Glacier or similar.
-
-#### Archive Strategy
-
-| Data | Archive Format | Storage Location | Compression |
-|------|---------------|------------------|-------------|
-| Crawled pages | PostgreSQL COPY | `/archive/pages/` | gzip |
-| Failed URLs | CSV export | `/archive/failures/` | gzip |
-| Stats rollups | JSON | `/archive/stats/` | gzip |
-
-#### Archive Script
-
-```bash
-#!/bin/bash
-# archive_old_data.sh - Monthly archive job
-
-ARCHIVE_DATE=$(date -d "90 days ago" +%Y-%m)
-ARCHIVE_DIR="/archive/crawler/$ARCHIVE_DATE"
-mkdir -p "$ARCHIVE_DIR"
-
-# Export crawled pages to archive
-psql -h localhost -U crawler crawler_db -c "
-  COPY (
-    SELECT * FROM crawled_pages
-    WHERE crawled_at < NOW() - INTERVAL '90 days'
-  ) TO STDOUT WITH CSV HEADER
-" | gzip > "$ARCHIVE_DIR/crawled_pages.csv.gz"
-
-# Export failed URLs with error analysis
-psql -h localhost -U crawler crawler_db -c "
-  COPY (
-    SELECT url, domain, error_message, created_at, updated_at
-    FROM url_frontier
-    WHERE status = 'failed'
-    AND updated_at < NOW() - INTERVAL '30 days'
-  ) TO STDOUT WITH CSV HEADER
-" | gzip > "$ARCHIVE_DIR/failed_urls.csv.gz"
-
-echo "Archived data to $ARCHIVE_DIR"
-
-# Optional: Upload to S3 if configured
-if [ -n "$AWS_BUCKET" ]; then
-  aws s3 sync "$ARCHIVE_DIR" "s3://$AWS_BUCKET/archive/$ARCHIVE_DATE/"
-fi
-```
-
-### Backfill and Replay Procedures
-
-Backfill is needed when re-processing historical data or recovering from data loss.
-
-#### Backfill Scenarios
-
-| Scenario | Trigger | Procedure |
-|----------|---------|-----------|
-| Schema migration | Added new extracted field | Re-crawl and re-parse stored HTML |
-| Lost Redis data | Redis crash without backup | Rebuild visited set from PostgreSQL |
-| Partial crawl loss | Worker crash mid-batch | Recover stale URLs via API |
-| Index rebuild | Elasticsearch reindex | Replay from crawled_pages table |
-
-#### Rebuild Visited URLs from PostgreSQL
-
-```typescript
-// backfill_visited_urls.ts
-// Rebuilds Redis visited set from PostgreSQL if Redis data is lost
-
-async function rebuildVisitedUrls(): Promise<number> {
-  console.log('Rebuilding visited URLs from PostgreSQL...');
-
-  // Stream URLs from database to avoid memory issues
-  const batchSize = 10000;
-  let offset = 0;
-  let total = 0;
-
-  while (true) {
-    const result = await db.query(`
-      SELECT url_hash FROM crawled_pages
-      ORDER BY id
-      LIMIT $1 OFFSET $2
-    `, [batchSize, offset]);
-
-    if (result.rows.length === 0) break;
-
-    // Add to Redis in batches
-    const pipeline = redis.pipeline();
-    for (const row of result.rows) {
-      pipeline.sadd('crawler:visited_urls', row.url_hash);
-    }
-    await pipeline.exec();
-
-    total += result.rows.length;
-    offset += batchSize;
-    console.log(`Processed ${total} URLs...`);
-  }
-
-  console.log(`Rebuilt visited set with ${total} URLs`);
-  return total;
-}
-```
-
-#### Replay Crawled Pages for Reprocessing
-
-```typescript
-// replay_pages.ts
-// Re-processes stored pages when parsing logic changes
-
-interface ReplayOptions {
-  startDate?: Date;
-  endDate?: Date;
-  domain?: string;
-  dryRun?: boolean;
-}
-
-async function replayPages(options: ReplayOptions): Promise<void> {
-  const whereClause = [];
-  const params = [];
-
-  if (options.startDate) {
-    params.push(options.startDate);
-    whereClause.push(`crawled_at >= $${params.length}`);
-  }
-  if (options.endDate) {
-    params.push(options.endDate);
-    whereClause.push(`crawled_at <= $${params.length}`);
-  }
-  if (options.domain) {
-    params.push(options.domain);
-    whereClause.push(`domain = $${params.length}`);
-  }
-
-  const where = whereClause.length > 0 ? `WHERE ${whereClause.join(' AND ')}` : '';
-
-  const countResult = await db.query(`SELECT COUNT(*) FROM crawled_pages ${where}`, params);
-  console.log(`Found ${countResult.rows[0].count} pages to replay`);
-
-  if (options.dryRun) {
-    console.log('Dry run - no changes made');
-    return;
-  }
-
-  // Re-queue pages for re-processing
-  await db.query(`
-    INSERT INTO url_frontier (url, url_hash, domain, priority, status, scheduled_at)
-    SELECT url, url_hash, domain, 2, 'pending', NOW()
-    FROM crawled_pages ${where}
-    ON CONFLICT (url_hash) DO UPDATE SET
-      status = 'pending',
-      scheduled_at = NOW()
-  `, params);
-
-  console.log('Pages queued for replay');
-}
-```
-
-#### Backfill from Archive
-
-```bash
-#!/bin/bash
-# restore_from_archive.sh - Restore archived data for analysis
-
-ARCHIVE_DATE=${1:?"Usage: restore_from_archive.sh YYYY-MM"}
-ARCHIVE_DIR="/archive/crawler/$ARCHIVE_DATE"
-
-if [ ! -d "$ARCHIVE_DIR" ]; then
-  echo "Archive not found: $ARCHIVE_DIR"
-  exit 1
-fi
-
-# Create temporary table for archived data
-psql -h localhost -U crawler crawler_db -c "
-  CREATE TABLE IF NOT EXISTS crawled_pages_restore (LIKE crawled_pages);
-"
-
-# Load archived data
-gunzip -c "$ARCHIVE_DIR/crawled_pages.csv.gz" | \
-  psql -h localhost -U crawler crawler_db -c "
-    COPY crawled_pages_restore FROM STDIN WITH CSV HEADER;
-  "
-
-echo "Restored $(psql -t -c 'SELECT COUNT(*) FROM crawled_pages_restore') pages"
-echo "Data available in crawled_pages_restore table"
-echo "Run 'DROP TABLE crawled_pages_restore' when done"
-```
-
-### Storage Growth Monitoring
-
-```sql
--- storage_report.sql - Monthly storage report
-
-SELECT
-  'url_frontier' as table_name,
-  pg_size_pretty(pg_total_relation_size('url_frontier')) as total_size,
-  (SELECT COUNT(*) FROM url_frontier) as row_count,
-  (SELECT COUNT(*) FROM url_frontier WHERE status = 'pending') as pending,
-  (SELECT COUNT(*) FROM url_frontier WHERE status = 'completed') as completed,
-  (SELECT COUNT(*) FROM url_frontier WHERE status = 'failed') as failed
-UNION ALL
-SELECT
-  'crawled_pages',
-  pg_size_pretty(pg_total_relation_size('crawled_pages')),
-  (SELECT COUNT(*) FROM crawled_pages),
-  NULL, NULL, NULL
-UNION ALL
-SELECT
-  'domains',
-  pg_size_pretty(pg_total_relation_size('domains')),
-  (SELECT COUNT(*) FROM domains),
-  NULL, NULL, NULL;
-```
-
----
-
-## 21. Future Extensions (v2+)
-
-| Feature | Description |
-|---------|-------------|
-| JavaScript rendering | Puppeteer/Playwright pool for SPA sites |
-| Near-duplicate detection | SimHash for content similarity |
-| Content storage | S3/HDFS for raw HTML archival |
-| Sitemap parsing | Extract URLs from sitemap.xml |
-| Adaptive scheduling | Learn optimal crawl frequency per domain |
-| Link graph storage | Store and analyze link relationships |
-| Search indexing | Elasticsearch integration for full-text search |
-| Work stealing | Dynamic rebalancing when workers are idle |
-| DNS caching | Reduce DNS lookups for repeated domains |
-| Per-site configurations | Custom rules for specific domains |
-
----
-
-## 22. Summary
-
-This v1 crawler:
-- Is simple but production-shaped
-- Scales horizontally with stateless workers
-- Obeys web norms (robots.txt, politeness)
-- Produces clean text and a growing URL frontier
-- Provides real-time observability via dashboard
-
-It forms a solid foundation for more advanced crawling systems while being runnable on a single laptop for learning purposes.
-
----
-
-## 23. Implementation Notes
-
-This section documents the rationale behind key implementation decisions made during the v1 development phase. These patterns solve common distributed systems challenges and provide a foundation for production deployment.
-
-### 23.1 Rate Limiting Protects Crawl Targets and Prevents Abuse
-
-**The Problem:**
-Web crawlers can inadvertently become a denial-of-service attack. Without rate limiting:
-1. A runaway crawler can overwhelm target websites
-2. Multiple workers hitting the same domain saturate its resources
-3. Seed URL injection could flood the frontier with millions of URLs
-4. API abuse could degrade dashboard performance for legitimate users
-
-**Our Solution:**
-We implement rate limiting at multiple levels:
-
-| Level | Mechanism | Purpose |
-|-------|-----------|---------|
-| Per-domain crawling | Redis SET NX EX locks | Prevents hitting the same domain faster than allowed |
-| API by user tier | Redis sliding window | 10/100/500 req/min for anonymous/user/admin |
-| Seed injection | Separate low limit | 10 req/min prevents frontier flooding |
-
-**Why Redis Sliding Window:**
-The sliding window algorithm provides smoother rate limiting than fixed windows:
-- No "burst at window edge" problem where users get 2x quota at window boundaries
-- More accurate count of recent requests
-- Automatically cleans up old entries via sorted set scores
-
-**Code location:** `src/middleware/rateLimit.ts`
-
-### 23.2 Circuit Breakers Prevent Cascade Failures
-
-**The Problem:**
-When a target website becomes unresponsive or returns errors:
-1. Workers waste time waiting for timeouts (30 seconds per request)
-2. The frontier fills with URLs from the failing domain
-3. Other healthy domains get starved of crawler capacity
-4. Retries compound the load on the struggling server
-
-**Our Solution:**
-Domain-level circuit breakers using the cockatiel library:
+### Local Setup Diagram
 
 ```
-CLOSED ──(5 failures)──► OPEN ──(60s timeout)──► HALF-OPEN
-   ▲                                                    │
-   └────────────(2 successes)───────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    localhost (or Docker Compose)                   │
+│                                                                   │
+│  ┌──────────────┐    HTTP     ┌──────────────────────────────┐   │
+│  │   Frontend   │ ──────────▶ │      API Server (Express)    │   │
+│  │  React + Vite│             │        Port 3001             │   │
+│  │  Port 5173   │             │                              │   │
+│  │              │             │  - /api/stats                │   │
+│  │  - Dashboard │             │  - /api/frontier/*           │   │
+│  │  - Frontier  │             │  - /api/pages                │   │
+│  │  - Pages     │             │  - /api/domains              │   │
+│  │  - Domains   │             │  - /health                   │   │
+│  │  - Admin     │             │  - /metrics                  │   │
+│  └──────────────┘             └──────────┬───────────────────┘   │
+│                                          │                        │
+│  ┌───────────────────────────────────────┤                        │
+│  │                                       │                        │
+│  │  ┌────────────┐ ┌────────────┐ ┌──────┴─────┐                 │
+│  │  │  Worker 1  │ │  Worker 2  │ │  Worker 3  │                 │
+│  │  │  (tsx)     │ │  (tsx)     │ │  (tsx)     │                 │
+│  │  │            │ │            │ │            │                 │
+│  │  │ Fetch ──▶  │ │ Fetch ──▶  │ │ Fetch ──▶  │                 │
+│  │  │ Parse ──▶  │ │ Parse ──▶  │ │ Parse ──▶  │                 │
+│  │  │ Extract    │ │ Extract    │ │ Extract    │                 │
+│  │  │ Ingest     │ │ Ingest     │ │ Ingest     │                 │
+│  │  └──────┬─────┘ └──────┬─────┘ └──────┬─────┘                 │
+│  │         └───────────────┼───────────────┘                      │
+│  │                         │                                      │
+│  │           ┌─────────────┴─────────────┐                        │
+│  │           │                           │                        │
+│  │    ┌──────▼──────┐            ┌───────▼──────┐                 │
+│  │    │  PostgreSQL │            │    Valkey    │                 │
+│  │    │  Port 5432  │            │  Port 6379   │                 │
+│  │    │             │            │              │                 │
+│  │    │  webcrawler │            │ - Visited    │                 │
+│  │    │  DB:        │            │   URLs SET   │                 │
+│  │    │  - url_     │            │ - Domain     │                 │
+│  │    │    frontier  │            │   locks      │                 │
+│  │    │  - crawled_  │            │ - Robots     │                 │
+│  │    │    pages     │            │   cache      │                 │
+│  │    │  - domains   │            │ - Circuit    │                 │
+│  │    │              │            │   breakers   │                 │
+│  │    └──────────────┘            │ - Sessions   │                 │
+│  │                                └──────────────┘                 │
+│  │                                                                │
+│  │  Docker Compose: webcrawler-postgres, webcrawler-redis,        │
+│  │    webcrawler-api, webcrawler-worker-{1,2,3}, webcrawler-frontend│
+│  └────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**States:**
-- **Closed:** Normal operation, requests pass through
-- **Open:** Requests fail immediately without network call
-- **Half-Open:** Allow test requests to check if domain recovered
+### Production-Grade Patterns Implemented
 
-**Why Per-Domain Isolation:**
-Each domain gets its own circuit breaker because:
-- example.com failing shouldn't affect crawling other-site.org
-- Different domains have different failure modes
-- Metrics can identify which domains are problematic
+| Pattern | Library | File Path | Why It Matters |
+|---------|---------|-----------|----------------|
+| Circuit breaker (per-domain) | Cockatiel | `backend/src/shared/resilience.ts` | Per-domain isolation prevents one failing site from affecting crawling of others; shared state via Redis for cross-worker awareness |
+| Retry with exponential backoff | Cockatiel | `backend/src/shared/resilience.ts` | Handles transient failures (ECONNRESET, 5xx) with jitter to prevent thundering herd |
+| Prometheus metrics | prom-client | `backend/src/shared/metrics.ts` | 15+ metrics: crawl throughput, latency, errors, frontier depth, circuit breaker state, cleanup activity |
+| Structured logging | Pino | `backend/src/shared/logger.ts` | JSON logs with component loggers (http, crawler, database, redis, circuit-breaker); worker ID context |
+| URL frontier | PostgreSQL + Redis | `backend/src/services/frontier.ts` | Priority-based scheduling with politeness; `FOR UPDATE SKIP LOCKED` for concurrent access |
+| robots.txt compliance | robots-parser | `backend/src/services/robots.ts` | Fetches, parses, and caches robots.txt; respects crawl-delay and disallow directives |
+| URL deduplication | Redis SET | `backend/src/services/crawler.ts` | O(1) membership check via SISMEMBER on SHA-256 hashes |
+| Per-domain rate limiting | Redis SET NX EX | `backend/src/services/crawler.ts` | Distributed lock with TTL matching domain crawl-delay |
+| Data cleanup | Custom cron jobs | `backend/src/services/cleanup.ts` | Removes completed frontier entries (7d), failed entries (30d), old page metadata (90d) |
+| Health checks | Custom | `backend/src/routes/` | `/health` checks PostgreSQL and Redis; Docker healthcheck integration |
+| Session auth + RBAC | express-session + Redis | `backend/src/middleware/` | Session-based auth with role-based access control for admin operations |
+| API rate limiting | express-rate-limit | `backend/src/middleware/` | Tiered rate limits for anonymous/user/admin |
+| Request security | Helmet + compression | `backend/src/server.ts` | Security headers and response compression |
 
-**Distributed Awareness:**
-Circuit state is stored in Redis so all workers share knowledge:
-- Worker A trips the circuit for domain X
-- Worker B immediately knows to skip domain X
-- Prevents all workers from wasting time on the same failing domain
+### Simplifications from Production Design
 
-**Code location:** `src/shared/resilience.ts`
+| Production Design | Local Substitute | Impact |
+|-------------------|------------------|--------|
+| 80-150 workers | 3 workers (Docker) or `dev:worker1`/`dev:worker2`/`dev:worker3` | Lower crawl rate; sufficient for learning |
+| Kafka for URL ingestion | Direct PostgreSQL INSERT from workers | No event replay; simpler but tighter coupling |
+| Redis Cluster for dedup at billion-scale | Single Valkey instance | Memory-limited; fine for 100K URLs |
+| Kubernetes HPA for workers | docker-compose restart: unless-stopped | No auto-scaling |
+| S3/MinIO for content storage | Metadata-only (no raw HTML stored) | Cannot re-process pages without re-crawling |
+| Multiple API server replicas | Single API server | No load balancing; single point of failure |
+| Partitioned frontier (by domain) | Single table with index | Contention at high concurrency |
+| Bloom filter for memory-efficient dedup | Exact dedup via Redis SET | Higher memory usage per URL |
 
-### 23.3 Structured Logging Enables Debugging Distributed Crawlers
+### What Was Omitted
 
-**The Problem:**
-In a distributed system with multiple workers:
-1. Logs from different workers interleave in unpredictable order
-2. Tracing a single URL's journey through the system is difficult
-3. Text-based logs are hard to search and aggregate
-4. Performance issues are hard to diagnose without context
-
-**Our Solution:**
-Structured JSON logging with pino:
-
-```json
-{
-  "level": "info",
-  "time": "2025-01-16T10:30:00.000Z",
-  "service": "web-crawler",
-  "component": "crawler",
-  "workerId": "worker-1",
-  "url": "https://example.com/page",
-  "domain": "example.com",
-  "statusCode": 200,
-  "contentLength": 15234,
-  "linksFound": 42,
-  "durationMs": 350,
-  "msg": "Crawl completed"
-}
-```
-
-**Why This Matters:**
-
-| Capability | Text Logs | Structured Logs |
-|------------|-----------|-----------------|
-| Filter by worker | grep "worker-1" | `jq 'select(.workerId == "worker-1")'` |
-| Calculate avg latency | Manual parsing | `jq '[.durationMs] | add / length'` |
-| Find all 5xx errors | Regex patterns | `jq 'select(.statusCode >= 500)'` |
-| Aggregate by domain | Very difficult | `jq 'group_by(.domain)'` |
-| Ingest into ELK/Loki | Custom parsers | Native JSON ingestion |
-
-**Child Loggers for Context:**
-Each crawl operation creates a child logger with URL context:
-```typescript
-const crawlLogger = this.logger.child({ url, domain, urlHash });
-crawlLogger.info('Starting crawl');  // All fields automatically included
-```
-
-**Code location:** `src/shared/logger.ts`
-
-### 23.4 Data Lifecycle Policies Prevent Unbounded Storage Growth
-
-**The Problem:**
-Web crawlers generate data continuously:
-- At 10 pages/second, that's 864,000 new rows per day
-- Each URL frontier entry is ~500 bytes; each crawled page is ~2KB
-- Without cleanup, storage grows ~2GB/day at modest scale
-- Query performance degrades as tables grow
-- Backup times increase with data volume
-
-**Our Solution:**
-TTL-based cleanup with configurable retention:
-
-| Data Type | Retention | Rationale |
-|-----------|-----------|-----------|
-| Completed URLs | 7 days | Job done, only keep for debugging |
-| Failed URLs | 30 days | Longer retention for failure analysis |
-| Crawled pages | 90 days | Historical data for re-crawl decisions |
-| Stats | 7 days | Roll up to daily aggregates then delete |
-| Redis keys | Auto-TTL | Session: 24h, Rate limits: 1min |
-
-**Batch Deletion:**
-Deletes are processed in batches of 1000 rows to:
-- Avoid long-running transactions that lock tables
-- Allow other queries to interleave
-- Prevent memory exhaustion from huge DELETE results
-
-**Scheduled Execution:**
-The cleanup service runs hourly by default:
-```typescript
-this.intervalId = setInterval(
-  () => this.runCleanup(),
-  60 * 60 * 1000  // 1 hour
-);
-```
-
-**Manual Trigger:**
-Admins can trigger cleanup via API:
-```bash
-curl -X POST http://localhost:3001/api/admin/cleanup \
-  -H "Cookie: crawler.sid=..."
-```
-
-**Storage Monitoring:**
-The `/api/admin/storage` endpoint provides current table sizes:
-```json
-{
-  "urlFrontier": { "pending": 1234, "inProgress": 10, "completed": 50000 },
-  "crawledPages": 48000,
-  "domains": 150,
-  "stats": 1000,
-  "redisMemory": "25.5M"
-}
-```
-
-**Code location:** `src/services/cleanup.ts`
-
-### 23.5 Prometheus Metrics Enable Operational Visibility
-
-Metrics exposed at `/metrics` in Prometheus format:
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `crawler_pages_crawled_total` | Counter | Total pages by status |
-| `crawler_crawl_duration_seconds` | Histogram | Latency distribution |
-| `crawler_frontier_size` | Gauge | Queue depth by status |
-| `crawler_circuit_breaker_state` | Gauge | Per-domain circuit state |
-| `crawler_rate_limit_hits_total` | Counter | Rate limit rejections |
-| `crawler_errors_total` | Counter | Errors by type |
-
-**Grafana Dashboard Queries (examples):**
-```promql
-# Crawl rate over time
-rate(crawler_pages_crawled_total{status="success"}[5m])
-
-# 95th percentile latency
-histogram_quantile(0.95, rate(crawler_crawl_duration_seconds_bucket[5m]))
-
-# Queue depth
-crawler_frontier_size{status="pending"}
-
-# Error rate
-rate(crawler_errors_total[5m]) / rate(crawler_pages_crawled_total[5m])
-```
-
-**Code location:** `src/shared/metrics.ts`
-
-### 23.6 Session-Based Authentication and RBAC
-
-**Authentication Flow:**
-```
-POST /api/auth/login { username, password }
-  ↓
-Validate credentials (pbkdf2)
-  ↓
-Create session in Redis: crawler:session:{id}
-  ↓
-Set cookie: crawler.sid (httpOnly, secure, sameSite)
-```
-
-**RBAC Boundaries:**
-
-| Role | Permissions | Endpoints |
-|------|-------------|-----------|
-| anonymous | Read public stats | `GET /health`, `GET /api/stats` |
-| user | View all data | `GET /api/*` |
-| admin | Full access | `POST/DELETE /api/admin/*` |
-
-**Admin-Only Operations:**
-- Inject seed URLs
-- Clear frontier
-- Purge crawled pages
-- Reset blocked domains
-- Trigger manual cleanup
-
-**Code location:** `src/middleware/auth.ts`
-
----
-
-## 24. Module Index
-
-Quick reference for new code modules added in v1:
-
-| Module | Path | Purpose |
-|--------|------|---------|
-| Logger | `src/shared/logger.ts` | Structured JSON logging with pino |
-| Metrics | `src/shared/metrics.ts` | Prometheus metrics definitions |
-| Resilience | `src/shared/resilience.ts` | Circuit breaker and retry logic |
-| Auth | `src/middleware/auth.ts` | Session auth and RBAC |
-| Rate Limit | `src/middleware/rateLimit.ts` | Redis sliding window rate limiting |
-| Cleanup | `src/services/cleanup.ts` | TTL-based data lifecycle management |
-
-All modules follow the singleton pattern where appropriate and export typed interfaces for use across the codebase.
+- JavaScript rendering for SPA content (Puppeteer integration)
+- Full-text search indexing (Elasticsearch)
+- PageRank or link-based authority scoring
+- Content storage in object storage (S3/MinIO)
+- Near-duplicate content detection (SimHash)
+- CDN for dashboard static assets
+- Multi-region deployment
+- Kubernetes orchestration and auto-scaling
+- Grafana dashboards (metrics exposed at `/metrics` but no visualization)
+- Distributed tracing (OpenTelemetry)
+- Webhook notifications for crawl completion
+- Sitemap.xml parsing for URL discovery
