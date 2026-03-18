@@ -414,6 +414,112 @@ This project is a **frontend-only implementation** demonstrating gallery layout 
 - Image metadata display (EXIF, author)
 - Mobile gesture support (swipe, pinch-to-zoom)
 
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (root layout)
+└── index.tsx (Home - single-page application)
+    ├── GalleryTabs (tab bar: Slideshow / Masonry / Tiles)
+    ├── Slideshow (full-width image display)
+    │   └── (main image, navigation arrows, thumbnail strip, play/pause, auto-advance)
+    ├── MasonryGrid (CSS columns layout)
+    │   └── (variable-height images in column-first order, click to open lightbox)
+    ├── TilesGrid (CSS Grid uniform squares)
+    │   └── (square-cropped images with hover scale, click to open lightbox)
+    ├── Lightbox (full-screen overlay)
+    │   └── (large image, left/right arrows, close button, keyboard navigation)
+    └── icons/ (SVG icon components: arrows, play/pause, grid icons)
+```
+
+This is a frontend-only project with no backend. All components are in `components/gallery/` with a flat, gallery-focused organization.
+
+### Zustand Store
+
+**`useGalleryStore`** (`stores/galleryStore.ts`) -- Single store managing all UI state:
+
+- **`activeTab`**: Which layout view is displayed (`'Slideshow' | 'Masonry' | 'Tiles'`). Defaults to `'Tiles'`. Switching tabs is instant (no data fetch, no animation delay).
+- **`lightboxImage`**: The image ID currently displayed in the lightbox overlay, or `null` when closed. Set by clicking any image in Masonry or Tiles views.
+- **`slideshowIndex`**: Current position in the slideshow (0-based index into the image array). Used by the Slideshow component for navigation and auto-play.
+- **`totalImages`**: Fixed at 50 (hardcoded list of picsum.photos IDs 10-59). Used by `nextSlide()` and `prevSlide()` for wraparound arithmetic.
+- **Actions**:
+  - `setActiveTab(tab)` -- switch layout view
+  - `openLightbox(imageId)` / `closeLightbox()` -- control lightbox visibility
+  - `setSlideshowIndex(index)` / `nextSlide()` / `prevSlide()` -- slideshow navigation with modular wraparound (index wraps from 49 back to 0 and vice versa)
+
+### Routing
+
+TanStack Router with file-based routing. This project uses a single route:
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/` | `routes/index.tsx` | Gallery with tab switching between Slideshow, Masonry, and Tiles |
+
+The root layout (`__root.tsx`) provides the page shell. All view switching happens via Zustand state (`activeTab`), not via routing, enabling instant transitions without URL changes.
+
+### Data Fetching
+
+**There is no data fetching.** This project loads images directly from `picsum.photos` using `<img>` tags with constructed URLs. The `utils/picsum.ts` helper generates URLs in the format `https://picsum.photos/id/{id}/{width}/{height}` for each image at the appropriate size for the current layout context.
+
+Images are loaded by the browser's native image loading mechanism. The Masonry and Tiles views use `loading="lazy"` for deferred loading of off-screen images. The Slideshow preloads adjacent images by rendering them in the DOM (hidden) so transitions are instant.
+
+### Key UI Patterns
+
+- **CSS-native layouts with zero JavaScript computation**: Masonry uses CSS `columns` with `break-inside: avoid`. Tiles uses CSS Grid with `repeat(auto-fill, minmax(200px, 1fr))` and `aspect-ratio: 1`. No layout libraries, no position calculations, no resize observers.
+- **Keyboard-accessible lightbox**: The Lightbox component listens for `ArrowLeft`, `ArrowRight`, and `Escape` keydown events on the document. This enables navigation without mouse interaction, meeting basic accessibility requirements.
+- **Auto-play slideshow**: The Slideshow component uses `setInterval` with a configurable delay (default 3 seconds) to auto-advance. The play/pause button toggles the interval. Navigation arrows and thumbnail clicks override auto-play position.
+- **Responsive column count**: The Masonry grid and Tiles grid automatically adjust column count based on viewport width using CSS breakpoints and `auto-fill`, requiring no JavaScript media query handling.
+- **Hardcoded image list**: Image IDs 10-59 are hardcoded to avoid broken/missing picsum.photos IDs. This provides a consistent, predictable experience without error handling for 404 images.
+
+---
+
+## Deep Pattern Explanations
+
+This project is a frontend-only implementation and does not include backend infrastructure patterns like Redis caching, circuit breakers, or Prometheus metrics. The patterns below are the ones relevant to this project's scope. Backend patterns are described at the production-scale level in the architecture sections above and would apply if this project were extended with a backend.
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether an application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing traffic and restarting failed instances.
+
+**How it works**: A health check endpoint (typically `GET /health`) performs a quick diagnostic of the system's ability to serve requests. A **liveness check** simply confirms the process is running (return 200 if the server can respond to HTTP). A **readiness check** verifies that critical dependencies are available (database responds to a ping, Redis returns PONG, the search index is reachable). If any dependency is down, the readiness check returns 503, and the load balancer stops sending traffic to that instance until it recovers.
+
+**Why it matters at production scale**: For a production image gallery serving billions of views, health checks would verify that the object storage (S3) is reachable, the image processing pipeline is running, and the database for metadata is healthy. Without health checks, a server whose S3 connection is broken would serve 500 errors for every image request while the load balancer continues routing traffic to it. Health checks enable self-healing: the load balancer removes broken instances, and the orchestrator restarts them.
+
+**Not applicable locally**: This frontend-only project has no backend server, so there are no health check endpoints to implement.
+
+### Structured Logging
+
+**What it is**: Structured logging produces log entries as machine-parseable JSON objects rather than human-readable text strings. Each log entry is a flat or nested JSON object with consistent field names (level, timestamp, message, request ID, duration, status code), enabling automated parsing, filtering, indexing, and alerting by log aggregation systems like Elasticsearch, Datadog, or CloudWatch.
+
+**How it works**: Instead of writing `console.log('Image upload completed in 250ms for user abc')`, structured logging produces `{"level":"info","event":"upload_complete","userId":"abc","durationMs":250,"imageId":"img-123","format":"webp"}`. The logging library (typically Pino for Node.js) handles serialization, timestamp formatting, and log level filtering. In development, a pretty-printer makes logs human-readable. In production, raw JSON is emitted for machine consumption.
+
+**Why it matters at production scale**: A production gallery processing 50M uploads per day generates enormous log volume. When a user reports that their upload failed, operators need to find the relevant log entry among billions. Structured logs enable queries like "show all upload failures for user X in the EU region in the last hour" in seconds. Request IDs (correlation IDs) link related log entries across the upload service, processing pipeline, and storage service, enabling end-to-end tracing of a single upload through the entire system.
+
+**Not applicable locally**: This frontend-only project uses `console.log` for development debugging. A production backend would use Pino for structured JSON logging.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. Applications expose a `/metrics` HTTP endpoint that Prometheus scrapes periodically. Four metric types are available: Counter (monotonically increasing, e.g., total requests), Gauge (can go up or down, e.g., active connections), Histogram (distribution of values in buckets, e.g., request latency), and Summary (pre-computed quantiles).
+
+**How it works**: At application startup, metric objects are created (e.g., a Histogram named `image_processing_duration_seconds`). During request processing, observations are recorded: `histogram.observe(0.25)` records a 250ms processing time. Prometheus scrapes the `/metrics` endpoint every 15-30 seconds and stores the time-series data. Grafana dashboards visualize trends, and alerting rules trigger notifications when metrics cross thresholds (e.g., CDN cache hit rate drops below 95%).
+
+**Why it matters at production scale**: For a production gallery, the critical metrics would be upload latency, processing pipeline throughput (images per second), CDN cache hit ratio, storage utilization, and error rates. If the processing pipeline throughput drops, the queue of unprocessed uploads grows, and users see "processing" states for minutes instead of seconds. Metrics detect this degradation long before users report it.
+
+**Not applicable locally**: This frontend-only project does not expose metrics. A production backend would use `prom-client` for request latency, image processing duration, storage utilization, and CDN hit rate metrics.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects services from abuse (intentional or accidental) by rejecting excess requests with HTTP 429 (Too Many Requests) responses before they consume server resources.
+
+**How it works**: The server maintains a counter for each client (identified by IP address, API key, or user ID). When a request arrives, the counter is checked against the configured limit. If below the limit, the request proceeds. If above, the request is rejected with a 429 response and a `Retry-After` header indicating when the client can retry. Common algorithms include fixed window (reset counter every N seconds), sliding window (rolling counter), and token bucket (constant refill rate with burst allowance).
+
+**Why it matters at production scale**: For a production gallery, rate limiting would protect the upload endpoint (preventing a single user from consuming all processing capacity), the search endpoint (preventing scraping of the entire image catalog), and the download endpoint (preventing bandwidth abuse). Without rate limiting on uploads, a single user could upload thousands of images per minute, filling the processing pipeline queue and delaying uploads for all other users.
+
+**Not applicable locally**: This frontend-only project makes no API requests. A production backend would apply rate limiting to upload, search, and API endpoints.
+
 ### Running Locally
 
 ```bash

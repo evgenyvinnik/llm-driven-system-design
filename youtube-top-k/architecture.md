@@ -594,3 +594,107 @@ This section maps the production architecture above to the actual local implemen
 - **Anomaly detection**: No spike detection or view fraud algorithms
 - **A/B testing**: Single algorithm, no experimentation framework
 - **Load testing**: No formal performance benchmarking suite
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (layout shell)
+└── index.tsx (Home Page - single-page application)
+    ├── Header (app title, SSE connection indicator, last update time)
+    ├── CategoryFilter (horizontal tab bar for category selection)
+    ├── TrendingList (ranked list of trending videos)
+    │   └── VideoCard (individual video with rank, title, view count, category badge)
+    └── StatsPanel (cache hit rate, update count, SSE connection status)
+```
+
+### Zustand Store
+
+**`useTrendingStore`** (`stores/trendingStore.ts`) -- Manages all trending dashboard state:
+
+- **`trending`**: A `Record<string, { videos: Video[] }>` keyed by category name. Updated atomically when an SSE message arrives, ensuring all categories refresh simultaneously.
+- **`stats`**: Cache hit rate, total updates, and trending computation metrics from the `/api/trending/stats` endpoint.
+- **`selectedCategory`**: Currently active category filter (defaults to `'all'`). Changing this re-derives the displayed video list without a network request.
+- **`isConnected`**: Whether the SSE connection is active. Displayed in the Header as a live/disconnected indicator.
+- **`lastUpdate`**: Timestamp of the most recent trending update, shown in the UI to indicate data freshness.
+- **`getSelectedVideos()`**: Derived getter that returns the video array for the currently selected category. Avoids redundant state by computing from `trending` and `selectedCategory`.
+
+### Routing
+
+TanStack Router with file-based routing. This project uses a single route:
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/` | `routes/index.tsx` | Full dashboard with trending list, category filter, and stats |
+
+The root layout (`__root.tsx`) provides the page shell. There is no admin route -- all functionality is on one page since the system is a real-time analytics dashboard.
+
+### Data Fetching
+
+Data arrives through two channels:
+
+1. **SSE (Server-Sent Events)** via the `useSSE` hook (`hooks/useSSE.ts`) -- The primary data source. On mount, the hook opens an `EventSource` connection to `/api/sse/trending`. When the backend computes new trending rankings (every 5 seconds), it pushes a `trending-update` event containing all categories' top-k videos. The hook parses the JSON payload and calls `setTrending()` on the store. On connection error, the hook closes the connection and retries after 5 seconds, providing automatic resilience to transient network issues.
+
+2. **REST API** via `services/api.ts` -- Used for initial data load and stats polling. The API service provides functions for fetching trending data (`/api/trending`), video details (`/api/videos`), and statistics (`/api/trending/stats`). This is the fallback when SSE is not connected.
+
+**No client-side caching layer** is needed because the SSE connection pushes fresh data every 5 seconds. The Zustand store itself acts as the cache -- components read from the store, and the store is updated by SSE events.
+
+### Key UI Patterns
+
+- **Real-time updates without polling**: The SSE connection replaces the traditional fetch-on-interval pattern. The UI updates reactively when the store changes, with no manual refresh needed
+- **Category filtering without network requests**: All category data arrives in each SSE update. Switching categories is an instant local state change (updating `selectedCategory`), not a new API call
+- **Connection status indicator**: The Header displays whether the SSE connection is active, giving users confidence that the data is live. The `isConnected` state toggles on SSE open/error events
+- **Automatic reconnection**: The `useSSE` hook implements reconnection with a 5-second delay on error, matching the browser's native `EventSource` retry behavior but with explicit control
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
+
+### Prometheus Metrics (prom-client)
+
+**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. The application exposes a `/metrics` HTTP endpoint that Prometheus periodically scrapes (typically every 15-30 seconds). The `prom-client` library provides four metric types: Counter (only goes up), Gauge (goes up and down), Histogram (distribution of values in configurable buckets), and Summary (similar to histogram with quantile calculation).
+
+**How it works**: The application creates metric objects at startup (e.g., a Histogram for view recording latency, a Counter for heap operations, a Gauge for SSE client count). During operation, the application records observations: `viewRecordingDuration.observe(0.012)` records a 12ms view ingestion, `heapOperations.inc({operation: "push"})` counts a heap insertion. Prometheus scrapes the `/metrics` endpoint and stores the time-series data. Grafana dashboards visualize trends, and alerting rules trigger notifications when metrics cross thresholds (e.g., view recording P95 exceeds 50ms).
+
+**Why it matters**: Logs tell you what happened to individual requests; metrics tell you what is happening to the system as a whole. In this project, metrics are critical for understanding whether the trending algorithm is keeping up with view ingestion. If the `youtube_topk_heap_operation_duration_seconds` histogram shows increasing latency, it signals that the number of active videos is approaching the threshold where you should switch from MinHeap to SpaceSaving. The `youtube_topk_cache_hit_rate` gauge tells you whether the 5-second in-memory trending cache is effective. Without metrics, you would not know the system was degrading until users reported stale trending data.
+
+**When to use it**: In any production system. Metrics are the foundation of observability and are required for SLO-based operations. Even in development, metrics help identify performance bottlenecks and validate that optimizations (like switching top-k algorithms) actually improve performance.
+
+### Structured Logging (Pino)
+
+**What it is**: Structured logging produces log entries as machine-parseable JSON objects rather than human-readable text strings. Each log entry is a flat or nested JSON object with consistent field names, enabling automated parsing, filtering, indexing, and alerting by log aggregation systems.
+
+**How it works**: Instead of writing `console.log('View recorded for video abc in 12ms')`, structured logging produces `{"level":"info","method":"POST","path":"/api/videos/abc/view","statusCode":200,"durationMs":12,"requestId":"req-123"}`. Every log entry includes a severity level, a timestamp, and contextual fields. The `pino-http` middleware automatically logs every HTTP request with method, path, status code, response time, and request ID. Developers add domain-specific fields (like `videoId`, `category`, `viewCount`) when logging business events.
+
+**Why it matters**: In production, an application might produce millions of log lines per hour. Text-based logs require regular expressions to extract useful information, which is fragile and slow. JSON logs can be directly indexed by systems like Elasticsearch, Datadog, or CloudWatch, enabling queries like "show me all view recording requests that took longer than 50ms for the gaming category" in seconds. Request IDs link related log entries across services, enabling end-to-end request tracing across API servers, trending workers, and SSE connections.
+
+**When to use it**: Always in production environments. Text-based "pretty" logging is appropriate only during local development (Pino supports both modes). Structured logging is especially critical when running multiple API server instances, as it enables correlating logs across instances using request IDs.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. In the context of APIs, an idempotent operation can be safely retried without causing duplicate side effects (double counting views, duplicate records).
+
+**How it works**: For view recording, the system generates an idempotency key from the request context: `{videoId}:{sessionId}:{timeBucket}`. The `timeBucket` is a 10-second window (e.g., the current timestamp rounded down to the nearest 10 seconds). The server performs a Redis `SETNX` (Set if Not eXists) with this key and a 1-hour TTL. If the key already exists, the view is considered a duplicate and is skipped. If the key does not exist, it is created and the view is processed. The 10-second bucketing allows for clock drift between client and server while still preventing abuse -- the same user cannot artificially inflate a video's view count by refreshing the page repeatedly.
+
+**Why it matters**: Without idempotency, network retries, double-clicks, and client bugs would inflate view counts. A video could accumulate 2-3x its real views, corrupting trending rankings. If a video with 100 real views is counted as 200 due to duplicates, it would incorrectly outrank a video with 150 real views. The `youtube_topk_duplicate_views_total` metric tracks prevented duplicates -- a high rate may indicate client bugs or coordinated view manipulation.
+
+**When to use it**: For any operation that has side effects that should not be repeated. View counting, payment processing, message sending, and similar operations all need idempotency. Read-only operations (GET requests) are naturally idempotent. Operations that are inherently idempotent by their data model (like UPSERT with absolute values rather than increments) may not need explicit keys.
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing traffic and restarting failed instances.
+
+**How it works**: This project implements four levels of health checks:
+- **`/health`** (simple): Returns 200 if the process is running. Used as a basic liveness signal.
+- **`/health/ready`** (readiness): Returns 200 only if PostgreSQL responds to queries, Redis responds to PING, and the TrendingService background loop is running. If any dependency fails, the endpoint returns 503 with details about which dependency is unhealthy. Used by load balancers to remove unhealthy instances from rotation.
+- **`/health/live`** (liveness): Returns process metadata (uptime, PID, memory usage). Used by Kubernetes to decide whether to restart the container.
+- **`/health/detailed`** (diagnostic): Returns comprehensive status including all dependency checks, current metric values (Redis memory, PG connections, table row counts), alert threshold evaluations, and active alerts. Used by operators for debugging and capacity planning.
+
+**Why it matters**: Without health checks, a load balancer has no way to know if a server instance is healthy. It would continue sending traffic to a server whose Redis connection is broken, resulting in failed view recordings and stale trending data. The TrendingService readiness check is particularly important: if the background trending loop stalls, the SSE clients stop receiving updates, but the API server itself is still "alive." The readiness check catches this by verifying that the trending service has started and is actively computing rankings.
+
+**When to use it**: Every production service needs at least liveness and readiness checks. The liveness check should be trivially simple (return 200). The readiness check should verify that all critical dependencies are reachable. The detailed check is optional but extremely valuable for debugging production issues without SSH access.

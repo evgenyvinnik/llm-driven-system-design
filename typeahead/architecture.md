@@ -576,3 +576,161 @@ This section maps the production architecture above to the actual local implemen
 - **WebSocket streaming**: REST-based suggestion API with polling
 - **Geographic/language-specific suggestions**: Single language, no geo-targeting
 - **Audit log persistence**: Audit events logged to stdout via Pino, not persisted to database
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (layout shell with header + navigation)
+├── index.tsx (HomePage)
+│   ├── SearchBox (core typeahead input with suggestion dropdown)
+│   ├── TrendingList (live trending queries sidebar)
+│   ├── SearchSettings (fuzzy toggle, max suggestions slider)
+│   └── FeatureCard / Step (static informational cards)
+├── admin.tsx (Admin Dashboard)
+│   ├── OverviewTab (system stats: trie size, cache hit rate, uptime)
+│   │   ├── StatCard (individual metric display)
+│   │   └── StatusCard (service health indicator)
+│   ├── AnalyticsTab (hourly query volume, top phrases)
+│   ├── ManagementTab (add phrases, manage blocklist, rebuild trie)
+│   ├── TabButton (tab navigation within admin)
+│   ├── ErrorState / LoadingState (shared status components)
+│   └── icons/ (CheckCircleIcon, DatabaseIcon, ServerIcon)
+└── widgets/ (5 typeahead variant demos)
+    ├── CommandPalette (macOS Spotlight-style overlay)
+    ├── RichTypeahead (enhanced with icons and metadata)
+    ├── MobileTypeahead (touch-optimized full-screen)
+    ├── InlineFormTypeahead (embedded in a form field)
+    └── (Standard SearchBox on home page)
+```
+
+### Zustand Stores
+
+**`useSearchStore`** (`stores/search-store.ts`) -- Single store managing all search-related state:
+
+- **User identity**: `userId` (persisted in localStorage) and `sessionId` (persisted in sessionStorage) for personalization and analytics tracking
+- **Search state**: `query`, `suggestions[]`, `isLoading`, `error`, `responseTime` -- the core suggestion lifecycle
+- **History**: `recentSearches[]` persisted in localStorage, capped at 10 entries
+- **Settings**: `fuzzyEnabled` toggle and `maxSuggestions` count, controlling API request parameters
+- **Actions**: `search(prefix)` fetches from API, `selectSuggestion(phrase)` logs to backend and updates history, `clearSuggestions()` resets dropdown
+
+### Routing
+
+TanStack Router with file-based routing:
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/` | `routes/index.tsx` | Home page with SearchBox, TrendingList, feature cards |
+| `/admin` | `routes/admin.tsx` | Admin dashboard with 3-tab interface (Overview, Analytics, Management) |
+
+The root layout (`__root.tsx`) provides a shared header with navigation links between user and admin views.
+
+### Data Fetching
+
+The data fetching layer implements a **three-tier caching strategy**:
+
+1. **Memory cache** (`services/cache.ts`) -- LRU cache with TTL (60s for suggestions, 30s for trending). Checks this first on every request. Max 1000 entries with automatic eviction of the oldest entry when full.
+2. **IndexedDB** (`db/database.ts`) -- Persistent browser storage for offline support. The `useTypeahead` hook checks IndexedDB when the memory cache misses, and updates it after every network response. Also stores search history and popularity counters.
+3. **Network** (`services/api.ts`) -- `ApiService` class with request cancellation (AbortController), timeout handling (5s default), and automatic cache population on response.
+
+**Request cancellation**: When the user types a new character, `cancelPendingRequests('suggestions:')` aborts any in-flight suggestion request before issuing a new one. This prevents stale results from overwriting fresher ones.
+
+**Prefetching** (`services/prefetch.ts`) -- Proactively loads suggestions for likely next queries during browser idle time:
+- `prefetchAdjacent()` uses a QWERTY keyboard adjacency map to predict typo corrections
+- `prefetchNextChars()` extends the current query with common English letters (e, t, a, o, i)
+- `warmCache()` preloads popular prefixes (how, what, why, best, top) on page load
+- All prefetching uses `requestIdleCallback` to avoid impacting user interactions
+
+**Performance tracking** (`services/performance.ts`) -- Measures client-side latency for each suggestion request, enabling end-to-end latency monitoring independent of server-side Prometheus metrics.
+
+### Key UI Patterns
+
+- **Debounced input**: The `useTypeahead` hook debounces API calls by 150ms, preventing a request on every keystroke while remaining responsive
+- **ARIA combobox**: Full ARIA implementation with `role="combobox"`, `aria-expanded`, `aria-activedescendant`, and `role="listbox"` for screen reader accessibility
+- **Keyboard navigation**: Arrow keys move through suggestions, Enter selects, Escape dismisses, Tab moves focus away
+- **5 widget variants**: Demonstrate how the same `useTypeahead` hook powers different UI paradigms (command palette, rich cards, mobile full-screen, inline form, standard dropdown)
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for reading from and writing to the cache. The cache does not communicate with the database directly -- the application sits between them and orchestrates data flow.
+
+**How it works**: When a request arrives, the application first checks Redis for the data. If the data is present and not expired (a "cache hit"), it is returned immediately without touching the database. If the data is absent or expired (a "cache miss"), the application queries the database, returns the result to the caller, and simultaneously writes the result to Redis with a time-to-live (TTL). The next request for the same data will find it in Redis.
+
+**Why it matters**: Database queries involve disk I/O, query parsing, and potentially complex joins. Redis stores data in memory, so reads complete in microseconds rather than milliseconds. For a typeahead system handling 100K+ queries per second, the difference between a 1ms Redis read and a 10ms PostgreSQL query means the difference between 10 servers and 100 servers. The 60-second TTL in this project balances freshness (trending topics appear within a minute) with cache efficiency (95%+ hit rate for popular prefixes).
+
+**When to use it**: Cache-aside is appropriate when reads vastly outnumber writes, when slightly stale data is acceptable, and when the cache is not the system of record. It is not appropriate when every read must reflect the absolute latest write (use write-through caching instead) or when the dataset is small enough to fit entirely in memory (use an in-process cache instead).
+
+### Circuit Breaker (Opossum)
+
+**What it is**: A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing service. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the operation. After a timeout period, the circuit enters a "half-open" state where a limited number of test requests are allowed through to check if the downstream service has recovered.
+
+**How it works**: The circuit breaker tracks the success and failure rate of calls to a protected resource. In this project, it wraps Redis and trie shard connections with three states:
+- **Closed** (normal): All requests pass through. If 5 consecutive failures occur, the circuit opens.
+- **Open** (failing): All requests are immediately rejected with a fallback response (cached or empty results). No actual calls are made to the failing service. After 10-30 seconds, the circuit transitions to half-open.
+- **Half-open** (testing): Up to 3 test requests are allowed through. If they succeed, the circuit closes. If any fail, the circuit reopens.
+
+**Why it matters**: Without a circuit breaker, when a downstream service (like a trie shard or Redis) becomes slow or unavailable, every incoming request would wait for the full timeout duration before failing. This ties up server threads, causes request queues to build up, and eventually crashes the calling service -- a phenomenon called cascading failure. The circuit breaker stops this cascade by failing fast, returning a degraded response (like cached suggestions or an empty list) in milliseconds rather than waiting seconds for a timeout.
+
+**When to use it**: Use circuit breakers around any call to an external service that could fail or become slow: database connections, HTTP calls to other services, message queue operations. Do not use them for in-process function calls or operations that are expected to fail frequently (like user input validation).
+
+### Structured Logging (Pino)
+
+**What it is**: Structured logging produces log entries as machine-parseable JSON objects rather than human-readable text strings. Each log entry is a flat or nested JSON object with consistent field names, enabling automated parsing, filtering, indexing, and alerting by log aggregation systems.
+
+**How it works**: Instead of writing `console.log('Request to /suggestions took 12ms')`, structured logging produces `{"level":"info","type":"request","path":"/api/v1/suggestions","durationMs":12,"cacheHit":true,"requestId":"abc-123"}`. Every log entry includes a severity level, a timestamp, and contextual fields. The `pino-http` middleware automatically logs every HTTP request with method, path, status code, and duration. Developers add domain-specific fields (like `query`, `cacheHit`, `suggestionCount`) when logging business events.
+
+**Why it matters**: In production, an application might produce millions of log lines per hour. Text-based logs require regular expressions to extract useful information, which is fragile and slow. JSON logs can be directly indexed by systems like Elasticsearch, Datadog, or CloudWatch, enabling queries like "show me all requests where durationMs > 100 and cacheHit is false" in seconds. Request IDs (correlation IDs) link related log entries across services, enabling end-to-end request tracing. In this project, query strings are truncated in logs to protect user privacy while still enabling debugging.
+
+**When to use it**: Always in production environments. Text-based "pretty" logging is appropriate only during local development (Pino supports both via `pino-pretty` in dev mode). Structured logging is especially critical when running multiple service instances, as it enables correlating logs across instances using request IDs.
+
+### Prometheus Metrics (prom-client)
+
+**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. The application exposes a `/metrics` HTTP endpoint that Prometheus periodically scrapes (typically every 15-30 seconds). The `prom-client` library provides four metric types: Counter (only goes up), Gauge (goes up and down), Histogram (distribution of values in configurable buckets), and Summary (similar to histogram with quantile calculation).
+
+**How it works**: The application creates metric objects at startup (e.g., a Histogram for request latency, a Counter for total requests, a Gauge for cache hit rate). During request processing, the application records observations: `latencyHistogram.observe(0.012)` records a 12ms request, `requestCounter.inc({status: "200"})` counts a successful request. Prometheus scrapes the `/metrics` endpoint and stores the time-series data. Grafana dashboards visualize the data, and alerting rules trigger notifications when metrics cross thresholds.
+
+**Why it matters**: Logs tell you what happened to individual requests; metrics tell you what is happening to the system as a whole. A single slow request might not matter, but if the P99 latency crosses 50ms for 2 minutes, that is an SLO violation that needs investigation. Metrics enable capacity planning (how many QPS can we handle before latency degrades?), anomaly detection (why did cache hit rate drop from 95% to 60%?), and alerting (page the on-call engineer when error rate exceeds 1%). In this project, metrics track suggestion latency, cache hit rates, trie size, aggregation buffer depth, and filtered query counts.
+
+**When to use it**: In any production system. Metrics are the foundation of observability and are required for SLO-based operations. Even in development, metrics help identify performance bottlenecks and validate that optimizations work.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects the service from abuse (intentional or accidental) by rejecting excess requests with HTTP 429 (Too Many Requests) responses before they consume server resources.
+
+**How it works**: The server maintains a counter for each client (identified by IP address, API key, or user ID). When a request arrives, the counter is checked against the configured limit. If the count is below the limit, the request proceeds and the counter increments. If the count exceeds the limit, the request is immediately rejected with a 429 response and a `Retry-After` header indicating when the client can try again. The counter resets at the end of each time window. This project uses `express-rate-limit` with per-endpoint configuration: suggestion queries might allow 100 requests per minute, while admin operations allow only 10.
+
+**Why it matters**: Without rate limiting, a single misbehaving client (a buggy script, a crawler, or an attacker) can consume all server resources, causing the service to become unavailable for legitimate users. Rate limiting also prevents brute-force attacks on admin endpoints and reduces the impact of DDoS attacks. In a typeahead system, rate limiting is especially important because every keystroke could trigger a request -- a fast typist hitting 10 characters per second generates 10 requests per second per user.
+
+**When to use it**: On every externally-facing API. Apply stricter limits to expensive operations (search, write operations) and more generous limits to cheap operations (health checks). Rate limiting should be applied at the API gateway level in production and at the application level for defense in depth.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. In the context of APIs, an idempotent operation can be safely retried without causing duplicate side effects (double counting, duplicate records, or double charges).
+
+**How it works**: The client includes a unique idempotency key with each request (e.g., `userId_timestamp_randomSuffix`). The server checks whether it has already processed a request with that key. If yes, it returns the cached result from the first processing. If no, it processes the request, caches the result keyed by the idempotency key, and returns the result. The cached result has a TTL (5 minutes in this project) after which the key expires and the same operation could be processed again. This project uses a two-tier check: an in-memory Set for fast local deduplication, and Redis SETNX for distributed deduplication across multiple server instances.
+
+**Why it matters**: Network communication is unreliable. A client might send a request, the server processes it successfully, but the response is lost due to a network timeout. The client, not knowing if the request succeeded, retries. Without idempotency, the query log would count the same search twice, inflating metrics and corrupting trending rankings. At 200K queries per second, even a 0.1% retry rate means 200 duplicate operations per second. Trie updates in this project are also idempotent by design: they use absolute counts rather than deltas, so rebuilding from the same snapshot always produces the same trie.
+
+**When to use it**: For any operation that has side effects (writes data, sends messages, charges money). Read-only operations (GET requests) are naturally idempotent and do not need explicit idempotency keys. Operations that are inherently idempotent by their data model (like UPSERT or SET) may not need application-level idempotency keys.
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing traffic and restarting failed instances.
+
+**How it works**: This project implements three health check endpoints:
+- **`/health`** (liveness): Returns 200 if the process is alive. Used by Kubernetes to decide whether to restart the container. Should never check external dependencies -- if the process can respond to HTTP, it is alive.
+- **`/health/ready`** (readiness): Returns 200 only if the trie is loaded with at least one phrase, Redis responds to PING, and PostgreSQL responds to `SELECT 1`. Used by load balancers to decide whether to route traffic to this instance. A new instance that has not finished loading its trie reports "not ready" so it does not receive traffic before it can serve suggestions.
+- **`/health/circuits`**: Reports the state of each circuit breaker (closed, open, half-open). Used by operators to diagnose cascading failures.
+
+**Why it matters**: Without health checks, a load balancer has no way to know if a server instance is healthy. It would continue sending traffic to a server whose database connection is broken, resulting in every request failing with a 500 error. With readiness checks, the load balancer removes the unhealthy instance from rotation, and traffic flows only to healthy instances. Liveness checks enable automatic recovery: if a process enters a deadlocked state where it cannot serve requests but has not crashed, the liveness check will fail and the orchestrator will restart it.
+
+**When to use it**: Every production service needs at least liveness and readiness checks. The liveness check should be trivially simple (return 200). The readiness check should verify that all critical dependencies are reachable. Avoid making health checks too expensive (do not run a full database query; a simple connection test is sufficient).

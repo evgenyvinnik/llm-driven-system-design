@@ -513,3 +513,160 @@ At scale, a single API server cannot maintain pools to thousands of target datab
 - Edge Functions / serverless function management
 - Storage bucket management (Supabase Storage)
 - Database backup and restore
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (root layout)
+├── login.tsx (Login page)
+├── register.tsx (Register page)
+├── index.tsx (Project list - landing page after login)
+│   └── ProjectCard (project name, description, connection status)
+└── project.$projectId.tsx (Project layout with sidebar)
+    ├── ProjectSidebar (navigation: Tables, SQL, Auth, Settings)
+    ├── project.$projectId.tables.tsx (Table list)
+    │   ├── TableList (all tables with row counts)
+    │   ├── CreateTableModal (structured table creation form)
+    │   │   └── ColumnEditor (column name, type, nullable, default, PK toggle)
+    │   └── SchemaViewer (columns, types, PK/FK constraints display)
+    ├── project.$projectId.tables_.$tableName.tsx (Table data browser)
+    │   ├── TableBrowser (spreadsheet-like data grid)
+    │   │   └── DataRow (inline editing, row insert/delete)
+    │   └── Breadcrumb (project > tables > tableName navigation)
+    ├── project.$projectId.sql.tsx (SQL editor)
+    │   ├── SQLEditor (textarea with Ctrl+Enter execution)
+    │   ├── QueryResults (tabular result display)
+    │   └── SavedQueryList (sidebar with saved queries)
+    ├── project.$projectId.auth.tsx (Auth user management)
+    │   ├── AuthUserList (table of simulated auth users)
+    │   └── AuthUserForm (create/edit user with role, email, metadata)
+    ├── project.$projectId.settings.tsx (Project settings)
+    │   ├── ProjectSettings (connection config form: host, port, db, user, password)
+    │   └── ConnectionStatus (live connectivity indicator with test button)
+    └── (shared)
+        └── Breadcrumb (hierarchical navigation)
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`) -- Authentication state:
+
+- **`user`**: Current logged-in dashboard user (username, email, role) or null
+- **`loading`**: Whether an auth operation is in progress
+- **Actions**: `login(username, password)`, `register(username, email, password)`, `logout()`, `checkAuth()` for session validation on page load
+
+**`useProjectStore`** (`stores/projectStore.ts`) -- Central store managing all project-related state. This is the largest store in the project, covering six data domains:
+
+- **Projects**: `projects[]`, `currentProject`, `projectsLoading` -- CRUD for database projects
+- **Tables**: `tables[]`, `tablesLoading` -- Schema introspection results from the target database
+- **Table Data**: `tableData` (rows + pagination metadata), `tableDataLoading` -- Paginated row browsing with sort support
+- **SQL**: `queryResult`, `queryError`, `queryLoading`, `savedQueries[]` -- SQL execution state with saved query management
+- **Auth Users**: `authUsers[]`, `authUsersLoading` -- Simulated Supabase auth users
+- **Settings**: `settings`, `settingsLoading` -- Project connection configuration
+
+Each domain has its own set of actions (e.g., `loadTables(projectId)`, `createTable(...)`, `dropTable(...)`). Actions that modify data (insert, update, delete) automatically reload the affected domain to keep the UI in sync.
+
+### Routing
+
+TanStack Router with file-based routing using nested layouts:
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/login` | `routes/login.tsx` | Login form |
+| `/register` | `routes/register.tsx` | Registration form |
+| `/` | `routes/index.tsx` | Project list (requires auth) |
+| `/project/:projectId` | `routes/project.$projectId.tsx` | Project layout with sidebar |
+| `/project/:projectId/tables` | `routes/project.$projectId.tables.tsx` | Table list + schema viewer |
+| `/project/:projectId/tables/:tableName` | `routes/project.$projectId.tables_.$tableName.tsx` | Table data browser |
+| `/project/:projectId/sql` | `routes/project.$projectId.sql.tsx` | SQL editor |
+| `/project/:projectId/auth` | `routes/project.$projectId.auth.tsx` | Auth user management |
+| `/project/:projectId/settings` | `routes/project.$projectId.settings.tsx` | Connection settings |
+
+The `project.$projectId.tsx` route acts as a nested layout, rendering the `ProjectSidebar` alongside an `<Outlet>` for child routes. This ensures the sidebar is always visible within a project context.
+
+### Data Fetching
+
+All data fetching goes through a centralized API service (`services/api.ts`) organized by domain:
+
+- **`authApi`**: login, register, logout, session check
+- **`projectsApi`**: CRUD operations, connection testing, member management
+- **`tablesApi`**: schema introspection (list tables), DDL operations (create, alter, drop)
+- **`tableDataApi`**: row CRUD with pagination and sorting parameters
+- **`sqlApi`**: query execution, saved query management
+- **`authUsersApi`**: simulated auth user CRUD
+- **`settingsApi`**: project settings read/write
+
+Each API module uses `fetch()` with credentials included (for session cookies). Error responses are parsed from JSON and thrown as Error objects with the server's error message. There is no client-side caching -- every navigation or action triggers a fresh fetch, which is appropriate for a database management tool where data freshness is critical.
+
+### Key UI Patterns
+
+- **Dark theme**: Supabase-branded dark color scheme (#1C1C1C background, #3ECF8E primary green) applied globally via Tailwind, matching the real Supabase Studio aesthetic
+- **Nested route layout**: The project sidebar persists across table/SQL/auth/settings views, avoiding re-renders of the navigation when switching tabs
+- **Inline editing**: Table data rows support click-to-edit, with changes submitted as PUT requests and the row data refreshed after success
+- **Connection status indicators**: Each project card shows a live connectivity status. The `ConnectionStatus` component on the settings page provides a "Test Connection" button that hits the backend's test-connection endpoint
+- **SQL execution with keyboard shortcut**: The SQL editor supports Ctrl+Enter (Cmd+Enter on Mac) to execute the query, matching the convention established by database tools like pgAdmin and DataGrip
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
+
+### Circuit Breaker (Opossum)
+
+**What it is**: A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing service. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the operation. After a timeout period, the circuit enters a "half-open" state where a limited number of test requests are allowed through to check if the downstream service has recovered.
+
+**How it works**: In this project, the circuit breaker wraps all operations against target databases (schema introspection, query execution, DDL operations). The circuit monitors the error rate of these operations. When the error rate exceeds 50% (meaning half of recent operations failed), the circuit opens. While open, any attempt to query the target database immediately returns a clear error message ("target database unavailable") instead of waiting for a connection timeout. After 30 seconds, the circuit transitions to half-open, allowing a few test queries through. If these succeed, the circuit closes and normal operation resumes. If they fail, the circuit re-opens.
+
+**Why it matters**: Target databases are user-managed and can be unreachable for many reasons (wrong credentials, firewall changes, database restart, network issues). Without a circuit breaker, every request to a down target database would wait for the full connection timeout (typically 10-30 seconds) before failing. During this time, the Express server's thread is blocked, and with enough concurrent users hitting the same dead target database, all server threads get consumed, making the entire dashboard unresponsive for all users across all projects. The circuit breaker prevents this cascade: after detecting that a target database is down, it fails immediately (in milliseconds) for subsequent requests, keeping the server responsive for users working with other, healthy databases.
+
+**When to use it**: Use circuit breakers around any call to an external service that could fail or become slow: database connections, HTTP calls to other services, message queue operations. In this project, the circuit breaker is especially important because target databases are external systems outside the dashboard's control. Do not use circuit breakers for in-process function calls or operations that are expected to fail frequently (like user input validation).
+
+### Prometheus Metrics (prom-client)
+
+**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. The application exposes a `/metrics` HTTP endpoint that Prometheus periodically scrapes. The `prom-client` library provides four metric types: Counter (only goes up), Gauge (goes up and down), Histogram (distribution of values in configurable buckets), and Summary (similar to histogram with quantile calculation).
+
+**How it works**: The application creates metric objects at startup. During request processing, the application records observations. In this project, four custom metrics are tracked: `http_request_duration_seconds` (histogram of request latency by method, route, and status code), `http_requests_total` (counter of total requests), `query_execution_duration_seconds` (histogram of SQL query latency by project and query type), and `active_target_connections` (gauge of currently open connection pools). Prometheus scrapes the `/metrics` endpoint and stores the time-series data. Grafana dashboards visualize trends, and alerting rules trigger notifications when metrics cross thresholds.
+
+**Why it matters**: For a database management dashboard, query execution latency is the most critical metric. If `query_execution_duration_seconds` shows increasing latency for a specific project, it may indicate a slow target database, an expensive query pattern, or connection pool exhaustion. The `active_target_connections` gauge helps with capacity planning -- if the number of active pools approaches the server's maximum (200 in the production design), it is time to add more API server instances or implement more aggressive pool eviction. Without metrics, operators would not know the system was degrading until users reported slow query execution.
+
+**When to use it**: In any production system. Metrics are especially important for multi-tenant systems like this dashboard, where one user's expensive query could degrade the experience for others.
+
+### Structured Logging (Pino)
+
+**What it is**: Structured logging produces log entries as machine-parseable JSON objects rather than human-readable text strings. Each log entry is a flat or nested JSON object with consistent field names, enabling automated parsing, filtering, indexing, and alerting by log aggregation systems.
+
+**How it works**: Instead of writing `console.log('Query executed for project abc in 150ms')`, structured logging produces `{"level":"info","projectId":"abc","queryType":"SELECT","durationMs":150,"rowCount":42,"requestId":"req-789"}`. Every log entry includes a severity level, a timestamp, and contextual fields. In development mode, Pino's `pino-pretty` formatter produces human-readable colored output. In production mode, raw JSON is emitted for ingestion by log aggregation systems.
+
+**Why it matters**: When a user reports that their SQL query is running slowly, operators need to find the relevant log entries quickly. With structured logs, they can filter by `projectId` and `queryType` to see exactly which queries are slow, what the execution times are, and how many rows were returned. Project IDs in every log entry enable per-tenant debugging in a multi-tenant system. Error logs include connection details (host, port, database name -- but not passwords) to help diagnose connectivity issues.
+
+**When to use it**: Always in production environments. Structured logging is especially critical for multi-tenant systems where log entries must be attributable to specific users and projects.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects the service from abuse by rejecting excess requests with HTTP 429 (Too Many Requests) responses before they consume server resources.
+
+**How it works**: This project implements three rate limiting tiers using `express-rate-limit`:
+- **API-wide**: 1000 requests per 15 minutes per IP address. Covers all endpoints.
+- **Auth endpoints**: 50 requests per 15 minutes per IP address. Stricter limit to prevent brute-force password guessing.
+- **SQL execution**: 100 queries per minute per user. Prevents a single user from overwhelming the target database connection pool.
+
+When a request arrives, the middleware checks a counter associated with the client's IP address (or user ID for authenticated endpoints). If the counter exceeds the configured limit, the request is immediately rejected with a 429 response and a `Retry-After` header.
+
+**Why it matters**: SQL execution is an expensive operation -- each query consumes a connection from the target database pool, CPU time for query processing, and network bandwidth for result transfer. Without rate limiting, a user could execute hundreds of queries per second (e.g., from a script or a runaway loop), exhausting the connection pool and making the target database unavailable for other users. The auth rate limit is equally important: without it, an attacker could attempt thousands of login attempts per minute to brute-force passwords.
+
+**When to use it**: On every externally-facing API. Apply stricter limits to expensive operations (SQL execution, authentication) and more generous limits to cheap operations (listing projects, health checks).
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators, and monitoring systems to make automated decisions about routing traffic and restarting failed instances.
+
+**How it works**: This project implements a single health check endpoint at `GET /api/health`. It tests connectivity to the metadata database by executing a simple query. If the database responds, it returns `{ status: 'ok' }` with HTTP 200. If the database is unreachable, it returns `{ status: 'unhealthy' }` with HTTP 503. The health check does not test target database connectivity because target databases are user-managed -- a down target database is not a system-level health issue.
+
+**Why it matters**: Without a health check, a load balancer has no way to distinguish between a healthy API server and one whose metadata database connection is broken. It would continue sending traffic to the broken server, resulting in every request failing with a 500 error. With health checks, the load balancer removes the unhealthy instance from rotation, directing all traffic to healthy instances until the broken one recovers.
+
+**When to use it**: Every production service needs at least a basic health check. For this project, checking only the metadata database is the correct scope -- the dashboard cannot function at all without its own database, but can function with some target databases being unreachable.

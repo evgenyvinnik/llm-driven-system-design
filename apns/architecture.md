@@ -702,3 +702,153 @@ At 200M concurrent connections, no single server can handle all devices. Connect
 - VoIP and complication push types
 - Silent push for background app refresh
 - Provider certificate management and rotation
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (root layout with navigation)
+├── login.tsx (admin login form)
+├── index.tsx (Dashboard - system overview)
+│   └── (stat cards: total devices, notifications sent, delivery rate, pending queue)
+├── devices.tsx (Device management)
+│   └── (device list with token hash, app bundle ID, validity status, topics, last seen)
+├── send.tsx (Send notification form)
+│   └── (target device selector, payload editor, priority picker, collapse ID, expiration)
+└── notifications.tsx (Notification history)
+    └── (notification list with status, priority, device, created time, payload preview)
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`) -- Admin authentication state with persistence:
+
+- **`user`**: Authenticated admin user (id, username, role) or null
+- **`token`**: Session token persisted in localStorage via Zustand's `persist` middleware (only the token is persisted, not the full user object)
+- **`isAuthenticated`**: Whether a valid session exists
+- **Actions**: `login(username, password)`, `logout()`, `checkAuth()` (validates stored token on page load)
+
+**`useDashboardStore`** (`stores/dashboardStore.ts`) -- Dashboard statistics state:
+
+- **`notifications`**: Aggregate counts by status (total, pending, queued, delivered, failed, expired)
+- **`devices`**: Aggregate counts by validity (total, valid, invalid)
+- **`topics[]`**: Per-topic subscriber counts
+- **`recentNotifications[]`**: Activity feed showing the latest notifications with status, payload, and timestamps
+- **Actions**: `fetchStats()` loads all dashboard data from `/api/v1/admin/stats` in a single request
+
+### Routing
+
+TanStack Router with file-based routing:
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/login` | `routes/login.tsx` | Admin login form |
+| `/` | `routes/index.tsx` | Dashboard with device and notification statistics |
+| `/devices` | `routes/devices.tsx` | Device token list with registration, invalidation, topic management |
+| `/send` | `routes/send.tsx` | Notification composer with priority, payload, collapse ID |
+| `/notifications` | `routes/notifications.tsx` | Notification history with status and delivery details |
+
+The root layout (`__root.tsx`) provides navigation links between Dashboard, Devices, Send, and Notifications pages. All routes except `/login` require authentication.
+
+### Data Fetching
+
+All data fetching goes through a centralized API service (`services/api.ts`) with an `adminApi` namespace:
+
+- **`adminApi.login(username, password)`** / **`adminApi.logout()`**: Session management
+- **`adminApi.getMe()`**: Session validation
+- **`adminApi.getStats()`**: Fetches aggregate dashboard statistics (devices, notifications, topics, recent activity) in a single request
+- **Device operations**: Register, list, invalidate, manage topic subscriptions
+- **Notification operations**: Send to device or topic, check delivery status, list history
+
+The API service reads the auth token from localStorage and includes it in request headers. Failed auth requests trigger automatic logout and redirect to the login page.
+
+### Key UI Patterns
+
+- **Admin-only interface**: This is a dashboard for system operators, not end users. All pages require authentication. The login page uses the `useAuthStore` to persist the session token
+- **Stat cards on dashboard**: The dashboard displays notification delivery statistics as color-coded cards (green for delivered, yellow for pending, red for failed), giving operators an at-a-glance system health view
+- **Notification composer**: The send page provides a form for constructing APNs payloads with JSON editing for the `aps` dictionary, priority selection (10/5/1), optional collapse ID, and expiration time
+- **Token persistence**: Using Zustand's `persist` middleware with `partialize` to store only the token (not the full user object), keeping localStorage minimal and avoiding stale user data
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for reading from and writing to the cache. The cache does not communicate with the database directly -- the application sits between them and orchestrates data flow.
+
+**How it works**: When a notification needs to be delivered, the system must look up the device token to verify it is valid and find the device's connection shard. The lookup path is:
+1. Check Redis for `token:{hash}` (1-hour TTL). If found, use the cached device info.
+2. If not in Redis (cache miss), query PostgreSQL's `device_tokens` table. If found, write the result to Redis and return it.
+3. If the token is not in PostgreSQL either, cache a negative result (`token:{hash}:invalid`) with a 5-minute TTL to prevent repeated database queries for the same invalid token.
+
+On token invalidation, the cache entry is immediately deleted and a negative cache entry is created. This ensures that notifications to invalidated tokens fail fast rather than being delivered to an uninstalled app.
+
+**Why it matters**: At production scale, 50B daily notifications means 50B token lookups. Without caching, every notification delivery would require a PostgreSQL query. With 2B tokens in the database, each lookup would take 1-5ms even with an index. At 580K notifications per second, the database would need to handle 580K queries per second just for token lookups -- far beyond a single PostgreSQL instance's capacity. Redis serves cached lookups in ~0.1ms, reducing database load by 95%+. The negative caching is equally important: without it, every notification to an uninstalled app would hit the database, and providers who have not cleaned up their token lists could flood the database with failed lookups.
+
+**When to use it**: Cache-aside is appropriate when the cached data changes infrequently relative to how often it is read (tokens are registered once but looked up thousands of times), when a cache miss is tolerable (the database is the source of truth), and when the cache and database can be temporarily inconsistent (a 1-hour TTL means a newly invalidated token could still be considered valid for up to 1 hour in edge cases, but the immediate cache deletion on invalidation minimizes this window).
+
+### Circuit Breaker (Opossum)
+
+**What it is**: A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing service. When failures exceed a threshold, the circuit "opens" and calls fail immediately with a fallback response rather than waiting for timeouts.
+
+**How it works**: In this project, separate circuit breakers wrap Redis pub/sub calls and per-device WebSocket delivery:
+- **Redis circuit**: Monitors pub/sub operations for cross-server notification routing. Opens at 50% error rate, resets after 15-30 seconds. When open, notifications are stored in the pending queue for later delivery rather than attempting pub/sub distribution.
+- **Per-device circuit**: Each WebSocket connection has its own circuit state. If delivery to a specific device fails repeatedly (device disconnected but connection not yet cleaned up), the circuit opens and the notification is queued as pending.
+
+**Why it matters**: In a push notification system, cascading failures are especially dangerous. If Redis pub/sub becomes unavailable, every notification delivery attempt would block for the connection timeout. With hundreds of thousands of notifications per second, this would quickly exhaust the server's thread pool, causing the entire system to hang. The circuit breaker's fallback (store in pending queue for later delivery) ensures that notifications are not lost -- they are just delayed. This aligns with APNs' store-and-forward promise: the notification will be delivered when conditions improve.
+
+**When to use it**: Around any call to an external service that could fail. In notification systems, circuit breakers are critical because the service must remain operational even when some components are degraded. A notification system that crashes when Redis is temporarily unavailable fails its core promise of reliable delivery.
+
+### Prometheus Metrics (prom-client)
+
+**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. The application exposes a `/metrics` HTTP endpoint with metrics in Prometheus text format.
+
+**How it works**: This project tracks eight custom metrics:
+- **`apns_notifications_sent_total`** (Counter, labels: priority, status): Tracks throughput by delivery outcome. Enables calculating delivery success rate.
+- **`apns_notification_delivery_seconds`** (Histogram, labels: priority): Distribution of end-to-end delivery latency. The P99 for priority-10 notifications must stay below 500ms per the SLA.
+- **`apns_active_device_connections`** (Gauge): Current WebSocket connection count. Indicates system load and capacity.
+- **`apns_pending_notifications`** (Gauge): Pending queue depth. High values indicate offline devices or delivery bottlenecks.
+- **`apns_cache_operations_total`** (Counter, labels: operation): Cache hit/miss ratio for token lookups. Drives TTL tuning decisions.
+- **`apns_circuit_breaker_state`** (Gauge): Numeric encoding of circuit state (0=closed, 1=open, 2=half-open). Enables alerting when circuits open.
+- **`apns_dependency_health`** (Gauge): Database and Redis connectivity status. Binary health signal for monitoring dashboards.
+- **`apns_token_operations_total`** (Counter, labels: operation): Token lifecycle events (register, invalidate, lookup_hit, lookup_miss).
+
+**Why it matters**: A push notification system's primary SLI is delivery success rate. The combination of `apns_notifications_sent_total{status="delivered"}` and total notifications enables computing this rate. If it drops below 99%, the system is failing its core promise. The `apns_circuit_breaker_state` metric enables proactive alerting -- when a circuit opens, operators can investigate the failing dependency before it causes widespread delivery failures.
+
+**When to use it**: In any production system, but push notification services have particularly strong monitoring requirements because failures are invisible to the sender. A provider sending notifications does not know if they are being delivered unless the monitoring system reports it.
+
+### Structured Logging (Pino)
+
+**What it is**: Structured logging produces log entries as machine-parseable JSON objects with consistent field names. This project adds a separate audit log stream for security-relevant events.
+
+**How it works**: Every HTTP request is logged with method, path, status code, duration, and request ID via `pino-http`. Notification delivery events include priority, status, latency, and device ID. Token lifecycle events (registration, invalidation) are logged at the audit level with the admin user who performed the action. The audit log stream enables compliance with security review requirements and incident investigation.
+
+**Why it matters**: Push notification systems handle sensitive operations: registering tokens (which are bearer credentials), invalidating tokens (which affects users' ability to receive notifications), and delivering payloads (which may contain personal messages). Audit logging of these operations is essential for security incident investigation. If an unauthorized party gains access to the admin dashboard and invalidates thousands of tokens, the audit log provides the evidence needed to identify the attacker and assess the blast radius.
+
+**When to use it**: Always in production. Audit logging is especially important for systems that handle bearer credentials (tokens, API keys) or that can affect user-facing functionality (invalidating push tokens prevents users from receiving notifications).
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once.
+
+**How it works**: Providers supply an `apns-id` header (UUID) with each notification. The server checks Redis for `cache:idem:{apns-id}` using `SET NX EX 86400` (set if not exists, 24-hour expiry). If the key already exists, the notification is a duplicate and the original response is returned. If the key does not exist, the notification is processed normally and the result is cached. Token registration is also idempotent: re-registering with the same token hash updates `last_seen` and `device_info` via an `ON CONFLICT` upsert rather than creating a duplicate.
+
+**Why it matters**: Providers retry failed notification sends. Without idempotency, a retry would create a duplicate notification, and the user would receive the same message twice. For messaging apps, this is confusing. For e-commerce apps sending order confirmations, it could cause user panic ("was I charged twice?"). The 24-hour deduplication window covers the typical retry window for most provider implementations.
+
+**When to use it**: For any notification or message delivery system where duplicate delivery is worse than missed delivery. The idempotency key should be provider-controlled (not server-generated) so that the provider can retry with the same key.
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly.
+
+**How it works**: This project's health check tests both PostgreSQL and Redis connectivity, and updates Prometheus dependency gauges (`apns_dependency_health`) with the results. The gauge values (0 for down, 1 for up) enable Grafana alerts when dependencies become unavailable.
+
+**Why it matters**: For a push notification system, the health check must verify both the database (for token lookups and notification persistence) and Redis (for caching, connection state, and idempotency). A server that has lost its Redis connection can still serve some requests from the database, but its cache hit rate will drop to zero and its idempotency checks will fail, potentially causing duplicate deliveries. The health check integration with Prometheus metrics means that dependency failures are both detected by the load balancer (via HTTP status) and visible in dashboards (via gauge metrics).
+
+**When to use it**: Every production service needs health checks. For notification systems, the health check should verify all dependencies in the critical delivery path (database, cache, message queue) because degradation in any one of them affects the system's ability to deliver notifications reliably.

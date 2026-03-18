@@ -619,3 +619,140 @@ Aggregation uses `ON CONFLICT (user_id, type, period, period_start) DO UPDATE`, 
 - ML-based anomaly detection for health data
 - Family sharing with consent management
 - Healthcare provider portal
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+Root Layout (Navbar + main content area)
+├── Login (email/password login form)
+├── Register (registration form)
+├── Dashboard (/) (health overview)
+│   ├── MetricCard (individual metric: steps, heart rate, sleep, etc.)
+│   ├── HealthChart (Recharts line/bar chart for trend visualization)
+│   └── InsightCard (health insight with severity, recommendation, acknowledge button)
+├── Metrics (/metrics) (detailed metric history)
+│   └── HealthChart (per-metric time-series charts)
+├── Devices (/devices) (device management)
+│   └── (device list with sync status, priority, last sync time)
+└── Admin (/admin) (system administration)
+    └── (user list, sample counts, reaggregation controls)
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`) -- Authentication state with persistence:
+
+- **`user`**: Current user (email, name, role) or null
+- **`token`**: Session token persisted in localStorage
+- **`isAuthenticated`**: Derived from token presence and validation
+- **Persistence**: Uses Zustand's `persist` middleware to store the token in localStorage, surviving page refreshes. On app load, `checkAuth()` validates the stored token against the server.
+- **Actions**: `login(email, password)`, `register(email, password, name)`, `logout()`, `checkAuth()`
+
+**`useHealthStore`** (`stores/healthStore.ts`) -- Health data state:
+
+- **`dailySummary`**: Today's aggregated metrics (steps, heart rate, sleep, calories)
+- **`weeklySummary`**: 7-day rolling summary for trend cards
+- **`latestMetrics`**: Most recent value for each metric type
+- **`insights[]`**: Active health insights with severity (low/medium/high), direction (improving/declining), message, and recommendation
+- **`history`**: A `Record<string, HealthAggregate[]>` keyed by metric type, storing time-series data for charts. Each fetch appends to this record, so multiple metric histories can be loaded without overwriting each other.
+- **`devices[]`**: Registered devices with sync status and priority
+- **Actions**: `fetchDailySummary(date?)`, `fetchWeeklySummary()`, `fetchLatestMetrics()`, `fetchInsights()`, `fetchHistory(type, days)`, `fetchDevices()`, `analyzeHealth()` (triggers server-side insight generation), `acknowledgeInsight(id)` (optimistically updates local state)
+
+### Routing
+
+TanStack Router with programmatic route definition (not file-based):
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/` | `routes/Dashboard.tsx` | Health overview with metric cards, charts, and insights |
+| `/login` | `routes/Login.tsx` | Login form |
+| `/register` | `routes/Register.tsx` | Registration form |
+| `/metrics` | `routes/Metrics.tsx` | Detailed metric history with per-type charts |
+| `/devices` | `routes/Devices.tsx` | Device management (register, sync, configure priority) |
+| `/admin` | `routes/Admin.tsx` | System stats, user management, reaggregation triggers |
+
+Routes are defined programmatically in `routes/index.tsx` using `createRootRoute` and `createRoute` with lazy component loading via dynamic `import()`. The root layout renders a `Navbar` component that provides navigation links and authentication status.
+
+### Data Fetching
+
+All data fetching goes through a centralized API service (`services/api.ts`) organized by domain:
+
+- **`api.auth`**: login, register, logout, session validation
+- **`api.health`**: dailySummary, weeklySummary, latest metrics, insights, history, analyze, acknowledgeInsight
+- **`api.devices`**: list, register, update, delete, sync (batch health sample upload)
+- **`api.admin`**: system stats, user list, reaggregation trigger
+
+The API service includes the session token in request headers for authentication. Each store action calls the corresponding API method, updates local state on success, and sets error state on failure. There is no client-side caching layer -- health data should always reflect the latest sync.
+
+### Key UI Patterns
+
+- **Recharts for data visualization**: Line charts for time-series data (heart rate trends, step history), bar charts for daily aggregates. Recharts provides responsive, declarative React charting components
+- **Metric cards**: Each MetricCard displays a metric name, current value, unit, and optionally a trend indicator (arrow up/down with color coding)
+- **Insight cards with acknowledge**: InsightCards show severity-coded health recommendations. Acknowledging an insight optimistically removes it from the active list without waiting for the server response
+- **Lazy-loaded routes**: Route components use dynamic `import()` for code splitting, reducing the initial bundle size. The dashboard loads first; metrics, devices, and admin pages load on navigation
+- **Token persistence**: The auth store persists only the session token to localStorage (not the full user object), and re-validates it on page load via `checkAuth()`
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
+
+### Prometheus Metrics (prom-client)
+
+**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. The application exposes a `/metrics` HTTP endpoint that Prometheus periodically scrapes. The `prom-client` library provides four metric types: Counter (only goes up), Gauge (goes up and down), Histogram (distribution of values in configurable buckets), and Summary (similar to histogram with quantile calculation).
+
+**How it works**: The application creates metric objects at startup. During operation, the application records observations. In this project, key metrics include: `health_pipeline_http_request_duration_seconds` (histogram of request latency by route), `health_pipeline_samples_ingested_total` (counter of ingested samples by type -- steps, heart_rate, etc.), `health_pipeline_sync_duration_seconds` (histogram of device sync operation duration), and `health_pipeline_db_pool_size` (gauge of active database connections). Default Node.js metrics (CPU usage, memory, event loop lag, garbage collection) are also collected automatically.
+
+**Why it matters**: For a health data pipeline, the most critical metric is ingestion throughput (`samples_ingested_total`). If the ingestion rate drops suddenly, it could mean devices are failing to sync, the API is rejecting valid samples, or the database is overloaded. The sync duration histogram reveals whether batch inserts are becoming slower as the database grows. Without these metrics, operators would only discover ingestion problems when users report missing health data -- potentially hours after the issue began. For HIPAA compliance, monitoring and audit trails are not optional; they are required.
+
+**When to use it**: In any production system, but especially in systems handling sensitive data like health records, where compliance frameworks require monitoring and alerting capabilities.
+
+### Structured Logging (Pino)
+
+**What it is**: Structured logging produces log entries as machine-parseable JSON objects rather than human-readable text strings. Each log entry includes consistent field names, enabling automated parsing, filtering, indexing, and alerting.
+
+**How it works**: Pino produces JSON log entries with severity level, timestamp, and contextual fields. In this project, a critical feature is **field redaction**: authorization headers, passwords, and session tokens are automatically stripped from log output. This prevents sensitive credentials from appearing in log files, log aggregation systems, or debug outputs. The `pino-http` middleware logs every HTTP request with method, path, status code, and duration. Domain-specific events (device syncs, aggregation completions, insight generation) include user IDs and metric types but never raw health data values.
+
+**Why it matters**: Health data systems operate under strict privacy regulations (HIPAA in the US, GDPR in Europe). Logging a patient's heart rate or blood glucose value in a debug log could constitute a compliance violation. Pino's redaction feature ensures that even when verbose logging is enabled for debugging, sensitive fields are automatically stripped. Request IDs enable tracing a sync operation from device upload through deduplication, aggregation, and insight generation without exposing the health data itself.
+
+**When to use it**: Always in production environments, and especially in systems handling personally identifiable information (PII) or protected health information (PHI). The redaction feature should be configured at project setup, not added later as an afterthought.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. For health data sync, idempotency prevents duplicate samples from corrupting aggregated metrics.
+
+**How it works**: This project implements a two-layer idempotency system:
+1. **Request-level**: The client sends an `X-Idempotency-Key` header with each sync request. The server generates this key from `userId + deviceId + SHA256(samples)`, making it content-based. The server checks Redis for the key: if found, it returns the cached response from the first processing. If not found, it processes the sync, caches the response with a 24-hour TTL, and returns the result.
+2. **Record-level**: Each health sample has a UUID primary key. The database insert uses `ON CONFLICT (id) DO NOTHING`, so even if the same sample appears in two different sync batches, it is inserted only once.
+
+**Why it matters**: Mobile health apps sync over unreliable cellular networks. A device might upload 500 heart rate samples, the server processes them all, but the HTTP response is lost to a network timeout. The device retries the entire batch. Without idempotency, those 500 samples would be counted twice, making the user's daily average heart rate appear higher than it actually is. For health data, accuracy is not just a user experience issue -- incorrect aggregates could lead to false health alerts or missed warnings. The content-based key generation (SHA-256 of the samples) is particularly important: even if the client does not include an idempotency header, the server can detect duplicate batches by their content hash.
+
+**When to use it**: For any operation that has side effects, especially when clients operate over unreliable networks (mobile apps, IoT devices). Health data sync is a textbook use case because the consequences of duplicate data are both subtle (slightly wrong averages) and serious (false medical insights).
+
+### Health Checks
+
+**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators, and monitoring systems.
+
+**How it works**: This project implements three health check endpoints:
+- **`/health`** (liveness): Returns 200 if the process is alive. Checks nothing beyond the ability to respond to HTTP. Used by Kubernetes to decide whether to restart the container.
+- **`/ready`** (readiness): Returns 200 only if the TimescaleDB database responds to a query and Redis responds to PING. Used by load balancers to decide whether to route traffic to this instance. A freshly started instance that has not yet established its database connection pool reports "not ready."
+- **`/health/deep`** (diagnostic): Returns detailed status including memory usage, database connection pool statistics (active, idle, waiting connections), and dependency versions. Used by operators for debugging without SSH access.
+
+**Why it matters**: The readiness check is especially important for health data pipelines because a server that cannot reach its database will accept sync requests but fail to store them -- silently losing health data. The readiness check prevents this by ensuring the load balancer only routes traffic to instances that can actually persist data. The deep health check helps diagnose connection pool exhaustion, which can happen during peak sync windows (e.g., millions of devices syncing when their users wake up in the morning).
+
+**When to use it**: Every production service needs liveness and readiness checks. The deep diagnostic check is valuable for systems with complex dependency chains (database, cache, queue, external services). For health data systems, readiness checks should verify write path dependencies (database) because accepting data that cannot be stored violates the "zero data loss" requirement.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects the service from abuse by rejecting excess requests with HTTP 429 (Too Many Requests) responses before they consume server resources.
+
+**How it works**: The server maintains request counters per client identifier (IP address or authenticated user ID). When a request arrives, the counter is checked against the configured limit. If within limits, the request proceeds. If exceeded, the request is rejected with a 429 response and a `Retry-After` header. For the health data pipeline, rate limiting is applied per-user on sync endpoints, preventing a malfunctioning device from overwhelming the ingestion path.
+
+**Why it matters**: A buggy health app or a compromised device could send thousands of sync requests per second, each containing hundreds of samples. Without rate limiting, this would exhaust database connections, fill up storage, and delay aggregation for all other users. Rate limiting on the sync endpoint ensures that even a malfunctioning client cannot degrade the service for others. It also provides a simple defense against denial-of-service attacks targeting the ingestion path.
+
+**When to use it**: On every externally-facing API, with particular attention to write-heavy endpoints (sync, upload) where each request triggers significant server-side processing (validation, deduplication, aggregation).

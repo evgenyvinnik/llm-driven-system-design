@@ -711,6 +711,200 @@ This section maps the production architecture above to what is actually running 
 - Editorial content and curated collections
 - App review (submission approval) pipeline
 
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (root layout with Header)
+├── login.tsx (Login form)
+├── register.tsx (Registration form)
+├── index.tsx (Home page)
+│   └── AppCard (app icon, name, rating stars, price - repeated for top charts)
+├── search.tsx (Search results)
+│   └── AppCard (search result cards with relevance highlighting)
+├── categories.tsx (Category grid)
+│   └── (category cards with icons and app counts)
+├── category.$slug.tsx (Category detail)
+│   └── AppCard (apps within a category with pagination)
+├── app.$id.tsx (App detail page)
+│   ├── (app header: icon, name, developer, rating, download button)
+│   ├── (screenshot gallery)
+│   ├── (description, release notes, version info)
+│   └── ReviewCard (user reviews with star rating, integrity badge, helpfulness votes)
+├── developer.tsx (Developer dashboard)
+│   └── (developer's app list with status indicators: draft, published, pending)
+└── developer.app.$id.tsx (Developer app management)
+    ├── DeveloperAppHeader (app name, status, action buttons)
+    ├── AppDetailsTab (edit metadata: name, description, keywords, pricing)
+    ├── AppReviewsTab (view reviews, respond to reviews)
+    │   └── ResponseForm (developer response textarea)
+    └── AppAnalyticsTab (download counts, review trends, rating breakdown)
+```
+
+Shared components:
+- **Header** (`components/Header.tsx`): Navigation bar with search input, category link, developer portal link, and auth status (login/register or user menu)
+- **AppCard** (`components/AppCard.tsx`): Reusable app display card used across home, search, and category pages
+- **ReviewCard** (`components/ReviewCard.tsx`): Review display with star rating, integrity score badge, helpfulness voting, and developer response
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`) -- Authentication state with persistence:
+
+- **`user`**: Current user (email, username, display name, role, avatar URL) or null
+- **`sessionId`**: Session identifier persisted in localStorage via Zustand's `persist` middleware
+- **`isLoading`** / **`error`**: Loading and error state for auth operations
+- **Actions**: `login(email, password)`, `register(email, password, username, displayName?)`, `logout()`, `fetchUser()` (re-validates session on page load)
+- **Persistence**: Only `sessionId` is persisted to localStorage. The full user object is re-fetched on each page load to ensure freshness.
+
+**`useCatalogStore`** (`stores/catalogStore.ts`) -- App browsing and search state:
+
+- **`categories[]`**: All available categories (fetched once on app load)
+- **`apps[]`**: Current app list for browsing pages
+- **`currentApp`**: Detailed app data for the app detail page, including `similarApps[]` from Elasticsearch's `more_like_this`
+- **`currentReviews[]`**: Paginated reviews for the current app
+- **`currentRatings`**: Rating distribution summary (5-star breakdown) for the current app
+- **`searchResults[]`**: Apps matching a search query
+- **`topApps`**: Top charts organized by type (`{ free: App[], paid: App[], new: App[] }`)
+- **`pagination`**: Current page, limit, total count, total pages -- shared across list views
+- **Actions**: `fetchCategories()`, `fetchApps(params)`, `fetchApp(id)`, `fetchTopApps(type, category?)`, `searchApps(query, params)`, `fetchReviews(appId, page)`, `fetchRatings(appId)`, `clearCurrentApp()`
+
+### Routing
+
+TanStack Router with file-based routing:
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/login` | `routes/login.tsx` | Login form |
+| `/register` | `routes/register.tsx` | Registration form |
+| `/` | `routes/index.tsx` | Home with top charts (Free, Paid, New) |
+| `/search` | `routes/search.tsx` | Search results with filters |
+| `/categories` | `routes/categories.tsx` | Category grid |
+| `/category/:slug` | `routes/category.$slug.tsx` | Apps in a category |
+| `/app/:id` | `routes/app.$id.tsx` | App detail with reviews |
+| `/developer` | `routes/developer.tsx` | Developer dashboard (app list) |
+| `/developer/app/:id` | `routes/developer.app.$id.tsx` | Developer app management (details, reviews, analytics tabs) |
+
+The root layout (`__root.tsx`) renders the `Header` component and an `<Outlet>` for page content.
+
+### Data Fetching
+
+All data fetching goes through a centralized API client (`services/api.ts`) that wraps `fetch` with:
+
+- **Session header injection**: Reads `sessionId` from localStorage and includes it in every request
+- **Response parsing**: Extracts `data` and `pagination` from the standardized response envelope
+- **Error handling**: Parses error messages from the server response body
+
+The API client provides typed methods organized by REST resource:
+- `api.get<T>(path)` / `api.post<T>(path, body)` / `api.put<T>(path, body)` / `api.delete(path)` -- generic HTTP methods
+- Store actions compose these methods with endpoint paths (e.g., `api.get<PaginatedResponse<App>>('/apps/search?q=...')`)
+
+### Key UI Patterns
+
+- **Top charts on home page**: Three horizontal scrollable lists (Top Free, Top Paid, New) built from `useCatalogStore.topApps`. Each chart type is fetched independently on page load.
+- **Search with URL params**: The search route reads the query from URL search params, enabling shareable search URLs. The `useCatalogStore.searchApps` action is triggered on route load and when the user submits a new query.
+- **Developer dashboard with role gating**: The developer route checks `user.role` and redirects non-developers to the home page. The developer app management page uses a tabbed interface (Details, Reviews, Analytics) with each tab being a component that fetches its own data.
+- **Review integrity badges**: ReviewCards display the integrity score as a visual badge (green for verified, yellow for moderate, red for flagged), giving users a quick signal about review trustworthiness without exposing the raw score.
+- **Developer review responses**: The `ResponseForm` component appears inline below each review on the developer's review tab, enabling developers to respond to feedback without leaving the page.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: Role-Based Access Control is an authorization model where permissions are assigned to roles, and users are assigned to roles. Instead of checking whether a specific user has permission to perform a specific action, the system checks whether the user's role grants that permission.
+
+**How it works**: In this project, users have a `role` column with three possible values: `user`, `developer`, and `admin`. Each API endpoint checks the caller's role before allowing the operation:
+- **`user`**: Can browse apps, search, write reviews, make purchases, and view their own purchase history. Cannot manage apps or access admin functionality.
+- **`developer`**: Inherits all `user` permissions. Additionally can create and update their own apps, upload screenshots, respond to reviews on their apps, and view analytics for their apps. Cannot modify other developers' apps or access admin functionality.
+- **`admin`**: Has unrestricted access to all endpoints, including user management, content moderation, and system configuration.
+
+The role check happens in Express middleware. When a request arrives at a protected endpoint (e.g., `POST /api/v1/developer/apps`), the middleware extracts the user from the session, checks `user.role === 'developer' || user.role === 'admin'`, and returns 403 Forbidden if the check fails. This check runs before any business logic, so unauthorized requests consume minimal server resources.
+
+**Why it matters**: Without RBAC, authorization logic is scattered throughout the codebase as ad-hoc `if` statements. This leads to inconsistent enforcement: one endpoint might check permissions correctly while another forgets. RBAC centralizes the authorization model, making it auditable and maintainable. In an app store, RBAC is critical because the consequences of unauthorized access are severe: a regular user who can modify app metadata could inject malicious descriptions, and a developer who can access other developers' analytics could gain competitive intelligence.
+
+**When to use it**: In any system with more than one type of user. RBAC is the most common authorization model for web applications. For more complex scenarios (e.g., user A can edit their own posts but not user B's posts), RBAC is typically extended with ownership checks (RBAC + object-level authorization) or replaced with attribute-based access control (ABAC).
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside is a caching strategy where the application checks the cache before querying the database. On a cache miss, the application queries the database, returns the result, and populates the cache for future requests.
+
+**How it works**: In this project, cache-aside is used for session management and ranking data. Session data is stored in Redis via `express-session` with `ioredis` as the backing store. Every authenticated request checks Redis for the session data rather than querying PostgreSQL. Rankings are precomputed hourly and stored in both PostgreSQL and Redis. API requests for top charts serve from Redis (sub-millisecond response) with fallback to PostgreSQL if Redis is unavailable.
+
+**Why it matters**: The home page displays three top charts (Free, Paid, New), each showing 10 apps. Without caching, every page load would execute three database queries with complex sorting and joins. With 50M daily active users loading the home page, that is 150M database queries per day for a dataset that changes only hourly. Redis caching reduces this to ~150M Redis reads (sub-millisecond each) and 3 database queries per hour (when rankings are recomputed). Session caching is equally important: without it, every authenticated API request would require a database query to validate the session.
+
+**When to use it**: When reads vastly outnumber writes and slightly stale data is acceptable. Rankings that are recomputed hourly are a perfect fit -- serving the previous hour's rankings for up to 60 seconds is imperceptible to users. Session data is also a good fit because it rarely changes during a session.
+
+### Circuit Breaker (Opossum)
+
+**What it is**: A circuit breaker prevents an application from repeatedly calling a failing service. When failures exceed a threshold, the circuit "opens" and calls fail immediately with a fallback response.
+
+**How it works**: This project uses two circuit breakers:
+- **Payment circuit**: Wraps simulated payment provider calls with a 5-second timeout and 30% failure threshold. When open, returns "Try again later" and preserves the user's cart state in Redis so they do not lose their purchase intent. Resets after 60 seconds.
+- **Elasticsearch circuit**: Wraps search and recommendation queries with a 10-second timeout and 50% failure threshold. When open, falls back to PostgreSQL's `ts_vector` full-text search, which is slower and lacks fuzzy matching but provides basic search functionality. Resets after 30 seconds.
+
+**Why it matters**: Elasticsearch is an external dependency that could become unavailable due to cluster rebalancing, index corruption, or resource exhaustion. Without a circuit breaker, a down Elasticsearch cluster would cause all search requests to hang for 10 seconds before timing out, making the entire store appear broken. With the circuit breaker, search falls back to PostgreSQL instantly, and users can still find apps (just with less sophisticated matching). The payment circuit breaker is even more critical: a hanging payment provider could lock users in a "processing" state indefinitely, causing them to retry and potentially trigger double charges.
+
+**When to use it**: Around any call to a service that could fail independently of your application. In this project, Elasticsearch and the payment provider are external systems with their own failure modes. Database connections are also candidates, but in practice, a database failure usually means the entire application is down (no fallback possible).
+
+### Structured Logging (Pino)
+
+**What it is**: Structured logging produces log entries as machine-parseable JSON objects. Each entry includes consistent field names for automated parsing, filtering, and alerting.
+
+**How it works**: Pino with `pino-http` middleware logs every HTTP request with method, path, status code, and duration. Child loggers add request context (user ID, session ID) that propagates to all log entries within a request. In development, `pino-pretty` formats logs for human readability. In production, raw JSON is emitted for log aggregation systems.
+
+**Why it matters**: An app store processes diverse operations (searches, purchases, reviews, developer uploads) at high volume. When a user reports that their purchase failed, operators need to quickly find the relevant log entries. Structured logs enable queries like "show all requests from user X in the last hour with status >= 400" in seconds. Without structured logging, finding the relevant log entry among millions of text lines requires fragile grep patterns.
+
+**When to use it**: Always in production. For an app store, structured logging is especially valuable because it enables correlating business events (purchase, review submission) with technical events (database latency, circuit breaker state changes).
+
+### Prometheus Metrics (prom-client)
+
+**What it is**: Prometheus collects numerical time-series data from applications via a `/metrics` endpoint. The `prom-client` library provides Counter, Gauge, Histogram, and Summary metric types.
+
+**How it works**: This project tracks six categories of metrics: HTTP request metrics (duration, count, active connections), database metrics (query duration, pool utilization), cache metrics (hit/miss counters, operation duration), message queue metrics (published/consumed counts, processing duration, queue depth), circuit breaker metrics (state gauge, failure/success counters), and business metrics (downloads, reviews submitted, purchases, revenue). Each metric type is chosen to match the measurement: downloads are a Counter (always increasing), queue depth is a Gauge (goes up and down), request duration is a Histogram (distribution of values).
+
+**Why it matters**: Business metrics are the distinguishing feature here. While HTTP latency and error rates tell you about system health, download counts, purchase revenue, and review submission rates tell you about business impact. A sudden drop in purchase revenue might be caused by a payment circuit breaker opening, which is caused by a payment provider timeout, which is caused by network congestion. The chain from business metric to technical root cause is only visible when both types of metrics are collected and correlated.
+
+**When to use it**: In any production system. Business metrics should be collected alongside technical metrics so that business impact can be immediately correlated with technical incidents.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts the number of requests a client can make within a time window, protecting the service from abuse.
+
+**How it works**: This project applies rate limiting per user and per IP address with configurable limits per endpoint. Write-heavy endpoints (review submission, purchase) have stricter limits than read-heavy endpoints (search, browse). The rate limiter returns HTTP 429 with a `Retry-After` header when the limit is exceeded.
+
+**Why it matters**: In an app store, rate limiting defends against several attack vectors: review bombing (submitting hundreds of fake reviews to manipulate rankings), purchase abuse (automated purchase bots exploiting promotions), and scraping (extracting the entire app catalog for competitive analysis). Each attack has a different signature and requires different rate limit configurations. The review integrity scoring system provides a second line of defense, but rate limiting is the first gate that prevents abuse from even reaching the scoring system.
+
+**When to use it**: On every externally-facing API. Apply the strictest limits to operations with financial impact (purchases) and reputation impact (reviews). More generous limits for search and browse operations that generate revenue when they work well.
+
+### Idempotency
+
+**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once.
+
+**How it works**: All mutating operations use client-provided idempotency keys stored in Redis. The flow is: (1) check Redis for existing result with key, (2) if found, return cached result, (3) if not found, acquire a lock via `SET NX EX 30`, (4) if lock acquired, process and cache result (24-hour TTL), (5) if lock not acquired, return 409 Conflict. Key patterns: purchases use `{userId}:{appId}:{timestamp_bucket}` (prevents double-purchase within 1-minute window), reviews use `{userId}:{appId}` (one review per user per app with upsert semantics), developer payouts use `{developerId}:{period}` (one payout per billing period).
+
+**Why it matters**: Purchase idempotency is the most critical case. If a user clicks "Buy" and the response is slow, they might click again. Without idempotency, the second click could charge them a second time. With the idempotency key, the second request finds the cached result from the first purchase and returns it without processing. The 30-second lock prevents race conditions where two concurrent requests for the same purchase could both succeed. Review idempotency prevents a user from submitting multiple reviews for the same app, which would corrupt the app's average rating.
+
+**When to use it**: For any operation with financial side effects (charges, transfers) or operations that should happen at most once (review submission, vote recording). Read operations are naturally idempotent and do not need keys.
+
+### Health Checks
+
+**What it is**: Health checks are HTTP endpoints that report application and dependency health for load balancers and orchestrators.
+
+**How it works**: This project implements three health check levels:
+- **`/health/live`** (liveness): Returns 200 if the process is running. Never checks external dependencies.
+- **`/health/ready`** (readiness): Returns 200 only if PostgreSQL and Redis are reachable. Used by load balancers.
+- **`/health`** (comprehensive): Checks all dependencies (PostgreSQL, Redis, Elasticsearch, RabbitMQ), reports queue depths, and shows circuit breaker states. Used by operators for diagnostics.
+
+**Why it matters**: The comprehensive health check is particularly valuable because it surfaces circuit breaker states. If the Elasticsearch circuit is open, the health check will report it, enabling operators to investigate before search quality degrades. Queue depth monitoring in the health check catches backlog situations where the download or review worker has fallen behind.
+
+**When to use it**: Every production service needs liveness and readiness checks. The comprehensive check is valuable for systems with multiple dependencies where partial failures are possible and each dependency has its own failure mode.
+
 ### Running Locally
 
 ```bash
