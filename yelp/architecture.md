@@ -17,85 +17,79 @@ A local business review and discovery platform enabling users to search for busi
 
 ### Non-Functional Requirements
 
-- **Scalability**: Handle 10K concurrent users in local dev; architecture supports horizontal scaling
+- **Scalability**: Handle 100K concurrent users; architecture supports horizontal scaling to millions
 - **Availability**: 99.9% uptime target (43 minutes downtime/month allowed)
 - **Latency**: p50 < 100ms, p95 < 300ms, p99 < 500ms for search queries
 - **Consistency**: Eventual consistency for search index (< 5 second lag); strong consistency for reviews and ratings
 
 ## Capacity Estimation
 
-### Local Development Scale
+### Production Scale
 
-Designed for a single developer machine running all services:
-
-| Metric | Local Dev Target | Production Equivalent |
-|--------|------------------|----------------------|
-| Daily Active Users (DAU) | 10-50 simulated | 100K |
-| Peak Requests per Second (RPS) | 50 | 5,000 |
-| Businesses in database | 10,000 | 10M |
-| Reviews in database | 100,000 | 500M |
-| Average review size | 500 bytes text + 2KB metadata | Same |
-| Photo storage | 1GB (MinIO) | 50TB (S3) |
+| Metric | Target |
+|--------|--------|
+| Daily Active Users (DAU) | 100K growing to 10M |
+| Peak Requests per Second (RPS) | 5,000 |
+| Businesses in database | 10M |
+| Reviews in database | 500M |
+| Average review size | 500 bytes text + 2KB metadata |
+| Photo storage | 50TB (S3) |
 
 ### Storage Growth Estimates
 
-| Data Type | Size per Record | Local Dev Total | Growth Rate |
-|-----------|-----------------|-----------------|-------------|
-| Business records | 2KB | 20MB | Static for dev |
-| Review records | 2.5KB | 250MB | ~10MB/month |
-| Review photos | 500KB avg | 1GB | ~100MB/month |
-| Search index | 1KB/business + 500B/review | 60MB | Mirrors DB |
-| Session data | 1KB/session | 50KB | TTL-managed |
-
-### Component Sizing (Local Dev)
-
-Based on 50 peak RPS target:
-
-- **PostgreSQL**: 1 instance, 512MB RAM, 2GB disk
-- **Elasticsearch**: 1 node, 1GB heap, 500MB disk
-- **Redis/Valkey**: 1 instance, 64MB RAM
-- **MinIO**: 1 instance, 2GB disk
-- **RabbitMQ**: 1 instance, 128MB RAM
-- **API Servers**: 2-3 instances on different ports, 256MB each
+| Data Type | Size per Record | Annual Growth |
+|-----------|-----------------|---------------|
+| Business records | 2KB | 200K new/year |
+| Review records | 2.5KB | 50M new/year |
+| Review photos | 500KB avg | 10TB/year |
+| Search index | 1KB/business + 500B/review | Mirrors DB |
 
 ## High-Level Architecture
 
 ```
-                                    +-----------------+
-                                    |   CDN (local:   |
-                                    |   nginx cache)  |
-                                    +--------+--------+
-                                             |
-                                    +--------v--------+
-                                    |  Load Balancer  |
-                                    |  (nginx:3000)   |
-                                    +--------+--------+
-                                             |
-              +------------------------------+------------------------------+
-              |                              |                              |
-    +---------v---------+          +---------v---------+          +---------v---------+
-    |   API Server 1    |          |   API Server 2    |          |   API Server 3    |
-    |   (port 3001)     |          |   (port 3002)     |          |   (port 3003)     |
-    +---+-------+-------+          +---+-------+-------+          +---+-------+-------+
-        |       |                      |       |                      |       |
-        |       +----------------------+-------+----------------------+       |
-        |                              |                                      |
-        v                              v                                      v
-+-------+-------+              +-------+-------+                      +-------+-------+
-|   PostgreSQL  |              |     Redis     |                      | Elasticsearch |
-|   + PostGIS   |              |   (Valkey)    |                      |               |
-|  (port 5432)  |              |  (port 6379)  |                      |  (port 9200)  |
-+-------+-------+              +---------------+                      +-------+-------+
-        |                                                                     ^
-        |                      +---------------+                              |
-        +--------------------->|   RabbitMQ    |------------------------------+
-                               |  (port 5672)  |
-                               +-------+-------+
-                                       |
-                               +-------v-------+
-                               |    MinIO      |
-                               | (port 9000)   |
-                               +---------------+
+┌───────────────────────────────────────────────────────────────────────────┐
+│                              Clients                                      │
+│                    (Web, iOS, Android)                                     │
+└──────────────────────────────┬────────────────────────────────────────────┘
+                               │
+                               ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                          CDN (CloudFront)                                  │
+│              Static assets, photo delivery, edge caching                  │
+└──────────────────────────────┬────────────────────────────────────────────┘
+                               │
+                               ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     API Gateway / Load Balancer                            │
+│                  (Rate limiting, SSL termination)                          │
+└──────┬───────────────┬───────────────┬────────────────────────────────────┘
+       │               │               │
+       ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  API Server  │ │  API Server  │ │  API Server  │
+│  (Stateless) │ │  (Stateless) │ │  (Stateless) │
+└──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+       │               │               │
+       └───────────────┼───────────────┘
+                       │
+       ┌───────────────┼───────────────┬────────────────┐
+       │               │               │                │
+       ▼               ▼               ▼                ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  PostgreSQL  │ │    Redis     │ │Elasticsearch │ │   RabbitMQ   │
+│  + PostGIS   │ │   (Cache/   │ │   (Search)   │ │  (Async Jobs)│
+│  (Primary)   │ │  Sessions)  │ │              │ │              │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────┬───────┘
+                                                          │
+                                                    ┌─────▼────────┐
+                                                    │ Index Worker  │
+                                                    │ (ES Sync)     │
+                                                    └──────────────┘
+                                                          │
+                                                    ┌─────▼────────┐
+                                                    │  S3 / MinIO  │
+                                                    │  (Photos)    │
+                                                    └──────────────┘
 ```
 
 ### Request Flow
@@ -103,134 +97,217 @@ Based on 50 peak RPS target:
 #### Search Request Flow
 
 ```
-1. User -> nginx LB -> API Server (round-robin)
-2. API Server checks Redis cache for query hash
-   - Cache HIT: Return cached results (TTL: 2 minutes)
-   - Cache MISS: Continue to step 3
-3. API Server queries Elasticsearch:
-   - Full-text match on business name/description
-   - geo_distance filter for location radius
-   - Aggregations for category facets
-4. API Server enriches results with PostgreSQL data if needed
-5. API Server caches results in Redis
-6. Return JSON response to user
+1. Client ──▶ CDN (cache check for static results)
+2. CDN MISS ──▶ API Gateway ──▶ API Server (round-robin)
+3. API Server checks Redis cache for query hash
+   ├── Cache HIT: Return cached results (TTL: 2 minutes)
+   └── Cache MISS: Continue to step 4
+4. API Server queries Elasticsearch:
+   ├── Full-text match on business name/description
+   ├── geo_distance filter for location radius
+   └── Aggregations for category facets
+5. API Server enriches results with PostgreSQL data if needed
+6. API Server caches results in Redis
+7. Return JSON response
 ```
 
 #### Review Submission Flow
 
 ```
-1. User -> nginx LB -> API Server
+1. Client ──▶ API Gateway ──▶ API Server
 2. API Server validates session (Redis lookup)
-3. API Server validates review data:
-   - User hasn't reviewed this business before (unique constraint)
-   - Rating is 1-5, text length within limits
-4. API Server writes to PostgreSQL (transaction):
-   - INSERT review record
-   - UPDATE business rating_sum, review_count (trigger-based)
-5. API Server publishes event to RabbitMQ:
-   - Queue: review.created
-   - Payload: { businessId, reviewId, action: 'create' }
-6. Index Worker consumes event:
-   - Updates Elasticsearch business document
-   - Invalidates Redis cache for business
-7. Return success response to user
+3. Idempotency check: lookup Idempotency-Key header in Redis
+4. API Server validates review data:
+   ├── User hasn't reviewed this business before (unique constraint)
+   └── Rating is 1-5, text length within limits
+5. API Server writes to PostgreSQL (transaction):
+   ├── INSERT review record
+   └── UPDATE business rating_sum, review_count (trigger-based)
+6. API Server publishes event to RabbitMQ:
+   ├── Queue: review.created
+   └── Payload: { businessId, reviewId, action: 'create' }
+7. Index Worker consumes event:
+   ├── Updates Elasticsearch business document
+   └── Invalidates Redis cache for business
+8. Return success response
 ```
 
 ### Core Components
 
-| Component | Purpose | Port | Technology |
-|-----------|---------|------|------------|
-| API Gateway | Load balancing, rate limiting, SSL termination | 3000 | nginx |
-| API Server | Business logic, REST endpoints | 3001-3003 | Node.js + Express |
-| Primary Database | Users, businesses, reviews (source of truth) | 5432 | PostgreSQL 16 + PostGIS |
-| Search Engine | Full-text search, geo queries, aggregations | 9200 | Elasticsearch 8.x |
-| Cache | Sessions, query results, hot business data | 6379 | Valkey/Redis |
-| Message Queue | Async indexing, notifications | 5672 | RabbitMQ |
-| Object Storage | Review photos, business images | 9000 | MinIO |
+| Component | Purpose | Technology |
+|-----------|---------|------------|
+| API Gateway | Load balancing, rate limiting, SSL termination | nginx / AWS ALB |
+| API Server | Business logic, REST endpoints | Node.js + Express |
+| Primary Database | Users, businesses, reviews (source of truth) | PostgreSQL 16 + PostGIS |
+| Search Engine | Full-text search, geo queries, aggregations | Elasticsearch 8.x |
+| Cache | Sessions, query results, hot business data | Redis / Valkey |
+| Message Queue | Async indexing, notifications | RabbitMQ |
+| Object Storage | Review photos, business images | S3 (MinIO locally) |
 
 ## Database Schema
-
-### Database Schema (PostgreSQL + PostGIS)
 
 ```sql
 -- Enable PostGIS extension
 CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Users table
 CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
-    display_name VARCHAR(100) NOT NULL,
-    avatar_url VARCHAR(500),
-    role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'business_owner', 'admin')),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    name VARCHAR(255) NOT NULL,
+    avatar_url TEXT,
+    role VARCHAR(50) DEFAULT 'user' CHECK (role IN ('user', 'business_owner', 'admin')),
+    review_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX idx_users_email ON users(email);
+-- Sessions table
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
 
--- Businesses table with PostGIS geometry
+-- Categories table
+CREATE TABLE categories (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    parent_id UUID REFERENCES categories(id),
+    icon VARCHAR(50),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Businesses table with PostGIS geography
 CREATE TABLE businesses (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    owner_id UUID REFERENCES users(id),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) NOT NULL,
+    slug VARCHAR(255) UNIQUE NOT NULL,
     description TEXT,
-    address VARCHAR(500) NOT NULL,
+    address TEXT NOT NULL,
     city VARCHAR(100) NOT NULL,
     state VARCHAR(50) NOT NULL,
     zip_code VARCHAR(20) NOT NULL,
+    country VARCHAR(100) DEFAULT 'USA',
+    latitude DECIMAL(10, 7) NOT NULL,
+    longitude DECIMAL(10, 7) NOT NULL,
+    location GEOGRAPHY(POINT, 4326),
     phone VARCHAR(20),
-    website VARCHAR(500),
-    location GEOGRAPHY(POINT, 4326) NOT NULL,
-    categories TEXT[] DEFAULT '{}',
-    hours JSONB DEFAULT '{}',
-    amenities TEXT[] DEFAULT '{}',
-    rating_sum INTEGER DEFAULT 0,
+    website VARCHAR(255),
+    email VARCHAR(255),
+    price_level INTEGER CHECK (price_level >= 1 AND price_level <= 4),
+    rating DECIMAL(2, 1) DEFAULT 0,
     review_count INTEGER DEFAULT 0,
-    photo_urls TEXT[] DEFAULT '{}',
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    rating_sum DECIMAL(10, 1) DEFAULT 0,
+    photo_count INTEGER DEFAULT 0,
+    is_claimed BOOLEAN DEFAULT FALSE,
+    is_verified BOOLEAN DEFAULT FALSE,
+    owner_id UUID REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Spatial index for geo queries
 CREATE INDEX idx_businesses_location ON businesses USING GIST(location);
+CREATE INDEX idx_businesses_rating ON businesses(rating DESC);
 CREATE INDEX idx_businesses_city ON businesses(city);
-CREATE INDEX idx_businesses_categories ON businesses USING GIN(categories);
-CREATE INDEX idx_businesses_rating ON businesses((rating_sum::float / NULLIF(review_count, 0)));
+CREATE INDEX idx_businesses_slug ON businesses(slug);
+
+-- Business categories junction table
+CREATE TABLE business_categories (
+    business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+    category_id UUID REFERENCES categories(id) ON DELETE CASCADE,
+    PRIMARY KEY (business_id, category_id)
+);
+
+-- Business hours table
+CREATE TABLE business_hours (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+    day_of_week INTEGER NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
+    open_time TIME NOT NULL,
+    close_time TIME NOT NULL,
+    is_closed BOOLEAN DEFAULT FALSE,
+    UNIQUE(business_id, day_of_week)
+);
+
+-- Business photos table
+CREATE TABLE business_photos (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    caption TEXT,
+    is_primary BOOLEAN DEFAULT FALSE,
+    uploaded_by UUID REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT NOW()
+);
 
 -- Reviews table
 CREATE TABLE reviews (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
-    rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-    title VARCHAR(200),
-    content TEXT NOT NULL,
-    photo_urls TEXT[] DEFAULT '{}',
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+    text TEXT NOT NULL,
     helpful_count INTEGER DEFAULT 0,
-    is_verified BOOLEAN DEFAULT false,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(user_id, business_id)
+    funny_count INTEGER DEFAULT 0,
+    cool_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(business_id, user_id)
 );
 
 CREATE INDEX idx_reviews_business ON reviews(business_id, created_at DESC);
-CREATE INDEX idx_reviews_user ON reviews(user_id, created_at DESC);
-CREATE INDEX idx_reviews_rating ON reviews(business_id, rating);
+CREATE INDEX idx_reviews_user ON reviews(user_id);
+CREATE INDEX idx_reviews_rating ON reviews(rating);
 
--- Review votes (helpful/not helpful)
-CREATE TABLE review_votes (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- Review photos, votes, and owner responses
+CREATE TABLE review_photos (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     review_id UUID REFERENCES reviews(id) ON DELETE CASCADE,
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    vote_type VARCHAR(10) CHECK (vote_type IN ('helpful', 'not_helpful')),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(review_id, user_id)
+    url TEXT NOT NULL,
+    caption TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Trigger to update business rating aggregates
+CREATE TABLE review_votes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    review_id UUID REFERENCES reviews(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    vote_type VARCHAR(20) NOT NULL CHECK (vote_type IN ('helpful', 'funny', 'cool')),
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(review_id, user_id, vote_type)
+);
+
+CREATE TABLE review_responses (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    review_id UUID REFERENCES reviews(id) ON DELETE CASCADE UNIQUE,
+    business_id UUID REFERENCES businesses(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Trigger: auto-sync PostGIS geography from lat/lng
+CREATE OR REPLACE FUNCTION update_business_location()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.location = ST_SetSRID(ST_MakePoint(NEW.longitude, NEW.latitude), 4326)::geography;
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_business_location
+    BEFORE INSERT OR UPDATE OF latitude, longitude ON businesses
+    FOR EACH ROW EXECUTE FUNCTION update_business_location();
+
+-- Trigger: update business rating aggregates on review changes
 CREATE OR REPLACE FUNCTION update_business_rating()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -238,39 +315,30 @@ BEGIN
         UPDATE businesses
         SET rating_sum = rating_sum + NEW.rating,
             review_count = review_count + 1,
-            updated_at = NOW()
+            rating = (rating_sum + NEW.rating) / (review_count + 1)
         WHERE id = NEW.business_id;
+        UPDATE users SET review_count = review_count + 1 WHERE id = NEW.user_id;
     ELSIF TG_OP = 'UPDATE' THEN
         UPDATE businesses
         SET rating_sum = rating_sum - OLD.rating + NEW.rating,
-            updated_at = NOW()
+            rating = (rating_sum - OLD.rating + NEW.rating) / review_count
         WHERE id = NEW.business_id;
     ELSIF TG_OP = 'DELETE' THEN
         UPDATE businesses
-        SET rating_sum = rating_sum - OLD.rating,
-            review_count = review_count - 1,
-            updated_at = NOW()
+        SET rating_sum = GREATEST(0, rating_sum - OLD.rating),
+            review_count = GREATEST(0, review_count - 1),
+            rating = CASE WHEN review_count - 1 <= 0 THEN 0
+                     ELSE (rating_sum - OLD.rating) / (review_count - 1) END
         WHERE id = OLD.business_id;
+        UPDATE users SET review_count = GREATEST(0, review_count - 1) WHERE id = OLD.user_id;
     END IF;
-    RETURN NEW;
+    RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trigger_update_business_rating
-AFTER INSERT OR UPDATE OF rating OR DELETE ON reviews
-FOR EACH ROW EXECUTE FUNCTION update_business_rating();
-
--- Sessions table (alternative to Redis-only sessions)
-CREATE TABLE sessions (
-    id VARCHAR(255) PRIMARY KEY,
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    data JSONB DEFAULT '{}',
-    expires_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_sessions_user ON sessions(user_id);
-CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+    AFTER INSERT OR UPDATE OR DELETE ON reviews
+    FOR EACH ROW EXECUTE FUNCTION update_business_rating();
 ```
 
 ### Elasticsearch Index Mapping
@@ -285,10 +353,7 @@ CREATE INDEX idx_sessions_expires ON sessions(expires_at);
         "analyzer": "standard",
         "fields": {
           "keyword": { "type": "keyword" },
-          "autocomplete": {
-            "type": "text",
-            "analyzer": "autocomplete"
-          }
+          "autocomplete": { "type": "text", "analyzer": "autocomplete" }
         }
       },
       "description": { "type": "text" },
@@ -341,29 +406,14 @@ business:{businessId}            -> { ...businessData }          TTL: 5 minutes
 
 # Rate limiting
 ratelimit:{userId}:{endpoint}    -> count                        TTL: 1 minute
-ratelimit:ip:{ipAddress}         -> count                        TTL: 1 minute
 
 # Popular searches (for autocomplete)
 popular:searches                 -> Sorted Set (term -> count)   TTL: 1 hour
 ```
 
-### Storage Strategy
-
-| Data Type | Storage | Rationale |
-|-----------|---------|-----------|
-| User accounts | PostgreSQL | Transactional integrity, auth queries |
-| Business records | PostgreSQL + PostGIS | Geo-spatial queries, source of truth |
-| Reviews | PostgreSQL | Strong consistency, complex queries |
-| Search index | Elasticsearch | Full-text search, geo_distance, facets |
-| Sessions | Redis (primary) + PostgreSQL (backup) | Fast reads, simple invalidation |
-| Photos | MinIO (S3-compatible) | Binary blob storage, CDN-friendly |
-| Message queue | RabbitMQ | Reliable async processing |
-
 ## API Design
 
-### Core Endpoints
-
-#### Authentication
+### Authentication
 ```
 POST   /api/v1/auth/register     # Create user account
 POST   /api/v1/auth/login        # Login, returns session cookie
@@ -371,7 +421,7 @@ POST   /api/v1/auth/logout       # Invalidate session
 GET    /api/v1/auth/me           # Get current user
 ```
 
-#### Businesses
+### Businesses
 ```
 GET    /api/v1/businesses                    # Search businesses
 GET    /api/v1/businesses/:id                # Get business details
@@ -382,29 +432,24 @@ GET    /api/v1/businesses/:id/reviews        # Get reviews for business
 POST   /api/v1/businesses/:id/photos         # Upload business photo
 ```
 
-#### Search
+### Search
 ```
 GET    /api/v1/search?q=pizza&lat=37.7&lng=-122.4&radius=5km
-       # Full-text search with geo filter
-
 GET    /api/v1/search/autocomplete?q=piz
-       # Autocomplete suggestions
-
 GET    /api/v1/search/nearby?lat=37.7&lng=-122.4&radius=1km&category=restaurants
-       # Nearby businesses by category
 ```
 
-#### Reviews
+### Reviews
 ```
 GET    /api/v1/reviews/:id                   # Get review details
 POST   /api/v1/reviews                       # Create review
 PUT    /api/v1/reviews/:id                   # Update own review
 DELETE /api/v1/reviews/:id                   # Delete own review
-POST   /api/v1/reviews/:id/vote              # Vote helpful/not helpful
+POST   /api/v1/reviews/:id/vote              # Vote helpful/funny/cool
 POST   /api/v1/reviews/:id/photos            # Upload review photo
 ```
 
-#### Admin
+### Admin
 ```
 GET    /api/v1/admin/users                   # List users
 PUT    /api/v1/admin/users/:id/role          # Change user role
@@ -414,214 +459,73 @@ DELETE /api/v1/admin/reviews/:id             # Remove review (moderation)
 GET    /api/v1/admin/stats                   # System statistics
 ```
 
-### Request/Response Examples
-
-#### Search Request
-```http
-GET /api/v1/search?q=sushi&lat=37.7749&lng=-122.4194&radius=5km&category=restaurants&sort=rating&page=1&limit=20
-```
-
-#### Search Response
-```json
-{
-  "data": {
-    "businesses": [
-      {
-        "id": "uuid",
-        "name": "Sushi House",
-        "address": "123 Main St",
-        "city": "San Francisco",
-        "location": { "lat": 37.775, "lng": -122.418 },
-        "distance_km": 0.5,
-        "categories": ["sushi", "japanese", "restaurants"],
-        "average_rating": 4.5,
-        "review_count": 127,
-        "price_level": 2,
-        "photo_url": "https://cdn.example.com/photos/abc123.jpg"
-      }
-    ],
-    "facets": {
-      "categories": [
-        { "key": "sushi", "count": 15 },
-        { "key": "japanese", "count": 12 }
-      ],
-      "price_levels": [
-        { "key": 1, "count": 5 },
-        { "key": 2, "count": 8 }
-      ]
-    },
-    "pagination": {
-      "page": 1,
-      "limit": 20,
-      "total": 45,
-      "total_pages": 3
-    }
-  },
-  "meta": {
-    "took_ms": 45,
-    "cache_hit": false
-  }
-}
-```
-
 ## Key Design Decisions
 
-### Geo-spatial Search
+### Geo-spatial Search: Dual-Layer Approach
 
-**Problem**: Find businesses within a radius of a given point efficiently.
+**Problem**: Find businesses within a radius efficiently while supporting full-text search and faceted filtering.
 
-**Solution**: Dual-layer geo-spatial support:
+**Solution**: PostgreSQL + PostGIS as source of truth, Elasticsearch as search layer.
 
-1. **PostgreSQL + PostGIS** (source of truth):
-   ```sql
-   SELECT id, name, ST_Distance(location, ST_Point(-122.4, 37.7)::geography) as distance
-   FROM businesses
-   WHERE ST_DWithin(location, ST_Point(-122.4, 37.7)::geography, 5000)  -- 5km radius
-   ORDER BY distance
-   LIMIT 20;
-   ```
+PostGIS handles authoritative geo-queries with `ST_DWithin` and GIST indexes. Elasticsearch handles the search UX: full-text matching on business names, `geo_distance` filtering, faceted aggregations for categories, and autocomplete via edge n-grams. Writes go to PostgreSQL first, then async sync to Elasticsearch via RabbitMQ.
 
-2. **Elasticsearch** (search layer):
-   ```json
-   {
-     "query": {
-       "bool": {
-         "must": { "match": { "name": "sushi" } },
-         "filter": {
-           "geo_distance": {
-             "distance": "5km",
-             "location": { "lat": 37.7, "lon": -122.4 }
-           }
-         }
-       }
-     },
-     "sort": [
-       { "_geo_distance": { "location": { "lat": 37.7, "lon": -122.4 }, "order": "asc" } }
-     ]
-   }
-   ```
+**Why not PostGIS alone?** PostgreSQL's `tsvector` + `pg_trgm` provides full-text search, but lacks Elasticsearch's relevance tuning (BM25 scoring), built-in aggregations for faceted search, and autocomplete tokenization. For < 100K businesses, PostgreSQL alone might suffice. At 10M+ businesses with complex multi-field queries, Elasticsearch's inverted index architecture handles read-heavy workloads more efficiently.
 
-**Trade-off**: Maintaining two geo indexes adds sync complexity but provides better search performance and richer query capabilities.
+**Trade-off**: Two geo indexes adds sync complexity. If Elasticsearch falls behind PostgreSQL, search results are temporarily stale (< 5 seconds). This is acceptable because users searching for restaurants don't need sub-second freshness on ratings.
 
-### Rating Aggregation
+### Rating Aggregation: Trigger-Based Pre-computation
 
-**Problem**: Calculating average ratings per-query is expensive at scale.
+**Problem**: Computing `AVG(rating)` across thousands of reviews on every search result is expensive.
 
-**Solution**: Pre-computed aggregates with trigger-based updates:
+**Solution**: Store `rating_sum` and `review_count` on the `businesses` table. A PostgreSQL trigger updates these counters on review INSERT/UPDATE/DELETE. Average is computed as `rating_sum / review_count`.
 
-- Store `rating_sum` and `review_count` on business records
-- Database trigger updates these on review INSERT/UPDATE/DELETE
-- Average = rating_sum / review_count (computed at query time)
+**Why triggers over materialized views?** Triggers provide real-time accuracy. A materialized view refreshed every N minutes would show stale ratings, and periodic refresh under write-heavy load creates spikes. Triggers amortize the cost across individual writes.
 
-**Alternative Considered**: Materialized view refreshed periodically. Rejected because triggers provide real-time accuracy without refresh overhead.
+**Trade-off**: Triggers add latency to review writes (~1ms extra) and couple the review and business tables at the database level. If review volume reaches millions per day, the single-row UPDATE on the business row could become a bottleneck. At that scale, we would move to async aggregation via a queue.
 
-### Search Index Synchronization
+### Search Index Synchronization: Async via RabbitMQ
 
-**Problem**: Keep Elasticsearch in sync with PostgreSQL without blocking writes.
+**Problem**: Keep Elasticsearch in sync with PostgreSQL without blocking API responses.
 
-**Solution**: Async event-driven sync via RabbitMQ:
+**Solution**: Event-driven sync. API writes to PostgreSQL (synchronous), publishes an event to RabbitMQ (async, fire-and-forget), and a separate Index Worker consumes events and updates Elasticsearch. Maximum eventual consistency delay: < 5 seconds.
 
-1. API writes to PostgreSQL (synchronous)
-2. API publishes event to RabbitMQ (async, fire-and-forget)
-3. Index worker consumes event and updates Elasticsearch
-4. Maximum eventual consistency delay: < 5 seconds
+**Failure handling**: RabbitMQ durable queues persist messages. Failed indexing attempts go to a dead-letter queue after 3 retries. A daily full re-index from PostgreSQL acts as a safety net.
 
-**Failure Handling**:
-- RabbitMQ durable queues persist messages
-- Dead-letter queue for failed indexing attempts
-- Periodic full re-index job as safety net (daily)
+**Why RabbitMQ over Kafka?** RabbitMQ's work-queue model, built-in DLQ, priority queues, and lower resource footprint make it better suited for request-response patterns at this scale. Kafka's log-based architecture would be overkill unless we need event replay or an analytics pipeline.
 
-## Technology Stack
+### PostgreSQL + PostGIS vs MongoDB + GeoJSON
 
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| **Application Layer** | Node.js + Express | Fast development, good ecosystem, async I/O |
-| **Frontend** | React 19 + TanStack Router + Tailwind | Modern stack, type-safe routing |
-| **Data Layer** | PostgreSQL 16 + PostGIS | ACID transactions, mature geo support |
-| **Search Layer** | Elasticsearch 8.x | Best-in-class full-text + geo |
-| **Cache Layer** | Valkey/Redis | Sub-ms reads, flexible data structures |
-| **Message Queue** | RabbitMQ | Reliable delivery, DLQ support, admin UI |
-| **Object Storage** | MinIO | S3-compatible, runs locally |
-| **Load Balancer** | nginx | Proven, simple config, caching |
+**Chose PostgreSQL** for ACID transactions ensuring review/rating consistency, mature PostGIS spatial functions, and a simpler operational model (single RDBMS). MongoDB's flexible schema might speed initial development, but PostgreSQL's constraints catch data integrity bugs early. The explicit schema also makes the rating trigger system possible.
 
-## Caching Strategy
+## Consistency and Idempotency
 
-### Cache-Aside Pattern
+### Idempotency for Review Submission
+
+Clients generate a UUID `Idempotency-Key` header before sending review requests. The server checks Redis for an existing key before processing. If found, it returns the cached response. If not found, it acquires a lock, processes the request, and caches the response. Keys expire after 24 hours.
 
 ```
-Read:
-1. Check cache for key
-2. If HIT: return cached value
-3. If MISS: query database, cache result, return
+Request 1: POST /reviews, Idempotency-Key: abc-123
+  -> Lock acquired, review created, response cached, return 201
 
-Write:
-1. Write to database
-2. Invalidate cache key (delete, not update)
-3. Next read populates fresh cache
+Request 2: POST /reviews, Idempotency-Key: abc-123 (retry)
+  -> Key found in cache, return cached 201 response (no duplicate created)
 ```
 
-### Cache TTLs and Invalidation
+The database `UNIQUE(business_id, user_id)` constraint catches a different class of problem (same user reviewing twice), not retry duplicates.
 
-| Data | TTL | Invalidation Trigger |
-|------|-----|---------------------|
-| Session | 24 hours | Explicit logout, password change |
-| Search results | 2 minutes | Time-based expiry only |
-| Business details | 5 minutes | On business update, review added |
-| Popular searches | 1 hour | Time-based expiry |
-| Rate limit counters | 1 minute | Time-based expiry |
-
-### Cache Hit Rate Targets
-
-- Session lookups: > 99% (almost all reads from cache)
-- Search queries: > 60% (repeating queries within TTL window)
-- Business details: > 70% (popular businesses cached)
-
-## Message Queue Design
-
-### RabbitMQ Queues
-
-| Queue | Purpose | Consumers | Delivery |
-|-------|---------|-----------|----------|
-| `index.business` | Sync business to Elasticsearch | Index Worker | At-least-once |
-| `index.review` | Sync review to Elasticsearch | Index Worker | At-least-once |
-| `notifications.email` | Send email notifications | Notification Worker | At-least-once |
-| `photos.process` | Resize/optimize uploaded photos | Photo Worker | At-least-once |
-
-### Dead Letter Queue (DLQ)
-
-Failed messages after 3 retries go to `dlq.{original_queue}`:
-- Manual inspection via RabbitMQ admin UI
-- Replay capability for transient failures
-- Alerting on DLQ depth > 100 messages
-
-## Security Considerations
+## Security
 
 ### Authentication and Authorization
 
-**Session-based Authentication**:
-```
-1. User submits credentials
-2. Server validates password hash (bcrypt, cost factor 12)
-3. Server creates session in Redis: session:{uuid} -> { userId, role }
-4. Server sets HttpOnly, Secure, SameSite=Strict cookie
-5. Subsequent requests include cookie for auth
-```
+**Session-based authentication**: User submits credentials, server validates bcrypt hash (cost factor 12), creates session in Redis, and sets HttpOnly/Secure/SameSite=Strict cookie.
 
 **Role-Based Access Control (RBAC)**:
 
 | Role | Permissions |
 |------|-------------|
 | `user` | Create/edit own reviews, vote on reviews |
-| `business_owner` | All user permissions + manage own business(es) |
+| `business_owner` | All user permissions + manage own businesses |
 | `admin` | All permissions + user management, moderation |
-
-**Authorization Middleware**:
-```typescript
-// Route protection examples
-app.post('/api/v1/reviews', requireAuth, createReview);
-app.put('/api/v1/businesses/:id', requireAuth, requireRole('business_owner', 'admin'), updateBusiness);
-app.delete('/api/v1/admin/reviews/:id', requireAuth, requireRole('admin'), deleteReview);
-```
 
 ### Rate Limiting
 
@@ -632,100 +536,42 @@ app.delete('/api/v1/admin/reviews/:id', requireAuth, requireRole('admin'), delet
 | POST /reviews | 10 requests | 1 hour | User ID |
 | GET /search | 100 requests | 1 minute | User ID or IP |
 
-**Implementation**: Token bucket in Redis with Lua script for atomicity.
+Multi-layer rate limiting: per-user, per-IP, and per-user-per-business limits. Sliding window counters in Redis prevent boundary-burst issues. Fail-open design: if Redis is unavailable, requests are allowed.
 
 ### Input Validation
 
-- All inputs validated with Zod schemas
+- All inputs validated server-side
 - SQL injection prevented by parameterized queries (pg library)
-- XSS prevented by React's default escaping + DOMPurify for user HTML
-- File uploads: type validation, size limits (5MB), virus scan (ClamAV optional)
-
-### Data Protection
-
+- XSS prevented by React's default escaping
+- File uploads: type validation, size limits (5MB)
 - Passwords: bcrypt with cost factor 12
-- PII: Not logged, masked in error responses
-- HTTPS: Required in production (nginx terminates TLS)
-- Cookies: HttpOnly, Secure, SameSite=Strict
 
 ## Observability
 
 ### Metrics (Prometheus)
 
-**Application Metrics**:
 ```
 # Request metrics
 http_requests_total{method, path, status}
 http_request_duration_seconds{method, path, quantile}
 
 # Business metrics
-reviews_created_total
-searches_total{cache_hit}
-businesses_created_total
+yelp_searches_total{cache_hit, has_geo, has_category}
+yelp_search_duration_seconds{cache_hit}
+yelp_search_results_count (histogram)
+yelp_reviews_created_total{rating}
+yelp_circuit_breaker_state{name}
 
 # Resource metrics
-db_pool_connections{state}  # active, idle, waiting
+db_pool_connections{state}
 cache_operations_total{operation, result}
 queue_messages_published_total{queue}
 queue_messages_consumed_total{queue, result}
 ```
 
-**Infrastructure Metrics** (from exporters):
-```
-# PostgreSQL
-pg_stat_activity_count
-pg_database_size_bytes
-pg_replication_lag_seconds
+### Logging (Structured JSON via Pino)
 
-# Elasticsearch
-elasticsearch_cluster_health_status
-elasticsearch_indices_docs_total
-elasticsearch_indices_store_size_bytes
-
-# Redis
-redis_connected_clients
-redis_memory_used_bytes
-redis_keyspace_hits_total / redis_keyspace_misses_total
-```
-
-### Logging (Structured JSON)
-
-```json
-{
-  "timestamp": "2024-01-15T10:30:00Z",
-  "level": "info",
-  "service": "api-server",
-  "traceId": "abc123",
-  "spanId": "def456",
-  "userId": "user-uuid",
-  "method": "GET",
-  "path": "/api/v1/search",
-  "status": 200,
-  "duration_ms": 45,
-  "cache_hit": true
-}
-```
-
-**Log Levels**:
-- `error`: Failures requiring attention (5xx, unhandled exceptions)
-- `warn`: Degraded behavior (retries, cache misses, rate limits)
-- `info`: Request/response, major state changes
-- `debug`: Detailed debugging (disabled in production)
-
-### Tracing (OpenTelemetry)
-
-Distributed traces across services:
-```
-[API Server] ---> [Redis] (cache lookup)
-     |
-     +---------> [Elasticsearch] (search query)
-     |
-     +---------> [PostgreSQL] (data fetch)
-     |
-     +---------> [RabbitMQ] (publish event)
-```
-
-**Trace Context**: Propagated via `traceparent` header (W3C Trace Context).
+All logs are structured JSON with request IDs for correlation. Log levels: `error` (5xx, unhandled exceptions), `warn` (retries, cache misses, rate limits), `info` (request/response), `debug` (disabled in production). Sensitive fields (passwords, tokens) are automatically redacted.
 
 ### Alerting Thresholds
 
@@ -735,10 +581,18 @@ Distributed traces across services:
 | Error rate (5xx) | > 1% | > 5% |
 | DB connection pool exhausted | > 80% | > 95% |
 | Cache hit rate | < 50% | < 30% |
-| Queue depth (DLQ) | > 50 | > 100 |
-| Disk usage | > 70% | > 85% |
+| DLQ depth | > 50 | > 100 |
 
 ## Failure Handling
+
+### Circuit Breaker Pattern
+
+Elasticsearch and heavy PostgreSQL geo-queries are wrapped in circuit breakers (CLOSED -> OPEN after 5 failures -> HALF_OPEN after 30s -> test requests -> CLOSED or OPEN).
+
+**Fallback behavior**:
+- Elasticsearch down: Fall back to PostgreSQL full-text search (slower but functional)
+- Redis down: Sessions from PostgreSQL backup table, skip caching
+- RabbitMQ down: Write to PostgreSQL outbox table, process later
 
 ### Retry Strategy
 
@@ -748,62 +602,6 @@ Distributed traces across services:
 | Elasticsearch query | 2 | Exponential (50ms, 100ms) | 3s |
 | Redis operation | 1 | Immediate | 500ms |
 | RabbitMQ publish | 3 | Exponential (100ms base) | 2s |
-| External API (if any) | 3 | Exponential (1s base) | 10s |
-
-### Circuit Breaker Pattern
-
-```typescript
-// Circuit breaker states: CLOSED -> OPEN -> HALF_OPEN -> CLOSED
-const esCircuitBreaker = new CircuitBreaker({
-  failureThreshold: 5,      // Open after 5 failures
-  resetTimeout: 30000,      // Try again after 30s
-  halfOpenRequests: 3       // Allow 3 test requests
-});
-
-// Usage
-const results = await esCircuitBreaker.fire(() => elasticsearch.search(query));
-```
-
-**Fallback Behavior**:
-- Elasticsearch down: Fall back to PostgreSQL full-text search (slower but functional)
-- Redis down: Sessions from PostgreSQL backup table, skip caching
-- RabbitMQ down: Write to PostgreSQL outbox table, process later
-
-### Idempotency
-
-**Review Creation**:
-- Client generates `Idempotency-Key` header (UUID)
-- Server checks Redis for existing key before processing
-- Key stored for 24 hours to handle retries
-
-```typescript
-// Idempotency middleware
-const idempotencyKey = req.headers['idempotency-key'];
-if (idempotencyKey) {
-  const existing = await redis.get(`idempotency:${idempotencyKey}`);
-  if (existing) return res.json(JSON.parse(existing));
-}
-
-// Process request...
-
-if (idempotencyKey) {
-  await redis.setex(`idempotency:${idempotencyKey}`, 86400, JSON.stringify(result));
-}
-```
-
-### Disaster Recovery (Local Dev)
-
-For local development, simplified DR:
-
-1. **Database Backup**: `pg_dump` script, daily cron
-2. **Elasticsearch Re-index**: Full re-index from PostgreSQL on demand
-3. **MinIO**: Local filesystem backup
-
-**Production Considerations** (not implemented for local dev):
-- Multi-region PostgreSQL replication
-- Elasticsearch cross-cluster replication
-- S3 cross-region replication
-- RTO: 1 hour, RPO: 5 minutes
 
 ## Scalability Considerations
 
@@ -817,433 +615,101 @@ For local development, simplified DR:
 | Redis | Redis Cluster (16K slots) | Memory > 80% |
 | RabbitMQ | Clustering + federation | Queue depth growing |
 
-### Database Sharding Strategy (Future)
+### Database Sharding Strategy
 
-When single PostgreSQL instance is insufficient:
-
-1. **Shard by city/region**: Most queries are geo-local
-2. **Shard key**: `city_id` or geohash prefix
-3. **Cross-shard queries**: Scatter-gather for global searches
-
-### Read Replica Configuration
-
-```
-                    +-------------+
-                    | Primary DB  |  <-- Writes
-                    +------+------+
-                           |
-            +--------------+--------------+
-            |              |              |
-      +-----v-----+  +-----v-----+  +-----v-----+
-      | Replica 1 |  | Replica 2 |  | Replica 3 |  <-- Reads
-      +-----------+  +-----------+  +-----------+
-```
-
-Replication lag: < 100ms acceptable for this use case (eventual consistency for reads).
+When single PostgreSQL instance is insufficient, shard by city/region. Most queries are geo-local, making city-based sharding natural. Cross-shard queries (global search) use scatter-gather. Read replicas handle the read-heavy search enrichment workload with < 100ms replication lag.
 
 ## Trade-offs Summary
 
-### PostgreSQL + PostGIS vs. MongoDB + GeoJSON
-
-**Chose PostgreSQL because**:
-- ACID transactions for review/rating consistency
-- Mature PostGIS with rich spatial functions
-- Simpler operational model (single RDBMS)
-
-**Trade-off**: MongoDB's flexible schema might speed initial development, but PostgreSQL's constraints catch bugs early.
-
-### Elasticsearch vs. PostgreSQL Full-Text Search
-
-**Chose Elasticsearch because**:
-- Better relevance tuning (BM25, custom scoring)
-- Native geo_distance sorting
-- Faceted search (aggregations) out of the box
-- Autocomplete with edge n-grams
-
-**Trade-off**: Adds operational complexity and sync requirements. For < 100K businesses, PostgreSQL `tsvector` + `pg_trgm` might suffice.
-
-### Redis vs. Memcached
-
-**Chose Redis/Valkey because**:
-- Data structures (sorted sets for leaderboards, hashes for sessions)
-- Persistence options if needed
-- Pub/sub for real-time features (future)
-
-**Trade-off**: Memcached has simpler multi-threaded model, but Redis's feature set wins for this use case.
-
-### RabbitMQ vs. Kafka
-
-**Chose RabbitMQ because**:
-- Simpler for request-response and work queues
-- Built-in DLQ, priority queues, TTL
-- Lower resource footprint for local dev
-
-**Trade-off**: Kafka better for event sourcing, high-throughput streams, replay. If adding analytics pipeline, consider Kafka.
-
-## Cost Tradeoffs (Production Estimates)
-
-| Component | Local Dev Cost | Production Monthly (AWS) |
-|-----------|---------------|-------------------------|
-| PostgreSQL | Free (Docker) | $200-500 (RDS db.r6g.large) |
-| Elasticsearch | Free (Docker) | $300-600 (OpenSearch m6g.large) |
-| Redis | Free (Docker) | $50-100 (ElastiCache r6g.large) |
-| Object Storage | Free (MinIO) | $50-100 (S3, ~500GB) |
-| Compute (API) | Free (local) | $200-400 (3x t3.medium) |
-| **Total** | $0 | **$800-1700/month** |
-
-**Cost Optimization Strategies**:
-- Reserved instances for predictable workloads (30-40% savings)
-- S3 Intelligent Tiering for photos
-- Elasticsearch UltraWarm for old data
-- Spot instances for index workers
-
-## Future Optimizations
-
-### Short-term (Next Iteration)
-- [ ] Implement Bayesian rating for fairer ranking (account for review count)
-- [ ] Add review photo uploads with automatic resizing
-- [ ] Implement spam detection (naive Bayes classifier)
-- [ ] Add real-time review notifications via WebSocket
-
-### Medium-term
-- [ ] Map-based browsing with marker clustering
-- [ ] Personalized search ranking (user preferences, history)
-- [ ] Business owner analytics dashboard
-- [ ] Mobile app API optimization (GraphQL or response compression)
-
-### Long-term
-- [ ] Machine learning for review sentiment analysis
-- [ ] Recommendation engine ("Users who liked X also liked Y")
-- [ ] Multi-language support with translation API
-- [ ] Real-time bidding for featured placements
-
-## Observability Dashboard
-
-### Grafana Dashboard Panels
-
-1. **Overview**
-   - Request rate (RPS) by endpoint
-   - Error rate (5xx percentage)
-   - p50/p95/p99 latency
-
-2. **Database**
-   - Query duration histogram
-   - Active connections
-   - Replication lag
-
-3. **Search**
-   - Elasticsearch query latency
-   - Index size and document count
-   - Cache hit ratio
-
-4. **Queue**
-   - Message publish/consume rate
-   - Queue depth
-   - DLQ size
-
-5. **Business Metrics**
-   - Reviews per hour
-   - Searches per hour
-   - New user signups
-
----
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Primary DB | PostgreSQL + PostGIS | MongoDB + GeoJSON | ACID transactions, mature geo support |
+| Search | Elasticsearch | PostgreSQL tsvector | Better relevance, geo_distance, facets |
+| Cache | Redis/Valkey | Memcached | Data structures, persistence, pub/sub |
+| Queue | RabbitMQ | Kafka | Simpler for work queues, DLQ built-in |
+| Rating | Trigger-based aggregation | Materialized views | Real-time accuracy |
+| Index sync | Async via RabbitMQ | Synchronous dual-write | Non-blocking writes |
+| Auth | Session-based (Redis) | JWT | Immediate revocation, simpler |
 
 ## Implementation Notes
 
-This section documents the implemented production-ready features and explains **why** each pattern was chosen based on system design principles.
+This section documents the actual local setup, what production patterns are implemented, what was simplified, and what was omitted.
 
-### Redis Caching Strategy
-
-**Implementation**: Redis caching for business listings, reviews, and search results with configurable TTLs.
-
-**Why caching reduces geo-query load**:
-
-1. **Geo-queries are computationally expensive**: PostGIS `ST_DWithin` and `ST_Distance` operations require scanning and calculating distances for many rows, even with spatial indexes. Each geo-query involves trigonometric calculations that are CPU-intensive.
-
-2. **Search patterns are repetitive**: Users in the same area often search for similar businesses (e.g., "pizza near downtown"). Caching search results for 2 minutes means the first user pays the computation cost, and subsequent users with similar queries get instant responses.
-
-3. **Business data changes infrequently**: Business hours, addresses, and descriptions rarely change, making them excellent cache candidates. We use a 5-minute TTL for business details, which provides a 70%+ cache hit rate for popular businesses.
-
-4. **Rating aggregation is expensive**: Computing average ratings across thousands of reviews requires aggregation queries. Pre-computed ratings cached in Redis avoid this overhead on every request.
-
-**Cache Key Design**:
-```
-search:{sha256(query+filters)}   -> [results]     TTL: 2 min  (short - ratings change)
-business:{id}                     -> {details}    TTL: 5 min  (medium - rarely changes)
-review:{id}                       -> {review}     TTL: 5 min  (medium)
-autocomplete:{prefix}             -> [suggestions] TTL: 5 min
-```
-
-### Idempotency for Review Submission
-
-**Implementation**: `Idempotency-Key` header support with Redis-based deduplication.
-
-**Why idempotency prevents duplicate reviews**:
-
-1. **Network unreliability is guaranteed**: Mobile users on unstable connections will experience timeouts and retry requests. Without idempotency, a successful review submission that times out on the response will be retried, creating duplicate reviews.
-
-2. **Database unique constraints are insufficient**: While we have a `UNIQUE(user_id, business_id)` constraint, this only prevents the same user from reviewing twice - not the same submission from being processed twice. If a user updates their review, the constraint won't catch retry duplicates.
-
-3. **User experience matters**: Users clicking "Submit" multiple times out of impatience shouldn't create multiple reviews or see confusing error messages.
-
-4. **Implementation approach**:
-   - Client generates a UUID `Idempotency-Key` header before sending the request
-   - Server checks Redis for existing key before processing
-   - If found, return the cached response (same status, same body)
-   - If not found, acquire a lock, process the request, cache the response
-   - Keys expire after 24 hours to prevent unbounded storage growth
-
-**Example Flow**:
-```
-Request 1: POST /reviews, Idempotency-Key: abc-123
-  -> Lock acquired, review created, response cached, return 201
-
-Request 2: POST /reviews, Idempotency-Key: abc-123 (retry)
-  -> Key found in cache, return cached 201 response (no duplicate created)
-```
-
-### Rate Limiting for Reviews
-
-**Implementation**: Multi-layer rate limiting using Redis sliding window counters.
-
-**Why rate limiting prevents review spam**:
-
-1. **Spam undermines trust**: Fake reviews (both positive and negative) destroy the platform's core value proposition. A competitor could automate negative reviews of rivals, or a business could flood itself with fake positive reviews.
-
-2. **User-based limits aren't enough**: A determined spammer can create multiple accounts. We implement multiple rate limit layers:
-   - **Per-user global**: 10 reviews/hour (prevents account-based spam)
-   - **Per-IP**: 20 reviews/hour (catches multi-account spam from same source)
-   - **Per-user-per-business**: 2 actions/day (prevents review update spam)
-   - **Vote rate limiting**: 5 votes/minute (prevents vote manipulation)
-
-3. **Sliding window is more accurate than fixed window**: Fixed windows have a burst problem at window boundaries (user could submit 10 reviews at 11:59 and 10 more at 12:01). Sliding window counters in Redis provide smooth rate limiting.
-
-4. **Fail-open design**: If Redis is unavailable, we allow requests rather than blocking all users. This trades temporary vulnerability for availability.
-
-**Rate Limit Headers**:
-```
-X-RateLimit-Limit: 10
-X-RateLimit-Remaining: 7
-X-RateLimit-Reset: 1642089600
-Retry-After: 3600  (only on 429 response)
-```
-
-### Search Metrics for Ranking Optimization
-
-**Implementation**: Prometheus metrics for search queries, including cache hits, geo-queries, category filters, result counts, and latency histograms.
-
-**Why search metrics enable ranking optimization**:
-
-1. **Understanding user intent**: By tracking what users search for and what they click, we can improve search relevance. Metrics like `yelp_searches_total{category="restaurants", has_geo="true"}` reveal that most searches are location-based restaurant queries, informing our optimization priorities.
-
-2. **Detecting search quality issues**: If `yelp_search_results_count` histogram shows many searches returning 0 results, we know users aren't finding what they need. This could indicate:
-   - Missing business data in certain areas
-   - Poor text matching (need synonym support)
-   - Overly restrictive filters
-
-3. **Cache effectiveness monitoring**: `yelp_cache_hit_ratio` tells us if our caching strategy is working. A low hit rate might mean:
-   - TTLs are too short
-   - Query diversity is too high (need query normalization)
-   - Cache capacity is insufficient
-
-4. **Performance regression detection**: `yelp_search_duration_seconds` histogram with percentiles (p50, p95, p99) allows alerting on latency regressions. If p95 exceeds 500ms, we know to investigate.
-
-5. **A/B testing ranking algorithms**: With metrics in place, we can experiment with different ranking factors:
-   - Weight rating vs. review count
-   - Boost verified businesses
-   - Factor in recency of reviews
-   - Personalize based on user history
-
-**Key Metrics Implemented**:
-```
-yelp_searches_total{cache_hit, has_geo, has_category}
-yelp_search_duration_seconds{cache_hit}
-yelp_search_results_count (histogram)
-yelp_reviews_created_total{rating}
-yelp_reviews_rejected_total{reason}
-yelp_circuit_breaker_state{name}
-```
-
-### Circuit Breaker for External Services
-
-**Implementation**: Opossum circuit breaker wrapping Elasticsearch and heavy PostgreSQL geo-queries.
-
-**Why circuit breakers improve resilience**:
-
-1. **Cascading failure prevention**: If Elasticsearch becomes slow or unresponsive, without circuit breakers, every API server thread would block waiting for ES responses. This would exhaust connection pools and crash the entire API layer. Circuit breakers "fail fast" after detecting failures.
-
-2. **Graceful degradation**: When the circuit opens, we fall back to PostgreSQL full-text search. It's slower and less feature-rich, but the platform remains functional.
-
-3. **Self-healing**: After a timeout (30 seconds), the circuit enters "half-open" state and allows test requests. If they succeed, normal operation resumes automatically.
-
-**Circuit Breaker States**:
-```
-CLOSED (normal) -> OPEN (after 5 failures in 50% of requests)
-OPEN (failing fast) -> HALF_OPEN (after 30 second timeout)
-HALF_OPEN (testing) -> CLOSED (if test requests succeed)
-HALF_OPEN (testing) -> OPEN (if test requests fail)
-```
-
-### Structured Logging with Pino
-
-**Implementation**: JSON-structured logging with request IDs, user context, and component tagging.
-
-**Benefits**:
-- **Searchability**: JSON logs are easily parsed by log aggregation tools (ELK, Datadog)
-- **Correlation**: Request IDs allow tracing a single request across all log entries
-- **Security**: Sensitive fields (passwords, tokens) are automatically redacted
-- **Performance**: Pino is the fastest Node.js logger, critical for high-throughput APIs
-
-## Frontend Architecture
-
-The frontend is built with React 19, TypeScript, TanStack Router, and Tailwind CSS. The codebase follows a modular component architecture to ensure maintainability, reusability, and clear separation of concerns.
-
-### Directory Structure
+### Local Architecture
 
 ```
-frontend/src/
-├── components/           # Reusable UI components
-│   ├── business/         # Business detail page components
-│   │   ├── index.ts            # Barrel export
-│   │   ├── PhotoGallery.tsx    # Image carousel with navigation
-│   │   ├── BusinessHeader.tsx  # Name, rating, categories display
-│   │   ├── BusinessSidebar.tsx # Contact info and hours
-│   │   ├── ReviewForm.tsx      # Review submission form
-│   │   └── ReviewsList.tsx     # Paginated reviews display
-│   ├── admin/            # Admin dashboard components
-│   │   ├── index.ts            # Barrel export
-│   │   ├── AdminTabs.tsx       # Tab navigation
-│   │   ├── OverviewTab.tsx     # Stats cards and top cities
-│   │   ├── UsersTab.tsx        # User management table
-│   │   ├── BusinessesTab.tsx   # Business management table
-│   │   └── ReviewsTab.tsx      # Review moderation list
-│   ├── dashboard/        # Business owner dashboard components
-│   │   ├── index.ts            # Barrel export
-│   │   ├── BusinessManageHeader.tsx  # Header with back button
-│   │   ├── BusinessInfoForm.tsx      # Business editing form
-│   │   └── BusinessReviewsManagement.tsx # Review response UI
-│   ├── BusinessCard.tsx  # Business listing card
-│   ├── Header.tsx        # Global navigation header
-│   ├── ReviewCard.tsx    # Individual review display
-│   └── StarRating.tsx    # Star rating components
-├── routes/               # TanStack Router file-based routes
-│   ├── __root.tsx        # Root layout with Header
-│   ├── index.tsx         # Home page
-│   ├── search.tsx        # Search results page
-│   ├── business.$slug.tsx      # Business detail page
-│   ├── login.tsx         # Login form
-│   ├── register.tsx      # Registration form
-│   ├── dashboard.tsx     # Business owner dashboard
-│   ├── dashboard.business.$id.tsx  # Business management
-│   ├── dashboard.business.new.tsx  # New business form
-│   ├── admin.tsx         # Admin dashboard
-│   └── profile.tsx       # User profile page
-├── services/             # API client and services
-│   └── api.ts            # Axios-based API client
-├── stores/               # Zustand state management
-│   └── authStore.ts      # Authentication state
-└── types/                # TypeScript type definitions
-    └── index.ts          # Shared type interfaces
+┌──────────────────────────────────────────────────────────┐
+│                    React Frontend                         │
+│           (Vite dev server, localhost:5173)               │
+└─────────────────────────┬────────────────────────────────┘
+                          │ HTTP
+                          ▼
+┌──────────────────────────────────────────────────────────┐
+│              Express API Server (localhost:3001)           │
+│                  (or 3002/3003 for multi-instance)        │
+└────┬──────────┬──────────┬──────────┬────────────────────┘
+     │          │          │          │
+     ▼          ▼          ▼          ▼
+┌─────────┐ ┌────────┐ ┌───────┐ ┌─────────┐
+│PostgreSQL│ │ Valkey │ │Elastic│ │RabbitMQ │
+│+ PostGIS│ │ :6379  │ │Search │ │ :5672   │
+│  :5432  │ │        │ │ :9200 │ │ :15672  │
+└─────────┘ └────────┘ └───────┘ └────┬────┘
+                                      │
+                                ┌─────▼────┐   ┌────────┐
+                                │  Index   │   │ MinIO  │
+                                │  Worker  │   │ :9000  │
+                                └──────────┘   └────────┘
 ```
 
-### Component Organization Principles
+All infrastructure runs via `docker-compose up -d` using `docker-compose.yml`.
 
-1. **Feature-based grouping**: Components are organized by feature/page (business, admin, dashboard) rather than by type (buttons, forms, modals).
+### Production Patterns Actually Implemented
 
-2. **Barrel exports**: Each component directory has an `index.ts` that exports all public components, enabling clean imports:
-   ```typescript
-   import { PhotoGallery, BusinessHeader, BusinessSidebar } from '../components/business';
-   ```
+| Pattern | Implementation | File Path |
+|---------|---------------|-----------|
+| Circuit breaker | Opossum wrapping Elasticsearch queries | `backend/src/utils/circuitBreaker.ts` |
+| Structured logging | Pino with JSON output and request context | `backend/src/utils/logger.ts` |
+| Prometheus metrics | prom-client with search/review/cache counters | `backend/src/utils/metrics.ts` |
+| Redis caching | Cache-aside for search results (2min), businesses (5min) | `backend/src/utils/redis.ts` |
+| Idempotency keys | Redis-backed deduplication for review creation | `backend/src/utils/idempotency.ts` |
+| Rate limiting | express-rate-limit with multi-layer limits | `backend/src/utils/reviewRateLimit.ts` |
+| Async ES indexing | RabbitMQ queue with Index Worker consumer | `backend/src/workers/indexWorker.ts` |
+| ES full-text search | Autocomplete, geo_distance, faceted search | `backend/src/utils/elasticsearch.ts` |
+| PostGIS geo-queries | ST_DWithin, ST_Distance with GIST index | `backend/src/routes/businesses/nearby.ts` |
+| Object storage | MinIO for photo uploads | `backend/src/utils/storage.ts` |
+| Session auth | Cookie-based sessions with Redis | `backend/src/middleware/auth.ts` |
+| RBAC | user, business_owner, admin roles | `backend/src/middleware/auth.ts` |
 
-3. **Component size limits**: Route components are kept under 250 lines by extracting logical sections into sub-components. Individual components aim for under 150 lines.
+### What Was Simplified or Substituted
 
-4. **Props interfaces**: All components define explicit TypeScript interfaces for their props, with JSDoc comments explaining each property.
+| Production Design | Local Substitute | Why |
+|-------------------|-----------------|-----|
+| S3 + CloudFront | MinIO (single node, port 9000) | S3-compatible API, no AWS account needed |
+| AWS ALB / API Gateway | Direct Express server (port 3001) | No load balancer configured |
+| PostgreSQL read replicas | Single PostgreSQL instance | Sufficient for dev-scale queries |
+| Redis Cluster | Single Valkey instance | < 100MB data, no sharding needed |
+| Multi-node Elasticsearch | Single ES node (512MB heap) | Dev-scale index fits in memory |
+| CDN for static assets | Vite dev server serves directly | No caching layer for assets |
+| OAuth / SSO | Cookie-based session auth | Simpler, avoids OAuth provider setup |
+| Grafana dashboards | Prometheus `/metrics` endpoint only | Metrics exposed but no visualization |
+| Multi-region deployment | Single machine, all services | Learning project, not HA |
 
-5. **Colocation**: Helper functions and sub-components that are only used by a single component are colocated in the same file rather than extracted.
+### What Was Omitted
 
-### Component Patterns
-
-#### Route Components
-Route components (in `routes/`) handle:
-- Data fetching via the API service
-- State management (loading, error, success states)
-- Authentication/authorization checks
-- Composition of feature components
-
-```typescript
-function BusinessDetailPage() {
-  // 1. Route params and auth
-  const { slug } = Route.useParams();
-  const { isAuthenticated } = useAuthStore();
-
-  // 2. State management
-  const [business, setBusiness] = useState<Business | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-
-  // 3. Data fetching
-  useEffect(() => { loadBusiness(); }, [slug]);
-
-  // 4. Render composition
-  return (
-    <div>
-      <PhotoGallery photos={photos} businessName={business.name} />
-      <BusinessHeader business={business} />
-      <BusinessSidebar business={business} />
-      <ReviewsList reviews={reviews} onVote={handleVote} />
-    </div>
-  );
-}
-```
-
-#### Presentational Components
-Feature components are primarily presentational:
-- Receive data via props
-- Emit events via callback props
-- No direct API calls
-- Minimal internal state (UI-only state like form inputs)
-
-```typescript
-interface BusinessHeaderProps {
-  business: Business;
-}
-
-export function BusinessHeader({ business }: BusinessHeaderProps) {
-  return (
-    <div className="mb-8">
-      <h1 className="text-3xl font-bold">{business.name}</h1>
-      <StarRating rating={business.rating} />
-    </div>
-  );
-}
-```
-
-### State Management
-
-- **Global state**: Zustand store for authentication (`authStore.ts`)
-- **Server state**: Local component state with `useState` for API data
-- **UI state**: Local component state for form inputs, toggles, etc.
-
-### API Integration
-
-All API calls go through the centralized `api.ts` service which:
-- Configures base URL from environment
-- Handles authentication headers
-- Provides typed request/response methods
-- Manages error handling
-
-```typescript
-import api from '../services/api';
-
-const response = await api.get<{ business: Business }>(`/businesses/${slug}`);
-```
-
-### Styling Approach
-
-- **Tailwind CSS**: Utility-first styling
-- **No CSS-in-JS**: All styles via Tailwind classes
-- **Responsive design**: Mobile-first with `md:` and `lg:` breakpoints
-- **Color palette**: Uses custom `yelp-red` and `yelp-blue` theme colors
+- CDN / edge caching (CloudFront, Cloudflare)
+- Multi-region PostgreSQL replication
+- Database sharding by city/region
+- Kubernetes / container orchestration
+- CI/CD pipeline for backend deployment
+- OAuth / social login integration
+- Review spam detection (ML-based classifier)
+- Recommendation engine ("Users who liked X also liked Y")
+- A/B testing infrastructure for search ranking
+- Distributed tracing (OpenTelemetry integration)
+- Push notifications
+- Map-based browsing with marker clustering
 
 ---
 
-*Architecture document for local development learning project. Production deployment would require additional considerations for multi-region, compliance, and operational runbooks.*
+*Architecture document for a local development learning project. Production deployment would require additional considerations for multi-region, compliance, and operational runbooks.*

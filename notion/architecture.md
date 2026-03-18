@@ -2,13 +2,13 @@
 
 ## System Overview
 
-Notion is a block-based collaborative workspace. Core challenges involve real-time editing, flexible block structures, and hierarchical organization.
+Notion is a block-based collaborative workspace combining document editing, databases, and team organization. Core challenges involve real-time editing with conflict resolution, flexible block data structures, hierarchical page organization, and database views.
 
 **Learning Goals:**
-- Implement real-time collaboration (CRDT/OT)
+- Implement real-time collaboration (CRDT-based)
 - Design flexible block-based data models
 - Build hierarchical permission systems
-- Handle offline-first architecture
+- Handle offline-first architecture patterns
 
 ---
 
@@ -16,50 +16,94 @@ Notion is a block-based collaborative workspace. Core challenges involve real-ti
 
 ### Functional Requirements
 
-1. **Edit**: Block-based document editing
-2. **Collaborate**: Real-time multi-user editing
-3. **Organize**: Pages, databases, workspaces
-4. **Share**: Granular permissions
-5. **Database**: Structured data with views
+1. **Edit**: Block-based document editing with rich text, headings, lists, code, quotes, callouts, toggles, and dividers
+2. **Collaborate**: Real-time multi-user editing with presence and operation broadcasting
+3. **Organize**: Workspaces, nested pages (recursive hierarchy), sidebar navigation
+4. **Share**: Workspace membership with roles (admin, member, guest) and page-level permissions
+5. **Database**: Structured data with properties schema, table/board/list views, filtering, and sorting
 
 ### Non-Functional Requirements
 
-- **Latency**: < 100ms for local edits
-- **Sync**: < 500ms for cross-user sync
-- **Offline**: Full editing capability offline
-- **Scale**: 10M workspaces, 1B blocks
+- **Latency**: < 100ms for local edits (optimistic apply)
+- **Sync**: < 500ms for cross-user operation propagation
+- **Offline**: Full editing capability offline with sync on reconnect
+- **Scale**: 10M workspaces, 1B blocks, 100M pages
+- **Availability**: 99.99% uptime for editing and sync
+- **Consistency**: Eventual consistency via CRDTs, strong consistency for permissions
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Target |
+|--------|--------|
+| Registered users | 30M |
+| Daily active users | 5M |
+| Concurrent editors | 500K |
+| Workspaces | 10M |
+| Total blocks | 1B |
+| Peak API RPS | 300K |
+| Peak WebSocket messages/sec | 1M |
+
+### Storage Breakdown (Production)
+
+| Data Type | Size | Growth |
+|-----------|------|--------|
+| Blocks (content JSONB) | 5TB | 500GB/year |
+| Pages metadata | 500GB | 50GB/year |
+| Database rows + properties | 2TB | 300GB/year |
+| Operations log | 10TB | 3TB/year |
+| Audit log | 1TB | 200GB/year |
+| File attachments (S3) | 50TB | 10TB/year |
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│       React + Block Editor + CRDT Runtime + IndexedDB           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ WebSocket
-┌─────────────────────────────────────────────────────────────────┐
-│                   Sync Server Cluster                           │
-│         (Real-time operation broadcast + conflict resolution)   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Server                                   │
-│         - Workspaces - Pages - Permissions - Search             │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────────────────────────────────┤
-│   PostgreSQL    │              Elasticsearch                    │
-│   - Blocks      │              - Full-text search               │
-│   - Pages       │              - Block content                  │
-│   - Workspaces  │                                               │
-└─────────────────┴───────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                        Client Layer                                   │
+│     React + Block Editor + CRDT Runtime + Zustand + IndexedDB        │
+└────────────────────────────────┬─────────────────────────────────────┘
+                                 │
+                    HTTP REST + WebSocket (wss://)
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                     CDN / Edge Layer                                  │
+│              Static assets, SSL termination, DDoS protection         │
+└────────────────────────────────┬─────────────────────────────────────┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                  API Gateway / Load Balancer                          │
+│              Rate limiting, auth verification, routing               │
+└──────┬──────────────────────────────────────────┬────────────────────┘
+       │                                          │
+       ▼                                          ▼
+┌──────────────────┐                   ┌──────────────────────┐
+│   API Servers    │                   │   Sync Servers       │
+│  (REST + CRUD)   │                   │  (WebSocket + CRDT)  │
+│  Workspaces,     │                   │  Operation broadcast │
+│  Pages, Blocks,  │                   │  Presence tracking   │
+│  Databases       │                   │  Conflict resolution │
+└──────┬───────────┘                   └──────────┬───────────┘
+       │                                          │
+       ├──────────────────────────────────────────┤
+       │                                          │
+       ▼                                          ▼
+┌──────────────────┐  ┌──────────────┐  ┌──────────────────┐
+│   PostgreSQL     │  │ Redis/Valkey │  │    RabbitMQ      │
+│   (Primary +     │  │  (Sessions,  │  │  (Export jobs,   │
+│    Replicas)     │  │   Cache,     │  │   Notifications, │
+│                  │  │   Presence,  │  │   Search index,  │
+│  Blocks, Pages,  │  │   Pub/Sub)   │  │   Email)         │
+│  Workspaces,     │  │              │  │                  │
+│  Permissions,    │  └──────────────┘  └──────────────────┘
+│  Audit Log       │
+└──────────────────┘
 ```
 
 ---
@@ -68,291 +112,295 @@ Notion is a block-based collaborative workspace. Core challenges involve real-ti
 
 ### 1. Block Data Model
 
-**Block Structure:**
-```typescript
-interface Block {
-  id: string
-  type: BlockType
-  parentId: string | null
-  pageId: string
-  properties: Record<string, any>
-  content: RichText[]
-  children: string[] // Ordered child block IDs
-  createdAt: Date
-  updatedAt: Date
-  createdBy: string
-}
+Everything in Notion is a block. Text, headings, code, images, and even databases are blocks. This unified model enables composable structures -- a toggle block can contain any other blocks as children, a page is a block container, and a database row is a page with properties.
 
-type BlockType =
-  | 'text'
-  | 'heading_1' | 'heading_2' | 'heading_3'
-  | 'bulleted_list' | 'numbered_list' | 'toggle'
-  | 'code' | 'quote' | 'callout'
-  | 'image' | 'video' | 'embed'
-  | 'table' | 'database'
-```
+Each block has a type, a properties JSONB column for type-specific data, a content JSONB column for rich text, and a fractional index position for ordering. Child blocks reference their parent via `parent_block_id`.
 
-**Rich Text:**
-```typescript
-interface RichText {
-  text: string
-  annotations: {
-    bold?: boolean
-    italic?: boolean
-    underline?: boolean
-    strikethrough?: boolean
-    code?: boolean
-    color?: string
-  }
-  link?: string
-}
-```
+Block types implemented: `text`, `heading_1`, `heading_2`, `heading_3`, `bulleted_list`, `numbered_list`, `toggle`, `code`, `quote`, `callout`, `divider`.
 
-### 2. Real-Time Collaboration
+### 2. Fractional Indexing for Block Order
 
-**CRDT Approach (Conflict-Free):**
-```typescript
-// Each block operation is a CRDT operation
-interface Operation {
-  id: string
-  type: 'insert' | 'delete' | 'update'
-  blockId: string
-  parentId?: string
-  position?: FractionalIndex // For ordering
-  properties?: Partial<Block>
-  timestamp: HybridLogicalClock
-  author: string
-}
+Instead of integer positions that require reindexing all siblings on every insert, blocks use string-based fractional indexes. Inserting between positions "a" and "b" produces "aU" -- a string that sorts lexicographically between them. This enables O(1) insertions without touching other blocks.
 
-// Fractional indexing for ordering
-// Allows inserting between any two blocks without reindexing
-function insertBetween(before: string, after: string): string {
-  // Returns a string that sorts between 'before' and 'after'
-  // e.g., insertBetween('a', 'b') → 'aU'
-}
-```
+The trade-off: fractional index strings grow in length with repeated insertions between the same pair. After ~50 consecutive insertions, strings can reach 20+ characters. Periodic compaction (rewriting all positions as evenly-spaced strings during a quiet period) keeps string lengths manageable.
 
-**Sync Protocol:**
-```typescript
-// Client maintains local operation log
-class SyncClient {
-  private pendingOps: Operation[] = []
-  private confirmedVersion: number = 0
+### 3. Real-Time Collaboration (CRDT)
 
-  async applyLocal(op: Operation) {
-    // Apply immediately to local state
-    this.applyOp(op)
-    this.pendingOps.push(op)
+CRDTs (Conflict-Free Replicated Data Types) are used instead of OT for conflict resolution. CRDTs guarantee that applying the same set of operations in any order produces the same final state, eliminating the need for a central ordering authority.
 
-    // Send to server
-    this.ws.send({ type: 'operation', op })
-  }
+**Why CRDT over OT**: Notion's offline-first requirement means clients may accumulate hours of edits before reconnecting. OT requires transforming each queued operation against every operation that occurred on the server during the offline period -- for 1000 queued operations against 500 server operations, this is O(500K) transformations. CRDTs merge in O(n) regardless of divergence because operations are commutative and idempotent.
 
-  handleServerOp(op: Operation) {
-    // Apply remote operation, handling conflicts
-    if (!this.hasOp(op.id)) {
-      this.applyOp(op)
-    }
-  }
+The trade-off: CRDT operations carry more metadata (Hybrid Logical Clock timestamps, node IDs) increasing payload size by ~40%. For a block-level CRDT (not character-level), this is ~100 extra bytes per operation -- acceptable.
 
-  handleAck(opId: string) {
-    this.pendingOps = this.pendingOps.filter(op => op.id !== opId)
-  }
-}
-```
+**Hybrid Logical Clock (HLC)** provides causal ordering across distributed clients. It combines a physical wall clock with a logical counter for same-millisecond events and a unique node ID for tie-breaking.
 
-### 3. Page Hierarchy
+**Sync Protocol**:
+1. Client connects with auth token via WebSocket
+2. Client subscribes to a page
+3. Server sends current presence list
+4. Operations are applied locally first (optimistic)
+5. Operations sent to server, broadcast to other clients
+6. Server acknowledges each operation
 
-**Recursive Page Structure:**
-```sql
--- Pages can contain other pages
-CREATE TABLE pages (
-  id UUID PRIMARY KEY,
-  workspace_id UUID REFERENCES workspaces(id),
-  parent_id UUID REFERENCES pages(id), -- NULL for root pages
-  title VARCHAR(500),
-  icon VARCHAR(100),
-  cover_image VARCHAR(500),
-  is_database BOOLEAN DEFAULT FALSE,
-  properties_schema JSONB, -- For databases
-  created_at TIMESTAMP DEFAULT NOW()
-);
+### 4. Page Hierarchy
 
--- Blocks belong to pages
-CREATE TABLE blocks (
-  id UUID PRIMARY KEY,
-  page_id UUID REFERENCES pages(id),
-  parent_block_id UUID REFERENCES blocks(id), -- NULL for top-level
-  type VARCHAR(50) NOT NULL,
-  properties JSONB,
-  content JSONB, -- Rich text array
-  position VARCHAR(100), -- Fractional index
-  created_at TIMESTAMP DEFAULT NOW()
-);
-```
+Pages form a recursive tree structure via `parent_id` self-reference. Root pages have `parent_id = NULL` and belong to a workspace. The sidebar renders this tree using recursive queries (`WITH RECURSIVE` CTEs in PostgreSQL).
 
-### 4. Database Views
+At production scale with deeply nested pages (10+ levels), recursive queries become expensive. The solution is a materialized path column (e.g., `/workspace-id/page-a/page-b/page-c`) that enables prefix-based queries for subtrees without recursion.
 
-**View Types:**
-```typescript
-interface DatabaseView {
-  id: string
-  databaseId: string
-  type: 'table' | 'board' | 'list' | 'calendar' | 'gallery'
-  name: string
-  filter: Filter[]
-  sort: Sort[]
-  properties: PropertyVisibility[]
-}
+### 5. Database Views
 
-// Board view groups by a select property
-interface BoardView extends DatabaseView {
-  type: 'board'
-  groupBy: string // Property ID (select type)
-}
+A database is a page with `is_database = TRUE` and a `properties_schema` JSONB column defining the schema (property name, type, options). Rows are stored in `database_rows` with a `properties` JSONB column holding values.
 
-// Calendar view requires a date property
-interface CalendarView extends DatabaseView {
-  type: 'calendar'
-  dateProperty: string // Property ID (date type)
-}
-```
+Views are saved configurations that define:
+- **View type**: table, board (Kanban), or list
+- **Filters**: which rows to show based on property conditions
+- **Sorts**: row ordering by one or more properties
+- **Group by**: for board view, which select property defines columns
+- **Property visibility**: which columns are shown and their widths
+
+Same data, different presentations. This is a key insight: views are cheap (just configuration) while data is shared.
 
 ---
 
 ## Database Schema
 
 ```sql
+-- Users
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    avatar_url VARCHAR(500),
+    role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Workspaces
 CREATE TABLE workspaces (
-  id UUID PRIMARY KEY,
-  name VARCHAR(200) NOT NULL,
-  owner_id UUID REFERENCES users(id),
-  settings JSONB,
-  created_at TIMESTAMP DEFAULT NOW()
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(200) NOT NULL,
+    icon VARCHAR(100),
+    owner_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    settings JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Workspace members
 CREATE TABLE workspace_members (
-  workspace_id UUID REFERENCES workspaces(id),
-  user_id UUID REFERENCES users(id),
-  role VARCHAR(20) DEFAULT 'member',
-  PRIMARY KEY (workspace_id, user_id)
+    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(20) DEFAULT 'member' CHECK (role IN ('admin', 'member', 'guest')),
+    joined_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (workspace_id, user_id)
 );
 
--- Pages (recursive)
+-- Pages (recursive hierarchy)
 CREATE TABLE pages (
-  id UUID PRIMARY KEY,
-  workspace_id UUID REFERENCES workspaces(id),
-  parent_id UUID REFERENCES pages(id),
-  title VARCHAR(500) DEFAULT 'Untitled',
-  icon VARCHAR(100),
-  is_database BOOLEAN DEFAULT FALSE,
-  properties_schema JSONB,
-  created_by UUID REFERENCES users(id),
-  created_at TIMESTAMP DEFAULT NOW()
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+    parent_id UUID REFERENCES pages(id) ON DELETE CASCADE,
+    title VARCHAR(500) DEFAULT 'Untitled',
+    icon VARCHAR(100),
+    cover_image VARCHAR(500),
+    is_database BOOLEAN DEFAULT FALSE,
+    properties_schema JSONB DEFAULT '[]',
+    position VARCHAR(100) DEFAULT 'a',
+    is_archived BOOLEAN DEFAULT FALSE,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Blocks
 CREATE TABLE blocks (
-  id UUID PRIMARY KEY,
-  page_id UUID REFERENCES pages(id),
-  parent_block_id UUID REFERENCES blocks(id),
-  type VARCHAR(50) NOT NULL,
-  properties JSONB,
-  content JSONB,
-  position VARCHAR(100),
-  version INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    page_id UUID REFERENCES pages(id) ON DELETE CASCADE,
+    parent_block_id UUID REFERENCES blocks(id) ON DELETE CASCADE,
+    type VARCHAR(50) NOT NULL DEFAULT 'text',
+    properties JSONB DEFAULT '{}',
+    content JSONB DEFAULT '[]',
+    position VARCHAR(100) DEFAULT 'a',
+    version INTEGER DEFAULT 0,
+    is_collapsed BOOLEAN DEFAULT FALSE,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Database views
+CREATE TABLE database_views (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    page_id UUID REFERENCES pages(id) ON DELETE CASCADE,
+    name VARCHAR(200) DEFAULT 'Default View',
+    type VARCHAR(20) DEFAULT 'table' CHECK (type IN ('table', 'board', 'list', 'calendar', 'gallery')),
+    filter JSONB DEFAULT '[]',
+    sort JSONB DEFAULT '[]',
+    group_by VARCHAR(100),
+    properties_visibility JSONB DEFAULT '[]',
+    position VARCHAR(100) DEFAULT 'a',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Database rows (pages that are database entries)
+CREATE TABLE database_rows (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    database_id UUID REFERENCES pages(id) ON DELETE CASCADE,
+    properties JSONB DEFAULT '{}',
+    position VARCHAR(100) DEFAULT 'a',
+    is_archived BOOLEAN DEFAULT FALSE,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Page permissions (override workspace-level)
+CREATE TABLE page_permissions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    page_id UUID REFERENCES pages(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    permission VARCHAR(20) DEFAULT 'view' CHECK (permission IN ('view', 'edit', 'full_access')),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(page_id, user_id)
+);
+
+-- Sessions
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(500) UNIQUE NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Operations log for CRDT sync
+CREATE TABLE operations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    page_id UUID REFERENCES pages(id) ON DELETE CASCADE,
+    block_id UUID,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('insert', 'update', 'delete', 'move')),
+    data JSONB NOT NULL,
+    timestamp BIGINT NOT NULL,
+    author_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Audit log (append-only for compliance)
+CREATE TABLE audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    user_id UUID NOT NULL,
+    resource_type VARCHAR(50) NOT NULL,
+    resource_id UUID NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    metadata JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### Key Indexes
+
+```sql
+CREATE INDEX idx_pages_workspace ON pages(workspace_id);
+CREATE INDEX idx_pages_parent ON pages(parent_id);
 CREATE INDEX idx_blocks_page ON blocks(page_id);
 CREATE INDEX idx_blocks_parent ON blocks(parent_block_id);
+CREATE INDEX idx_blocks_position ON blocks(page_id, position);
+CREATE INDEX idx_database_rows_database ON database_rows(database_id);
+CREATE INDEX idx_operations_page ON operations(page_id);
+CREATE INDEX idx_operations_timestamp ON operations(page_id, timestamp);
+CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_audit_log_user ON audit_log(user_id, timestamp DESC);
+CREATE INDEX idx_audit_log_resource ON audit_log(resource_type, resource_id, timestamp DESC);
+```
+
+---
+
+## API Design
+
+```
+Authentication:
+POST   /api/auth/register              - Create account
+POST   /api/auth/login                 - Create session
+POST   /api/auth/logout                - Destroy session
+GET    /api/auth/me                    - Get current user
+
+Workspaces:
+GET    /api/workspaces                 - List user's workspaces
+POST   /api/workspaces                 - Create workspace
+GET    /api/workspaces/:id             - Get workspace details
+PUT    /api/workspaces/:id             - Update workspace
+GET    /api/workspaces/:id/members     - List members
+POST   /api/workspaces/:id/members     - Add member
+DELETE /api/workspaces/:id/members/:uid - Remove member
+
+Pages:
+GET    /api/pages?workspace_id=        - List pages in workspace
+POST   /api/pages                      - Create page
+GET    /api/pages/:id                  - Get page with blocks
+PUT    /api/pages/:id                  - Update page metadata
+DELETE /api/pages/:id                  - Archive page
+
+Blocks:
+GET    /api/pages/:id/blocks           - List blocks for page
+POST   /api/pages/:id/blocks           - Create block
+PUT    /api/blocks/:id                 - Update block content/properties
+DELETE /api/blocks/:id                 - Delete block
+
+Databases:
+GET    /api/databases/:id/rows         - List rows with filters/sorts
+POST   /api/databases/:id/rows         - Create row
+PUT    /api/databases/:id/rows/:rid    - Update row properties
+GET    /api/databases/:id/views        - List views
+POST   /api/databases/:id/views        - Create view
+PUT    /api/databases/:id/views/:vid   - Update view configuration
+
+WebSocket:
+WS /ws                                - Real-time sync endpoint
+  → subscribe(pageId)                  - Join page for updates
+  → operation(op)                      - Send block operation
+  → presence(pageId, cursor)           - Cursor/presence update
+  ← operation(op, userId)              - Receive remote operation
+  ← presence(users)                    - Presence list update
+  ← ack(opId)                          - Operation acknowledged
 ```
 
 ---
 
 ## Key Design Decisions
 
-### 1. CRDT for Collaboration
+### 1. CRDT for Collaboration (Not OT)
 
-**Decision**: Use CRDTs instead of OT for conflict resolution
+CRDTs guarantee convergence without a central authority, making them ideal for offline-first editing. When a user edits offline for an hour and reconnects, their operations merge automatically without the O(n*m) transformation cost of OT. The server becomes a relay, not an authority -- it broadcasts operations and persists them, but does not transform them.
 
-**Rationale**:
-- No central authority needed
-- Better offline support
-- Deterministic merge
-- Simpler server logic
+The trade-off: character-level text CRDTs (like Yjs or Automerge) add ~2x storage overhead for the internal CRDT state. At block-level granularity (our current implementation), the overhead is minimal -- each block operation is ~200 bytes regardless of text length. Full character-level CRDT for rich text within blocks is a future enhancement.
 
-**Trade-off**: Slightly larger operation payloads
+### 2. Blocks as Universal Primitive
 
-### 2. Fractional Indexing for Order
+Making everything a block (text, headings, code, images, databases) provides a unified editing experience and data model. A toggle block can contain any other blocks as children. A database row is a page which contains blocks. This composability is Notion's key differentiator.
 
-**Decision**: Use string-based fractional indexes for block ordering
+The trade-off: the blocks table becomes the hottest table in the system. With 1B blocks, queries must be carefully indexed. We index on `(page_id, position)` for ordered retrieval and `(parent_block_id)` for tree traversal. At scale, sharding by page_id keeps all blocks for a page on the same shard.
 
-**Rationale**:
-- Insert between any two blocks
-- No reindexing of siblings
-- Naturally sortable strings
+### 3. Fractional Indexing for Order
 
-### 3. Blocks as Core Primitive
+Integer positions require reindexing all subsequent siblings when inserting in the middle of a list. With 100 blocks in a page and frequent reordering, this creates write amplification. Fractional indexes (lexicographically sortable strings) enable O(1) insertions by generating a string between any two existing positions.
 
-**Decision**: Everything is a block (text, images, databases)
-
-**Rationale**:
-- Unified data model
-- Composable structures
-- Consistent editing experience
+The trade-off: string positions grow with repeated insertions between the same pair. After ~50 insertions, positions can reach 20+ characters. Periodic compaction (rewriting positions as evenly-spaced strings) is needed, but this is a background operation that does not block editing.
 
 ---
 
-## Trade-offs Summary
+## Caching Strategy
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Sync | CRDT | OT | Offline support |
-| Ordering | Fractional index | Array index | No reindexing |
-| Storage | PostgreSQL | Document DB | Relational queries |
-| Real-time | WebSocket | SSE | Bidirectional |
+### Cache-Aside for Read-Heavy Data
 
----
-
-## Caching and Edge Strategy
-
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CDN (Static Assets)                       │
-│           - JS bundles, CSS, images, fonts                       │
-│           - TTL: 1 year (versioned filenames)                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      API Gateway / Load Balancer                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-            ┌─────────────────┴─────────────────┐
-            ▼                                   ▼
-┌───────────────────────┐           ┌───────────────────────┐
-│      API Server       │           │     Sync Server       │
-└───────────────────────┘           └───────────────────────┘
-            │                                   │
-            ▼                                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Redis/Valkey Cache Cluster                    │
-│     - Sessions, Page metadata, Block cache, Presence            │
-└─────────────────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         PostgreSQL                               │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Cache Strategy by Data Type
+Pages and blocks are read far more often than written. A popular team wiki page might have 100 views per edit. Cache-aside with Redis reduces database load:
 
 | Data Type | Strategy | TTL | Invalidation |
 |-----------|----------|-----|--------------|
@@ -363,1120 +411,217 @@ CREATE INDEX idx_blocks_parent ON blocks(parent_block_id);
 | Search results | Cache-aside | 2 minutes | Time-based expiry only |
 | Presence (who is online) | Write-through | 30 seconds | Heartbeat refresh |
 
-### Cache-Aside Pattern (Read-Heavy Data)
-
-Used for page metadata and block content where reads far exceed writes.
-
-```typescript
-// Cache key structure
-const CACHE_KEYS = {
-  page: (pageId: string) => `page:${pageId}`,
-  blocks: (pageId: string) => `blocks:${pageId}`,
-  workspace: (wsId: string) => `workspace:${wsId}`,
-  workspaceMembers: (wsId: string) => `workspace:${wsId}:members`,
-};
-
-async function getPageWithBlocks(pageId: string): Promise<PageWithBlocks> {
-  const cacheKey = CACHE_KEYS.blocks(pageId);
-
-  // Try cache first
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  // Cache miss: fetch from database
-  const page = await db.query(`
-    SELECT p.*, json_agg(b ORDER BY b.position) as blocks
-    FROM pages p
-    LEFT JOIN blocks b ON b.page_id = p.id
-    WHERE p.id = $1
-    GROUP BY p.id
-  `, [pageId]);
-
-  // Store in cache
-  await redis.setex(cacheKey, 600, JSON.stringify(page)); // 10 min TTL
-
-  return page;
-}
-```
-
-### Write-Through Pattern (Critical Data)
-
-Used for sessions and presence where consistency is important.
-
-```typescript
-async function updatePresence(userId: string, pageId: string): Promise<void> {
-  const presenceKey = `presence:${pageId}`;
-  const userData = { userId, lastSeen: Date.now() };
-
-  // Write to cache immediately (source of truth for presence)
-  await redis.hset(presenceKey, userId, JSON.stringify(userData));
-  await redis.expire(presenceKey, 30); // Auto-expire if no heartbeat
-
-  // Broadcast to other clients on this page
-  await redis.publish(`page:${pageId}:presence`, JSON.stringify({
-    type: 'presence_update',
-    user: userData
-  }));
-}
-```
-
-### Cache Invalidation Rules
-
-**Event-Driven Invalidation:**
-
-```typescript
-// Block operations invalidate page cache
-async function handleBlockOperation(op: Operation): Promise<void> {
-  // Apply operation to database
-  await applyToDatabase(op);
-
-  // Invalidate affected caches
-  await redis.del(CACHE_KEYS.blocks(op.pageId));
-
-  // If it's a page title change, invalidate parent's child list
-  if (op.type === 'update' && op.properties?.title) {
-    const page = await db.query('SELECT parent_id FROM pages WHERE id = $1', [op.pageId]);
-    if (page.parent_id) {
-      await redis.del(CACHE_KEYS.page(page.parent_id));
-    }
-  }
-}
-
-// Membership changes invalidate workspace cache
-async function handleMembershipChange(workspaceId: string): Promise<void> {
-  await redis.del(CACHE_KEYS.workspaceMembers(workspaceId));
-}
-```
-
-**Stale-While-Revalidate for Search:**
-
-```typescript
-async function searchBlocks(query: string, workspaceId: string): Promise<SearchResult[]> {
-  const cacheKey = `search:${workspaceId}:${hashQuery(query)}`;
-
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    // Return cached immediately, refresh in background
-    setImmediate(() => refreshSearchCache(cacheKey, query, workspaceId));
-    return JSON.parse(cached);
-  }
-
-  return await executeSearchAndCache(cacheKey, query, workspaceId);
-}
-```
-
-### Local Development Setup
-
-For local development, use a single Valkey instance:
-
-```yaml
-# docker-compose.yml addition
-services:
-  valkey:
-    image: valkey/valkey:7.2
-    ports:
-      - "6379:6379"
-    volumes:
-      - valkey_data:/data
-    command: valkey-server --appendonly yes
-
-volumes:
-  valkey_data:
-```
-
-Environment configuration:
-
-```bash
-REDIS_URL=redis://localhost:6379
-CACHE_TTL_PAGE=300          # 5 minutes for page metadata
-CACHE_TTL_BLOCKS=600        # 10 minutes for block content
-CACHE_TTL_SESSION=86400     # 24 hours for sessions
-```
+Cache invalidation is event-driven: when a block is updated, the page cache is invalidated. When a page title changes, the parent page's child list cache is invalidated.
 
 ---
 
 ## Async Queue and Background Jobs
 
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Producers                                │
-│    API Server | Sync Server | Scheduled Tasks (cron)            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      RabbitMQ Exchange                           │
-│            (Topic exchange for flexible routing)                 │
-├─────────────────────────────────────────────────────────────────┤
-│                         Queues                                   │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐            │
-│  │   fanout     │ │   search     │ │   export     │            │
-│  │  (presence,  │ │  (index      │ │  (PDF,       │            │
-│  │   realtime)  │ │   updates)   │ │   Markdown)  │            │
-│  └──────────────┘ └──────────────┘ └──────────────┘            │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐            │
-│  │  webhooks    │ │   cleanup    │ │   email      │            │
-│  │  (external   │ │  (stale      │ │  (invites,   │            │
-│  │   notify)    │ │   sessions)  │ │   shares)    │            │
-│  └──────────────┘ └──────────────┘ └──────────────┘            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Consumers                                │
-│    Worker processes (can scale independently per queue)          │
-└─────────────────────────────────────────────────────────────────┘
-```
+RabbitMQ handles asynchronous workloads that should not block user requests:
 
 ### Queue Definitions
 
-```typescript
-// Queue configuration with delivery semantics
-const QUEUES = {
-  // High priority, low latency - presence and realtime fanout
-  fanout: {
-    name: 'notion.fanout',
-    durable: true,
-    prefetch: 50,        // Process many at once
-    ttl: 30_000,         // Messages expire after 30s (stale presence is useless)
-    retries: 0,          // No retries - fanout is best-effort
-    deadLetter: false,
-  },
+| Queue | Prefetch | Retries | TTL | Semantics | Purpose |
+|-------|----------|---------|-----|-----------|---------|
+| `notion.fanout` | 50 | 0 | 30s | At-most-once | Real-time presence, cursor updates |
+| `notion.notifications` | 10 | 3 | 1h | At-least-once | In-app notifications |
+| `notion.export` | 2 | 5 | 24h | Exactly-once* | PDF/Markdown export (resource-intensive) |
+| `notion.email` | 10 | 3 | 24h | At-least-once | Invite emails, share notifications |
+| `notion.search` | 10 | 3 | 1h | At-least-once | Search index updates (idempotent) |
 
-  // Medium priority - search index updates
-  search: {
-    name: 'notion.search',
-    durable: true,
-    prefetch: 10,
-    ttl: 3600_000,       // 1 hour
-    retries: 3,
-    deadLetter: 'notion.search.dlq',
-  },
+*Exactly-once via idempotency keys stored in Redis.
 
-  // Low priority, high reliability - exports
-  export: {
-    name: 'notion.export',
-    durable: true,
-    prefetch: 2,         // Resource-intensive
-    ttl: 86400_000,      // 24 hours
-    retries: 5,
-    deadLetter: 'notion.export.dlq',
-  },
+### Why Async for Exports
 
-  // External integrations
-  webhooks: {
-    name: 'notion.webhooks',
-    durable: true,
-    prefetch: 5,
-    ttl: 3600_000,
-    retries: 5,          // External services may be temporarily down
-    deadLetter: 'notion.webhooks.dlq',
-  },
+Export operations (PDF, Markdown) are time-consuming (seconds for large pages), resource-intensive (CPU/memory for rendering), and would timeout if handled synchronously. The API returns immediately with a job ID; the worker processes the export and notifies the user when complete. Prefetch of 2 prevents a single worker from consuming too much memory.
 
-  // Background maintenance
-  cleanup: {
-    name: 'notion.cleanup',
-    durable: true,
-    prefetch: 1,
-    ttl: null,           // No expiry
-    retries: 3,
-    deadLetter: 'notion.cleanup.dlq',
-  },
-
-  // Transactional email
-  email: {
-    name: 'notion.email',
-    durable: true,
-    prefetch: 10,
-    ttl: 86400_000,
-    retries: 3,
-    deadLetter: 'notion.email.dlq',
-  },
-};
-```
-
-### Message Types and Handlers
-
-```typescript
-// Fanout messages - broadcast to connected clients
-interface FanoutMessage {
-  type: 'operation' | 'presence' | 'cursor';
-  pageId: string;
-  excludeConnectionId?: string; // Don't send back to originator
-  payload: any;
-}
-
-// Search index updates - eventual consistency with Elasticsearch
-interface SearchIndexMessage {
-  type: 'index_block' | 'delete_block' | 'reindex_page';
-  blockId?: string;
-  pageId: string;
-  content?: string;
-  workspaceId: string;
-}
-
-// Export jobs - long-running tasks
-interface ExportMessage {
-  type: 'pdf' | 'markdown' | 'html';
-  pageId: string;
-  userId: string;
-  options: {
-    includeSubpages: boolean;
-    includeImages: boolean;
-  };
-  callbackUrl?: string;
-}
-```
-
-### Consumer Implementation with Backpressure
-
-```typescript
-import amqp from 'amqplib';
-
-class QueueConsumer {
-  private channel: amqp.Channel;
-  private processing = 0;
-  private maxConcurrent: number;
-
-  constructor(queueConfig: typeof QUEUES[keyof typeof QUEUES]) {
-    this.maxConcurrent = queueConfig.prefetch;
-  }
-
-  async start(handler: (msg: any) => Promise<void>): Promise<void> {
-    const connection = await amqp.connect(process.env.RABBITMQ_URL);
-    this.channel = await connection.createChannel();
-
-    // Prefetch limits in-flight messages (backpressure)
-    await this.channel.prefetch(this.maxConcurrent);
-
-    await this.channel.consume(this.queueConfig.name, async (msg) => {
-      if (!msg) return;
-
-      this.processing++;
-      const startTime = Date.now();
-
-      try {
-        const content = JSON.parse(msg.content.toString());
-        await handler(content);
-        this.channel.ack(msg);
-
-        metrics.recordJobDuration(this.queueConfig.name, Date.now() - startTime);
-        metrics.incrementJobSuccess(this.queueConfig.name);
-
-      } catch (error) {
-        const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
-
-        if (retryCount <= this.queueConfig.retries) {
-          // Requeue with exponential backoff
-          await this.requeueWithDelay(msg, retryCount);
-        } else {
-          // Send to dead letter queue
-          if (this.queueConfig.deadLetter) {
-            await this.sendToDeadLetter(msg, error);
-          }
-          this.channel.ack(msg); // Remove from main queue
-        }
-
-        metrics.incrementJobFailure(this.queueConfig.name);
-      } finally {
-        this.processing--;
-      }
-    });
-  }
-
-  private async requeueWithDelay(msg: amqp.Message, retryCount: number): Promise<void> {
-    const delay = Math.min(1000 * Math.pow(2, retryCount), 60000); // Max 1 minute
-
-    // Use delayed message exchange or scheduled requeue
-    setTimeout(() => {
-      this.channel.publish('', this.queueConfig.name, msg.content, {
-        headers: { 'x-retry-count': retryCount }
-      });
-      this.channel.ack(msg);
-    }, delay);
-  }
-}
-```
-
-### Delivery Semantics
-
-| Queue | Semantics | Rationale |
-|-------|-----------|-----------|
-| fanout | At-most-once | Stale presence/cursor data is worse than missing it |
-| search | At-least-once | Duplicate index updates are idempotent |
-| export | Exactly-once* | Use idempotency key to prevent duplicate exports |
-| webhooks | At-least-once | External systems should handle duplicates |
-| cleanup | At-least-once | Cleanup operations are idempotent |
-| email | At-least-once | Email providers dedupe by message-id |
-
-*Exactly-once achieved via idempotency keys stored in Redis with TTL matching job TTL.
-
-### Local Development Setup
-
-```yaml
-# docker-compose.yml addition
-services:
-  rabbitmq:
-    image: rabbitmq:3.12-management
-    ports:
-      - "5672:5672"    # AMQP
-      - "15672:15672"  # Management UI
-    environment:
-      RABBITMQ_DEFAULT_USER: notion
-      RABBITMQ_DEFAULT_PASS: notion_local
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-
-volumes:
-  rabbitmq_data:
-```
-
-Environment configuration:
-
-```bash
-RABBITMQ_URL=amqp://notion:notion_local@localhost:5672
-QUEUE_PREFETCH_DEFAULT=10
-QUEUE_RETRY_MAX=3
-```
-
-### Running Workers Locally
-
-```bash
-# Run all workers in development
-npm run dev:workers
-
-# Or run specific workers
-npm run dev:worker:search
-npm run dev:worker:export
-npm run dev:worker:email
-```
+Dead letter queues capture permanently failed jobs for investigation. Exponential backoff on retry (1s, 2s, 4s, 8s) prevents retry storms against temporarily unavailable dependencies.
 
 ---
 
 ## Observability
 
-### Three Pillars Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Observability Stack                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
-│  │   Metrics   │   │    Logs     │   │   Traces    │           │
-│  │ (Prometheus)│   │ (Structured │   │  (OpenTel   │           │
-│  │             │   │    JSON)    │   │   /Jaeger)  │           │
-│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘           │
-│         │                 │                 │                   │
-│         └────────────┬────┴────────────────┘                   │
-│                      ▼                                          │
-│            ┌─────────────────┐                                  │
-│            │     Grafana     │                                  │
-│            │   (Dashboards)  │                                  │
-│            └─────────────────┘                                  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
 ### Metrics (Prometheus)
 
-**Application Metrics:**
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_request_duration_seconds{method,route,status}` | Histogram | API latency SLI |
+| `websocket_connections_total{server_id}` | Gauge | WebSocket load distribution |
+| `crdt_operations_total{type,status}` | Counter | Operation throughput and error rate |
+| `rabbitmq_queue_depth{queue_name}` | Gauge | Backpressure indicator |
+| `cache_hits_total{cache_type}` | Counter | Cache effectiveness |
+| `cache_misses_total{cache_type}` | Counter | Cache effectiveness |
 
-```typescript
-import { Counter, Histogram, Gauge, Registry } from 'prom-client';
+### SLIs and Alerts
 
-const registry = new Registry();
-
-// Request latency by endpoint
-const httpRequestDuration = new Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'Duration of HTTP requests',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
-  registers: [registry],
-});
-
-// WebSocket connections
-const wsConnectionsGauge = new Gauge({
-  name: 'websocket_connections_total',
-  help: 'Current number of WebSocket connections',
-  labelNames: ['server_id'],
-  registers: [registry],
-});
-
-// Operations processed
-const operationsCounter = new Counter({
-  name: 'crdt_operations_total',
-  help: 'Total CRDT operations processed',
-  labelNames: ['type', 'status'], // type: insert/update/delete, status: success/conflict/error
-  registers: [registry],
-});
-
-// Queue depth
-const queueDepthGauge = new Gauge({
-  name: 'rabbitmq_queue_depth',
-  help: 'Current messages in queue',
-  labelNames: ['queue_name'],
-  registers: [registry],
-});
-
-// Cache hit rate
-const cacheHitsCounter = new Counter({
-  name: 'cache_hits_total',
-  help: 'Cache hit count',
-  labelNames: ['cache_type'], // page, blocks, session, search
-  registers: [registry],
-});
-
-const cacheMissesCounter = new Counter({
-  name: 'cache_misses_total',
-  help: 'Cache miss count',
-  labelNames: ['cache_type'],
-  registers: [registry],
-});
-```
-
-**SLI Definitions:**
-
-| SLI | Metric | Target | Alert Threshold |
-|-----|--------|--------|-----------------|
-| API Availability | `sum(rate(http_requests{status!~"5.."}[5m])) / sum(rate(http_requests[5m]))` | 99.9% | < 99.5% for 5min |
-| API Latency (p95) | `histogram_quantile(0.95, http_request_duration_seconds)` | < 200ms | > 500ms for 5min |
-| Sync Latency (p95) | `histogram_quantile(0.95, operation_sync_duration_seconds)` | < 500ms | > 1s for 5min |
-| WebSocket Availability | `websocket_connections_total > 0` per server | 100% | Any server at 0 for 1min |
-| Queue Lag | `rabbitmq_queue_depth{queue="search"}` | < 1000 | > 5000 for 10min |
-| Cache Hit Rate | `cache_hits / (cache_hits + cache_misses)` | > 80% | < 60% for 15min |
+| SLI | Target | Alert Threshold |
+|-----|--------|-----------------|
+| API availability | 99.9% | < 99.5% for 5 min |
+| API latency p95 | < 200ms | > 500ms for 5 min |
+| Sync latency p95 | < 500ms | > 1s for 5 min |
+| WebSocket availability | 100% per server | Any server at 0 connections for 1 min |
+| Queue lag (search) | < 1000 messages | > 5000 for 10 min |
+| Cache hit rate | > 80% | < 60% for 15 min |
+| Dead letter queue | 0 | > 100 for 30 min |
 
 ### Structured Logging
 
-```typescript
-import pino from 'pino';
-
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label }),
-  },
-  base: {
-    service: 'notion-api',
-    version: process.env.APP_VERSION,
-    environment: process.env.NODE_ENV,
-  },
-});
-
-// Request logging middleware
-app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
-  const startTime = Date.now();
-
-  // Attach logger with request context
-  req.log = logger.child({
-    requestId,
-    method: req.method,
-    path: req.path,
-    userId: req.user?.id,
-  });
-
-  res.on('finish', () => {
-    req.log.info({
-      statusCode: res.statusCode,
-      durationMs: Date.now() - startTime,
-      contentLength: res.get('content-length'),
-    }, 'request completed');
-  });
-
-  next();
-});
-
-// Operation logging
-function logOperation(op: Operation, context: { pageId: string; userId: string }) {
-  logger.info({
-    event: 'crdt_operation',
-    operationId: op.id,
-    operationType: op.type,
-    blockId: op.blockId,
-    pageId: context.pageId,
-    userId: context.userId,
-    timestamp: op.timestamp,
-  }, 'operation applied');
-}
-```
-
-**Log Levels by Event Type:**
-
-| Event | Level | Example |
-|-------|-------|---------|
-| Request completed | info | HTTP request with timing |
-| Operation applied | info | CRDT operation processed |
-| Cache miss | debug | Cache key not found |
-| Conflict resolved | warn | CRDT merge required |
-| Queue full | warn | Backpressure triggered |
-| Database error | error | Query failed |
-| Unhandled exception | error | Crash with stack trace |
-
-### Distributed Tracing
-
-```typescript
-import { trace, SpanStatusCode } from '@opentelemetry/api';
-import { NodeSDK } from '@opentelemetry/sdk-node';
-import { JaegerExporter } from '@opentelemetry/exporter-jaeger';
-
-// Initialize tracing
-const sdk = new NodeSDK({
-  serviceName: 'notion-api',
-  traceExporter: new JaegerExporter({
-    endpoint: process.env.JAEGER_ENDPOINT || 'http://localhost:14268/api/traces',
-  }),
-});
-sdk.start();
-
-const tracer = trace.getTracer('notion-api');
-
-// Trace a page load with all sub-operations
-async function getPageWithTracing(pageId: string): Promise<Page> {
-  return tracer.startActiveSpan('getPage', async (span) => {
-    try {
-      span.setAttribute('page.id', pageId);
-
-      // Cache lookup span
-      const cached = await tracer.startActiveSpan('cache.get', async (cacheSpan) => {
-        const result = await redis.get(`page:${pageId}`);
-        cacheSpan.setAttribute('cache.hit', !!result);
-        cacheSpan.end();
-        return result;
-      });
-
-      if (cached) {
-        span.setAttribute('cache.hit', true);
-        span.end();
-        return JSON.parse(cached);
-      }
-
-      // Database query span
-      const page = await tracer.startActiveSpan('db.query', async (dbSpan) => {
-        dbSpan.setAttribute('db.statement', 'SELECT page with blocks');
-        const result = await db.query('SELECT ...');
-        dbSpan.setAttribute('db.rows_affected', result.rowCount);
-        dbSpan.end();
-        return result;
-      });
-
-      span.setStatus({ code: SpanStatusCode.OK });
-      span.end();
-      return page;
-
-    } catch (error) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
-      span.recordException(error);
-      span.end();
-      throw error;
-    }
-  });
-}
-```
+Pino JSON logger with request context (requestId, method, path, userId). Log levels: `info` for completed requests and applied operations, `warn` for CRDT conflicts and queue backpressure, `error` for database failures and unhandled exceptions.
 
 ### Audit Logging
 
-Security-relevant events logged separately for compliance and debugging.
+Security-relevant events logged to an append-only `audit_log` table for compliance:
+- Page sharing and permission changes
+- Workspace member additions/removals
+- Page exports
+- Authentication events (login, logout, failures)
+- Block deletions
 
-```typescript
-interface AuditEvent {
-  timestamp: string;
-  eventType: string;
-  userId: string;
-  resourceType: 'page' | 'workspace' | 'block' | 'user';
-  resourceId: string;
-  action: 'create' | 'read' | 'update' | 'delete' | 'share' | 'export';
-  metadata: Record<string, any>;
-  ipAddress: string;
-  userAgent: string;
-}
+Indexed by user, resource, and timestamp for efficient querying during incident investigation.
 
-class AuditLogger {
-  async log(event: Omit<AuditEvent, 'timestamp'>): Promise<void> {
-    const auditRecord: AuditEvent = {
-      ...event,
-      timestamp: new Date().toISOString(),
-    };
+---
 
-    // Write to dedicated audit table (append-only)
-    await db.query(`
-      INSERT INTO audit_log (timestamp, event_type, user_id, resource_type,
-                             resource_id, action, metadata, ip_address, user_agent)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    `, [
-      auditRecord.timestamp,
-      auditRecord.eventType,
-      auditRecord.userId,
-      auditRecord.resourceType,
-      auditRecord.resourceId,
-      auditRecord.action,
-      JSON.stringify(auditRecord.metadata),
-      auditRecord.ipAddress,
-      auditRecord.userAgent,
-    ]);
+## Failure Handling
 
-    // Also log to structured logs for real-time alerting
-    logger.info({ audit: auditRecord }, 'audit event');
-  }
-}
+### Graceful Degradation
 
-// Audit log table schema
-/*
-CREATE TABLE audit_log (
-  id BIGSERIAL PRIMARY KEY,
-  timestamp TIMESTAMPTZ NOT NULL,
-  event_type VARCHAR(100) NOT NULL,
-  user_id UUID NOT NULL,
-  resource_type VARCHAR(50) NOT NULL,
-  resource_id UUID NOT NULL,
-  action VARCHAR(50) NOT NULL,
-  metadata JSONB,
-  ip_address INET,
-  user_agent TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
+| Failure | Behavior | User Impact |
+|---------|----------|-------------|
+| Redis down | Sessions from PostgreSQL, skip cache | Slower page loads, no presence |
+| RabbitMQ down | Skip async jobs, log for retry | Exports queued locally, delayed notifications |
+| PostgreSQL readonly | Disable writes, show banner | View-only mode |
+| WebSocket disconnect | Auto-reconnect with exponential backoff | 1-5s interruption in sync |
+| Single API server down | LB routes to others | Transparent to users |
 
-CREATE INDEX idx_audit_log_user ON audit_log(user_id, timestamp DESC);
-CREATE INDEX idx_audit_log_resource ON audit_log(resource_type, resource_id, timestamp DESC);
-CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp DESC);
-*/
-```
+### Retry Strategy
 
-**Audit Events to Capture:**
+Exponential backoff with jitter for all retryable operations. Queue consumers use prefetch-based backpressure -- a slow consumer naturally reduces its intake without affecting other consumers or the message broker.
 
-| Event | Trigger | Metadata |
-|-------|---------|----------|
-| page.created | New page created | parentId, title |
-| page.shared | Page permissions changed | shareType, recipientId |
-| page.exported | Page exported | format, includeSubpages |
-| workspace.member_added | User joined workspace | role, invitedBy |
-| workspace.member_removed | User removed from workspace | removedBy, reason |
-| user.login | Successful authentication | method (password/oauth) |
-| user.login_failed | Failed authentication | reason, attemptCount |
-| block.deleted | Block permanently deleted | blockType, pageId |
+---
 
-### Grafana Dashboards
+## Scalability Considerations
 
-**Dashboard 1: API Health**
-- Request rate by endpoint (line chart)
-- p50/p95/p99 latency (line chart with thresholds)
-- Error rate by status code (stacked bar)
-- Active WebSocket connections (gauge)
+### What Breaks First
 
-**Dashboard 2: Real-Time Sync**
-- Operations per second by type (line chart)
-- Sync latency distribution (heatmap)
-- Conflict rate (counter with alert)
-- Connected users per page (table)
+1. **Blocks table** at 1B rows. Shard by page_id so all blocks for a page live on one shard. This preserves single-shard queries for page loads (the most common operation).
+2. **WebSocket connections** at ~10K per server. Add sync servers horizontally. Redis pub/sub distributes operations across servers. At extreme scale, move to Kafka with partitioning by page_id.
+3. **Database queries** (filter + sort on JSONB properties) become expensive with millions of rows. Move database properties to a columnar store or pre-compute views into materialized tables.
+4. **Operations log** grows fastest. Time-based partitioning with automatic archival of partitions older than 90 days.
 
-**Dashboard 3: Background Jobs**
-- Queue depth by queue (line chart)
-- Job processing rate (line chart)
-- Job failure rate (line chart with alert)
-- Dead letter queue size (gauge with alert)
+### Horizontal Scaling Path
 
-**Dashboard 4: Cache Performance**
-- Hit rate by cache type (line chart)
-- Eviction rate (line chart)
-- Memory usage (gauge)
-- Key count (gauge)
+- **API servers**: Stateless, scale behind load balancer
+- **Sync servers**: Partitioned by page_id hash, Redis pub/sub for cross-partition messages
+- **PostgreSQL**: Read replicas for page listing, write primary for block operations, sharding by workspace_id at extreme scale
+- **RabbitMQ**: Separate queues per priority level, scale consumers independently per queue
+- **Redis**: Redis Cluster with hash slots, dedicated instances for cache vs. pub/sub
 
-### Local Development Setup
+---
 
-```yaml
-# docker-compose.yml additions
-services:
-  prometheus:
-    image: prom/prometheus:v2.47.0
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
+## Trade-offs Summary
 
-  grafana:
-    image: grafana/grafana:10.2.0
-    ports:
-      - "3001:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./grafana/datasources:/etc/grafana/provisioning/datasources
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.50
-    ports:
-      - "16686:16686"  # UI
-      - "14268:14268"  # HTTP collector
-
-volumes:
-  prometheus_data:
-  grafana_data:
-```
-
-**prometheus.yml:**
-
-```yaml
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'notion-api'
-    static_configs:
-      - targets: ['host.docker.internal:3000']
-    metrics_path: /metrics
-
-  - job_name: 'notion-sync'
-    static_configs:
-      - targets: ['host.docker.internal:3002']
-    metrics_path: /metrics
-```
-
-### Alert Rules
-
-```yaml
-# alerts.yml (Prometheus alerting rules)
-groups:
-  - name: notion-alerts
-    rules:
-      - alert: HighErrorRate
-        expr: sum(rate(http_requests_total{status_code=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.01
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Error rate above 1%"
-
-      - alert: HighLatency
-        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 0.5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "p95 latency above 500ms"
-
-      - alert: QueueBacklog
-        expr: rabbitmq_queue_depth{queue="search"} > 5000
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Search queue backlog growing"
-
-      - alert: LowCacheHitRate
-        expr: sum(rate(cache_hits_total[15m])) / (sum(rate(cache_hits_total[15m])) + sum(rate(cache_misses_total[15m]))) < 0.6
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Cache hit rate below 60%"
-
-      - alert: DeadLetterQueueGrowing
-        expr: rabbitmq_queue_depth{queue=~".*\\.dlq"} > 100
-        for: 30m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Dead letter queue has unprocessed messages"
-```
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Conflict resolution | CRDT | OT | Offline support, no central authority needed |
+| Block ordering | Fractional index | Array index | O(1) insertions, no sibling reindexing |
+| Block storage | PostgreSQL JSONB | Document DB (MongoDB) | Relational queries for permissions, hierarchy |
+| Real-time transport | WebSocket | SSE | Bidirectional needed for operations + acks |
+| Async jobs | RabbitMQ | Redis queues | Durable, dead letter queues, per-queue scaling |
+| Session auth | Cookie + Redis | JWT | Instant revocation, simpler WebSocket auth |
+| Caching | Redis cache-aside | Application-level LRU | Shared across server instances |
 
 ---
 
 ## Implementation Notes
 
-This section documents the actual implementation of caching, async queues, observability, and audit logging in the backend codebase.
+This section documents the actual local implementation: what was built, what was simplified, and what was omitted.
 
-### Why Caching Reduces Load for Frequently Accessed Pages
-
-Pages and their blocks are read far more often than they are written. In a collaborative workspace like Notion:
-
-1. **Read-heavy workload**: Users view pages constantly (navigating, reading) while edits happen less frequently
-2. **Shared content**: Popular pages (team docs, wikis) are accessed by many users simultaneously
-3. **Database cost**: Each page view requires multiple JOIN queries (page + blocks + children + views)
-
-**Implementation**: We use the **cache-aside pattern** in `/backend/src/shared/cache.ts`:
-
-```typescript
-// Cache-aside: check cache first, fetch from DB on miss, then cache
-const pageContent = await cacheAside(
-  CACHE_KEYS.pageWithBlocks(pageId),
-  CACHE_TTL.page,  // 5 minutes
-  async () => {
-    // Only hit database on cache miss
-    const blocks = await pool.query('SELECT * FROM blocks WHERE page_id = $1', [pageId]);
-    return { blocks: blocks.rows, ... };
-  },
-  'page'
-);
-```
-
-**Cache invalidation** is event-driven - when a block is updated, we invalidate the page cache:
-
-```typescript
-// In blocks route after update
-await invalidatePageCache(block.page_id);
-```
-
-**Trade-offs**:
-- TTL of 5-10 minutes balances freshness vs load reduction
-- Eventual consistency: other users may see stale content briefly
-- Memory cost: Redis stores serialized page data
-
-### Why Async Queues Enable Reliable Export/Import Jobs
-
-Export operations (PDF, Markdown) are:
-1. **Time-consuming**: Rendering a large page with images takes seconds
-2. **Resource-intensive**: High CPU/memory for PDF generation
-3. **User-blocking**: Synchronous export would timeout or freeze the UI
-
-**Implementation**: We use RabbitMQ in `/backend/src/shared/queue.ts`:
-
-```typescript
-// Non-blocking: Returns immediately, user gets notified when done
-await publishExportJob({
-  type: 'pdf',
-  pageId: pageId,
-  userId: userId,
-  options: { includeSubpages: true, includeImages: true },
-  callbackUrl: '/api/exports/complete',
-});
-```
-
-**Queue configurations** are tuned per use case:
-
-| Queue | Prefetch | Retries | TTL | Rationale |
-|-------|----------|---------|-----|-----------|
-| fanout | 50 | 0 | 30s | Real-time, best-effort |
-| export | 2 | 5 | 24h | Resource-heavy, must succeed |
-| search | 10 | 3 | 1h | Index updates, idempotent |
-
-**Backpressure handling**:
-- Prefetch limits concurrent jobs per worker
-- Dead letter queues capture permanently failed jobs
-- Exponential backoff on retry (1s, 2s, 4s, 8s...)
-
-### Why Audit Logging Enables Security and Compliance
-
-Security-sensitive actions need an immutable record for:
-1. **Incident investigation**: Who shared this page externally? When?
-2. **Compliance requirements**: GDPR data access logs, SOC 2 audit trails
-3. **User accountability**: Tracking permission changes, deletions
-
-**Implementation**: Audit logger in `/backend/src/shared/audit.ts`:
-
-```typescript
-// Logs to both database (compliance) and structured logs (alerting)
-await auditLogger.logPageShared(
-  req.user.id,
-  pageId,
-  {
-    sharedWith: recipientEmail,
-    permission: 'view',
-    shareType: 'user',
-  },
-  req.ip,
-  req.headers['user-agent']
-);
-```
-
-**Audit events captured**:
-- Page sharing and permission changes
-- Workspace member additions/removals
-- Page exports
-- Permanent deletions
-- Authentication events (login, logout, failures)
-
-**Database schema** (`audit_log` table):
-- Append-only for immutability
-- Indexed by user, resource, and timestamp
-- JSON metadata for flexible event details
-
-### Why Metrics Enable Performance Optimization
-
-Without metrics, you're flying blind. Prometheus metrics enable:
-1. **Capacity planning**: Track request rates, queue depths, connection counts
-2. **Latency optimization**: Identify slow endpoints via p95/p99 histograms
-3. **Cache tuning**: Measure hit rates to optimize TTLs and key strategies
-4. **Alerting**: Automated detection of degraded performance
-
-**Implementation**: Metrics in `/backend/src/shared/metrics.ts`:
-
-```typescript
-// Request latency histogram with percentile buckets
-const httpRequestDuration = new Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
-});
-
-// Cache hit/miss tracking
-cacheHitsCounter.inc({ cache_type: 'page' });
-cacheMissesCounter.inc({ cache_type: 'page' });
-```
-
-**Key SLIs tracked**:
-- `http_request_duration_seconds` - API latency by endpoint
-- `page_loads_total` / `page_edits_total` - Business metrics
-- `cache_hits_total` / `cache_misses_total` - Cache effectiveness
-- `queue_depth` - Backpressure indicator
-
-**Endpoints**:
-- `/metrics` - Prometheus scrape endpoint
-- `/health` - Dependency health checks (DB, Redis, RabbitMQ)
-- `/ready` - Kubernetes readiness probe
-
-### Shared Module Structure
-
-All observability and infrastructure concerns are centralized in `/backend/src/shared/`:
+### Local Setup Diagram
 
 ```
-backend/src/shared/
-├── logger.ts    # Structured JSON logging with pino
-├── cache.ts     # Redis caching with cache-aside/write-through
-├── queue.ts     # RabbitMQ producer/consumer with backpressure
-├── metrics.ts   # Prometheus metrics and middleware
-└── audit.ts     # Security audit logging
+┌────────────────────┐
+│   React Frontend   │
+│   (Vite :5173)     │
+│   Block Editor,    │
+│   Database Views,  │
+│   Sidebar          │
+└─────────┬──────────┘
+          │ HTTP + WebSocket
+          ▼
+┌────────────────────┐
+│  Express + ws      │
+│  (Port 3000)       │
+│  REST + WebSocket  │
+└──┬──────┬──────┬───┘
+   │      │      │
+   ▼      ▼      ▼
+┌──────┐ ┌────┐ ┌──────────┐
+│ PG   │ │ VK │ │ RabbitMQ │
+│:5432 │ │:6379│ │:5672     │
+└──────┘ └────┘ │:15672 UI │
+                └──────────┘
+
+Optional (--profile observability):
+┌────────────┐  ┌─────────┐
+│ Prometheus │  │ Grafana │
+│   :9090    │  │  :3002  │
+└────────────┘  └─────────┘
 ```
 
-This separation of concerns keeps route handlers focused on business logic while infrastructure concerns are reusable and testable.
+Multiple API instances on ports 3001-3003 via `PORT=300x npm run dev`. Workers run independently:
+- `npm run dev:worker:search` -- Search index updates
+- `npm run dev:worker:export` -- PDF/Markdown export
+- `npm run dev:worker:email` -- Email notifications
+- `npm run dev:worker:notification` -- In-app notifications
 
----
+### Production Patterns Actually Implemented
 
-## Frontend Architecture
+| Pattern | File Path | Description |
+|---------|-----------|-------------|
+| Cache-aside | `backend/src/shared/cache.ts` | Redis caching for pages, blocks, workspaces with configurable TTL and event-driven invalidation |
+| RabbitMQ queues | `backend/src/shared/queue.ts` | Durable queues with prefetch, retries, dead letter queues, and backpressure |
+| Export worker | `backend/src/workers/export-worker.ts` | Async PDF/Markdown export via RabbitMQ |
+| Search worker | `backend/src/workers/search-worker.ts` | Async search index updates |
+| Email worker | `backend/src/workers/email-worker.ts` | Async email delivery |
+| Notification worker | `backend/src/workers/notification-worker.ts` | In-app notification processing |
+| Audit logging | `backend/src/shared/audit.ts` | Append-only security event log (page sharing, permissions, auth) |
+| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP latency, WebSocket connections, cache hit/miss, queue depth |
+| Structured logging | `backend/src/shared/logger.ts` | Pino JSON logger with request context |
+| WebSocket sync | `backend/src/services/websocket.ts` | Operation broadcasting, presence tracking, page subscriptions |
+| Fractional indexing | `backend/src/utils/fractionalIndex.ts` | String-based position generation for block ordering |
+| Hybrid Logical Clock | `backend/src/utils/hlc.ts` | Causal ordering for CRDT operations |
+| Block editor | `frontend/src/components/blocks/BlockComponent.tsx` | Delegation pattern: orchestrator + type-specific renderers |
+| Database views | `frontend/src/components/database/DatabaseView.tsx` | Table, board (Kanban), and list views with filtering/sorting |
+| Sidebar navigation | `frontend/src/components/sidebar/Sidebar.tsx` | Recursive page tree |
+| Editor state | `frontend/src/stores/editor.ts` | Zustand store with optimistic updates and rollback |
 
-### Overview
+### What Was Simplified or Substituted
 
-The frontend follows a modular component architecture built with React, TypeScript, and Zustand for state management. Components are organized by feature area with clear separation of concerns.
+| Production Design | Local Implementation | Rationale |
+|-------------------|---------------------|-----------|
+| Redis Cluster | Single Valkey instance | Same API, sufficient for local |
+| PostgreSQL primary + replicas | Single PostgreSQL instance | No read replica routing at local scale |
+| Separate API + Sync servers | Combined Express + ws server | Simpler deployment |
+| Full character-level CRDT (Yjs/Automerge) | Block-level CRDT with HLC ordering | Demonstrates concepts without full CRDT library |
+| CDN for static assets | Vite dev server | Development convenience |
+| Elasticsearch for full-text search | Not implemented (search worker queues only) | Search index not yet connected |
+| OAuth / SSO | Session-based auth with bcrypt | Appropriate for learning |
+| S3 for file attachments | Not implemented | No image/file upload yet |
 
-### Directory Structure
+### What Was Omitted
 
-```
-frontend/src/
-├── components/
-│   ├── blocks/              # Block editor components
-│   │   ├── BlockComponent.tsx      # Main orchestrator component
-│   │   ├── HeadingBlock.tsx        # H1/H2/H3 block renderer
-│   │   ├── ListBlock.tsx           # Bulleted/numbered list renderer
-│   │   ├── ToggleBlock.tsx         # Collapsible toggle with children
-│   │   ├── CodeBlock.tsx           # Code block with syntax support
-│   │   ├── QuoteBlock.tsx          # Blockquote renderer
-│   │   ├── CalloutBlock.tsx        # Callout/info box renderer
-│   │   ├── DividerBlock.tsx        # Horizontal rule renderer
-│   │   ├── TextBlock.tsx           # Default paragraph renderer
-│   │   ├── BlockTypeMenu.tsx       # Block type conversion menu
-│   │   ├── types.ts                # Shared types and utilities
-│   │   └── index.ts                # Barrel exports
-│   ├── database/            # Database view components
-│   │   ├── DatabaseView.tsx        # View switcher
-│   │   ├── TableView.tsx           # Table/spreadsheet view
-│   │   ├── BoardView.tsx           # Kanban board view
-│   │   ├── ListView.tsx            # Compact list view
-│   │   └── PropertyCell.tsx        # Property value renderer
-│   ├── editor/              # Editor wrapper components
-│   │   └── BlockEditor.tsx         # Full page editor
-│   └── sidebar/             # Navigation components
-│       └── Sidebar.tsx             # Workspace/page tree
-├── stores/                  # Zustand state stores
-│   └── editor.ts            # Block editing state
-├── services/                # API and WebSocket clients
-├── routes/                  # Page-level route components
-└── types/                   # Shared TypeScript definitions
-    └── index.ts             # All type exports
-```
-
-### Block Component Architecture
-
-The block editor uses a **delegation pattern** where the main `BlockComponent` acts as an orchestrator that:
-
-1. **Handles common functionality**: Focus management, keyboard navigation, block handles, and the type menu
-2. **Delegates rendering**: Each block type has its own specialized renderer component
-3. **Manages state**: Local state for menu visibility and toggle expansion
-
-```
-BlockComponent (orchestrator)
-├── BlockHandle          # Add/menu buttons
-├── HeadingBlock         # heading_1, heading_2, heading_3
-├── ListBlock            # bulleted_list, numbered_list
-├── ToggleBlock          # toggle (with children)
-├── CodeBlock            # code
-├── QuoteBlock           # quote
-├── CalloutBlock         # callout
-├── DividerBlock         # divider
-├── TextBlock            # text (default)
-└── BlockTypeMenu        # Type conversion dropdown
-```
-
-### Component Design Principles
-
-1. **Single Responsibility**: Each block type component handles only its rendering and type-specific behavior
-2. **Shared Props Interface**: All editable blocks receive the same `BlockRendererProps` for consistency
-3. **JSDoc Documentation**: All components and significant functions include JSDoc comments
-4. **Accessibility**: ARIA labels and roles for interactive elements
-5. **Under 200 Lines**: Components are kept small and focused
-
-### State Management
-
-Block editing state is managed by the Zustand `useEditorStore`:
-
-| State | Purpose |
-|-------|---------|
-| `blocks` | Array of all blocks in the current page |
-| `focusedBlockId` | Currently focused block for editing |
-| `selectedBlockId` | Selected block for bulk operations |
-| `presence` | Real-time presence of other users |
-
-Actions like `addBlock`, `updateBlock`, and `deleteBlock` implement optimistic updates with rollback on failure.
-
-### Block Type Renderers
-
-Each block type component follows a consistent pattern:
-
-```typescript
-interface BlockRendererProps {
-  contentRef: React.RefObject<HTMLDivElement | null>;
-  textContent: string;
-  placeholder: string;
-  onInput: () => void;
-  onKeyDown: (e: React.KeyboardEvent) => void;
-  onFocus: () => void;
-}
-
-function MyBlockType(props: BlockRendererProps) {
-  return (
-    <div
-      ref={props.contentRef}
-      contentEditable
-      suppressContentEditableWarning
-      data-placeholder={props.placeholder}
-      onInput={props.onInput}
-      onKeyDown={props.onKeyDown}
-      onFocus={props.onFocus}
-    >
-      {props.textContent}
-    </div>
-  );
-}
-```
-
-### Utilities
-
-Shared utilities in `types.ts`:
-
-- `getPlaceholder(type)`: Returns contextual placeholder text for each block type
-- `getTextContent(content)`: Extracts plain text from RichText array
-
-### Future Improvements
-
-1. **Rich Text Formatting**: Inline bold, italic, code, and link support
-2. **Drag and Drop**: Block reordering via drag handles
-3. **Keyboard Shortcuts**: Markdown-style shortcuts (e.g., `##` for heading)
-4. **Selection**: Multi-block selection for bulk operations
-5. **Undo/Redo**: Operation history for reverting changes
+- **Full offline editing** with IndexedDB persistence and sync-on-reconnect
+- **Character-level CRDT** for rich text within blocks (currently block-level only)
+- **Drag-and-drop** block reordering
+- **Calendar and gallery** database views
+- **Granular page permissions** UI (backend schema exists, frontend not built)
+- **Share links** for external access
+- **Version history** for pages
+- **Templates** and page duplication
+- **Comments** on blocks
+- **CDN** and edge caching
+- **Multi-region** deployment
+- **Kubernetes** orchestration
+- **Distributed tracing** (OpenTelemetry / Jaeger)
+- **Database sharding**
+- **Image/file upload** and processing

@@ -2,1392 +2,705 @@
 
 ## System Overview
 
-Twitch is a live streaming platform with real-time chat. Core challenges involve low-latency video delivery, chat at massive scale, and stream processing in real-time.
-
-**Learning Goals:**
-- Understand live video streaming protocols (RTMP, HLS)
-- Design real-time chat systems at scale
-- Handle stream transcoding pipelines
-- Build subscription and monetization systems
-
----
+Twitch is a live streaming platform with real-time chat, subscription-based monetization, and VOD (video on demand) recording. The core technical challenges center on three areas: low-latency live video delivery from broadcaster to thousands of concurrent viewers, real-time chat messaging at massive scale (100K+ users in a single channel), and a stream processing pipeline that simultaneously transcodes, delivers, and archives live content.
 
 ## Requirements
 
 ### Functional Requirements
 
-1. **Stream**: Broadcast live video to viewers
-2. **Watch**: View streams with low latency
-3. **Chat**: Real-time messaging during streams
-4. **Subscribe**: Paid subscriptions to channels
-5. **VOD**: Watch past broadcasts and clips
+1. **Stream**: Broadcast live video to viewers via RTMP ingest, transcoded to HLS for delivery
+2. **Watch**: View live streams with < 5 second glass-to-glass latency, with quality selection
+3. **Chat**: Real-time messaging during streams with emotes, badges, and moderation tools
+4. **Subscribe**: Tiered paid subscriptions (Tier 1/2/3) with gift subscriptions
+5. **VOD**: Watch past broadcasts, create clips from live streams
+6. **Discover**: Browse by category, follow channels, see who's live
 
 ### Non-Functional Requirements
 
-- **Latency**: < 5 seconds glass-to-glass (broadcast to viewer)
-- **Scale**: 10M concurrent viewers, 100K concurrent streams
-- **Chat**: 1M messages/minute during peak
-- **Availability**: 99.99% for video delivery
+- **Latency**: < 5 seconds glass-to-glass (broadcaster capture to viewer display); < 2 seconds for LL-HLS
+- **Scale**: 10M concurrent viewers, 100K concurrent streams, 1M chat messages/minute at peak
+- **Availability**: 99.99% for video delivery; 99.9% for chat; 99.9% for API
+- **Chat reliability**: Messages delivered in order within a channel; at-most-once for delivery (dropped > duplicated)
+- **Consistency**: Strong consistency for subscriptions/payments; eventual consistency for viewer counts and follower counts
 
----
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Value | Sizing Implication |
+|--------|-------|-------------------|
+| Concurrent viewers | 10M peak | ~500K WebSocket connections per chat pod |
+| Concurrent streams | 100K | ~100K RTMP ingest connections |
+| Chat messages | 1M/min peak | ~17K messages/second |
+| Video bandwidth | ~20 Tbps | CDN required; origin serves < 1% |
+| HLS segment size | 2-4 seconds | Balance latency vs. CDN cache efficiency |
+| VOD storage growth | ~5TB/day | Archive to cold storage after 60 days |
+
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Concurrent users | 1-5 |
+| Active streams | 1-3 (simulated) |
+| Chat messages | < 10/second |
+| Storage | < 1GB |
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Broadcaster Layer                            │
-│              OBS / Streamlabs (RTMP output)                     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ RTMP
-┌─────────────────────────────────────────────────────────────────┐
-│                    Ingest Layer                                 │
-│    Multiple ingest servers globally (rtmp://ingest.twitch.tv)   │
-│    - Authenticate stream key                                    │
-│    - Forward to transcoder                                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Transcoding Layer                              │
-│    FFmpeg/MediaLive clusters                                    │
-│    - Source → 1080p60, 720p60, 720p30, 480p, 360p               │
-│    - Generate HLS segments (2-4 second chunks)                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Origin Layer                                  │
-│    - Store HLS manifests (.m3u8) and segments (.ts)             │
-│    - Serve to CDN edge nodes                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     CDN Edge Layer                              │
-│    CloudFront / Fastly / Custom CDN                             │
-│    - Cache segments at edge                                     │
-│    - Serve to viewers globally                                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Viewer Layer                                │
-│    Browser (HLS.js) / Mobile / TV apps                          │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Broadcaster Layer                                  │
+│               OBS / Streamlabs (RTMP output)                            │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ RTMP
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Ingest Layer                                       │
+│   Globally distributed RTMP ingest servers                              │
+│   - Authenticate stream key against database                            │
+│   - Forward raw stream to transcoding pipeline                          │
+│   - One ingest per stream (nearest POP)                                 │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                    ┌────────────┼────────────┐
+                    ▼            ▼            ▼
+          ┌─────────────┐ ┌──────────┐ ┌──────────────┐
+          │ Transcoder  │ │   VOD    │ │   Thumbnail  │
+          │ (GPU)       │ │ Archiver │ │  Generator   │
+          │ 1080p/720p/ │ │ segment  │ │  periodic    │
+          │ 480p/360p   │ │ storage  │ │  keyframe    │
+          └──────┬──────┘ └─────┬────┘ └──────────────┘
+                 │              │
+                 ▼              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         CDN Layer                                       │
+│   Edge servers deliver HLS segments with < 2 second edge propagation    │
+│   Push model: origin pushes segments to edges on creation               │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Client Layer                                      │
+│              Web (HLS.js) / Mobile / Desktop                            │
+│         Video player + Chat panel + Channel UI                          │
+└─────────────────────┬──────────────────────────┬───────────────────────┘
+                      │ WebSocket                 │ HTTPS
+                      ▼                           ▼
+┌─────────────────────────────┐    ┌──────────────────────────────────────┐
+│       Chat Service          │    │            API Service               │
+│                             │    │                                      │
+│ - WebSocket connections     │    │ - Auth (sessions)                    │
+│ - Message fan-out via       │    │ - Channels / Categories              │
+│   Redis Pub/Sub             │    │ - Follows / Subscriptions            │
+│ - Rate limiting per user    │    │ - Stream management                  │
+│ - Emote rendering           │    │ - Moderation (bans, timeouts)        │
+│ - Moderation enforcement    │    │ - VOD / Clips                        │
+│ - Message persistence       │    │ - Emotes / Badges                    │
+└──────────┬──────────────────┘    └──────────┬───────────────────────────┘
+           │                                   │
+           ▼                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Data Layer                                     │
+├────────────────┬────────────────┬──────────────────┬────────────────────┤
+│   PostgreSQL   │   Redis/Valkey │   S3 / Blob      │   Kafka            │
+│                │                │   Storage         │   (Optional)       │
+│ - Users        │ - Sessions     │                   │                    │
+│ - Channels     │ - Chat Pub/Sub │ - VOD segments    │ - Chat replay      │
+│ - Streams      │ - Viewer count │ - Thumbnails      │ - Analytics        │
+│ - Follows      │ - Rate limits  │ - Emote images    │ - Audit trail      │
+│ - Subscriptions│ - Stream state │                   │                    │
+│ - Chat history │                │                   │                    │
+│ - Bans/Mods    │                │                   │                    │
+└────────────────┴────────────────┴──────────────────┴────────────────────┘
 ```
-
----
 
 ## Core Components
 
-### 1. Stream Ingestion
+### 1. Live Video Pipeline
 
-**RTMP Server:**
-```javascript
-// Simplified RTMP server concept
-const rtmpServer = new RTMPServer()
+The live video pipeline is the most latency-sensitive component. Every millisecond of added latency degrades the interactive experience between streamer and chat.
 
-rtmpServer.on('connect', (session) => {
-  const { streamKey } = session.connectCmdObj
-  const channel = await validateStreamKey(streamKey)
+**Glass-to-glass latency breakdown:**
 
-  if (!channel) {
-    session.reject()
-    return
-  }
+| Stage | Typical Latency | Optimization |
+|-------|----------------|--------------|
+| Capture + encode (OBS) | ~500ms | Hardware encoding (NVENC) |
+| Upload (RTMP) | ~500ms | Nearest ingest POP |
+| Transcoding | ~1s | GPU acceleration, 2s segments |
+| CDN propagation | ~1s | Edge push (not pull) |
+| Player buffer | ~2s | Reduced buffer for LL-HLS |
+| **Total** | **~5 seconds** | **< 2s with LL-HLS** |
 
-  session.channelId = channel.id
-  await notifyStreamStart(channel.id)
-})
+**RTMP Ingest flow:**
+1. Broadcaster configures OBS with stream key from Twitch dashboard
+2. OBS connects to nearest ingest server via RTMP
+3. Ingest server validates stream key against the database
+4. If valid, raw stream is forwarded to the transcoding cluster
+5. If invalid, connection is rejected immediately
 
-rtmpServer.on('publish', (session) => {
-  // Forward to transcoder
-  const transcoderUrl = assignTranscoder(session.channelId)
-  session.pipe(transcoderUrl)
-})
+**Transcoding output:**
+- 4 quality variants (1080p60, 720p30, 480p30, 360p30)
+- HLS segments (2-4 seconds each, balancing latency vs. cacheability)
+- Master manifest listing all available qualities
+- Segments pushed to CDN origin immediately on creation
+
+**Low-Latency HLS (LL-HLS):**
+Standard HLS uses 6-second segments with 3-segment buffer = 18 seconds minimum latency. LL-HLS uses partial segments (200ms chunks within a 2-second segment) and server push, reducing latency to < 2 seconds. The trade-off is higher CDN request volume and reduced cache efficiency.
+
+### 2. Chat System
+
+Chat is the second hardest problem. A single popular stream can have 100K+ concurrent chatters sending thousands of messages per second.
+
+**Architecture: WebSocket + Redis Pub/Sub fan-out**
+
+```
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Client  │    │ Client  │    │ Client  │
+│  (WS)   │    │  (WS)   │    │  (WS)   │
+└────┬────┘    └────┬────┘    └────┬────┘
+     │              │              │
+     ▼              ▼              ▼
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Chat    │    │ Chat    │    │ Chat    │
+│ Pod A   │    │ Pod B   │    │ Pod C   │
+└────┬────┘    └────┬────┘    └────┬────┘
+     │              │              │
+     └──────────────┼──────────────┘
+                    │
+                    ▼
+           ┌───────────────┐
+           │ Redis Pub/Sub │
+           │ chat:{chId}   │
+           └───────────────┘
 ```
 
-### 2. Transcoding
+1. Client connects via WebSocket and joins a channel room
+2. When a user sends a message, their chat pod publishes to Redis channel `chat:{channelId}`
+3. All chat pods subscribed to that channel receive the message
+4. Each pod broadcasts to all locally connected WebSocket clients for that channel
+5. Messages are also persisted to PostgreSQL for moderation history
 
-**FFmpeg Pipeline:**
-```bash
-# Transcode to multiple qualities
-ffmpeg -i rtmp://input \
-  -map 0:v -map 0:a -c:v libx264 -preset veryfast -b:v 6000k -s 1920x1080 -f hls output_1080p.m3u8 \
-  -map 0:v -map 0:a -c:v libx264 -preset veryfast -b:v 3000k -s 1280x720 -f hls output_720p.m3u8 \
-  -map 0:v -map 0:a -c:v libx264 -preset veryfast -b:v 1500k -s 854x480 -f hls output_480p.m3u8
-```
+**Rate limiting**: Normal users: 1 message/second. Slow mode: configurable (5s, 30s, etc.). Subscribers get higher rate limits.
 
-**HLS Manifest:**
-```
-#EXTM3U
-#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080
-1080p/playlist.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720
-720p/playlist.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=854x480
-480p/playlist.m3u8
-```
+**Why Redis Pub/Sub over Kafka**: For chat, delivery latency matters more than durability. Redis Pub/Sub delivers messages in < 1ms within a datacenter. Kafka adds 5-50ms of latency due to batching and partition management. If a chat message is lost during a Redis restart, the impact is minimal (one message in a flood of thousands). Kafka would be the right choice for chat replay/VOD chat, where durability matters.
 
-### 3. Chat System
+### 3. Stream Key Management
 
-**Challenge**: Handle 100K+ concurrent users in a single chat room
+Stream keys authenticate broadcasters. The flow:
 
-**Architecture:**
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Chat Service Cluster                         │
-├─────────────┬─────────────┬─────────────┬─────────────┬─────────┤
-│  Chat Pod 1 │  Chat Pod 2 │  Chat Pod 3 │  Chat Pod N │   ...   │
-│ (WS conns)  │ (WS conns)  │ (WS conns)  │ (WS conns)  │         │
-└─────────────┴─────────────┴─────────────┴─────────────┴─────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Message Broker (Kafka/Valkey Pub/Sub)        │
-│              channel:123 → all pods subscribed                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. Streamer generates a unique stream key from their dashboard
+2. Key is stored as a unique value in the `channels` table
+3. When OBS connects, the ingest server validates the key against the database
+4. If valid, the channel is marked `is_live = true` and a stream record is created
+5. Streamers can regenerate their key at any time (invalidating the old one)
 
-**Message Flow:**
-```javascript
-// User sends message
-async function handleChatMessage(userId, channelId, message) {
-  // Validate user can chat (not banned, not slow mode limited)
-  const canChat = await validateChat(userId, channelId)
-  if (!canChat) return
+Stream keys should be treated like passwords -- transmitted only over RTMP (encrypted in transit) and never exposed in API responses.
 
-  const chatMessage = {
-    id: uuid(),
-    userId,
-    channelId,
-    username: await getUsername(userId),
-    message,
-    badges: await getBadges(userId, channelId),
-    timestamp: Date.now()
-  }
+### 4. Subscription and Monetization
 
-  // Publish to all chat pods
-  await redis.publish(`chat:${channelId}`, JSON.stringify(chatMessage))
+**Tier structure:**
+- Tier 1: Base subscription (e.g., $4.99/month)
+- Tier 2: Enhanced subscription (e.g., $9.99/month)
+- Tier 3: Premium subscription (e.g., $24.99/month)
 
-  // Store for moderation/replay (optional)
-  await storeChatMessage(chatMessage)
-}
+Each tier unlocks progressively more emotes and grants corresponding subscriber badges in chat.
 
-// Each pod receives and broadcasts to connected clients
-redis.subscribe(`chat:${channelId}`)
-redis.on('message', (channel, data) => {
-  const message = JSON.parse(data)
-  broadcastToRoom(channel, message)
-})
-```
+**Gift subscriptions**: A user can purchase a subscription for another user. Tracked via `is_gift` and `gifted_by` columns. Gift subs follow the same tier structure.
 
-### 4. VOD Recording
+**Idempotency for payments**: Subscription creation uses idempotency keys to prevent double-charging. If a network retry resends a subscription request, the server checks the idempotency key and returns the cached result.
 
-**Parallel Recording During Live:**
-```javascript
-// As transcoder outputs segments, also write to storage
-async function handleSegment(channelId, segment) {
-  // 1. Send to CDN for live viewers
-  await cdn.uploadSegment(segment)
+### 5. Moderation System
 
-  // 2. Archive for VOD
-  await s3.putObject({
-    bucket: 'vods',
-    key: `${channelId}/${streamId}/${segment.sequence}.ts`,
-    body: segment.data
-  })
+Chat moderation is critical for maintaining community health on a live platform.
 
-  // 3. Update VOD manifest
-  await updateVodManifest(channelId, streamId, segment)
-}
-```
+**Roles and permissions:**
 
----
+| Action | Viewer | Subscriber | Moderator | Broadcaster | Admin |
+|--------|--------|------------|-----------|-------------|-------|
+| Send messages | Yes | Yes | Yes | Yes | Yes |
+| Use sub emotes | No | Yes | Yes | Yes | Yes |
+| Timeout users | No | No | Yes | Yes | Yes |
+| Ban users | No | No | Yes | Yes | Yes |
+| Delete messages | No | No | Yes | Yes | Yes |
+| Manage moderators | No | No | No | Yes | Yes |
+| Manage stream key | No | No | No | Yes | Yes |
+
+**Ban enforcement**: When a user is banned from a channel, their WebSocket connection is terminated and new connections are rejected by checking the `channel_bans` table. Bans can be permanent or timed (with `expires_at`).
+
+**Audit logging**: All moderation actions (bans, timeouts, message deletions, moderator assignments) are logged with actor, target, reason, and timestamp for accountability and appeal handling.
 
 ## Database Schema
 
 ```sql
--- Channels
+-- =============================================================================
+-- USERS
+-- =============================================================================
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  username VARCHAR(50) UNIQUE NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  display_name VARCHAR(100),
+  avatar_url VARCHAR(500),
+  bio TEXT,
+  role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin', 'moderator')),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- =============================================================================
+-- CATEGORIES (games, IRL, etc.)
+-- =============================================================================
+CREATE TABLE categories (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100) UNIQUE NOT NULL,
+  slug VARCHAR(100) UNIQUE NOT NULL,
+  image_url VARCHAR(500),
+  viewer_count INTEGER DEFAULT 0,   -- Denormalized, updated periodically
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- =============================================================================
+-- CHANNELS
+-- =============================================================================
 CREATE TABLE channels (
   id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   name VARCHAR(100) UNIQUE NOT NULL,
   stream_key VARCHAR(100) UNIQUE NOT NULL,
-  title VARCHAR(200),
+  title VARCHAR(200) DEFAULT 'Untitled Stream',
+  description TEXT,
   category_id INTEGER REFERENCES categories(id),
   follower_count INTEGER DEFAULT 0,
   subscriber_count INTEGER DEFAULT 0,
   is_live BOOLEAN DEFAULT FALSE,
   current_viewers INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW()
+  thumbnail_url VARCHAR(500),
+  offline_banner_url VARCHAR(500),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Streams (each broadcast)
+-- =============================================================================
+-- STREAMS (each broadcast session)
+-- =============================================================================
 CREATE TABLE streams (
   id SERIAL PRIMARY KEY,
-  channel_id INTEGER REFERENCES channels(id),
+  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
   title VARCHAR(200),
+  category_id INTEGER REFERENCES categories(id),
   started_at TIMESTAMP DEFAULT NOW(),
   ended_at TIMESTAMP,
   peak_viewers INTEGER DEFAULT 0,
   total_views INTEGER DEFAULT 0,
-  vod_url VARCHAR(500)
+  vod_url VARCHAR(500),
+  thumbnail_url VARCHAR(500)
 );
 
--- Subscriptions
+-- =============================================================================
+-- SOCIAL (follows + subscriptions)
+-- =============================================================================
+CREATE TABLE followers (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+  followed_at TIMESTAMP DEFAULT NOW(),
+  notifications_enabled BOOLEAN DEFAULT TRUE,
+  UNIQUE(user_id, channel_id)
+);
+
 CREATE TABLE subscriptions (
   id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
-  channel_id INTEGER REFERENCES channels(id),
-  tier INTEGER DEFAULT 1, -- 1, 2, or 3
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+  tier INTEGER DEFAULT 1 CHECK (tier IN (1, 2, 3)),
   started_at TIMESTAMP DEFAULT NOW(),
   expires_at TIMESTAMP,
   is_gift BOOLEAN DEFAULT FALSE,
-  gifted_by INTEGER REFERENCES users(id)
+  gifted_by INTEGER REFERENCES users(id),
+  UNIQUE(user_id, channel_id)
 );
 
--- Chat messages (for moderation, not primary storage)
+-- =============================================================================
+-- EMOTES
+-- =============================================================================
+CREATE TABLE emotes (
+  id SERIAL PRIMARY KEY,
+  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+  code VARCHAR(50) NOT NULL,
+  image_url VARCHAR(500) NOT NULL,
+  tier INTEGER DEFAULT 0,        -- 0 = free, 1/2/3 = subscriber tier
+  is_global BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- =============================================================================
+-- CHAT
+-- =============================================================================
 CREATE TABLE chat_messages (
   id BIGSERIAL PRIMARY KEY,
-  channel_id INTEGER REFERENCES channels(id),
-  user_id INTEGER REFERENCES users(id),
-  message TEXT,
+  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  username VARCHAR(50) NOT NULL,
+  message TEXT NOT NULL,
+  badges JSONB DEFAULT '[]',
+  is_deleted BOOLEAN DEFAULT FALSE,
+  deleted_by INTEGER REFERENCES users(id),
   created_at TIMESTAMP DEFAULT NOW()
-) PARTITION BY RANGE (created_at);
+);
 
--- Bans
+-- =============================================================================
+-- MODERATION
+-- =============================================================================
 CREATE TABLE channel_bans (
-  channel_id INTEGER REFERENCES channels(id),
-  user_id INTEGER REFERENCES users(id),
+  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   banned_by INTEGER REFERENCES users(id),
   reason TEXT,
-  expires_at TIMESTAMP, -- NULL = permanent
+  expires_at TIMESTAMP,           -- NULL = permanent
   created_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (channel_id, user_id)
 );
+
+CREATE TABLE channel_moderators (
+  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  added_by INTEGER REFERENCES users(id),
+  created_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (channel_id, user_id)
+);
+
+-- =============================================================================
+-- SESSIONS
+-- =============================================================================
+CREATE TABLE sessions (
+  id VARCHAR(255) PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- =============================================================================
+-- INDEXES
+-- =============================================================================
+CREATE INDEX idx_channels_is_live ON channels(is_live);
+CREATE INDEX idx_channels_category ON channels(category_id);
+CREATE INDEX idx_channels_viewers ON channels(current_viewers DESC);
+CREATE INDEX idx_streams_channel ON streams(channel_id);
+CREATE INDEX idx_streams_started_at ON streams(started_at DESC);
+CREATE INDEX idx_followers_user ON followers(user_id);
+CREATE INDEX idx_followers_channel ON followers(channel_id);
+CREATE INDEX idx_subscriptions_user ON subscriptions(user_id);
+CREATE INDEX idx_subscriptions_channel ON subscriptions(channel_id);
+CREATE INDEX idx_chat_messages_channel ON chat_messages(channel_id);
+CREATE INDEX idx_chat_messages_created ON chat_messages(created_at DESC);
+CREATE INDEX idx_emotes_channel ON emotes(channel_id);
+CREATE INDEX idx_emotes_global ON emotes(is_global) WHERE is_global = TRUE;
 ```
 
----
+## API Design
+
+### Auth API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/auth/register` | Create account + channel |
+| POST | `/api/auth/login` | Login (sets session cookie) |
+| POST | `/api/auth/logout` | Destroy session |
+| GET | `/api/auth/me` | Get current user + channel |
+
+### Channel API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/channels` | List live channels (filterable by category) |
+| GET | `/api/channels/:id` | Get channel details |
+| PUT | `/api/channels/:id` | Update channel info (owner only) |
+| POST | `/api/channels/:id/follow` | Follow a channel |
+| DELETE | `/api/channels/:id/follow` | Unfollow |
+| POST | `/api/channels/:id/subscribe` | Subscribe (tier 1/2/3) |
+| POST | `/api/channels/:id/stream-key/regenerate` | Regenerate stream key |
+
+### Stream API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/streams/start` | Go live (creates stream record) |
+| POST | `/api/streams/end` | End stream |
+| GET | `/api/streams/live` | List all live streams |
+| GET | `/api/streams/:id/vod` | Get VOD for past stream |
+
+### Category API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/categories` | List all categories |
+| GET | `/api/categories/:slug` | Get category with live channels |
+
+### Moderation API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/moderation/:channelId/ban` | Ban user from channel |
+| DELETE | `/api/moderation/:channelId/ban/:userId` | Unban user |
+| POST | `/api/moderation/:channelId/timeout` | Timeout user (timed ban) |
+| POST | `/api/moderation/:channelId/moderators` | Add moderator |
+| DELETE | `/api/moderation/:channelId/moderators/:userId` | Remove moderator |
+| GET | `/api/moderation/:channelId/logs` | Get moderation audit log |
+
+### Chat (WebSocket)
+
+| Message Type | Direction | Description |
+|-------------|-----------|-------------|
+| `join` | Client -> Server | Join a channel's chat room |
+| `leave` | Client -> Server | Leave a channel's chat room |
+| `message` | Client -> Server | Send a chat message |
+| `message` | Server -> Client | Receive a chat message (with badges, emotes) |
+| `system` | Server -> Client | System messages (ban, timeout, slow mode) |
+| `viewer_count` | Server -> Client | Periodic viewer count update |
+
+### Emote API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/emotes/global` | Get global emotes |
+| GET | `/api/emotes/channel/:id` | Get channel-specific emotes |
 
 ## Key Design Decisions
 
-### 1. HLS over WebRTC
+### 1. Redis Pub/Sub for Chat Over Kafka
 
-**Decision**: Use HLS for video delivery, not WebRTC
+**Decision**: Use Redis Pub/Sub for real-time chat message fan-out across chat pods.
 
-**Rationale**:
-- WebRTC: Lower latency (~1s) but complex at scale
-- HLS: Higher latency (~5s) but simple CDN distribution
-- Trade-off: Accept 5s latency for simplicity
+**Why it works**: Chat messages must reach viewers within 50-100ms. Redis Pub/Sub delivers messages in < 1ms within a datacenter. Messages are published to a channel-specific topic (`chat:{channelId}`), and all chat pods subscribed to that channel receive the message instantly. The fire-and-forget nature of Pub/Sub is acceptable because dropping a single chat message in a stream of thousands per second is invisible to users.
 
-**When to use WebRTC**: Interactive streams (co-streaming, gaming)
+**Why not Kafka**: Kafka adds 5-50ms of latency due to write batching and partition commit cycles. For a real-time chat system where latency is the primary concern and messages are ephemeral, this latency penalty is unacceptable. Kafka's durability guarantees (which require disk writes) are unnecessary for live chat -- if a message is lost during a Redis restart, the conversation continues unaffected.
 
-### 2. Kafka for Chat Fan-Out
+**What we give up**: Redis Pub/Sub has no message persistence. If a chat pod disconnects and reconnects, it misses messages sent during the disconnection. In production, this is mitigated by rapid reconnection and the fact that users don't notice a few missing messages in a fast-moving chat. For chat replay (VOD chat), messages are written to PostgreSQL synchronously, providing the durable copy.
 
-**Decision**: Pub/sub for chat message distribution
+### 2. WebSocket per Channel (Not per User)
 
-**Rationale**:
-- Decouples message producers from consumers
-- Horizontal scaling of chat pods
-- Message ordering per channel
+**Decision**: Each WebSocket connection subscribes to one or more channel chat rooms, rather than having a single multiplexed connection per user.
 
-### 3. Segment-Based VOD
+**Why it works**: Users typically watch one stream at a time. A single WebSocket connection per active viewer, subscribed to one channel, is simple to implement and reason about. When the user navigates to a different channel, they close the old connection and open a new one.
 
-**Decision**: Store VOD as HLS segments during live
+**Trade-off**: For users watching multiple streams simultaneously (multiview), this means multiple WebSocket connections. At scale, this could increase connection count. But since multi-stream viewers are < 5% of users, the simplicity benefit outweighs the edge case cost.
 
-**Rationale**:
-- No post-processing needed
-- Instant VOD availability
-- Same format for live and VOD
+### 3. Simulated Streams vs. Real RTMP Ingest
 
----
+**Decision**: In the local implementation, streams are simulated (start/stop via API, viewer counts fluctuate automatically) rather than implementing real RTMP ingest with FFmpeg.
 
-## Scalability Considerations
+**Why**: Real RTMP ingest requires nginx-rtmp module, FFmpeg for transcoding, and significant CPU resources. These are infrastructure concerns, not system design concerns. The simulated approach lets us focus on the hard problems (chat at scale, subscription management, moderation) while the video pipeline is documented as a design artifact.
 
-### Viewer Scaling
+## Consistency and Idempotency
 
-- CDN caches segments at edge
-- No origin hit for popular streams
-- Cache hit ratio > 99% for live streams
+**Chat message deduplication**: Each chat message is assigned a unique ID. Redis-based deduplication (TTL 5 minutes) prevents duplicate messages from network retries.
 
-### Chat Scaling
+**Subscription idempotency**: Subscription creation uses idempotency keys (TTL 24 hours) to prevent double-charging from payment retries.
 
-- Partition chat pods by channel_id
-- Large channels: Multiple pods per channel
-- Rate limiting per user (1 message/second)
+**Stream state**: Stream start/end operations use Redis locks (TTL 10 seconds) to prevent race conditions when multiple RTMP reconnects arrive simultaneously.
 
-### Stream Processing
+**Follow/unfollow idempotency**: The `UNIQUE(user_id, channel_id)` constraint on the `followers` table prevents duplicate follows at the database level.
 
-- Transcoder per stream (not shared)
-- Horizontal scaling: Add transcoders as needed
-- Stateless transcoders, state in message queue
+## Security and Auth
 
----
+**Session-based authentication**: Cookie-based sessions stored in PostgreSQL (`sessions` table) with Redis caching. Sessions expire based on the `expires_at` column.
 
-## Trade-offs Summary
+**Stream key security**: Stream keys are unique per channel, stored as plain values (not hashed, since they need to be displayed to the streamer). Keys can be regenerated at any time, immediately invalidating the old key.
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Video protocol | HLS | WebRTC | Scalability |
-| Chat transport | WebSocket + Pub/Sub | HTTP polling | Low latency |
-| VOD storage | Segment archive | Re-encode | Instant availability |
-| Transcoding | Per-stream workers | Shared | Isolation |
+**Chat rate limiting**: Redis-backed rate limiting per user per channel. Default: 1 message/second. Configurable slow mode by moderators (5s, 30s, etc.).
 
----
-
-## Consistency and Idempotency Semantics
-
-### Write Consistency Models
-
-| Operation | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Stream key validation | Strong (PostgreSQL) | Must reject invalid keys immediately |
-| Go live / offline status | Strong (PostgreSQL) | Viewers need accurate live state |
-| Chat messages | Eventual (Redis pub/sub) | Slight delay acceptable; duplicates filtered client-side |
-| Viewer counts | Eventual (Redis counter) | Approximate counts are acceptable |
-| Subscriptions/payments | Strong (PostgreSQL with transactions) | Financial accuracy required |
-| Follow/unfollow | Strong (PostgreSQL) | User expects immediate feedback |
-| VOD segment writes | Eventual (S3/MinIO) | Segments processed in order by sequence number |
-
-### Idempotency Keys
-
-**Subscription Creation:**
-```javascript
-// Client generates idempotency key for payment operations
-const idempotencyKey = `sub:${userId}:${channelId}:${Date.now()}`
-
-// Server checks before processing
-async function createSubscription(userId, channelId, tier, idempotencyKey) {
-  // Check if already processed
-  const existing = await redis.get(`idempotency:${idempotencyKey}`)
-  if (existing) {
-    return JSON.parse(existing) // Return cached result
-  }
-
-  // Process subscription in transaction
-  const result = await db.transaction(async (tx) => {
-    const sub = await tx.insert(subscriptions).values({
-      user_id: userId,
-      channel_id: channelId,
-      tier: tier,
-      started_at: new Date(),
-      expires_at: addMonths(new Date(), 1)
-    }).returning()
-    return sub[0]
-  })
-
-  // Cache result with 24h TTL
-  await redis.setex(`idempotency:${idempotencyKey}`, 86400, JSON.stringify(result))
-  return result
-}
-```
-
-**Stream Start Event:**
-```javascript
-// Prevent duplicate "go live" events from RTMP reconnects
-async function handleStreamConnect(channelId, streamKey) {
-  const lockKey = `stream_lock:${channelId}`
-  const acquired = await redis.set(lockKey, '1', 'NX', 'EX', 10)
-
-  if (!acquired) {
-    // Another connection is being processed
-    return { status: 'duplicate', action: 'reject' }
-  }
-
-  try {
-    const channel = await db.query.channels.findFirst({
-      where: eq(channels.stream_key, streamKey)
-    })
-
-    if (channel.is_live) {
-      // Already live - this is a reconnect, not a new stream
-      return { status: 'reconnect', streamId: channel.current_stream_id }
-    }
-
-    // New stream - create stream record
-    const stream = await startNewStream(channelId)
-    return { status: 'new', streamId: stream.id }
-  } finally {
-    await redis.del(lockKey)
-  }
-}
-```
-
-### Chat Message Deduplication
-
-```javascript
-// Client-side: Include message ID for dedup
-const messageId = `${userId}:${Date.now()}:${Math.random().toString(36).slice(2)}`
-
-// Server-side: Track recent message IDs in Redis set with TTL
-async function processChatMessage(channelId, userId, messageId, content) {
-  const dedupKey = `chat_dedup:${channelId}`
-
-  // Check if already processed (SADD returns 0 if member exists)
-  const isNew = await redis.sadd(dedupKey, messageId)
-  if (!isNew) {
-    return { status: 'duplicate', dropped: true }
-  }
-
-  // Set TTL on the set (5 minutes window)
-  await redis.expire(dedupKey, 300)
-
-  // Broadcast message
-  await redis.publish(`chat:${channelId}`, JSON.stringify({
-    id: messageId,
-    userId,
-    content,
-    timestamp: Date.now()
-  }))
-
-  return { status: 'sent' }
-}
-```
-
-### Conflict Resolution
-
-**Concurrent Stream Updates (e.g., title change during live):**
-```sql
--- Use optimistic locking with version column
-ALTER TABLE channels ADD COLUMN version INTEGER DEFAULT 1;
-
--- Update only if version matches
-UPDATE channels
-SET title = $1, version = version + 1
-WHERE id = $2 AND version = $3
-RETURNING version;
-
--- If no rows returned, fetch current state and retry or notify user
-```
-
----
+**Moderation audit trail**: All moderation actions (bans, timeouts, message deletions, moderator changes) are logged with actor, target, reason, and timestamp via a dedicated audit logger.
 
 ## Observability
 
-### Metrics (Prometheus)
+**Prometheus metrics** (via `prom-client`):
+- WebSocket connection gauge (active connections by channel)
+- Chat messages sent/received counter
+- Chat rate limit hits counter
+- Chat deduplication counter
+- Stream start/end events
+- Subscription creation counter (by tier, gift vs. paid)
+- Moderation action counter (ban, timeout, delete)
+- HTTP request duration and count by route
+- Circuit breaker state gauge
 
-**Key Metrics for Local Development:**
+**Structured logging** (via `pino`):
+- JSON format for machine parsing
+- Request ID propagation via middleware
+- Chat-specific event logging (join, leave, message, ban)
+- Audit logging for moderation actions (separate log stream)
+- HTTP request logging via `pino-http`
 
-```yaml
-# prometheus.yml
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'twitch-api'
-    static_configs:
-      - targets: ['localhost:3001', 'localhost:3002', 'localhost:3003']
-
-  - job_name: 'twitch-chat'
-    static_configs:
-      - targets: ['localhost:3010']
-
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['localhost:9121']  # redis_exporter
-```
-
-**Application Metrics (Express middleware):**
-```javascript
-import { Registry, Counter, Histogram, Gauge } from 'prom-client'
-
-const register = new Registry()
-
-// HTTP request metrics
-const httpRequestDuration = new Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'Duration of HTTP requests',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
-})
-
-// Business metrics
-const activeStreams = new Gauge({
-  name: 'twitch_active_streams',
-  help: 'Number of currently live streams'
-})
-
-const chatMessagesTotal = new Counter({
-  name: 'twitch_chat_messages_total',
-  help: 'Total chat messages processed',
-  labelNames: ['channel_id']
-})
-
-const wsConnections = new Gauge({
-  name: 'twitch_websocket_connections',
-  help: 'Active WebSocket connections',
-  labelNames: ['server_instance']
-})
-
-const viewerCount = new Gauge({
-  name: 'twitch_viewer_count',
-  help: 'Total viewers across all streams'
-})
-
-// Expose metrics endpoint
-app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', register.contentType)
-  res.end(await register.metrics())
-})
-```
-
-### Structured Logging
-
-```javascript
-import pino from 'pino'
-
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  },
-  base: {
-    service: 'twitch-api',
-    instance: process.env.INSTANCE_ID || 'local'
-  }
-})
-
-// Request logging middleware
-app.use((req, res, next) => {
-  const start = Date.now()
-  res.on('finish', () => {
-    logger.info({
-      method: req.method,
-      path: req.path,
-      status: res.statusCode,
-      duration_ms: Date.now() - start,
-      user_id: req.session?.userId,
-      trace_id: req.headers['x-trace-id']
-    }, 'request completed')
-  })
-  next()
-})
-
-// Business event logging
-function logStreamEvent(eventType, channelId, metadata = {}) {
-  logger.info({
-    event_type: eventType,
-    channel_id: channelId,
-    ...metadata
-  }, `stream ${eventType}`)
-}
-
-// Usage
-logStreamEvent('go_live', 123, { title: 'Gaming Stream', category: 'Fortnite' })
-logStreamEvent('end_stream', 123, { duration_minutes: 120, peak_viewers: 450 })
-```
-
-### Distributed Tracing (OpenTelemetry)
-
-```javascript
-import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node'
-import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base'
-import { JaegerExporter } from '@opentelemetry/exporter-jaeger'
-import { trace } from '@opentelemetry/api'
-
-// Setup (in instrumentation.ts, loaded before app)
-const provider = new NodeTracerProvider()
-provider.addSpanProcessor(new SimpleSpanProcessor(
-  new JaegerExporter({ endpoint: 'http://localhost:14268/api/traces' })
-))
-provider.register()
-
-const tracer = trace.getTracer('twitch-api')
-
-// Trace chat message flow
-async function handleChatMessage(channelId, userId, message) {
-  const span = tracer.startSpan('chat.process_message')
-  span.setAttributes({
-    'chat.channel_id': channelId,
-    'chat.user_id': userId,
-    'chat.message_length': message.length
-  })
-
-  try {
-    // Validate
-    const validateSpan = tracer.startSpan('chat.validate', { parent: span })
-    const canChat = await validateChat(userId, channelId)
-    validateSpan.end()
-
-    if (!canChat) {
-      span.setStatus({ code: SpanStatusCode.OK, message: 'rate limited' })
-      return
-    }
-
-    // Publish
-    const publishSpan = tracer.startSpan('chat.publish_redis', { parent: span })
-    await redis.publish(`chat:${channelId}`, JSON.stringify({ userId, message }))
-    publishSpan.end()
-
-    span.setStatus({ code: SpanStatusCode.OK })
-  } catch (error) {
-    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
-    throw error
-  } finally {
-    span.end()
-  }
-}
-```
-
-### SLI Dashboards (Grafana)
-
-**Dashboard Panels for Local Development:**
-
-```json
-{
-  "panels": [
-    {
-      "title": "API Request Latency (p95)",
-      "type": "graph",
-      "targets": [{
-        "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))"
-      }]
-    },
-    {
-      "title": "Active Streams",
-      "type": "stat",
-      "targets": [{
-        "expr": "twitch_active_streams"
-      }]
-    },
-    {
-      "title": "Chat Messages/sec",
-      "type": "graph",
-      "targets": [{
-        "expr": "rate(twitch_chat_messages_total[1m])"
-      }]
-    },
-    {
-      "title": "WebSocket Connections",
-      "type": "graph",
-      "targets": [{
-        "expr": "sum(twitch_websocket_connections)"
-      }]
-    },
-    {
-      "title": "Error Rate",
-      "type": "graph",
-      "targets": [{
-        "expr": "sum(rate(http_request_duration_seconds_count{status_code=~\"5..\"}[5m])) / sum(rate(http_request_duration_seconds_count[5m]))"
-      }]
-    }
-  ]
-}
-```
-
-### Alert Thresholds
-
-| Alert | Condition | Severity | Action |
-|-------|-----------|----------|--------|
-| High API Latency | p95 > 500ms for 5 min | Warning | Check database queries |
-| Error Rate Spike | 5xx rate > 1% for 2 min | Critical | Check logs, rollback if needed |
-| Redis Connection Lost | Connection down > 30s | Critical | Chat will fail; restart Redis |
-| No Active Streams | 0 streams for 10 min (during expected hours) | Warning | Check ingest service |
-| WebSocket Saturation | Connections > 80% limit | Warning | Scale chat pods |
-| Database Pool Exhausted | Available connections < 5 | Critical | Increase pool or find leaks |
-
-**Alertmanager Config (for local testing):**
-```yaml
-# alertmanager.yml
-route:
-  receiver: 'console'
-  group_wait: 30s
-
-receivers:
-  - name: 'console'
-    webhook_configs:
-      - url: 'http://localhost:3099/alerts'  # Local webhook for testing
-```
-
-### Audit Logging
-
-```javascript
-// Audit log for security-sensitive operations
-const auditLogger = pino({
-  level: 'info',
-  base: { type: 'audit' }
-}).child({
-  destination: pino.destination('./logs/audit.log')
-})
-
-// Audit events
-function audit(action, actor, resource, details = {}) {
-  auditLogger.info({
-    action,
-    actor_id: actor.userId,
-    actor_ip: actor.ip,
-    resource_type: resource.type,
-    resource_id: resource.id,
-    details,
-    timestamp: new Date().toISOString()
-  })
-}
-
-// Usage examples
-audit('stream_key.regenerate', { userId: 123, ip: req.ip }, { type: 'channel', id: 456 })
-audit('user.ban', { userId: 123, ip: req.ip }, { type: 'user', id: 789 }, { reason: 'spam', channel_id: 456 })
-audit('subscription.create', { userId: 123, ip: req.ip }, { type: 'subscription', id: 101 }, { tier: 1, channel_id: 456 })
-audit('admin.login', { userId: 1, ip: req.ip }, { type: 'session', id: 'sess123' })
-```
-
----
+**Health checks**:
+- `/health` -- comprehensive check with database and Redis status
+- `/health/live` -- liveness probe (process is running)
+- `/health/ready` -- readiness probe (database and Redis reachable)
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency
+### Circuit Breakers
 
-```javascript
-// Generic retry wrapper with exponential backoff
-async function withRetry(operation, options = {}) {
-  const {
-    maxRetries = 3,
-    baseDelayMs = 100,
-    maxDelayMs = 5000,
-    idempotencyKey = null,
-    retryableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED']
-  } = options
+Circuit breakers (Opossum) protect critical paths:
 
-  // Check if already completed (for idempotent operations)
-  if (idempotencyKey) {
-    const cached = await redis.get(`retry:${idempotencyKey}`)
-    if (cached) return JSON.parse(cached)
-  }
+- **Redis chat publish**: If Redis becomes unresponsive, the circuit opens and chat falls back to local broadcast (messages only delivered to clients connected to the same pod). This is degraded but functional.
+- **Database queries**: If PostgreSQL is slow, the circuit opens and endpoints return cached data or 503.
 
-  let lastError
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const result = await operation()
+### Retry Strategy
 
-      // Cache successful result for idempotent operations
-      if (idempotencyKey) {
-        await redis.setex(`retry:${idempotencyKey}`, 3600, JSON.stringify(result))
-      }
-
-      return result
-    } catch (error) {
-      lastError = error
-
-      // Don't retry non-retryable errors
-      if (!retryableErrors.includes(error.code) && !error.retryable) {
-        throw error
-      }
-
-      if (attempt < maxRetries) {
-        const delay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs)
-        const jitter = delay * 0.1 * Math.random()
-        await sleep(delay + jitter)
-
-        logger.warn({
-          attempt: attempt + 1,
-          max_retries: maxRetries,
-          error: error.message,
-          next_delay_ms: delay
-        }, 'retrying operation')
-      }
-    }
-  }
-
-  throw lastError
-}
-
-// Usage: Retry VOD segment upload
-await withRetry(
-  () => s3.putObject({ bucket: 'vods', key: segmentKey, body: segmentData }),
-  { idempotencyKey: `segment:${streamId}:${sequence}`, maxRetries: 5 }
-)
-```
-
-### Circuit Breaker
-
-```javascript
-// Simple circuit breaker implementation
-class CircuitBreaker {
-  constructor(name, options = {}) {
-    this.name = name
-    this.failureThreshold = options.failureThreshold || 5
-    this.resetTimeoutMs = options.resetTimeoutMs || 30000
-    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
-    this.failures = 0
-    this.lastFailureTime = null
-  }
-
-  async call(operation) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
-        this.state = 'HALF_OPEN'
-        logger.info({ circuit: this.name }, 'circuit breaker half-open, testing')
-      } else {
-        throw new Error(`Circuit breaker ${this.name} is OPEN`)
-      }
-    }
-
-    try {
-      const result = await operation()
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      throw error
-    }
-  }
-
-  onSuccess() {
-    this.failures = 0
-    if (this.state === 'HALF_OPEN') {
-      this.state = 'CLOSED'
-      logger.info({ circuit: this.name }, 'circuit breaker closed')
-    }
-  }
-
-  onFailure() {
-    this.failures++
-    this.lastFailureTime = Date.now()
-
-    if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN'
-      logger.error({ circuit: this.name, failures: this.failures }, 'circuit breaker opened')
-    }
-  }
-}
-
-// Circuit breakers for external dependencies
-const circuitBreakers = {
-  database: new CircuitBreaker('database', { failureThreshold: 3, resetTimeoutMs: 10000 }),
-  redis: new CircuitBreaker('redis', { failureThreshold: 5, resetTimeoutMs: 5000 }),
-  s3: new CircuitBreaker('s3', { failureThreshold: 5, resetTimeoutMs: 30000 })
-}
-
-// Usage
-async function getChannel(channelId) {
-  return circuitBreakers.database.call(async () => {
-    return db.query.channels.findFirst({ where: eq(channels.id, channelId) })
-  })
-}
-```
+- Database connection failures: retry with exponential backoff (1s, 2s, 4s, max 3 retries)
+- Redis reconnection: automatic via the redis client library with configurable retry strategy
+- Non-retryable: authentication failures, validation errors, permission denials
 
 ### Graceful Degradation
 
-```javascript
-// Fallback strategies when services are unavailable
+| Component Failure | Degradation Behavior |
+|-------------------|---------------------|
+| Redis down | Chat falls back to local-pod-only broadcast; sessions read from PostgreSQL |
+| PostgreSQL slow | Cached channel/category data served; writes queued |
+| CDN edge failure | Viewers fall back to next-nearest edge or origin |
+| Chat pod crash | Clients reconnect to another pod; miss a few messages |
+| Transcoder failure | Stream continues at last available quality |
 
-// Chat: Fall back to local broadcast if Redis is down
-async function broadcastChatMessage(channelId, message) {
-  try {
-    await circuitBreakers.redis.call(() =>
-      redis.publish(`chat:${channelId}`, JSON.stringify(message))
-    )
-  } catch (error) {
-    logger.warn({ channel_id: channelId }, 'Redis unavailable, using local broadcast only')
-    // Only broadcast to local WebSocket connections
-    localBroadcast(channelId, message)
-  }
-}
+### Graceful Shutdown
 
-// Viewer count: Use cached value if Redis is down
-async function getViewerCount(channelId) {
-  try {
-    return await circuitBreakers.redis.call(() =>
-      redis.get(`viewers:${channelId}`)
-    )
-  } catch (error) {
-    // Return last known value from local cache
-    return localViewerCache.get(channelId) || 0
-  }
-}
+On SIGTERM:
+1. Stop accepting new WebSocket connections
+2. Send "server_shutdown" message to all connected chat clients
+3. Close all WebSocket connections gracefully
+4. Stop accepting new HTTP requests
+5. Wait for in-flight requests to complete (10-second timeout)
+6. Close database and Redis connections
+7. Exit
 
-// VOD: Queue for retry if S3 upload fails
-async function uploadVodSegment(streamId, sequence, data) {
-  try {
-    await circuitBreakers.s3.call(() =>
-      s3.putObject({ bucket: 'vods', key: `${streamId}/${sequence}.ts`, body: data })
-    )
-  } catch (error) {
-    // Write to local disk and queue for retry
-    await fs.writeFile(`/tmp/vod-queue/${streamId}-${sequence}.ts`, data)
-    await db.insert(vod_upload_queue).values({
-      stream_id: streamId,
-      sequence,
-      local_path: `/tmp/vod-queue/${streamId}-${sequence}.ts`,
-      created_at: new Date()
-    })
-    logger.warn({ stream_id: streamId, sequence }, 'VOD segment queued for retry')
-  }
-}
-```
+## Scalability Considerations
 
-### Local Development DR Simulation
+### Horizontal Scaling Path
 
-For learning purposes, simulate disaster recovery scenarios:
+1. **Chat pods**: Scale horizontally. Each pod subscribes to Redis Pub/Sub for its active channels. Connection count balanced by load balancer (sticky sessions per channel).
+2. **API servers**: Stateless with session state in Redis/PostgreSQL. Scale behind load balancer.
+3. **RTMP ingest**: Scale by region. Each ingest server handles ~1000 concurrent streams. New POPs added as geographic demand grows.
+4. **Transcoders**: Scale independently per stream. GPU instances auto-scale based on active stream count.
+5. **PostgreSQL**: Read replicas for channel/category browsing. Write sharding by `channel_id` for chat messages.
+6. **Redis**: Cluster mode. Separate instances for sessions, chat Pub/Sub, and rate limiting.
 
-```javascript
-// scripts/chaos.js - Simulate failures for testing
-import { program } from 'commander'
+### What Breaks First
 
-program
-  .command('kill-redis')
-  .description('Stop Redis to test chat fallback')
-  .action(async () => {
-    await exec('docker-compose stop redis')
-    console.log('Redis stopped. Chat should fall back to local-only mode.')
-    console.log('Run "docker-compose start redis" to restore.')
-  })
+1. **Chat message volume** in popular streams -- solved by sharding chat across multiple Redis channels and using client-side message batching
+2. **WebSocket connection count** -- solved by adding chat pods (each handles ~50K connections)
+3. **Viewer count accuracy** -- solved by sampling and periodic aggregation rather than real-time counting
+4. **Chat message persistence** -- solved by partitioning `chat_messages` by `created_at` with TTL-based cleanup
+5. **Transcoder capacity** -- solved by GPU auto-scaling, with priority queue for partner/affiliate streamers
 
-program
-  .command('slow-db')
-  .description('Add latency to database queries')
-  .action(async () => {
-    // Uses pg_sleep in a middleware
-    process.env.DB_ARTIFICIAL_DELAY_MS = '500'
-    console.log('Database queries will have 500ms artificial delay.')
-  })
+### Chat Message Retention
 
-program
-  .command('fill-disk')
-  .description('Simulate disk full for VOD storage')
-  .action(async () => {
-    // Create a large temp file in the VOD directory
-    await exec('dd if=/dev/zero of=/tmp/vod-queue/filler bs=1M count=100')
-    console.log('Added 100MB filler file. VOD uploads may fail.')
-  })
+| Age | Storage | Access Pattern |
+|-----|---------|---------------|
+| < 24 hours | PostgreSQL (hot) | Moderation, recent history |
+| 1-30 days | PostgreSQL (partitioned) | User appeals, content reports |
+| > 30 days | Archived / deleted | Compliance retention only |
 
-program.parse()
-```
+## Trade-offs Summary
 
-### Backup and Restore Testing
-
-**Database Backup (for local development):**
-
-```bash
-#!/bin/bash
-# scripts/backup.sh
-
-BACKUP_DIR="./backups"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-# PostgreSQL backup
-docker-compose exec -T postgres pg_dump -U postgres twitch > "$BACKUP_DIR/twitch_$TIMESTAMP.sql"
-echo "Database backed up to $BACKUP_DIR/twitch_$TIMESTAMP.sql"
-
-# Redis backup (if persistence enabled)
-docker-compose exec redis redis-cli BGSAVE
-sleep 2
-docker cp twitch-redis:/data/dump.rdb "$BACKUP_DIR/redis_$TIMESTAMP.rdb"
-echo "Redis backed up to $BACKUP_DIR/redis_$TIMESTAMP.rdb"
-
-# MinIO/S3 backup (VOD segments)
-docker-compose exec minio mc mirror /data/vods "$BACKUP_DIR/vods_$TIMESTAMP"
-echo "VOD segments backed up"
-```
-
-**Restore Script:**
-
-```bash
-#!/bin/bash
-# scripts/restore.sh
-
-BACKUP_FILE=$1
-
-if [[ -z "$BACKUP_FILE" ]]; then
-  echo "Usage: ./restore.sh <backup_file.sql>"
-  exit 1
-fi
-
-# Drop and recreate database
-docker-compose exec -T postgres psql -U postgres -c "DROP DATABASE IF EXISTS twitch"
-docker-compose exec -T postgres psql -U postgres -c "CREATE DATABASE twitch"
-
-# Restore
-docker-compose exec -T postgres psql -U postgres twitch < "$BACKUP_FILE"
-echo "Database restored from $BACKUP_FILE"
-```
-
-**Backup Verification Test:**
-
-```javascript
-// tests/backup-restore.test.js
-import { describe, it, beforeAll, afterAll } from 'vitest'
-import { exec } from 'child_process'
-import { promisify } from 'util'
-
-const execAsync = promisify(exec)
-
-describe('Backup and Restore', () => {
-  let backupFile
-
-  it('should create a backup', async () => {
-    const { stdout } = await execAsync('./scripts/backup.sh')
-    expect(stdout).toContain('Database backed up')
-
-    // Extract backup filename from output
-    const match = stdout.match(/twitch_\d+_\d+\.sql/)
-    backupFile = `./backups/${match[0]}`
-  })
-
-  it('should restore from backup', async () => {
-    // Insert test data
-    await db.insert(channels).values({ name: 'test_channel', stream_key: 'test123' })
-
-    // Restore (should remove test data)
-    await execAsync(`./scripts/restore.sh ${backupFile}`)
-
-    // Verify test data is gone
-    const channel = await db.query.channels.findFirst({
-      where: eq(channels.name, 'test_channel')
-    })
-    expect(channel).toBeUndefined()
-  })
-})
-```
-
-### Health Checks
-
-```javascript
-// Comprehensive health check endpoint
-app.get('/health', async (req, res) => {
-  const checks = {
-    postgres: { status: 'unknown', latency_ms: null },
-    redis: { status: 'unknown', latency_ms: null },
-    s3: { status: 'unknown', latency_ms: null }
-  }
-
-  // PostgreSQL
-  try {
-    const start = Date.now()
-    await db.execute(sql`SELECT 1`)
-    checks.postgres = { status: 'healthy', latency_ms: Date.now() - start }
-  } catch (error) {
-    checks.postgres = { status: 'unhealthy', error: error.message }
-  }
-
-  // Redis
-  try {
-    const start = Date.now()
-    await redis.ping()
-    checks.redis = { status: 'healthy', latency_ms: Date.now() - start }
-  } catch (error) {
-    checks.redis = { status: 'unhealthy', error: error.message }
-  }
-
-  // S3/MinIO
-  try {
-    const start = Date.now()
-    await s3.headBucket({ Bucket: 'vods' })
-    checks.s3 = { status: 'healthy', latency_ms: Date.now() - start }
-  } catch (error) {
-    checks.s3 = { status: 'unhealthy', error: error.message }
-  }
-
-  const allHealthy = Object.values(checks).every(c => c.status === 'healthy')
-  res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy ? 'healthy' : 'degraded',
-    checks,
-    timestamp: new Date().toISOString()
-  })
-})
-
-// Liveness probe (just checks process is running)
-app.get('/health/live', (req, res) => {
-  res.json({ status: 'alive' })
-})
-
-// Readiness probe (checks if ready to serve traffic)
-app.get('/health/ready', async (req, res) => {
-  try {
-    await db.execute(sql`SELECT 1`)
-    await redis.ping()
-    res.json({ status: 'ready' })
-  } catch (error) {
-    res.status(503).json({ status: 'not ready', error: error.message })
-  }
-})
-```
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Chat delivery | Redis Pub/Sub | Kafka | < 1ms latency; durability unnecessary for ephemeral chat |
+| Chat protocol | WebSocket | SSE / Long polling | Bidirectional needed; lower overhead per message |
+| HLS segments | 2-4 second | 6 second (standard) | Lower latency at cost of higher CDN request volume |
+| Session storage | PostgreSQL + Redis cache | JWT | Revocable sessions; Redis for speed, PG for durability |
+| Stream simulation | API-based start/stop | Real RTMP ingest | Focuses on system design over infrastructure setup |
+| Chat persistence | PostgreSQL | Cassandra | Simpler operations; partition by time at scale |
+| Viewer counts | Redis INCR + periodic flush | Real-time DB writes | Reduces write pressure; eventual consistency acceptable |
 
 ---
 
 ## Implementation Notes
 
-This section documents the key implementation decisions and explains WHY each pattern was chosen for the Twitch streaming platform.
+This section maps the production architecture above to what is actually running locally.
 
-### WHY Idempotency Prevents Duplicate Chat Messages
+### Local Architecture
 
-**Problem**: In a high-traffic live chat system, network instability and client retries can cause the same message to be submitted multiple times. Without deduplication:
-- Users see duplicate messages cluttering the chat
-- Database storage is wasted on repeated content
-- Message ordering becomes confusing
-- Moderators may take action on what appears to be spam
-
-**Implementation**:
-```javascript
-// Each message includes a client-generated unique ID
-const messageId = `${userId}:${Date.now()}:${randomSuffix}`;
-
-// Server tracks recent message IDs in a Redis set with 5-minute TTL
-const isNew = await redis.sAdd(`chat_dedup:${channelId}`, messageId);
-if (!isNew) {
-  // Silently drop duplicate - client may have retried
-  return;
-}
+```
+┌───────────────────────┐         ┌───────────────────────┐
+│   React Frontend      │────────▶│   Express API Server  │
+│   :5173 (Vite)        │  HTTP   │   :3000                │
+│                       │         │                       │
+│ - Browse/home page    │         │ - Channel/category API│
+│ - Channel pages       │    WS   │ - Auth (cookie-based) │
+│ - Chat panel      ────│────────▶│ - WebSocket chat      │
+│ - Dashboard (creator) │         │   (/ws/chat)          │
+│ - Category browse     │         │ - Stream simulator    │
+│ - Following feed      │         │ - Moderation API      │
+│ - HLS.js player       │         │ - Emotes API          │
+│ - Zustand + TanStack  │         │ - Prometheus metrics  │
+│   Router              │         │ - Audit logging       │
+└───────────────────────┘         └────┬──────────┬───────┘
+                                       │          │
+                          ┌────────────┘          │
+                          ▼                       ▼
+                 ┌─────────────────┐    ┌─────────────────┐
+                 │   PostgreSQL    │    │   Valkey/Redis   │
+                 │   :5432         │    │   :6379          │
+                 │   (twitch_db)   │    │   (chat pub/sub, │
+                 │                 │    │    rate limits,   │
+                 │   Full schema:  │    │    viewer counts, │
+                 │   users,channels│    │    idempotency)   │
+                 │   streams,chat  │    │                   │
+                 │   bans,mods,    │    │                   │
+                 │   emotes,subs   │    │                   │
+                 └─────────────────┘    └─────────────────┘
 ```
 
-**Why Redis Sets?**
-- O(1) membership checks for high throughput
-- Automatic TTL cleanup prevents unbounded memory growth
-- Shared across all chat server instances
-- Fail-open design: if Redis is unavailable, allow the message through (users tolerate occasional duplicates better than lost messages)
-
-**Trade-off**: We chose server-side deduplication over client-side because:
-- Clients may be malicious or buggy
-- Server has authoritative view of what was processed
-- Centralized dedup works across all server instances
-
-### WHY Subscription Idempotency Prevents Double Charging
-
-**Problem**: Payment operations are critical and retries are common due to network timeouts. Without idempotency:
-- Users could be charged twice for the same subscription
-- Financial reconciliation becomes a nightmare
-- Refund processing creates customer support burden
-- Trust in the platform is damaged
-
-**Implementation**:
-```javascript
-// Client includes idempotency key in header
-// Idempotency-Key: sub:userId:channelId:timestamp
-
-// Server checks before processing payment
-const { isDuplicate, cachedResult } = await checkSubscriptionIdempotency(redis, key);
-if (isDuplicate) {
-  return cachedResult; // Return same response as original request
-}
-
-// Process subscription with transaction
-await withRetry(async () => {
-  const client = await getClient();
-  await client.query('BEGIN');
-  // ... create subscription, update counts ...
-  await client.query('COMMIT');
-}, { maxRetries: 3 });
-
-// Cache result for 24 hours
-await storeSubscriptionResult(redis, key, result);
+Run with:
+```
+docker-compose up -d          # Infrastructure (PostgreSQL, Valkey)
+cd backend && npm run dev     # API + WebSocket server on :3000
+cd frontend && npm run dev    # Frontend on :5173
 ```
 
-**Why 24-hour TTL?**
-- Long enough to handle delayed retries from payment processors
-- Short enough to not bloat Redis memory indefinitely
-- Aligns with typical payment processor retry windows
+### Production Patterns Actually Implemented
 
-### WHY Circuit Breakers Protect Live Streaming Infrastructure
+| Pattern | Implementation | File Path |
+|---------|---------------|-----------|
+| Structured logging | Pino JSON logger with request ID | `backend/src/utils/logger.ts` |
+| Prometheus metrics | WS connections, chat messages, subs, moderation | `backend/src/utils/metrics.ts` |
+| Circuit breakers | Opossum wrapping Redis chat publish | `backend/src/utils/circuitBreaker.ts` |
+| Retry with backoff | Exponential backoff for transient failures | `backend/src/utils/retry.ts` |
+| Health checks | Liveness, readiness, comprehensive probes | `backend/src/utils/health.ts` |
+| Idempotency | Chat message dedup, subscription dedup, stream locks | `backend/src/utils/idempotency.ts` |
+| Audit logging | Tamper-evident moderation action log | `backend/src/utils/audit.ts` |
+| WebSocket chat | Real-time chat with Redis Pub/Sub fan-out | `backend/src/services/chat.ts` |
+| Chat rate limiting | Redis-backed per-user per-channel limits | `backend/src/services/redis.ts` |
+| Stream simulation | Automatic viewer count fluctuation | `backend/src/services/streamSimulator.ts` |
+| Session auth | Cookie-based sessions stored in PostgreSQL | `backend/src/routes/auth.ts` |
+| Moderation system | Bans, timeouts, moderator management, filters | `backend/src/routes/moderation/` |
+| Emote system | Global + channel emotes with tier gating | `backend/src/routes/emotes.ts` |
+| Graceful shutdown | SIGTERM handler with connection cleanup | `backend/src/index.ts` |
 
-**Problem**: Live streaming is a real-time experience where cascading failures can destroy user experience:
-- If Redis fails, all chat servers keep retrying, creating thundering herd
-- Database connection pool exhaustion affects all users, not just the failing feature
-- Transcoding service overload can cause stream drops
-- Without protection, one failing component takes down the entire platform
+### What Was Simplified or Substituted
 
-**Implementation**:
-```javascript
-// Circuit breaker for Redis chat publishing
-const redisChatBreaker = createCircuitBreaker('redis-chat-publish', publishFn, {
-  timeout: 1000,              // Fast fail for real-time chat
-  errorThresholdPercentage: 50, // Open after 50% failures
-  resetTimeout: 5000,         // Try again after 5 seconds
-  volumeThreshold: 10         // Need 10 requests to calculate failure rate
-});
+| Production Component | Local Substitute | Reason |
+|---------------------|-----------------|--------|
+| RTMP ingest servers | API-based start/stop simulation | No nginx-rtmp module needed |
+| GPU transcoding (FFmpeg) | No transcoding; simulated stream state | Focuses on chat/moderation design |
+| CDN (CloudFront/Akamai) | No CDN; video player shows placeholder | No real video segments to deliver |
+| HLS segment delivery | Simulated; HLS.js included but no real segments | Video pipeline is a design artifact |
+| Kafka (chat replay, analytics) | Redis Pub/Sub only | Sufficient for local fan-out |
+| Payment processor (Stripe) | Subscription creation without payment | No real billing integration |
+| Multi-pod chat deployment | Single process; Redis Pub/Sub still used | Use `npm run dev:server{1,2,3}` to test fan-out |
+| OAuth / SSO | Cookie sessions with bcrypt passwords | Simpler for learning |
 
-// Fallback to local-only broadcast when Redis is unavailable
-redisChatBreaker.fallback((channel, message) => {
-  localBroadcast(channelId, message);
-  return { fallback: true };
-});
-```
+### What Was Omitted
 
-**Why These Specific Thresholds?**
-- **1000ms timeout**: Chat must feel instant; waiting longer frustrates users
-- **50% threshold**: Aggressive because chat is critical but not life-safety
-- **5s reset**: Fast recovery for transient issues; Redis usually recovers quickly
-- **Fallback to local**: Graceful degradation keeps chat working within single instances
-
-**Critical for Live Streaming Because**:
-- Viewers expect real-time interaction during live events
-- A 30-second outage during a major stream can cause massive user churn
-- Streamers depend on the platform for income; reliability is paramount
-
-### WHY Stream Start Uses Distributed Locks
-
-**Problem**: RTMP connections are unstable; streamers may reconnect multiple times:
-- OBS crashes and auto-reconnects
-- Network hiccups cause brief disconnections
-- Multiple connection attempts arrive simultaneously
-
-Without locking:
-- Multiple "go live" events are broadcast to followers
-- Duplicate stream records are created in database
-- Viewer counts are fragmented across multiple "streams"
-
-**Implementation**:
-```javascript
-async function startStream(channelId, title, categoryId) {
-  // Acquire lock to prevent duplicate go-live events
-  const { acquired } = await acquireStreamLock(redis, channelId);
-  if (!acquired) {
-    // Check if already live (reconnect scenario)
-    if (channel.is_live) {
-      return { reconnect: true };
-    }
-    throw new Error('Failed to acquire stream lock');
-  }
-
-  try {
-    // Create stream record and update channel
-    await query('UPDATE channels SET is_live = TRUE ...');
-    await query('INSERT INTO streams ...');
-  } finally {
-    await releaseStreamLock(redis, channelId);
-  }
-}
-```
-
-**Why Redis SET NX with TTL?**
-- Atomic operation prevents race conditions
-- TTL ensures locks don't persist forever if process crashes
-- 10-second TTL is long enough for the operation but short enough for recovery
-
-### WHY Moderation Audit Logging Enables Appeal Handling
-
-**Problem**: Moderation actions affect real people and their income:
-- Banned streamers lose revenue
-- Viewers may be unfairly timed out
-- Moderators may abuse their power
-- Legal compliance requires action history
-
-Without audit logging:
-- Appeals are "he said, she said" with no evidence
-- Patterns of abuse go undetected
-- Compliance audits cannot be satisfied
-- Trust and Safety team is blind
-
-**Implementation**:
-```javascript
-function logUserBan(actor, targetUserId, targetUsername, channelId, reason, expiresAt) {
-  auditLogger.info({
-    action: 'ban_user',
-    actor: { user_id: actor.userId, username: actor.username, ip: actor.ip },
-    target: { type: 'user', id: targetUserId },
-    channel_id: channelId,
-    reason,
-    metadata: {
-      target_username: targetUsername,
-      is_permanent: !expiresAt,
-      expires_at: expiresAt
-    },
-    timestamp: new Date().toISOString()
-  });
-}
-```
-
-**What We Log**:
-- **Who**: Actor user ID, username, and IP address
-- **What**: Action type (ban, unban, timeout, delete, etc.)
-- **Whom**: Target user or message ID
-- **Where**: Channel ID where action occurred
-- **Why**: Reason provided by moderator
-- **When**: ISO timestamp for timezone-agnostic sorting
-
-**Why Separate Logger?**
-- Audit logs may have different retention policies (7 years for legal)
-- Should be append-only and tamper-evident in production
-- Can be shipped to different storage (SIEM, compliance system)
-- Metrics can track moderation action rates per channel
-
-### WHY Viewer Metrics Enable Stream Quality Optimization
-
-**Problem**: Without metrics, platform operators are flying blind:
-- Cannot detect when streams have quality issues
-- Cannot optimize CDN routing
-- Cannot identify popular content for recommendations
-- Cannot measure SLA compliance
-
-**Implementation**:
-```javascript
-// Prometheus metrics exposed at /metrics
-const totalViewers = new Gauge({
-  name: 'twitch_total_viewers',
-  help: 'Total viewers across all live streams'
-});
-
-const activeStreams = new Gauge({
-  name: 'twitch_active_streams',
-  help: 'Number of currently live streams'
-});
-
-const chatMessagesTotal = new Counter({
-  name: 'twitch_chat_messages_total',
-  help: 'Total chat messages processed',
-  labelNames: ['channel_id']
-});
-
-// Updated periodically by stream simulator
-setInterval(async () => {
-  const result = await query('SELECT current_viewers FROM channels WHERE is_live = TRUE');
-  let total = 0;
-  for (const channel of result.rows) {
-    total += channel.current_viewers;
-  }
-  setTotalViewers(total);
-  setActiveStreams(result.rows.length);
-}, 30000);
-```
-
-**Key Metrics and Their Purpose**:
-
-| Metric | Purpose |
-|--------|---------|
-| `twitch_active_streams` | Capacity planning, detect stream drop events |
-| `twitch_total_viewers` | Platform health, trending analysis |
-| `twitch_chat_messages_total` | Rate limiting tuning, spam detection |
-| `twitch_websocket_connections` | Server scaling decisions |
-| `twitch_circuit_breaker_state` | Dependency health monitoring |
-| `twitch_moderation_actions_total` | Community health, moderator activity |
-
-**Why Prometheus?**
-- Pull-based model works well with dynamic scaling
-- Rich query language (PromQL) for dashboards
-- Standard format understood by Grafana, AlertManager
-- Low overhead for high-cardinality metrics
-
-### Implementation File Summary
-
-| File | Purpose |
-|------|---------|
-| `src/utils/logger.js` | Structured JSON logging with pino, request correlation |
-| `src/utils/metrics.js` | Prometheus metrics collection and exposition |
-| `src/utils/circuitBreaker.js` | Opossum-based circuit breaker with fallbacks |
-| `src/utils/retry.js` | Exponential backoff with jitter |
-| `src/utils/idempotency.js` | Chat dedup, subscription idempotency, stream locks |
-| `src/utils/audit.js` | Tamper-evident logging for moderation actions |
-| `src/utils/health.js` | Comprehensive health check endpoints |
-| `src/routes/moderation.js` | Ban/unban, message deletion, moderator management |
-
-### Endpoints Added
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /metrics` | Prometheus metrics scraping |
-| `GET /health` | Detailed health with dependency status |
-| `GET /health/live` | Kubernetes liveness probe |
-| `GET /health/ready` | Kubernetes readiness probe |
-| `POST /api/moderation/:channelId/ban` | Ban user with audit logging |
-| `DELETE /api/moderation/:channelId/ban/:userId` | Unban user with audit logging |
-| `DELETE /api/moderation/:channelId/message/:messageId` | Delete message with audit logging |
-| `POST /api/moderation/:channelId/clear` | Clear chat with audit logging |
-| `POST /api/moderation/:channelId/moderator` | Add moderator with audit logging |
-| `DELETE /api/moderation/:channelId/moderator/:userId` | Remove moderator with audit logging |
-
-### NPM Packages Added
-
-- `pino`: High-performance JSON logger
-- `pino-http`: HTTP request logging middleware
-- `prom-client`: Prometheus metrics client
-- `opossum`: Circuit breaker implementation
+- **Real RTMP ingest**: No nginx-rtmp module; streams are simulated via API calls
+- **Video transcoding pipeline**: No FFmpeg; no actual video segments generated
+- **CDN layer**: No edge caching; video player shows channel info placeholder
+- **VOD recording**: Schema supports it (`vod_url` column) but no segment archival implemented
+- **Clip creation**: No clip extraction from live or VOD content
+- **Push notifications**: No notification system for go-live events
+- **Chat replay**: No synchronization of chat messages with VOD timeline
+- **Multi-region deployment**: Single Docker Compose on localhost
+- **Kubernetes orchestration**: No container scheduling or auto-scaling
+- **Spam/ML moderation**: Rule-based only; no ML content filtering
+- **Bits/donations**: No micropayment or tipping system
+- **Raid/host system**: No stream-to-stream viewer redirection

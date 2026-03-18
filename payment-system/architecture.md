@@ -2,7 +2,7 @@
 
 ## System Overview
 
-A transaction processing and payment platform that handles payment authorization, capture, refunds, and multi-currency conversions with built-in fraud detection.
+A transaction processing and payment platform that handles payment authorization, capture, refunds, and multi-currency conversions with built-in fraud detection. The system implements double-entry bookkeeping for financial integrity, idempotent payment processing, and webhook delivery for merchant notifications. Learning goals: financial transaction atomicity, ledger consistency, idempotency patterns, fraud scoring, and webhook reliability.
 
 ## Requirements
 
@@ -14,17 +14,22 @@ A transaction processing and payment platform that handles payment authorization
 - **Fraud detection**: Rule-based scoring with velocity checks and device fingerprinting
 - **Merchant management**: Onboarding, API key management, and webhook configuration
 - **Reconciliation**: Daily settlement reports and dispute handling
+- **Chargeback handling**: Dispute management with evidence tracking and resolution workflow
 
 ### Non-Functional Requirements
 
-- **Scalability**: Handle 500 RPS peak with horizontal scaling to 2,000 RPS
-- **Availability**: 99.9% uptime (8.7 hours downtime/year budget)
-- **Latency**: p50 < 200ms, p99 < 800ms for payment authorization
-- **Consistency**: Strong consistency for ledger writes; eventual consistency acceptable for analytics
+| Requirement | Target |
+|-------------|--------|
+| Availability | 99.9% uptime (8.7 hours downtime/year) |
+| Authorization latency | p50 < 200ms, p99 < 800ms |
+| Throughput | 500 RPS sustained, burst to 2,000 RPS |
+| Consistency | Strong consistency for ledger writes; eventual consistency for analytics |
+| Idempotency | Every payment mutation must be safely retryable |
+| Durability | Zero lost transactions, complete audit trail for PCI-DSS compliance |
 
 ## Capacity Estimation
 
-**Local development target**: Simulate a mid-sized payment processor
+### Production Scale
 
 | Metric | Value | Sizing Implication |
 |--------|-------|-------------------|
@@ -35,73 +40,120 @@ A transaction processing and payment platform that handles payment authorization
 | Active merchants | 10,000 | Negligible metadata storage |
 | Webhook events | 4M/day | 100 RPS to webhook workers |
 
-**Component sizing for local dev (3-instance setup)**:
-- PostgreSQL: 50 GB disk, 2 GB RAM
-- Valkey/Redis: 512 MB (rate limits, idempotency keys, session cache)
-- RabbitMQ: 256 MB, 10K messages in flight max
-- API servers: 3 instances on ports 3001, 3002, 3003
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Concurrent users | 2-5 |
+| Transactions/day | 100-500 |
+| API servers | 3 instances on ports 3001-3003 |
+| PostgreSQL | Single instance, 50 GB disk |
+| Valkey/Redis | 512 MB (rate limits, idempotency, sessions) |
+| RabbitMQ | 256 MB, 10K messages in flight max |
 
 ## High-Level Architecture
 
 ```
-                                    [Load Balancer :3000]
-                                           |
-                    +----------------------+----------------------+
-                    |                      |                      |
-              [API Server :3001]    [API Server :3002]    [API Server :3003]
-                    |                      |                      |
-                    +----------------------+----------------------+
-                                           |
-                    +----------------------+----------------------+
-                    |                      |                      |
-              [PostgreSQL]           [Valkey/Redis]         [RabbitMQ]
-              (Primary DB)           (Cache + Locks)     (Async Processing)
-
-                              +------------+------------+
-                              |            |            |
-                        [Webhook      [Fraud        [Settlement
-                         Worker]       Worker]        Worker]
+┌──────────────────┐
+│   Merchant App   │
+│   / React SPA    │
+└────────┬─────────┘
+         │ HTTPS
+         ▼
+┌──────────────────────────────────────────────────┐
+│                  API Gateway / CDN                │
+│       (TLS Termination, Rate Limiting, WAF)       │
+└────────────────────────┬─────────────────────────┘
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+   ┌────────────┐ ┌────────────┐ ┌────────────┐
+   │ Payment    │ │ Payment    │ │ Payment    │
+   │ API Server │ │ API Server │ │ API Server │
+   │ (Node.js)  │ │ (Node.js)  │ │ (Node.js)  │
+   └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
+          │              │              │
+          └──────────────┼──────────────┘
+                         │
+    ┌────────┬───────────┼───────────┬────────────┐
+    ▼        ▼           ▼           ▼            ▼
+┌────────┐ ┌────────┐ ┌────────┐ ┌──────────┐ ┌──────────────┐
+│Postgres│ │ Valkey  │ │RabbitMQ│ │ Fraud    │ │  Prometheus  │
+│(Primary│ │(Cache + │ │(Async  │ │ Service  │ │  + Grafana   │
+│+ Read  │ │ Locks)  │ │ Queue) │ │(Scoring) │ │              │
+│Replica)│ │         │ │        │ │          │ │              │
+└────────┘ └────────┘ └────┬───┘ └──────────┘ └──────────────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────────┐
+        │ Webhook  │ │  Fraud   │ │  Settlement  │
+        │ Worker   │ │  Worker  │ │  Worker      │
+        └──────────┘ └──────────┘ └──────────────┘
 ```
 
-### Core Components
+## Core Components
 
-1. **API Gateway/Load Balancer** (nginx on :3000)
-   - Routes requests round-robin to API servers
-   - Terminates TLS in production
-   - Rate limiting enforcement point
+### 1. API Gateway
 
-2. **Payment API Service** (Node.js + Express on :3001-3003)
-   - Handles payment lifecycle: authorize, capture, void, refund
-   - Validates idempotency keys before processing
-   - Publishes events to RabbitMQ for async processing
+The API gateway is the single entry point for all merchant traffic. In production, this is a managed gateway (AWS API Gateway, Kong, or Nginx Plus) that handles:
 
-3. **PostgreSQL** (Primary data store on :5432)
-   - Transactions, ledger entries, merchants, customers
-   - Uses row-level locking for balance updates
-   - Stores audit trail for compliance
+- TLS termination and certificate management
+- Request rate limiting per merchant API key
+- Request routing to backend instances via round-robin
+- Request/response logging for audit
+- Web Application Firewall (WAF) rules for PCI-DSS compliance
 
-4. **Valkey/Redis** (:6379)
-   - Idempotency key storage (TTL: 24 hours)
-   - Rate limit counters (sliding window)
-   - Distributed locks for concurrent payment handling
-   - Session cache for admin dashboard
+### 2. Payment API Service (Stateless)
 
-5. **RabbitMQ** (:5672)
-   - Queues: `webhook.delivery`, `fraud.scoring`, `settlement.batch`, `notifications`
-   - Dead-letter queues for failed message retry
+Handles the full payment lifecycle: authorize, capture, void, refund, and chargeback. Each instance is stateless -- all state lives in PostgreSQL and Valkey -- enabling horizontal scaling by adding instances behind the gateway.
 
-6. **Background Workers**
-   - **Webhook Worker**: Delivers payment events to merchant endpoints with exponential backoff
-   - **Fraud Worker**: Async fraud scoring for post-authorization review
-   - **Settlement Worker**: Batches transactions for daily settlement files
+Key responsibilities:
+- Validate merchant API keys (SHA-256 hashed, looked up from cache or DB)
+- Enforce idempotency: check Valkey for existing key before processing
+- Acquire distributed locks to prevent concurrent processing of the same payment
+- Execute payment within a PostgreSQL transaction (transaction + ledger entries + audit log)
+- Publish events to RabbitMQ for async processing (webhooks, fraud scoring, settlement)
+
+### 3. PostgreSQL (Primary Data Store)
+
+Stores all financial data with ACID guarantees:
+- **Transactions**: Payment records with status tracking
+- **Ledger entries**: Double-entry bookkeeping for every balance change
+- **Merchants**: Account configuration, API key hashes, webhook URLs
+- **Audit log**: Immutable record of every action for PCI-DSS Requirement 10
+
+Uses SERIALIZABLE isolation for ledger writes to prevent phantom reads and ensure balance consistency.
+
+### 4. Valkey/Redis (Cache + Coordination)
+
+- **Idempotency keys**: `SET idempotency:{merchant}:{key} {response} EX 86400` -- 24-hour TTL prevents duplicate charges
+- **Rate limit counters**: Sliding window using sorted sets with `ZRANGEBYSCORE`
+- **Distributed locks**: `SET lock:payment:{key} 1 NX EX 30` -- prevents concurrent processing
+- **Merchant config cache**: 5-minute TTL avoids DB round-trip on every request
+- **Exchange rate cache**: 5-minute TTL for FX lookups
+
+### 5. RabbitMQ (Async Processing)
+
+Topic exchange (`payment.events`) with routing keys:
+
+| Queue | Routing Key | Consumer | Purpose |
+|-------|-------------|----------|---------|
+| `webhook.delivery` | `payment.*`, `refund.*` | Webhook Worker | Deliver events to merchant endpoints |
+| `fraud.scoring` | `payment.authorized` | Fraud Worker | Async deep fraud analysis |
+| `settlement.batch` | `payment.captured` | Settlement Worker | Batch for daily settlement |
+
+Dead-letter queues (DLQ) handle messages that fail after 5 retries. DLQ messages are reviewed manually or re-queued after root cause fix.
+
+### 6. Background Workers
+
+- **Webhook Worker**: Delivers payment events to merchant endpoints with HMAC-SHA256 signatures. Exponential backoff retry: 1s, 5s, 30s, 2min, 10min, then DLQ.
+- **Fraud Worker**: Deep fraud analysis post-authorization. Checks velocity patterns, device fingerprints, geolocation anomalies. Can trigger auto-void if score exceeds threshold.
+- **Settlement Worker**: Batches captured transactions by merchant and currency for daily settlement file generation.
 
 ## Database Schema
 
-### Database Schema
-
 ```sql
--- Core tables with PostgreSQL
-
 CREATE TABLE merchants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255) NOT NULL,
@@ -246,9 +298,11 @@ CREATE INDEX idx_transactions_idempotency ON transactions(idempotency_key) WHERE
 
 ## API Design
 
-### Core Endpoints
+### Authentication
 
-**Authentication**: API key in `Authorization: Bearer sk_live_xxx` header
+API key in `Authorization: Bearer sk_live_xxx` header. Keys use `sk_live_*` and `sk_test_*` prefixes to distinguish environments. Keys are hashed with SHA-256 before storage -- the plaintext key is shown to the merchant only once at creation.
+
+### Core Endpoints
 
 ```
 POST   /v1/payments              # Create and authorize a payment
@@ -272,70 +326,43 @@ POST   /v1/admin/merchants/:id/suspend  # Suspend merchant
 GET    /v1/admin/reconciliation  # Daily settlement reports
 ```
 
-**Request/Response Example**:
-
-```json
-// POST /v1/payments
-// Headers: Authorization: Bearer sk_live_xxx, Idempotency-Key: order_12345
-{
-  "amount": 5000,
-  "currency": "usd",
-  "payment_method_id": "pm_abc123",
-  "description": "Order #12345",
-  "capture": true,
-  "metadata": { "order_id": "12345" }
-}
-
-// Response 201
-{
-  "id": "txn_xyz789",
-  "status": "captured",
-  "amount": 5000,
-  "currency": "usd",
-  "captured_amount": 5000,
-  "refunded_amount": 0,
-  "fraud_score": 12,
-  "created_at": "2025-01-15T10:30:00Z"
-}
-```
-
-## Request Flow
+## Request Flows
 
 ### Payment Authorization Flow
 
 ```
-1. Client -> API Server: POST /v1/payments (with Idempotency-Key header)
+1. Client ──▶ API Server: POST /v1/payments (with Idempotency-Key header)
 
 2. API Server:
-   a. Validate API key -> fetch merchant from cache or DB
+   a. Validate API key ──▶ fetch merchant from cache or DB
    b. Check Valkey for existing idempotency key
       - If exists: return cached response (no processing)
-   c. Acquire distributed lock: LOCK payment:{idempotency_key}
+   c. Acquire distributed lock: SET lock:payment:{key} 1 NX EX 30
    d. Validate request payload
    e. Rate limit check (Valkey sliding window)
 
-3. API Server -> Fraud Service (inline, <50ms budget):
+3. API Server ──▶ Fraud Service (inline, <50ms budget):
    a. Calculate fraud score based on:
       - Velocity (transactions per hour for this card)
       - Device fingerprint match
       - Geolocation vs billing address
    b. If score > 80: auto-decline
 
-4. API Server -> PostgreSQL (transaction):
+4. API Server ──▶ PostgreSQL (single transaction):
    BEGIN;
    INSERT INTO transactions (...) VALUES (...);
    INSERT INTO ledger_entries (...) VALUES (...);  -- Hold funds
    INSERT INTO audit_log (...) VALUES (...);
    COMMIT;
 
-5. API Server -> Valkey:
+5. API Server ──▶ Valkey:
    SET idempotency:{merchant}:{key} {response} EX 86400
 
-6. API Server -> RabbitMQ:
+6. API Server ──▶ RabbitMQ:
    Publish to webhook.delivery queue
    Publish to fraud.scoring queue (async deep analysis)
 
-7. API Server -> Client: 201 Created with payment object
+7. API Server ──▶ Client: 201 Created with payment object
 
 8. Release distributed lock
 ```
@@ -343,21 +370,21 @@ GET    /v1/admin/reconciliation  # Daily settlement reports
 ### Refund Flow
 
 ```
-1. Client -> API Server: POST /v1/payments/:id/refund { amount: 2500 }
+1. Client ──▶ API Server: POST /v1/payments/:id/refund { amount: 2500 }
 
 2. API Server:
    a. Validate API key and ownership of transaction
-   b. Acquire lock: LOCK refund:{transaction_id}
+   b. Acquire lock: SET lock:refund:{transaction_id} 1 NX EX 30
    c. Validate: captured_amount - refunded_amount >= requested_amount
 
-3. API Server -> PostgreSQL (transaction):
+3. API Server ──▶ PostgreSQL (single transaction):
    BEGIN;
    UPDATE transactions SET refunded_amount = refunded_amount + 2500;
    INSERT INTO ledger_entries (...);  -- Credit customer, debit merchant
    INSERT INTO audit_log (...);
    COMMIT;
 
-4. API Server -> RabbitMQ:
+4. API Server ──▶ RabbitMQ:
    Publish refund.created webhook event
 
 5. Return updated payment object
@@ -365,176 +392,56 @@ GET    /v1/admin/reconciliation  # Daily settlement reports
 
 ## Key Design Decisions
 
-### Transaction Consistency
+### Transaction Consistency (Double-Entry Ledger)
 
-**Problem**: Payment operations must be atomic - we cannot have partial state where money is debited but transaction record is missing.
+**Problem**: Payment operations must be atomic -- we cannot have partial state where money is debited but the transaction record is missing.
 
-**Solution**:
-- Use PostgreSQL transactions with SERIALIZABLE isolation for ledger writes
-- Idempotency keys prevent duplicate charges on retry
-- Two-phase approach: authorize (hold funds) then capture (settle)
+**Chosen: Double-entry bookkeeping within PostgreSQL transactions.** Every balance change creates paired debit/credit entries in the `ledger_entries` table. The transaction record captures the business event; the ledger entries capture the accounting impact. If the ledger ever disagrees with the expected balance, we know something went wrong.
 
-```javascript
-// Idempotency implementation
-async function processPayment(merchantId, idempotencyKey, payload) {
-  const cacheKey = `idempotency:${merchantId}:${idempotencyKey}`;
+**Why not event sourcing?** Event sourcing would provide a complete replay log, but adds significant complexity: event store, projection rebuilding, eventual consistency between views. For a payment system where we need immediate balance consistency, a relational ledger within ACID transactions is simpler and equally correct. Event sourcing makes more sense when the domain has complex state transitions (e.g., order management with many status changes) rather than the straightforward debit/credit pattern of payments.
 
-  // Check cache first
-  const cached = await valkey.get(cacheKey);
-  if (cached) return JSON.parse(cached);
+### Idempotency Storage in Valkey
 
-  // Acquire distributed lock
-  const lock = await valkey.set(`lock:${cacheKey}`, '1', 'NX', 'EX', 30);
-  if (!lock) throw new ConflictError('Request in progress');
+**Problem**: Network timeouts, client retries, and load balancer retries can cause duplicate payment processing. A customer charged twice is the worst possible payment system failure.
 
-  try {
-    const result = await db.transaction(async (tx) => {
-      // Process payment within transaction
-      const txn = await tx.insert(transactions).values({...}).returning();
-      await tx.insert(ledgerEntries).values([...]);
-      return txn;
-    });
+**Chosen: Valkey with 24-hour TTL for idempotency keys.** The server checks Valkey before beginning any processing. If the key exists, the cached response is returned immediately. Keys are scoped per merchant (`idempotency:{merchant_id}:{key}`) to prevent cross-merchant collisions.
 
-    // Cache response for 24 hours
-    await valkey.setex(cacheKey, 86400, JSON.stringify(result));
-    return result;
-  } finally {
-    await valkey.del(`lock:${cacheKey}`);
-  }
-}
-```
+**Why Valkey instead of PostgreSQL?** Idempotency checks happen on every mutation request, before the business logic begins. A Valkey GET is sub-millisecond; a PostgreSQL query adds 1-5ms. Since idempotency keys are ephemeral (24h TTL), they do not warrant permanent storage. The trade-off: if Valkey loses data (restart without persistence), a small window of duplicate risk exists. We mitigate this by also storing the idempotency key in the transactions table (`UNIQUE(merchant_id, idempotency_key)`) as a database-level fallback.
+
+### Sync Fraud Scoring with Async Deep Analysis
+
+**Problem**: Fraud checks must be fast enough to fit within the authorization latency budget, but thorough enough to catch sophisticated attacks.
+
+**Chosen: Two-phase approach.** Phase 1 runs inline during authorization with a 50ms budget -- velocity checks, device fingerprint matching, geolocation comparison. If the score exceeds 80, the payment is auto-declined. Phase 2 runs asynchronously via the fraud worker, performing deeper analysis (cross-merchant velocity, network graph analysis) that can take seconds.
+
+**Why not fully async?** Allowing a fraudulent payment through and reversing it later damages merchant trust and creates chargeback costs. The inline check catches 90%+ of fraud at minimal latency cost. The async check catches the remaining sophisticated attacks within minutes, enabling manual review or auto-void before settlement.
+
+### Webhook Delivery via Message Queue
+
+**Problem**: Merchants need real-time notification of payment events, but webhook delivery is inherently unreliable (merchant servers may be down, slow, or returning errors).
+
+**Chosen: RabbitMQ with dedicated webhook workers.** Payment events are published to the `webhook.delivery` queue immediately after the payment transaction commits. The webhook worker delivers events with exponential backoff (1s, 5s, 30s, 2min, 10min) and moves permanently failed events to a DLQ.
+
+**Why not deliver webhooks inline during the payment request?** If the merchant's webhook endpoint is slow (5+ seconds) or down, the payment authorization would either timeout or fail. By decoupling via a queue, the payment response returns in <800ms regardless of webhook endpoint health. The trade-off is eventual delivery -- merchants may receive the webhook seconds after the payment, not simultaneously.
+
+## Consistency and Idempotency
 
 ### Idempotency Semantics
 
-- Idempotency keys are scoped per merchant (same key from different merchants = different operations)
-- Keys expire after 24 hours
-- Subsequent requests with same key return cached response without reprocessing
-- If original request failed, retry will attempt processing again (failure is not cached)
+- Keys are scoped per merchant (same key from different merchants = different operations)
+- Keys expire after 24 hours (Valkey TTL)
+- Subsequent requests with the same key return the cached response without reprocessing
+- If the original request failed, the key is not cached (failure is not idempotent -- the client can retry)
+- A distributed lock prevents concurrent processing of the same idempotency key
 
 ### Multi-Currency Handling
 
-- All amounts stored in smallest currency unit (cents, pence)
-- Exchange rates fetched from external service and cached for 5 minutes
+- All amounts stored in smallest currency unit (cents, pence, yen)
+- Exchange rates fetched from external service and cached in Valkey for 5 minutes
 - Merchant settles in their configured currency
-- FX conversion happens at capture time, locked rate stored on transaction
+- FX conversion happens at capture time; the locked rate is stored on the transaction record
 
-## Technology Stack
-
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| **Application** | Node.js + Express + TypeScript | Fast iteration, good async I/O for payment APIs |
-| **Data** | PostgreSQL 16 | ACID compliance critical for financial data |
-| **Cache** | Valkey (Redis-compatible) | Idempotency, rate limits, distributed locks |
-| **Queue** | RabbitMQ | Reliable delivery, DLQ support, good for webhook retry |
-| **Load Balancer** | nginx | Simple local setup, sticky sessions for admin |
-| **Monitoring** | Prometheus + Grafana | Metrics collection and visualization |
-
-## Caching Strategy
-
-### Cache-Aside Pattern
-
-| Data | Cache Location | TTL | Invalidation |
-|------|---------------|-----|--------------|
-| Merchant config | Valkey | 5 min | On update via API |
-| Exchange rates | Valkey | 5 min | TTL expiry |
-| Idempotency responses | Valkey | 24 hours | TTL expiry |
-| Rate limit counters | Valkey | 1 min sliding | Automatic |
-
-### Rate Limiting (Valkey)
-
-```javascript
-// Sliding window rate limiter
-async function checkRateLimit(merchantId, limit = 100, windowSecs = 60) {
-  const key = `ratelimit:${merchantId}`;
-  const now = Date.now();
-  const windowStart = now - (windowSecs * 1000);
-
-  // Remove old entries, add current, count
-  const multi = valkey.multi();
-  multi.zremrangebyscore(key, 0, windowStart);
-  multi.zadd(key, now, `${now}-${Math.random()}`);
-  multi.zcard(key);
-  multi.expire(key, windowSecs);
-
-  const results = await multi.exec();
-  const count = results[2][1];
-
-  if (count > limit) {
-    throw new RateLimitError(`Rate limit exceeded: ${count}/${limit}`);
-  }
-  return { remaining: limit - count, reset: windowStart + (windowSecs * 1000) };
-}
-```
-
-## Message Queue Design (RabbitMQ)
-
-### Queue Topology
-
-```
-Exchange: payment.events (topic)
-  |
-  +-- Queue: webhook.delivery
-  |     Routing key: payment.*, refund.*
-  |     DLQ: webhook.delivery.dlq (after 5 retries)
-  |
-  +-- Queue: fraud.scoring
-  |     Routing key: payment.authorized
-  |
-  +-- Queue: settlement.batch
-        Routing key: payment.captured
-```
-
-### Delivery Semantics
-
-- **At-least-once delivery**: Workers must be idempotent
-- **Retry with backoff**: 1s, 5s, 30s, 2min, 10min, then DLQ
-- **Prefetch limit**: 10 messages per worker to prevent memory bloat
-
-### Webhook Delivery Worker
-
-```javascript
-// Exponential backoff for webhook retries
-const RETRY_DELAYS = [1000, 5000, 30000, 120000, 600000]; // ms
-
-async function processWebhook(webhook) {
-  try {
-    const signature = generateSignature(webhook.payload, merchant.webhookSecret);
-    const response = await fetch(merchant.webhookUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Signature': signature,
-        'X-Webhook-ID': webhook.id,
-      },
-      body: JSON.stringify(webhook.payload),
-      timeout: 10000,
-    });
-
-    if (response.ok) {
-      await db.update(webhooks).set({ status: 'delivered' }).where(eq(webhooks.id, webhook.id));
-    } else {
-      throw new Error(`HTTP ${response.status}`);
-    }
-  } catch (error) {
-    const nextDelay = RETRY_DELAYS[webhook.attempts] || null;
-    if (nextDelay) {
-      await db.update(webhooks).set({
-        attempts: webhook.attempts + 1,
-        next_retry_at: new Date(Date.now() + nextDelay),
-        last_error: error.message,
-      }).where(eq(webhooks.id, webhook.id));
-      // Re-queue with delay
-      channel.sendToQueue('webhook.delivery', Buffer.from(JSON.stringify(webhook)), {
-        headers: { 'x-delay': nextDelay },
-      });
-    } else {
-      await db.update(webhooks).set({ status: 'failed' }).where(eq(webhooks.id, webhook.id));
-    }
-  }
-}
-```
-
-## Security Considerations
+## Security
 
 ### Authentication and Authorization
 
@@ -546,107 +453,35 @@ async function processWebhook(webhook) {
 
 ### API Key Management
 
-```javascript
-// API key generation and validation
-function generateApiKey(environment = 'live') {
-  const prefix = environment === 'live' ? 'sk_live_' : 'sk_test_';
-  const key = prefix + crypto.randomBytes(24).toString('base64url');
-  const hash = crypto.createHash('sha256').update(key).digest('hex');
-  return { key, hash };  // Store hash, return key to merchant once
-}
-
-async function validateApiKey(bearerToken) {
-  const hash = crypto.createHash('sha256').update(bearerToken).digest('hex');
-  const merchant = await db.select().from(merchants).where(eq(merchants.apiKeyHash, hash)).limit(1);
-  if (!merchant.length || merchant[0].status !== 'active') {
-    throw new UnauthorizedError('Invalid API key');
-  }
-  return merchant[0];
-}
-```
+API keys are generated with `crypto.randomBytes(24).toString('base64url')` and prefixed with `sk_live_` or `sk_test_`. Only the SHA-256 hash is stored. The plaintext key is returned to the merchant once at creation and never stored.
 
 ### RBAC for Admin Operations
 
-```javascript
-// Role definitions
-const ROLES = {
-  support: ['read:transactions', 'read:merchants'],
-  operations: ['read:transactions', 'read:merchants', 'write:refunds'],
-  admin: ['read:*', 'write:*', 'manage:merchants'],
-};
-
-// Middleware
-function requirePermission(permission) {
-  return (req, res, next) => {
-    const userPerms = ROLES[req.session.user.role] || [];
-    const hasPermission = userPerms.some(p =>
-      p === permission || p === 'read:*' || p === 'write:*'
-    );
-    if (!hasPermission) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    next();
-  };
-}
+```
+support:    read:transactions, read:merchants
+operations: read:transactions, read:merchants, write:refunds
+admin:      read:*, write:*, manage:merchants
 ```
 
 ### Data Protection
 
-- Card numbers never stored; tokenized via payment processor
+- Card numbers never stored; tokenized via payment processor reference
 - PII encrypted at rest (PostgreSQL pgcrypto for email/name)
 - TLS 1.3 for all external communication
 - API keys hashed with SHA-256 before storage
 
 ## Observability
 
-### Metrics (Prometheus)
+### Prometheus Metrics
 
-```javascript
-// Key metrics to expose at /metrics
-const metrics = {
-  // Latency histograms
-  payment_request_duration_seconds: new Histogram({
-    name: 'payment_request_duration_seconds',
-    help: 'Payment API request latency',
-    labelNames: ['method', 'endpoint', 'status'],
-    buckets: [0.05, 0.1, 0.2, 0.5, 1, 2, 5],
-  }),
-
-  // Counters
-  payment_total: new Counter({
-    name: 'payment_total',
-    help: 'Total payments processed',
-    labelNames: ['status', 'currency'],
-  }),
-
-  webhook_delivery_total: new Counter({
-    name: 'webhook_delivery_total',
-    help: 'Webhook delivery attempts',
-    labelNames: ['status'],
-  }),
-
-  // Gauges
-  queue_depth: new Gauge({
-    name: 'rabbitmq_queue_depth',
-    help: 'Messages waiting in queue',
-    labelNames: ['queue'],
-  }),
-};
-```
-
-### SLI Dashboard Queries (Grafana)
-
-```promql
-# Availability: Successful responses / Total responses
-sum(rate(payment_request_duration_seconds_count{status=~"2.."}[5m]))
-/ sum(rate(payment_request_duration_seconds_count[5m]))
-
-# Latency p99
-histogram_quantile(0.99, sum(rate(payment_request_duration_seconds_bucket[5m])) by (le))
-
-# Error rate by type
-sum(rate(payment_total{status="failed"}[5m])) by (currency)
-```
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `payment_request_duration_seconds` | Histogram | method, endpoint, status | Latency SLO tracking |
+| `payment_total` | Counter | status, currency | Volume and success rate |
+| `webhook_delivery_total` | Counter | status | Webhook reliability |
+| `rabbitmq_queue_depth` | Gauge | queue | Queue health |
+| `fraud_score_distribution` | Histogram | - | Risk distribution |
+| `db_active_connections` | Gauge | - | Pool utilization |
 
 ### Alert Thresholds
 
@@ -656,31 +491,18 @@ sum(rate(payment_total{status="failed"}[5m])) by (currency)
 | High latency | p99 > 2s for 5 min | Warning |
 | Queue backup | Queue depth > 1000 for 10 min | Warning |
 | Webhook failures | Failure rate > 5% for 15 min | Warning |
-| DB connection exhausted | Active connections > 80% pool | Critical |
+| DB connections exhausted | Active connections > 80% pool | Critical |
 
 ### Structured Logging
 
-```javascript
-// Log format for payment events
-logger.info({
-  event: 'payment.processed',
-  transaction_id: txn.id,
-  merchant_id: merchant.id,
-  amount: txn.amount,
-  currency: txn.currency,
-  status: txn.status,
-  duration_ms: endTime - startTime,
-  fraud_score: txn.fraudScore,
-  trace_id: req.headers['x-trace-id'],
-});
-```
+JSON-structured logging with Pino, including contextual fields: `event`, `transaction_id`, `merchant_id`, `amount`, `currency`, `status`, `duration_ms`, `fraud_score`, `trace_id`. Trace IDs are generated at the API gateway and propagated through all service calls via headers.
 
 ### Distributed Tracing
 
 - Generate `trace_id` at load balancer or first API server
-- Pass through all service calls in headers
-- Store on audit_log entries for correlation
-- Use OpenTelemetry SDK for span creation
+- Pass through all service calls and queue messages in headers
+- Store on `audit_log` entries for correlation
+- OpenTelemetry SDK for span creation across async boundaries
 
 ## Failure Handling
 
@@ -695,95 +517,51 @@ logger.info({
 
 ### Circuit Breaker Pattern
 
-```javascript
-// Circuit breaker for external payment processor
-const processorBreaker = new CircuitBreaker({
-  failureThreshold: 5,
-  successThreshold: 2,
-  timeout: 30000,  // 30s open state
-});
+Circuit breakers wrap calls to external payment processors and the fraud scoring service. Configuration:
+- **Failure threshold**: 5 consecutive failures opens the circuit
+- **Recovery timeout**: 30 seconds in open state before allowing a test request
+- **Half-open**: 2 successful requests needed to close the circuit
 
-async function callProcessor(payload) {
-  if (processorBreaker.isOpen()) {
-    throw new ServiceUnavailableError('Payment processor temporarily unavailable');
-  }
-
-  try {
-    const result = await processorClient.authorize(payload);
-    processorBreaker.recordSuccess();
-    return result;
-  } catch (error) {
-    processorBreaker.recordFailure();
-    throw error;
-  }
-}
-```
-
-### Disaster Recovery (Local Dev Simulation)
-
-For local development, simulate failure scenarios:
-
-1. **PostgreSQL failover**: Run primary on :5432, replica on :5433
-   ```bash
-   # Promote replica
-   docker exec postgres-replica pg_ctl promote
-   ```
-
-2. **Valkey cluster mode**: 3-node cluster for lock availability
-   ```yaml
-   # docker-compose.yml
-   valkey-node-1:
-     command: valkey-server --cluster-enabled yes --cluster-node-timeout 5000
-   ```
-
-3. **Backup/restore testing**:
-   ```bash
-   # Daily backup
-   pg_dump -Fc payment_system > backup_$(date +%Y%m%d).dump
-
-   # Restore
-   pg_restore -d payment_system backup_20250115.dump
-   ```
+When the processor circuit breaker is open, payment requests receive a `503 Service Unavailable` immediately instead of waiting for a 30-second timeout. This prevents connection pool exhaustion and cascading failures.
 
 ### Graceful Degradation
 
-- If fraud service is down: approve payments with score=50, flag for manual review
-- If webhook queue is full: store in PostgreSQL overflow table, process later
-- If Valkey is down: fall back to DB-based rate limiting (slower but functional)
+- **Fraud service down**: Approve payments with `fraud_score=50`, flag for manual review
+- **Webhook queue full**: Store in PostgreSQL overflow table, process later via polling
+- **Valkey down**: Fall back to DB-based rate limiting and idempotency checks (slower but functional)
+- **RabbitMQ down**: Store events in PostgreSQL for later replay
 
-## Cost Tradeoffs
+## Scalability Considerations
 
-### Local Development Focus
+### Horizontal Scaling
 
-| Decision | Trade-off | Rationale |
-|----------|-----------|-----------|
-| PostgreSQL for everything | Simpler ops vs. specialized stores | Learning project; avoid operational complexity |
-| Valkey vs. Redis | Open source vs. managed | No license concerns, full feature parity |
-| RabbitMQ vs. Kafka | Simpler setup vs. higher throughput | Webhook delivery doesn't need Kafka's scale |
-| Single-region | No geo-redundancy | Local dev; add multi-region when studying DR |
+- **API servers**: Stateless; add instances behind load balancer. No session affinity needed for API key auth.
+- **Workers**: Scale independently based on queue depth. Webhook workers scale with merchant count; fraud workers scale with transaction volume.
+- **Database**: Read replicas for reporting queries (admin dashboard, reconciliation). Primary handles all writes.
 
-### Scaling Cost Considerations
+### Sharding Strategy
 
-If this were production:
+If transaction volume exceeds single-node PostgreSQL capacity:
+- Shard by `merchant_id` (hash-based, 5 initial shards)
+- Each shard handles ~20% of traffic
+- Cross-shard queries (admin search) via application-level aggregation
+- Ledger entries co-located with their transaction (same shard key)
 
-| Component | Local Dev | Production Estimate |
-|-----------|-----------|---------------------|
-| PostgreSQL | Single instance | RDS db.r5.xlarge ($400/mo) + read replicas |
-| Cache | 512 MB Valkey | ElastiCache r6g.large ($200/mo) |
-| Queue | Single RabbitMQ | Amazon MQ mq.m5.large ($300/mo) |
-| Compute | 3 containers | 6x c5.xlarge ECS tasks ($600/mo) |
-| **Total** | ~$0 (local) | ~$1,500/mo baseline |
+### Connection Pooling
 
-### Storage Tiering Strategy
+With 3 API servers each holding 20 connections, total pool is 60. PostgreSQL `max_connections` set to 100, leaving headroom for admin connections and workers. At higher scale, use PgBouncer for connection multiplexing.
+
+### Storage Tiering
 
 | Data Age | Storage | Cost Tier |
 |----------|---------|-----------|
-| 0-30 days | PostgreSQL (hot) | High (SSD) |
+| 0-30 days | PostgreSQL (hot, SSD) | High |
 | 30-365 days | PostgreSQL (archive partition) | Medium |
 | 365+ days | S3/MinIO (Parquet exports) | Low |
 
+Transactions table partitioned by `created_at` month for efficient archival:
+
 ```sql
--- Partition transactions by month for archival
 CREATE TABLE transactions (
     -- columns as above
 ) PARTITION BY RANGE (created_at);
@@ -792,245 +570,116 @@ CREATE TABLE transactions_2025_01 PARTITION OF transactions
     FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
 ```
 
-## Scalability Considerations
-
-### Horizontal Scaling
-
-- **API servers**: Stateless; add more instances behind load balancer
-- **Workers**: Scale independently based on queue depth
-- **Database**: Read replicas for reporting queries; primary for writes
-
-### Sharding Strategy (Future)
-
-If transaction volume exceeds single-node PostgreSQL:
-- Shard by `merchant_id` (hash-based)
-- Each shard handles ~20% of traffic (5 shards)
-- Cross-shard queries via application-level aggregation
-
-### Connection Pooling
-
-```javascript
-// PostgreSQL pool configuration
-const pool = new Pool({
-  max: 20,  // Per API server instance
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
-
-// With 3 API servers: 60 connections total
-// PostgreSQL default max_connections: 100
-// Leave headroom for admin connections and workers
-```
-
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Why Chosen |
-|----------|--------|-------------|------------|
-| Sync fraud check | Inline (<50ms) | Async only | Better UX; decline bad payments immediately |
-| Idempotency storage | Valkey | PostgreSQL | Faster lookups; TTL built-in |
-| Ledger model | Double-entry in SQL | Event sourcing | Simpler for learning; sufficient for use case |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Sync fraud check | Inline (<50ms) | Async only | Decline bad payments immediately |
+| Idempotency storage | Valkey with DB fallback | PostgreSQL only | Sub-ms lookups; DB as safety net |
+| Ledger model | Double-entry in SQL | Event sourcing | Simpler; sufficient for debit/credit pattern |
 | Webhook delivery | RabbitMQ + worker | Direct HTTP in request | Decouples merchant latency from payment response |
-
-## Future Optimizations
-
-1. **Read replicas**: Route GET requests to replicas to reduce primary load
-2. **Materialized views**: Pre-aggregate daily transaction summaries
-3. **GraphQL**: Consider for admin dashboard to reduce over-fetching
-4. **Event sourcing**: If audit requirements become complex, consider full event log
-5. **Multi-region**: Active-passive setup with PostgreSQL logical replication
+| Multi-currency | FX at capture time | FX at authorization | Locked rate prevents merchant surprise |
+| Auth model | API keys (hashed) | OAuth2 / JWT | Simpler for M2M; immediate revocation via DB |
 
 ---
 
 ## Implementation Notes
 
-This section documents the critical implementation decisions and explains WHY each feature is essential for a production payment system.
+This section maps the production architecture above to the actual local implementation running on Docker Compose.
 
-### Idempotency - CRITICAL for Payment Systems
-
-**WHY idempotency prevents double-charging:**
-
-Payment operations are NOT inherently idempotent. Without explicit idempotency handling:
-
-1. **Network Timeouts**: A payment request can timeout AFTER the server processed it but BEFORE the client received the response. The client retries, and the customer is charged twice.
-
-2. **Client Retries**: Mobile apps and browsers automatically retry failed HTTP requests. Each retry without idempotency protection = potential duplicate charge.
-
-3. **Load Balancer Retries**: Some load balancers retry requests on 5xx errors, potentially causing double-processing.
-
-**Implementation approach:**
+### Local Setup Diagram
 
 ```
-Client sends: POST /v1/payments
-Headers: Idempotency-Key: order_12345
-
-Server logic:
-1. Check Redis for key "idempotency:payment:{merchant}:{key}"
-2. If exists: return cached response immediately (no processing)
-3. If not: acquire distributed lock, process payment
-4. On success: cache response with 24h TTL
-5. On failure: release lock (allows retry)
+┌────────────────────┐
+│   React SPA        │
+│   (Vite :5173)     │
+└─────────┬──────────┘
+          │ HTTP
+          ▼
+┌────────────────────┐
+│   API Server       │
+│   (Express :3000)  │
+│   or 3 instances   │
+│   (:3001-3003)     │
+├────────────────────┤
+│  /health           │
+│  /metrics          │
+│  /api/v1/payments  │
+│  /api/v1/merchants │
+│  /api/v1/refunds   │
+│  /api/v1/ledger    │
+└──┬──────┬──────┬───┘
+   │      │      │
+   ▼      ▼      ▼
+┌──────┐┌──────┐┌────────┐
+│Postgr││Valkey││RabbitMQ│
+│:5432 ││:6379 ││:5672   │
+│      ││      ││:15672  │
+└──────┘└──────┘└───┬────┘
+                    │
+          ┌─────────┼─────────┐
+          ▼         ▼         ▼
+    ┌──────────┐┌──────────┐  (Settlement
+    │ Webhook  ││  Fraud   │   worker not
+    │ Worker   ││  Worker  │   implemented)
+    └──────────┘└──────────┘
 ```
 
-**Key files:**
-- `/backend/src/shared/idempotency.ts` - Idempotency key management
-- `/backend/src/services/payment.service.ts` - Uses `withIdempotency()` wrapper
+### Production-Grade Patterns Actually Implemented
 
-### Audit Logging - Required for PCI Compliance
+**1. Idempotency** -- Every payment mutation checks Valkey for an existing idempotency key before processing. Keys are scoped per merchant with 24-hour TTL. The distributed lock prevents concurrent processing of the same key.
 
-**WHY audit logging is required for PCI-DSS:**
+File: `backend/src/shared/idempotency.ts`
 
-PCI-DSS Requirement 10 mandates:
-- Log all access to cardholder data
-- Track all changes to system components
-- Retain logs for at least 1 year
-- Logs must be immutable and queryable
+**2. Double-Entry Ledger** -- Payment, capture, and refund operations create paired debit/credit entries in the `ledger_entries` table within a single PostgreSQL transaction.
 
-**What we log:**
+Files: `backend/src/services/ledger.service.ts`, `backend/src/services/payment/`
 
-| Event | Data Captured |
-|-------|---------------|
-| Payment created | Transaction ID, merchant, amount, currency, IP, user-agent |
-| Payment authorized | Transaction ID, processor reference |
-| Payment captured | Transaction ID, captured amount |
-| Refund processed | Refund ID, original transaction, amount, full/partial |
-| Chargeback created | Chargeback ID, reason code, evidence due date |
+**3. Circuit Breaker** -- Uses `cockatiel` library for circuit breakers on external processor and fraud service calls. Separate breakers for processor and fraud with configurable thresholds.
 
-**Dual logging strategy:**
-1. **PostgreSQL `audit_log` table**: Queryable, long-term retention, compliance
-2. **Pino structured logs**: Real-time monitoring, log aggregation (ELK, Splunk, Datadog)
+File: `backend/src/shared/circuit-breaker.ts`
 
-**Key files:**
-- `/backend/src/shared/audit.ts` - Audit logging functions
-- `/backend/src/shared/logger.ts` - Pino structured logger
+**4. Prometheus Metrics** -- HTTP request duration histograms, payment counters by status/currency, fraud score distributions, circuit breaker state gauges, and DB connection metrics. Exposed at `GET /metrics`.
 
-### Circuit Breakers - Protection Against Processor Outages
+File: `backend/src/shared/metrics.ts`
 
-**WHY circuit breakers protect the system:**
+**5. Structured Logging** -- Pino JSON logger with request context. Audit logger writes to both PostgreSQL `audit_log` table and structured log output.
 
-Payment processors experience outages. Without circuit breakers:
+Files: `backend/src/shared/logger.ts`, `backend/src/shared/audit.ts`
 
-1. **Connection Pool Exhaustion**: All requests queue up waiting for processor timeouts (30+ seconds each)
-2. **Cascading Failures**: Database connections exhaust, Redis connections exhaust, entire system becomes unresponsive
-3. **Poor User Experience**: Users wait 30+ seconds only to see failures
+**6. Health Check** -- Full dependency health check at `GET /health` (PostgreSQL, Valkey, circuit breaker states), liveness probe at `/health/live`, readiness probe at `/health/ready`.
 
-**Circuit breaker behavior:**
+File: `backend/src/index.ts`
 
-```
-State: CLOSED (normal operation)
-  |
-  v (5 consecutive failures)
-State: OPEN (fail fast - 30 seconds)
-  |
-  v (30 seconds elapsed)
-State: HALF-OPEN (test with single request)
-  |
-  v (success)
-State: CLOSED
-```
+**7. Graceful Shutdown** -- SIGTERM/SIGINT handlers stop accepting new connections, drain in-flight requests, close database and Redis connections, with a 30-second forced exit timeout.
 
-**Benefits:**
-- Fail fast (milliseconds instead of 30-second timeouts)
-- System remains responsive for other operations
-- Automatic recovery when processor comes back online
+File: `backend/src/index.ts`
 
-**Key files:**
-- `/backend/src/shared/circuit-breaker.ts` - Circuit breaker implementation
-- Uses `cockatiel` library for battle-tested resilience patterns
+**8. Webhook Delivery Workers** -- Separate processes consume from RabbitMQ with exponential backoff retry.
 
-### Transaction Metrics - Enabling Fraud Detection
+File: `backend/src/workers/webhook-worker.ts`
 
-**WHY transaction metrics are critical:**
+### What Was Simplified or Substituted
 
-Prometheus metrics enable real-time fraud detection and SLO monitoring:
+| Production Component | Local Substitute | Reason |
+|---------------------|-----------------|--------|
+| API Gateway (Kong, AWS) | Direct Express access on :3000 | No need for managed gateway locally |
+| Payment processor integration | Simulated processor responses | No real card network connection |
+| HSM / PCI-compliant vault | `token_vault_ref` column (placeholder) | Hardware security modules out of scope |
+| PostgreSQL sharding (Citus) | Single PostgreSQL instance | Sufficient for dev scale |
+| Read replicas | Single instance handles reads/writes | No replication needed locally |
+| Multi-region deployment | Single Docker Compose stack | Local development only |
+| Managed queue (Amazon MQ) | Local RabbitMQ container | Same AMQP protocol |
 
-1. **Fraud Velocity Detection**:
-   - Sudden spike in transactions from one merchant = potential compromised credentials
-   - Unusual transaction amount distributions = potential card testing attack
-   - High decline rates from specific BINs = potential fraud ring
+### What Was Omitted
 
-2. **SLO Monitoring**:
-   - p99 latency tracking ensures payment response times stay within SLA
-   - Success rate monitoring enables immediate alerts on payment processor issues
-
-3. **Business Intelligence**:
-   - Transaction volume by currency helps treasury planning
-   - Refund rate by merchant identifies problematic merchants
-
-**Key metrics exposed at `/metrics`:**
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `payment_transactions_total{status,currency}` | Counter | Volume tracking, fraud detection |
-| `payment_processing_duration_seconds` | Histogram | SLO monitoring |
-| `fraud_score` | Histogram | Risk distribution analysis |
-| `circuit_breaker_state` | Gauge | Processor health |
-| `refund_transactions_total{type}` | Counter | Refund rate monitoring |
-
-**Key files:**
-- `/backend/src/shared/metrics.ts` - Prometheus metric definitions
-- `/backend/src/index.ts` - `/metrics` endpoint
-
-### Retry Logic with Exponential Backoff
-
-**WHY exponential backoff is essential:**
-
-Fixed-interval retries can overwhelm recovering services. Exponential backoff:
-
-1. **Gives services time to recover**: Each retry waits longer
-2. **Prevents thundering herd**: Jitter spreads out retry attempts
-3. **Fails gracefully**: Maximum retry limit prevents infinite loops
-
-**Configuration:**
-- Max attempts: 3
-- Initial delay: 100ms
-- Max delay: 10 seconds
-- Backoff factor: 2x
-
-**Usage:**
-- Webhook delivery (up to 5 retries: 1s, 5s, 30s, 2min, 10min)
-- Payment processor calls (combined with circuit breaker)
-- Database connection retries
-
-### Health Check Endpoints
-
-**Endpoint design:**
-
-| Endpoint | Purpose | Checks |
-|----------|---------|--------|
-| `GET /health` | Full health check | PostgreSQL, Redis, circuit breaker states |
-| `GET /health/live` | Kubernetes liveness | Process is running |
-| `GET /health/ready` | Kubernetes readiness | Database connectivity |
-| `GET /metrics` | Prometheus scraping | All collected metrics |
-
-**Response format:**
-
-```json
-{
-  "status": "healthy|degraded|unhealthy",
-  "checks": {
-    "postgres": { "status": "healthy", "latency_ms": 2 },
-    "redis": { "status": "healthy", "latency_ms": 1 },
-    "circuit_breaker_processor": { "status": "healthy" }
-  },
-  "uptime_seconds": 3600
-}
-```
-
-### Shared Module Architecture
-
-All resilience and observability code is centralized in `/backend/src/shared/`:
-
-```
-shared/
-├── index.ts           # Re-exports all shared modules
-├── logger.ts          # Pino structured logging + audit logger
-├── metrics.ts         # Prometheus metrics definitions
-├── circuit-breaker.ts # Circuit breaker + retry policies
-├── idempotency.ts     # Idempotency key management
-└── audit.ts           # Compliance audit logging
-```
-
-This centralization ensures:
-- Consistent behavior across all services
-- Single point of configuration
-- Easy testing and mocking
+- **CDN** for frontend static assets
+- **WAF** (Web Application Firewall) for PCI-DSS network requirements
+- **Multi-region** active-passive deployment
+- **Kubernetes** orchestration and auto-scaling
+- **PgBouncer** connection pooling proxy
+- **Settlement worker** (queue and schema exist but worker is not implemented)
+- **Notification service** (email/SMS for payment receipts)
+- **Full PCI-DSS compliance** (encryption at rest, network segmentation, penetration testing)
+- **Real FX rate service** integration
+- **Grafana dashboards** (Prometheus metrics are collected but no dashboards configured)

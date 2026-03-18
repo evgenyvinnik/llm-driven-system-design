@@ -16,50 +16,89 @@ Google Search is a web search engine with distributed crawling and ranking. Core
 
 ### Functional Requirements
 
-1. **Crawl**: Discover and fetch web pages
-2. **Index**: Build searchable index of content
-3. **Query**: Process user search queries
-4. **Rank**: Order results by relevance
-5. **Serve**: Return results with low latency
+1. **Crawl**: Discover and fetch web pages respecting robots.txt
+2. **Index**: Build searchable inverted index of content
+3. **Query**: Process user search queries with phrases, exclusions, and site filters
+4. **Rank**: Order results by relevance using text scoring, PageRank, and freshness
+5. **Serve**: Return results with snippets and highlighting at low latency
 
 ### Non-Functional Requirements
 
 - **Scale**: Index 100B+ pages
-- **Latency**: < 200ms for queries
-- **Freshness**: Update popular pages daily
-- **Relevance**: High precision and recall
+- **Latency**: < 200ms p95 for queries
+- **Freshness**: Update popular pages daily, news pages hourly
+- **Relevance**: High precision and recall, zero-result rate < 5%
+- **Availability**: 99.99% uptime for query serving
+- **Throughput**: 100K+ queries per second globally
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Target |
+|--------|--------|
+| Indexed pages | 100B+ |
+| Daily queries | 8.5B (100K QPS) |
+| Daily crawl volume | 50M pages |
+| Index size | 100+ PB (distributed) |
+| Average query latency | < 200ms |
+
+### Storage Breakdown (Production)
+
+| Data Type | Size | Storage System |
+|-----------|------|----------------|
+| Raw page content | 100+ PB | Distributed file system (GFS/Colossus) |
+| Inverted index | 50+ PB | Custom sharded index servers |
+| URL metadata + crawl state | 10+ TB | Bigtable / distributed KV store |
+| PageRank scores | 1+ TB | Pre-computed, loaded into memory |
+| Query cache | 1+ TB | Distributed Redis/Memcached |
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Crawl System                                │
-│     URL Frontier │ Fetcher │ Parser │ Deduplication            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Indexing Pipeline                             │
-│     Tokenizer │ Index Builder │ PageRank │ Sharding            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Serving System                                │
-│       Query Parser │ Index Servers │ Ranking │ Cache           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│   Bigtable      │   Colossus (GFS)  │      Redis                │
-│   - URL DB      │   - Documents     │      - Query cache        │
-│   - PageRank    │   - Index files   │      - Suggestions        │
-│   - Crawl state │   - Crawl data    │      - Hot results        │
-└─────────────────┴───────────────────┴───────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Crawl System                                  │
+│                                                                       │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌──────────┐ │
+│  │ URL Frontier │──▶│   Fetcher   │──▶│   Parser    │──▶│  Dedup   │ │
+│  │ (Priority Q) │   │ (Politeness)│   │ (Cheerio)   │   │(Hash Cmp)│ │
+│  └─────────────┘   └─────────────┘   └─────────────┘   └──────────┘ │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │ Parsed documents + discovered URLs
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                      Indexing Pipeline                                │
+│                                                                       │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────┐   ┌────────────┐ │
+│  │  Tokenizer  │──▶│ Index Builder │──▶│ PageRank │──▶│  Sharding  │ │
+│  │ (Stem/Stop) │   │  (TF-IDF)    │   │ (Batch)  │   │ (By Term)  │ │
+│  └─────────────┘   └──────────────┘   └──────────┘   └────────────┘ │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │ Indexed shards
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       Serving System                                  │
+│                                                                       │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────┐   ┌────────────┐ │
+│  │Query Parser  │──▶│ Index Servers │──▶│ Ranking  │──▶│  Snippet   │ │
+│  │(Spell/Expand)│   │ (BM25 Score) │   │(Multi-Sig)│  │ Generation │ │
+│  └─────────────┘   └──────────────┘   └──────────┘   └────────────┘ │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Data Layer                                    │
+├──────────────────┬────────────────────┬──────────────────────────────┤
+│   PostgreSQL     │   Elasticsearch    │      Redis/Valkey            │
+│   - URL state    │   - Inverted index │      - Query cache           │
+│   - Link graph   │   - BM25 scoring   │      - Suggestions           │
+│   - PageRank     │   - Highlighting   │      - Rate limiting         │
+│   - Query logs   │                    │      - Idempotency keys      │
+└──────────────────┴────────────────────┴──────────────────────────────┘
 ```
 
 ---
@@ -68,674 +107,207 @@ Google Search is a web search engine with distributed crawling and ranking. Core
 
 ### 1. Web Crawler
 
-**URL Frontier & Politeness:**
-```javascript
-class URLFrontier {
-  constructor() {
-    this.frontQueues = new Map() // Per-host queues
-    this.backQueue = new PriorityQueue() // Priority by importance
-    this.hostLastFetch = new Map() // Politeness timing
-  }
+The crawler manages a URL frontier with priority-based scheduling and per-host politeness. Each URL is assigned a priority based on domain importance, inlink count, and freshness needs. The frontier maintains per-host queues to enforce a minimum 1-second delay between requests to the same host (politeness policy). Before fetching, the crawler checks a cached robots.txt for the target domain.
 
-  async addURL(url, priority) {
-    const host = new URL(url).hostname
-
-    // Check robots.txt
-    if (!await this.isAllowed(url)) {
-      return
-    }
-
-    // Check if already crawled or in queue
-    if (await this.isDuplicate(url)) {
-      return
-    }
-
-    // Add to host-specific queue
-    if (!this.frontQueues.has(host)) {
-      this.frontQueues.set(host, [])
-    }
-    this.frontQueues.get(host).push({ url, priority })
-
-    // Track in back queue for scheduling
-    this.backQueue.enqueue({ host, priority })
-  }
-
-  async getNextURL() {
-    while (true) {
-      const { host } = this.backQueue.dequeue()
-
-      // Check politeness (1 request per host per second)
-      const lastFetch = this.hostLastFetch.get(host) || 0
-      const now = Date.now()
-
-      if (now - lastFetch < 1000) {
-        // Re-queue and try another host
-        this.backQueue.enqueue({ host, priority: 0 })
-        continue
-      }
-
-      const queue = this.frontQueues.get(host)
-      if (queue && queue.length > 0) {
-        const { url } = queue.shift()
-        this.hostLastFetch.set(host, now)
-        return url
-      }
-    }
-  }
-
-  async isAllowed(url) {
-    const host = new URL(url).hostname
-    const robots = await this.getRobotsTxt(host)
-    return robots.isAllowed(url, 'Googlebot')
-  }
-}
-
-class Crawler {
-  async crawl(url) {
-    // Fetch page
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'Googlebot/2.1' },
-      timeout: 10000
-    })
-
-    if (!response.ok) {
-      await this.recordCrawlError(url, response.status)
-      return
-    }
-
-    const html = await response.text()
-
-    // Check for duplicate content
-    const contentHash = this.hashContent(html)
-    if (await this.isContentDuplicate(contentHash)) {
-      return
-    }
-
-    // Parse and extract
-    const parsed = this.parseHTML(html)
-
-    // Store document
-    await this.storeDocument(url, {
-      content: parsed.text,
-      title: parsed.title,
-      links: parsed.links,
-      fetchTime: Date.now()
-    })
-
-    // Add discovered links to frontier
-    for (const link of parsed.links) {
-      const absoluteUrl = new URL(link, url).href
-      await this.frontier.addURL(absoluteUrl, this.calculatePriority(absoluteUrl))
-    }
-  }
-
-  calculatePriority(url) {
-    // Higher priority for:
-    // - Known important domains
-    // - Pages linked from many sources
-    // - Fresh content (news sites)
-    const host = new URL(url).hostname
-    let priority = 0.5
-
-    if (this.importantDomains.has(host)) priority += 0.3
-    if (this.highInlinkCount(url)) priority += 0.2
-
-    return priority
-  }
-}
-```
+After fetching, the crawler extracts content using an HTML parser, computes a content hash for deduplication, extracts outgoing links, and stores the parsed document for indexing. Discovered links are added back to the frontier with calculated priorities.
 
 ### 2. Inverted Index
 
-**Index Construction:**
-```javascript
-class IndexBuilder {
-  async buildIndex(documents) {
-    const invertedIndex = new Map() // term -> [{docId, positions, score}]
+The indexing pipeline tokenizes document content (lowercasing, stopword removal, Porter stemming), then builds postings lists mapping each term to the documents containing it, along with positions and term frequency. Field-specific boosts are applied: terms appearing in the title get a 3x boost, terms in anchor text get 2x.
 
-    for (const doc of documents) {
-      const tokens = this.tokenize(doc.content)
+TF-IDF scoring is computed at index time: `tf = 1 + log(termFreq)`, `idf = log(N / docFreq)`. At query time, Elasticsearch applies BM25 scoring with parameters k1=1.2 and b=0.75.
 
-      for (let position = 0; position < tokens.length; position++) {
-        const term = this.normalize(tokens[position])
-
-        if (!invertedIndex.has(term)) {
-          invertedIndex.set(term, [])
-        }
-
-        // Find or create posting for this doc
-        let posting = invertedIndex.get(term).find(p => p.docId === doc.id)
-        if (!posting) {
-          posting = {
-            docId: doc.id,
-            positions: [],
-            termFreq: 0,
-            fieldWeights: { title: 0, body: 0, anchor: 0 }
-          }
-          invertedIndex.get(term).push(posting)
-        }
-
-        posting.positions.push(position)
-        posting.termFreq++
-      }
-
-      // Boost for terms in title
-      const titleTokens = this.tokenize(doc.title)
-      for (const term of titleTokens) {
-        const normalized = this.normalize(term)
-        const posting = invertedIndex.get(normalized)?.find(p => p.docId === doc.id)
-        if (posting) {
-          posting.fieldWeights.title++
-        }
-      }
-    }
-
-    // Calculate IDF and final scores
-    const docCount = documents.length
-    for (const [term, postings] of invertedIndex) {
-      const idf = Math.log(docCount / postings.length)
-
-      for (const posting of postings) {
-        const tf = 1 + Math.log(posting.termFreq)
-        posting.tfidf = tf * idf
-
-        // Boost for field matches
-        posting.score = posting.tfidf *
-          (1 + posting.fieldWeights.title * 3) *
-          (1 + posting.fieldWeights.anchor * 2)
-      }
-    }
-
-    return invertedIndex
-  }
-
-  tokenize(text) {
-    return text
-      .toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
-      .filter(t => t.length > 1 && !this.stopwords.has(t))
-  }
-
-  normalize(term) {
-    // Stemming (Porter stemmer)
-    return this.stemmer.stem(term)
-  }
-}
-
-class IndexSharder {
-  async shardIndex(invertedIndex, numShards) {
-    const shards = Array.from({ length: numShards }, () => new Map())
-
-    for (const [term, postings] of invertedIndex) {
-      // Hash-based sharding by term
-      const shardId = this.hashTerm(term) % numShards
-      shards[shardId].set(term, postings)
-    }
-
-    // Write shards to storage
-    for (let i = 0; i < numShards; i++) {
-      await this.writeShardToStorage(i, shards[i])
-    }
-  }
-}
-```
+At production scale, the index is sharded by term hash so that all postings for a given term live on one shard. This makes query routing simple -- the query coordinator sends each query term to the appropriate shard and merges results. The alternative (sharding by document) would require querying every shard for every query.
 
 ### 3. PageRank
 
-**Iterative PageRank:**
-```javascript
-class PageRank {
-  constructor(dampingFactor = 0.85, iterations = 100) {
-    this.d = dampingFactor
-    this.iterations = iterations
-  }
+PageRank is computed offline in batch using the iterative power method with damping factor d=0.85. The algorithm loads the link graph from PostgreSQL, initializes all pages with uniform rank 1/N, and iterates the formula:
 
-  async calculate(linkGraph) {
-    const pages = Object.keys(linkGraph)
-    const n = pages.length
+`PR(page) = (1 - d) / N + d * sum(PR(inlink) / outDegree(inlink))`
 
-    // Initialize uniform PageRank
-    let ranks = {}
-    for (const page of pages) {
-      ranks[page] = 1 / n
-    }
+Convergence is checked by max absolute difference between iterations, terminating when delta < 0.0001 or after 100 iterations. Scores are written back to the URL table and used as a ranking signal.
 
-    // Iterative calculation
-    for (let i = 0; i < this.iterations; i++) {
-      const newRanks = {}
-
-      for (const page of pages) {
-        // Sum of PageRank from linking pages
-        let sum = 0
-
-        const inlinks = this.getInlinks(linkGraph, page)
-        for (const inlink of inlinks) {
-          const outDegree = linkGraph[inlink]?.length || 1
-          sum += ranks[inlink] / outDegree
-        }
-
-        // PageRank formula
-        newRanks[page] = (1 - this.d) / n + this.d * sum
-      }
-
-      // Check convergence
-      const diff = this.maxDiff(ranks, newRanks)
-      ranks = newRanks
-
-      if (diff < 0.0001) {
-        console.log(`Converged after ${i + 1} iterations`)
-        break
-      }
-    }
-
-    return ranks
-  }
-
-  getInlinks(linkGraph, targetPage) {
-    const inlinks = []
-    for (const [page, outlinks] of Object.entries(linkGraph)) {
-      if (outlinks.includes(targetPage)) {
-        inlinks.push(page)
-      }
-    }
-    return inlinks
-  }
-
-  maxDiff(ranks1, ranks2) {
-    let max = 0
-    for (const page of Object.keys(ranks1)) {
-      max = Math.max(max, Math.abs(ranks1[page] - ranks2[page]))
-    }
-    return max
-  }
-}
-```
+Computing PageRank incrementally (on every new crawl) would provide fresher scores but is computationally expensive and complex to implement correctly. Weekly batch recomputation is sufficient since the web's link structure changes slowly relative to content.
 
 ### 4. Query Processing
 
-**Query Parser & Expansion:**
-```javascript
-class QueryProcessor {
-  async process(queryString) {
-    // Parse query
-    const parsed = this.parseQuery(queryString)
+The query parser handles:
+- Basic terms: `javascript tutorial`
+- Exact phrases: `"react hooks"` (position-based matching)
+- Exclusions: `python -django` (filter from results)
+- Site filters: `site:example.com tutorial` (domain constraint)
 
-    // Spell correction
-    const corrected = await this.spellCorrect(parsed.terms)
-
-    // Query expansion (synonyms)
-    const expanded = await this.expandQuery(corrected)
-
-    // Execute search
-    const results = await this.search(expanded)
-
-    // Rank results
-    const ranked = await this.rankResults(results, parsed)
-
-    return {
-      results: ranked,
-      correctedQuery: corrected.join(' '),
-      totalResults: results.length
-    }
-  }
-
-  parseQuery(query) {
-    const terms = []
-    const phrases = []
-    const excluded = []
-
-    // Handle quoted phrases
-    const phraseRegex = /"([^"]+)"/g
-    let match
-    while ((match = phraseRegex.exec(query)) !== null) {
-      phrases.push(match[1])
-    }
-
-    // Handle exclusions (-term)
-    const excludeRegex = /-(\w+)/g
-    while ((match = excludeRegex.exec(query)) !== null) {
-      excluded.push(match[1])
-    }
-
-    // Remaining terms
-    const remaining = query
-      .replace(/"[^"]+"/g, '')
-      .replace(/-\w+/g, '')
-      .split(/\s+/)
-      .filter(t => t.length > 0)
-
-    terms.push(...remaining)
-
-    return { terms, phrases, excluded }
-  }
-
-  async spellCorrect(terms) {
-    return Promise.all(terms.map(async term => {
-      if (await this.isValidTerm(term)) {
-        return term
-      }
-
-      // Find closest match using edit distance
-      const candidates = await this.getCandidates(term)
-      const scored = candidates.map(c => ({
-        term: c,
-        distance: this.editDistance(term, c),
-        frequency: this.getTermFrequency(c)
-      }))
-
-      scored.sort((a, b) => {
-        if (a.distance !== b.distance) return a.distance - b.distance
-        return b.frequency - a.frequency
-      })
-
-      return scored[0]?.term || term
-    }))
-  }
-
-  async search(query) {
-    const { terms, phrases, excluded } = query
-
-    // Get postings for each term
-    const postingLists = await Promise.all(
-      terms.map(term => this.getPostings(term))
-    )
-
-    // Intersect for AND semantics
-    let docIds = this.intersectPostings(postingLists)
-
-    // Filter out excluded terms
-    for (const term of excluded) {
-      const excludePostings = await this.getPostings(term)
-      docIds = docIds.filter(id => !excludePostings.has(id))
-    }
-
-    // Filter for phrase matches
-    for (const phrase of phrases) {
-      docIds = await this.filterByPhrase(docIds, phrase)
-    }
-
-    return docIds
-  }
-}
-```
+Spell correction uses edit distance against a dictionary of known terms, preferring corrections with higher document frequency. Query expansion adds synonyms to broaden recall.
 
 ### 5. Ranking System
 
-**Multi-Signal Ranking:**
-```javascript
-class Ranker {
-  async rankResults(docIds, query) {
-    const scoredDocs = await Promise.all(
-      docIds.map(async docId => {
-        const doc = await this.getDocument(docId)
+Results are ranked by combining four signals with learned weights:
 
-        // Multiple ranking signals
-        const textScore = this.calculateTextScore(doc, query)
-        const pageRank = await this.getPageRank(docId)
-        const freshness = this.calculateFreshness(doc.lastModified)
-        const clickScore = await this.getClickScore(docId, query)
+| Signal | Weight | Source |
+|--------|--------|--------|
+| Text relevance (BM25) | 0.35 | Elasticsearch scoring |
+| PageRank | 0.25 | Pre-computed batch scores |
+| Freshness | 0.15 | Decay function on last-modified date |
+| Click-through rate | 0.25 | Historical query-document click data |
 
-        // Combine signals (learned weights)
-        const finalScore =
-          textScore * 0.35 +
-          pageRank * 0.25 +
-          freshness * 0.15 +
-          clickScore * 0.25
-
-        return {
-          docId,
-          url: doc.url,
-          title: doc.title,
-          snippet: this.generateSnippet(doc.content, query),
-          score: finalScore
-        }
-      })
-    )
-
-    // Sort by score
-    scoredDocs.sort((a, b) => b.score - a.score)
-
-    return scoredDocs.slice(0, 10) // Top 10 results
-  }
-
-  calculateTextScore(doc, query) {
-    let score = 0
-
-    for (const term of query.terms) {
-      // BM25 scoring
-      const tf = this.getTermFrequency(doc, term)
-      const dl = doc.length
-      const avgdl = this.avgDocLength
-      const k1 = 1.2
-      const b = 0.75
-
-      const tfNorm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
-      const idf = this.getIDF(term)
-
-      score += tfNorm * idf
-    }
-
-    // Boost for exact title match
-    if (doc.title.toLowerCase().includes(query.terms.join(' '))) {
-      score *= 1.5
-    }
-
-    return score
-  }
-
-  calculateFreshness(lastModified) {
-    const ageInDays = (Date.now() - lastModified) / (1000 * 60 * 60 * 24)
-
-    if (ageInDays < 1) return 1.0
-    if (ageInDays < 7) return 0.9
-    if (ageInDays < 30) return 0.7
-    if (ageInDays < 365) return 0.5
-    return 0.3
-  }
-
-  generateSnippet(content, query) {
-    // Find best passage containing query terms
-    const sentences = content.split(/[.!?]+/)
-    let bestScore = 0
-    let bestSentence = sentences[0]
-
-    for (const sentence of sentences) {
-      const score = query.terms.filter(t =>
-        sentence.toLowerCase().includes(t.toLowerCase())
-      ).length
-
-      if (score > bestScore) {
-        bestScore = score
-        bestSentence = sentence
-      }
-    }
-
-    // Truncate and highlight
-    let snippet = bestSentence.slice(0, 200)
-    for (const term of query.terms) {
-      const regex = new RegExp(`(${term})`, 'gi')
-      snippet = snippet.replace(regex, '<b>$1</b>')
-    }
-
-    return snippet + '...'
-  }
-}
-```
+Two-phase ranking is used at scale: a cheap first pass retrieves the top 1000 candidates using BM25 alone, then an expensive re-ranking pass applies all signals to the top candidates. This prevents computing expensive signals (PageRank lookup, freshness calculation) for millions of candidate documents.
 
 ---
 
 ## Database Schema
 
 ```sql
--- URL Database (crawl state)
+-- URLs table (crawl state)
 CREATE TABLE urls (
-  url_hash BIGINT PRIMARY KEY, -- Hash of URL
-  url TEXT NOT NULL,
-  last_crawl TIMESTAMP,
-  last_modified TIMESTAMP,
-  crawl_status VARCHAR(20),
-  content_hash BIGINT,
-  page_rank DECIMAL,
-  inlink_count INTEGER DEFAULT 0
+    id BIGSERIAL PRIMARY KEY,
+    url_hash BIGINT UNIQUE NOT NULL,
+    url TEXT NOT NULL,
+    domain VARCHAR(255) NOT NULL,
+    last_crawl TIMESTAMP,
+    last_modified TIMESTAMP,
+    crawl_status VARCHAR(20) DEFAULT 'pending',
+    content_hash BIGINT,
+    page_rank DECIMAL DEFAULT 0.0,
+    inlink_count INTEGER DEFAULT 0,
+    priority DECIMAL DEFAULT 0.5,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Documents
 CREATE TABLE documents (
-  id BIGINT PRIMARY KEY,
-  url TEXT NOT NULL,
-  title TEXT,
-  content TEXT,
-  fetch_time TIMESTAMP,
-  content_length INTEGER,
-  language VARCHAR(10)
+    id BIGSERIAL PRIMARY KEY,
+    url_id BIGINT REFERENCES urls(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    title TEXT,
+    description TEXT,
+    content TEXT,
+    content_length INTEGER,
+    language VARCHAR(10) DEFAULT 'en',
+    fetch_time TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Link Graph
+-- Link Graph (for PageRank)
 CREATE TABLE links (
-  source_url_hash BIGINT,
-  target_url_hash BIGINT,
-  anchor_text TEXT,
-  PRIMARY KEY (source_url_hash, target_url_hash)
+    id BIGSERIAL PRIMARY KEY,
+    source_url_id BIGINT REFERENCES urls(id) ON DELETE CASCADE,
+    target_url_id BIGINT REFERENCES urls(id) ON DELETE CASCADE,
+    anchor_text TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(source_url_id, target_url_id)
 );
 
--- Query Logs (for learning)
+-- Query Logs (for analytics and ranking improvement)
 CREATE TABLE query_logs (
-  id BIGSERIAL PRIMARY KEY,
-  query TEXT NOT NULL,
-  results_clicked JSONB,
-  timestamp TIMESTAMP DEFAULT NOW(),
-  session_id VARCHAR(100)
+    id BIGSERIAL PRIMARY KEY,
+    query TEXT NOT NULL,
+    results_count INTEGER DEFAULT 0,
+    results_clicked JSONB DEFAULT '[]',
+    duration_ms INTEGER,
+    session_id VARCHAR(100),
+    created_at TIMESTAMP DEFAULT NOW()
 );
+
+-- Search Suggestions (popular queries for autocomplete)
+CREATE TABLE search_suggestions (
+    id BIGSERIAL PRIMARY KEY,
+    query TEXT NOT NULL UNIQUE,
+    frequency INTEGER DEFAULT 1,
+    last_used TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Robots.txt cache
+CREATE TABLE robots_cache (
+    id BIGSERIAL PRIMARY KEY,
+    domain VARCHAR(255) UNIQUE NOT NULL,
+    content TEXT,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+### Key Indexes
+
+```sql
+CREATE INDEX idx_urls_domain ON urls(domain);
+CREATE INDEX idx_urls_crawl_status ON urls(crawl_status);
+CREATE INDEX idx_urls_priority ON urls(priority DESC);
+CREATE INDEX idx_urls_page_rank ON urls(page_rank DESC);
+CREATE INDEX idx_documents_url_id ON documents(url_id);
+CREATE INDEX idx_links_source ON links(source_url_id);
+CREATE INDEX idx_links_target ON links(target_url_id);
+CREATE INDEX idx_query_logs_query ON query_logs(query);
+CREATE INDEX idx_search_suggestions_frequency ON search_suggestions(frequency DESC);
+```
+
+---
+
+## API Design
+
+```
+Search:
+GET  /search?q=query&page=1&size=10     - Execute search query
+GET  /suggest?q=partial                  - Autocomplete suggestions
+
+Admin:
+GET  /admin/stats                        - Crawl/index/query statistics
+POST /admin/crawl                        - Trigger crawl job
+POST /admin/index/rebuild                - Rebuild Elasticsearch index
+POST /admin/pagerank/calculate           - Trigger PageRank recalculation
+
+Health/Observability:
+GET  /health                             - Full dependency health check
+GET  /healthz                            - Kubernetes liveness probe
+GET  /ready                              - Kubernetes readiness probe
+GET  /metrics                            - Prometheus metrics endpoint
 ```
 
 ---
 
 ## Key Design Decisions
 
-### 1. Inverted Index Sharding
+### 1. Inverted Index Sharding: By Term, Not Document
 
-**Decision**: Shard by term hash, not document
+Sharding by term hash means all postings for "javascript" live on one shard. A query for "javascript tutorial" requires hitting exactly 2 shards (one per term), then intersecting results. Sharding by document would require querying every shard for every query and merging results -- at 10,000 shards, this creates 10,000 fan-out requests per query, making sub-200ms latency impossible.
 
-**Rationale**:
-- All postings for a term on one shard
-- Simple query routing
-- Good load balance
+The trade-off: term-based sharding creates hot spots for common terms ("the", "is"). This is mitigated by stopword removal during indexing and by replicating high-frequency term shards.
 
 ### 2. Two-Phase Ranking
 
-**Decision**: Cheap first pass, expensive re-ranking
+Computing all four ranking signals (BM25, PageRank, freshness, click-through) for every matching document would require O(millions) lookups per query. Two-phase ranking retrieves the top 1000 candidates with cheap BM25 scoring, then re-ranks only those with expensive signals. This reduces computation by 1000x while maintaining result quality -- the top 10 results almost always come from the BM25 top-1000.
 
-**Rationale**:
-- Latency constraints
-- Only compute expensive signals for top candidates
-- Progressive refinement
+The trade-off: a document with low BM25 but very high PageRank might be missed. For navigational queries ("facebook login"), this matters. We handle these with a separate navigational index that maps domain names directly to URLs, bypassing the ranking pipeline entirely.
 
-### 3. PageRank Pre-computation
+### 3. PageRank as Batch Pre-computation
 
-**Decision**: Batch compute PageRank offline
+Computing PageRank iteratively over the entire link graph takes hours even on distributed infrastructure. Running this at query time is impossible. Batch computation (weekly) is acceptable because the web's link structure changes slowly -- a page that was important last week is almost certainly still important this week.
 
-**Rationale**:
-- Expensive to compute
-- Relatively stable
-- Update periodically (weekly)
+The trade-off: newly published pages start with zero PageRank regardless of their quality. We compensate with a freshness boost for recently crawled pages and by weighting other signals (BM25, click-through) more heavily for new content.
 
 ---
 
 ## Consistency and Idempotency
 
-### Consistency Model by Component
+### Consistency Model
 
 | Component | Consistency Level | Rationale |
 |-----------|-------------------|-----------|
 | URL Frontier | Eventual | Duplicate URLs acceptable; deduped during crawl |
-| Crawl State (PostgreSQL) | Strong (per-URL) | Uses row-level locks to prevent concurrent crawls of same URL |
+| Crawl State (PostgreSQL) | Strong (per-URL) | Row-level locks prevent concurrent crawls of same URL |
 | Document Store | Eventual | Newer crawls overwrite older; content hash prevents duplicates |
-| Inverted Index (Elasticsearch) | Eventual | Near real-time indexing with refresh interval |
+| Inverted Index (ES) | Eventual | Near real-time indexing with refresh interval |
 | PageRank | Batch consistent | Computed atomically; swapped in during index rebuild |
 | Query Cache (Redis) | Eventual | Stale reads acceptable; TTL-based invalidation |
 
 ### Idempotency Patterns
 
-**URL Crawling**:
-```javascript
-// Each crawl job carries an idempotency key
-const crawlJob = {
-  idempotencyKey: `crawl:${urlHash}:${scheduledAt}`,
-  url: 'https://example.com/page',
-  attempt: 1
-}
+**URL Crawling**: Each crawl job carries an idempotency key (`crawl:{urlHash}:{scheduledAt}`). Before crawling, the crawler acquires a Redis lock with `SET NX EX 3600`. If the lock exists, the job is skipped. This prevents duplicate crawls when multiple crawler instances pick up the same URL.
 
-async function processCrawlJob(job) {
-  // Check if already processed (Redis SET with NX)
-  const acquired = await redis.set(
-    job.idempotencyKey,
-    'processing',
-    'EX', 3600,  // 1 hour expiry
-    'NX'         // Only set if not exists
-  )
+**Document Indexing**: Elasticsearch uses deterministic document IDs derived from URL hashes. Re-indexing the same URL produces an upsert, not a duplicate. This makes index rebuilds safe to retry.
 
-  if (!acquired) {
-    console.log(`Job ${job.idempotencyKey} already processed, skipping`)
-    return
-  }
-
-  try {
-    await crawl(job.url)
-    await redis.set(job.idempotencyKey, 'completed', 'EX', 86400)
-  } catch (error) {
-    await redis.del(job.idempotencyKey)  // Allow retry
-    throw error
-  }
-}
-```
-
-**Document Indexing**:
-```javascript
-// Elasticsearch uses document ID for upsert semantics
-async function indexDocument(doc) {
-  const docId = hashUrl(doc.url)  // Deterministic ID from URL
-
-  await elasticsearch.index({
-    index: 'documents',
-    id: docId,           // Same URL always gets same ID
-    body: doc,
-    refresh: false       // Batch refresh for performance
-  })
-}
-```
-
-**PageRank Updates**:
-```javascript
-// Atomic swap pattern for PageRank updates
-async function updatePageRanks(newRanks) {
-  const batchId = Date.now()
-
-  // Write new ranks to staging table
-  await db.query(`
-    INSERT INTO pagerank_staging (url_hash, rank, batch_id)
-    SELECT url_hash, rank, $1 FROM unnest($2::pagerank_row[])
-  `, [batchId, newRanks])
-
-  // Atomic swap within transaction
-  await db.query(`
-    BEGIN;
-    DELETE FROM pagerank_active;
-    INSERT INTO pagerank_active SELECT url_hash, rank FROM pagerank_staging WHERE batch_id = $1;
-    DELETE FROM pagerank_staging WHERE batch_id < $1;
-    COMMIT;
-  `, [batchId])
-}
-```
-
-### Conflict Resolution
-
-| Scenario | Resolution Strategy |
-|----------|---------------------|
-| Concurrent crawls of same URL | First-writer-wins via Redis lock |
-| Duplicate content from different URLs | Canonical URL detection; keep highest PageRank |
-| Stale index entries | Periodic index rebuild from document store |
-| Query cache vs fresh results | TTL expiry (5 min for trending, 1 hour standard) |
+**PageRank Updates**: New scores are written to a staging table, then atomically swapped into the active table within a transaction. This prevents partial updates where some URLs have new scores and others have old ones.
 
 ---
 
@@ -743,779 +315,164 @@ async function updatePageRanks(newRanks) {
 
 ### Metrics (Prometheus)
 
-**Crawl System Metrics**:
-```yaml
-# prometheus/crawl_metrics.yml
-- name: crawl_urls_fetched_total
-  type: counter
-  help: Total URLs fetched by crawler
-  labels: [status_code, content_type]
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `crawl_urls_fetched_total{status_code}` | Counter | Crawl throughput and error rate |
+| `crawl_latency_seconds` | Histogram | Per-URL fetch + parse time |
+| `crawl_frontier_size` | Gauge | Backlog monitoring |
+| `index_documents_total` | Counter | Indexing throughput |
+| `search_query_latency_seconds{cache_hit}` | Histogram | Query latency SLI |
+| `search_queries_total{status}` | Counter | Query volume |
+| `search_cache_hit_ratio` | Gauge | Cache effectiveness |
+| `search_query_results_count` | Histogram | Zero-result detection |
+| `circuit_breaker_state{service}` | Gauge | Dependency health |
 
-- name: crawl_latency_seconds
-  type: histogram
-  help: Time to fetch and process a URL
-  buckets: [0.1, 0.5, 1, 2, 5, 10, 30]
+### SLIs and Alerts
 
-- name: crawl_frontier_size
-  type: gauge
-  help: Number of URLs waiting in frontier
-
-- name: crawl_robots_cache_hits_total
-  type: counter
-  help: robots.txt cache hit/miss ratio
-  labels: [cache_result]
-
-- name: crawl_errors_total
-  type: counter
-  help: Crawl failures by error type
-  labels: [error_type]  # timeout, dns_failure, http_error, parse_error
-```
-
-**Index System Metrics**:
-```yaml
-- name: index_documents_total
-  type: counter
-  help: Documents indexed
-
-- name: index_bulk_latency_seconds
-  type: histogram
-  help: Time for bulk index operations
-  buckets: [0.5, 1, 2, 5, 10, 30]
-
-- name: elasticsearch_index_size_bytes
-  type: gauge
-  help: Size of Elasticsearch index
-
-- name: pagerank_computation_seconds
-  type: gauge
-  help: Time for last PageRank computation
-```
-
-**Query System Metrics**:
-```yaml
-- name: query_latency_seconds
-  type: histogram
-  help: End-to-end query latency
-  buckets: [0.05, 0.1, 0.2, 0.5, 1, 2]
-
-- name: query_cache_hit_ratio
-  type: gauge
-  help: Percentage of queries served from cache
-
-- name: query_results_count
-  type: histogram
-  help: Number of results returned per query
-  buckets: [0, 1, 5, 10, 50, 100, 1000]
-
-- name: query_error_rate
-  type: gauge
-  help: Percentage of queries returning errors
-```
+| SLI | Target | Alert |
+|-----|--------|-------|
+| Query latency p95 | < 200ms | > 500ms for 2 min |
+| Query error rate | < 1% | > 5% for 2 min |
+| Cache hit ratio | > 60% | < 30% for 5 min |
+| Crawl error rate | < 10% | > 10% for 5 min |
+| ES cluster health | green/yellow | red for 1 min |
+| Frontier backlog | < 100K | > 100K for 10 min |
 
 ### Structured Logging
 
-```javascript
-// Structured log format for all components
-const logger = {
-  info: (event, data) => console.log(JSON.stringify({
-    level: 'info',
-    timestamp: new Date().toISOString(),
-    service: process.env.SERVICE_NAME,
-    event,
-    ...data
-  })),
-
-  error: (event, error, data) => console.log(JSON.stringify({
-    level: 'error',
-    timestamp: new Date().toISOString(),
-    service: process.env.SERVICE_NAME,
-    event,
-    error: { message: error.message, stack: error.stack },
-    ...data
-  }))
-}
-
-// Crawl logging
-logger.info('crawl_complete', {
-  url: 'https://example.com',
-  statusCode: 200,
-  contentLength: 45000,
-  parseTimeMs: 45,
-  linksExtracted: 23,
-  traceId: request.traceId
-})
-
-// Query logging
-logger.info('query_executed', {
-  query: 'javascript tutorial',
-  resultCount: 1500,
-  latencyMs: 85,
-  cacheHit: false,
-  userId: 'anonymous',
-  traceId: request.traceId
-})
-```
-
-### Distributed Tracing
-
-```javascript
-// OpenTelemetry trace context propagation
-const { trace, context, propagation } = require('@opentelemetry/api')
-
-async function handleSearch(req, res) {
-  const tracer = trace.getTracer('search-service')
-
-  return tracer.startActiveSpan('search_query', async (span) => {
-    span.setAttribute('query.text', req.query.q)
-    span.setAttribute('query.page', req.query.page || 1)
-
-    try {
-      // Parse query (child span)
-      const parsed = await tracer.startActiveSpan('parse_query', async (parseSpan) => {
-        const result = queryProcessor.parse(req.query.q)
-        parseSpan.setAttribute('query.terms_count', result.terms.length)
-        parseSpan.end()
-        return result
-      })
-
-      // Search index (child span)
-      const results = await tracer.startActiveSpan('search_index', async (searchSpan) => {
-        const result = await elasticsearch.search(parsed)
-        searchSpan.setAttribute('results.count', result.hits.total)
-        searchSpan.end()
-        return result
-      })
-
-      // Rank results (child span)
-      const ranked = await tracer.startActiveSpan('rank_results', async (rankSpan) => {
-        const result = await ranker.rank(results, parsed)
-        rankSpan.end()
-        return result
-      })
-
-      span.setStatus({ code: 0 })
-      return ranked
-    } catch (error) {
-      span.setStatus({ code: 2, message: error.message })
-      span.recordException(error)
-      throw error
-    } finally {
-      span.end()
-    }
-  })
-}
-```
-
-### SLI Dashboard (Grafana)
-
-**Key Panels for Local Development**:
-
-```yaml
-# grafana/dashboards/search-sli.json
-panels:
-  - title: "Query Latency (p50/p95/p99)"
-    type: graph
-    targets:
-      - expr: histogram_quantile(0.50, rate(query_latency_seconds_bucket[5m]))
-      - expr: histogram_quantile(0.95, rate(query_latency_seconds_bucket[5m]))
-      - expr: histogram_quantile(0.99, rate(query_latency_seconds_bucket[5m]))
-    thresholds:
-      - value: 0.2
-        color: green
-      - value: 0.5
-        color: yellow
-      - value: 1.0
-        color: red
-
-  - title: "Crawl Rate (URLs/min)"
-    type: stat
-    targets:
-      - expr: rate(crawl_urls_fetched_total[5m]) * 60
-
-  - title: "Index Freshness (avg age)"
-    type: gauge
-    targets:
-      - expr: avg(time() - document_last_indexed_timestamp)
-
-  - title: "Error Rate by Component"
-    type: bargauge
-    targets:
-      - expr: rate(crawl_errors_total[5m])
-      - expr: rate(index_errors_total[5m])
-      - expr: rate(query_errors_total[5m])
-```
-
-### Alert Thresholds
-
-```yaml
-# prometheus/alerts.yml
-groups:
-  - name: search-alerts
-    rules:
-      - alert: HighQueryLatency
-        expr: histogram_quantile(0.95, rate(query_latency_seconds_bucket[5m])) > 0.5
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Query latency p95 exceeds 500ms"
-
-      - alert: CrawlFrontierBacklog
-        expr: crawl_frontier_size > 100000
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Crawl frontier has large backlog"
-
-      - alert: ElasticsearchClusterRed
-        expr: elasticsearch_cluster_health_status{color="red"} == 1
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Elasticsearch cluster is red"
-
-      - alert: QueryCacheHitRateLow
-        expr: query_cache_hit_ratio < 0.3
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Query cache hit rate below 30%"
-
-      - alert: CrawlErrorRateHigh
-        expr: rate(crawl_errors_total[5m]) / rate(crawl_urls_fetched_total[5m]) > 0.1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Crawl error rate exceeds 10%"
-```
-
-### Audit Logging
-
-```javascript
-// Audit log for admin operations and data access
-const auditLogger = {
-  log: async (action, details) => {
-    const entry = {
-      timestamp: new Date().toISOString(),
-      action,
-      actor: details.actor || 'system',
-      resource: details.resource,
-      resourceId: details.resourceId,
-      outcome: details.outcome,  // success, failure, denied
-      metadata: details.metadata,
-      ipAddress: details.ipAddress,
-      traceId: details.traceId
-    }
-
-    // Write to dedicated audit table (immutable, append-only)
-    await db.query(`
-      INSERT INTO audit_log (timestamp, action, actor, resource, resource_id, outcome, metadata)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-    `, [entry.timestamp, action, entry.actor, entry.resource, entry.resourceId, entry.outcome, entry.metadata])
-
-    // Also log to stdout for centralized collection
-    console.log(JSON.stringify({ type: 'audit', ...entry }))
-  }
-}
-
-// Usage examples
-await auditLogger.log('index_rebuild', {
-  actor: 'admin@example.com',
-  resource: 'elasticsearch_index',
-  resourceId: 'documents_v2',
-  outcome: 'success',
-  metadata: { documentCount: 150000, durationSeconds: 3600 }
-})
-
-await auditLogger.log('crawl_config_change', {
-  actor: 'admin@example.com',
-  resource: 'crawl_config',
-  outcome: 'success',
-  metadata: { field: 'politeness_delay', oldValue: 1000, newValue: 500 }
-})
-```
+JSON-formatted logs with trace IDs, service name, and event-specific metadata. Key events logged: `crawl_complete` (URL, status, links extracted), `query_executed` (query text, result count, latency, cache hit), `index_rebuild` (document count, duration).
 
 ---
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency
+### Circuit Breakers
 
-```javascript
-// Exponential backoff with jitter and idempotency
-class RetryHandler {
-  constructor(options = {}) {
-    this.maxRetries = options.maxRetries || 3
-    this.baseDelayMs = options.baseDelayMs || 1000
-    this.maxDelayMs = options.maxDelayMs || 30000
-  }
+Separate circuit breakers protect each dependency:
 
-  async execute(operation, idempotencyKey) {
-    let lastError
+| Service | Failure Threshold | Reset Timeout | Fallback |
+|---------|-------------------|---------------|----------|
+| Elasticsearch | 3 failures | 10 seconds | Return empty results with `fallback: true` |
+| PostgreSQL | 5 failures | 30 seconds | Skip crawl state updates, queue for retry |
+| Redis | 3 failures | 5 seconds | Bypass cache, query ES directly |
 
-    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      try {
-        // Check if already completed (idempotent)
-        const cached = await redis.get(`result:${idempotencyKey}`)
-        if (cached) {
-          return JSON.parse(cached)
-        }
+### Retry Strategy
 
-        const result = await operation()
+Exponential backoff with jitter for transient failures. Max 3 retries with base delay 1 second, capped at 30 seconds. Non-retryable errors (4xx status codes, validation failures) fail immediately. Each retry checks Redis for cached results (idempotency) to avoid duplicate work.
 
-        // Cache successful result
-        await redis.set(
-          `result:${idempotencyKey}`,
-          JSON.stringify(result),
-          'EX', 3600
-        )
+### Graceful Degradation
 
-        return result
-      } catch (error) {
-        lastError = error
-
-        // Don't retry non-retryable errors
-        if (this.isNonRetryable(error)) {
-          throw error
-        }
-
-        if (attempt < this.maxRetries) {
-          const delay = this.calculateDelay(attempt)
-          console.log(`Retry ${attempt}/${this.maxRetries} after ${delay}ms: ${error.message}`)
-          await this.sleep(delay)
-        }
-      }
-    }
-
-    throw lastError
-  }
-
-  calculateDelay(attempt) {
-    // Exponential backoff with jitter
-    const exponentialDelay = this.baseDelayMs * Math.pow(2, attempt - 1)
-    const jitter = Math.random() * 0.3 * exponentialDelay
-    return Math.min(exponentialDelay + jitter, this.maxDelayMs)
-  }
-
-  isNonRetryable(error) {
-    // Don't retry client errors or validation failures
-    return error.statusCode >= 400 && error.statusCode < 500
-  }
-
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms))
-  }
-}
-
-// Usage in crawler
-const retryHandler = new RetryHandler({ maxRetries: 3 })
-
-async function fetchWithRetry(url) {
-  const idempotencyKey = `fetch:${hashUrl(url)}:${Date.now()}`
-
-  return retryHandler.execute(
-    () => fetch(url, { timeout: 10000 }),
-    idempotencyKey
-  )
-}
-```
-
-### Circuit Breaker
-
-```javascript
-// Circuit breaker for external dependencies
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5
-    this.resetTimeoutMs = options.resetTimeoutMs || 30000
-    this.halfOpenMaxAttempts = options.halfOpenMaxAttempts || 3
-
-    this.state = 'CLOSED'  // CLOSED, OPEN, HALF_OPEN
-    this.failureCount = 0
-    this.lastFailureTime = null
-    this.halfOpenAttempts = 0
-  }
-
-  async execute(operation, fallback = null) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
-        this.state = 'HALF_OPEN'
-        this.halfOpenAttempts = 0
-      } else {
-        if (fallback) return fallback()
-        throw new Error('Circuit breaker is OPEN')
-      }
-    }
-
-    try {
-      const result = await operation()
-
-      if (this.state === 'HALF_OPEN') {
-        this.halfOpenAttempts++
-        if (this.halfOpenAttempts >= this.halfOpenMaxAttempts) {
-          this.reset()
-        }
-      }
-
-      return result
-    } catch (error) {
-      this.recordFailure()
-      throw error
-    }
-  }
-
-  recordFailure() {
-    this.failureCount++
-    this.lastFailureTime = Date.now()
-
-    if (this.failureCount >= this.failureThreshold) {
-      this.state = 'OPEN'
-      console.log('Circuit breaker opened')
-    }
-  }
-
-  reset() {
-    this.state = 'CLOSED'
-    this.failureCount = 0
-    this.halfOpenAttempts = 0
-    console.log('Circuit breaker reset to CLOSED')
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      failureCount: this.failureCount,
-      lastFailureTime: this.lastFailureTime
-    }
-  }
-}
-
-// Circuit breakers for each external service
-const circuitBreakers = {
-  elasticsearch: new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 10000 }),
-  postgres: new CircuitBreaker({ failureThreshold: 5, resetTimeoutMs: 30000 }),
-  redis: new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 5000 })
-}
-
-// Usage in query handler
-async function searchWithCircuitBreaker(query) {
-  return circuitBreakers.elasticsearch.execute(
-    () => elasticsearch.search(query),
-    () => ({ hits: { total: 0, hits: [] }, fallback: true })  // Graceful degradation
-  )
-}
-```
-
-### Local Development DR Simulation
-
-```yaml
-# docker-compose.dr-test.yml
-# Simulate failures for disaster recovery testing
-version: '3.8'
-
-services:
-  elasticsearch:
-    image: elasticsearch:8.11.0
-    deploy:
-      replicas: 2  # Run 2 nodes for failover testing
-
-  postgres-primary:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: search_primary
-
-  postgres-replica:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: search_replica
-    depends_on:
-      - postgres-primary
-
-  # Chaos testing container
-  chaos:
-    image: alexei-led/pumba
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: >
-      --random
-      --interval 30s
-      pause --duration 10s
-      re2:.*elasticsearch.*
-```
-
-**DR Test Scripts**:
-
-```bash
-#!/bin/bash
-# scripts/dr-test.sh - Test disaster recovery scenarios
-
-echo "=== DR Test Suite ==="
-
-echo "1. Testing Elasticsearch node failure..."
-docker stop google-search-elasticsearch-1
-sleep 5
-# Verify queries still work via remaining node
-curl -s "http://localhost:3000/search?q=test" | jq '.error // "OK"'
-docker start google-search-elasticsearch-1
-
-echo "2. Testing Redis failure (cache miss fallback)..."
-docker stop google-search-redis-1
-curl -s "http://localhost:3000/search?q=test" | jq '.cacheHit'  # Should be false
-docker start google-search-redis-1
-
-echo "3. Testing PostgreSQL failover..."
-docker stop google-search-postgres-primary-1
-# Verify crawler handles DB unavailability gracefully
-curl -s "http://localhost:3001/health" | jq '.database'
-docker start google-search-postgres-primary-1
-
-echo "=== DR Tests Complete ==="
-```
-
-### Backup and Restore
-
-**PostgreSQL Backup**:
-
-```bash
-#!/bin/bash
-# scripts/backup-postgres.sh
-
-BACKUP_DIR="./backups/postgres"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_FILE="${BACKUP_DIR}/search_${TIMESTAMP}.sql.gz"
-
-mkdir -p $BACKUP_DIR
-
-# Create compressed backup
-docker exec google-search-postgres-1 \
-  pg_dump -U postgres search_db | gzip > $BACKUP_FILE
-
-echo "Backup created: $BACKUP_FILE"
-
-# Keep only last 7 daily backups (for local dev)
-find $BACKUP_DIR -name "*.sql.gz" -mtime +7 -delete
-```
-
-**Elasticsearch Snapshot**:
-
-```bash
-#!/bin/bash
-# scripts/backup-elasticsearch.sh
-
-BACKUP_DIR="./backups/elasticsearch"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-# Register snapshot repository (first time only)
-curl -X PUT "localhost:9200/_snapshot/local_backup" -H 'Content-Type: application/json' -d'
-{
-  "type": "fs",
-  "settings": {
-    "location": "/usr/share/elasticsearch/backup"
-  }
-}'
-
-# Create snapshot
-curl -X PUT "localhost:9200/_snapshot/local_backup/snapshot_${TIMESTAMP}?wait_for_completion=true"
-
-echo "Elasticsearch snapshot created: snapshot_${TIMESTAMP}"
-
-# List snapshots
-curl -s "localhost:9200/_snapshot/local_backup/_all" | jq '.snapshots | length'
-```
-
-**Restore Procedures**:
-
-```bash
-#!/bin/bash
-# scripts/restore-postgres.sh
-
-BACKUP_FILE=$1
-if [ -z "$BACKUP_FILE" ]; then
-  echo "Usage: ./restore-postgres.sh <backup_file.sql.gz>"
-  exit 1
-fi
-
-echo "Restoring from $BACKUP_FILE..."
-
-# Drop and recreate database
-docker exec -i google-search-postgres-1 psql -U postgres -c "DROP DATABASE IF EXISTS search_db;"
-docker exec -i google-search-postgres-1 psql -U postgres -c "CREATE DATABASE search_db;"
-
-# Restore from backup
-gunzip -c $BACKUP_FILE | docker exec -i google-search-postgres-1 psql -U postgres search_db
-
-echo "Restore complete. Verify with: docker exec google-search-postgres-1 psql -U postgres -d search_db -c 'SELECT COUNT(*) FROM urls;'"
-```
-
-```bash
-#!/bin/bash
-# scripts/restore-elasticsearch.sh
-
-SNAPSHOT_NAME=$1
-if [ -z "$SNAPSHOT_NAME" ]; then
-  echo "Usage: ./restore-elasticsearch.sh <snapshot_name>"
-  echo "Available snapshots:"
-  curl -s "localhost:9200/_snapshot/local_backup/_all" | jq '.snapshots[].snapshot'
-  exit 1
-fi
-
-echo "Restoring from snapshot $SNAPSHOT_NAME..."
-
-# Close indices before restore
-curl -X POST "localhost:9200/documents/_close"
-
-# Restore snapshot
-curl -X POST "localhost:9200/_snapshot/local_backup/${SNAPSHOT_NAME}/_restore?wait_for_completion=true"
-
-# Reopen indices
-curl -X POST "localhost:9200/documents/_open"
-
-echo "Restore complete."
-```
-
-**Backup Testing Schedule**:
-
-```yaml
-# For local dev: Run backup tests weekly
-backup_test_checklist:
-  - Create fresh backup of PostgreSQL and Elasticsearch
-  - Spin up separate Docker containers for restore testing
-  - Restore backups to test containers
-  - Run validation queries:
-      - SELECT COUNT(*) FROM urls
-      - SELECT COUNT(*) FROM documents
-      - curl localhost:9201/_cat/indices
-  - Verify crawl state can resume from restored data
-  - Document any issues in project claude.md
-```
+| Failure | Behavior |
+|---------|----------|
+| ES cluster down | Circuit breaker opens, queries return "temporarily unavailable" |
+| Redis down | Bypass cache, all queries hit ES directly (higher latency) |
+| PostgreSQL down | Crawling pauses, serving continues from cached index |
+| Single crawler down | Other crawlers continue; frontier rebalances |
 
 ---
 
-## Implementation Notes
+## Scalability Considerations
 
-This section documents the rationale behind key observability, resilience, and performance features implemented in the backend.
+### What Breaks First
 
-### Why Result Caching Reduces Index Load for Popular Queries
+1. **Elasticsearch** at ~10K QPS per node. Scale horizontally with index replication (each shard has 2 replicas). Query coordinators distribute load across replicas.
+2. **Crawl throughput** limited by politeness constraints, not infrastructure. Scale by adding crawler instances with distinct host assignments. A 1000-crawler fleet can fetch ~50M pages/day.
+3. **PostgreSQL** link graph table grows to billions of rows. Shard by source_url_hash. Consider graph database (Neo4j) for PageRank if iteration becomes too slow.
+4. **Redis query cache** at ~1M cached queries. Redis Cluster with hash slots distributes memory. Eviction policy: allkeys-lfu.
 
-Search queries follow a power-law distribution: a small percentage of queries account for a large percentage of total search volume. By caching search results in Redis:
+### Index Freshness vs. Cost
 
-1. **Popular queries hit cache**: The top 20% of queries (by frequency) often account for 80% of search traffic. These queries are served from Redis (sub-millisecond) instead of hitting Elasticsearch.
-
-2. **Elasticsearch load reduction**: Each cached query avoids:
-   - Network round-trip to Elasticsearch cluster
-   - Query parsing and analysis
-   - Index segment reads and scoring
-   - Result aggregation and highlighting
-
-3. **Cost efficiency**: Elasticsearch cluster sizing can be based on unique query volume rather than total query volume. A 70% cache hit rate effectively reduces required ES capacity by 70%.
-
-4. **Freshness trade-off**: Cached results may be up to 5 minutes stale (configurable via `SEARCH_CACHE_TTL`). For most searches, slightly stale results are acceptable. Time-sensitive queries can bypass cache.
-
-**Implementation**: See `src/shared/rateLimiter.js` for Redis-backed caching and `src/services/search.js` for cache-aside pattern.
-
-### Why Rate Limiting Prevents Resource Exhaustion
-
-Rate limiting protects the search infrastructure from both malicious attacks and accidental overload:
-
-1. **Elasticsearch protection**: ES queries are expensive operations:
-   - Each query consumes CPU for scoring
-   - Memory for loading segments and building results
-   - Network bandwidth for cluster coordination
-   - Too many concurrent queries can cause GC pressure and cluster instability
-
-2. **Fair resource allocation**: Without rate limits, a single misbehaving client could:
-   - Exhaust connection pools
-   - Queue up requests causing latency spikes for all users
-   - Trigger circuit breakers affecting legitimate traffic
-
-3. **Defense in depth**: Multiple rate limit layers:
-   - Per-endpoint limits (search: 60/min, autocomplete: 120/min)
-   - Per-IP global limit (200/min total)
-   - Admin endpoints more restrictive (10/min)
-
-4. **Graceful degradation**: Rate-limited requests get 429 responses with `Retry-After` headers, allowing clients to back off gracefully.
-
-**Implementation**: See `src/shared/rateLimiter.js` using Redis for distributed rate limiting across multiple backend instances.
-
-### Why Circuit Breakers Protect Index Availability
-
-Circuit breakers prevent cascading failures when Elasticsearch or other dependencies are struggling:
-
-1. **Fail-fast pattern**: When ES is overloaded:
-   - Without circuit breaker: Requests queue up, timeout, retry, making overload worse
-   - With circuit breaker: After N failures, immediately reject new requests, letting ES recover
-
-2. **States explained**:
-   - **CLOSED** (normal): All requests pass through
-   - **OPEN** (failing): Requests fail immediately without hitting ES
-   - **HALF-OPEN** (testing): Allow limited requests to test if ES has recovered
-
-3. **Prevent cascade failures**:
-   - If indexing circuit breaker trips, search can still work
-   - Separate breakers for bulk indexing vs. single document operations
-   - Granular failure isolation
-
-4. **Metrics integration**: Circuit breaker state is exposed via Prometheus metrics:
-   - `search_circuit_breaker_state` (0=closed, 1=half_open, 2=open)
-   - `search_circuit_breaker_trips_total` (count of times breaker opened)
-
-**Implementation**: See `src/shared/circuitBreaker.js` using opossum library, integrated into `src/services/indexer.js`.
-
-### Why Query Metrics Enable Ranking Optimization
-
-Prometheus metrics on queries provide signals for improving search quality:
-
-1. **Latency analysis**:
-   - `search_query_latency_seconds` histogram with cache hit/miss labels
-   - Identify slow queries for index optimization
-   - Track p50/p95/p99 for SLO monitoring
-
-2. **Zero-result queries**:
-   - `search_query_results_count` histogram
-   - High zero-result rate indicates index gaps or query parsing issues
-   - Can drive crawl prioritization for missing content
-
-3. **Cache effectiveness**:
-   - `search_cache_hit_ratio` gauge
-   - Low hit rate may indicate TTL too short or query diversity too high
-   - High hit rate validates caching strategy
-
-4. **Query patterns**:
-   - Audit logs capture query text and result counts
-   - Enable analysis of popular queries for pre-warming cache
-   - Identify queries where ranking could be improved
-
-5. **Ranking feedback loop**:
-   - Track which queries return few results
-   - Correlate with user behavior (if click tracking added)
-   - Inform BM25 parameter tuning and boost factor adjustments
-
-**Implementation**: See `src/shared/metrics.js` for Prometheus metrics and `src/routes/search.js` for metric collection.
-
-### Endpoint Summary
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /health` | Comprehensive health check with dependency status |
-| `GET /healthz` | Kubernetes liveness probe |
-| `GET /ready` | Kubernetes readiness probe |
-| `GET /metrics` | Prometheus metrics scraping endpoint |
+Real-time indexing for every page change is prohibitively expensive at 100B pages. Instead, use adaptive recrawl scheduling: news sites every hour, popular sites daily, long-tail sites monthly. Change detection via HTTP conditional GETs (If-Modified-Since) reduces unnecessary fetches by ~60%.
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Index sharding | By term | By document | Query efficiency |
-| Ranking | Multi-phase | Single phase | Latency |
-| Freshness | Crawl priority | Real-time | Cost, scale |
-| PageRank | Batch | Incremental | Simplicity |
-| Consistency | Eventual (reads) | Strong | Performance; stale acceptable |
-| Idempotency | Redis locks + content hash | DB transactions | Speed; acceptable for crawl dedup |
-| Circuit breakers | Per-service | Global | Granular failure isolation |
-| Backups | Daily local snapshots | Continuous replication | Simpler for learning project |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Index sharding | By term | By document | Query efficiency, simple routing |
+| Ranking | Multi-phase (2-pass) | Single phase | Latency: avoid expensive signals on all candidates |
+| Freshness | Crawl priority scheduling | Real-time indexing | Cost-effective at scale |
+| PageRank | Weekly batch | Incremental | Simpler, link structure changes slowly |
+| Consistency | Eventual (reads) | Strong | Performance; stale results acceptable |
+| Idempotency | Redis locks + content hash | DB transactions | Speed for crawl dedup |
+| Circuit breakers | Per-service (ES/PG/Redis) | Global | Granular failure isolation |
+| Full-text search | Elasticsearch | Custom inverted index | Production-grade BM25 with minimal overhead |
+
+---
+
+## Implementation Notes
+
+This section documents the actual local implementation: what was built, what was simplified, and what was omitted.
+
+### Local Setup Diagram
+
+```
+┌───────────────────┐
+│  React Frontend   │
+│  (Vite :5173)     │
+│  SearchBox, Admin │
+└────────┬──────────┘
+         │ HTTP
+         ▼
+┌───────────────────┐
+│  Express Backend  │
+│  (Port 3000)      │
+│  Search + Admin   │
+└──┬──────┬──────┬──┘
+   │      │      │
+   ▼      ▼      ▼
+┌──────┐ ┌────┐ ┌──────────────┐
+│ PG   │ │ VK │ │ Elasticsearch│
+│:5432 │ │:6379│ │   :9200      │
+└──────┘ └────┘ └──────────────┘
+```
+
+Multiple API instances can be run on ports 3001-3003 via `PORT=300x npm run dev`.
+
+Backend scripts for offline processing:
+- `npm run crawl` -- Run crawler against seed URLs
+- `npm run build-index` -- Index crawled documents into Elasticsearch
+- `npm run calculate-pagerank` -- Compute PageRank from link graph
+
+### Production Patterns Actually Implemented
+
+| Pattern | File Path | Description |
+|---------|-----------|-------------|
+| Prometheus metrics | `backend/src/shared/metrics.ts` | Query latency histogram, cache hit ratio, crawl counters, result count distribution |
+| Circuit breakers | `backend/src/shared/circuitBreaker.ts` | Opossum-based breakers for ES, PostgreSQL, Redis with Prometheus state gauge |
+| Rate limiting | `backend/src/shared/rateLimiter.ts` | Redis-backed per-endpoint rate limiting (search: 60/min, admin: 10/min) |
+| Idempotency | `backend/src/shared/idempotency.ts` | Redis SET NX for crawl dedup; deterministic ES document IDs for index idempotency |
+| Structured logging | `backend/src/shared/logger.ts` | Pino JSON logger with request correlation and trace IDs |
+| Health checks | `backend/src/shared/health.ts` | `/health` with dependency checks (PG, Redis, ES), `/healthz` liveness, `/ready` readiness |
+| Crawler | `backend/src/services/crawler.ts` | URL frontier, robots.txt compliance, politeness, content extraction with Cheerio |
+| PageRank | `backend/src/services/pagerank.ts` | Iterative computation with convergence detection, damping factor 0.85 |
+| Indexer | `backend/src/services/indexer.ts` | Tokenization, stemming (natural library), Elasticsearch bulk indexing |
+| Search service | `backend/src/services/search.ts` | Query parsing (phrases, exclusions, site filter), BM25 via ES, snippet generation |
+| Tokenizer | `backend/src/utils/tokenizer.ts` | Stopword removal, Porter stemming via `natural` library |
+
+### What Was Simplified or Substituted
+
+| Production Design | Local Implementation | Rationale |
+|-------------------|---------------------|-----------|
+| Custom distributed index (Bigtable + Colossus) | Single Elasticsearch node | ES provides production-grade BM25 with minimal setup |
+| 1000-crawler distributed fleet | Single-process crawler | Demonstrates concepts without distributed coordination |
+| Redis Cluster for query cache | Single Valkey instance | Same API, sufficient for local volume |
+| PostgreSQL sharded link graph | Single PostgreSQL instance | Link graph fits in memory at local scale |
+| Learning-to-rank model | Static weight combination (0.35/0.25/0.15/0.25) | Demonstrates multi-signal ranking without ML infrastructure |
+| Click-through rate signal | Simulated via query logs | No real user click data at local scale |
+| Distributed tracing (OpenTelemetry) | Structured logs with trace IDs | Lighter weight, sufficient for debugging |
+
+### What Was Omitted
+
+- **Distributed crawling** coordination (URL frontier partitioning across crawlers)
+- **Index compression** (variable-byte encoding, PForDelta for postings)
+- **Real-time indexing pipeline** (Kafka-based streaming from crawl to index)
+- **Learning-to-rank** model training on click data
+- **CDN** for serving static frontend assets
+- **Multi-region** deployment with geo-routed queries
+- **Kubernetes** orchestration and horizontal pod autoscaling
+- **Spell correction** with language model (basic edit-distance only)
+- **Knowledge graph** panels and entity extraction
+- **Image/video search** and multimodal indexing
+- **Personalization** based on user search history

@@ -2,1593 +2,539 @@
 
 ## System Overview
 
-FaceTime is a real-time video calling service with end-to-end encryption. Core challenges involve low latency, NAT traversal, and group call scaling.
+FaceTime is a real-time video calling service with end-to-end encryption, supporting 1:1 and group video/audio calls across multiple Apple devices. Core challenges involve achieving sub-150ms latency, reliable NAT traversal, group call scaling beyond P2P mesh limits, and seamless device handoff.
 
 **Learning Goals:**
-- Build real-time media pipelines
-- Design WebRTC-based calling systems
+- Build real-time media pipelines with WebRTC
+- Design WebRTC-based calling systems with STUN/TURN
 - Implement E2E encryption for calls
-- Handle network adaptation
-
----
+- Handle network adaptation and quality management
 
 ## Requirements
 
 ### Functional Requirements
 
-1. **Call**: 1:1 video/audio calls
-2. **Group**: Multi-party video calls
-3. **Ring**: Multi-device incoming calls
-4. **Handoff**: Transfer call between devices
-5. **Share**: SharePlay for shared experiences
+1. **1:1 Calls**: Video and audio calls between two users
+2. **Group Calls**: Multi-party video calls (up to 32 participants)
+3. **Multi-Device Ring**: Ring all registered devices simultaneously on incoming call
+4. **Device Handoff**: Transfer an active call between devices seamlessly
+5. **SharePlay**: Shared media experiences during calls
 
 ### Non-Functional Requirements
 
-- **Latency**: < 150ms end-to-end
-- **Quality**: Up to 1080p video
-- **Scale**: Millions of concurrent calls
-- **Security**: End-to-end encryption
+| Metric | Target |
+|--------|--------|
+| End-to-end latency | < 150ms (same region) |
+| Call setup time | < 3 seconds from tap to ring |
+| Video quality | Up to 1080p adaptive |
+| Concurrent calls | Millions globally |
+| Availability | 99.99% for signaling |
+| Security | End-to-end encryption for all media |
+| Packet loss tolerance | < 5% before quality degradation |
 
----
+## Capacity Estimation
+
+### Production Scale
+
+- **Peak concurrent calls**: 5 million
+- **Average call duration**: 8 minutes
+- **Calls per day**: ~500 million
+- **Signaling messages per call**: ~20 (setup) + ~5/minute (ICE keepalive)
+- **Peak signaling load**: ~100M messages/minute
+- **TURN relay rate**: ~15% of calls require relay (corporate NATs, symmetric NATs)
+- **TURN bandwidth**: 15% of 5M calls * 4 Mbps bidirectional = 3 Tbps TURN capacity
+- **P2P success rate**: ~85% via STUN (direct or port-mapped)
+
+### Local Development Scale
+
+- 2-5 concurrent calls
+- 2-4 participants per call
+- Single signaling server, single Coturn instance
+- All services on localhost
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│          iPhone │ iPad │ Mac │ Apple Watch │ Apple TV           │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Signaling Server│    │  STUN Server  │    │  TURN Server  │
-│               │    │               │    │               │
-│ - Call setup  │    │ - NAT mapping │    │ - Media relay │
-│ - Presence    │    │ - ICE         │    │ - Fallback    │
-│ - Routing     │    │               │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Peer-to-Peer Media                           │
-│              (Direct connection when possible)                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      SFU (Group Calls)                          │
-│        (Selective Forwarding Unit for multi-party)             │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Client Layer                                  │
+│            iPhone │ iPad │ Mac │ Apple Watch │ Apple TV              │
+└─────────────────────────────────────────────────────────────────────┘
+          │                       │                       │
+          │ WebSocket             │ STUN                  │ SRTP
+          │ (signaling)           │ (NAT mapping)         │ (media)
+          ▼                       ▼                       ▼
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  API Gateway     │    │  STUN Cluster    │    │  TURN Cluster    │
+│  (L7 + WS)      │    │                  │    │                  │
+│  - Rate limiting │    │  - NAT discovery │    │  - Media relay   │
+│  - Auth          │    │  - Server        │    │  - Bandwidth     │
+│  - Routing       │    │    reflexive     │    │    allocation    │
+└────────┬─────────┘    └──────────────────┘    └──────────────────┘
+         │
+         ├─────────────────────┬─────────────────────┐
+         ▼                     ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│  Signaling       │  │  Call Management │  │  Presence        │
+│  Service         │  │  Service         │  │  Service         │
+│                  │  │                  │  │                  │
+│  - WebSocket     │  │  - Call CRUD     │  │  - Device online │
+│  - Offer/Answer  │  │  - Participant   │  │  - Multi-device  │
+│  - ICE exchange  │  │    tracking      │  │  - Heartbeat     │
+│  - Room mgmt     │  │  - Call history  │  │  - Routing       │
+└────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+         │                     │                     │
+         ▼                     ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│  Redis Cluster   │  │  PostgreSQL      │  │  Redis Cluster   │
+│  (call state,    │  │  (users, calls,  │  │  (presence,      │
+│   idempotency,   │  │   devices,       │  │   sessions,      │
+│   signaling      │  │   call history)  │  │   device map)    │
+│   buffer)        │  │                  │  │                  │
+└──────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
----
+### P2P Media Flow (1:1 Calls)
+
+```
+Device A                                               Device B
+    │                                                      │
+    │──── STUN Binding Request ────▶ STUN Server           │
+    │◀─── Server Reflexive Addr ────┘                      │
+    │                                                      │
+    │──── WebSocket: Offer (SDP) ──────────────────────────▶│
+    │◀─── WebSocket: Answer (SDP) ─────────────────────────│
+    │                                                      │
+    │──── ICE Candidate ───────────────────────────────────▶│
+    │◀─── ICE Candidate ──────────────────────────────────│
+    │                                                      │
+    │◀═══════════ DTLS Handshake ═══════════════════════▶│
+    │                                                      │
+    │◀═══════════ SRTP Media (P2P) ═════════════════════▶│
+```
+
+### Group Call Architecture (SFU)
+
+For calls beyond 4 participants, an SFU (Selective Forwarding Unit) replaces the mesh:
+
+```
+                    ┌──────────────────────┐
+                    │    SFU Controller    │
+                    │    (routing layer)   │
+                    └──────────┬───────────┘
+                               │
+            ┌──────────────────┼──────────────────┐
+            ▼                  ▼                   ▼
+     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+     │  SFU Worker 1│  │  SFU Worker 2│  │  SFU Worker N│
+     │  (CPU Core)  │  │  (CPU Core)  │  │  (CPU Core)  │
+     │  ~200 users  │  │  ~200 users  │  │  ~200 users  │
+     └──────────────┘  └──────────────┘  └──────────────┘
+```
+
+Each participant sends one stream to the SFU, which selectively forwards it to all others — O(N) server connections vs O(N^2) in mesh.
 
 ## Core Components
 
-### 1. Call Signaling
+### 1. Signaling Service
 
-**Call Setup Protocol:**
-```javascript
-class SignalingService {
-  async initiateCall(callerId, calleeIds, callType) {
-    const callId = uuid()
+The signaling server mediates WebRTC session establishment without touching media bytes:
 
-    // Create call session
-    const call = {
-      id: callId,
-      initiator: callerId,
-      participants: calleeIds,
-      type: callType, // 'video', 'audio'
-      state: 'ringing',
-      createdAt: Date.now()
-    }
+**Signaling Protocol:**
 
-    await this.storeCall(call)
+| Direction | Message | Purpose |
+|-----------|---------|---------|
+| Client → Server | `register` | Register device with userId, deviceId, deviceType |
+| Server → Client | `registered` | Confirm registration, assign clientId |
+| Client → Server | `call-initiate` | Start call with target userId(s), call type |
+| Server → Client | `incoming-call` | Ring on all target user's online devices |
+| Client → Server | `call-response` | Accept/decline with device selection |
+| Server → Client | `call-accepted` | Notify initiator, include SDP answer |
+| Client → Server | `offer` | WebRTC SDP offer |
+| Server → Client | `offer` | Forward SDP offer to callee |
+| Client → Server | `answer` | WebRTC SDP answer |
+| Server → Client | `answer` | Forward SDP answer to caller |
+| Client → Server | `ice-candidate` | ICE candidate from local gathering |
+| Server → Client | `ice-candidate` | Forward ICE candidate to peer |
+| Client → Server | `call-end` | End the call |
+| Server → Client | `call-ended` | Notify all participants |
+| Client → Server | `heartbeat` | Keep presence alive |
 
-    // Ring all callee devices
-    for (const calleeId of calleeIds) {
-      const devices = await this.getUserDevices(calleeId)
+### 2. Presence Service
 
-      for (const device of devices) {
-        await this.sendPush(device, {
-          type: 'incoming_call',
-          callId,
-          caller: await this.getUserInfo(callerId),
-          callType
-        })
+Tracks which devices are online for each user, enabling multi-device ring:
 
-        // Also send via WebSocket if connected
-        this.sendToDevice(device, {
-          type: 'ring',
-          callId,
-          caller: callerId,
-          callType
-        })
-      }
-    }
+- **Write-through pattern**: Device registration updates Redis immediately
+- **Heartbeat refresh**: 30-second heartbeat keeps presence TTL alive (60s TTL)
+- **Multi-device awareness**: Hash map per user (`presence:{userId}` → `{deviceId: presenceData}`)
+- **Fast routing**: Sub-millisecond lookup of all online devices during call setup
 
-    // Start ring timeout (30 seconds)
-    setTimeout(() => this.handleRingTimeout(callId), 30000)
+When a call arrives, the signaling service queries presence to find all online devices for the target user, then sends `incoming-call` to every device simultaneously. The first device to accept wins.
 
-    return { callId }
-  }
+### 3. Call Management Service
 
-  async answerCall(callId, deviceId, answer) {
-    const call = await this.getCall(callId)
+Handles call lifecycle and persistence:
 
-    if (call.state !== 'ringing') {
-      throw new Error('Call not ringing')
-    }
+- **Call creation**: Generates call record with idempotency key protection
+- **Participant tracking**: Records join/leave timestamps per device
+- **Call history**: Stores completed calls with duration, quality rating, participants
+- **Multi-device ring**: Routes incoming calls to all registered devices
 
-    // Stop ringing on all devices
-    await this.stopRinging(call.participants)
+### 4. NAT Traversal (STUN/TURN)
 
-    // Exchange SDP
-    await this.exchangeSDP(callId, deviceId, answer)
+The ICE (Interactive Connectivity Establishment) framework handles NAT traversal:
 
-    // Update call state
-    await this.updateCall(callId, {
-      state: 'connected',
-      answeredBy: deviceId,
-      connectedAt: Date.now()
-    })
+**ICE Candidate Gathering Order:**
+1. **Host candidates** — Direct LAN addresses
+2. **Server reflexive (srflx)** — Public IP:port learned via STUN
+3. **Relay candidates** — TURN-allocated relay addresses (fallback)
 
-    // Notify caller
-    this.sendToDevice(call.initiatorDevice, {
-      type: 'call_answered',
-      callId,
-      answer
-    })
-  }
+**TURN is the fallback for hostile networks.** Approximately 15% of calls require TURN relay because the client is behind a symmetric NAT or corporate firewall that blocks UDP hole-punching. TURN adds ~20-50ms latency but guarantees connectivity.
 
-  async exchangeICECandidate(callId, fromDevice, candidate) {
-    const call = await this.getCall(callId)
-    const otherParticipants = call.devices.filter(d => d !== fromDevice)
-
-    for (const device of otherParticipants) {
-      this.sendToDevice(device, {
-        type: 'ice_candidate',
-        callId,
-        from: fromDevice,
-        candidate
-      })
-    }
-  }
-}
-```
-
-### 2. NAT Traversal
-
-**ICE Connectivity:**
-```javascript
-class ICEManager {
-  constructor() {
-    this.stunServers = [
-      { urls: 'stun:stun.apple.com:3478' },
-      { urls: 'stun:stun.apple.com:5349' }
-    ]
-    this.turnServers = [
-      {
-        urls: 'turn:turn.apple.com:3478',
-        username: 'user',
-        credential: 'pass'
-      }
-    ]
-  }
-
-  async gatherCandidates(peerConnection) {
-    const candidates = []
-
-    return new Promise((resolve) => {
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-          candidates.push({
-            candidate: event.candidate.candidate,
-            sdpMid: event.candidate.sdpMid,
-            sdpMLineIndex: event.candidate.sdpMLineIndex,
-            type: this.getCandidateType(event.candidate)
-          })
-        } else {
-          // Gathering complete
-          resolve(candidates)
-        }
-      }
-
-      // Trigger gathering
-      peerConnection.setLocalDescription(peerConnection.localDescription)
-    })
-  }
-
-  getCandidateType(candidate) {
-    // Prefer in order: host > srflx > relay
-    if (candidate.candidate.includes('typ host')) return 'host'
-    if (candidate.candidate.includes('typ srflx')) return 'srflx'
-    if (candidate.candidate.includes('typ relay')) return 'relay'
-    return 'unknown'
-  }
-
-  async checkConnectivity(peerConnection, timeout = 10000) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error('ICE connection timeout'))
-      }, timeout)
-
-      peerConnection.oniceconnectionstatechange = () => {
-        if (peerConnection.iceConnectionState === 'connected') {
-          clearTimeout(timer)
-          resolve(true)
-        } else if (peerConnection.iceConnectionState === 'failed') {
-          clearTimeout(timer)
-          reject(new Error('ICE connection failed'))
-        }
-      }
-    })
-  }
-}
-```
-
-### 3. Media Pipeline
-
-**Adaptive Video Encoding:**
-```javascript
-class MediaPipeline {
-  constructor() {
-    this.encoderConfig = {
-      codec: 'VP8', // or H.264
-      maxBitrate: 2500000, // 2.5 Mbps
-      maxFramerate: 30,
-      width: 1280,
-      height: 720
-    }
-  }
-
-  async startCapture() {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30 }
-      },
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
-    })
-
-    return stream
-  }
-
-  adaptToNetwork(stats) {
-    const { availableBandwidth, packetLoss, rtt } = stats
-
-    // Reduce quality if bandwidth is low
-    if (availableBandwidth < 500000) {
-      this.setResolution(640, 360)
-      this.setBitrate(400000)
-    } else if (availableBandwidth < 1000000) {
-      this.setResolution(960, 540)
-      this.setBitrate(800000)
-    } else {
-      this.setResolution(1280, 720)
-      this.setBitrate(2500000)
-    }
-
-    // Reduce framerate if packet loss is high
-    if (packetLoss > 5) {
-      this.setFramerate(15)
-    } else if (packetLoss > 2) {
-      this.setFramerate(24)
-    } else {
-      this.setFramerate(30)
-    }
-  }
-
-  async applyPortraitMode(videoTrack) {
-    // Use ML model to segment person from background
-    const processor = new MediaStreamTrackProcessor({ track: videoTrack })
-    const generator = new MediaStreamTrackGenerator({ kind: 'video' })
-
-    const transformer = new TransformStream({
-      async transform(frame, controller) {
-        // Apply background blur
-        const blurredFrame = await this.blurBackground(frame)
-        controller.enqueue(blurredFrame)
-        frame.close()
-      }
-    })
-
-    processor.readable.pipeThrough(transformer).pipeTo(generator.writable)
-
-    return generator
-  }
-}
-```
-
-### 4. Group Call (SFU)
-
-**Selective Forwarding:**
-```javascript
-class SFU {
-  constructor() {
-    this.rooms = new Map() // roomId -> participants
-  }
-
-  async joinRoom(roomId, userId, offer) {
-    let room = this.rooms.get(roomId)
-
-    if (!room) {
-      room = {
-        id: roomId,
-        participants: new Map(),
-        dominantSpeaker: null
-      }
-      this.rooms.set(roomId, room)
-    }
-
-    // Create peer connection for this participant
-    const pc = new RTCPeerConnection({
-      sdpSemantics: 'unified-plan'
-    })
-
-    // Set up receive tracks from this participant
-    pc.ontrack = (event) => {
-      // Forward to other participants
-      this.forwardTrack(roomId, userId, event.track)
-    }
-
-    // Set up send tracks to this participant (from others)
-    for (const [otherId, otherParticipant] of room.participants) {
-      // Add existing tracks
-      for (const track of otherParticipant.tracks) {
-        pc.addTrack(track)
-      }
-    }
-
-    // Process offer
-    await pc.setRemoteDescription(offer)
-    const answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    room.participants.set(userId, {
-      pc,
-      tracks: [],
-      userId
-    })
-
-    return { answer, participants: Array.from(room.participants.keys()) }
-  }
-
-  forwardTrack(roomId, fromUserId, track) {
-    const room = this.rooms.get(roomId)
-    if (!room) return
-
-    // Store track
-    const participant = room.participants.get(fromUserId)
-    participant.tracks.push(track)
-
-    // Forward to all other participants
-    for (const [userId, p] of room.participants) {
-      if (userId !== fromUserId) {
-        p.pc.addTrack(track)
-
-        // Renegotiate
-        this.renegotiate(p.pc, userId)
-      }
-    }
-  }
-
-  // Dominant speaker detection
-  async detectDominantSpeaker(roomId) {
-    const room = this.rooms.get(roomId)
-    if (!room) return
-
-    const audioLevels = new Map()
-
-    for (const [userId, participant] of room.participants) {
-      const stats = await participant.pc.getStats()
-
-      for (const stat of stats.values()) {
-        if (stat.type === 'inbound-rtp' && stat.kind === 'audio') {
-          audioLevels.set(userId, stat.audioLevel || 0)
-        }
-      }
-    }
-
-    // Find loudest speaker
-    let maxLevel = 0
-    let dominant = null
-
-    for (const [userId, level] of audioLevels) {
-      if (level > maxLevel) {
-        maxLevel = level
-        dominant = userId
-      }
-    }
-
-    if (dominant !== room.dominantSpeaker) {
-      room.dominantSpeaker = dominant
-      this.notifyDominantSpeakerChange(roomId, dominant)
-    }
-  }
-}
-```
-
-### 5. End-to-End Encryption
-
-**SRTP with Key Exchange:**
-```javascript
-class E2EEncryption {
-  async setupEncryption(peerConnection) {
-    // Generate key pair for this call
-    const keyPair = await crypto.subtle.generateKey(
-      { name: 'ECDH', namedCurve: 'P-256' },
-      true,
-      ['deriveBits']
-    )
-
-    // Export public key to share
-    const publicKey = await crypto.subtle.exportKey('raw', keyPair.publicKey)
-
-    return { keyPair, publicKey }
-  }
-
-  async deriveSessionKey(privateKey, remotePublicKey) {
-    // Import remote public key
-    const importedPublicKey = await crypto.subtle.importKey(
-      'raw',
-      remotePublicKey,
-      { name: 'ECDH', namedCurve: 'P-256' },
-      false,
-      []
-    )
-
-    // Derive shared secret
-    const sharedSecret = await crypto.subtle.deriveBits(
-      { name: 'ECDH', public: importedPublicKey },
-      privateKey,
-      256
-    )
-
-    // Derive encryption key
-    const sessionKey = await crypto.subtle.importKey(
-      'raw',
-      sharedSecret,
-      { name: 'AES-GCM' },
-      false,
-      ['encrypt', 'decrypt']
-    )
-
-    return sessionKey
-  }
-
-  // SRTP encryption for media
-  async encryptRTPPacket(packet, sessionKey) {
-    const iv = crypto.getRandomValues(new Uint8Array(12))
-
-    const encrypted = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      sessionKey,
-      packet.payload
-    )
-
-    return {
-      header: packet.header,
-      iv,
-      payload: encrypted
-    }
-  }
-}
-```
-
----
+**Credential rotation**: TURN credentials are time-limited (5 minutes). The client requests fresh credentials from the API before each call. This prevents credential reuse if intercepted.
 
 ## Database Schema
 
 ```sql
--- Active Calls
-CREATE TABLE calls (
-  id UUID PRIMARY KEY,
-  initiator_id UUID NOT NULL,
-  call_type VARCHAR(20) NOT NULL, -- 'video', 'audio', 'group'
-  state VARCHAR(20) NOT NULL,
-  started_at TIMESTAMP,
-  ended_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW()
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Users: Apple ID-linked accounts
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  username VARCHAR(50) UNIQUE NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  display_name VARCHAR(100) NOT NULL,
+  avatar_url VARCHAR(500),
+  role VARCHAR(20) DEFAULT 'user',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Call Participants
-CREATE TABLE call_participants (
-  call_id UUID REFERENCES calls(id),
-  user_id UUID NOT NULL,
-  device_id UUID NOT NULL,
-  state VARCHAR(20), -- 'ringing', 'connected', 'left'
-  joined_at TIMESTAMP,
-  left_at TIMESTAMP,
-  PRIMARY KEY (call_id, user_id, device_id)
-);
-
--- User Devices (for multi-device ring)
+-- Multi-device registration
 CREATE TABLE user_devices (
-  id UUID PRIMARY KEY,
-  user_id UUID NOT NULL,
-  device_type VARCHAR(50),
-  push_token VARCHAR(500),
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  device_name VARCHAR(100),
+  device_type VARCHAR(50),  -- 'desktop', 'mobile', 'tablet'
+  push_token VARCHAR(500),  -- APNs token for offline ring
   is_active BOOLEAN DEFAULT TRUE,
-  last_seen TIMESTAMP
+  last_seen TIMESTAMPTZ DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Call records
+CREATE TABLE calls (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  initiator_id UUID REFERENCES users(id),
+  call_type VARCHAR(20) NOT NULL,       -- 'video', 'audio', 'group'
+  state VARCHAR(20) NOT NULL,           -- 'ringing', 'connected', 'ended', 'missed', 'declined'
+  room_id VARCHAR(100),
+  max_participants INTEGER DEFAULT 2,
+  started_at TIMESTAMPTZ,
+  ended_at TIMESTAMPTZ,
+  duration_seconds INTEGER,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Per-device participation in calls
+CREATE TABLE call_participants (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  call_id UUID REFERENCES calls(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id),
+  device_id UUID REFERENCES user_devices(id),
+  state VARCHAR(20) NOT NULL,           -- 'ringing', 'connected', 'left', 'declined'
+  is_initiator BOOLEAN DEFAULT FALSE,
+  joined_at TIMESTAMPTZ,
+  left_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Denormalized call history for fast user-facing queries
+CREATE TABLE call_history (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  call_id UUID REFERENCES calls(id),
+  user_id UUID REFERENCES users(id),
+  other_participants JSONB,
+  call_type VARCHAR(20),
+  duration_seconds INTEGER,
+  quality_rating INTEGER,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Performance indexes
+CREATE INDEX idx_user_devices_user_id ON user_devices(user_id);
+CREATE INDEX idx_user_devices_active ON user_devices(user_id, is_active);
+CREATE INDEX idx_calls_initiator ON calls(initiator_id);
+CREATE INDEX idx_calls_state ON calls(state);
+CREATE INDEX idx_call_participants_call ON call_participants(call_id);
+CREATE INDEX idx_call_participants_user ON call_participants(user_id);
+CREATE INDEX idx_call_history_user ON call_history(user_id, created_at DESC);
 ```
 
----
+## API Design
+
+### REST Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/users` | List all users (contact discovery) |
+| GET | `/api/users/:id` | Get user profile |
+| POST | `/api/users/:id/devices` | Register a device |
+| GET | `/api/calls/history/:userId` | Get call history for a user |
+| GET | `/api/calls/active` | List active calls (admin) |
+| GET | `/turn-credentials` | Get time-limited TURN credentials |
+| GET | `/health` | Health check with dependency status |
+| GET | `/metrics` | Prometheus metrics |
+| GET | `/stats` | Online users and connection count |
+
+### WebSocket Protocol
+
+Connection: `ws://host/ws`
+
+All messages are JSON with a `type` field. See the Signaling Service section for the full message protocol.
 
 ## Key Design Decisions
 
-### 1. SFU for Group Calls
+### P2P vs SFU vs MCU
 
-**Decision**: Use SFU instead of MCU or mesh
+| Architecture | Pros | Cons |
+|-------------|------|------|
+| **P2P (chosen for 1:1)** | Zero server media cost, lowest latency, true E2E encryption | Cannot scale past ~4 participants |
+| **SFU (for groups)** | O(N) server connections, preserves individual streams | Requires media server infrastructure |
+| MCU | Lowest client bandwidth (single mixed stream) | Highest server CPU, destroys E2E encryption, loses individual stream control |
 
-**Rationale**:
-- Lower server CPU (no transcoding)
-- Lower latency than MCU
-- Scales better than mesh
+We use P2P for 1:1 calls because it eliminates media server cost entirely and provides the lowest possible latency — the media path is direct between devices. For group calls (5+ participants), P2P mesh creates N*(N-1)/2 connections, which at 6 participants means 15 simultaneous upstream connections per device. Mobile bandwidth cannot sustain this. The SFU approach reduces this to 1 upload + (N-1) downloads per participant.
 
-### 2. Direct P2P When Possible
+The trade-off is infrastructure complexity: SFU requires dedicated media servers with high CPU and bandwidth, whereas P2P has zero ongoing server cost. For a product like FaceTime where the vast majority of calls are 1:1, optimizing the common case with P2P and reserving SFU for groups is the right balance.
 
-**Decision**: Prefer direct connection over relay
+### WebSocket vs HTTP Polling for Signaling
 
-**Rationale**:
-- Lower latency
-- No server bandwidth cost
-- Fall back to TURN when needed
+WebSocket is mandatory for WebRTC signaling. The ICE/DTLS handshake requires sub-second round-trip message exchanges across multiple steps: offer, answer, and typically 4-8 ICE candidates per side. HTTP polling at 1-second intervals would add 500ms average latency to each step of a multi-step negotiation that must complete in under 3 seconds for acceptable UX. The total setup time would balloon from ~2 seconds to ~8-10 seconds, causing users to hang up before the call connects.
 
-### 3. ECDH Key Exchange
+Additionally, incoming call notifications must arrive within 1 second of initiation. Polling creates an unacceptable 50-500ms variable delay where one device rings noticeably before another.
 
-**Decision**: Per-call key exchange with PFS
+### Redis for Call State vs Database
 
-**Rationale**:
-- Perfect forward secrecy
-- No key escrow
-- Per-call key isolation
+Active call state (who is in a call, which device, current ICE state) lives in Redis rather than PostgreSQL. Call setup involves 10-20 state reads/writes within 3 seconds — PostgreSQL's row-level locking and WAL overhead would add ~5ms per operation, totaling ~100ms of database latency in the critical path. Redis handles these as in-memory operations in ~0.1ms each.
 
----
+The trade-off is durability: if Redis crashes, all active calls lose state and cannot gracefully resume. We mitigate this with Redis AOF persistence and by designing the client to re-establish calls after brief disconnections. Completed call records are persisted to PostgreSQL for permanent history.
 
-## Trade-offs Summary
+### Coturn vs Commercial TURN
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Group topology | SFU | MCU/Mesh | Scalability, latency |
-| Encryption | E2E SRTP | Hop-by-hop | Privacy |
-| NAT traversal | ICE with TURN | UPnP only | Reliability |
-| Codec | VP8/H.264 | AV1 | Hardware support |
+Coturn is the dominant open-source TURN server. At production scale, TURN is the most expensive component because it relays actual media traffic — every relayed call consumes server bandwidth equal to the call's bitrate. Commercial alternatives (Twilio TURN, Xirsys) offer managed infrastructure but at $0.40-0.80/GB, which at millions of calls becomes prohibitive.
 
----
+We chose Coturn because it provides full RFC 5766 compliance, supports UDP/TCP/TLS transport, and can be horizontally scaled behind DNS-based load balancing. The trade-off is operational complexity: Coturn requires careful capacity planning, port allocation management, and geographic distribution.
 
 ## Consistency and Idempotency
 
-### Write Semantics by Operation
+### Idempotent Call Initiation
 
-| Operation | Consistency | Idempotency | Conflict Resolution |
-|-----------|-------------|-------------|---------------------|
-| Call initiation | Strong (PostgreSQL) | Idempotency key in request header | First-write-wins; reject duplicates |
-| Answer call | Strong | Device-scoped; one answer per call | First device to answer wins |
-| ICE candidates | Eventual | Dedupe by (callId, deviceId, candidateHash) | Accept all unique candidates |
-| Call state updates | Strong | State machine validation | Reject invalid transitions |
-| Device registration | Strong | Upsert by (userId, deviceId) | Last-write-wins for push tokens |
+Call initiation uses an `X-Idempotency-Key` header (client-generated UUID) stored in Redis with a 5-minute TTL. If the client retries due to network timeout, the server returns the existing call ID instead of creating a duplicate. This prevents the "phantom call" problem where a user sees multiple incoming call notifications from a single tap.
 
-### Idempotency Implementation
+Without idempotency, a mobile client on a flaky network might retry 3 times, creating 3 separate call records. The callee would see 3 incoming call overlays stacked on each other, and accepting one would leave 2 orphaned "ringing" calls that never resolve.
 
-**Call Initiation with Idempotency Key:**
-```javascript
-class SignalingService {
-  async initiateCall(callerId, calleeIds, callType, idempotencyKey) {
-    // Check for existing call with same idempotency key (Redis, 5-minute TTL)
-    const existingCallId = await redis.get(`idempotency:call:${idempotencyKey}`)
-    if (existingCallId) {
-      // Return existing call instead of creating duplicate
-      return { callId: existingCallId, deduplicated: true }
-    }
+### ICE Candidate Deduplication
 
-    const callId = uuid()
+ICE candidates are deduplicated using a SHA-256 hash of `callId:deviceId:candidateString`. The hash is stored in Redis with SETNX (set-if-not-exists) and a 1-hour TTL. Duplicate candidates from network retries are silently dropped.
 
-    // Store idempotency mapping before creating call
-    await redis.setex(`idempotency:call:${idempotencyKey}`, 300, callId)
+This matters because ICE gathering can produce identical candidates from multiple network interfaces, and client-side retries during the gathering phase can flood the signaling server with duplicates. Each duplicate would be forwarded to the peer, wasting bandwidth and confusing the ICE agent.
 
-    // Create call in PostgreSQL with transaction
-    await db.transaction(async (tx) => {
-      await tx.query(`
-        INSERT INTO calls (id, initiator_id, call_type, state)
-        VALUES ($1, $2, $3, 'ringing')
-      `, [callId, callerId, callType])
+### Call State Consistency
 
-      for (const calleeId of calleeIds) {
-        await tx.query(`
-          INSERT INTO call_participants (call_id, user_id, state)
-          VALUES ($1, $2, 'ringing')
-        `, [callId, calleeId])
-      }
-    })
+Call state transitions follow a strict state machine: `ringing → connected → ended`, `ringing → missed`, `ringing → declined`. Invalid transitions (e.g., `ended → connected`) are rejected. State transitions are atomic in Redis using Lua scripts to prevent race conditions where two devices try to accept the same call simultaneously.
 
-    return { callId, deduplicated: false }
-  }
-}
-```
+## Security / Auth
 
-**State Machine for Call Transitions:**
-```javascript
-const VALID_TRANSITIONS = {
-  'ringing':   ['connected', 'cancelled', 'declined', 'missed'],
-  'connected': ['ended'],
-  'cancelled': [],  // Terminal state
-  'declined':  [],  // Terminal state
-  'missed':    [],  // Terminal state
-  'ended':     []   // Terminal state
-}
+- **Session-based authentication** with Redis-backed sessions
+- **CORS** restricted to frontend origin
+- **Helmet** security headers (CSP disabled for WebSocket compatibility)
+- **TURN credential rotation**: Credentials valid for 5 minutes, generated per-call
+- **Audit logging**: TURN credential requests logged with IP, userId, timestamp
 
-async function updateCallState(callId, newState) {
-  const result = await db.query(`
-    UPDATE calls
-    SET state = $2, updated_at = NOW()
-    WHERE id = $1
-      AND state = ANY($3)
-    RETURNING state
-  `, [callId, newState, Object.keys(VALID_TRANSITIONS).filter(
-    s => VALID_TRANSITIONS[s].includes(newState)
-  )])
-
-  if (result.rowCount === 0) {
-    throw new Error(`Invalid state transition to ${newState}`)
-  }
-  return result.rows[0]
-}
-```
-
-### Replay Handling
-
-**ICE Candidate Deduplication:**
-```javascript
-async function handleICECandidate(callId, deviceId, candidate) {
-  // Generate deterministic hash for deduplication
-  const candidateHash = crypto
-    .createHash('sha256')
-    .update(`${callId}:${deviceId}:${candidate.candidate}`)
-    .digest('hex')
-    .slice(0, 16)
-
-  // SETNX returns 1 if key was set (new candidate), 0 if exists (duplicate)
-  const isNew = await redis.setnx(
-    `ice:${callId}:${candidateHash}`,
-    Date.now()
-  )
-
-  if (!isNew) {
-    console.log(`Duplicate ICE candidate ignored: ${candidateHash}`)
-    return { processed: false, reason: 'duplicate' }
-  }
-
-  // Set TTL for cleanup (candidates expire after call ends + buffer)
-  await redis.expire(`ice:${callId}:${candidateHash}`, 3600)
-
-  // Forward to peer
-  await forwardToPeer(callId, deviceId, candidate)
-  return { processed: true }
-}
-```
-
-### Conflict Resolution for Multi-Device Answer
-
-When multiple devices attempt to answer the same call simultaneously:
-
-```javascript
-async function answerCall(callId, deviceId, answer) {
-  // Atomic check-and-update using PostgreSQL advisory lock
-  const result = await db.query(`
-    WITH locked_call AS (
-      SELECT id, state FROM calls
-      WHERE id = $1
-      FOR UPDATE SKIP LOCKED
-    )
-    UPDATE calls
-    SET state = 'connected',
-        answered_by_device = $2,
-        connected_at = NOW()
-    FROM locked_call
-    WHERE calls.id = locked_call.id
-      AND locked_call.state = 'ringing'
-    RETURNING calls.*
-  `, [callId, deviceId])
-
-  if (result.rowCount === 0) {
-    // Either call doesn't exist, already answered, or locked by another device
-    const call = await db.query('SELECT state, answered_by_device FROM calls WHERE id = $1', [callId])
-    if (call.rows[0]?.state === 'connected') {
-      return { success: false, reason: 'already_answered', answeredBy: call.rows[0].answered_by_device }
-    }
-    throw new Error('Call not available')
-  }
-
-  // Stop ringing on all other devices
-  await notifyOtherDevices(callId, deviceId, { type: 'call_answered_elsewhere' })
-
-  return { success: true }
-}
-```
-
----
-
-## Caching and Edge Strategy
-
-### Cache Architecture
-
-For a local development setup, we use Redis/Valkey as the primary cache layer. In production, this would be fronted by a CDN for static assets and edge caching for signaling.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Apps                              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              CDN (Static Assets + ICE Server Config)            │
-│   - STUN/TURN server lists (TTL: 1 hour)                       │
-│   - Client app bundles (TTL: immutable, versioned)              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Redis/Valkey Cache Layer                      │
-│   - User presence (TTL: 60s, refresh on heartbeat)             │
-│   - Active call state (TTL: 30 min, refresh on activity)       │
-│   - Device registry (TTL: 24h, invalidate on logout)            │
-│   - TURN credentials (TTL: 5 min, short-lived)                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     PostgreSQL (Source of Truth)                │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Caching Strategy by Data Type
-
-| Data | Strategy | TTL | Invalidation |
-|------|----------|-----|--------------|
-| User profile | Cache-aside | 1 hour | On profile update (pub/sub) |
-| User presence | Write-through | 60 seconds | Heartbeat refresh |
-| Active call state | Write-through | 30 minutes | On state change |
-| Device registry | Cache-aside | 24 hours | On device logout/register |
-| TURN credentials | Read-through | 5 minutes | None (credentials expire) |
-| Contact list | Cache-aside | 10 minutes | On contact change |
-
-### Cache Implementation
-
-**Cache-Aside Pattern (User Profile):**
-```javascript
-class UserCache {
-  constructor(redis, db) {
-    this.redis = redis
-    this.db = db
-    this.TTL = 3600 // 1 hour
-  }
-
-  async getUser(userId) {
-    const cacheKey = `user:${userId}`
-
-    // Try cache first
-    const cached = await this.redis.get(cacheKey)
-    if (cached) {
-      return JSON.parse(cached)
-    }
-
-    // Cache miss: fetch from DB
-    const result = await this.db.query(
-      'SELECT id, name, avatar_url, created_at FROM users WHERE id = $1',
-      [userId]
-    )
-
-    if (result.rows.length === 0) {
-      return null
-    }
-
-    const user = result.rows[0]
-
-    // Store in cache
-    await this.redis.setex(cacheKey, this.TTL, JSON.stringify(user))
-
-    return user
-  }
-
-  async invalidateUser(userId) {
-    await this.redis.del(`user:${userId}`)
-    // Publish invalidation for other instances
-    await this.redis.publish('cache:invalidate', JSON.stringify({
-      type: 'user',
-      id: userId
-    }))
-  }
-}
-```
-
-**Write-Through Pattern (Presence):**
-```javascript
-class PresenceManager {
-  constructor(redis) {
-    this.redis = redis
-    this.TTL = 60 // 60 seconds
-  }
-
-  async setOnline(userId, deviceId) {
-    const key = `presence:${userId}`
-    const deviceKey = `presence:${userId}:devices`
-
-    // Write to cache immediately (no DB for presence - ephemeral data)
-    await this.redis
-      .multi()
-      .hset(key, 'status', 'online', 'lastSeen', Date.now())
-      .expire(key, this.TTL)
-      .sadd(deviceKey, deviceId)
-      .expire(deviceKey, this.TTL)
-      .exec()
-
-    return { status: 'online' }
-  }
-
-  async heartbeat(userId, deviceId) {
-    const key = `presence:${userId}`
-    const deviceKey = `presence:${userId}:devices`
-
-    // Refresh TTL on heartbeat
-    await this.redis
-      .multi()
-      .hset(key, 'lastSeen', Date.now())
-      .expire(key, this.TTL)
-      .expire(deviceKey, this.TTL)
-      .exec()
-  }
-
-  async getOnlineContacts(userId) {
-    const contacts = await this.db.query(
-      'SELECT contact_id FROM contacts WHERE user_id = $1',
-      [userId]
-    )
-
-    const pipeline = this.redis.pipeline()
-    for (const { contact_id } of contacts.rows) {
-      pipeline.hgetall(`presence:${contact_id}`)
-    }
-
-    const results = await pipeline.exec()
-    return contacts.rows.map((c, i) => ({
-      userId: c.contact_id,
-      ...results[i][1]
-    })).filter(c => c.status === 'online')
-  }
-}
-```
-
-**TURN Credential Caching:**
-```javascript
-class TURNCredentialService {
-  constructor(redis, turnSecret) {
-    this.redis = redis
-    this.turnSecret = turnSecret
-    this.TTL = 300 // 5 minutes - credentials are short-lived for security
-  }
-
-  async getCredentials(userId) {
-    const cacheKey = `turn:${userId}`
-
-    // Check cache
-    const cached = await this.redis.get(cacheKey)
-    if (cached) {
-      return JSON.parse(cached)
-    }
-
-    // Generate time-limited TURN credentials (RFC 5389)
-    const timestamp = Math.floor(Date.now() / 1000) + this.TTL
-    const username = `${timestamp}:${userId}`
-    const credential = crypto
-      .createHmac('sha1', this.turnSecret)
-      .update(username)
-      .digest('base64')
-
-    const credentials = {
-      username,
-      credential,
-      urls: [
-        'turn:localhost:3478?transport=udp',
-        'turn:localhost:3478?transport=tcp'
-      ],
-      ttl: this.TTL
-    }
-
-    // Cache with same TTL as credential validity
-    await this.redis.setex(cacheKey, this.TTL - 30, JSON.stringify(credentials))
-
-    return credentials
-  }
-}
-```
-
-### Cache Invalidation Rules
-
-**Event-Driven Invalidation via Redis Pub/Sub:**
-```javascript
-class CacheInvalidator {
-  constructor(redis, caches) {
-    this.redis = redis
-    this.caches = caches
-
-    // Subscribe to invalidation channel
-    this.subscriber = redis.duplicate()
-    this.subscriber.subscribe('cache:invalidate')
-    this.subscriber.on('message', (channel, message) => {
-      this.handleInvalidation(JSON.parse(message))
-    })
-  }
-
-  async handleInvalidation({ type, id, action }) {
-    switch (type) {
-      case 'user':
-        await this.caches.user.invalidate(id)
-        break
-      case 'call':
-        await this.redis.del(`call:${id}`)
-        break
-      case 'device':
-        await this.redis.del(`devices:${id}`)
-        break
-    }
-  }
-
-  // Triggered by application code after DB writes
-  async publishInvalidation(type, id) {
-    await this.redis.publish('cache:invalidate', JSON.stringify({ type, id }))
-  }
-}
-```
-
-### Local Development Configuration
-
-**docker-compose.yml additions for caching:**
-```yaml
-services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-```
-
-**Environment variables:**
-```bash
-REDIS_URL=redis://localhost:6379
-CACHE_USER_TTL=3600
-CACHE_PRESENCE_TTL=60
-CACHE_TURN_CREDENTIAL_TTL=300
-```
-
----
+In production:
+- **E2E encryption**: SRTP with per-call keys derived from identity keys via X3DH
+- **Identity verification**: Short authentication string (SAS) for contact verification
+- **Certificate pinning**: Prevent MITM on signaling channel
+- **Push notification encryption**: Encrypted APNs payloads for incoming call alerts
 
 ## Observability
 
-### Metrics, Logs, and Traces Stack
+### Metrics (Prometheus via prom-client)
 
-For local development, we use a lightweight observability stack:
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `facetime_calls_initiated_total` | Counter | Call volume by type (video/audio/group) |
+| `facetime_calls_answered_total` | Counter | Answer rate, combined with initiated for success rate |
+| `facetime_calls_ended_total` | Counter | End reasons (normal, timeout, error) |
+| `facetime_call_duration_seconds` | Histogram | Call duration distribution (30s-3600s buckets) |
+| `facetime_call_setup_latency_seconds` | Histogram | Time from initiation to connection (SLI) |
+| `facetime_active_calls` | Gauge | Current active call count |
+| `facetime_active_websocket_connections` | Gauge | Live WebSocket connections |
+| `facetime_websocket_connections_total` | Counter | Total connections established |
+| `facetime_websocket_errors_total` | Counter | Connection errors by type |
+| `facetime_ice_connection_type_total` | Counter | ICE types (host/srflx/relay) for NAT analysis |
+| `facetime_ice_candidate_latency_seconds` | Histogram | ICE gathering time |
+| `facetime_signaling_latency_seconds` | Histogram | Per-message processing latency |
+| `facetime_idempotency_hits_total` | Counter | Duplicate call initiations prevented |
+| `facetime_circuit_breaker_state` | Gauge | Circuit breaker state (0=closed, 1=open, 2=half-open) |
+| `facetime_cache_hits_total` | Counter | Cache hit rate by type (profile, presence, call_state) |
+| `facetime_cache_misses_total` | Counter | Cache miss rate by type |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Application Services                        │
-│     (Signaling Server, TURN Server, API Server)                │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-   Prometheus            Structured JSON         OpenTelemetry
-    Metrics                  Logs                  Traces
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│   Prometheus  │    │    stdout     │    │    Jaeger     │
-│   :9090       │    │  (piped to    │    │   :16686      │
-│               │    │   file/loki)  │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        └─────────────────────┼─────────────────────┘
-                              ▼
-                      ┌───────────────┐
-                      │    Grafana    │
-                      │    :3000      │
-                      └───────────────┘
-```
+### Structured Logging (Pino)
 
-### Key Metrics (Prometheus)
+- JSON-formatted logs with service metadata (`facetime-signaling`, version, PID)
+- Request-level correlation via `requestId` (UUID, propagated from `X-Request-Id` header)
+- Dedicated WebSocket logger with `clientId`, `userId`, `deviceId` context
+- Call event logger with `callId` and event type for tracing full call lifecycle
+- Audit logger (separate Pino instance) for security-sensitive operations (TURN credentials, auth)
+- Signaling event logger for WebRTC debugging (`offer`, `answer`, `ice-candidate`)
 
-**Signaling Service Metrics:**
-```javascript
-const promClient = require('prom-client')
+### Health Checks
 
-// Call metrics
-const callsInitiated = new promClient.Counter({
-  name: 'facetime_calls_initiated_total',
-  help: 'Total number of calls initiated',
-  labelNames: ['call_type'] // 'video', 'audio', 'group'
-})
+- `GET /health` — Full health with database/Redis latency, circuit breaker states, memory usage
+- `GET /health/live` — Liveness probe (process running)
+- `GET /health/ready` — Readiness probe (database + Redis connectivity)
 
-const callsAnswered = new promClient.Counter({
-  name: 'facetime_calls_answered_total',
-  help: 'Total number of calls answered',
-  labelNames: ['call_type']
-})
+## Failure Handling
 
-const callDuration = new promClient.Histogram({
-  name: 'facetime_call_duration_seconds',
-  help: 'Duration of completed calls in seconds',
-  labelNames: ['call_type'],
-  buckets: [30, 60, 120, 300, 600, 1800, 3600] // 30s to 1h
-})
+### Circuit Breaker (Opossum)
 
-const callSetupLatency = new promClient.Histogram({
-  name: 'facetime_call_setup_latency_seconds',
-  help: 'Time from initiation to connection',
-  labelNames: ['call_type'],
-  buckets: [0.5, 1, 2, 5, 10, 30] // 500ms to 30s
-})
+Wraps database and Redis operations with configurable thresholds:
+- **Error threshold**: 50% failure rate triggers open circuit
+- **Timeout**: 3 seconds per operation
+- **Reset timeout**: 10 seconds before half-open probe
+- **Volume threshold**: Minimum 5 requests before circuit can trip
 
-// Connection metrics
-const activeConnections = new promClient.Gauge({
-  name: 'facetime_active_websocket_connections',
-  help: 'Current number of active WebSocket connections'
-})
+Circuit breaker state changes emit Prometheus metrics and structured log entries for alerting.
 
-const activeCalls = new promClient.Gauge({
-  name: 'facetime_active_calls',
-  help: 'Current number of active calls',
-  labelNames: ['call_type']
-})
+### WebSocket Reconnection
 
-// ICE/TURN metrics
-const iceConnectionType = new promClient.Counter({
-  name: 'facetime_ice_connection_type_total',
-  help: 'ICE connection types used',
-  labelNames: ['type'] // 'host', 'srflx', 'relay'
-})
+Client implements exponential backoff:
+- Attempts: 5
+- Delays: 1s, 2s, 4s, 8s, 16s
+- On reconnect: re-register device, rejoin active call if one exists
 
-const turnBandwidth = new promClient.Counter({
-  name: 'facetime_turn_bytes_total',
-  help: 'Total bytes relayed through TURN',
-  labelNames: ['direction'] // 'in', 'out'
-})
+### Graceful Shutdown
 
-// Error metrics
-const signalingErrors = new promClient.Counter({
-  name: 'facetime_signaling_errors_total',
-  help: 'Signaling errors by type',
-  labelNames: ['error_type'] // 'timeout', 'invalid_state', 'connection_failed'
-})
-```
+Server handles SIGTERM/SIGINT:
+1. Stop accepting new connections
+2. Close all WebSocket connections with code 1001 ("going away")
+3. Wait 5 seconds for in-flight requests
+4. Close database pool and Redis connections
+5. Exit process
 
-**Metrics Endpoint:**
-```javascript
-app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', promClient.register.contentType)
-  res.send(await promClient.register.metrics())
-})
-```
+### Call Recovery
 
-### SLI Dashboard Metrics
+If a signaling connection drops during an active call:
+- P2P media continues flowing (independent of signaling)
+- Client has 30 seconds to reconnect signaling
+- If reconnected, call state is restored from Redis
+- If not reconnected within 30 seconds, the call is marked as ended
 
-| SLI | Metric | Target | Alert Threshold |
-|-----|--------|--------|-----------------|
-| Call Success Rate | `calls_answered / calls_initiated` | > 95% | < 90% |
-| Call Setup Latency (p95) | `call_setup_latency_seconds` | < 3s | > 5s |
-| Connection Failure Rate | `ice_connection_failed / ice_attempts` | < 5% | > 10% |
-| WebSocket Availability | `ws_connection_errors / ws_connections` | < 1% | > 5% |
-| TURN Relay Fallback Rate | `ice_type_relay / ice_total` | < 20% | > 40% |
+## Scalability Considerations
 
-### Structured Logging
+### Signaling Server Scaling
 
-**Log Format (JSON Lines):**
-```javascript
-const pino = require('pino')
+Signaling servers are stateless — all state lives in Redis. Scale horizontally behind an L7 load balancer with WebSocket-aware sticky sessions (based on connection, not cookie). At 100M signaling messages/minute, with each server handling ~50K concurrent WebSocket connections, approximately 100 signaling servers are needed.
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  },
-  base: {
-    service: 'facetime-signaling',
-    version: process.env.APP_VERSION || 'dev'
-  }
-})
+### TURN Server Scaling
 
-// Request logging middleware
-app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || uuid()
-  req.log = logger.child({
-    requestId,
-    method: req.method,
-    path: req.path
-  })
+TURN is the hardest to scale because it handles actual media traffic:
+- **Geographic distribution**: TURN servers in every major region (reduces relay latency)
+- **DNS-based routing**: GeoDNS routes clients to nearest TURN cluster
+- **Capacity planning**: Each TURN server handles ~5,000 concurrent relayed calls at ~4 Mbps each = 20 Gbps per server
+- **Graceful drain**: New calls routed away before server maintenance
 
-  const start = Date.now()
-  res.on('finish', () => {
-    req.log.info({
-      statusCode: res.statusCode,
-      durationMs: Date.now() - start
-    }, 'request completed')
-  })
+### Database Scaling
 
-  next()
-})
+- **Read replicas**: Call history queries (user's recent calls) served from replicas
+- **Write primary**: Call creation and state updates on primary
+- **Sharding**: At extreme scale, shard by `user_id` hash to keep each user's history on one shard
+- **Archive**: Calls older than 90 days moved to cold storage
 
-// Call-specific logging
-function logCallEvent(callId, event, details = {}) {
-  logger.info({
-    callId,
-    event,
-    ...details
-  }, `call:${event}`)
-}
+### Redis Scaling
 
-// Example usage:
-logCallEvent(callId, 'initiated', {
-  initiator: callerId,
-  participants: calleeIds.length,
-  callType: 'video'
-})
+- **Redis Cluster**: Shard by call ID for call state, by user ID for presence
+- **Separate clusters**: Presence cluster (high write, short TTL) separate from call state cluster (moderate write, longer TTL)
+- **Sentinel**: Automatic failover with <30 second detection
 
-logCallEvent(callId, 'answered', {
-  answeredBy: deviceId,
-  ringDurationMs: Date.now() - call.createdAt
-})
+## Trade-offs Summary
 
-logCallEvent(callId, 'ice_connected', {
-  connectionType: 'srflx',
-  candidatePairs: 3,
-  setupDurationMs: 1234
-})
-```
-
-### Distributed Tracing (OpenTelemetry)
-
-```javascript
-const { NodeTracerProvider } = require('@opentelemetry/sdk-trace-node')
-const { JaegerExporter } = require('@opentelemetry/exporter-jaeger')
-const { registerInstrumentations } = require('@opentelemetry/instrumentation')
-const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http')
-const { ExpressInstrumentation } = require('@opentelemetry/instrumentation-express')
-const { PgInstrumentation } = require('@opentelemetry/instrumentation-pg')
-const { RedisInstrumentation } = require('@opentelemetry/instrumentation-redis')
-
-const provider = new NodeTracerProvider()
-provider.addSpanProcessor(new BatchSpanProcessor(new JaegerExporter({
-  endpoint: 'http://localhost:14268/api/traces'
-})))
-provider.register()
-
-registerInstrumentations({
-  instrumentations: [
-    new HttpInstrumentation(),
-    new ExpressInstrumentation(),
-    new PgInstrumentation(),
-    new RedisInstrumentation()
-  ]
-})
-
-// Custom spans for call flow
-const tracer = provider.getTracer('facetime-signaling')
-
-async function initiateCall(callerId, calleeIds, callType) {
-  return tracer.startActiveSpan('call.initiate', async (span) => {
-    span.setAttribute('call.type', callType)
-    span.setAttribute('call.participant_count', calleeIds.length + 1)
-
-    try {
-      const callId = uuid()
-      span.setAttribute('call.id', callId)
-
-      await tracer.startActiveSpan('call.persist', async (dbSpan) => {
-        await db.query('INSERT INTO calls ...')
-        dbSpan.end()
-      })
-
-      await tracer.startActiveSpan('call.notify_devices', async (notifySpan) => {
-        for (const calleeId of calleeIds) {
-          notifySpan.addEvent('notifying_user', { userId: calleeId })
-          await sendPushNotification(calleeId)
-        }
-        notifySpan.end()
-      })
-
-      span.setStatus({ code: SpanStatusCode.OK })
-      return { callId }
-    } catch (error) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
-      span.recordException(error)
-      throw error
-    } finally {
-      span.end()
-    }
-  })
-}
-```
-
-### Audit Logging
-
-For security-sensitive operations (useful for debugging and compliance):
-
-```javascript
-const auditLogger = pino({
-  level: 'info',
-  base: { type: 'audit' }
-})
-
-// Audit log schema
-interface AuditEvent {
-  timestamp: string
-  action: string
-  actor: {
-    userId: string
-    deviceId: string
-    ip: string
-  }
-  resource: {
-    type: string
-    id: string
-  }
-  outcome: 'success' | 'failure'
-  details?: Record<string, any>
-}
-
-function logAudit(event: AuditEvent) {
-  auditLogger.info(event, `audit:${event.action}`)
-}
-
-// Example audit events
-logAudit({
-  timestamp: new Date().toISOString(),
-  action: 'call.initiated',
-  actor: { userId: callerId, deviceId, ip: req.ip },
-  resource: { type: 'call', id: callId },
-  outcome: 'success',
-  details: { callType: 'video', participants: calleeIds }
-})
-
-logAudit({
-  timestamp: new Date().toISOString(),
-  action: 'device.registered',
-  actor: { userId, deviceId: newDeviceId, ip: req.ip },
-  resource: { type: 'device', id: newDeviceId },
-  outcome: 'success',
-  details: { deviceType: 'iphone', pushToken: '***' }
-})
-
-logAudit({
-  timestamp: new Date().toISOString(),
-  action: 'call.answer_rejected',
-  actor: { userId, deviceId, ip: req.ip },
-  resource: { type: 'call', id: callId },
-  outcome: 'failure',
-  details: { reason: 'already_answered', answeredBy: otherDeviceId }
-})
-```
-
-### Alert Thresholds
-
-**Prometheus Alerting Rules (prometheus/alerts.yml):**
-```yaml
-groups:
-  - name: facetime-alerts
-    rules:
-      # Call success rate too low
-      - alert: LowCallSuccessRate
-        expr: |
-          (sum(rate(facetime_calls_answered_total[5m])) /
-           sum(rate(facetime_calls_initiated_total[5m]))) < 0.90
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Call success rate below 90%"
-          description: "Only {{ $value | humanizePercentage }} of calls are being answered"
-
-      # Call setup latency too high
-      - alert: HighCallSetupLatency
-        expr: |
-          histogram_quantile(0.95, rate(facetime_call_setup_latency_seconds_bucket[5m])) > 5
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Call setup latency p95 exceeds 5 seconds"
-          description: "p95 call setup latency is {{ $value | humanizeDuration }}"
-
-      # Too many TURN relay connections
-      - alert: HighTURNRelayRate
-        expr: |
-          (sum(rate(facetime_ice_connection_type_total{type="relay"}[10m])) /
-           sum(rate(facetime_ice_connection_type_total[10m]))) > 0.40
-        for: 10m
-        labels:
-          severity: info
-        annotations:
-          summary: "TURN relay rate exceeds 40%"
-          description: "{{ $value | humanizePercentage }} of connections using TURN relay"
-
-      # WebSocket connection errors
-      - alert: HighWebSocketErrorRate
-        expr: |
-          rate(facetime_signaling_errors_total{error_type="connection_failed"}[5m]) > 1
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High WebSocket connection failure rate"
-          description: "{{ $value }} connection failures per second"
-
-      # No active calls (potential outage)
-      - alert: NoActiveCalls
-        expr: sum(facetime_active_calls) == 0
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: "No active calls for 15 minutes"
-          description: "This may indicate a signaling or connectivity issue"
-```
-
-### Local Development Observability Setup
-
-**docker-compose.yml additions:**
-```yaml
-services:
-  prometheus:
-    image: prom/prometheus:v2.47.0
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-
-  grafana:
-    image: grafana/grafana:10.1.0
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
-      - ./grafana/provisioning:/etc/grafana/provisioning
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.50
-    ports:
-      - "16686:16686"  # UI
-      - "14268:14268"  # Collector HTTP
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
-```
-
-**prometheus/prometheus.yml:**
-```yaml
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'signaling-server'
-    static_configs:
-      - targets: ['host.docker.internal:4000']
-
-  - job_name: 'turn-server'
-    static_configs:
-      - targets: ['coturn:9641']
-
-rule_files:
-  - /etc/prometheus/alerts.yml
-```
-
----
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| 1:1 media | P2P (WebRTC) | SFU relay | Zero server cost, lowest latency, true E2E |
+| Group media | SFU | MCU / P2P mesh | O(N) connections, preserves stream control |
+| Signaling | WebSocket | HTTP polling / SSE | Sub-second bidirectional, mandatory for ICE |
+| Call state | Redis | PostgreSQL | Sub-ms latency in call setup critical path |
+| Presence | Redis hash per user | PostgreSQL polling | Real-time device tracking with TTL expiry |
+| TURN | Coturn (self-hosted) | Twilio / Xirsys | Cost control at scale, full RFC compliance |
+| Idempotency | Redis with TTL | Database unique constraint | Catches duplicates before DB, 5-min window |
+| NAT traversal | ICE (STUN+TURN) | Always relay | 85% P2P success rate saves TURN bandwidth |
 
 ## Implementation Notes
 
-This section documents the key implementation decisions and their rationale based on the Codex review feedback.
-
-### Why Idempotency Prevents Duplicate Call Initiations
-
-**Problem:** Network retries, mobile app reconnects, and race conditions can cause the same call initiation request to arrive at the server multiple times. Without idempotency, each request creates a new call, resulting in:
-- Multiple ringing notifications to the callee
-- Confusing UI state with multiple incoming call dialogs
-- Wasted database and Redis resources
-- Poor user experience
-
-**Solution:** The signaling server implements idempotency using Redis with a 5-minute TTL:
-
-```typescript
-// Client sends: X-Idempotency-Key header (UUID generated once per call attempt)
-// Server flow:
-1. Check Redis: idempotency:call:{key} -> existingCallId?
-2. If exists: Return existing call (deduplicated: true)
-3. If not: Store key -> callId BEFORE creating call
-4. Create call in database
-5. Return new call
-
-// Key insight: Store idempotency mapping BEFORE the write
-// This ensures crash-safety: if we crash after Redis write but before
-// DB write, retry will find the key but no call exists (acceptable)
-// versus crash after DB write: retry creates duplicate (bad)
-```
-
-**Implementation files:**
-- `/backend/src/shared/idempotency.ts` - Idempotency key checking and storage
-- `/backend/src/services/signaling.ts` - Integration in `handleCallInitiate()`
-
-### Why Presence Caching Enables Fast Call Routing
-
-**Problem:** When initiating a call, the server must determine which devices are online to receive the ring notification. Querying PostgreSQL for every call initiation adds:
-- 5-20ms latency per device lookup
-- Database load during peak calling hours
-- Potential timeout if database is slow
-
-**Solution:** Write-through caching in Redis for user presence with 60-second TTL:
+### Local Architecture
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │────>│   Redis     │────>│ PostgreSQL  │
-│  Heartbeat  │     │  (60s TTL)  │     │  (eventual) │
-└─────────────┘     └─────────────┘     └─────────────┘
-                          │
-                          │ < 1ms lookup
-                          ▼
-                    ┌─────────────┐
-                    │ Call Router │
-                    └─────────────┘
+┌───────────────┐     ┌───────────────────────────────────────┐
+│   Browser     │     │        Docker Compose                 │
+│   (React)     │     │                                       │
+│               │     │  ┌────────────┐  ┌────────────┐      │
+│  :5173        │────▶│  │ PostgreSQL │  │   Valkey   │      │
+│  Vite Dev     │     │  │   :5432    │  │   :6379    │      │
+└───────┬───────┘     │  └────────────┘  └────────────┘      │
+        │             │                                       │
+        │             │  ┌────────────┐                       │
+        │ WS + HTTP   │  │  Coturn    │                       │
+        ▼             │  │ :3478 UDP  │                       │
+┌───────────────┐     │  │ :3478 TCP  │                       │
+│  Express +    │     │  │ :5349 TLS  │                       │
+│  WebSocket    │────▶│  │ :49152-    │                       │
+│  :3000        │     │  │  49200 UDP │                       │
+│  (signaling)  │     │  └────────────┘                       │
+└───────────────┘     └───────────────────────────────────────┘
 ```
 
-**Key design decisions:**
-- **Write-through:** Presence updates go to Redis immediately (not cache-aside)
-- **60-second TTL:** Matches heartbeat interval; stale presence auto-expires
-- **Heartbeat refresh:** Each ping extends TTL without updating lastSeen timestamp
-- **No database for presence:** Presence is ephemeral; PostgreSQL only stores device metadata
+### Production-Grade Patterns Implemented
 
-**Implementation files:**
-- `/backend/src/shared/cache.ts` - `updatePresence()`, `getUserDevicePresence()`, `refreshPresenceTTL()`
-- `/backend/src/services/signaling.ts` - Integration in `handleRegister()` and heartbeat handler
+**Structured logging** (`backend/src/shared/logger.ts`): Pino with JSON output, request correlation via UUID, dedicated child loggers for WebSocket connections (with `clientId`/`userId`/`deviceId` context), call events, and security audit events. Separate audit logger instance for compliance-sensitive operations. This pattern is critical at production scale where text logs are unsearchable across thousands of server instances.
 
-### Why Call Quality Metrics Enable Codec Optimization
+**Prometheus metrics** (`backend/src/shared/metrics.ts`): 16 custom metrics covering call lifecycle (initiated/answered/ended counters, duration histogram, setup latency histogram), connection health (active WebSocket gauge, error counter), ICE/TURN analysis (connection type counter, candidate latency histogram), idempotency tracking, circuit breaker state, and cache hit/miss rates. Default Node.js metrics (CPU, memory, event loop) collected automatically with `facetime_` prefix.
 
-**Problem:** WebRTC can use multiple codecs (VP8, H.264, AV1) with different trade-offs:
-- VP8: Universal support, moderate quality
-- H.264: Hardware acceleration, good quality
-- AV1: Best compression, limited hardware support
+**Circuit breaker** (`backend/src/shared/circuit-breaker.ts`): Opossum-based with configurable thresholds (50% error rate, 3s timeout, 10s reset). Factory pattern (`createCircuitBreaker`) with singleton registry. State changes emit Prometheus metrics and structured logs. Includes a convenience wrapper `withCircuitBreaker` that handles breaker creation, fallback registration, and execution in one call.
 
-Without metrics, we cannot know:
-- Which codec performs best for our user base
-- What network conditions users experience
-- When to recommend simulcast vs single stream
+**Idempotency** (`backend/src/shared/idempotency.ts`): Redis-backed idempotency keys for call initiation with 5-minute TTL. Prevents duplicate calls from network retries. Also includes ICE candidate deduplication via SHA-256 hashing with SETNX. Metrics track hit/miss rates for monitoring duplicate request frequency.
 
-**Solution:** Prometheus metrics for call quality indicators:
+**Caching** (`backend/src/shared/cache.ts`): Three caching strategies — cache-aside for user profiles (1h TTL), write-through for device presence (60s TTL with heartbeat refresh), and direct cache for call state (2h TTL). Presence uses Redis hash maps (`HSET`/`HGETALL`) for per-user device tracking with pipeline support for batch queries. All cache operations emit hit/miss metrics.
 
-| Metric | Purpose | Optimization Action |
-|--------|---------|---------------------|
-| `call_setup_latency_seconds` | Time to connect | Optimize ICE candidate gathering |
-| `call_duration_seconds` | Engagement indicator | Identify quality issues causing early drops |
-| `ice_connection_type_total` | NAT traversal success | Tune STUN/TURN server selection |
-| `signaling_latency_seconds` | Server processing time | Identify bottlenecks |
+**WebSocket signaling** (`backend/src/services/signaling/`): Full signaling protocol across 6 handler modules — registration, call initiation, call response, signaling relay (offer/answer/ICE), connection management, and room management. Device registration, multi-device ring, and call state machine are implemented.
 
-**Example optimization loop:**
-```
-1. Observe: p95 call_setup_latency > 5s
-2. Investigate: High ice_connection_type{type="relay"} rate
-3. Hypothesis: Too many users hitting TURN fallback
-4. Action: Add STUN servers in user's region
-5. Verify: call_setup_latency decreases
-```
+**Health checks** (`backend/src/index.ts`): Three-tier health system — `/health` (full dependency check with latency), `/health/live` (liveness probe), `/health/ready` (readiness probe). Reports database/Redis connectivity, circuit breaker states, and process memory.
 
-**Implementation files:**
-- `/backend/src/shared/metrics.ts` - Prometheus metric definitions
-- `/backend/src/services/signaling.ts` - Metric instrumentation points
-- `/backend/src/index.ts` - `/metrics` endpoint for Prometheus scraping
+**Graceful shutdown** (`backend/src/index.ts`): SIGTERM/SIGINT handlers that close WebSocket connections with code 1001, drain HTTP server, and allow 5 seconds for in-flight operations before process exit.
 
-### Why Circuit Breakers Protect Signaling Infrastructure
+### What Was Simplified or Substituted
 
-**Problem:** The signaling server depends on PostgreSQL and Redis. If either becomes slow or unavailable:
-- WebSocket handlers block waiting for timeout
-- Thread pool exhaustion occurs
-- All users experience failures (cascade failure)
-- Recovery is slow even after dependency recovers
+| Production Component | Local Substitute | Impact |
+|---------------------|-----------------|--------|
+| Apple Push Notification Service | WebSocket-only ring | Offline devices do not ring |
+| STUN cluster (geo-distributed) | Google public STUN + local Coturn | Works for LAN/localhost only |
+| Redis Cluster (sharded) | Single Valkey instance | No failover, no sharding |
+| E2E encryption (SRTP + key exchange) | Unencrypted WebRTC media | Media not encrypted in transit |
+| OAuth / Apple ID | Simple user selection (no passwords) | No real authentication |
+| SFU for group calls | P2P only | Group calls limited to ~4 participants |
+| CDN for static assets | Vite dev server | No caching, no edge distribution |
+| L7 load balancer | Direct connection to single server | No horizontal scaling |
 
-**Solution:** Circuit breaker pattern using opossum library:
+### What Was Omitted
 
-```
-Normal Operation (Circuit CLOSED):
-  Request ──> Database ──> Response
-                 │
-                 └── Track success/failure rate
-
-Error Threshold Exceeded (Circuit OPEN):
-  Request ──> FAIL FAST ──> Fallback Response
-                 │
-                 └── No database call (prevents cascade)
-
-Recovery Attempt (Circuit HALF-OPEN):
-  Request ──> Database ──> If success, close circuit
-                 │
-                 └── Limited requests to test recovery
-```
-
-**Configuration for signaling:**
-```typescript
-{
-  timeout: 3000,              // 3s max per operation
-  errorThresholdPercentage: 50,  // Open at 50% error rate
-  resetTimeout: 10000,        // Try recovery after 10s
-  volumeThreshold: 5          // Need 5 requests before tripping
-}
-```
-
-**Protected operations:**
-- `db-user-lookup`: User verification during registration
-- `db-call-create`: Call record creation
-- `db-participant-add`: Adding participants to calls
-- `db-device-upsert`: Device registration updates
-- `db-device-offline`: Device offline status updates
-
-**Fallback behavior:**
-- User lookup: Return cached profile if available, else error
-- Device updates: Fire-and-forget (log error, continue)
-- Call creation: Error to client (no fallback for writes)
-
-**Implementation files:**
-- `/backend/src/shared/circuit-breaker.ts` - Circuit breaker factory and helpers
-- `/backend/src/services/signaling.ts` - `withCircuitBreaker()` usage
-- `/backend/src/index.ts` - Circuit breaker state in `/health` endpoint
-
-### Shared Module Architecture
-
-The implementation adds these shared modules under `/backend/src/shared/`:
-
-```
-shared/
-├── logger.ts         # Pino structured logging with request context
-├── metrics.ts        # Prometheus metrics for observability
-├── cache.ts          # Redis caching with TTL management
-├── circuit-breaker.ts # Opossum circuit breaker wrapper
-└── idempotency.ts    # Idempotency key handling for call initiation
-```
-
-**Design principles:**
-1. **Separation of concerns:** Each module handles one aspect
-2. **Consistent interfaces:** All modules export typed functions
-3. **Fail-open where safe:** Caching failures don't block operations
-4. **Metrics everywhere:** Each module tracks its own metrics
-
-### New API Endpoints
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /metrics` | Prometheus metrics for scraping |
-| `GET /health` | Detailed health check with dependency status |
-| `GET /health/live` | Simple liveness probe for orchestrators |
-| `GET /health/ready` | Readiness probe checking dependencies |
-
-### Environment Variables
-
-```bash
-# Logging
-LOG_LEVEL=info              # pino log level (trace, debug, info, warn, error)
-APP_VERSION=dev             # Version tag for logs
-
-# Cache TTLs (seconds)
-CACHE_USER_TTL=3600         # User profile cache (1 hour)
-CACHE_PRESENCE_TTL=60       # Presence cache (60 seconds)
-CACHE_TURN_CREDENTIAL_TTL=300  # TURN credentials (5 minutes)
-CACHE_IDEMPOTENCY_TTL=300   # Idempotency keys (5 minutes)
-```
+- **SFU implementation** — Group calls beyond 4 participants
+- **E2E encryption** — SRTP key exchange, identity verification, SAS
+- **Adaptive bitrate** — Network quality detection and codec adjustment
+- **Simulcast / SVC** — Multiple quality layers for receivers
+- **SharePlay** — Shared media experiences during calls
+- **Device handoff** — Transferring active call between devices
+- **Push notifications** — APNs for ringing offline devices
+- **Multi-region deployment** — Geographic distribution of signaling and TURN
+- **Kubernetes orchestration** — Container management and auto-scaling
+- **Call recording** — Server-side recording and storage
+- **Audio processing** — Echo cancellation, noise suppression, automatic gain control

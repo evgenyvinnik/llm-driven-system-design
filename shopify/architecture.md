@@ -16,50 +16,83 @@ Shopify is a multi-tenant e-commerce platform where each merchant has an isolate
 
 ### Functional Requirements
 
-1. **Store**: Merchants create branded stores
-2. **Products**: Manage catalog and inventory
-3. **Checkout**: Secure payment processing
-4. **Orders**: Process and fulfill orders
-5. **Analytics**: Sales and customer insights
+1. **Store**: Merchants create branded stores with custom themes
+2. **Products**: Manage catalog with variants and inventory
+3. **Checkout**: Secure payment processing with cart management
+4. **Orders**: Process, fulfill, and track orders
+5. **Analytics**: Sales and customer insights per store
 
 ### Non-Functional Requirements
 
-- **Availability**: 99.99% for checkout
+- **Availability**: 99.99% for checkout flows
 - **Isolation**: Complete data separation between merchants
-- **Latency**: < 100ms for product pages
-- **Scale**: 1M+ stores, 100M+ products
+- **Latency**: < 100ms for product pages, < 200ms for checkout
+- **Scale**: 1M+ stores, 100M+ products across all tenants
+- **Consistency**: Strong consistency for inventory and payments
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Value | Derivation |
+|--------|-------|------------|
+| Active stores | 1M | Total merchant base |
+| Products (total) | 100M | ~100 products/store average |
+| Peak orders/second | 10,000 | Flash sales, holiday traffic |
+| Custom domains | 500K | ~50% of stores use custom domains |
+| Concurrent shoppers | 5M | Across all storefronts |
+
+### Storage Estimates
+
+| Data | Size | Growth Rate |
+|------|------|------------|
+| Product catalog | 2 TB | 200 GB/year |
+| Orders (hot, < 2 years) | 5 TB | 2 TB/year |
+| Media (product images) | 50 TB | 20 TB/year |
+| Sessions + carts | 50 GB | Ephemeral |
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Request Routing                             │
-│    Custom Domains → Tenant Resolution → Store Rendering         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
-│              (Tenant context in every request)                  │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Store Service │    │Product Service│    │Checkout Service│
-│               │    │               │    │               │
-│ - Settings    │    │ - Catalog     │    │ - Cart        │
-│ - Themes      │    │ - Variants    │    │ - Payment     │
-│ - Domains     │    │ - Inventory   │    │ - Orders      │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-│         PostgreSQL (with Row-Level Security per tenant)         │
-│              + Valkey (sessions, cart) + Stripe                 │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            Client Layer                                  │
+│     Storefront (shoppers)  │  Admin Dashboard (merchants)                │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         CDN / Edge Layer                                 │
+│   Custom Domain Resolution  │  SSL Termination  │  Static Asset Cache   │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          API Gateway                                     │
+│          Tenant context injection  │  Rate limiting  │  Auth             │
+└──────────────────────────────────────────────────────────────────────────┘
+           │                        │                        │
+           ▼                        ▼                        ▼
+┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐
+│   Store Service    │  │  Product Service   │  │   Checkout Service     │
+│                    │  │                    │  │                        │
+│ - Settings/Themes  │  │ - Catalog CRUD     │  │ - Cart management      │
+│ - Domain routing   │  │ - Variants         │  │ - Payment (Stripe)     │
+│ - Merchant auth    │  │ - Collections      │  │ - Order creation       │
+│ - Customer mgmt    │  │ - Inventory        │  │ - Idempotency          │
+└────────────────────┘  └────────────────────┘  └────────────────────────┘
+           │                        │                        │
+           ▼                        ▼                        ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           Data Layer                                     │
+├──────────────────┬──────────────────┬────────────────────────────────────┤
+│    PostgreSQL    │   Valkey/Redis   │           RabbitMQ                 │
+│  (with RLS per  │  (sessions,      │  (order events, webhooks,          │
+│   tenant)       │   cart cache)    │   email notifications)             │
+└──────────────────┴──────────────────┴────────────────────────────────────┘
 ```
 
 ---
@@ -68,34 +101,22 @@ Shopify is a multi-tenant e-commerce platform where each merchant has an isolate
 
 ### 1. Multi-Tenant Data Model
 
-**Approach 1: Shared Database, Tenant Column**
-```sql
--- Every table has store_id
-CREATE TABLE products (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  title VARCHAR(200),
-  price DECIMAL(10, 2),
-  ...
-);
+**Approach: Shared Database with Row-Level Security**
 
--- Row-Level Security
+Every table includes a `store_id` column. PostgreSQL RLS policies enforce that queries only see rows belonging to the current tenant. The application sets `app.current_store_id` per connection before executing queries.
+
+```sql
 ALTER TABLE products ENABLE ROW LEVEL SECURITY;
-CREATE POLICY store_isolation ON products
-  USING (store_id = current_setting('app.current_store_id')::integer);
+CREATE POLICY store_isolation_products ON products
+  FOR ALL
+  USING (store_id = NULLIF(current_setting('app.current_store_id', true), '')::integer);
 ```
 
-**Approach 2: Schema Per Tenant**
-```sql
--- Each store gets own schema
-CREATE SCHEMA store_12345;
-CREATE TABLE store_12345.products (...);
-```
+**Why Shared DB + RLS over Schema-Per-Tenant:**
 
-**Chosen: Shared Database with RLS**
-- Simpler operations (one schema)
-- Efficient for millions of stores
-- RLS enforces isolation at database level
+Schema-per-tenant creates one PostgreSQL schema per store. With 1M stores, this means 1M schemas, each with its own set of tables. This causes: (a) connection pool bloat since each schema needs separate connections, (b) migration nightmares as schema changes must apply to every schema, (c) catalog table bloat in `pg_class` degrading planner performance.
+
+Shared DB + RLS keeps a single schema with a `store_id` column on every table. RLS enforces isolation at the database level, meaning even a bug in application code cannot leak data cross-tenant. The trade-off is that cross-tenant analytics queries are impossible by design -- admin analytics require a superuser connection that bypasses RLS.
 
 ### 2. Custom Domain Routing
 
@@ -111,502 +132,427 @@ Request: mystore.com
     │
     ▼
 ┌─────────────────┐
-│ Domain Lookup   │──▶ Valkey: domain → store_id
-│ (Edge/CDN)      │
+│ Domain Lookup   │──▶ Valkey: domain → store_id (sub-ms)
+│ (Edge/CDN)      │    Fallback: PostgreSQL custom_domains table
 └─────────────────┘
     │
     ▼
 ┌─────────────────┐
-│ Route to Store  │──▶ Set tenant context, render
+│ Route to Store  │──▶ Set tenant context, render storefront
 └─────────────────┘
 ```
 
-**Domain Registration:**
-```javascript
-async function registerCustomDomain(storeId, domain) {
-  // Validate domain ownership (DNS TXT record check)
-  const verified = await verifyDomainOwnership(domain)
-  if (!verified) throw new Error('Domain verification failed')
-
-  // Store mapping
-  await db('custom_domains').insert({ store_id: storeId, domain })
-
-  // Update edge cache
-  await redis.set(`domain:${domain}`, storeId)
-
-  // Provision SSL certificate (Let's Encrypt)
-  await provisionSSL(domain)
-}
-```
+Domain registration involves DNS TXT record verification, SSL certificate provisioning via Let's Encrypt, and caching the domain-to-store mapping in Valkey at the edge for sub-millisecond lookups.
 
 ### 3. Checkout Flow
 
-**Secure Checkout Sequence:**
-```javascript
-async function processCheckout(storeId, cartId, paymentMethodId) {
-  const cart = await getCart(cartId)
+The checkout is the most critical path in the system. It must handle concurrent buyers, prevent overselling, and tolerate network failures without creating duplicate orders.
 
-  // 1. Validate inventory
-  for (const item of cart.items) {
-    const available = await checkInventory(storeId, item.variantId, item.quantity)
-    if (!available) {
-      throw new Error(`${item.title} is no longer available`)
-    }
-  }
+**Sequence:**
+1. Validate inventory (SELECT FOR UPDATE on variant rows)
+2. Reserve inventory within a database transaction
+3. Process payment via Stripe (circuit breaker protected)
+4. Create order with idempotency key
+5. Commit inventory deduction
+6. Publish `order.created` event to RabbitMQ (non-blocking)
+7. Return success to customer
 
-  // 2. Reserve inventory
-  await reserveInventory(cart.items)
-
-  // 3. Calculate totals
-  const totals = await calculateTotals(cart)
-
-  // 4. Process payment (Stripe)
-  const payment = await stripe.paymentIntents.create({
-    amount: totals.total * 100, // cents
-    currency: 'usd',
-    payment_method: paymentMethodId,
-    confirm: true,
-    metadata: { store_id: storeId, cart_id: cartId }
-  })
-
-  if (payment.status !== 'succeeded') {
-    await releaseInventory(cart.items)
-    throw new Error('Payment failed')
-  }
-
-  // 5. Create order
-  const order = await createOrder(storeId, cart, payment)
-
-  // 6. Commit inventory reduction
-  await commitInventory(cart.items)
-
-  // 7. Send confirmations
-  await sendOrderConfirmation(order)
-
-  return order
-}
-```
+If payment fails, reserved inventory is released. If the network times out and the customer retries, the idempotency key ensures the same order is returned without double-charging.
 
 ### 4. Theme System
 
-**Template Engine:**
-```javascript
-// Simplified Liquid-like template rendering
-const themes = {
-  default: {
-    'index.html': `
-      <html>
-        <head><title>{{ store.name }}</title></head>
-        <body>
-          {% for product in products %}
-            <div class="product">
-              <h2>{{ product.title }}</h2>
-              <p>{{ product.price | money }}</p>
-            </div>
-          {% endfor %}
-        </body>
-      </html>
-    `
-  }
-}
-
-async function renderStorefront(storeId, page, data) {
-  const store = await getStore(storeId)
-  const theme = await getTheme(store.themeId)
-  const template = theme.templates[page]
-
-  return render(template, { store, ...data })
-}
-```
+Merchants customize their storefronts through theme configuration stored as JSONB in the `stores.theme` column. The theme defines primary/secondary colors, layout preferences, and branding. At production scale, themes would use a Liquid-like template engine with sandboxed rendering to prevent arbitrary code execution.
 
 ---
 
 ## Database Schema
 
 ```sql
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Users table (platform-level)
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  name VARCHAR(200),
+  role VARCHAR(20) DEFAULT 'merchant', -- 'admin', 'merchant'
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Stores (tenants)
 CREATE TABLE stores (
   id SERIAL PRIMARY KEY,
-  owner_id INTEGER REFERENCES users(id),
+  owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   name VARCHAR(200) NOT NULL,
-  subdomain VARCHAR(50) UNIQUE,
+  subdomain VARCHAR(50) UNIQUE NOT NULL,
   custom_domain VARCHAR(255),
-  theme_id INTEGER REFERENCES themes(id),
-  settings JSONB,
+  description TEXT,
+  logo_url VARCHAR(500),
+  currency VARCHAR(3) DEFAULT 'USD',
+  stripe_account_id VARCHAR(100),
+  settings JSONB DEFAULT '{}',
+  theme JSONB DEFAULT '{"primaryColor": "#4F46E5", "secondaryColor": "#10B981"}',
   plan VARCHAR(50) DEFAULT 'basic',
+  status VARCHAR(20) DEFAULT 'active',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Custom domains
+CREATE TABLE custom_domains (
+  id SERIAL PRIMARY KEY,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE,
+  domain VARCHAR(255) UNIQUE NOT NULL,
+  verified BOOLEAN DEFAULT false,
+  verification_token VARCHAR(100),
+  ssl_provisioned BOOLEAN DEFAULT false,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Products (tenant-isolated)
 CREATE TABLE products (
   id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  handle VARCHAR(200),
   title VARCHAR(200) NOT NULL,
   description TEXT,
-  status VARCHAR(20) DEFAULT 'draft',
-  created_at TIMESTAMP DEFAULT NOW()
+  images JSONB DEFAULT '[]',
+  status VARCHAR(20) DEFAULT 'draft', -- 'draft', 'active', 'archived'
+  tags JSONB DEFAULT '[]',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(store_id, handle)
 );
 
 -- Variants (size, color combinations)
 CREATE TABLE variants (
   id SERIAL PRIMARY KEY,
-  product_id INTEGER REFERENCES products(id),
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
   sku VARCHAR(100),
-  price DECIMAL(10, 2),
+  title VARCHAR(200),
+  price DECIMAL(10, 2) NOT NULL,
+  compare_at_price DECIMAL(10, 2),
   inventory_quantity INTEGER DEFAULT 0,
-  options JSONB
+  options JSONB DEFAULT '{}',
+  weight DECIMAL(10, 2),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Collections (product groupings)
+CREATE TABLE collections (
+  id SERIAL PRIMARY KEY,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  handle VARCHAR(200),
+  title VARCHAR(200) NOT NULL,
+  description TEXT,
+  image_url VARCHAR(500),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(store_id, handle)
+);
+
+-- Collection products (many-to-many)
+CREATE TABLE collection_products (
+  id SERIAL PRIMARY KEY,
+  collection_id INTEGER REFERENCES collections(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  position INTEGER DEFAULT 0,
+  UNIQUE(collection_id, product_id)
+);
+
+-- Customers (per-store)
+CREATE TABLE customers (
+  id SERIAL PRIMARY KEY,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  email VARCHAR(255) NOT NULL,
+  password_hash VARCHAR(255),
+  first_name VARCHAR(100),
+  last_name VARCHAR(100),
+  phone VARCHAR(50),
+  accepts_marketing BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(store_id, email)
+);
+
+-- Carts
+CREATE TABLE carts (
+  id SERIAL PRIMARY KEY,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  session_id VARCHAR(255),
+  items JSONB DEFAULT '[]',
+  subtotal DECIMAL(10, 2) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Orders
 CREATE TABLE orders (
   id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  order_number VARCHAR(50),
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  order_number VARCHAR(50) NOT NULL,
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
   customer_email VARCHAR(255),
+  subtotal DECIMAL(10, 2),
+  shipping_cost DECIMAL(10, 2) DEFAULT 0,
+  tax DECIMAL(10, 2) DEFAULT 0,
   total DECIMAL(10, 2),
-  status VARCHAR(30) DEFAULT 'pending',
+  payment_status VARCHAR(30) DEFAULT 'pending',
+  fulfillment_status VARCHAR(30) DEFAULT 'unfulfilled',
   shipping_address JSONB,
-  payment_status VARCHAR(30),
-  fulfillment_status VARCHAR(30),
+  billing_address JSONB,
+  notes TEXT,
+  stripe_payment_intent_id VARCHAR(100),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Order line items
+CREATE TABLE order_items (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  variant_id INTEGER REFERENCES variants(id) ON DELETE SET NULL,
+  title VARCHAR(200),
+  variant_title VARCHAR(200),
+  sku VARCHAR(100),
+  quantity INTEGER NOT NULL,
+  price DECIMAL(10, 2) NOT NULL,
+  total DECIMAL(10, 2) NOT NULL,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Enable RLS on all tenant tables
+-- Sessions (for auth)
+CREATE TABLE sessions (
+  id SERIAL PRIMARY KEY,
+  session_id VARCHAR(255) UNIQUE NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE,
+  data JSONB DEFAULT '{}',
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Idempotency keys
+CREATE TABLE idempotency_keys (
+  id SERIAL PRIMARY KEY,
+  idempotency_key VARCHAR(64) NOT NULL,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE NOT NULL,
+  operation VARCHAR(50) NOT NULL,
+  status VARCHAR(20) DEFAULT 'processing',
+  request_params JSONB,
+  response_data JSONB,
+  resource_id INTEGER,
+  error_message TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(idempotency_key, store_id, operation)
+);
+
+-- Audit logs
+CREATE TABLE audit_logs (
+  id SERIAL PRIMARY KEY,
+  store_id INTEGER REFERENCES stores(id) ON DELETE CASCADE,
+  actor_id INTEGER,
+  actor_type VARCHAR(20),     -- 'merchant', 'customer', 'system', 'admin'
+  action VARCHAR(50) NOT NULL,
+  resource_type VARCHAR(50),
+  resource_id INTEGER,
+  changes JSONB,
+  ip_address INET,
+  user_agent TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Processed webhooks (replay protection)
+CREATE TABLE processed_webhooks (
+  id SERIAL PRIMARY KEY,
+  event_id VARCHAR(100) UNIQUE NOT NULL,
+  event_type VARCHAR(100) NOT NULL,
+  processed_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- RLS policies on all tenant tables
 ALTER TABLE products ENABLE ROW LEVEL SECURITY;
 ALTER TABLE variants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE collections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE carts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
 ```
+
+### Index Strategy
+
+```sql
+CREATE INDEX idx_products_store_id ON products(store_id);
+CREATE INDEX idx_products_status ON products(status);
+CREATE INDEX idx_variants_product_id ON variants(product_id);
+CREATE INDEX idx_variants_store_id ON variants(store_id);
+CREATE INDEX idx_orders_store_id ON orders(store_id);
+CREATE INDEX idx_orders_customer_id ON orders(customer_id);
+CREATE INDEX idx_orders_created_at ON orders(created_at);
+CREATE INDEX idx_customers_store_id ON customers(store_id);
+CREATE INDEX idx_carts_store_id ON carts(store_id);
+CREATE INDEX idx_carts_session_id ON carts(session_id);
+CREATE INDEX idx_stores_subdomain ON stores(subdomain);
+CREATE INDEX idx_custom_domains_domain ON custom_domains(domain);
+CREATE INDEX idx_idempotency_keys_lookup ON idempotency_keys(idempotency_key, store_id, operation);
+CREATE INDEX idx_idempotency_keys_created ON idempotency_keys(created_at);
+CREATE INDEX idx_audit_logs_store_created ON audit_logs(store_id, created_at DESC);
+CREATE INDEX idx_audit_logs_action ON audit_logs(action, created_at DESC);
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id, created_at DESC);
+```
+
+---
+
+## API Design
+
+### Merchant Admin API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/auth/register` | Register merchant account |
+| POST | `/api/auth/login` | Login and create session |
+| POST | `/api/auth/logout` | Destroy session |
+| GET | `/api/stores/:id` | Get store details |
+| PUT | `/api/stores/:id` | Update store settings |
+| GET | `/api/stores/:id/products` | List store products |
+| POST | `/api/stores/:id/products` | Create product |
+| PUT | `/api/stores/:id/products/:pid` | Update product |
+| DELETE | `/api/stores/:id/products/:pid` | Delete product |
+| GET | `/api/stores/:id/orders` | List store orders |
+| PUT | `/api/stores/:id/orders/:oid` | Update order status |
+| GET | `/api/stores/:id/customers` | List store customers |
+| GET | `/api/stores/:id/analytics` | Dashboard analytics |
+
+### Storefront API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/storefront/:subdomain` | Get store info + products |
+| GET | `/api/storefront/:subdomain/products/:id` | Product detail |
+| POST | `/api/storefront/:subdomain/cart` | Create/get cart |
+| POST | `/api/storefront/:subdomain/cart/items` | Add item to cart |
+| PUT | `/api/storefront/:subdomain/cart/items/:id` | Update cart item |
+| DELETE | `/api/storefront/:subdomain/cart/items/:id` | Remove from cart |
+| POST | `/api/storefront/:subdomain/checkout` | Process checkout |
 
 ---
 
 ## Key Design Decisions
 
-### 1. Shared Database with RLS
+### 1. Shared Database with Row-Level Security
 
-**Decision**: Single database, row-level security per tenant
+**Decision**: Single PostgreSQL database, row-level security per tenant.
 
-**Rationale**:
-- Simpler operations than schema-per-tenant
-- PostgreSQL RLS provides strong isolation
-- Scales to millions of tenants
+Shared DB + RLS was chosen over schema-per-tenant because operational simplicity scales better with 1M+ tenants. Schema-per-tenant would require creating and migrating 1M schemas for every DDL change, consuming excessive connection pool resources, and bloating PostgreSQL's catalog tables. RLS enforces isolation at the database layer -- even if application code has a bug, data cannot leak between tenants. The cost is that platform-wide analytics (e.g., "total GMV across all stores") requires a superuser connection that bypasses RLS, adding an extra layer of complexity for internal tooling.
 
-**Trade-off**: Cross-tenant queries impossible (by design)
+### 2. Stripe Connect for Payments
 
-### 2. Edge Domain Resolution
+**Decision**: Delegate payment processing to Stripe Connect.
 
-**Decision**: Cache domain → store mapping at CDN edge
+Building payment processing in-house means achieving PCI-DSS Level 1 compliance, which requires annual audits, penetration testing, and dedicated security infrastructure. Stripe Connect handles all of this, plus marketplace-style payouts where the platform takes a cut and routes funds to merchants. The trade-off is vendor lock-in and Stripe's per-transaction fees (2.9% + $0.30). For a platform where payment reliability directly impacts merchant trust, the operational overhead of running our own payment infrastructure far outweighs Stripe's fees.
 
-**Rationale**:
-- Sub-millisecond lookups
-- Handles millions of custom domains
-- CDN handles SSL termination
+### 3. RabbitMQ for Async Processing
 
-### 3. Stripe for Payments
+**Decision**: Use RabbitMQ for decoupling checkout from downstream processing.
 
-**Decision**: Use Stripe Connect for payment processing
-
-**Rationale**:
-- Handles PCI compliance
-- Supports marketplace payouts
-- Simple integration
+The checkout critical path must be fast. Synchronous webhook delivery, email sending, and analytics aggregation during checkout would add latency and create fragile dependencies. If a merchant's webhook endpoint is slow or down, checkout should not fail. RabbitMQ decouples these concerns: the checkout publishes an `order.created` event and returns immediately. Dedicated workers consume events for email, webhooks, inventory alerts, and analytics. Kafka was considered but RabbitMQ's simpler operational model and built-in dead-letter queues are sufficient. The trade-off is that RabbitMQ does not retain messages for replay; once consumed and acknowledged, they are gone. For audit and replay needs, we rely on the audit_logs table.
 
 ---
 
-## Consistency and Idempotency Semantics
+## Consistency and Idempotency
 
 ### Write Consistency Model
 
 **Order and Payment Writes: Strong Consistency**
-- Use PostgreSQL transactions with `SERIALIZABLE` isolation for inventory updates during checkout
-- All order creation, inventory deduction, and payment recording happen in a single transaction
+- Use `SERIALIZABLE` isolation with `SELECT FOR UPDATE` on inventory rows during checkout
+- All inventory deduction, order creation, and payment recording happen in a single transaction
 - No eventual consistency for financial operations
-
-```sql
--- Checkout transaction with serializable isolation
-BEGIN ISOLATION LEVEL SERIALIZABLE;
-
--- Reserve inventory (SELECT FOR UPDATE prevents concurrent modifications)
-UPDATE variants
-SET inventory_quantity = inventory_quantity - $quantity
-WHERE id = $variant_id AND store_id = $store_id AND inventory_quantity >= $quantity;
-
--- Create order only if inventory update succeeded
-INSERT INTO orders (store_id, order_number, total, status, idempotency_key)
-VALUES ($store_id, $order_number, $total, 'confirmed', $idempotency_key);
-
-COMMIT;
-```
 
 **Product and Catalog Writes: Eventual Consistency**
 - Product updates use read-committed isolation (default)
 - Cache invalidation is asynchronous (1-5 second lag acceptable)
-- Collections and search indices update via background jobs
 
 ### Idempotency Implementation
 
-**Idempotency Key Pattern for Checkout:**
-```javascript
-async function processCheckoutIdempotent(storeId, cartId, paymentMethodId, idempotencyKey) {
-  // Check for existing completed request
-  const existing = await db('checkout_requests')
-    .where({ idempotency_key: idempotencyKey, store_id: storeId })
-    .first();
+The checkout endpoint requires an `Idempotency-Key` header. The flow:
 
-  if (existing) {
-    if (existing.status === 'completed') {
-      return { order: await getOrder(existing.order_id), deduplicated: true };
-    }
-    if (existing.status === 'processing') {
-      throw new Error('Request already in progress');
-    }
-  }
+1. Check `idempotency_keys` table for existing key with matching `store_id` and operation
+2. If found with `status = 'completed'`, return the cached response (no reprocessing)
+3. If found with `status = 'processing'`, reject with 409 Conflict (prevents concurrent duplicates)
+4. If not found or `status = 'failed'`, insert/update with `status = 'processing'` and proceed
+5. On success, update to `status = 'completed'` with cached response
+6. On failure, update to `status = 'failed'` to allow retry
 
-  // Insert or update idempotency record
-  await db('checkout_requests')
-    .insert({
-      idempotency_key: idempotencyKey,
-      store_id: storeId,
-      cart_id: cartId,
-      status: 'processing',
-      created_at: new Date()
-    })
-    .onConflict(['idempotency_key', 'store_id'])
-    .merge({ status: 'processing', updated_at: new Date() });
+Keys have a 24-hour TTL enforced by a background cleanup job.
 
-  try {
-    const order = await processCheckout(storeId, cartId, paymentMethodId);
+### Webhook Replay Handling
 
-    await db('checkout_requests')
-      .where({ idempotency_key: idempotencyKey, store_id: storeId })
-      .update({ status: 'completed', order_id: order.id });
-
-    return { order, deduplicated: false };
-  } catch (error) {
-    await db('checkout_requests')
-      .where({ idempotency_key: idempotencyKey, store_id: storeId })
-      .update({ status: 'failed', error_message: error.message });
-    throw error;
-  }
-}
-```
-
-**Idempotency Table:**
-```sql
-CREATE TABLE checkout_requests (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id) NOT NULL,
-  idempotency_key VARCHAR(64) NOT NULL,
-  cart_id INTEGER,
-  order_id INTEGER REFERENCES orders(id),
-  status VARCHAR(20) DEFAULT 'processing', -- processing, completed, failed
-  error_message TEXT,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(store_id, idempotency_key)
-);
-
--- TTL cleanup: remove records older than 24 hours
-CREATE INDEX idx_checkout_requests_created ON checkout_requests(created_at);
-```
-
-### Conflict Resolution
-
-**Inventory Conflicts:**
-- Last-write-wins is NOT acceptable for inventory
-- Use optimistic locking with version column for non-checkout inventory updates
-- Checkout uses pessimistic locking (SELECT FOR UPDATE)
-
-```sql
--- Optimistic locking for admin inventory adjustments
-UPDATE variants
-SET inventory_quantity = $new_quantity, version = version + 1
-WHERE id = $variant_id AND store_id = $store_id AND version = $expected_version;
--- If 0 rows affected, retry with fresh data
-```
-
-**Webhook Replay Handling:**
-- All webhook handlers are idempotent using event IDs
-- Store processed event IDs in `processed_webhooks` table (7-day retention)
-- Stripe webhook signature verification before processing
+All webhook handlers are idempotent using event IDs stored in `processed_webhooks`. Stripe webhook signature verification prevents spoofed events. The table has 7-day retention.
 
 ---
 
 ## Async Queue Architecture
 
-### Queue Infrastructure (RabbitMQ)
-
-**Local Development Setup:**
-```yaml
-# docker-compose.yml
-rabbitmq:
-  image: rabbitmq:3-management
-  ports:
-    - "5672:5672"
-    - "15672:15672"  # Management UI
-  environment:
-    RABBITMQ_DEFAULT_USER: shopify
-    RABBITMQ_DEFAULT_PASS: shopify_dev
-```
-
 ### Queue Topology
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        RabbitMQ Exchanges                       │
-├─────────────────────────────────────────────────────────────────┤
-│  orders.events (fanout)     │  inventory.events (topic)        │
-│  └── orders.created         │  └── inventory.low.*             │
-│  └── orders.fulfilled       │  └── inventory.out.*             │
-│  └── orders.cancelled       │                                   │
-├─────────────────────────────────────────────────────────────────┤
-│  notifications (direct)     │  background (direct)              │
-│  └── email.send             │  └── search.index                │
-│  └── sms.send               │  └── analytics.aggregate         │
-│  └── webhook.deliver        │  └── image.resize                │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    RabbitMQ Exchanges                         │
+├──────────────────────────────────────────────────────────────┤
+│  orders.events (fanout)        │  inventory.events (topic)   │
+│  └── orders.created            │  └── inventory.low.*        │
+│  └── orders.fulfilled          │  └── inventory.out.*        │
+│  └── orders.cancelled          │                              │
+├──────────────────────────────────────────────────────────────┤
+│  notifications (direct)        │  background (direct)         │
+│  └── email.send                │  └── search.index           │
+│  └── webhook.deliver           │  └── analytics.aggregate    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Queue Definitions
+### Queue Delivery Semantics
 
-```javascript
-// Queue configuration with delivery semantics
-const queues = {
-  // Order processing - at-least-once delivery, manual ack
-  'orders.processing': {
-    durable: true,
-    arguments: {
-      'x-dead-letter-exchange': 'dlx.orders',
-      'x-message-ttl': 86400000  // 24 hours
-    }
-  },
+| Queue | Durability | Delivery | TTL | Use Case |
+|-------|-----------|----------|-----|----------|
+| orders.processing | Durable | At-least-once, manual ack | 24h | Order fulfillment |
+| notifications.email | Durable | At-least-once, 3 retries | 24h | Order confirmation emails |
+| webhooks.deliver | Durable | At-least-once, 5 retries + backoff | 24h | Merchant webhook delivery |
+| search.index | Non-durable | At-most-once | 5 min | Search re-indexing |
 
-  // Email notifications - at-least-once, 3 retries
-  'notifications.email': {
-    durable: true,
-    arguments: {
-      'x-dead-letter-exchange': 'dlx.notifications',
-      'x-max-retries': 3
-    }
-  },
+All order and payment queues use dead-letter exchanges for failed messages. Consumers implement their own idempotency via message IDs. At-least-once delivery is chosen over exactly-once because downstream operations (emails, webhooks) are inherently idempotent -- re-sending an email is annoying but acceptable; missing an email is not.
 
-  // Search indexing - at-most-once acceptable (eventual consistency)
-  'search.index': {
-    durable: false,
-    arguments: {
-      'x-message-ttl': 300000  // 5 minutes
-    }
-  },
+---
 
-  // Webhook delivery - at-least-once with exponential backoff
-  'webhooks.deliver': {
-    durable: true,
-    arguments: {
-      'x-dead-letter-exchange': 'dlx.webhooks',
-      'x-max-retries': 5
-    }
-  }
-};
-```
+## Security / Auth
 
-### Background Job Patterns
+### Authentication
 
-**Order Created Fanout:**
-```javascript
-// Publisher (after order created)
-async function publishOrderCreated(order) {
-  const message = {
-    event: 'order.created',
-    timestamp: new Date().toISOString(),
-    idempotency_key: `order_created_${order.id}`,
-    data: {
-      order_id: order.id,
-      store_id: order.store_id,
-      total: order.total,
-      items: order.items
-    }
-  };
+- **Merchant auth**: Session-based with cookies stored in Valkey. Sessions expire after 24 hours of inactivity.
+- **Customer auth**: Per-store customer accounts with bcrypt-hashed passwords. Customers are scoped to a single store via `UNIQUE(store_id, email)`.
+- **Storefront cart**: Session-based cart using `session_id` for anonymous shoppers, linked to `customer_id` after login.
 
-  await channel.publish('orders.events', '', Buffer.from(JSON.stringify(message)), {
-    persistent: true,
-    messageId: message.idempotency_key
-  });
-}
+### Authorization
 
-// Consumer (email service)
-async function handleOrderCreated(msg) {
-  const event = JSON.parse(msg.content.toString());
+- RLS policies enforce tenant isolation at the database level
+- Application middleware sets `app.current_store_id` on every database connection
+- A separate `shopify_app` database user with limited privileges runs application queries
 
-  // Idempotency check
-  if (await isEventProcessed(event.idempotency_key)) {
-    channel.ack(msg);
-    return;
-  }
+### Rate Limiting
 
-  try {
-    await sendOrderConfirmationEmail(event.data);
-    await markEventProcessed(event.idempotency_key);
-    channel.ack(msg);
-  } catch (error) {
-    // Requeue with backoff (up to 3 times)
-    if (msg.fields.deliveryTag < 3) {
-      channel.nack(msg, false, true);
-    } else {
-      // Send to dead letter queue
-      channel.nack(msg, false, false);
-    }
-  }
-}
-```
-
-### Backpressure Handling
-
-**Consumer Prefetch Limits:**
-```javascript
-// Limit concurrent processing per consumer
-channel.prefetch(10);  // Process max 10 messages at a time
-
-// For heavy operations like image processing
-channel.prefetch(2);
-```
-
-**Queue Length Monitoring:**
-```javascript
-// Check queue depth before publishing
-async function checkBackpressure(queueName) {
-  const queue = await channel.checkQueue(queueName);
-  if (queue.messageCount > 10000) {
-    logger.warn(`Queue ${queueName} has high backlog: ${queue.messageCount}`);
-    // Could implement: reject new requests, enable sampling, alert
-  }
-  return queue.messageCount;
-}
-```
-
-### Dead Letter Queue Processing
-
-```javascript
-// DLQ consumer for manual review or retry
-async function processDLQ(queueName) {
-  const dlqName = `dlq.${queueName}`;
-
-  channel.consume(dlqName, async (msg) => {
-    const headers = msg.properties.headers;
-    const originalError = headers['x-death']?.[0]?.reason;
-
-    // Log for investigation
-    logger.error({
-      queue: queueName,
-      messageId: msg.properties.messageId,
-      error: originalError,
-      payload: msg.content.toString()
-    });
-
-    // Could implement: retry after delay, send to manual review queue
-    channel.ack(msg);
-  });
-}
-```
+- Per-store API rate limits prevent a single merchant from degrading platform performance
+- Checkout endpoints have stricter limits to prevent abuse
+- Storefront endpoints scale independently from admin API
 
 ---
 
@@ -614,64 +560,17 @@ async function processDLQ(queueName) {
 
 ### Metrics (Prometheus)
 
-**Key Business Metrics:**
-```yaml
-# prometheus.yml scrape config
-scrape_configs:
-  - job_name: 'shopify-api'
-    static_configs:
-      - targets: ['localhost:3001', 'localhost:3002', 'localhost:3003']
-    metrics_path: '/metrics'
-```
+Key metrics exposed at `GET /metrics`:
 
-**Application Metrics (Express middleware):**
-```javascript
-const promClient = require('prom-client');
-
-// Request metrics
-const httpRequestDuration = new promClient.Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'route', 'status_code', 'store_id'],
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
-});
-
-const httpRequestsTotal = new promClient.Counter({
-  name: 'http_requests_total',
-  help: 'Total HTTP requests',
-  labelNames: ['method', 'route', 'status_code']
-});
-
-// Business metrics
-const checkoutsTotal = new promClient.Counter({
-  name: 'shopify_checkouts_total',
-  help: 'Total checkout attempts',
-  labelNames: ['store_id', 'status']  // status: success, failed, abandoned
-});
-
-const orderValue = new promClient.Histogram({
-  name: 'shopify_order_value_dollars',
-  help: 'Order value distribution',
-  labelNames: ['store_id'],
-  buckets: [10, 50, 100, 250, 500, 1000, 5000]
-});
-
-const inventoryLevel = new promClient.Gauge({
-  name: 'shopify_inventory_level',
-  help: 'Current inventory level per variant',
-  labelNames: ['store_id', 'variant_id']
-});
-
-const queueDepth = new promClient.Gauge({
-  name: 'shopify_queue_depth',
-  help: 'RabbitMQ queue message count',
-  labelNames: ['queue_name']
-});
-```
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `http_request_duration_seconds` | Histogram | method, route, status_code | API latency tracking |
+| `shopify_checkouts_total` | Counter | store_id, status | Checkout success/failure rate |
+| `shopify_order_value_dollars` | Histogram | store_id | Order value distribution |
+| `shopify_inventory_level` | Gauge | store_id, variant_id | Real-time stock levels |
+| `shopify_queue_depth` | Gauge | queue_name | RabbitMQ backlog monitoring |
 
 ### SLI/SLO Dashboard
-
-**Service Level Indicators:**
 
 | SLI | Target | Measurement |
 |-----|--------|-------------|
@@ -680,623 +579,122 @@ const queueDepth = new promClient.Gauge({
 | API error rate | < 1% | `rate(http_requests_total{status_code=~"5.."}[5m]) / rate(http_requests_total[5m])` |
 | Queue processing lag | < 30s | `time() - oldest_message_timestamp` |
 
-**Grafana Dashboard Panels:**
-```json
-{
-  "dashboard": {
-    "title": "Shopify SLI Dashboard",
-    "panels": [
-      {
-        "title": "Checkout Success Rate (5m rolling)",
-        "type": "stat",
-        "targets": [{
-          "expr": "sum(rate(shopify_checkouts_total{status='success'}[5m])) / sum(rate(shopify_checkouts_total[5m])) * 100"
-        }],
-        "thresholds": [
-          { "value": 99.9, "color": "green" },
-          { "value": 99, "color": "yellow" },
-          { "value": 0, "color": "red" }
-        ]
-      },
-      {
-        "title": "API Latency p95 by Route",
-        "type": "timeseries",
-        "targets": [{
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (route, le))"
-        }]
-      },
-      {
-        "title": "Queue Depth",
-        "type": "timeseries",
-        "targets": [{
-          "expr": "shopify_queue_depth"
-        }]
-      }
-    ]
-  }
-}
-```
+### Structured Logging (Pino)
 
-### Alert Thresholds
-
-```yaml
-# alerting_rules.yml
-groups:
-  - name: shopify-critical
-    rules:
-      - alert: CheckoutSuccessRateLow
-        expr: |
-          sum(rate(shopify_checkouts_total{status="success"}[5m]))
-          / sum(rate(shopify_checkouts_total[5m])) < 0.99
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Checkout success rate below 99%"
-          description: "Current rate: {{ $value | humanizePercentage }}"
-
-      - alert: HighAPILatency
-        expr: |
-          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
-          > 0.5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "API p95 latency exceeds 500ms"
-
-      - alert: QueueBacklogHigh
-        expr: shopify_queue_depth > 5000
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Queue {{ $labels.queue_name }} has high backlog"
-
-      - alert: InventoryOutOfStock
-        expr: shopify_inventory_level == 0
-        for: 1m
-        labels:
-          severity: info
-        annotations:
-          summary: "Variant {{ $labels.variant_id }} is out of stock"
-```
-
-### Structured Logging
-
-**Log Format (JSON):**
-```javascript
-const logger = require('pino')({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  },
-  base: {
-    service: 'shopify-api',
-    version: process.env.APP_VERSION
-  }
-});
-
-// Request logging middleware
-app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || uuidv4();
-  req.log = logger.child({
-    request_id: requestId,
-    store_id: req.storeId,
-    method: req.method,
-    path: req.path
-  });
-
-  const start = Date.now();
-  res.on('finish', () => {
-    req.log.info({
-      status_code: res.statusCode,
-      duration_ms: Date.now() - start,
-      user_agent: req.headers['user-agent']
-    }, 'request completed');
-  });
-
-  next();
-});
-```
-
-**Example Log Output:**
-```json
-{
-  "level": "info",
-  "time": 1705420800000,
-  "service": "shopify-api",
-  "request_id": "abc-123",
-  "store_id": 42,
-  "method": "POST",
-  "path": "/api/checkout",
-  "status_code": 200,
-  "duration_ms": 245,
-  "msg": "request completed"
-}
-```
-
-### Distributed Tracing (OpenTelemetry)
-
-```javascript
-const { NodeTracerProvider } = require('@opentelemetry/node');
-const { SimpleSpanProcessor } = require('@opentelemetry/tracing');
-const { JaegerExporter } = require('@opentelemetry/exporter-jaeger');
-
-const provider = new NodeTracerProvider();
-provider.addSpanProcessor(
-  new SimpleSpanProcessor(new JaegerExporter({
-    serviceName: 'shopify-api',
-    host: 'localhost',
-    port: 6831
-  }))
-);
-provider.register();
-
-// Trace checkout flow
-const tracer = opentelemetry.trace.getTracer('checkout');
-
-async function processCheckoutWithTracing(storeId, cartId, paymentMethodId) {
-  return tracer.startActiveSpan('checkout.process', async (span) => {
-    span.setAttribute('store_id', storeId);
-    span.setAttribute('cart_id', cartId);
-
-    try {
-      // Each step creates child span
-      await tracer.startActiveSpan('checkout.validate_inventory', async (childSpan) => {
-        await validateInventory(cartId);
-        childSpan.end();
-      });
-
-      await tracer.startActiveSpan('checkout.process_payment', async (childSpan) => {
-        childSpan.setAttribute('payment_provider', 'stripe');
-        await processPayment(paymentMethodId);
-        childSpan.end();
-      });
-
-      span.setStatus({ code: SpanStatusCode.OK });
-    } catch (error) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
-      throw error;
-    } finally {
-      span.end();
-    }
-  });
-}
-```
+JSON-formatted logs with request IDs, store IDs, and correlation IDs for distributed tracing. Every request gets a child logger with tenant context attached.
 
 ### Audit Logging
 
-**Audit Events Table:**
-```sql
-CREATE TABLE audit_logs (
-  id SERIAL PRIMARY KEY,
-  store_id INTEGER REFERENCES stores(id),
-  actor_id INTEGER,           -- user who performed action
-  actor_type VARCHAR(20),     -- 'merchant', 'customer', 'system', 'admin'
-  action VARCHAR(50) NOT NULL,-- 'order.created', 'product.updated', etc.
-  resource_type VARCHAR(50),  -- 'order', 'product', 'variant'
-  resource_id INTEGER,
-  changes JSONB,              -- { before: {...}, after: {...} }
-  ip_address INET,
-  user_agent TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+Immutable audit trail in `audit_logs` table tracking order lifecycle events, inventory adjustments, admin actions, and configuration changes. INSERT-only -- application code never updates or deletes audit records. Indexed on `(store_id, created_at)` for efficient tenant-scoped queries during dispute resolution.
 
-CREATE INDEX idx_audit_store_created ON audit_logs(store_id, created_at DESC);
-CREATE INDEX idx_audit_action ON audit_logs(action, created_at DESC);
-```
+---
 
-**Audit Logger:**
-```javascript
-async function auditLog(context, action, resource, changes) {
-  await db('audit_logs').insert({
-    store_id: context.storeId,
-    actor_id: context.userId,
-    actor_type: context.userType,
-    action: action,
-    resource_type: resource.type,
-    resource_id: resource.id,
-    changes: JSON.stringify(changes),
-    ip_address: context.ipAddress,
-    user_agent: context.userAgent
-  });
-}
+## Failure Handling
 
-// Usage in order creation
-await auditLog(
-  { storeId: 42, userId: 123, userType: 'customer', ipAddress: '192.168.1.1' },
-  'order.created',
-  { type: 'order', id: order.id },
-  { after: { total: order.total, items: order.items.length } }
-);
-```
+### Circuit Breakers
 
-**Audit Events to Track:**
-- `order.created`, `order.cancelled`, `order.refunded`
-- `product.created`, `product.updated`, `product.deleted`
-- `inventory.adjusted` (manual adjustments)
-- `settings.updated` (store configuration changes)
-- `domain.verified`, `domain.removed`
-- `api_key.created`, `api_key.revoked`
+Circuit breakers (Opossum library) protect against cascading failures from external services:
+
+| Service | Timeout | Error Threshold | Reset Timeout | Fallback |
+|---------|---------|-----------------|---------------|----------|
+| Stripe (payments) | 30s | 25% of 5 requests | 60s | Queue as payment_pending |
+| Valkey (cache) | 3s | 50% of 10 requests | 15s | Skip cache, query DB |
+| RabbitMQ | 5s | 30% of 5 requests | 30s | Write to fallback DB table |
+
+### Retry Strategy
+
+Exponential backoff with jitter for transient failures. Maximum 3 retries for payment processing, 5 retries for webhook delivery.
+
+### Graceful Degradation
+
+- If RabbitMQ is down, order creation still succeeds but notifications are delayed (written to a fallback table)
+- If Valkey is down, sessions fall back to PostgreSQL-backed sessions (higher latency)
+- If Stripe is down, checkout returns a clear error; no silent failures
+
+---
+
+## Scalability Considerations
+
+### Horizontal Scaling Path
+
+1. **API servers**: Stateless, scale horizontally behind a load balancer. Session state lives in Valkey.
+2. **PostgreSQL read replicas**: Route read-heavy storefront queries to replicas. Writes (orders, inventory) go to primary.
+3. **Tenant-based sharding**: At extreme scale (10M+ stores), shard PostgreSQL by `store_id` ranges. RLS policies work per-shard.
+4. **Queue workers**: Scale independently based on queue depth. Add workers for specific queues during flash sales.
+
+### What Breaks First
+
+1. **Single PostgreSQL primary** becomes the write bottleneck as order volume grows. Solution: shard by store_id.
+2. **RabbitMQ** under heavy webhook delivery load. Solution: add nodes to the cluster.
+3. **Domain resolution latency** with 1M+ custom domains. Solution: edge caching with CDN workers.
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Multi-tenancy | Shared DB + RLS | Schema per tenant | Operational simplicity |
-| Domains | Edge cache | Database lookup | Latency |
-| Payments | Stripe Connect | Custom | Compliance, speed |
-| Themes | Liquid templates | React SSR | Simplicity |
-| Message Queue | RabbitMQ | Kafka | Simpler for local dev, sufficient for learning |
-| Tracing | OpenTelemetry + Jaeger | Zipkin | Vendor neutral, better ecosystem |
-| Metrics | Prometheus + Grafana | Datadog | Self-hosted, free for local dev |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Multi-tenancy | Shared DB + RLS | Schema per tenant | Operational simplicity at 1M+ stores |
+| Domain routing | Edge cache (Valkey) | Database lookup per request | Sub-millisecond lookups for custom domains |
+| Payments | Stripe Connect | Custom payment processing | PCI compliance, marketplace payouts |
+| Themes | JSONB config | Liquid template engine | Simpler for learning; production would use Liquid |
+| Message queue | RabbitMQ | Kafka | Simpler ops, DLQ support, sufficient throughput |
+| Metrics | Prometheus + Grafana | Datadog | Self-hosted, free for development |
+| Logging | Pino (JSON) | Winston | Better performance, native JSON output |
 
 ---
 
 ## Implementation Notes
 
-This section documents the actual implementation of reliability patterns in the backend codebase, explaining **why** each pattern is critical for e-commerce operations.
+This section documents the actual local implementation and maps production-scale design to what runs on Docker + Node.js + React.
 
-### 1. Why Idempotency Prevents Inventory Overselling
-
-**The Problem:**
-When a customer clicks "Place Order" and the network times out, they naturally retry. Without idempotency, this can create duplicate orders and decrement inventory twice, leading to overselling.
+### Local Architecture
 
 ```
-Customer clicks "Buy" → Network timeout → Customer retries
-Without idempotency:
-  - Order 1 created, inventory -1
-  - Order 2 created, inventory -1 (OVERSOLD!)
-
-With idempotency:
-  - Order 1 created, inventory -1
-  - Retry detected via idempotency key → Return Order 1 (no duplicate)
+┌───────────────────┐         ┌────────────────────┐
+│  React Frontend   │────────▶│  Express Backend   │
+│  localhost:5173   │         │  localhost:3001     │
+└───────────────────┘         └────────────────────┘
+                                 │      │      │
+                    ┌────────────┘      │      └────────────┐
+                    ▼                   ▼                    ▼
+            ┌──────────────┐  ┌──────────────┐  ┌────────────────┐
+            │  PostgreSQL  │  │    Valkey     │  │   RabbitMQ     │
+            │  :5432       │  │    :6379      │  │   :5672/:15672 │
+            └──────────────┘  └──────────────┘  └────────────────┘
 ```
 
-**Implementation:**
-The `withIdempotency()` wrapper in `/backend/src/services/idempotency.js`:
-1. Checks if the idempotency key already exists in the database
-2. If found with status `completed`, returns the cached result
-3. If found with status `processing`, rejects (prevents race conditions)
-4. If not found or `failed`, processes the operation and stores the result
-
-**Why PostgreSQL for Idempotency Storage:**
-- ACID guarantees prevent race conditions during key insertion
-- Unique constraint on `(idempotency_key, store_id, operation)` enforces exactly-once semantics
-- 24-hour TTL cleanup prevents unbounded growth
-
-**Critical Insight:**
-The checkout uses `SERIALIZABLE` isolation level combined with `SELECT FOR UPDATE` on inventory rows. This prevents the "lost update" problem where two concurrent transactions both read the same inventory level before either writes.
-
-### 2. Why Async Queues Enable Reliable Webhook Delivery
-
-**The Problem:**
-Synchronous webhook delivery during checkout creates fragile dependencies:
-- If the merchant's webhook endpoint is slow, checkout is slow
-- If it's down, checkout fails entirely
-- Retry logic in the critical path adds latency and complexity
-
-**Implementation:**
-RabbitMQ queues in `/backend/src/services/rabbitmq.js` decouple order creation from downstream processing:
-
-```
-Checkout (synchronous, fast):
-  1. Validate inventory (SELECT FOR UPDATE)
-  2. Process payment (circuit breaker protected)
-  3. Create order in database
-  4. Publish to RabbitMQ (non-blocking)
-  5. Return success to customer
-
-Async Workers (eventual, reliable):
-  - orders.created → Send confirmation email
-  - orders.created → Deliver merchant webhook (with retries)
-  - inventory.low → Alert merchant
-  - inventory.out → Pause product visibility
-```
-
-**Queue Delivery Semantics:**
-- `durable: true` - Messages survive RabbitMQ restarts
-- `persistent: true` - Messages written to disk
-- Manual acknowledgment - Only ack after successful processing
-- Dead Letter Queues - Failed messages preserved for investigation
-
-**Why At-Least-Once is Correct:**
-Webhooks and emails are idempotent operations (re-sending is safe). We choose at-least-once delivery over exactly-once because:
-1. Exactly-once is expensive (2-phase commit, distributed transactions)
-2. Consumers implement their own idempotency via message IDs
-3. Duplicate email is annoying but acceptable; missing email is not
-
-### 3. Why Inventory Metrics Enable Stockout Prevention
-
-**The Problem:**
-Stockouts are invisible until customers complain. By the time you notice, you've lost sales and frustrated customers who see "out of stock" on popular items.
-
-**Implementation:**
-Real-time Prometheus metrics in `/backend/src/services/metrics.js`:
-
-```
-shopify_inventory_level{store_id="1", variant_id="42", sku="TS-M-BLACK"} 5
-shopify_inventory_low_total{store_id="1", variant_id="42"} 3
-shopify_inventory_out_of_stock_total{store_id="1", variant_id="42"} 1
-```
-
-**Alerting Rules (defined in architecture.md):**
-```yaml
-# Alert when inventory approaches zero
-- alert: InventoryLow
-  expr: shopify_inventory_level < 10
-  for: 5m
-  labels:
-    severity: warning
-
-# Alert immediately when sold out
-- alert: InventoryOutOfStock
-  expr: shopify_inventory_level == 0
-  for: 1m
-  labels:
-    severity: info
-```
-
-**Dashboard Insights:**
-- **Trend Analysis:** `rate(shopify_inventory_out_of_stock_total[24h])` shows stockout frequency
-- **Reorder Point:** When `shopify_inventory_level` crosses reorder threshold, alert for purchase order
-- **Velocity Tracking:** Combine with order metrics to calculate days-of-inventory-remaining
-
-**Why Prometheus Over Database Queries:**
-- Real-time (no query latency)
-- Historical data (track trends over time)
-- Alerting built-in (PagerDuty, Slack integration)
-- Aggregation at scale (no N+1 queries across all variants)
-
-### 4. Why Audit Logging Enables Order Dispute Resolution
-
-**The Problem:**
-Customer disputes require forensic reconstruction:
-- "I was charged but never received confirmation"
-- "The inventory said 10 available but checkout said out of stock"
-- "Someone changed my order without my authorization"
-
-**Implementation:**
-Comprehensive audit trail in `/backend/src/services/audit.js`:
-
-```javascript
-// Every checkout step is logged
-await logCheckoutEvent(context, AuditAction.CHECKOUT_STARTED, { cartId, email });
-await logInventoryChange(context, variantId, oldQty, newQty, 'checkout_reserve');
-await logPaymentEvent(context, success, { amount, paymentIntentId });
-await logOrderCreated(context, order);
-
-// Query for dispute resolution
-const trail = await getOrderAuditTrail(storeId, orderId);
-// Returns chronological list:
-// - checkout.started (timestamp, IP, cart contents)
-// - inventory.adjusted (each SKU reserved)
-// - payment.processed (Stripe intent ID)
-// - order.created (final order state)
-```
-
-**What We Capture:**
-- `actor_id` + `actor_type` - Who did it (customer, merchant, admin, system)
-- `ip_address` - Where the request came from
-- `changes.before` + `changes.after` - What changed
-- `created_at` - When it happened
-
-**Retention and Compliance:**
-- Audit logs are immutable (INSERT only, no UPDATE/DELETE in application code)
-- Indexes on `(store_id, created_at)` for efficient time-range queries
-- 7+ year retention for financial records (PCI-DSS, tax compliance)
-
-**Why Database Over Log Files:**
-- Queryable (SQL WHERE clauses for investigation)
-- Relational (JOIN with orders, products for context)
-- Transactional (audit log and business operation in same transaction)
-- Secure (database-level access controls, no need for log file permissions)
-
----
-
-## Reliability Patterns Summary
+### Production-Grade Patterns Actually Implemented
 
 | Pattern | File | Purpose |
 |---------|------|---------|
-| Idempotency | `services/idempotency.js` | Prevent duplicate orders on retry |
-| Circuit Breaker | `services/circuit-breaker.js` | Protect against payment gateway failures |
-| Async Queues | `services/rabbitmq.js` | Decouple checkout from notifications |
-| Structured Logging | `services/logger.js` | Debug production issues |
-| Prometheus Metrics | `services/metrics.js` | SLI/SLO dashboards and alerting |
-| Audit Logging | `services/audit.js` | Dispute resolution and compliance |
+| Idempotency | `backend/src/services/idempotency.ts` | Prevents duplicate orders on checkout retry |
+| Circuit breaker | `backend/src/services/circuit-breaker.ts` | Protects against Stripe and Valkey failures (Opossum) |
+| Async queues | `backend/src/services/rabbitmq.ts` | Decouples checkout from email/webhook/inventory workers |
+| Structured logging | `backend/src/services/logger.ts` | JSON logs with Pino for request tracing |
+| Prometheus metrics | `backend/src/services/metrics.ts` | Checkout counters, latency histograms, inventory gauges |
+| Audit logging | `backend/src/services/audit.ts` | Immutable audit trail for orders and inventory changes |
+| Row-Level Security | `backend/src/db/init.sql` | PostgreSQL RLS policies on all tenant tables |
+| Background workers | `backend/src/workers/order-worker.ts`, `inventory-worker.ts`, `webhook-worker.ts`, `email-worker.ts` | Consume RabbitMQ queues for async processing |
 
----
+### What Was Simplified or Substituted
 
-## Running the Implementation
+| Production | Local | Reason |
+|------------|-------|--------|
+| Stripe Connect (real payments) | Mocked payment processing | No real Stripe account needed for learning |
+| CDN + edge domain resolution | Direct subdomain routing via Express | No CDN infrastructure locally |
+| Liquid template engine | JSONB theme config (colors only) | Simpler; demonstrates the concept |
+| Multiple API instances + LB | Single Express server (supports 3001-3003) | Can test with multiple ports manually |
+| Kubernetes + auto-scaling | docker-compose | Sufficient for local development |
+| Multi-region PostgreSQL | Single PostgreSQL instance | No replication needed locally |
 
-### Prerequisites
-```bash
-# Start infrastructure
-docker-compose up -d
+### What Was Omitted
 
-# Wait for services to be healthy
-docker-compose ps
-```
-
-### Starting the Backend
-```bash
-cd backend
-npm install
-npm run dev
-```
-
-### Verifying the Implementation
-
-**Health Check:**
-```bash
-curl http://localhost:3001/health
-# Returns: { status, checks: { database, redis, rabbitmq }, circuitBreakers }
-```
-
-**Prometheus Metrics:**
-```bash
-curl http://localhost:3001/metrics
-# Returns: Prometheus-formatted metrics
-```
-
-**Idempotent Checkout:**
-```bash
-# First request creates order
-curl -X POST http://localhost:3001/api/storefront/demo/checkout \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: checkout-abc123" \
-  -H "X-Cart-Session: your-cart-session" \
-  -d '{"email": "test@example.com"}'
-
-# Retry returns same order (deduplicated: true)
-curl -X POST http://localhost:3001/api/storefront/demo/checkout \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: checkout-abc123" \
-  -H "X-Cart-Session: your-cart-session" \
-  -d '{"email": "test@example.com"}'
-```
-
-### RabbitMQ Management UI
-```
-URL: http://localhost:15672
-User: shopify
-Pass: shopify_dev
-```
-
----
-
-## Frontend Architecture
-
-The frontend is built with React, TypeScript, and Vite, following a modular component architecture designed for maintainability and reusability.
-
-### Directory Structure
-
-```
-frontend/src/
-├── components/
-│   ├── admin/                    # Admin dashboard components
-│   │   ├── index.ts              # Barrel export
-│   │   ├── AdminLayout.tsx       # Sidebar and header layout
-│   │   ├── DashboardTab.tsx      # Analytics dashboard
-│   │   ├── ProductsTab.tsx       # Product CRUD management
-│   │   ├── OrdersTab.tsx         # Order list and fulfillment
-│   │   ├── CustomersTab.tsx      # Customer list
-│   │   └── SettingsTab.tsx       # Store settings form
-│   ├── common/                   # Shared UI components
-│   │   ├── index.ts              # Barrel export
-│   │   ├── LoadingSpinner.tsx    # Loading indicators
-│   │   └── EmptyState.tsx        # Empty/error state displays
-│   ├── icons/                    # SVG icon components
-│   │   ├── index.ts              # Barrel export
-│   │   ├── CartIcon.tsx
-│   │   ├── BackArrowIcon.tsx
-│   │   ├── ImagePlaceholderIcon.tsx
-│   │   └── CheckIcon.tsx
-│   └── storefront/               # Customer-facing components
-│       ├── index.ts              # Barrel export
-│       ├── StorefrontLayout.tsx  # Header and footer
-│       ├── ProductsView.tsx      # Product grid display
-│       ├── ProductDetailView.tsx # Single product view
-│       ├── CartView.tsx          # Shopping cart
-│       ├── CheckoutView.tsx      # Checkout form
-│       └── SuccessView.tsx       # Order confirmation
-├── routes/                       # Tanstack Router pages
-│   ├── admin/
-│   │   └── $storeId.tsx          # Admin dashboard (127 lines)
-│   └── store/
-│       └── $subdomain.tsx        # Storefront (239 lines)
-├── services/
-│   └── api.ts                    # API client functions
-├── stores/
-│   ├── auth.ts                   # Authentication state (Zustand)
-│   └── storefront.ts             # Storefront state (Zustand)
-└── types/
-    └── index.ts                  # TypeScript interfaces
-```
-
-### Component Design Principles
-
-**1. Single Responsibility**
-Each component handles one concern. For example, `ProductCard` only displays a single product; `ProductsView` orchestrates the grid layout.
-
-**2. Composition Over Inheritance**
-Complex UIs are built by composing smaller components:
-```tsx
-<CartView>
-  <CartItem />      {/* Individual item row */}
-  <CartSummary />   {/* Subtotal and actions */}
-</CartView>
-```
-
-**3. Props Down, Callbacks Up**
-Components receive data via props and communicate changes via callback functions:
-```tsx
-<ProductsTab storeId={123} />  // Data flows down
-<CartItem onUpdateQuantity={(id, qty) => {...}} />  // Events flow up
-```
-
-**4. Colocation of Related Code**
-Helper components (like `StatusBadge`, `QuantityControls`) are defined in the same file as their parent when they're not reused elsewhere.
-
-### State Management
-
-**Global State (Zustand)**
-- `useAuthStore` - User authentication, login/logout
-- `useStorefrontStore` - Store data, products, cart for customer view
-- `useStoreStore` - Current store for admin context
-
-**Local State (React useState)**
-- Form inputs and validation
-- UI state (modals, active tabs)
-- Loading/processing indicators
-
-### Component Size Guidelines
-
-| Component Type | Target Lines | Example |
-|---------------|--------------|---------|
-| Page/Route | < 200 | `$storeId.tsx` (127 lines) |
-| Container | < 150 | `ProductsTab.tsx` (145 lines) |
-| Presentational | < 100 | `CartView.tsx` (95 lines) |
-| Helper | < 50 | `StatusBadge` (15 lines) |
-
-### Import Conventions
-
-Components are exported via barrel files for clean imports:
-
-```tsx
-// Clean imports via barrel exports
-import { ProductsView, CartView, CheckoutView } from '../../components/storefront';
-import { AdminSidebar, DashboardTab } from '../../components/admin';
-import { LoadingSpinner, EmptyState } from '../../components/common';
-import { CartIcon, BackArrowIcon } from '../../components/icons';
-```
-
-### JSDoc Documentation
-
-All components include JSDoc comments describing their purpose and props:
-
-```tsx
-/**
- * Product card component for grid display.
- * Shows product image, title, price, and add to cart button.
- *
- * @param props - Product card configuration
- * @returns Product card element with image, details, and actions
- */
-export function ProductCard({ product, primaryColor, onSelectProduct, onAddToCart }: ProductCardProps) {
-  // ...
-}
-```
-
-### Key Design Decisions
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Routing | Tanstack Router | React Router | Type-safe routing, file-based routes |
-| State | Zustand | Redux | Simpler API, less boilerplate |
-| Styling | Tailwind CSS | CSS Modules | Utility-first, rapid development |
-| Icons | SVG components | Icon library | Full control, tree-shaking |
-| Forms | Controlled inputs | React Hook Form | Simpler for current scale |
+- **CDN**: No static asset caching or edge workers
+- **SSL certificate provisioning**: Custom domains table exists but Let's Encrypt integration is not implemented
+- **Multi-region replication**: Single PostgreSQL instance
+- **Kubernetes orchestration**: docker-compose only
+- **Real Stripe webhooks**: No webhook endpoint for Stripe event processing
+- **Search**: No Elasticsearch; product listing relies on PostgreSQL queries
+- **Sharding**: Single database instance; no horizontal partitioning
+- **OAuth / SSO**: Session-based auth only

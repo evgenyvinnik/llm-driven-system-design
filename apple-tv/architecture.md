@@ -39,1713 +39,120 @@ Apple TV+ is a premium video streaming service delivering original content with 
 │  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐       │
 │  │ Master Files  │  │  Transcoder   │  │   Packager    │       │
 │  │               │  │               │  │               │       │
-│  │ - 4K masters  │→ │ - Multi-res   │→ │ - HLS chunks  │       │
+│  │ - 4K masters  │──▶│ - Multi-res   │──▶│ - HLS chunks  │       │
 │  │ - Audio stems │  │ - Multi-codec │  │ - Manifests   │       │
 │  └───────────────┘  └───────────────┘  └───────────────┘       │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Content Storage                              │
-│         (Origin servers with all encoded variants)               │
+│                    Origin Storage                               │
+│     (Encrypted HLS segments, manifests, DRM keys)               │
 └─────────────────────────────────────────────────────────────────┘
                               │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
 ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│   CDN Edge    │    │   CDN Edge    │    │   CDN Edge    │
-│   Americas    │    │    Europe     │    │     Asia      │
-│               │    │               │    │               │
-│ - Cache video │    │ - Cache video │    │ - Cache video │
-│ - DRM license │    │ - DRM license │    │ - DRM license │
+│  CDN Edge A   │    │  CDN Edge B   │    │  CDN Edge C   │
+│  (us-west)    │    │  (eu-west)    │    │  (ap-east)    │
 └───────────────┘    └───────────────┘    └───────────────┘
-         │                    │                    │
-         └────────────────────┼────────────────────┘
+              │               │               │
+              └───────────────┼───────────────┘
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Client Devices                               │
-│    iPhone | iPad | Apple TV | Mac | Samsung TV | Roku           │
+│                      Client Layer                               │
+│      Apple TV │ iPhone │ iPad │ Mac │ Web │ Smart TV            │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      API Gateway                                │
+│        (Auth, rate limiting, routing, geo-enforcement)          │
+└─────────────────────────────────────────────────────────────────┘
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ Content       │    │ Playback      │    │ Recommendation│
+│ Service       │    │ Service       │    │ Service       │
+│               │    │               │    │               │
+│ - Catalog     │    │ - Manifests   │    │ - Personalized│
+│ - Metadata    │    │ - Progress    │    │ - Trending    │
+│ - Search      │    │ - DRM         │    │ - Continue    │
+└───────────────┘    └───────────────┘    └───────────────┘
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Data Layer                                 │
+├─────────────────┬───────────────────┬───────────────────────────┤
+│   PostgreSQL    │   Redis/Valkey    │   Object Storage (S3)     │
+│   - Catalog     │   - Sessions      │   - Video segments        │
+│   - Users       │   - Cache         │   - Thumbnails            │
+│   - Progress    │   - Rate limits   │   - Master files          │
+│   - Downloads   │   - Watch state   │                           │
+└─────────────────┴───────────────────┴───────────────────────────┘
 ```
 
 ---
 
 ## Core Components
 
-### 1. Video Ingestion Pipeline
+### 1. Video Transcoding Pipeline
 
-**Master File Processing:**
-```javascript
-class IngestionService {
-  async ingestContent(contentId, masterFiles) {
-    const { videoFile, audioStems, subtitles, metadata } = masterFiles
+The ingestion pipeline takes 4K master files and produces multiple encoded variants for adaptive streaming. Each master is encoded into a ladder of resolutions and bitrates:
 
-    // Validate master file quality
-    const videoInfo = await this.analyzeVideo(videoFile)
-    if (videoInfo.resolution < 3840 || videoInfo.bitDepth < 10) {
-      throw new Error('Master file must be 4K HDR minimum')
-    }
+| Resolution | Codec | Bitrate | HDR | Target Device |
+|------------|-------|---------|-----|---------------|
+| 2160p (4K) | HEVC | 25 Mbps | Dolby Vision | Apple TV 4K |
+| 2160p | HEVC | 15 Mbps | HDR10 | Smart TVs |
+| 1080p | HEVC | 8 Mbps | SDR | iPad, Mac |
+| 1080p | H.264 | 6 Mbps | SDR | Older devices |
+| 720p | H.264 | 3 Mbps | SDR | iPhone cellular |
+| 480p | H.264 | 1.5 Mbps | SDR | Low bandwidth |
 
-    // Create content record
-    await db.query(`
-      INSERT INTO content
-        (id, title, duration, master_resolution, hdr_format, status)
-      VALUES ($1, $2, $3, $4, $5, 'ingesting')
-    `, [
-      contentId,
-      metadata.title,
-      videoInfo.duration,
-      `${videoInfo.width}x${videoInfo.height}`,
-      videoInfo.hdrFormat
-    ])
+Encoding is distributed across worker clusters. Each resolution/codec combination runs as an independent job, enabling parallelism. Per-scene quality optimization (VMAF-based) adjusts bitrate allocation -- action sequences get more bits, static dialog scenes get fewer.
 
-    // Queue transcoding jobs for all profiles
-    const profiles = this.getEncodingProfiles(videoInfo)
-    for (const profile of profiles) {
-      await this.queue.publish('transcode', {
-        contentId,
-        profile,
-        sourceFile: videoFile,
-        priority: profile.resolution >= 2160 ? 'high' : 'normal'
-      })
-    }
+After encoding, the packager segments each variant into 6-second HLS chunks (`.ts` files) and generates variant playlists. Audio tracks (multiple languages, Dolby Atmos) and subtitles are packaged separately.
 
-    // Process audio tracks
-    for (const audio of audioStems) {
-      await this.queue.publish('audio-encode', {
-        contentId,
-        sourceFile: audio.file,
-        language: audio.language,
-        codec: 'aac', // Also Dolby Atmos for supported
-        channels: audio.channels
-      })
-    }
+### 2. Adaptive Streaming (HLS)
 
-    // Process subtitles
-    for (const subtitle of subtitles) {
-      await this.queue.publish('subtitle-process', {
-        contentId,
-        sourceFile: subtitle.file,
-        language: subtitle.language,
-        type: subtitle.type // 'caption' or 'subtitle'
-      })
-    }
+The master manifest lists all available quality variants. The client's ABR algorithm selects the appropriate variant based on:
 
-    return { contentId, profileCount: profiles.length }
-  }
+- **Available bandwidth** (measured from segment download times)
+- **Buffer health** (maintain 30s buffer target)
+- **Device capabilities** (4K HDR only on capable hardware)
+- **Battery state** (reduce quality on low battery)
 
-  getEncodingProfiles(videoInfo) {
-    const profiles = [
-      // 4K HDR profiles
-      { resolution: 2160, codec: 'hevc', hdr: true, bitrate: 25000 },
-      { resolution: 2160, codec: 'hevc', hdr: true, bitrate: 15000 },
-      // 4K SDR fallback
-      { resolution: 2160, codec: 'hevc', hdr: false, bitrate: 12000 },
-      // 1080p profiles
-      { resolution: 1080, codec: 'hevc', hdr: false, bitrate: 8000 },
-      { resolution: 1080, codec: 'h264', hdr: false, bitrate: 6000 },
-      { resolution: 1080, codec: 'h264', hdr: false, bitrate: 4500 },
-      // 720p profiles
-      { resolution: 720, codec: 'h264', hdr: false, bitrate: 3000 },
-      { resolution: 720, codec: 'h264', hdr: false, bitrate: 1500 },
-      // Low bandwidth
-      { resolution: 480, codec: 'h264', hdr: false, bitrate: 800 },
-      { resolution: 360, codec: 'h264', hdr: false, bitrate: 400 }
-    ]
+The manifest includes audio groups (language tracks) and subtitle groups, allowing independent selection. Codec strings in the manifest (`hvc1.2.4.L150.B0` for Dolby Vision HEVC) enable clients to filter unsupported variants before attempting playback.
 
-    return profiles.filter(p => p.resolution <= videoInfo.height)
-  }
-}
-```
+### 3. Content Delivery Network
 
-### 2. Transcoding Service
+A multi-tier CDN architecture minimizes latency:
 
-**Distributed Encoding:**
-```javascript
-class TranscodingService {
-  async processJob(job) {
-    const { contentId, profile, sourceFile } = job
+1. **Edge nodes** (city-level): Cache popular content, serve 95%+ of requests
+2. **Regional shields**: Aggregate cache misses before hitting origin
+3. **Origin storage**: S3/MinIO with all content, accessed only on cache misses
 
-    const outputPath = this.getOutputPath(contentId, profile)
+Predictive pre-positioning pushes new release content to edge nodes before launch. Cache keys include content ID and variant ID; manifests have short TTLs (60s) while segments have long TTLs (24h).
 
-    // Build FFmpeg command for encoding
-    const ffmpegArgs = this.buildEncodingArgs(profile, sourceFile, outputPath)
+Geographic licensing enforcement happens at the API layer -- the CDN serves segments to any authenticated request, but the API refuses to issue manifest URLs for content not licensed in the user's region.
 
-    // Run encoding (this takes significant time)
-    const startTime = Date.now()
-    await this.runFFmpeg(ffmpegArgs)
-    const encodingTime = Date.now() - startTime
+### 4. DRM Protection (FairPlay)
 
-    // Store encoding result
-    await db.query(`
-      INSERT INTO encoded_variants
-        (content_id, resolution, codec, hdr, bitrate, file_path, encoding_time)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-    `, [
-      contentId,
-      profile.resolution,
-      profile.codec,
-      profile.hdr,
-      profile.bitrate,
-      outputPath,
-      encodingTime
-    ])
+Content is encrypted with AES-128 per-segment keys. The playback flow:
 
-    // Segment into HLS chunks
-    await this.segmentVideo(contentId, profile, outputPath)
+1. Client requests manifest URL from API (includes playback token)
+2. Client downloads manifest from CDN
+3. Before decrypting segments, client sends SPC (Server Playback Context) to license server
+4. License server validates playback token, device authorization, and subscription
+5. Server returns CKC (Content Key Context) containing the decryption key encrypted for the specific device's Secure Element
+6. Client decrypts and plays segments
 
-    // Check if all variants complete
-    await this.checkContentComplete(contentId)
-  }
+Device-specific licenses enable per-device revocation and download limits (max 25 offline downloads per account).
 
-  buildEncodingArgs(profile, source, output) {
-    const args = [
-      '-i', source,
-      '-c:v', profile.codec === 'hevc' ? 'libx265' : 'libx264',
-      '-preset', 'slow',
-      '-b:v', `${profile.bitrate}k`,
-      '-maxrate', `${profile.bitrate * 1.5}k`,
-      '-bufsize', `${profile.bitrate * 2}k`,
-      '-vf', `scale=-2:${profile.resolution}`
-    ]
+### 5. Watch Progress Sync
 
-    if (profile.hdr) {
-      args.push(
-        '-color_primaries', 'bt2020',
-        '-color_trc', 'smpte2084',
-        '-colorspace', 'bt2020nc'
-      )
-    }
+Watch progress uses a last-write-wins (LWW) strategy with client-side timestamps for conflict resolution. When a user watches on their iPhone and later switches to Apple TV, the most recent position wins:
 
-    args.push('-an', output) // No audio (processed separately)
-
-    return args
-  }
-
-  async segmentVideo(contentId, profile, videoFile) {
-    const segmentDir = this.getSegmentDir(contentId, profile)
-
-    // Create HLS segments
-    await this.runFFmpeg([
-      '-i', videoFile,
-      '-c', 'copy',
-      '-hls_time', '6',
-      '-hls_playlist_type', 'vod',
-      '-hls_segment_filename', `${segmentDir}/segment_%04d.ts`,
-      `${segmentDir}/playlist.m3u8`
-    ])
-
-    // Upload segments to origin
-    const segments = await fs.readdir(segmentDir)
-    for (const segment of segments) {
-      await this.uploadToOrigin(contentId, profile, segment)
-    }
-  }
-}
-```
-
-### 3. Adaptive Streaming (HLS)
-
-**Master Manifest Generation:**
-```javascript
-class ManifestService {
-  async generateMasterPlaylist(contentId) {
-    // Get all encoded variants
-    const variants = await db.query(`
-      SELECT * FROM encoded_variants
-      WHERE content_id = $1
-      ORDER BY resolution DESC, bitrate DESC
-    `, [contentId])
-
-    // Get audio tracks
-    const audioTracks = await db.query(`
-      SELECT * FROM audio_tracks
-      WHERE content_id = $1
-    `, [contentId])
-
-    // Get subtitles
-    const subtitles = await db.query(`
-      SELECT * FROM subtitles
-      WHERE content_id = $1
-    `, [contentId])
-
-    let manifest = '#EXTM3U\n'
-    manifest += '#EXT-X-VERSION:6\n'
-    manifest += '#EXT-X-INDEPENDENT-SEGMENTS\n\n'
-
-    // Add audio groups
-    for (const audio of audioTracks.rows) {
-      manifest += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",`
-      manifest += `LANGUAGE="${audio.language}",NAME="${audio.name}",`
-      manifest += `URI="${this.getAudioPlaylistUrl(contentId, audio)}"\n`
-    }
-
-    // Add subtitle groups
-    for (const sub of subtitles.rows) {
-      manifest += `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",`
-      manifest += `LANGUAGE="${sub.language}",NAME="${sub.name}",`
-      manifest += `URI="${this.getSubtitlePlaylistUrl(contentId, sub)}"\n`
-    }
-
-    manifest += '\n'
-
-    // Add video variants
-    for (const variant of variants.rows) {
-      const bandwidth = variant.bitrate * 1000
-      const resolution = `${this.getWidth(variant.resolution)}x${variant.resolution}`
-      const codecs = this.getCodecs(variant)
-
-      manifest += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},`
-      manifest += `RESOLUTION=${resolution},CODECS="${codecs}",`
-      manifest += `AUDIO="audio",SUBTITLES="subs"\n`
-      manifest += `${this.getVariantPlaylistUrl(contentId, variant)}\n`
-    }
-
-    return manifest
-  }
-
-  getCodecs(variant) {
-    if (variant.codec === 'hevc' && variant.hdr) {
-      return 'hvc1.2.4.L150.B0,mp4a.40.2'
-    } else if (variant.codec === 'hevc') {
-      return 'hvc1.1.6.L150.90,mp4a.40.2'
-    } else {
-      return 'avc1.640029,mp4a.40.2'
-    }
-  }
-}
-```
-
-### 4. Content Delivery Network
-
-**CDN Edge Configuration:**
-```javascript
-class CDNService {
-  async getPlaybackUrl(contentId, userId, deviceInfo) {
-    // Check content availability in user's region
-    const availability = await this.checkAvailability(contentId, userId)
-    if (!availability.available) {
-      throw new Error(`Content not available in ${availability.region}`)
-    }
-
-    // Get nearest edge server
-    const edge = await this.selectEdge(userId, deviceInfo)
-
-    // Generate signed URL with DRM token
-    const playbackToken = await this.generatePlaybackToken({
-      contentId,
-      userId,
-      deviceId: deviceInfo.deviceId,
-      expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-      maxBitrate: this.getMaxBitrate(deviceInfo)
-    })
-
-    // Return CDN URL with token
-    return {
-      manifestUrl: `${edge.baseUrl}/content/${contentId}/master.m3u8`,
-      playbackToken,
-      licenseUrl: `${edge.baseUrl}/drm/license`,
-      certificateUrl: `${edge.baseUrl}/drm/certificate`
-    }
-  }
-
-  async selectEdge(userId, deviceInfo) {
-    // Get user's approximate location
-    const location = await this.getLocation(userId)
-
-    // Find nearest healthy edge with capacity
-    const edges = await redis.zrangebyscore(
-      `edges:${location.region}`,
-      0, 80, // Load < 80%
-      'LIMIT', 0, 5
-    )
-
-    if (edges.length === 0) {
-      // Fall back to origin
-      return { baseUrl: this.originUrl }
-    }
-
-    // Select based on latency history
-    const best = await this.selectByLatency(edges, userId)
-    return { baseUrl: `https://${best}.cdn.example.com` }
-  }
-
-  getMaxBitrate(deviceInfo) {
-    // Limit bitrate based on device capabilities
-    const capabilities = {
-      'AppleTV4K': 25000,
-      'iPad': 15000,
-      'iPhone': 12000,
-      'Mac': 25000,
-      'Web': 8000
-    }
-
-    return capabilities[deviceInfo.deviceType] || 6000
-  }
-}
-```
-
-### 5. DRM Protection (FairPlay)
-
-**License Server:**
-```javascript
-class DRMService {
-  async getLicense(request) {
-    const { playbackToken, spcMessage, deviceInfo } = request
-
-    // Verify playback token
-    const tokenData = await this.verifyToken(playbackToken)
-    if (!tokenData) {
-      throw new Error('Invalid playback token')
-    }
-
-    // Verify device is authorized
-    const deviceAuthorized = await this.verifyDevice(
-      tokenData.userId,
-      deviceInfo.deviceId
-    )
-    if (!deviceAuthorized) {
-      throw new Error('Device not authorized')
-    }
-
-    // Decrypt SPC (Server Playback Context)
-    const spc = await this.decryptSPC(spcMessage)
-
-    // Generate CKC (Content Key Context)
-    const contentKey = await this.getContentKey(tokenData.contentId)
-    const ckc = await this.generateCKC(spc, contentKey, {
-      rental: false,
-      offlineAllowed: true,
-      hdcpRequired: true
-    })
-
-    // Log license issuance
-    await db.query(`
-      INSERT INTO license_grants
-        (user_id, content_id, device_id, granted_at, expires_at)
-      VALUES ($1, $2, $3, NOW(), $4)
-    `, [
-      tokenData.userId,
-      tokenData.contentId,
-      deviceInfo.deviceId,
-      new Date(tokenData.expiresAt)
-    ])
-
-    return { ckc }
-  }
-
-  async generateCKC(spc, contentKey, options) {
-    // FairPlay key server generates CKC
-    // This contains the decryption key encrypted for the specific device
-    return await this.fairplayServer.generateCKC({
-      spc,
-      contentKey,
-      rentalDuration: options.rental ? 48 * 3600 : null,
-      playbackDuration: 24 * 3600,
-      offlineLease: options.offlineAllowed,
-      hdcpEnforcement: options.hdcpRequired ? 2 : 0
-    })
-  }
-}
-```
-
-### 6. User Experience
-
-**Playback State Sync:**
-```javascript
-class PlaybackService {
-  async updateProgress(userId, contentId, progress) {
-    const { position, duration, completed } = progress
-
-    // Update watch progress
-    await db.query(`
-      INSERT INTO watch_progress
-        (user_id, content_id, position, duration, updated_at)
-      VALUES ($1, $2, $3, $4, NOW())
-      ON CONFLICT (user_id, content_id)
-      DO UPDATE SET
-        position = $3,
-        duration = $4,
-        updated_at = NOW()
-    `, [userId, contentId, position, duration])
-
-    // Mark as completed if > 90%
-    if (position / duration > 0.9 && !completed) {
-      await this.markCompleted(userId, contentId)
-    }
-
-    // Sync to other devices (via iCloud or our sync service)
-    await this.syncToDevices(userId, {
-      type: 'progress_update',
-      contentId,
-      position,
-      timestamp: Date.now()
-    })
-  }
-
-  async getContinueWatching(userId, limit = 10) {
-    const results = await db.query(`
-      SELECT
-        c.id,
-        c.title,
-        c.thumbnail_url,
-        c.duration,
-        wp.position,
-        (wp.position::float / c.duration) as progress_pct
-      FROM watch_progress wp
-      JOIN content c ON c.id = wp.content_id
-      WHERE wp.user_id = $1
-        AND wp.position > 60  -- Started watching (> 1 min)
-        AND (wp.position::float / c.duration) < 0.9  -- Not finished
-      ORDER BY wp.updated_at DESC
-      LIMIT $2
-    `, [userId, limit])
-
-    return results.rows.map(row => ({
-      ...row,
-      progressPercent: Math.round(row.progress_pct * 100),
-      remainingMinutes: Math.round((row.duration - row.position) / 60)
-    }))
-  }
-
-  async syncToDevices(userId, event) {
-    // Get user's active devices
-    const devices = await db.query(`
-      SELECT device_token FROM user_devices
-      WHERE user_id = $1 AND active = true
-    `, [userId])
-
-    // Push sync event
-    for (const device of devices.rows) {
-      await this.pushService.send(device.device_token, {
-        type: 'sync',
-        payload: event
-      })
-    }
-  }
-}
-```
-
-### 7. Offline Downloads
-
-**Download Manager:**
-```javascript
-class DownloadService {
-  async initiateDownload(userId, contentId, deviceId, quality) {
-    // Check download limits
-    const downloads = await this.getActiveDownloads(userId)
-    if (downloads.length >= 25) {
-      throw new Error('Download limit reached')
-    }
-
-    // Get variant for requested quality
-    const variant = await this.selectVariant(contentId, quality)
-
-    // Generate download license
-    const license = await this.drmService.generateOfflineLicense(
-      userId,
-      contentId,
-      deviceId,
-      { expiresIn: 30 * 24 * 60 * 60 * 1000 } // 30 days
-    )
-
-    // Create download record
-    await db.query(`
-      INSERT INTO downloads
-        (id, user_id, content_id, device_id, quality, status, license_expires)
-      VALUES ($1, $2, $3, $4, $5, 'pending', $6)
-    `, [
-      uuid(),
-      userId,
-      contentId,
-      deviceId,
-      quality,
-      new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
-    ])
-
-    // Return download manifest
-    return {
-      manifestUrl: await this.getDownloadManifest(contentId, variant),
-      license,
-      estimatedSize: await this.estimateSize(contentId, variant),
-      expiresAt: license.expiresAt
-    }
-  }
-
-  async getDownloadManifest(contentId, variant) {
-    // Generate manifest with all segments for offline
-    const segments = await db.query(`
-      SELECT segment_url, segment_number, duration
-      FROM video_segments
-      WHERE content_id = $1 AND variant_id = $2
-      ORDER BY segment_number
-    `, [contentId, variant.id])
-
-    return {
-      videoSegments: segments.rows,
-      audioUrl: await this.getAudioUrl(contentId),
-      subtitles: await this.getSubtitleUrls(contentId),
-      totalDuration: variant.duration,
-      totalSize: variant.file_size
-    }
-  }
-
-  async checkExpiredDownloads(userId, deviceId) {
-    // Find expired downloads
-    const expired = await db.query(`
-      SELECT id, content_id FROM downloads
-      WHERE user_id = $1 AND device_id = $2
-        AND license_expires < NOW()
-    `, [userId, deviceId])
-
-    return {
-      expiredIds: expired.rows.map(r => r.id),
-      message: `${expired.rows.length} downloads have expired`
-    }
-  }
-}
-```
-
----
-
-## Database Schema
-
-```sql
--- Content catalog
-CREATE TABLE content (
-  id UUID PRIMARY KEY,
-  title VARCHAR(500) NOT NULL,
-  description TEXT,
-  duration INTEGER NOT NULL, -- seconds
-  release_date DATE,
-  content_type VARCHAR(20), -- movie, series, episode
-  series_id UUID REFERENCES content(id),
-  season_number INTEGER,
-  episode_number INTEGER,
-  rating VARCHAR(10),
-  genres TEXT[],
-  master_resolution VARCHAR(20),
-  hdr_format VARCHAR(20),
-  status VARCHAR(20) DEFAULT 'processing',
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_content_type ON content(content_type);
-CREATE INDEX idx_content_series ON content(series_id, season_number, episode_number);
-
--- Encoded variants
-CREATE TABLE encoded_variants (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  content_id UUID REFERENCES content(id),
-  resolution INTEGER NOT NULL,
-  codec VARCHAR(20) NOT NULL,
-  hdr BOOLEAN DEFAULT false,
-  bitrate INTEGER NOT NULL,
-  file_path VARCHAR(500),
-  file_size BIGINT,
-  encoding_time INTEGER,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_variants_content ON encoded_variants(content_id);
-
--- Video segments (HLS)
-CREATE TABLE video_segments (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  content_id UUID REFERENCES content(id),
-  variant_id UUID REFERENCES encoded_variants(id),
-  segment_number INTEGER NOT NULL,
-  duration DECIMAL NOT NULL,
-  segment_url VARCHAR(500),
-  byte_size INTEGER
-);
-
-CREATE INDEX idx_segments_content ON video_segments(content_id, variant_id);
-
--- Watch progress
-CREATE TABLE watch_progress (
-  user_id UUID NOT NULL,
-  content_id UUID REFERENCES content(id),
-  position INTEGER NOT NULL, -- seconds
-  duration INTEGER NOT NULL,
-  completed BOOLEAN DEFAULT false,
-  updated_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (user_id, content_id)
-);
-
-CREATE INDEX idx_progress_user ON watch_progress(user_id, updated_at DESC);
-
--- Downloads
-CREATE TABLE downloads (
-  id UUID PRIMARY KEY,
-  user_id UUID NOT NULL,
-  content_id UUID REFERENCES content(id),
-  device_id VARCHAR(100) NOT NULL,
-  quality VARCHAR(20),
-  status VARCHAR(20) DEFAULT 'pending',
-  license_expires TIMESTAMP,
-  downloaded_at TIMESTAMP,
-  last_played TIMESTAMP
-);
-
-CREATE INDEX idx_downloads_user ON downloads(user_id);
-CREATE INDEX idx_downloads_expires ON downloads(license_expires);
-
--- User profiles
-CREATE TABLE user_profiles (
-  id UUID PRIMARY KEY,
-  user_id UUID NOT NULL,
-  name VARCHAR(100) NOT NULL,
-  avatar_url VARCHAR(500),
-  is_kids BOOLEAN DEFAULT false,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_profiles_user ON user_profiles(user_id);
-```
-
----
-
-## Key Design Decisions
-
-### 1. HLS over DASH
-
-**Decision**: Use HLS (HTTP Live Streaming) as primary format
-
-**Rationale**:
-- Native support on Apple devices
-- FairPlay DRM integration
-- Wide CDN support
-- Simpler implementation
-
-### 2. Per-Segment Encryption
-
-**Decision**: Encrypt each segment with unique key
-
-**Rationale**:
-- Enables secure seeking
-- Better security than single key
-- Required for offline playback
-
-### 3. Device-Specific Licenses
-
-**Decision**: Issue DRM licenses per device
-
-**Rationale**:
-- Enables device limits
-- Supports offline downloads
-- Can revoke individual devices
-
----
-
-## Consistency and Idempotency Semantics
-
-### Consistency Model by Operation
-
-| Operation | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Watch progress updates | Eventual (last-write-wins) | User only has one active playback session; conflicts rare |
-| Download initiation | Strong (serializable) | Must enforce download limits accurately |
-| Content ingestion | Strong (per-content) | Encoding jobs depend on consistent state |
-| License grants | Strong | Security-critical; must not double-issue |
-| Watchlist add/remove | Eventual | Low conflict risk; UI can handle stale reads |
-| Profile creation | Strong | Must enforce max profiles per account |
-
-### Idempotency Keys
-
-All mutating API endpoints accept an `Idempotency-Key` header to handle client retries safely.
-
-```javascript
-// Middleware for idempotent writes
-async function idempotencyMiddleware(req, res, next) {
-  const idempotencyKey = req.headers['idempotency-key']
-  if (!idempotencyKey) {
-    return next() // Non-idempotent request, proceed normally
-  }
-
-  const cacheKey = `idempotency:${req.userId}:${idempotencyKey}`
-
-  // Check if we already processed this request
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    const response = JSON.parse(cached)
-    return res.status(response.status).json(response.body)
-  }
-
-  // Store pending state to detect concurrent duplicates
-  const lockKey = `${cacheKey}:lock`
-  const acquired = await redis.set(lockKey, '1', 'NX', 'EX', 30)
-  if (!acquired) {
-    return res.status(409).json({ error: 'Request already in progress' })
-  }
-
-  // Wrap response to capture and cache result
-  const originalJson = res.json.bind(res)
-  res.json = async (body) => {
-    await redis.setex(cacheKey, 86400, JSON.stringify({
-      status: res.statusCode,
-      body
-    }))
-    await redis.del(lockKey)
-    return originalJson(body)
-  }
-
-  next()
-}
-```
-
-### Key Idempotency Patterns
-
-**Download Initiation:**
-```javascript
-async initiateDownload(userId, contentId, deviceId, quality, idempotencyKey) {
-  // Use composite key: user + content + device + quality
-  const downloadKey = `download:${userId}:${contentId}:${deviceId}:${quality}`
-
-  // Check for existing pending/active download
-  const existing = await db.query(`
-    SELECT id, status, license_expires FROM downloads
-    WHERE user_id = $1 AND content_id = $2 AND device_id = $3
-    AND status IN ('pending', 'downloading', 'complete')
-  `, [userId, contentId, deviceId])
-
-  if (existing.rows.length > 0) {
-    // Return existing download (idempotent)
-    return existing.rows[0]
-  }
-
-  // Create new download within transaction
-  return await db.transaction(async (tx) => {
-    const count = await tx.query(`
-      SELECT COUNT(*) FROM downloads WHERE user_id = $1 AND status = 'complete'
-    `, [userId])
-
-    if (count.rows[0].count >= 25) {
-      throw new Error('Download limit reached')
-    }
-
-    return await tx.query(`
-      INSERT INTO downloads (id, user_id, content_id, device_id, quality, status)
-      VALUES ($1, $2, $3, $4, $5, 'pending')
-      RETURNING *
-    `, [uuid(), userId, contentId, deviceId, quality])
-  })
-}
-```
-
-**Watch Progress (Last-Write-Wins):**
-```javascript
-// Client includes local timestamp; server uses it for conflict resolution
-async updateProgress(userId, contentId, position, clientTimestamp) {
-  await db.query(`
-    INSERT INTO watch_progress (user_id, content_id, position, client_timestamp, updated_at)
-    VALUES ($1, $2, $3, $4, NOW())
-    ON CONFLICT (user_id, content_id)
-    DO UPDATE SET
-      position = CASE
-        WHEN watch_progress.client_timestamp < $4 THEN $3
-        ELSE watch_progress.position
-      END,
-      client_timestamp = GREATEST(watch_progress.client_timestamp, $4),
-      updated_at = NOW()
-  `, [userId, contentId, position, clientTimestamp])
-}
-```
-
-### Replay Handling
-
-- **Transcoding jobs**: Job ID derived from content ID + profile hash; worker checks completion before starting
-- **License grants**: License ID is deterministic (hash of user + content + device + timestamp window); duplicate requests return same license
-- **Notification delivery**: Each notification has unique ID; client deduplicates on receipt
-
----
-
-## Observability
-
-### Metrics (Prometheus)
-
-**Key Application Metrics:**
-```javascript
-// metrics.js - Prometheus metrics for local development
-const promClient = require('prom-client')
-
-// Request latency histogram
-const httpRequestDuration = new promClient.Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
-})
-
-// Playback start latency (time to first frame)
-const playbackStartLatency = new promClient.Histogram({
-  name: 'playback_start_latency_seconds',
-  help: 'Time from play request to first frame rendered',
-  labelNames: ['device_type', 'quality'],
-  buckets: [0.5, 1, 1.5, 2, 2.5, 3, 5, 10]
-})
-
-// Active streams gauge
-const activeStreams = new promClient.Gauge({
-  name: 'active_streams_total',
-  help: 'Number of currently active video streams',
-  labelNames: ['quality', 'device_type']
-})
-
-// Transcoding job duration
-const transcodingDuration = new promClient.Histogram({
-  name: 'transcoding_job_duration_seconds',
-  help: 'Duration of transcoding jobs',
-  labelNames: ['resolution', 'codec'],
-  buckets: [60, 300, 600, 1800, 3600, 7200]
-})
-
-// DRM license issuance
-const licenseRequests = new promClient.Counter({
-  name: 'drm_license_requests_total',
-  help: 'Total DRM license requests',
-  labelNames: ['status', 'device_type']
-})
-
-// CDN cache hit ratio
-const cdnCacheHits = new promClient.Counter({
-  name: 'cdn_cache_hits_total',
-  help: 'CDN cache hit count',
-  labelNames: ['edge_location', 'content_type']
-})
-
-const cdnCacheMisses = new promClient.Counter({
-  name: 'cdn_cache_misses_total',
-  help: 'CDN cache miss count',
-  labelNames: ['edge_location', 'content_type']
-})
-```
-
-### SLI Definitions and Alert Thresholds
-
-| SLI | Target | Warning Threshold | Critical Threshold |
-|-----|--------|-------------------|-------------------|
-| Playback start latency (p95) | < 2s | > 2.5s | > 4s |
-| API availability | 99.9% | < 99.5% | < 99% |
-| Streaming availability | 99.99% | < 99.95% | < 99.9% |
-| Manifest generation latency (p95) | < 100ms | > 150ms | > 300ms |
-| DRM license latency (p95) | < 200ms | > 300ms | > 500ms |
-| CDN cache hit rate | > 95% | < 90% | < 80% |
-| Transcoding success rate | > 99% | < 98% | < 95% |
-
-**Alerting Rules (Prometheus format):**
-```yaml
-# alerts.yml
-groups:
-  - name: apple-tv-streaming
-    rules:
-      - alert: HighPlaybackLatency
-        expr: histogram_quantile(0.95, rate(playback_start_latency_seconds_bucket[5m])) > 2.5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Playback start latency exceeds 2.5s (p95)"
-
-      - alert: CriticalPlaybackLatency
-        expr: histogram_quantile(0.95, rate(playback_start_latency_seconds_bucket[5m])) > 4
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Playback start latency exceeds 4s (p95)"
-
-      - alert: LowCacheHitRate
-        expr: rate(cdn_cache_hits_total[10m]) / (rate(cdn_cache_hits_total[10m]) + rate(cdn_cache_misses_total[10m])) < 0.9
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "CDN cache hit rate below 90%"
-
-      - alert: TranscodingFailureSpike
-        expr: rate(transcoding_job_failures_total[5m]) / rate(transcoding_job_total[5m]) > 0.02
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Transcoding failure rate exceeds 2%"
-
-      - alert: DRMLicenseErrors
-        expr: rate(drm_license_requests_total{status="error"}[5m]) > 10
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High rate of DRM license failures"
-```
-
-### Structured Logging
-
-```javascript
-// Structured logging with correlation IDs
-const logger = require('pino')({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  }
-})
-
-// Request logging middleware
-function requestLogger(req, res, next) {
-  const requestId = req.headers['x-request-id'] || uuid()
-  req.log = logger.child({
-    requestId,
-    userId: req.userId,
-    method: req.method,
-    path: req.path
-  })
-
-  const start = Date.now()
-  res.on('finish', () => {
-    req.log.info({
-      statusCode: res.statusCode,
-      duration: Date.now() - start,
-      contentLength: res.get('content-length')
-    }, 'request completed')
-  })
-
-  next()
-}
-
-// Example: Playback event logging
-async function logPlaybackEvent(event) {
-  logger.info({
-    event: 'playback',
-    action: event.action, // 'start', 'pause', 'seek', 'quality_change', 'error'
-    userId: event.userId,
-    contentId: event.contentId,
-    deviceId: event.deviceId,
-    position: event.position,
-    quality: event.quality,
-    bufferHealth: event.bufferHealth,
-    bandwidth: event.bandwidth
-  }, `playback:${event.action}`)
-}
-```
-
-### Distributed Tracing
-
-```javascript
-// OpenTelemetry setup for local development
-const { NodeTracerProvider } = require('@opentelemetry/node')
-const { SimpleSpanProcessor } = require('@opentelemetry/tracing')
-const { JaegerExporter } = require('@opentelemetry/exporter-jaeger')
-
-const provider = new NodeTracerProvider()
-provider.addSpanProcessor(new SimpleSpanProcessor(
-  new JaegerExporter({
-    serviceName: 'apple-tv-api',
-    endpoint: 'http://localhost:14268/api/traces'
-  })
-))
-provider.register()
-
-const tracer = provider.getTracer('apple-tv')
-
-// Example: Trace playback request flow
-async function handlePlaybackRequest(req, res) {
-  const span = tracer.startSpan('playback.request')
-  span.setAttribute('user.id', req.userId)
-  span.setAttribute('content.id', req.params.contentId)
-
-  try {
-    // Check subscription
-    const subSpan = tracer.startSpan('subscription.check', { parent: span })
-    const subscription = await checkSubscription(req.userId)
-    subSpan.end()
-
-    // Generate manifest
-    const manifestSpan = tracer.startSpan('manifest.generate', { parent: span })
-    const manifest = await generateManifest(req.params.contentId)
-    manifestSpan.setAttribute('variant.count', manifest.variants.length)
-    manifestSpan.end()
-
-    // Issue DRM license
-    const drmSpan = tracer.startSpan('drm.license', { parent: span })
-    const license = await issueLicense(req.userId, req.params.contentId)
-    drmSpan.end()
-
-    span.setStatus({ code: 'OK' })
-    return { manifest, license }
-  } catch (error) {
-    span.recordException(error)
-    span.setStatus({ code: 'ERROR', message: error.message })
-    throw error
-  } finally {
-    span.end()
-  }
-}
-```
-
-### Audit Logging
-
-```javascript
-// Security-relevant events logged separately for compliance
-const auditLogger = require('pino')({
-  level: 'info',
-  transport: {
-    target: 'pino/file',
-    options: { destination: './logs/audit.log' }
-  }
-})
-
-// Audit events
-const AuditEvents = {
-  LICENSE_ISSUED: 'drm.license.issued',
-  LICENSE_REVOKED: 'drm.license.revoked',
-  DOWNLOAD_STARTED: 'download.started',
-  DOWNLOAD_DELETED: 'download.deleted',
-  DEVICE_REGISTERED: 'device.registered',
-  DEVICE_REMOVED: 'device.removed',
-  PROFILE_CREATED: 'profile.created',
-  PROFILE_DELETED: 'profile.deleted',
-  SUBSCRIPTION_CHANGED: 'subscription.changed',
-  CONTENT_ACCESSED: 'content.accessed'
-}
-
-async function auditLog(event, data) {
-  auditLogger.info({
-    timestamp: new Date().toISOString(),
-    event,
-    userId: data.userId,
-    deviceId: data.deviceId,
-    contentId: data.contentId,
-    ipAddress: data.ipAddress,
-    userAgent: data.userAgent,
-    details: data.details
-  })
-
-  // Also store in database for querying
-  await db.query(`
-    INSERT INTO audit_log (event, user_id, device_id, content_id, ip_address, details, created_at)
-    VALUES ($1, $2, $3, $4, $5, $6, NOW())
-  `, [event, data.userId, data.deviceId, data.contentId, data.ipAddress, JSON.stringify(data.details)])
-}
-
-// Example usage
-await auditLog(AuditEvents.LICENSE_ISSUED, {
-  userId: user.id,
-  deviceId: device.id,
-  contentId: content.id,
-  ipAddress: req.ip,
-  userAgent: req.headers['user-agent'],
-  details: { licenseType: 'streaming', expiresAt: license.expiresAt }
-})
-```
-
-### Local Development Dashboard
-
-For local development, use a simple Grafana dashboard with docker-compose:
-
-```yaml
-# docker-compose.observability.yml
-services:
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3001:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-
-  jaeger:
-    image: jaegertracing/all-in-one:latest
-    ports:
-      - "16686:16686"  # UI
-      - "14268:14268"  # Collector
-```
-
----
-
-## Failure Handling
-
-### Retry Strategy with Backoff
-
-```javascript
-// Configurable retry with exponential backoff
-class RetryHandler {
-  constructor(options = {}) {
-    this.maxRetries = options.maxRetries || 3
-    this.baseDelay = options.baseDelay || 100 // ms
-    this.maxDelay = options.maxDelay || 10000 // ms
-    this.retryableErrors = options.retryableErrors || [
-      'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN'
-    ]
-  }
-
-  async execute(fn, context = {}) {
-    let lastError
-
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      try {
-        return await fn()
-      } catch (error) {
-        lastError = error
-
-        if (!this.isRetryable(error) || attempt === this.maxRetries) {
-          throw error
-        }
-
-        const delay = Math.min(
-          this.baseDelay * Math.pow(2, attempt) + Math.random() * 100,
-          this.maxDelay
-        )
-
-        logger.warn({
-          attempt: attempt + 1,
-          maxRetries: this.maxRetries,
-          delay,
-          error: error.message,
-          ...context
-        }, 'Retrying operation')
-
-        await this.sleep(delay)
-      }
-    }
-
-    throw lastError
-  }
-
-  isRetryable(error) {
-    if (error.statusCode >= 500) return true
-    if (error.statusCode === 429) return true // Rate limited
-    if (this.retryableErrors.includes(error.code)) return true
-    return false
-  }
-
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms))
-  }
-}
-
-// Usage with idempotency key
-const retry = new RetryHandler({ maxRetries: 3 })
-
-async function fetchWithRetry(url, options) {
-  return retry.execute(
-    () => fetch(url, {
-      ...options,
-      headers: {
-        ...options.headers,
-        'Idempotency-Key': options.idempotencyKey || uuid()
-      }
-    }),
-    { operation: 'fetch', url }
-  )
-}
-```
-
-### Circuit Breaker Pattern
-
-```javascript
-// Circuit breaker for external service calls (CDN, DRM server)
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5
-    this.resetTimeout = options.resetTimeout || 30000 // 30 seconds
-    this.halfOpenRequests = options.halfOpenRequests || 3
-
-    this.state = 'CLOSED'
-    this.failures = 0
-    this.successes = 0
-    this.lastFailureTime = null
-    this.halfOpenAttempts = 0
-  }
-
-  async execute(fn, fallback) {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailureTime > this.resetTimeout) {
-        this.state = 'HALF_OPEN'
-        this.halfOpenAttempts = 0
-      } else {
-        logger.warn({ state: this.state }, 'Circuit breaker open, using fallback')
-        return fallback()
-      }
-    }
-
-    try {
-      const result = await fn()
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      if (fallback) {
-        return fallback()
-      }
-      throw error
-    }
-  }
-
-  onSuccess() {
-    if (this.state === 'HALF_OPEN') {
-      this.halfOpenAttempts++
-      if (this.halfOpenAttempts >= this.halfOpenRequests) {
-        this.state = 'CLOSED'
-        this.failures = 0
-        logger.info('Circuit breaker closed')
-      }
-    }
-    this.failures = 0
-  }
-
-  onFailure() {
-    this.failures++
-    this.lastFailureTime = Date.now()
-
-    if (this.state === 'HALF_OPEN') {
-      this.state = 'OPEN'
-      logger.warn('Circuit breaker opened from half-open state')
-    } else if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN'
-      logger.warn({ failures: this.failures }, 'Circuit breaker opened')
-    }
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      failures: this.failures,
-      lastFailureTime: this.lastFailureTime
-    }
-  }
-}
-
-// Circuit breakers for each external dependency
-const circuitBreakers = {
-  drm: new CircuitBreaker({ failureThreshold: 3, resetTimeout: 60000 }),
-  cdn: new CircuitBreaker({ failureThreshold: 5, resetTimeout: 30000 }),
-  transcoding: new CircuitBreaker({ failureThreshold: 10, resetTimeout: 120000 })
-}
-
-// Example: DRM license with fallback
-async function getLicense(userId, contentId, deviceId) {
-  return circuitBreakers.drm.execute(
-    async () => {
-      return await drmService.issueLicense(userId, contentId, deviceId)
-    },
-    async () => {
-      // Fallback: Return cached license if available
-      const cached = await redis.get(`license:${userId}:${contentId}:${deviceId}`)
-      if (cached) {
-        logger.info('Using cached DRM license (circuit open)')
-        return JSON.parse(cached)
-      }
-      throw new Error('DRM service unavailable and no cached license')
-    }
-  )
-}
-```
-
-### Graceful Degradation
-
-```javascript
-// Degraded service modes when dependencies fail
-class DegradedModeHandler {
-  constructor() {
-    this.degradedFeatures = new Set()
-  }
-
-  enableDegradedMode(feature) {
-    this.degradedFeatures.add(feature)
-    logger.warn({ feature }, 'Enabling degraded mode')
-  }
-
-  disableDegradedMode(feature) {
-    this.degradedFeatures.delete(feature)
-    logger.info({ feature }, 'Disabling degraded mode')
-  }
-
-  isDegraed(feature) {
-    return this.degradedFeatures.has(feature)
-  }
-}
-
-const degradedMode = new DegradedModeHandler()
-
-// Example: Recommendations degrade gracefully
-async function getRecommendations(userId) {
-  if (degradedMode.isDegraded('recommendations')) {
-    // Return static popular content instead
-    return await getPopularContent()
-  }
-
-  try {
-    return await recommendationService.getPersonalized(userId)
-  } catch (error) {
-    logger.error({ error, userId }, 'Recommendation service failed')
-    degradedMode.enableDegradedMode('recommendations')
-    setTimeout(() => degradedMode.disableDegradedMode('recommendations'), 60000)
-    return await getPopularContent()
-  }
-}
-
-// Example: Quality degradation under load
-async function selectPlaybackQuality(userId, contentId, deviceInfo, networkConditions) {
-  const maxQuality = cdnService.getMaxBitrate(deviceInfo)
-
-  // Check system load
-  const systemLoad = await getSystemLoad()
-  if (systemLoad > 0.9) {
-    // Reduce max quality to shed load
-    return Math.min(maxQuality, 4500) // Cap at 1080p/4.5Mbps
-  }
-
-  // Check CDN health
-  const cdnHealth = circuitBreakers.cdn.getState()
-  if (cdnHealth.state !== 'CLOSED') {
-    return Math.min(maxQuality, 3000) // Cap at 720p/3Mbps
-  }
-
-  return maxQuality
-}
-```
-
-### Backup and Restore (Local Development)
-
-```bash
-#!/bin/bash
-# scripts/backup.sh - Backup PostgreSQL and essential data
-
-BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-
-# PostgreSQL dump
-pg_dump -h localhost -U postgres -d appletv \
-  --format=custom \
-  --file="$BACKUP_DIR/appletv.dump"
-
-# Export critical tables as CSV for quick inspection
-psql -h localhost -U postgres -d appletv -c \
-  "COPY content TO STDOUT WITH CSV HEADER" > "$BACKUP_DIR/content.csv"
-
-psql -h localhost -U postgres -d appletv -c \
-  "COPY user_profiles TO STDOUT WITH CSV HEADER" > "$BACKUP_DIR/profiles.csv"
-
-# Redis snapshot (if using persistence)
-if [ -f /var/lib/redis/dump.rdb ]; then
-  cp /var/lib/redis/dump.rdb "$BACKUP_DIR/redis.rdb"
-fi
-
-# MinIO bucket list (content storage)
-mc ls local/videos --recursive > "$BACKUP_DIR/minio-inventory.txt"
-
-echo "Backup completed: $BACKUP_DIR"
-```
-
-```bash
-#!/bin/bash
-# scripts/restore.sh - Restore from backup
-
-BACKUP_DIR=$1
-
-if [ -z "$BACKUP_DIR" ]; then
-  echo "Usage: ./restore.sh <backup_directory>"
-  exit 1
-fi
-
-# Restore PostgreSQL
-pg_restore -h localhost -U postgres -d appletv \
-  --clean --if-exists \
-  "$BACKUP_DIR/appletv.dump"
-
-# Restore Redis
-if [ -f "$BACKUP_DIR/redis.rdb" ]; then
-  redis-cli SHUTDOWN NOSAVE
-  cp "$BACKUP_DIR/redis.rdb" /var/lib/redis/dump.rdb
-  redis-server &
-fi
-
-echo "Restore completed from: $BACKUP_DIR"
-```
-
-### Backup Verification Testing
-
-```javascript
-// tests/backup-restore.test.js
-const { exec } = require('child_process')
-const db = require('../src/shared/db')
-
-describe('Backup and Restore', () => {
-  let originalContentCount
-  let backupDir
-
-  beforeAll(async () => {
-    // Record current state
-    const result = await db.query('SELECT COUNT(*) FROM content')
-    originalContentCount = parseInt(result.rows[0].count)
-
-    // Create backup
-    const { stdout } = await execPromise('./scripts/backup.sh')
-    backupDir = stdout.trim().split(': ')[1]
-  })
-
-  test('backup creates valid dump file', async () => {
-    const { stdout } = await execPromise(`pg_restore --list ${backupDir}/appletv.dump`)
-    expect(stdout).toContain('content')
-    expect(stdout).toContain('watch_progress')
-  })
-
-  test('restore recovers data correctly', async () => {
-    // Insert test data
-    await db.query(`INSERT INTO content (id, title, duration) VALUES ($1, $2, $3)`,
-      ['test-backup-id', 'Backup Test', 3600])
-
-    // Restore from backup
-    await execPromise(`./scripts/restore.sh ${backupDir}`)
-
-    // Verify test data is gone (restored to backup state)
-    const result = await db.query('SELECT * FROM content WHERE id = $1', ['test-backup-id'])
-    expect(result.rows.length).toBe(0)
-
-    // Verify original count restored
-    const countResult = await db.query('SELECT COUNT(*) FROM content')
-    expect(parseInt(countResult.rows[0].count)).toBe(originalContentCount)
-  })
-
-  afterAll(async () => {
-    // Cleanup backup
-    await execPromise(`rm -rf ${backupDir}`)
-  })
-})
-
-function execPromise(cmd) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, (error, stdout, stderr) => {
-      if (error) reject(error)
-      else resolve({ stdout, stderr })
-    })
-  })
-}
-```
-
-### Multi-Region Considerations (Learning Notes)
-
-For local development, we simulate multi-region behavior. In production:
-
-1. **Active-Active Regions**: Each region handles reads/writes independently
-   - Watch progress uses last-write-wins with vector clocks
-   - Content catalog replicated asynchronously (eventual consistency acceptable)
-   - DRM licenses region-local (user connects to nearest region)
-
-2. **Failover Strategy**:
-   - DNS-based failover with health checks (30s TTL)
-   - CDN automatically routes to healthy origins
-   - Session affinity via regional cookie
-
-3. **Data Replication**:
-   - PostgreSQL: Streaming replication to read replicas, async to other regions
-   - Redis: Redis Cluster with cross-region replication disabled (region-local cache)
-   - MinIO: Cross-region replication for video segments (eventual consistency)
-
-**Local Simulation:**
-```yaml
-# docker-compose.multiregion.yml - Simulate two regions
-services:
-  # Region A
-  api-region-a:
-    build: .
-    ports:
-      - "3001:3000"
-    environment:
-      - REGION=us-west
-      - DATABASE_URL=postgresql://postgres:pass@db-a:5432/appletv
-
-  db-a:
-    image: postgres:16
-    environment:
-      - POSTGRES_DB=appletv
-      - POSTGRES_PASSWORD=pass
-
-  # Region B
-  api-region-b:
-    build: .
-    ports:
-      - "3002:3000"
-    environment:
-      - REGION=us-east
-      - DATABASE_URL=postgresql://postgres:pass@db-b:5432/appletv
-
-  db-b:
-    image: postgres:16
-    environment:
-      - POSTGRES_DB=appletv
-      - POSTGRES_PASSWORD=pass
-
-  # Load balancer simulating geo-routing
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "3000:80"
-    volumes:
-      - ./nginx-geo.conf:/etc/nginx/nginx.conf
-```
-
----
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Streaming format | HLS | DASH | Apple ecosystem |
-| DRM | FairPlay | Widevine | Native integration |
-| Encoding | HEVC + H.264 | AV1 | Device support |
-| CDN strategy | Multi-CDN | Single CDN | Reliability |
-| Offline | License-based | Time-based | Flexibility |
-| Watch progress consistency | Eventual (LWW) | Strong | Low conflict, better latency |
-| Retries | Exponential backoff | Fixed interval | Avoids thundering herd |
-| Circuit breaker | Per-service | Global | Isolates failures |
-
----
-
-## Implementation Notes
-
-This section documents the actual implementation of observability, resilience, and consistency patterns in the backend codebase. Each change addresses specific Codex feedback about production-readiness.
-
-### 1. Prometheus Metrics (`shared/metrics.js`)
-
-**Why this improves the system:**
-
-Prometheus metrics enable data-driven decision making and proactive issue detection. Without metrics, operators are blind to performance degradation until users complain.
-
-**Key metrics implemented:**
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_request_duration_seconds` | Histogram | Tracks API latency distribution for SLI monitoring |
-| `playback_start_latency_seconds` | Histogram | Measures time-to-first-frame, critical UX metric |
-| `active_streams_total` | Gauge | Real-time concurrent stream count for capacity planning |
-| `manifest_generation_duration_seconds` | Histogram | Identifies HLS manifest bottlenecks |
-| `segment_requests_total` | Counter | Tracks CDN/origin load per content |
-| `streaming_errors_total` | Counter | Error rate monitoring by type |
-| `circuit_breaker_state` | Gauge | Visualizes circuit breaker health (0=closed, 1=half-open, 2=open) |
-| `watch_progress_updates_total` | Counter | Tracks sync success/conflict/error rates |
-| `idempotent_requests_total` | Counter | Monitors idempotency cache effectiveness |
-
-**SLI targets defined:**
-- Playback start latency (p95) < 2s
-- Manifest generation (p95) < 100ms
-- API availability > 99.9%
-- Streaming availability > 99.99%
-
-**How to access:** `GET /metrics` returns Prometheus-formatted metrics.
-
-### 2. Structured Logging with Pino (`shared/logger.js`)
-
-**Why this improves the system:**
-
-Console.log statements are inadequate for production debugging. Structured logging enables:
-- Log aggregation and search (e.g., Loki, Elasticsearch)
-- Request correlation across services via `requestId`
-- Contextual debugging with user/profile/content identifiers
-- Performance (pino is 5x faster than winston)
-
-**Features implemented:**
-
-1. **Request correlation:** Every request gets a `requestId` (from `X-Request-Id` header or auto-generated UUID)
-2. **Child loggers:** Each request has a logger with pre-bound context (userId, profileId, method, path)
-3. **Automatic request logging:** Logs request completion with duration and status
-4. **Audit logging:** Separate logger for security events (login, license issuance, content access)
-
-**Audit events tracked:**
-- `drm.license.issued` / `drm.license.revoked`
-- `playback.started`
-- `content.accessed`
-- `auth.login.success` / `auth.login.failed`
-- `profile.created` / `profile.deleted`
-
-**Log format example:**
-```json
-{
-  "level": "info",
-  "time": "2025-01-16T10:30:00.000Z",
-  "requestId": "abc-123",
-  "userId": "user-456",
-  "method": "GET",
-  "path": "/api/stream/content-789/master.m3u8",
-  "statusCode": 200,
-  "duration": 45,
-  "msg": "request completed"
-}
-```
-
-### 3. Circuit Breaker Pattern (`shared/circuitBreaker.js`)
-
-**Why this improves the system:**
-
-External dependencies (CDN, transcoding service, DRM server) can fail. Without circuit breakers:
-- Failed calls block threads waiting for timeouts
-- Cascading failures bring down the entire service
-- Recovery is slow as traffic hammers the recovering service
-
-**Implementation using opossum:**
-
-| Service | Timeout | Error Threshold | Reset Timeout |
-|---------|---------|-----------------|---------------|
-| CDN | 5s | 30% | 15s |
-| Transcoding | 5min | 50% | 2min |
-| DRM | 5s | 25% | 60s |
-| Storage | 10s | 40% | 30s |
-
-**Circuit states:**
-- **Closed:** Normal operation, requests pass through
-- **Open:** Requests fail fast, fallback is used
-- **Half-Open:** Limited requests test if service recovered
-
-**Fallback strategies:**
-- CDN: Return cached content or error gracefully
-- Transcoding: Queue job for later processing
-- DRM: No fallback (license is required for playback)
-- Storage: Return cached data if available
-
-**Usage in streaming routes:**
-```javascript
-const content = await withCircuitBreaker('storage', async () => {
-  return db.query('SELECT * FROM content WHERE id = $1', [contentId]);
-});
-```
-
-### 4. Idempotency for Playback State Sync (`shared/idempotency.js`)
-
-**Why this improves the system:**
-
-Mobile clients retry requests on network failures. Without idempotency:
-- Duplicate progress updates could create inconsistent state
-- User sees "position jumping" when syncing across devices
-- Database writes are wasted on duplicate operations
-
-**Two-layer idempotency implemented:**
-
-**Layer 1: Global Idempotency Middleware**
-- Clients send `Idempotency-Key` header
-- Response cached in Redis for 24 hours
-- Concurrent duplicates receive 409 Conflict
-- Subsequent retries receive cached response
-
-**Layer 2: Last-Write-Wins for Watch Progress**
-- `client_timestamp` column added to `watch_progress` table
-- Updates only apply if `client_timestamp` is newer
-- Stale updates are acknowledged but not persisted
-- Response includes `wasUpdated: boolean`
-
-**Database schema change:**
-```sql
-ALTER TABLE watch_progress
-ADD COLUMN client_timestamp BIGINT;
-```
-
-**Conflict resolution SQL:**
 ```sql
 INSERT INTO watch_progress (..., client_timestamp, ...)
 ON CONFLICT (profile_id, content_id)
@@ -1757,209 +164,568 @@ DO UPDATE SET
   client_timestamp = GREATEST(watch_progress.client_timestamp, $new_timestamp);
 ```
 
-**Batch sync endpoint:** `POST /api/watch/progress/batch` for offline-to-online sync (max 50 updates per request).
+"Continue Watching" shows content where `position > 60s` AND `progress < 90%`, ordered by `updated_at DESC`.
 
-### 5. Enhanced Health Checks (`/health`, `/health/live`, `/health/ready`)
+### 6. Recommendations
 
-**Why this improves the system:**
+The recommendation engine generates multiple content rows for the home screen:
 
-Kubernetes and load balancers need to know service health. Simple "200 OK" checks miss partial failures.
+- **Continue Watching**: In-progress content (profile-specific)
+- **Because You Watched X**: Content similar to recently completed shows
+- **Trending**: Popular content weighted by recent view velocity
+- **New Releases**: Recently added content matching profile genre preferences
+- **For Kids** (kids profiles): Age-appropriate content only
 
-**Endpoints implemented:**
+### 7. Offline Downloads
 
-| Endpoint | Purpose | Checks |
-|----------|---------|--------|
-| `/health` | Deep health with details | DB, Redis, circuit breakers |
-| `/health/live` | Liveness probe | Process is running |
-| `/health/ready` | Readiness probe | DB + Redis connectivity |
-
-**Response format:**
-```json
-{
-  "status": "healthy",
-  "timestamp": "2025-01-16T10:30:00.000Z",
-  "uptime": 3600,
-  "version": "1.0.0",
-  "responseTime": 12,
-  "checks": {
-    "database": { "status": "healthy", "latency": 5 },
-    "redis": { "status": "healthy", "latency": 2 },
-    "circuitBreakers": {
-      "cdn": { "state": "closed", "stats": { "fires": 100, "failures": 2 } },
-      "storage": { "state": "closed" }
-    }
-  }
-}
-```
-
-### 6. Graceful Shutdown
-
-**Why this improves the system:**
-
-Abrupt termination loses in-flight requests and corrupts connections. Graceful shutdown:
-- Closes Redis connections cleanly
-- Drains database connection pool
-- Logs shutdown events for debugging
-
-**Implementation:**
-```javascript
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-
-async function shutdown(signal) {
-  logger.info({ signal }, 'Shutdown signal received');
-  await redisClient.quit();
-  await db.pool.end();
-  process.exit(0);
-}
-```
-
-### Summary of Files Changed/Added
-
-| File | Type | Purpose |
-|------|------|---------|
-| `src/shared/logger.js` | New | Pino structured logging with audit logging |
-| `src/shared/metrics.js` | New | Prometheus metrics definitions |
-| `src/shared/circuitBreaker.js` | New | Circuit breaker for CDN/transcoding/DRM |
-| `src/shared/idempotency.js` | New | Request idempotency and LWW conflict resolution |
-| `src/shared/index.js` | New | Exports all shared modules |
-| `src/index.js` | Modified | Integrated observability and health checks |
-| `src/routes/streaming.js` | Modified | Added metrics, circuit breaker, audit logging |
-| `src/routes/watchProgress.js` | Modified | Added idempotency, batch sync, conflict tracking |
-| `src/db/init.sql` | Modified | Added `client_timestamp` and `audit_log` table |
-
-### NPM Dependencies Added
-
-```json
-{
-  "prom-client": "^15.x",    // Prometheus metrics
-  "pino": "^9.x",            // Structured logging
-  "pino-http": "^10.x",      // HTTP request logging
-  "opossum": "^8.x"          // Circuit breaker
-}
-```
+Download management enforces account-wide limits (25 downloads) and time-based license expiry (30 days). The download manifest includes all segments for a selected quality tier plus audio and subtitle tracks. Expired downloads require re-licensing, which checks subscription status.
 
 ---
 
-## Frontend Architecture
+## Database Schema
 
-The frontend is built with React 19, TypeScript, Vite, Tanstack Router, and Zustand for state management. Components follow a modular architecture with clear separation of concerns.
+```sql
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
-### Directory Structure
+-- Users table
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+  subscription_tier VARCHAR(50) DEFAULT 'free' CHECK (subscription_tier IN ('free', 'monthly', 'yearly')),
+  subscription_expires_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- User profiles (multiple profiles per user for family sharing)
+CREATE TABLE user_profiles (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(100) NOT NULL,
+  avatar_url VARCHAR(500),
+  is_kids BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_profiles_user ON user_profiles(user_id);
+
+-- User devices
+CREATE TABLE user_devices (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  device_id VARCHAR(255) NOT NULL,
+  device_name VARCHAR(255),
+  device_type VARCHAR(50),
+  active BOOLEAN DEFAULT true,
+  last_used_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(user_id, device_id)
+);
+
+CREATE INDEX idx_devices_user ON user_devices(user_id);
+
+-- Content catalog
+CREATE TABLE content (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  title VARCHAR(500) NOT NULL,
+  description TEXT,
+  duration INTEGER NOT NULL, -- seconds
+  release_date DATE,
+  content_type VARCHAR(20) CHECK (content_type IN ('movie', 'series', 'episode')),
+  series_id UUID REFERENCES content(id) ON DELETE SET NULL,
+  season_number INTEGER,
+  episode_number INTEGER,
+  rating VARCHAR(10),
+  genres TEXT[],
+  thumbnail_url VARCHAR(500),
+  banner_url VARCHAR(500),
+  master_resolution VARCHAR(20),
+  hdr_format VARCHAR(20),
+  status VARCHAR(20) DEFAULT 'processing' CHECK (status IN ('processing', 'ready', 'disabled')),
+  featured BOOLEAN DEFAULT false,
+  view_count INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_content_type ON content(content_type);
+CREATE INDEX idx_content_series ON content(series_id, season_number, episode_number);
+CREATE INDEX idx_content_featured ON content(featured) WHERE featured = true;
+CREATE INDEX idx_content_status ON content(status);
+
+-- Encoded variants (different quality/codec versions)
+CREATE TABLE encoded_variants (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  resolution INTEGER NOT NULL,
+  codec VARCHAR(20) NOT NULL,
+  hdr BOOLEAN DEFAULT false,
+  bitrate INTEGER NOT NULL, -- kbps
+  file_path VARCHAR(500),
+  file_size BIGINT,
+  encoding_time INTEGER,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_variants_content ON encoded_variants(content_id);
+
+-- Video segments (HLS chunks)
+CREATE TABLE video_segments (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  variant_id UUID REFERENCES encoded_variants(id) ON DELETE CASCADE,
+  segment_number INTEGER NOT NULL,
+  duration DECIMAL NOT NULL,
+  segment_url VARCHAR(500),
+  byte_size INTEGER
+);
+
+CREATE INDEX idx_segments_content ON video_segments(content_id, variant_id);
+
+-- Audio tracks
+CREATE TABLE audio_tracks (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  language VARCHAR(10) NOT NULL,
+  name VARCHAR(100),
+  codec VARCHAR(20),
+  channels INTEGER DEFAULT 2,
+  file_path VARCHAR(500),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_audio_content ON audio_tracks(content_id);
+
+-- Subtitles
+CREATE TABLE subtitles (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  language VARCHAR(10) NOT NULL,
+  name VARCHAR(100),
+  type VARCHAR(20) DEFAULT 'subtitle' CHECK (type IN ('caption', 'subtitle')),
+  file_path VARCHAR(500),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_subtitles_content ON subtitles(content_id);
+
+-- Watch progress
+CREATE TABLE watch_progress (
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  profile_id UUID REFERENCES user_profiles(id) ON DELETE CASCADE,
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL DEFAULT 0, -- seconds
+  duration INTEGER NOT NULL,
+  completed BOOLEAN DEFAULT false,
+  client_timestamp BIGINT, -- For last-write-wins conflict resolution
+  updated_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (profile_id, content_id)
+);
+
+CREATE INDEX idx_progress_profile ON watch_progress(profile_id, updated_at DESC);
+
+-- Watch history (completed views)
+CREATE TABLE watch_history (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  profile_id UUID REFERENCES user_profiles(id) ON DELETE CASCADE,
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  watched_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_history_profile ON watch_history(profile_id, watched_at DESC);
+
+-- Downloads
+CREATE TABLE downloads (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  device_id VARCHAR(255) NOT NULL,
+  quality VARCHAR(20),
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'downloading', 'completed', 'expired')),
+  license_expires TIMESTAMP,
+  downloaded_at TIMESTAMP,
+  last_played TIMESTAMP
+);
+
+CREATE INDEX idx_downloads_user ON downloads(user_id);
+CREATE INDEX idx_downloads_expires ON downloads(license_expires);
+
+-- Watchlist (My List)
+CREATE TABLE watchlist (
+  profile_id UUID REFERENCES user_profiles(id) ON DELETE CASCADE,
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  added_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (profile_id, content_id)
+);
+
+CREATE INDEX idx_watchlist_profile ON watchlist(profile_id, added_at DESC);
+
+-- Content ratings by users
+CREATE TABLE content_ratings (
+  profile_id UUID REFERENCES user_profiles(id) ON DELETE CASCADE,
+  content_id UUID REFERENCES content(id) ON DELETE CASCADE,
+  rating INTEGER CHECK (rating >= 1 AND rating <= 5),
+  rated_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (profile_id, content_id)
+);
+
+CREATE INDEX idx_ratings_content ON content_ratings(content_id);
+
+-- Audit log for security-relevant events
+CREATE TABLE audit_log (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  event VARCHAR(100) NOT NULL,
+  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  device_id VARCHAR(255),
+  content_id UUID REFERENCES content(id) ON DELETE SET NULL,
+  ip_address VARCHAR(45),
+  details JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_user ON audit_log(user_id, created_at DESC);
+CREATE INDEX idx_audit_event ON audit_log(event, created_at DESC);
+CREATE INDEX idx_audit_created ON audit_log(created_at DESC);
+```
+
+### Schema Design Rationale
+
+**Self-referential content table**: The `content` table stores movies, series, and episodes in a single table. Episodes reference their parent series via `series_id`. This enables a single query to fetch a series with all its episodes, ordered by `(season_number, episode_number)`.
+
+**Profile-level watch state**: Watch progress and watchlists are keyed by `profile_id`, not `user_id`. Each family member has independent watch history. The primary key `(profile_id, content_id)` ensures one progress record per content per profile.
+
+**Encoded variants + segments**: The two-table split (`encoded_variants` -> `video_segments`) models the HLS hierarchy. Variants describe quality levels; segments are the individual chunks. This supports manifest generation without file system inspection.
+
+**Audit log**: Compliance-grade event logging for DRM license issuance, content access, and account changes. `ON DELETE SET NULL` preserves audit records when users or content are removed.
+
+---
+
+## API Design
+
+### Content
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/content` | Browse catalog with filters |
+| GET | `/api/content/:id` | Content details (episodes for series) |
+| GET | `/api/content/featured` | Featured/hero content |
+| GET | `/api/content/search?q=` | Search catalog |
+
+### Streaming
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/stream/:contentId/master.m3u8` | HLS master manifest |
+| GET | `/api/stream/:contentId/variant/:variantId` | Variant playlist |
+| GET | `/api/stream/:contentId/segment/:segmentId` | Video segment |
+
+### Watch Progress
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/watch/continue` | Continue Watching list |
+| POST | `/api/watch/progress` | Update watch position |
+| POST | `/api/watch/progress/batch` | Batch sync (offline to online) |
+
+### Watchlist
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/watchlist` | My List |
+| POST | `/api/watchlist` | Add to watchlist |
+| DELETE | `/api/watchlist/:contentId` | Remove from watchlist |
+
+### Recommendations
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/recommendations` | Personalized content rows |
+
+### Subscription
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/subscription` | Current subscription status |
+| POST | `/api/subscription` | Create/upgrade subscription |
+
+### Admin
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/admin/stats` | Platform statistics |
+| GET | `/api/admin/content` | Content management list |
+| POST | `/api/admin/content` | Add new content |
+| PUT | `/api/admin/content/:id` | Update content metadata |
+
+---
+
+## Key Design Decisions
+
+### 1. HLS over DASH
+
+**Decision**: Use HLS (HTTP Live Streaming) as the primary streaming format.
+
+**Why HLS works**: Native support across all Apple devices without additional player libraries. FairPlay DRM integrates natively with HLS. Every CDN supports HLS caching. The format is well-documented with Apple's HLS Authoring Specification providing clear guidelines for encoding ladders.
+
+**Why DASH fails for this use case**: DASH requires a third-party player on Apple devices. FairPlay DRM is HLS-only; using DASH would require Widevine, adding a second DRM system. While DASH is technically more flexible (supports more codecs), the operational overhead of maintaining two DRM systems outweighs the codec flexibility benefit for an Apple-first service.
+
+**Trade-off**: HLS has slightly higher segment overhead than DASH (TS containers vs. fMP4), and the Apple ecosystem lock-in limits flexibility. For non-Apple devices (web, smart TVs), we serve HLS in fMP4 containers which most modern players support.
+
+### 2. Per-Segment Encryption
+
+**Decision**: Encrypt each HLS segment with a unique key rather than using a single content-wide key.
+
+**Why it works**: Per-segment keys enable secure seeking -- the player only needs the key for the segment being played, not the entire file. This is required for offline playback where the device stores encrypted segments and licenses separately.
+
+**Why single-key fails**: A single key for the entire content means compromising one key exposes the whole film. Per-segment rotation limits the damage of any single key exposure to 6 seconds of content.
+
+**Trade-off**: More key rotation requests to the license server. We mitigate this by including multiple segment keys in each license response (key rotation window of 10 segments).
+
+### 3. Last-Write-Wins for Watch Progress
+
+**Decision**: Use client-side timestamps with last-write-wins (LWW) for watch progress conflict resolution rather than strong consistency.
+
+**Why LWW works**: A user only watches on one device at a time. Conflicts are rare and low-stakes -- the worst case is resuming from a position 30 seconds off. LWW enables fast writes without distributed locks, keeping progress updates under 10ms.
+
+**Why strong consistency fails**: Serializable transactions for every progress update (every 10 seconds during playback) would create lock contention. At millions of concurrent streams, this bottleneck would degrade playback experience for a problem (conflicting progress) that almost never occurs.
+
+**Trade-off**: In the rare case of simultaneous playback on two devices, one device's position will be silently overwritten. The client includes `client_timestamp` so the more recent write always wins, even if it arrives at the server later.
+
+---
+
+## Consistency and Idempotency
+
+### Consistency Model
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Watch progress | Eventual (LWW) | One active session per profile; conflicts rare |
+| Download initiation | Strong (serializable) | Must enforce download limits accurately |
+| Content ingestion | Strong (per-content) | Encoding jobs depend on consistent state |
+| License grants | Strong | Security-critical; must not double-issue |
+| Watchlist add/remove | Eventual | Low conflict risk; UI handles stale reads |
+| Profile creation | Strong | Must enforce max profiles per account |
+
+### Idempotency
+
+All mutating endpoints accept an `Idempotency-Key` header. The middleware checks Redis for an existing response, returning cached results for replayed requests. Concurrent duplicates receive 409 Conflict. Cached responses expire after 24 hours.
+
+Key idempotency patterns:
+- **Download initiation**: Composite key (user + content + device + quality); existing pending/active downloads returned instead of creating duplicates
+- **Watch progress**: Inherently idempotent via `ON CONFLICT` upsert with `client_timestamp` comparison
+- **Transcoding jobs**: Job ID derived from content ID + profile hash; workers check completion before starting
+
+---
+
+## Security and Auth
+
+### Session-Based Authentication
+
+Sessions stored in Redis via `connect-redis` with express-session. Cookies are `httpOnly`, `sameSite: lax`, with `secure: true` in production. Session secret configured via environment variable.
+
+### Subscription Enforcement
+
+Streaming endpoints check subscription status before generating manifest URLs. Expired subscriptions receive a 403 with redirect to subscription management. Free-tier users can browse the catalog but cannot stream.
+
+### Profile Management
+
+Each account supports up to 6 profiles. Kids profiles enforce content rating filters (G, PG only) at the API layer. Profile selection is stored in the session.
+
+---
+
+## Observability
+
+### Prometheus Metrics
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_request_duration_seconds` | Histogram | API latency by method, route, status |
+| `playback_start_latency_seconds` | Histogram | Time to first frame by device/quality |
+| `active_streams_total` | Gauge | Concurrent streams by quality/device |
+| `manifest_generation_duration_seconds` | Histogram | HLS manifest build time |
+| `streaming_errors_total` | Counter | Errors by type (DRM, network, codec) |
+| `circuit_breaker_state` | Gauge | Health of external dependencies |
+| `watch_progress_updates_total` | Counter | Sync success/conflict/error rates |
+| `idempotent_requests_total` | Counter | Idempotency cache hit/miss |
+
+### SLI/SLO Targets
+
+| SLI | Target | Warning | Critical |
+|-----|--------|---------|----------|
+| Playback start latency (p95) | < 2s | > 2.5s | > 4s |
+| API availability | 99.9% | < 99.5% | < 99% |
+| Streaming availability | 99.99% | < 99.95% | < 99.9% |
+| Manifest generation (p95) | < 100ms | > 150ms | > 300ms |
+| CDN cache hit rate | > 95% | < 90% | < 80% |
+
+### Structured Logging
+
+JSON-formatted logs via Pino with request correlation (`requestId`), user/profile context, and separate audit logging for security events (license issuance, content access, login, device registration).
+
+---
+
+## Failure Handling
+
+### Circuit Breaker Pattern
+
+Independent circuit breakers for each external dependency:
+
+| Service | Timeout | Error Threshold | Reset Timeout |
+|---------|---------|-----------------|---------------|
+| CDN | 5s | 30% | 15s |
+| Transcoding | 5 min | 50% | 2 min |
+| DRM | 5s | 25% | 60s |
+| Storage | 10s | 40% | 30s |
+
+**Fallback strategies:**
+- **CDN failure**: Return cached content from origin or error gracefully
+- **Transcoding failure**: Queue job for later; content marked as "processing"
+- **DRM failure**: No fallback (license required for playback); user sees retry prompt
+- **Storage failure**: Return cached metadata if available
+
+### Graceful Degradation
+
+- **Recommendations down**: Return static "Popular Now" content
+- **Under high load**: Cap max quality at 1080p/4.5Mbps to shed load
+- **CDN unhealthy**: Reduce max quality to 720p/3Mbps
+
+### Retry Strategy
+
+Exponential backoff with jitter for retryable errors (5xx, 429, ETIMEDOUT, ECONNRESET). Max 3 retries with base delay 100ms, max delay 10s. Non-retryable errors (4xx) fail immediately.
+
+---
+
+## Scalability Considerations
+
+### What Breaks First
+
+1. **CDN cache hit rate under new releases**: A major premiere drives millions of simultaneous requests for the same content. Solution: predictive pre-positioning to edge nodes 24h before release.
+
+2. **Watch progress write volume**: Millions of concurrent viewers updating progress every 10 seconds. Solution: batch client-side updates, write to Redis first, flush to PostgreSQL asynchronously.
+
+3. **Transcoding backlog**: A content library expansion could overwhelm encoding workers. Solution: autoscale workers based on queue depth, prioritize by release date.
+
+### Horizontal Scaling Path
+
+- **API servers**: Stateless; scale horizontally behind load balancer
+- **PostgreSQL**: Read replicas for catalog queries; shard user data by `user_id`
+- **Redis**: Redis Cluster with slot-based sharding
+- **CDN**: Multi-CDN strategy (CloudFront + Akamai) for redundancy and geographic coverage
+- **Transcoding**: Spot instances for cost-effective parallel encoding
+
+### Multi-Region Strategy
+
+- Active-active regions with region-local databases
+- Watch progress syncs across regions with LWW conflict resolution
+- Content catalog replicated asynchronously (eventual consistency acceptable)
+- CDN automatically routes to healthy origins on regional failure
+
+---
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Streaming format | HLS | DASH | Native Apple device support, FairPlay integration |
+| DRM | FairPlay | Widevine | Native on all Apple devices |
+| Encoding | HEVC + H.264 | AV1 | Broader device support today |
+| CDN | Multi-CDN | Single CDN | Reliability and geographic coverage |
+| Watch progress | LWW (eventual) | Strong consistency | Low conflict risk, better write latency |
+| Offline | License-based (30 day) | Time-based stream | More flexible, supports subscription changes |
+| Retries | Exponential backoff | Fixed interval | Prevents thundering herd on recovery |
+| Circuit breaker | Per-service | Global | Isolates failures to specific dependencies |
+
+---
+
+## Implementation Notes
+
+This section maps the production architecture above to the actual local implementation.
+
+### Local Architecture
 
 ```
-frontend/src/
-├── components/              # Shared UI components
-│   ├── index.ts             # Barrel exports for all components
-│   ├── Header.tsx           # App header with navigation
-│   ├── ContentCard.tsx      # Movie/series thumbnail cards
-│   ├── ContentRow.tsx       # Horizontal scrolling content rows
-│   ├── HeroBanner.tsx       # Featured content hero section
-│   ├── VideoPlayer.tsx      # Main video player component
-│   ├── admin/               # Admin dashboard sub-components
-│   │   ├── index.ts         # Admin barrel exports
-│   │   ├── types.ts         # Admin-specific type definitions
-│   │   ├── AdminTabs.tsx    # Tab navigation component
-│   │   ├── StatCard.tsx     # Metric display cards
-│   │   ├── OverviewTab.tsx  # Platform statistics overview
-│   │   ├── ContentTab.tsx   # Content management table
-│   │   └── UsersTab.tsx     # User listing table
-│   └── player/              # Video player sub-components
-│       ├── index.ts         # Player barrel exports
-│       ├── types.ts         # Player-specific type definitions
-│       ├── PlayerTopBar.tsx # Back button and title display
-│       ├── ProgressBar.tsx  # Interactive seek bar
-│       ├── PlayerControls.tsx # Play/pause, volume, settings
-│       ├── QualitySettings.tsx # Quality selection dropdown
-│       └── VideoOverlay.tsx # Video area with play indicator
-├── routes/                  # Tanstack Router file-based routes
-│   ├── __root.tsx           # Root layout component
-│   ├── index.tsx            # Home page (/)
-│   ├── admin.tsx            # Admin dashboard (/admin)
-│   ├── watch.$contentId.tsx # Video player (/watch/:contentId)
-│   └── ...                  # Other pages
-├── stores/                  # Zustand state stores
-│   ├── authStore.ts         # Authentication and profile state
-│   ├── playerStore.ts       # Video playback state
-│   └── contentStore.ts      # Content catalog state
-├── services/                # API client functions
-│   └── api.ts               # REST API wrapper
-├── types/                   # Shared TypeScript types
-│   └── index.ts             # Content, User, Profile types
-└── utils/                   # Utility functions
-    └── index.ts             # Formatters and helpers
+┌─────────────────┐         ┌─────────────────┐
+│   React + Vite  │────────▶│  Express API    │
+│   :5173         │  HTTP   │  :3000          │
+│                 │◀────────│                 │
+│ - Home (Hero)   │         │ - Auth          │
+│ - Content Detail│         │ - Content CRUD  │
+│ - Video Player  │         │ - Streaming     │
+│ - Profile Mgmt  │         │ - Watch Progress│
+│ - Watchlist     │         │ - Watchlist     │
+│ - Account       │         │ - Subscriptions │
+│ - Admin Panel   │         │ - Recommendations│
+└─────────────────┘         │ - Admin         │
+                            └────────┬─────────┘
+                                     │
+              ┌──────────────────────┼──────────────────────┐
+              ▼                      ▼                      ▼
+     ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+     │   PostgreSQL    │    │  Valkey/Redis   │    │     MinIO       │
+     │   :5432         │    │  :6379          │    │  :9000 / :9001  │
+     │                 │    │                 │    │                 │
+     │ - All tables    │    │ - Sessions      │    │ - videos        │
+     │ - Full schema   │    │ - Idempotency   │    │ - thumbnails    │
+     │ - Audit log     │    │ - Cache         │    │                 │
+     └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
-### Component Design Principles
+### Production Patterns Actually Implemented
 
-1. **Modular Sub-components**: Large components are split into focused sub-components:
-   - Admin dashboard (409 lines) -> 6 sub-components (~60-150 lines each)
-   - Video player (409 lines) -> 5 sub-components (~50-100 lines each)
+**1. Prometheus Metrics** (`backend/src/shared/metrics.ts`)
 
-2. **Barrel Exports**: Each component directory has an `index.ts` for clean imports:
-   ```typescript
-   // Direct imports
-   import { AdminTabs, StatCard } from '../components/admin';
-   import { PlayerControls, ProgressBar } from '../components/player';
+Full `/metrics` endpoint with HTTP request duration histogram, playback start latency histogram, active streams gauge, manifest generation timing, streaming error counter, and circuit breaker state gauge. Includes Node.js default metrics (CPU, memory, event loop lag). Accessible at `GET /metrics`.
 
-   // Or via main barrel
-   import { VideoPlayer, AdminTabs } from '../components';
-   ```
+**2. Structured Logging with Pino** (`backend/src/shared/logger.ts`)
 
-3. **Type Colocation**: Types specific to a component group live in that directory's `types.ts`:
-   - `components/admin/types.ts` - AdminStats, AdminContent, AdminUser
-   - `components/player/types.ts` - PlayerStateProps, PlayerControlCallbacks
+JSON-formatted request logging with request correlation via `X-Request-Id` header. Child loggers carry user/profile/content context. Audit events logged for security-relevant operations (login, license issuance, content access, profile changes).
 
-4. **Custom Hooks**: Complex logic is extracted into custom hooks:
-   - `useAutoHideControls` - Auto-hide player controls after 3 seconds
-   - `useKeyboardControls` - Keyboard shortcut handling
-   - `usePlaybackSimulation` - Simulated video playback
-   - `useProgressAutoSave` - Periodic progress persistence
+**3. Circuit Breaker (Opossum)** (`backend/src/shared/circuitBreaker.ts`)
 
-5. **JSDoc Documentation**: All components and significant functions include JSDoc comments:
-   ```typescript
-   /**
-    * Statistic card component for displaying key metrics.
-    * Shows an icon, label, and value with a colored gradient background.
-    *
-    * @param props - StatCardProps with icon, label, value, and color
-    * @returns Colored stat card component with gradient background
-    */
-   export function StatCard({ icon, label, value, color }: StatCardProps) { ... }
-   ```
+Circuit breakers wrapping external service calls (CDN, transcoding, DRM, storage) using the `opossum` library. Configured with per-service timeouts and error thresholds. Health status exposed via `/health` endpoint and Prometheus gauge metrics.
 
-### Key Components
+**4. Idempotency Middleware** (`backend/src/shared/idempotency.ts`)
 
-| Component | Lines | Purpose |
-|-----------|-------|---------|
-| `VideoPlayer.tsx` | ~356 | Main player with 4 custom hooks for controls, keyboard, progress |
-| `PlayerControls.tsx` | ~447 | Bottom control bar with 7 button sub-components |
-| `admin.tsx` (route) | ~183 | Admin page orchestrating sub-components |
-| `OverviewTab.tsx` | ~173 | Stats cards and subscription breakdown |
-| `ContentTab.tsx` | ~188 | Content management table with featured toggle |
-| `UsersTab.tsx` | ~151 | User listing table with role badges |
+Global `Idempotency-Key` header support with Redis-backed response caching. 24-hour TTL. Concurrent duplicate detection via Redis lock. Watch progress uses database-level LWW via `client_timestamp` column.
 
-Note: `PlayerControls.tsx` contains 7 small button components (15-35 lines each) that are
-logically related and kept together for easier navigation. Each has JSDoc documentation.
+**5. HLS Manifest Generation** (`backend/src/routes/streaming.ts`)
 
-### State Management
+Generates HLS master playlists with quality variants from `encoded_variants` table data. Includes audio track groups and subtitle groups. Variant playlists list simulated segments. Note: actual video segments are simulated -- no real FFmpeg transcoding pipeline.
 
-**Zustand stores** provide centralized state:
+**6. Enhanced Health Checks** (`backend/src/index.ts`)
 
-- **authStore**: User authentication, profile selection, logout
-- **playerStore**: Playback state (isPlaying, currentTime, volume), quality selection, progress save
-- **contentStore**: Cached content catalog data
+Three-tier health checks: `/health/live` (liveness), `/health/ready` (DB + Redis connectivity), `/health` (deep check with component latency and circuit breaker state).
 
-Components subscribe to specific slices to avoid unnecessary re-renders:
-```typescript
-const { isPlaying } = usePlayerStore((state) => ({ isPlaying: state.isPlaying }));
-```
+**7. Graceful Shutdown** (`backend/src/index.ts`)
 
-### Styling
+SIGTERM/SIGINT handlers that close Redis connections and drain the database pool before exit.
 
-- **Tailwind CSS** for utility-first styling
-- Custom colors defined in `tailwind.config.js`:
-  - `apple-blue`, `apple-green`, `apple-red`, `apple-gray-*`
-- Gradient backgrounds for visual depth
-- Hover transitions for interactive elements
+### What Was Simplified or Substituted
 
+| Production Component | Local Substitute | Rationale |
+|----------------------|------------------|-----------|
+| CDN (multi-tier) | MinIO direct URLs | No edge caching needed locally |
+| FairPlay DRM | No encryption | Requires Apple developer certificates |
+| FFmpeg transcoding | Simulated variants in DB | No actual encoding pipeline |
+| Video segments | Simulated HLS playlists | No real .ts segment files |
+| OAuth/Apple ID | Session + bcrypt | Simpler for development |
+| Geo-licensing | No region enforcement | Single-region setup |
+| Multi-region DB | Single PostgreSQL | One machine |
+| Message queue | Synchronous processing | No Kafka/RabbitMQ needed at local scale |
+
+### What Was Omitted
+
+- **Real video transcoding** -- no FFmpeg pipeline; variants are seeded into the database
+- **Actual HLS segment delivery** -- manifests are generated but reference simulated URLs, not real .ts files
+- **DRM/FairPlay integration** -- no content encryption or license server
+- **Offline downloads** -- schema exists but no download manager or license generation
+- **Cross-device sync push** -- no WebSocket/push notification when progress updates on another device
+- **Real ABR client** -- video player simulates playback; no actual adaptive bitrate logic
+- **CDN with edge caching** -- all content served from MinIO or simulated URLs
+- **Kubernetes / auto-scaling** -- runs as single-process Express server
+- **Distributed tracing** -- OpenTelemetry not integrated despite being referenced in observability design
+- **Backup/restore scripts** -- documented in architecture but not implemented

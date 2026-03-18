@@ -2,7 +2,7 @@
 
 ## System Overview
 
-LinkedIn is a professional social network where users build career profiles, connect with colleagues, and discover job opportunities. Core challenges involve graph traversal for connections and multi-factor recommendation algorithms.
+LinkedIn is a professional social network where users build career profiles, connect with colleagues, and discover job opportunities. Core challenges involve graph traversal for connection degrees, multi-factor recommendation algorithms (PYMK, job matching), and feed ranking with professional context.
 
 **Learning Goals:**
 - Design efficient social graph storage and traversal
@@ -16,1653 +16,633 @@ LinkedIn is a professional social network where users build career profiles, con
 
 ### Functional Requirements
 
-1. **Profiles**: Professional history, skills, education
-2. **Connections**: Request, accept, view network
-3. **Feed**: Posts from connections, ranked by relevance
-4. **Jobs**: Post listings, apply, match candidates
-5. **Search**: Find people, companies, jobs
+1. **Profiles**: Professional history (experience, education, skills)
+2. **Connections**: Request, accept, view 1st/2nd/3rd degree network
+3. **Feed**: Posts from connections, ranked by relevance and engagement
+4. **Jobs**: Post listings, apply, match candidates to jobs
+5. **Search**: Find people, companies, jobs with relevance ranking
+6. **Recommendations**: People You May Know (PYMK) with multi-signal scoring
 
 ### Non-Functional Requirements
 
-- **Latency**: < 200ms for feed, < 500ms for PYMK
+- **Latency**: < 200ms for feed, < 500ms for PYMK computation
 - **Scale**: 900M users, 100B connections
 - **Availability**: 99.9% uptime
-- **Consistency**: Eventual for feed, strong for connections
+- **Consistency**: Eventual for feed and PYMK, strong for connection state
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+- **Users**: 900M total, 300M MAU, 100M DAU
+- **Connections**: 100B total, 500 average connections per active user
+- **Posts**: 5M new posts/day (~58/sec)
+- **Feed reads**: 100M DAU * 15 feed views/day = 1.5B feed requests/day (~17,400 QPS)
+- **PYMK requests**: 100M DAU * 2 views/day = 200M/day (~2,300 QPS)
+- **Job postings**: 20M active listings, 1M new/day
+- **Search queries**: 50M/day (~580 QPS)
+- **Connection graph**: 900M nodes, 100B edges, ~200 GB in adjacency list format
+
+### Local Development Scale
+
+- 2-5 concurrent users, ~50 connections, ~20 posts
+- Single PostgreSQL instance, single Valkey instance
+- Single Elasticsearch instance, single RabbitMQ instance
+- All services run as a single Express process
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Layer                             │
-│              React + Professional UI Components                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        API Gateway                              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Profile Service│    │ Graph Service │    │  Job Service  │
-│               │    │               │    │               │
-│ - CRUD profile│    │ - Connections │    │ - Listings    │
-│ - Skills      │    │ - Degrees     │    │ - Matching    │
-│ - Experience  │    │ - PYMK        │    │ - Applications│
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │   Graph Store     │    Elasticsearch          │
-│   - Profiles    │   - Connections   │    - Profile search       │
-│   - Jobs        │   - Traversals    │    - Job search           │
-│   - Companies   │   (Neo4j or       │    - Skill matching       │
-│                 │   PostgreSQL)     │                           │
-└─────────────────┴───────────────────┴───────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              Clients                                     │
+│                    (Web / Mobile / LinkedIn Apps)                         │
+└──────────────────────────────┬──────────────────────────────────────────┘
+                               │
+                     ┌─────────▼─────────┐
+                     │   API Gateway /   │
+                     │   Load Balancer   │
+                     └─────────┬─────────┘
+                               │
+       ┌──────────────────┬────┼────┬──────────────────┐
+       │                  │         │                   │
+┌──────▼──────┐  ┌────────▼───┐ ┌───▼──────────┐ ┌─────▼───────┐
+│  Profile    │  │ Connection │ │ Feed         │ │ Job         │
+│  Service    │  │ Service    │ │ Service      │ │ Service     │
+│             │  │            │ │              │ │             │
+│ - CRUD      │  │ - Requests │ │ - Ranking    │ │ - Listings  │
+│ - Skills    │  │ - PYMK     │ │ - Posts      │ │ - Matching  │
+│ - Experience│  │ - Degrees  │ │ - Comments   │ │ - Apply     │
+└──────┬──────┘  └─────┬──────┘ └──────┬───────┘ └──────┬──────┘
+       │               │               │                │
+       └───────┬───────┴───────┬───────┴────────┬───────┘
+               │               │                │
+┌──────────────▼──┐  ┌────────▼────────┐  ┌────▼──────────────┐
+│   PostgreSQL    │  │  Valkey/Redis   │  │  Elasticsearch    │
+│  (Users, Conns, │  │  (Sessions,     │  │  (Users, Jobs     │
+│   Posts, Jobs)  │  │   PYMK cache,   │  │   full-text       │
+│                 │  │   Feed cache,   │  │   search)         │
+│                 │  │   Rate limits)  │  │                   │
+└─────────────────┘  └────────────────┘  └───────────────────┘
+               │
+     ┌─────────▼─────────┐
+     │    RabbitMQ        │
+     │  (Feed fanout,     │
+     │   Notifications,   │
+     │   PYMK compute,    │
+     │   Search index)    │
+     └────────────────────┘
 ```
+
+At production scale, the architecture would add:
+- **Graph database** (e.g., LinkedIn's in-house LIquid) for connection traversal at billions of edges
+- **Kafka** for event streaming between services
+- **Dedicated PYMK service** with precomputed recommendations
+- **CDN** for profile images and static assets
+- **ML pipeline** for feed ranking, job matching, and recommendation quality
 
 ---
 
 ## Core Components
 
-### 1. Connection Degrees
+### 1. Connection Degree Calculation
 
-**Challenge**: Given user A, find all 2nd-degree connections efficiently
+**Challenge**: With 900M users and 100B connections, finding 2nd-degree connections (friends-of-friends) is a graph traversal problem that can explode in complexity.
 
-**Approach 1: SQL Recursive CTE**
-```sql
-WITH RECURSIVE connection_degrees AS (
-  -- First degree
-  SELECT connected_to as user_id, 1 as degree
-  FROM connections WHERE user_id = $1
+**Approaches**:
 
-  UNION
+| Approach | Latency | Storage | Freshness |
+|----------|---------|---------|-----------|
+| Real-time graph traversal | O(connections^2) | None extra | Real-time |
+| Precomputed 2nd-degree cache | O(1) lookup | Massive (per-user lists) | Stale (nightly refresh) |
+| Hybrid: cached 1st-degree, compute 2nd on demand | O(connections) | Moderate | 1-hour cache |
 
-  -- Second degree
-  SELECT c.connected_to, cd.degree + 1
-  FROM connections c
-  JOIN connection_degrees cd ON c.user_id = cd.user_id
-  WHERE cd.degree < 2
-)
-SELECT DISTINCT user_id, MIN(degree) as degree
-FROM connection_degrees
-GROUP BY user_id;
+**Chosen: Hybrid approach**. First-degree connections are cached in Valkey for 1 hour. Second-degree connections are computed on demand by intersecting first-degree lists. This works because the median LinkedIn user has ~500 connections, making the intersection manageable (~250K comparisons worst case).
+
+**Why real-time traversal fails at scale**: A user with 500 connections, each with 500 connections, produces 250,000 candidate 2nd-degree connections. Adding 3rd-degree multiplies again to 125M candidates. Without caching, every profile view triggers this computation.
+
+**Why full precomputation fails**: Storing every user's 2nd-degree list requires O(users * avg_2nd_degree) storage. With 900M users averaging 50K 2nd-degree connections, that is 45 trillion entries. Even with compact encoding, this exceeds practical storage limits.
+
+### 2. PYMK Algorithm (People You May Know)
+
+Multi-signal scoring combines graph proximity with professional similarity:
+
+| Signal | Weight | Rationale |
+|--------|--------|-----------|
+| Mutual connections | 10 points each | Strongest predictor of real-world relationship |
+| Same current company | 8 points | Colleagues often connect |
+| Same past company | 5 points | Alumni networks |
+| Same school | 5 points | Educational ties |
+| Shared skills | 2 points each | Professional affinity |
+| Same location | 2 points | Geographic proximity |
+
+The algorithm operates on 2nd-degree connections only (already connected users are excluded). Results are cached for 24 hours because the inputs (connections, experience, skills) change infrequently.
+
+**Why not collaborative filtering?** PYMK is not a content recommendation problem. It predicts real-world relationships, where explicit graph signals (mutual friends, shared employer) outperform latent factor models. LinkedIn's published research confirms that mutual connections alone account for >60% of successful connection predictions.
+
+### 3. Feed Ranking
+
+The feed uses a multi-factor scoring formula computed in SQL:
+
+```
+rank_score = (engagement_score * 0.3) + (recency_score * 0.5) + (relationship_boost)
+
+engagement_score = like_count + (comment_count * 2)
+recency_score = max(0, 100 - hours_since_posted)
+relationship_boost = 20 if author is the viewing user, else 0
 ```
 
-**Approach 2: Graph Database (Neo4j)**
-```cypher
-MATCH (me:User {id: $userId})-[:CONNECTED*1..2]-(other:User)
-WHERE other.id <> $userId
-RETURN other.id, min(length(path)) as degree
-```
+**Why comments are weighted 2x likes**: A comment represents higher engagement intent than a like. Professional content that generates discussion (comments) is more valuable to the network than content that receives passive approval (likes).
 
-**Approach 3: Precomputed + Cache (Chosen for scale)**
-- Precompute 2nd-degree connections nightly
-- Store in Valkey sorted sets
-- Refresh incrementally on new connections
+**Why recency dominates at 50%**: LinkedIn is a professional network where timely information matters. A job announcement from yesterday is more relevant than a thought leadership post from last week, even if the old post has more engagement. The linear decay (not exponential) ensures that high-engagement posts remain visible for ~4 days before falling off.
 
-### 2. People You May Know (PYMK)
+**Feed cache invalidation**: When a user creates a post, the feed caches for their first 50 connections are explicitly deleted. This ensures direct connections see new content immediately. Beyond 50 connections, the TTL-based cache (not yet implemented) handles eventual consistency.
 
-**Scoring Factors:**
-```javascript
-function pymkScore(userId, candidateId) {
-  let score = 0
+### 4. Job-Candidate Matching
 
-  // Mutual connections (strongest signal)
-  const mutuals = getMutualConnections(userId, candidateId)
-  score += mutuals.length * 10
+Job matching scores candidates against job requirements across multiple dimensions:
 
-  // Same company (current or past)
-  if (sameCompany(userId, candidateId)) score += 8
+| Dimension | Score Calculation |
+|-----------|-------------------|
+| Skills match | (matched_required / total_required * 60) + (matched_optional * 5) |
+| Experience level | 20 points if experience years >= required years |
+| Location | 15 points if job location matches candidate location |
+| Remote preference | 10 points if job is remote and candidate is remote-friendly |
 
-  // Same school
-  if (sameSchool(userId, candidateId)) score += 5
-
-  // Shared skills
-  const sharedSkills = getSharedSkills(userId, candidateId)
-  score += sharedSkills.length * 2
-
-  // Same industry
-  if (sameIndustry(userId, candidateId)) score += 3
-
-  // Geographic proximity
-  if (sameLocation(userId, candidateId)) score += 2
-
-  return score
-}
-```
-
-**Batch Processing:**
-- Run PYMK calculation daily in background
-- Store top 100 candidates per user
-- Invalidate on new connections
-
-### 3. Job-Candidate Matching
-
-**Multi-Factor Scoring:**
-```javascript
-function jobMatchScore(job, candidate) {
-  let score = 0
-
-  // Required skills match
-  const requiredSkills = job.requiredSkills
-  const candidateSkills = candidate.skills
-  const skillMatch = intersection(requiredSkills, candidateSkills).length
-  score += (skillMatch / requiredSkills.length) * 40
-
-  // Experience level
-  const expMatch = Math.abs(job.yearsRequired - candidate.yearsExperience)
-  score += Math.max(0, 25 - expMatch * 5)
-
-  // Location compatibility
-  if (job.remote || sameLocation(job, candidate)) score += 15
-
-  // Education match
-  if (educationMeets(job.education, candidate.education)) score += 10
-
-  // Company connection (knows someone there)
-  if (hasConnectionAtCompany(candidate, job.companyId)) score += 10
-
-  return score
-}
-```
+The matching score (0-100) is stored on the `job_applications` table as `match_score` for sorting and filtering.
 
 ---
 
 ## Database Schema
 
-This section documents the complete PostgreSQL schema for the LinkedIn system, including all tables, relationships, indexes, and the rationale behind key design decisions.
-
-### Entity-Relationship Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    LINKEDIN DATABASE SCHEMA                                  │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-
-                                    ┌─────────────┐
-                                    │  companies  │
-                                    ├─────────────┤
-                                    │ id (PK)     │
-                                    │ name        │
-                                    │ slug (UQ)   │
-                                    │ industry    │
-                                    │ size        │
-                                    │ location    │
-                                    └──────┬──────┘
-                                           │
-              ┌────────────────────────────┼────────────────────────────┐
-              │                            │                            │
-              ▼ 1:N                        ▼ 1:N                        ▼ 1:N
-    ┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
-    │   experiences   │          │      jobs       │          │      jobs       │
-    ├─────────────────┤          ├─────────────────┤          │ (posted_by_user)│
-    │ id (PK)         │          │ id (PK)         │          └────────┬────────┘
-    │ user_id (FK)    │          │ company_id (FK) │                   │
-    │ company_id (FK) │          │ posted_by (FK)──┼───────────────────┤
-    │ title           │          │ title           │                   │
-    │ is_current      │          │ status          │                   │
-    └────────┬────────┘          └────────┬────────┘                   │
-             │                            │                            │
-             │                            ├─────────────┐              │
-             │                            │             │              │
-             │                            ▼ M:N         ▼ 1:N          │
-             │                   ┌─────────────────┐  ┌──────────────┐ │
-             │                   │   job_skills    │  │    job_      │ │
-             │                   ├─────────────────┤  │ applications │ │
-             │                   │ job_id (PK,FK)  │  ├──────────────┤ │
-             │                   │ skill_id (PK,FK)│  │ id (PK)      │ │
-             │                   │ is_required     │  │ job_id (FK)  │ │
-             │                   └────────┬────────┘  │ user_id (FK) │ │
-             │                            │           │ status       │ │
-             │                            │           │ match_score  │ │
-             │                            ▼           └──────┬───────┘ │
-             │                   ┌─────────────────┐         │         │
-             │                   │     skills      │         │         │
-             │                   ├─────────────────┤         │         │
-             │                   │ id (PK)         │         │         │
-             │                   │ name (UQ)       │         │         │
-             │                   └────────┬────────┘         │         │
-             │                            │                  │         │
-             │                            ▼ M:N              │         │
-             │                   ┌─────────────────┐         │         │
-             │                   │   user_skills   │         │         │
-             │                   ├─────────────────┤         │         │
-             │                   │ user_id (PK,FK) │         │         │
-             │                   │ skill_id (PK,FK)│         │         │
-             │                   │ endorsement_cnt │         │         │
-             │                   └────────┬────────┘         │         │
-             │                            │                  │         │
-             ▼                            ▼                  ▼         ▼
-    ┌─────────────────────────────────────────────────────────────────────────────┐
-    │                                   users                                      │
-    ├─────────────────────────────────────────────────────────────────────────────┤
-    │ id (PK) │ email (UQ) │ first_name │ last_name │ headline │ role │ location │
-    └─────────────────────────────────────────────────────────────────────────────┘
-             │                   │                            │
-             │                   │                            │
-    ┌────────┴────────┐ ┌───────┴───────┐           ┌────────┴────────┐
-    │                 │ │               │           │                 │
-    ▼ 1:N             ▼ 1:N             ▼ M:N       ▼ 1:N             ▼ 1:N
-┌───────────┐   ┌───────────┐   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-│ education │   │   posts   │   │ connections │ │ connection_ │ │ audit_logs  │
-├───────────┤   ├───────────┤   ├─────────────┤ │  requests   │ ├─────────────┤
-│ id (PK)   │   │ id (PK)   │   │user_id(PK,FK│ ├─────────────┤ │ id (PK)     │
-│ user_id   │   │ user_id   │   │connected_to │ │ id (PK)     │ │ event_type  │
-│school_name│   │ content   │   │ (PK,FK)     │ │from_user_id │ │ actor_id(FK)│
-│ degree    │   │like_count │   │ CHECK:      │ │ to_user_id  │ │ target_type │
-│ field     │   │comment_cnt│   │user<connected│ │ status     │ │ details     │
-└───────────┘   └─────┬─────┘   └─────────────┘ └─────────────┘ └─────────────┘
-                      │
-         ┌────────────┴────────────┐
-         │                         │
-         ▼ 1:N                     ▼ M:N
-    ┌───────────────┐       ┌───────────────┐
-    │ post_comments │       │  post_likes   │
-    ├───────────────┤       ├───────────────┤
-    │ id (PK)       │       │ user_id(PK,FK)│
-    │ post_id (FK)  │       │ post_id(PK,FK)│
-    │ user_id (FK)  │       │ created_at    │
-    │ content       │       └───────────────┘
-    └───────────────┘
-
-Legend: PK = Primary Key, FK = Foreign Key, UQ = Unique, M:N = Many-to-Many
-```
-
 ### Complete Table Definitions
 
-#### 1. Core Entities
-
-**companies** - Organizations where users work or have worked
+#### 1. companies
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| name | VARCHAR(255) | NOT NULL | Company display name |
-| slug | VARCHAR(255) | UNIQUE NOT NULL | URL-friendly identifier |
-| description | TEXT | | Company description/about |
-| industry | VARCHAR(100) | | Industry category |
-| size | VARCHAR(50) | | Employee count range (e.g., '51-200') |
+| id | SERIAL | PRIMARY KEY | Company identifier |
+| name | VARCHAR(255) | NOT NULL | Company name |
+| slug | VARCHAR(255) | UNIQUE, NOT NULL | URL-friendly identifier |
+| description | TEXT | | Company description |
+| industry | VARCHAR(100) | | Industry sector |
+| size | VARCHAR(50) | | Employee count range |
 | location | VARCHAR(100) | | Headquarters location |
 | website | VARCHAR(255) | | Company website URL |
-| logo_url | VARCHAR(500) | | Company logo image URL |
-| created_at | TIMESTAMP | DEFAULT NOW() | Record creation timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last modification timestamp |
+| logo_url | VARCHAR(500) | | Company logo URL |
+| created_at | TIMESTAMP | DEFAULT NOW() | Creation timestamp |
 
-**users** - Core user profile information
+#### 2. users
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| email | VARCHAR(255) | UNIQUE NOT NULL | Login email address |
+| id | SERIAL | PRIMARY KEY | User identifier |
+| email | VARCHAR(255) | UNIQUE, NOT NULL | Login email |
 | password_hash | VARCHAR(255) | NOT NULL | bcrypt hashed password |
-| first_name | VARCHAR(100) | NOT NULL | User's first name |
-| last_name | VARCHAR(100) | NOT NULL | User's last name |
-| headline | VARCHAR(200) | | Professional tagline (e.g., "Software Engineer at Google") |
-| summary | TEXT | | About section / bio |
+| first_name | VARCHAR(100) | NOT NULL | First name |
+| last_name | VARCHAR(100) | NOT NULL | Last name |
+| headline | VARCHAR(200) | | Professional tagline |
+| summary | TEXT | | About section |
 | location | VARCHAR(100) | | Current location |
 | industry | VARCHAR(100) | | Primary industry |
-| profile_image_url | VARCHAR(500) | | Profile photo URL |
-| banner_image_url | VARCHAR(500) | | Profile banner URL |
-| connection_count | INTEGER | DEFAULT 0 | Denormalized 1st-degree connection count |
-| role | VARCHAR(20) | DEFAULT 'user' | Role: 'user', 'recruiter', 'admin' |
-| created_at | TIMESTAMP | DEFAULT NOW() | Account creation timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last profile update timestamp |
+| profile_image_url | VARCHAR(500) | | Profile photo |
+| banner_image_url | VARCHAR(500) | | Profile banner |
+| connection_count | INTEGER | DEFAULT 0 | Denormalized 1st-degree count |
+| role | VARCHAR(20) | DEFAULT 'user' | user, recruiter, admin |
+| created_at | TIMESTAMP | DEFAULT NOW() | Account creation |
 
-#### 2. Skills (Normalized)
+**Design rationale**: `connection_count` is denormalized because it appears on every profile view, connection card, and PYMK suggestion. Computing it from the connections table on every render would be expensive at scale.
 
-**skills** - Master list of skills for standardization
+#### 3. skills (normalized)
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| name | VARCHAR(100) | UNIQUE NOT NULL | Skill name (e.g., "Python", "Machine Learning") |
-| created_at | TIMESTAMP | DEFAULT NOW() | Record creation timestamp |
-
-**user_skills** - Junction table for user-skill relationships
+**skills** table:
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| user_id | INTEGER | PK, FK -> users(id) | User who has this skill |
-| skill_id | INTEGER | PK, FK -> skills(id) | Skill the user has |
-| endorsement_count | INTEGER | DEFAULT 0 | Number of endorsements from connections |
+| id | SERIAL | PRIMARY KEY | Skill identifier |
+| name | VARCHAR(100) | UNIQUE, NOT NULL | Skill name (e.g., "Python") |
 
-#### 3. Professional History
-
-**experiences** - Work history
+**user_skills** junction table:
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| user_id | INTEGER | FK -> users(id) | User this experience belongs to |
-| company_id | INTEGER | FK -> companies(id) | Link to company (if in system) |
-| company_name | VARCHAR(255) | NOT NULL | Denormalized company name |
+| user_id | INTEGER | FK -> users ON DELETE CASCADE | User |
+| skill_id | INTEGER | FK -> skills ON DELETE CASCADE | Skill |
+| endorsement_count | INTEGER | DEFAULT 0 | Endorsement count |
+| | | PRIMARY KEY (user_id, skill_id) | |
+
+**Design rationale**: Normalized skills (separate table with IDs) enable consistent PYMK matching. Without normalization, "JavaScript" vs "Javascript" vs "JS" would be treated as different skills.
+
+#### 4. experiences
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | SERIAL | PRIMARY KEY | Experience identifier |
+| user_id | INTEGER | FK -> users ON DELETE CASCADE | User |
+| company_id | INTEGER | FK -> companies ON DELETE SET NULL | Company reference |
+| company_name | VARCHAR(255) | NOT NULL | Denormalized for display |
 | title | VARCHAR(200) | NOT NULL | Job title |
-| location | VARCHAR(100) | | Job location |
-| start_date | DATE | NOT NULL | Employment start date |
-| end_date | DATE | | Employment end date (NULL if current) |
+| location | VARCHAR(100) | | Work location |
+| start_date | DATE | NOT NULL | Start date |
+| end_date | DATE | | End date (NULL = current) |
 | description | TEXT | | Role description |
-| is_current | BOOLEAN | DEFAULT FALSE | Currently employed here |
-| created_at | TIMESTAMP | DEFAULT NOW() | Record creation timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last modification timestamp |
+| is_current | BOOLEAN | DEFAULT FALSE | Current position flag |
 
-**education** - Academic history
+#### 5. education
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| user_id | INTEGER | FK -> users(id) | User this education belongs to |
+| id | SERIAL | PRIMARY KEY | Education identifier |
+| user_id | INTEGER | FK -> users ON DELETE CASCADE | User |
 | school_name | VARCHAR(255) | NOT NULL | Institution name |
-| degree | VARCHAR(100) | | Degree type (e.g., "Bachelor of Science") |
-| field_of_study | VARCHAR(100) | | Major/field (e.g., "Computer Science") |
-| start_year | INTEGER | | Year started |
-| end_year | INTEGER | | Year completed |
+| degree | VARCHAR(100) | | Degree type |
+| field_of_study | VARCHAR(100) | | Major/field |
+| start_year | INTEGER | | Start year |
+| end_year | INTEGER | | End year |
 | description | TEXT | | Additional details |
-| created_at | TIMESTAMP | DEFAULT NOW() | Record creation timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last modification timestamp |
 
-#### 4. Connections (Social Graph)
-
-**connections** - Bidirectional connection relationships
+#### 6. connections (Social Graph)
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| user_id | INTEGER | PK, FK -> users(id) | First user in connection (lower ID) |
-| connected_to | INTEGER | PK, FK -> users(id) | Second user in connection (higher ID) |
-| connected_at | TIMESTAMP | DEFAULT NOW() | When connection was formed |
+| user_id | INTEGER | FK -> users ON DELETE CASCADE | Smaller user ID |
+| connected_to | INTEGER | FK -> users ON DELETE CASCADE | Larger user ID |
+| connected_at | TIMESTAMP | DEFAULT NOW() | Connection established |
+| | | PRIMARY KEY (user_id, connected_to) | |
+| | | CHECK (user_id < connected_to) | Canonical ordering |
 
-*Note: The CHECK constraint `user_id < connected_to` ensures each connection is stored exactly once.*
+**Design rationale**: Storing connections with `user_id < connected_to` halves storage and eliminates duplicate records. A connection between users 5 and 12 is always stored as `(5, 12)`, never `(12, 5)`. Queries use `WHERE user_id = ? OR connected_to = ?` to find all connections for either user.
 
-**connection_requests** - Pending connection invitations
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| from_user_id | INTEGER | FK -> users(id) | User sending the request |
-| to_user_id | INTEGER | FK -> users(id) | User receiving the request |
-| message | TEXT | | Optional personalized message |
-| status | VARCHAR(20) | DEFAULT 'pending' | Status: 'pending', 'accepted', 'declined', 'withdrawn' |
-| created_at | TIMESTAMP | DEFAULT NOW() | Request sent timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last status change timestamp |
-
-*Note: UNIQUE(from_user_id, to_user_id) prevents duplicate requests.*
-
-#### 5. Feed and Content
-
-**posts** - User-generated content
+#### 7. connection_requests
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| user_id | INTEGER | FK -> users(id) | Post author |
-| content | TEXT | NOT NULL | Post text content |
-| image_url | VARCHAR(500) | | Optional attached image |
+| id | SERIAL | PRIMARY KEY | Request identifier |
+| from_user_id | INTEGER | FK -> users ON DELETE CASCADE | Sender |
+| to_user_id | INTEGER | FK -> users ON DELETE CASCADE | Recipient |
+| message | TEXT | | Personalized invitation |
+| status | VARCHAR(20) | DEFAULT 'pending' | pending, accepted, declined, withdrawn |
+| created_at | TIMESTAMP | DEFAULT NOW() | Request sent time |
+| | | UNIQUE(from_user_id, to_user_id) | One request per pair |
+
+#### 8. posts
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | SERIAL | PRIMARY KEY | Post identifier |
+| user_id | INTEGER | FK -> users ON DELETE CASCADE | Author |
+| content | TEXT | NOT NULL | Post text |
+| image_url | VARCHAR(500) | | Attached image |
 | like_count | INTEGER | DEFAULT 0 | Denormalized like count |
 | comment_count | INTEGER | DEFAULT 0 | Denormalized comment count |
 | share_count | INTEGER | DEFAULT 0 | Denormalized share count |
-| created_at | TIMESTAMP | DEFAULT NOW() | Post creation timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last edit timestamp |
+| created_at | TIMESTAMP | DEFAULT NOW() | Post creation time |
 
-**post_likes** - Tracks which users liked which posts
+**Indexes**: `(user_id)`, `(created_at DESC)`.
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| user_id | INTEGER | PK, FK -> users(id) | User who liked |
-| post_id | INTEGER | PK, FK -> posts(id) | Post that was liked |
-| created_at | TIMESTAMP | DEFAULT NOW() | When like occurred |
+#### 9. post_likes / post_comments
 
-**post_comments** - Comments on posts
+**post_likes**: `PRIMARY KEY (user_id, post_id)` prevents duplicate likes.
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| post_id | INTEGER | FK -> posts(id) | Parent post |
-| user_id | INTEGER | FK -> users(id) | Comment author |
-| content | TEXT | NOT NULL | Comment text |
-| created_at | TIMESTAMP | DEFAULT NOW() | Comment timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last edit timestamp |
+**post_comments**: Standard comment table with `post_id` FK and `user_id` FK. Flat structure (no threading) since LinkedIn comments are rarely deeply nested.
 
-#### 6. Jobs and Applications
-
-**jobs** - Job postings
+#### 10. jobs
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| company_id | INTEGER | FK -> companies(id) | Hiring company |
-| posted_by_user_id | INTEGER | FK -> users(id) | Recruiter who posted |
+| id | SERIAL | PRIMARY KEY | Job identifier |
+| company_id | INTEGER | FK -> companies ON DELETE CASCADE | Hiring company |
+| posted_by_user_id | INTEGER | FK -> users ON DELETE SET NULL | Recruiter who posted |
 | title | VARCHAR(200) | NOT NULL | Job title |
-| description | TEXT | NOT NULL | Full job description |
+| description | TEXT | NOT NULL | Full description |
 | location | VARCHAR(100) | | Job location |
-| is_remote | BOOLEAN | DEFAULT FALSE | Remote work allowed |
-| employment_type | VARCHAR(50) | | 'full-time', 'part-time', 'contract', 'internship' |
-| experience_level | VARCHAR(50) | | 'entry', 'associate', 'mid-senior', 'director', 'executive' |
+| is_remote | BOOLEAN | DEFAULT FALSE | Remote work flag |
+| employment_type | VARCHAR(50) | | full-time, part-time, contract, internship |
+| experience_level | VARCHAR(50) | | entry, associate, mid-senior, director, executive |
 | years_required | INTEGER | | Minimum years of experience |
-| salary_min | INTEGER | | Minimum salary (annual) |
-| salary_max | INTEGER | | Maximum salary (annual) |
-| status | VARCHAR(20) | DEFAULT 'active' | 'active', 'closed', 'filled', 'draft' |
-| created_at | TIMESTAMP | DEFAULT NOW() | Posted timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last edit timestamp |
+| salary_min | INTEGER | | Salary range minimum |
+| salary_max | INTEGER | | Salary range maximum |
+| status | VARCHAR(20) | DEFAULT 'active' | active, closed, filled, draft |
 
-**job_skills** - Required skills for jobs
+**job_skills**: Many-to-many junction with `is_required` flag (required vs nice-to-have).
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| job_id | INTEGER | PK, FK -> jobs(id) | Job posting |
-| skill_id | INTEGER | PK, FK -> skills(id) | Required skill |
-| is_required | BOOLEAN | DEFAULT TRUE | TRUE = required, FALSE = nice-to-have |
+**job_applications**: `UNIQUE(job_id, user_id)` prevents duplicate applications. Includes `match_score` (0-100) for candidate ranking.
 
-**job_applications** - User applications to jobs
+#### 11. audit_logs
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| job_id | INTEGER | FK -> jobs(id) | Job applied to |
-| user_id | INTEGER | FK -> users(id) | Applicant |
-| resume_url | VARCHAR(500) | | Uploaded resume URL |
-| cover_letter | TEXT | | Application cover letter |
-| status | VARCHAR(20) | DEFAULT 'pending' | 'pending', 'reviewed', 'interviewing', 'offered', 'rejected', 'withdrawn' |
-| match_score | INTEGER | | AI-computed fit score (0-100) |
-| created_at | TIMESTAMP | DEFAULT NOW() | Application timestamp |
-| updated_at | TIMESTAMP | DEFAULT NOW() | Last status change |
-
-*Note: UNIQUE(job_id, user_id) ensures one application per user per job.*
-
-#### 7. Audit and Security
-
-**audit_logs** - Security-sensitive operation tracking
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing identifier |
-| event_type | VARCHAR(100) | NOT NULL | Event category (e.g., 'auth.login.success') |
-| actor_id | INTEGER | FK -> users(id) | User who performed action |
-| actor_ip | INET | | IP address of actor |
-| target_type | VARCHAR(50) | | Entity type: 'user', 'profile', 'connection', 'post', 'job', 'session' |
-| target_id | INTEGER | | ID of entity acted upon |
-| action | VARCHAR(50) | NOT NULL | Short action description |
+| id | SERIAL | PRIMARY KEY | Log identifier |
+| event_type | VARCHAR(100) | NOT NULL | Event category |
+| actor_id | INTEGER | FK -> users ON DELETE SET NULL | Acting user |
+| actor_ip | INET | | Client IP |
+| target_type | VARCHAR(50) | | Entity type |
+| target_id | INTEGER | | Entity ID |
+| action | VARCHAR(50) | NOT NULL | Action description |
 | details | JSONB | DEFAULT '{}' | Event-specific data |
-| created_at | TIMESTAMP | DEFAULT NOW() | Event timestamp |
+| created_at | TIMESTAMP | DEFAULT NOW() | Event time |
 
-### Foreign Key Relationships and Cascade Behaviors
+**Indexes**: `(actor_id, created_at)`, `(target_type, target_id, created_at)`, `(event_type, created_at)`, `(created_at)`, partial index for admin actions.
 
-| Parent Table | Child Table | FK Column | ON DELETE | Rationale |
-|--------------|-------------|-----------|-----------|-----------|
-| users | user_skills | user_id | CASCADE | Skills meaningless without user |
-| skills | user_skills | skill_id | CASCADE | Remove user-skill links when skill deleted |
-| users | experiences | user_id | CASCADE | Work history belongs to user |
-| companies | experiences | company_id | SET NULL | Keep experience record even if company deleted |
-| users | education | user_id | CASCADE | Education belongs to user |
-| users | connections | user_id | CASCADE | Remove connection when user deleted |
-| users | connections | connected_to | CASCADE | Remove connection when user deleted |
-| users | connection_requests | from_user_id | CASCADE | Request meaningless without sender |
-| users | connection_requests | to_user_id | CASCADE | Request meaningless without recipient |
-| users | posts | user_id | CASCADE | Posts belong to author |
-| users | post_likes | user_id | CASCADE | Like records removed with user |
-| posts | post_likes | post_id | CASCADE | Like records removed with post |
-| posts | post_comments | post_id | CASCADE | Comments removed with post |
-| users | post_comments | user_id | CASCADE | Comments removed with author |
-| companies | jobs | company_id | CASCADE | Jobs belong to company |
-| users | jobs | posted_by_user_id | SET NULL | Keep job even if recruiter leaves |
-| jobs | job_skills | job_id | CASCADE | Skill requirements belong to job |
-| skills | job_skills | skill_id | CASCADE | Remove requirement when skill deleted |
-| jobs | job_applications | job_id | CASCADE | Applications belong to job |
-| users | job_applications | user_id | CASCADE | Applications belong to applicant |
-| users | audit_logs | actor_id | SET NULL | Keep audit trail even if user deleted |
+---
 
-**Rationale for Cascade Choices:**
-
-1. **CASCADE for user-owned data**: When a user deletes their account, their posts, comments, connections, and applications should be removed to respect data deletion requests (GDPR compliance).
-
-2. **SET NULL for references that should persist**:
-   - `experiences.company_id`: A user's work history should remain visible even if the company profile is deleted from the system.
-   - `jobs.posted_by_user_id`: Job listings should remain active even if the recruiter who posted them leaves the company.
-   - `audit_logs.actor_id`: Security audit trails must persist for compliance, even after user account deletion.
-
-3. **CASCADE for junction tables**: Many-to-many relationship records (user_skills, job_skills, post_likes) have no meaning without both sides of the relationship.
-
-### Indexes
-
-```sql
--- User lookups
-CREATE INDEX idx_users_email ON users(email);
-
--- Experience queries (profile view, company employee lists)
-CREATE INDEX idx_experiences_user_id ON experiences(user_id);
-CREATE INDEX idx_experiences_company_id ON experiences(company_id);
-
--- Education queries (profile view)
-CREATE INDEX idx_education_user_id ON education(user_id);
-
--- Feed queries (posts by user, chronological feed)
-CREATE INDEX idx_posts_user_id ON posts(user_id);
-CREATE INDEX idx_posts_created_at ON posts(created_at DESC);
-
--- Job search and listing
-CREATE INDEX idx_jobs_company_id ON jobs(company_id);
-CREATE INDEX idx_jobs_status ON jobs(status);
-
--- Application tracking
-CREATE INDEX idx_job_applications_user_id ON job_applications(user_id);
-CREATE INDEX idx_job_applications_job_id ON job_applications(job_id);
-
--- Connection request notifications
-CREATE INDEX idx_connection_requests_to_user ON connection_requests(to_user_id, status);
-
--- Audit log queries
-CREATE INDEX idx_audit_logs_actor ON audit_logs(actor_id, created_at);
-CREATE INDEX idx_audit_logs_target ON audit_logs(target_type, target_id, created_at);
-CREATE INDEX idx_audit_logs_event ON audit_logs(event_type, created_at);
-CREATE INDEX idx_audit_logs_created ON audit_logs(created_at);
-
--- Partial index for admin action compliance queries
-CREATE INDEX idx_audit_logs_admin ON audit_logs(created_at)
-  WHERE event_type LIKE 'admin.%';
-```
-
-### Design Rationale
-
-#### Why Normalize Skills?
-
-Skills are normalized into a separate `skills` table rather than stored as arrays or JSON because:
-
-1. **Standardization**: Ensures "JavaScript", "javascript", and "JS" map to a single canonical skill
-2. **Searchability**: Enables efficient skill-based user and job search
-3. **Matching**: Powers job-candidate matching algorithms by comparing skill IDs
-4. **Analytics**: Allows trending skills analysis and skill gap identification
-
-#### Why Store Connections Once with CHECK Constraint?
-
-The `connections` table uses `CHECK (user_id < connected_to)` to store each bidirectional connection exactly once:
-
-```sql
--- Alice (id=5) connects with Bob (id=10)
--- Stored as: (5, 10) regardless of who initiated
--- NOT stored: (10, 5) - would violate CHECK constraint
-```
-
-Benefits:
-- **50% storage reduction**: One row per connection instead of two
-- **No duplicates**: Constraint prevents accidental duplicate entries
-- **Consistent queries**: Finding connections requires checking both directions:
-  ```sql
-  SELECT connected_to FROM connections WHERE user_id = $1
-  UNION
-  SELECT user_id FROM connections WHERE connected_to = $1
-  ```
-
-#### Why Denormalize Counts?
-
-Several tables include denormalized counts (`connection_count`, `like_count`, `comment_count`):
-
-1. **Performance**: Avoids COUNT(*) queries on every profile/post view
-2. **Scale**: At LinkedIn scale (billions of connections), counting is expensive
-3. **Trade-off**: Requires maintaining counts via triggers or application logic
-
-Count updates use atomic operations:
-```sql
-UPDATE posts SET like_count = like_count + 1 WHERE id = $1;
-```
-
-#### Why company_name in Experiences?
-
-The `experiences` table includes both `company_id` (FK) and `company_name` (VARCHAR):
-
-1. **company_id**: Links to company profile for rich display (logo, link to company page)
-2. **company_name**: Denormalized copy for cases where:
-   - Company doesn't exist in system (small/defunct companies)
-   - Company is deleted but experience should persist
-   - Fast display without JOINs
-
-### Data Flow for Key Operations
-
-#### 1. Sending a Connection Request
+## API Design
 
 ```
-User A clicks "Connect" on User B's profile
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│ INSERT INTO connection_requests         │
-│ (from_user_id, to_user_id, message)     │
-│ VALUES (A, B, 'Hi, let''s connect!')    │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────┐
-│ INSERT INTO audit_logs                  │
-│ (event_type, actor_id, target_type,     │
-│  target_id, action, details)            │
-│ VALUES ('connection.request', A,         │
-│  'user', B, 'sent', '{}')               │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-         Queue notification for User B
-```
+# Authentication
+POST   /api/auth/register           - Create account
+POST   /api/auth/login              - Login
+POST   /api/auth/logout             - Logout
+GET    /api/auth/me                 - Get current user
 
-#### 2. Accepting a Connection Request
+# Users / Profiles
+GET    /api/users/:id               - Get full profile
+PUT    /api/users/:id               - Update profile
+GET    /api/users/:id/experience    - Get work history
+POST   /api/users/:id/experience    - Add experience
+GET    /api/users/:id/education     - Get education
+POST   /api/users/:id/education     - Add education
+GET    /api/users/:id/skills        - Get skills with endorsements
+POST   /api/users/:id/skills        - Add skill
+POST   /api/users/:id/skills/:skillId/endorse - Endorse a skill
+GET    /api/users/search?q=         - Search users (Elasticsearch)
 
-```
-User B accepts User A's request
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│ BEGIN TRANSACTION                       │
-├─────────────────────────────────────────┤
-│ UPDATE connection_requests              │
-│ SET status = 'accepted'                 │
-│ WHERE from_user_id = A AND to_user_id = B│
-├─────────────────────────────────────────┤
-│ INSERT INTO connections                 │
-│ (user_id, connected_to)                 │
-│ VALUES (MIN(A,B), MAX(A,B))             │
-├─────────────────────────────────────────┤
-│ UPDATE users SET connection_count =     │
-│   connection_count + 1 WHERE id IN (A,B)│
-├─────────────────────────────────────────┤
-│ COMMIT                                  │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-         Queue PYMK recalculation for A and B
-         Queue notification for User A
-```
+# Connections
+POST   /api/connections/request     - Send connection request
+POST   /api/connections/:id/accept  - Accept request
+POST   /api/connections/:id/reject  - Reject request
+DELETE /api/connections/:id         - Remove connection
+GET    /api/connections             - List connections
+GET    /api/connections/pending     - Pending requests
+GET    /api/connections/mutual/:userId - Mutual connections
+GET    /api/connections/degree/:userId - Connection degree (1st/2nd/3rd)
+GET    /api/connections/pymk        - People You May Know
 
-#### 3. Creating a Post
+# Feed
+GET    /api/feed                    - Personalized feed
+POST   /api/feed/posts              - Create post
+POST   /api/feed/posts/:id/like     - Like post
+DELETE /api/feed/posts/:id/like     - Unlike post
+POST   /api/feed/posts/:id/comments - Add comment
+GET    /api/feed/posts/:id/comments - Get comments
 
-```
-User creates post with content
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│ INSERT INTO posts                       │
-│ (user_id, content, image_url)           │
-│ VALUES ($userId, $content, $imageUrl)   │
-│ RETURNING id                            │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────┐
-│ Index post in Elasticsearch             │
-│ for content search                      │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────┐
-│ Queue: feed.generate                    │
-│ Fanout to all connections' feeds        │
-│ (async via RabbitMQ)                    │
-└─────────────────────────────────────────┘
-```
-
-#### 4. Applying for a Job
-
-```
-User applies to job posting
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│ INSERT INTO job_applications            │
-│ (job_id, user_id, resume_url,           │
-│  cover_letter, status)                  │
-│ VALUES ($jobId, $userId, $resumeUrl,    │
-│  $coverLetter, 'pending')               │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────┐
-│ Queue: jobs.match                       │
-│ Calculate match_score based on:         │
-│ - User skills vs job_skills             │
-│ - Years experience vs years_required    │
-│ - Location compatibility                │
-│ - Education match                       │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────┐
-│ UPDATE job_applications                 │
-│ SET match_score = $calculatedScore      │
-│ WHERE id = $applicationId               │
-└────────────────────┬────────────────────┘
-                     │
-                     ▼
-         Notify recruiter of new application
-```
-
-#### 5. Feed Generation (Query)
-
-```
-User loads their feed
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ -- Get posts from 1st-degree connections                    │
-│ WITH user_connections AS (                                  │
-│   SELECT connected_to AS conn_id FROM connections           │
-│   WHERE user_id = $userId                                   │
-│   UNION                                                     │
-│   SELECT user_id AS conn_id FROM connections                │
-│   WHERE connected_to = $userId                              │
-│ )                                                           │
-│ SELECT p.*, u.first_name, u.last_name, u.headline,          │
-│        u.profile_image_url,                                 │
-│        -- Ranking score                                     │
-│        (p.like_count * 0.3 +                                │
-│         p.comment_count * 0.5 +                             │
-│         EXTRACT(EPOCH FROM NOW() - p.created_at) / -3600    │
-│        ) AS rank_score                                      │
-│ FROM posts p                                                │
-│ JOIN users u ON p.user_id = u.id                            │
-│ WHERE p.user_id IN (SELECT conn_id FROM user_connections)   │
-│    OR p.user_id = $userId                                   │
-│ ORDER BY rank_score DESC                                    │
-│ LIMIT 20 OFFSET $offset                                     │
-└─────────────────────────────────────────────────────────────┘
+# Jobs
+GET    /api/jobs                    - List jobs with filters
+GET    /api/jobs/:id                - Get job details
+POST   /api/jobs                    - Create job posting
+POST   /api/jobs/:id/apply          - Apply to job
+GET    /api/jobs/:id/applicants     - Get applicants with match scores
+GET    /api/jobs/search?q=          - Search jobs (Elasticsearch)
 ```
 
 ---
 
 ## Key Design Decisions
 
-### 1. Hybrid Graph Storage
+### 1. Canonical Connection Storage (user_id < connected_to)
 
-**Decision**: PostgreSQL for profile data, optional Neo4j for deep traversals
+**Chosen**: Store each connection once with smaller ID first, constrained by `CHECK (user_id < connected_to)`.
 
-**Rationale**:
-- Most queries are 1-2 hops (efficient in SQL)
-- Neo4j for complex PYMK calculations (optional)
-- Keeps primary stack simple
+**Why this works**: A connection between users 5 and 12 is always row `(5, 12)`. To check if two users are connected, the application normalizes the pair before querying. This halves the storage (one row per connection, not two) and eliminates the ambiguity of "which direction was it stored."
 
-### 2. Precomputed Recommendations
+**What breaks with bidirectional storage**: Storing both `(5, 12)` and `(12, 5)` doubles the connections table. At 100B connections, that is 200B rows. Worse, every connection mutation requires two writes and consistency between them. If one write succeeds and the other fails, the graph becomes asymmetric.
 
-**Decision**: Batch compute PYMK and job matches offline
+**What we give up**: Queries are slightly more complex. Instead of `WHERE user_id = ?`, we need `WHERE user_id = ? OR connected_to = ?`. But this is a negligible query planning cost compared to the storage and consistency benefits.
 
-**Rationale**:
-- Expensive calculations (millions of comparisons)
-- Results don't need real-time freshness
-- Cache invalidated on relevant changes
+### 2. Pull Model for Feed (Not Fanout-on-Write)
 
-### 3. Skills as First-Class Entities
+**Chosen**: Feed is computed on demand by querying posts from the user's connections.
 
-**Decision**: Normalized skills table with endorsements
+**Why pull model works for LinkedIn**: The median LinkedIn user has ~500 connections and checks their feed 2-3 times/day. Pull model computes the feed at read time: fetch connections from cache, query posts from those users, rank them. At 500 connections, this is a single `WHERE user_id = ANY(array_of_500_ids) ORDER BY rank_score DESC LIMIT 20` query, which PostgreSQL handles in <50ms with proper indexes.
 
-**Rationale**:
-- Enables skill-based search and matching
-- Standardizes skill names across users
-- Supports endorsement counting
+**What breaks with fanout-on-write**: When a user creates a post, fanout-on-write copies it to every follower's feed timeline. A LinkedIn influencer with 10M followers would require 10M write operations per post. With 5M posts/day and an average of 500 connections, fanout generates 2.5B write operations/day just for feed maintenance. This is operationally expensive and introduces write amplification.
 
----
+**What we give up**: Feed latency is higher than pre-materialized feeds. A pull model requires a database query per feed request, while fanout serves from a pre-built list. For LinkedIn's usage pattern (professional network, not real-time messaging), sub-200ms query latency is sufficient.
 
-## Async Processing and Message Queues
+### 3. Elasticsearch for User and Job Search
 
-For background jobs, fanout operations, and handling backpressure, we use RabbitMQ with well-defined delivery semantics.
+**Chosen**: Elasticsearch with fuzzy matching and field boosting for user and job discovery.
 
-### Queue Architecture
+**Why Elasticsearch over PostgreSQL full-text**: LinkedIn search requires fuzzy matching (finding "Jhon" when searching "John"), multi-field search with different weights (name boosted 2x, skills boosted 2x for jobs), and faceted filtering (by location, remote, experience level). PostgreSQL `tsvector` supports full-text search but lacks native fuzzy matching and sophisticated relevance tuning.
 
-```
-┌──────────────┐     ┌─────────────────────────────────────────────────────┐
-│ API Services │────▶│                    RabbitMQ                         │
-└──────────────┘     ├─────────────────────────────────────────────────────┤
-                     │  Exchanges:                                          │
-                     │  ├── linkedin.direct (direct)                        │
-                     │  ├── linkedin.fanout (fanout)                        │
-                     │  └── linkedin.topic (topic)                          │
-                     ├─────────────────────────────────────────────────────┤
-                     │  Queues:                                             │
-                     │  ├── pymk.compute (PYMK batch jobs)                  │
-                     │  ├── feed.generate (feed building)                   │
-                     │  ├── notifications (email/push)                      │
-                     │  ├── search.index (Elasticsearch sync)               │
-                     │  └── jobs.match (candidate matching)                 │
-                     └─────────────────────────────────────────────────────┘
-                                          │
-                     ┌────────────────────┼────────────────────┐
-                     ▼                    ▼                    ▼
-              ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-              │PYMK Worker  │     │Feed Worker  │     │Index Worker │
-              └─────────────┘     └─────────────┘     └─────────────┘
-```
-
-### Queue Definitions and Use Cases
-
-| Queue | Purpose | Delivery | Concurrency | Retry Policy |
-|-------|---------|----------|-------------|--------------|
-| `pymk.compute` | Recalculate PYMK for a user | At-least-once | 2 workers | 3 retries, exponential backoff |
-| `feed.generate` | Build personalized feed | At-least-once | 3 workers | 5 retries, 30s delay |
-| `notifications` | Send emails, push notifications | At-least-once | 5 workers | 3 retries, then dead-letter |
-| `search.index` | Sync profile/job changes to Elasticsearch | At-least-once | 2 workers | Infinite retries, 60s delay |
-| `jobs.match` | Match candidates to new job postings | At-least-once | 2 workers | 3 retries |
-
-### Message Schemas
-
-```typescript
-// Connection event - triggers PYMK recalculation and feed updates
-interface ConnectionEvent {
-  type: 'connection.created' | 'connection.removed';
-  userId: string;
-  connectedUserId: string;
-  timestamp: string; // ISO 8601
-  idempotencyKey: string; // UUID for deduplication
-}
-
-// Profile update - triggers search index update
-interface ProfileUpdateEvent {
-  type: 'profile.updated';
-  userId: string;
-  changedFields: string[]; // ['headline', 'skills', 'experience']
-  timestamp: string;
-  idempotencyKey: string;
-}
-
-// Job posted - triggers candidate matching
-interface JobPostedEvent {
-  type: 'job.posted';
-  jobId: string;
-  companyId: string;
-  requiredSkills: string[];
-  timestamp: string;
-  idempotencyKey: string;
-}
-```
-
-### Delivery Semantics
-
-**At-Least-Once Delivery** (chosen for all queues):
-- Messages are acknowledged only after successful processing
-- Workers must be idempotent (use `idempotencyKey` to detect duplicates)
-- Idempotency tracking stored in Valkey with 24-hour TTL
-
-```typescript
-// Idempotent message processing
-async function processMessage(message: ConnectionEvent) {
-  const idempotencyKey = `processed:${message.idempotencyKey}`;
-
-  // Check if already processed
-  const alreadyProcessed = await valkey.get(idempotencyKey);
-  if (alreadyProcessed) {
-    return; // Skip duplicate
-  }
-
-  // Process the message
-  await recalculatePYMK(message.userId);
-
-  // Mark as processed (24-hour TTL)
-  await valkey.setex(idempotencyKey, 86400, 'true');
-}
-```
-
-### Backpressure Handling
-
-1. **Prefetch Limit**: Each worker prefetches at most 10 messages
-2. **Queue Length Alerts**: Alert when queue depth exceeds 1000 messages
-3. **Dead Letter Queue**: Failed messages after max retries go to `*.dlq` queues
-4. **Consumer Scaling**: Workers can be scaled horizontally (2-5 instances locally)
-
-### Local Development Setup
-
-```bash
-# Start RabbitMQ with management UI
-docker run -d --name rabbitmq \
-  -p 5672:5672 -p 15672:15672 \
-  -e RABBITMQ_DEFAULT_USER=linkedin \
-  -e RABBITMQ_DEFAULT_PASS=linkedin123 \
-  rabbitmq:3-management
-
-# Management UI available at http://localhost:15672
-```
+**What we give up**: An additional infrastructure dependency. Elasticsearch requires index synchronization, which introduces eventual consistency between the database and search results. A newly registered user may not appear in search for a few seconds.
 
 ---
 
-## Authentication, Authorization, and Rate Limiting
+## Consistency and Idempotency
 
-### Authentication Strategy
+### Connection Request Idempotency
 
-**Session-Based Authentication** (chosen for simplicity in local development):
+Connection requests check for existing connections and pending requests before creating. The `UNIQUE(from_user_id, to_user_id)` constraint prevents database-level duplicates. Accepting a connection uses `INSERT ... ON CONFLICT DO NOTHING` when creating the connection row.
 
-```
-┌─────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────┐
-│ Client  │────▶│ API Gateway │────▶│ Auth Service│────▶│ Valkey  │
-└─────────┘     └─────────────┘     └─────────────┘     └─────────┘
-     │                                     │
-     │  Cookie: session_id=abc123          │  Session lookup
-     │◀────────────────────────────────────│  user:session:abc123
+### Like Idempotency
+
+`INSERT INTO post_likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING` makes likes naturally idempotent. The `like_count` is updated by counting actual rows rather than incrementing, preventing over-counting from duplicate requests:
+```sql
+UPDATE posts SET like_count = (SELECT COUNT(*) FROM post_likes WHERE post_id = $1) WHERE id = $1
 ```
 
-### Session Management
+### Message Idempotency (RabbitMQ)
 
-```typescript
-// Session stored in Valkey
-interface Session {
-  userId: string;
-  email: string;
-  role: 'user' | 'recruiter' | 'admin';
-  permissions: string[];
-  createdAt: string;
-  lastAccessedAt: string;
-  ipAddress: string;
-  userAgent: string;
-}
+Every queue message carries an `idempotencyKey` (UUID). Before processing, the consumer checks Redis for `processed:{key}`. If found, the message is acknowledged without re-processing. After successful processing, the key is stored in Redis with a 24-hour TTL. Failed messages are rejected to a dead letter queue (not requeued) to prevent infinite retry loops.
 
-// Session TTL: 7 days, sliding expiration
-// Key format: user:session:{sessionId}
-```
+### Feed Cache Invalidation
 
-**Login Flow:**
-1. User submits email/password to `POST /api/v1/auth/login`
-2. Server validates credentials against bcrypt hash in PostgreSQL
-3. Server creates session in Valkey with 7-day TTL
-4. Server sets HttpOnly, Secure, SameSite=Strict cookie with session ID
-5. Subsequent requests include cookie automatically
+When a user creates a post, feed caches for their first 50 connections are explicitly deleted (`cacheDel('feed:${connId}')`). This ensures high-value connections see fresh content immediately. The 50-connection limit prevents cache stampedes when popular users post.
 
-### Role-Based Access Control (RBAC)
+---
 
-| Role | Description | Permissions |
-|------|-------------|-------------|
-| `user` | Standard LinkedIn user | `profile:read`, `profile:write:own`, `connection:*`, `feed:read`, `job:apply` |
-| `recruiter` | Company recruiter | All user permissions + `job:post`, `job:manage:own`, `candidate:search` |
-| `admin` | Platform administrator | All permissions + `user:manage`, `content:moderate`, `analytics:view` |
+## Security / Auth
 
-### Permission Checks
-
-```typescript
-// Middleware for route protection
-function requirePermission(permission: string) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const session = await getSession(req.cookies.session_id);
-
-    if (!session) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    if (!session.permissions.includes(permission)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    req.user = session;
-    next();
-  };
-}
-
-// Route examples
-app.get('/api/v1/profile/:id', requirePermission('profile:read'), getProfile);
-app.put('/api/v1/profile/:id', requirePermission('profile:write:own'), updateProfile);
-app.post('/api/v1/admin/users/:id/ban', requirePermission('user:manage'), banUser);
-```
-
-### API Endpoint Authorization Matrix
-
-| Endpoint | user | recruiter | admin |
-|----------|------|-----------|-------|
-| `GET /api/v1/profile/:id` | Yes | Yes | Yes |
-| `PUT /api/v1/profile/:id` | Own only | Own only | Any |
-| `POST /api/v1/connections` | Yes | Yes | Yes |
-| `POST /api/v1/jobs` | No | Yes | Yes |
-| `GET /api/v1/jobs/:id/candidates` | No | Own jobs | Any |
-| `GET /api/v1/admin/users` | No | No | Yes |
-| `POST /api/v1/admin/users/:id/ban` | No | No | Yes |
-| `GET /api/v1/admin/analytics` | No | No | Yes |
-
-### Rate Limiting
-
-**Strategy**: Token bucket algorithm implemented in Valkey
-
-| Endpoint Category | Rate Limit | Bucket Size | Refill Rate |
-|-------------------|------------|-------------|-------------|
-| Public (login, signup) | 10 req/min | 10 | 1 token/6s |
-| Authenticated reads | 100 req/min | 100 | ~1.6 token/s |
-| Authenticated writes | 30 req/min | 30 | 0.5 token/s |
-| Search | 20 req/min | 20 | 0.33 token/s |
-| Admin endpoints | 60 req/min | 60 | 1 token/s |
-
-```typescript
-// Rate limiter implementation
-async function checkRateLimit(userId: string, category: string): Promise<boolean> {
-  const key = `ratelimit:${category}:${userId}`;
-  const limit = RATE_LIMITS[category];
-
-  const current = await valkey.incr(key);
-  if (current === 1) {
-    await valkey.expire(key, 60); // Reset every minute
-  }
-
-  return current <= limit.requestsPerMinute;
-}
-
-// Response headers
-res.setHeader('X-RateLimit-Limit', limit.requestsPerMinute);
-res.setHeader('X-RateLimit-Remaining', Math.max(0, limit.requestsPerMinute - current));
-res.setHeader('X-RateLimit-Reset', resetTimestamp);
-```
+- **Session-based auth** with express-session (in-memory store in development, Redis in production)
+- **bcryptjs** password hashing
+- **Rate limiting** via Redis token bucket algorithm (`src/utils/rateLimiter.ts`):
+  - Public endpoints (login/register): 10 requests/minute
+  - Read operations: 100 requests/minute
+  - Write operations: 30 requests/minute
+  - Connection requests: 20 requests/minute (anti-spam)
+  - Search: 20 requests/minute
+- **Trace ID propagation**: `X-Trace-Id` header on every request/response for distributed tracing
+- **CORS**: Restricted to frontend origin
+- **Cookie security**: HttpOnly, SameSite=strict, secure in production
 
 ---
 
 ## Observability
 
-### Metrics (Prometheus)
+### Prometheus Metrics
 
-**Key Metrics to Track:**
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_requests_total` | Counter | Request count by method/path/status |
+| `http_request_duration_seconds` | Histogram | API latency by method/path |
+| `connections_created_total` | Counter | New connections rate |
+| `connections_removed_total` | Counter | Connection removal rate |
+| `connection_requests_total` | Counter | Connection request rate |
+| `posts_created_total` | Counter | Post creation rate |
+| `post_likes_total` | Counter | Like rate |
+| `post_comments_total` | Counter | Comment rate |
+| `profile_views_total` | Counter | Profile view rate |
+| `search_queries_total` | Counter | Search query rate by type |
+| `pymk_computation_duration_seconds` | Histogram | PYMK algorithm performance |
+| `feed_generation_duration_seconds` | Histogram | Feed query time |
+| `queue_depth` | Gauge | RabbitMQ queue depth by queue |
+| `queue_processing_duration_seconds` | Histogram | Message processing time |
+| `db_query_duration_seconds` | Histogram | Database query time by type |
+| `cache_hits_total` / `cache_misses_total` | Counter | Cache effectiveness |
+| `rate_limit_hits_total` | Counter | Rate limit violations by category |
+| `login_attempts_total` | Counter | Login attempts (success/failure) |
+| `active_sessions` | Gauge | Current active sessions |
 
-| Metric Name | Type | Description | Labels |
-|-------------|------|-------------|--------|
-| `http_requests_total` | Counter | Total HTTP requests | `method`, `path`, `status` |
-| `http_request_duration_seconds` | Histogram | Request latency | `method`, `path` |
-| `active_sessions` | Gauge | Current active sessions | - |
-| `connections_created_total` | Counter | New connections made | - |
-| `pymk_computation_duration_seconds` | Histogram | PYMK batch job duration | `user_network_size` |
-| `feed_generation_duration_seconds` | Histogram | Feed build time | - |
-| `queue_depth` | Gauge | Messages waiting in queue | `queue_name` |
-| `queue_processing_duration_seconds` | Histogram | Message processing time | `queue_name` |
-| `db_query_duration_seconds` | Histogram | Database query time | `query_type` |
-| `cache_hits_total` | Counter | Valkey cache hits | `cache_name` |
-| `cache_misses_total` | Counter | Valkey cache misses | `cache_name` |
-| `elasticsearch_query_duration_seconds` | Histogram | Search query time | `index` |
+### Health Checks
 
-**Prometheus Configuration (prometheus.yml):**
+- `GET /health` - Detailed status with PostgreSQL, Valkey, and RabbitMQ checks with latency
+- `GET /health/live` - Liveness probe
+- `GET /health/ready` - Readiness probe (database + Redis)
+- `GET /metrics` - Prometheus scrape endpoint
 
-```yaml
-global:
-  scrape_interval: 15s
+### Structured Logging
 
-scrape_configs:
-  - job_name: 'linkedin-api'
-    static_configs:
-      - targets: ['localhost:3001', 'localhost:3002', 'localhost:3003']
+Pino logger with JSON output. Trace IDs (`X-Trace-Id`) propagated through request lifecycle. Request duration, user ID, and status code logged for every request.
 
-  - job_name: 'linkedin-workers'
-    static_configs:
-      - targets: ['localhost:3010', 'localhost:3011']
+---
 
-  - job_name: 'rabbitmq'
-    static_configs:
-      - targets: ['localhost:15692']  # RabbitMQ Prometheus plugin
+## Failure Handling
 
-  - job_name: 'postgres'
-    static_configs:
-      - targets: ['localhost:9187']  # postgres_exporter
-```
+- **RabbitMQ unavailability**: Server starts even if RabbitMQ is unavailable (logged as warning). Async features (notifications, search indexing) are disabled but core API remains functional
+- **Dead letter queues**: Every RabbitMQ queue has a DLQ. Failed messages are rejected without requeue (`nack(msg, false, false)`) and routed to the DLQ for manual inspection
+- **Rate limiter fail-open**: If Redis is down, rate limiting allows all requests rather than blocking. This trades abuse protection for availability
+- **PYMK degradation**: If PYMK computation fails (e.g., database timeout), return empty recommendations rather than error. The cache ensures most requests are served from pre-computed results
+- **Graceful shutdown**: SIGTERM/SIGINT handlers close RabbitMQ channel/connection, drain database pool, disconnect Redis
 
-### Logging (Structured JSON)
+---
 
-**Log Format:**
+## Scalability Considerations
 
-```typescript
-interface LogEntry {
-  timestamp: string;      // ISO 8601
-  level: 'debug' | 'info' | 'warn' | 'error';
-  service: string;        // 'api', 'pymk-worker', 'feed-worker'
-  traceId: string;        // For request correlation
-  spanId: string;
-  userId?: string;        // If authenticated
-  message: string;
-  context: Record<string, any>;
-  error?: {
-    name: string;
-    message: string;
-    stack: string;
-  };
-}
-```
+### Horizontal Scaling Path
 
-**Example Log Entries:**
+1. **API servers**: Stateless (sessions in Redis), scale behind load balancer. Multiple instances on ports 3001-3003 supported
+2. **Connection graph**: At 100B connections, PostgreSQL struggles. Production LinkedIn uses an in-house graph store. For medium scale, connection queries can use read replicas and aggressive caching
+3. **PYMK computation**: Move to dedicated workers consuming from RabbitMQ. Batch-compute recommendations nightly for all users, store in Redis. On-demand computation for recently changed networks
+4. **Feed generation**: Introduce hybrid push/pull: fanout for users with <1000 connections, pull for power users. Pre-materialize feeds in Redis sorted sets
+5. **Search**: Elasticsearch cluster with sharding by index type (users, jobs). Dedicated indexing pipeline consuming from RabbitMQ
+6. **Database**: Vertical scaling then read replicas for read-heavy queries (profiles, feeds). Shard users table by user_id hash for horizontal scaling
 
-```json
-{"timestamp":"2025-01-15T10:23:45.123Z","level":"info","service":"api","traceId":"abc123","spanId":"def456","userId":"user_789","message":"Connection request sent","context":{"targetUserId":"user_012","mutualConnections":5}}
+### Sharding Strategy (Future)
 
-{"timestamp":"2025-01-15T10:23:46.456Z","level":"error","service":"pymk-worker","traceId":"ghi789","spanId":"jkl012","message":"PYMK computation failed","context":{"userId":"user_789","networkSize":5000},"error":{"name":"TimeoutError","message":"Query exceeded 30s limit","stack":"..."}}
-```
-
-**Log Levels by Environment:**
-
-| Environment | Min Level | Destinations |
-|-------------|-----------|--------------|
-| Development | debug | Console (pretty-printed) |
-| Local Docker | info | Console (JSON), file |
-| Production | info | Log aggregator (Loki/ELK) |
-
-### Distributed Tracing
-
-**Trace Propagation:**
-
-```typescript
-// Express middleware to extract/create trace context
-function tracingMiddleware(req: Request, res: Response, next: NextFunction) {
-  const traceId = req.headers['x-trace-id'] || crypto.randomUUID();
-  const spanId = crypto.randomUUID();
-
-  req.traceContext = { traceId, spanId, parentSpanId: req.headers['x-span-id'] };
-  res.setHeader('X-Trace-Id', traceId);
-
-  next();
-}
-
-// Propagate to downstream services and workers
-async function publishToQueue(queue: string, message: any, traceContext: TraceContext) {
-  await channel.sendToQueue(queue, Buffer.from(JSON.stringify({
-    ...message,
-    _trace: traceContext
-  })));
-}
-```
-
-### SLI/SLO Dashboard
-
-**Service Level Indicators:**
-
-| SLI | Target (SLO) | Measurement |
-|-----|--------------|-------------|
-| Feed API latency (p99) | < 200ms | `histogram_quantile(0.99, http_request_duration_seconds{path="/api/v1/feed"})` |
-| PYMK API latency (p99) | < 500ms | `histogram_quantile(0.99, http_request_duration_seconds{path="/api/v1/pymk"})` |
-| API availability | 99.9% | `sum(rate(http_requests_total{status!~"5.."})) / sum(rate(http_requests_total))` |
-| Connection request success rate | 99.5% | `sum(rate(http_requests_total{path="/api/v1/connections",status="201"})) / sum(rate(http_requests_total{path="/api/v1/connections"}))` |
-| Cache hit ratio | > 80% | `sum(cache_hits_total) / (sum(cache_hits_total) + sum(cache_misses_total))` |
-| Queue processing lag | < 30s | `max(queue_depth) / avg(rate(queue_processing_duration_seconds_count))` |
-
-**Grafana Dashboard Panels:**
-
-1. **Overview Row**: Request rate, error rate, p50/p95/p99 latency
-2. **API Breakdown**: Latency by endpoint, top 5 slowest endpoints
-3. **Cache Performance**: Hit/miss ratio, cache size, evictions
-4. **Queue Health**: Depth per queue, processing rate, dead letters
-5. **Database**: Query latency, connection pool usage, slow queries
-6. **Business Metrics**: New connections/hour, jobs posted, PYMK clicks
-
-### Alert Thresholds
-
-| Alert | Condition | Severity | Action |
-|-------|-----------|----------|--------|
-| High Error Rate | `rate(http_requests_total{status=~"5.."}[5m]) > 0.01` | Critical | Page on-call |
-| API Latency Spike | `histogram_quantile(0.99, http_request_duration_seconds[5m]) > 1` | Warning | Investigate |
-| Queue Backup | `queue_depth{queue_name="feed.generate"} > 5000` | Warning | Scale workers |
-| Dead Letters | `rate(queue_depth{queue_name=~".*dlq"}[1h]) > 10` | Warning | Review failures |
-| Low Cache Hit Ratio | `cache_hit_ratio < 0.7` | Warning | Check cache config |
-| Database Connection Pool Exhausted | `db_pool_available < 5` | Critical | Scale connections |
-| Disk Space Low | `node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.1` | Warning | Clean up or expand |
-
-**Alert Configuration (Prometheus rules):**
-
-```yaml
-groups:
-  - name: linkedin-alerts
-    rules:
-      - alert: HighErrorRate
-        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.01
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High error rate detected"
-          description: "Error rate is {{ $value | humanizePercentage }} over the last 5 minutes"
-
-      - alert: FeedLatencyHigh
-        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{path="/api/v1/feed"}[5m])) > 0.5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Feed API p99 latency exceeds 500ms"
-```
-
-### Audit Logging
-
-**Auditable Events:**
-
-| Event | Logged Fields | Retention |
-|-------|--------------|-----------|
-| Login success/failure | userId, email, ipAddress, userAgent, success | 90 days |
-| Profile update | userId, changedFields, previousValues (hashed), newValues (hashed) | 1 year |
-| Connection request sent/accepted | userId, targetUserId, action | 1 year |
-| Job posted/updated/deleted | recruiterId, jobId, companyId, action | 2 years |
-| Admin action | adminUserId, targetUserId, action, reason | 5 years |
-| Permission change | adminUserId, targetUserId, oldRole, newRole | 5 years |
-
-**Audit Log Schema:**
-
-```sql
-CREATE TABLE audit_logs (
-  id SERIAL PRIMARY KEY,
-  event_type VARCHAR(100) NOT NULL,
-  actor_id INTEGER REFERENCES users(id),
-  actor_ip INET,
-  target_type VARCHAR(50),  -- 'user', 'job', 'connection'
-  target_id INTEGER,
-  action VARCHAR(50) NOT NULL,
-  details JSONB,            -- Event-specific data
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Index for compliance queries
-CREATE INDEX idx_audit_logs_actor ON audit_logs(actor_id, created_at);
-CREATE INDEX idx_audit_logs_target ON audit_logs(target_type, target_id, created_at);
-CREATE INDEX idx_audit_logs_event ON audit_logs(event_type, created_at);
-```
-
-**Audit Log Query Examples:**
-
-```sql
--- All admin actions in the last 30 days
-SELECT * FROM audit_logs
-WHERE event_type LIKE 'admin.%'
-AND created_at > NOW() - INTERVAL '30 days'
-ORDER BY created_at DESC;
-
--- All changes to a specific user's profile
-SELECT * FROM audit_logs
-WHERE target_type = 'user' AND target_id = 12345
-ORDER BY created_at DESC;
-```
-
-### Local Observability Stack
-
-```bash
-# Start Prometheus + Grafana for local development
-docker-compose -f docker-compose.observability.yml up -d
-
-# docker-compose.observability.yml
-version: '3.8'
-services:
-  prometheus:
-    image: prom/prometheus:v2.45.0
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-
-  grafana:
-    image: grafana/grafana:10.0.0
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
-
-  loki:
-    image: grafana/loki:2.9.0
-    ports:
-      - "3100:3100"
-```
+- **Users/profiles**: Shard by user_id hash
+- **Connections**: Shard by smaller user_id (connections are co-located with at least one user)
+- **Posts**: Shard by user_id (author's posts co-located)
+- **Jobs**: Shard by company_id (company's jobs co-located)
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Graph storage | PostgreSQL + cache | Neo4j | Simplicity |
-| PYMK | Batch precompute | Real-time | Cost efficiency |
-| Search | Elasticsearch | PostgreSQL FTS | Better relevance |
-| Skills | Normalized table | JSON array | Queryable, standardized |
-| Message Queue | RabbitMQ | Kafka | Simpler ops, sufficient for batch jobs |
-| Auth | Session + Valkey | JWT | Simpler revocation, less client complexity |
-| Rate Limiting | Token bucket in Valkey | Fixed window | Smoother traffic, burst tolerance |
-| Observability | Prometheus + Grafana | Datadog/New Relic | Free, self-hosted, learning-focused |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Connection storage | Canonical (id < id) | Bidirectional rows | Half storage, no inconsistency risk |
+| Feed strategy | Pull + cache | Push (fanout-on-write) | Simpler, sufficient for professional network usage pattern |
+| Search | Elasticsearch | PostgreSQL full-text | Fuzzy matching, field boosting, faceted filters |
+| Graph traversal | SQL + cache | Graph database (Neo4j) | Simpler operations, sufficient for 2-degree queries |
+| Session storage | In-memory / Redis | JWT | Immediate revocation, simpler state management |
+| PYMK caching | 24-hour Redis cache | Real-time computation | Inputs change slowly, computation is expensive |
+| Message queue | RabbitMQ | Kafka | Simpler for job-based processing, sufficient throughput |
+| Rate limiting | Redis token bucket | In-memory | Distributed rate limiting across API instances |
 
 ---
 
 ## Implementation Notes
 
-This section documents the rationale behind key implementation decisions for the LinkedIn clone's backend infrastructure.
-
-### Why Async Queues Enable Efficient Feed Fanout
-
-When a user creates a post, their content needs to appear in the feeds of all their connections. For a user with 500+ connections, synchronously updating all those feeds would:
-
-1. **Block the API response** - The user would wait seconds for the post to publish
-2. **Create thundering herd problems** - Cache invalidation for 500 feeds simultaneously overwhelms Redis
-3. **Risk partial failures** - If the 300th cache update fails, is the post published or not?
-
-**RabbitMQ solves this by decoupling the publish from the fanout:**
+### Local Architecture
 
 ```
-User creates post -> API returns immediately -> Message queued
-                                                      |
-                                                      v
-                              Worker processes at controlled rate
-                              (10 connections/second, not 500 at once)
+┌───────────────────┐     ┌───────────────────────────┐
+│   React Frontend  │────▶│   Express API Server      │
+│   localhost:5173   │     │   localhost:3000           │
+└───────────────────┘     │                           │
+                          │  Routes:                  │
+                          │  /api/auth/*              │
+                          │  /api/users/*             │
+                          │  /api/connections/*       │
+                          │  /api/feed/*              │
+                          │  /api/jobs/*              │
+                          │                           │
+                          │  /health, /metrics        │
+                          └──┬────┬────┬────┬─────────┘
+                             │    │    │    │
+              ┌──────────────▼┐ ┌─▼────▼──┐ │
+              │ PostgreSQL    │ │ Valkey   │ │
+              │ :5432         │ │ :6379    │ │
+              │ linkedin/     │ │ sessions │ │
+              │ linkedin_pwd  │ │ PYMK     │ │
+              └───────────────┘ │ feed     │ │
+                                │ rate lim │ │
+                                └──────────┘ │
+                    ┌────────────────────────▼┐
+                    │     Elasticsearch       │
+                    │     :9200               │
+                    │     users, jobs indices  │
+                    └─────────────────────────┘
+                    ┌─────────────────────────┐
+                    │     RabbitMQ            │
+                    │     :5672 (AMQP)        │
+                    │     :15672 (Mgmt UI)    │
+                    │     feed.fanout         │
+                    │     notifications       │
+                    │     pymk.compute        │
+                    │     search.index        │
+                    │     profile.update      │
+                    └─────────────────────────┘
 ```
 
-The queue provides:
-- **Backpressure handling**: Workers process at sustainable rates
-- **Retry semantics**: Failed fanouts retry with exponential backoff
-- **Observability**: Queue depth metrics alert when fanout falls behind
-- **Idempotency**: Deduplication keys prevent duplicate notifications
+### Production-Grade Patterns Implemented
 
-For PYMK (People You May Know) recalculation, which can take 30+ seconds for users with large networks, async processing is essential. The queue allows batch computation during off-peak hours without blocking the main API.
+1. **Prometheus metrics** (`src/utils/metrics.ts`): 20+ custom metrics covering HTTP requests, business events (connections, posts, likes), PYMK computation time, feed generation time, queue depth, cache hits/misses, rate limit violations, and login attempts. Default Node.js metrics (CPU, memory, event loop) included.
 
-### Why Rate Limiting Prevents Spam Connection Requests
+2. **Structured logging** (`src/utils/logger.ts`): Pino with JSON output. Trace ID propagation via `X-Trace-Id` header for request correlation across services.
 
-LinkedIn's connection request feature is a prime target for spam:
+3. **Rate limiting** (`src/utils/rateLimiter.ts`): Redis-backed token bucket algorithm with Lua scripting for atomic operations. Six categories with different limits (public, read, write, connection requests, search, admin). Rate limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) on responses. Fail-open design if Redis is unavailable.
 
-1. **Recruiters** may blast connection requests to thousands of candidates
-2. **Bots** harvest connection graphs for lead generation
-3. **Bad actors** send malicious links in connection messages
+4. **RabbitMQ message infrastructure** (`src/utils/rabbitmq.ts`): Five queues with dead letter configuration (feed fanout, notifications, PYMK compute, search index, profile update). Three exchange types (direct, fanout, topic). Message idempotency via Redis-tracked processing keys. Prefetch limit of 10 for backpressure.
 
-Without rate limiting, a single user could send 10,000 connection requests per hour, creating:
-- Notification fatigue for recipients
-- Database load from pending request storage
-- Reputation damage to the platform
+5. **Elasticsearch integration** (`src/utils/elasticsearch.ts`): Automatic index creation at startup with optimized mappings. User search with name boosting (2x) and fuzzy matching. Job search with title boosting (3x), skill boosting (2x), and faceted filters.
 
-**Our token bucket implementation provides:**
+6. **PYMK algorithm** (`src/services/connectionService.ts`): Multi-factor scoring (mutual connections, same company, same school, shared skills, same location). Results cached in Valkey for 24 hours. Candidate limit of 100 for performance.
 
-| Endpoint | Limit | Burst | Rationale |
-|----------|-------|-------|-----------|
-| Connection requests | 20/min | 10 | Prevents spam while allowing normal networking |
-| Profile updates | 30/min | 30 | Generous for editing, prevents abuse |
-| Search queries | 20/min | 20 | Protects Elasticsearch from query storms |
-| Login attempts | 10/min | 10 | Mitigates credential stuffing attacks |
+7. **Feed ranking** (`src/services/feedService.ts`): SQL-based multi-factor ranking combining engagement (30%), recency (50%), and relationship boost. Cache invalidation on post creation for first 50 connections.
 
-The token bucket algorithm (vs. fixed window) provides smoother traffic patterns:
-- A user can burst 10 requests instantly, then must wait
-- Tokens refill gradually, not all-at-once at window boundaries
-- More predictable load on downstream services
+8. **Health checks** (`src/index.ts`): Detailed health endpoint checking PostgreSQL, Valkey, and RabbitMQ. Separate liveness and readiness probes. Graceful shutdown with resource cleanup.
 
-Rate limit headers (`X-RateLimit-Remaining`, `X-RateLimit-Reset`) allow well-behaved clients to back off gracefully before hitting limits.
+9. **Audit logging** (database-backed): Security event tracking for login attempts, profile changes, connection events, and administrative actions.
 
-### Why Audit Logging Enables Account Recovery and Security
+### What Was Simplified
 
-Professional networks contain sensitive career data. Audit logging serves multiple critical functions:
+| Production Design | Local Implementation |
+|-------------------|---------------------|
+| Graph database for connections | PostgreSQL with SQL joins and caching |
+| Kafka event streaming | RabbitMQ with direct queue publishing |
+| Distributed session store (Redis) | In-memory express-session store |
+| ML-based feed ranking | SQL formula with fixed weights |
+| Precomputed PYMK (nightly batch) | On-demand computation with 24-hour cache |
+| CDN for profile images | Direct URL references |
+| OAuth/SSO/2FA | Session-based auth with bcrypt |
+| Separate microservices | Single Express process with route modules |
 
-**1. Account Recovery**
-When a user reports their profile was changed without their knowledge:
-```sql
-SELECT * FROM audit_logs
-WHERE target_type = 'profile' AND target_id = 12345
-AND created_at > NOW() - INTERVAL '30 days'
-ORDER BY created_at DESC;
-```
-This reveals exactly what changed, when, and from which IP address, enabling:
-- Identification of unauthorized access
-- Restoration of previous profile state
-- Evidence for security investigations
+### What Was Omitted
 
-**2. Compliance Requirements**
-Professional platforms may need to demonstrate:
-- Who accessed candidate data (GDPR data subject requests)
-- When admin actions were taken (SOC 2 audits)
-- Login history for compromised account investigations
-
-**3. Security Monitoring**
-Audit logs enable detection of:
-- Credential stuffing (many failed logins from one IP)
-- Account takeover (login from unusual location)
-- Privilege escalation (role changes)
-
-**What we log:**
-| Event Type | Retention | Purpose |
-|------------|-----------|---------|
-| Login success/failure | 90 days | Security monitoring |
-| Profile updates | 1 year | Account recovery |
-| Connection events | 1 year | Network integrity |
-| Admin actions | 5 years | Compliance |
-
-**Privacy considerations:**
-- Sensitive field values are masked (showing only first/last 2 characters)
-- IP addresses are stored for security but not exposed to users
-- Audit logs are append-only (no UPDATE/DELETE access)
-
-### Why Metrics Enable Engagement Optimization
-
-LinkedIn's business model depends on user engagement. Prometheus metrics enable data-driven optimization:
-
-**1. Performance SLOs**
-```yaml
-# Alert when feed generation exceeds 500ms p99
-- alert: FeedLatencyHigh
-  expr: histogram_quantile(0.99, rate(feed_generation_duration_seconds_bucket[5m])) > 0.5
-```
-Slow feeds reduce scroll engagement. Metrics identify performance regressions before users complain.
-
-**2. Feature Adoption**
-```promql
-# Track connection request conversion rate
-rate(connections_created_total[1h]) / rate(connection_requests_total[1h])
-```
-This reveals whether PYMK algorithm changes improve actual connection formation.
-
-**3. Capacity Planning**
-```promql
-# Predict when we'll exceed queue capacity
-predict_linear(queue_depth{queue_name="notifications"}[1h], 3600)
-```
-Queue depth trends indicate when to scale notification workers.
-
-**4. Business Metrics**
-| Metric | What It Reveals |
-|--------|-----------------|
-| `posts_created_total` | Content creation health |
-| `profile_views_total` | Job seeker activity |
-| `post_likes_total` | Feed engagement quality |
-| `pymk_computation_duration_seconds` | Algorithm efficiency |
-
-**Key Prometheus patterns used:**
-- **Counters** for monotonically increasing values (requests, errors)
-- **Histograms** for latency distributions (p50, p95, p99)
-- **Gauges** for current state (queue depth, active sessions)
-
-The `/metrics` endpoint exposes all metrics in Prometheus format, enabling:
-- Grafana dashboards for real-time visibility
-- Alertmanager integration for on-call notifications
-- Long-term trend analysis for quarterly reviews
-
-### Implementation Summary
-
-| Feature | Files Added/Modified | Key Benefit |
-|---------|---------------------|-------------|
-| RabbitMQ integration | `utils/rabbitmq.ts` | Async fanout, decoupled architecture |
-| Rate limiting | `utils/rateLimiter.ts` | Spam prevention, fair usage |
-| Audit logging | `utils/audit.ts`, `db/migrations/001_create_audit_logs.sql` | Security, compliance, recovery |
-| Prometheus metrics | `utils/metrics.ts` | Observability, SLO monitoring |
-| Structured logging | `utils/logger.ts` | Debugging, trace correlation |
-| Enhanced health checks | `index.ts` | Kubernetes readiness, dependency monitoring |
-| RBAC middleware | `middleware/auth.ts` | Fine-grained access control |
-
----
-
-## Frontend Architecture
-
-This section documents the organization and structure of the LinkedIn frontend application, including component architecture, routing, and state management patterns.
-
-### Technology Stack
-
-- **Framework**: React 19 with TypeScript
-- **Build Tool**: Vite
-- **Routing**: TanStack Router (file-based routing)
-- **State Management**: Zustand (global auth state), React useState (local UI state)
-- **Styling**: Tailwind CSS
-- **Icons**: Lucide React
-
-### Directory Structure
-
-```
-frontend/src/
-├── components/              # Reusable UI components
-│   ├── profile/             # Profile page sub-components
-│   │   ├── index.ts         # Barrel export for profile components
-│   │   ├── ProfileHeader.tsx
-│   │   ├── EditProfileModal.tsx
-│   │   ├── ProfileAbout.tsx
-│   │   ├── ExperienceSection.tsx
-│   │   ├── EducationSection.tsx
-│   │   ├── SkillsSection.tsx
-│   │   └── ActivitySection.tsx
-│   ├── ConnectionCard.tsx   # Connection display card
-│   ├── JobCard.tsx          # Job listing card
-│   ├── Navbar.tsx           # Global navigation bar
-│   └── PostCard.tsx         # Feed post card with engagement
-├── routes/                  # TanStack Router file-based routes
-│   ├── __root.tsx           # Root layout with navbar
-│   ├── index.tsx            # Home/feed page
-│   ├── login.tsx            # Authentication page
-│   ├── register.tsx         # Registration page
-│   ├── profile.$userId.tsx  # Dynamic user profile page
-│   ├── network.tsx          # Connections and PYMK
-│   ├── jobs.tsx             # Job listings
-│   ├── jobs.$jobId.tsx      # Individual job detail
-│   └── search.tsx           # Global search page
-├── services/                # API client modules
-│   └── api.ts               # REST API service layer
-├── stores/                  # Zustand global state stores
-│   └── authStore.ts         # Authentication state
-├── types/                   # TypeScript type definitions
-│   └── index.ts             # Shared interface definitions
-└── main.tsx                 # Application entry point
-```
-
-### Component Organization Patterns
-
-#### 1. Profile Components
-
-The profile page was refactored from a single 534-line component into focused sub-components, each under 200 lines:
-
-| Component | Lines | Responsibility |
-|-----------|-------|----------------|
-| `ProfileHeader` | ~150 | Banner, avatar, name, connection actions |
-| `EditProfileModal` | ~160 | Profile editing form dialog |
-| `ProfileAbout` | ~35 | User summary/bio display |
-| `ExperienceSection` | ~115 | Work history list with add action |
-| `EducationSection` | ~110 | Education history list with add action |
-| `SkillsSection` | ~195 | Skills list with add/remove/endorse |
-| `ActivitySection` | ~40 | User's posts feed |
-
-**Benefits of this structure:**
-- **Readability**: Each component has a single, clear responsibility
-- **Testability**: Components can be unit tested in isolation
-- **Reusability**: Section components could be used in other contexts
-- **Maintainability**: Changes to one section don't affect others
-
-#### 2. Barrel Exports
-
-Components in feature directories use barrel exports (`index.ts`) for cleaner imports:
-
-```typescript
-// Instead of multiple imports
-import { ProfileHeader } from '../components/profile/ProfileHeader';
-import { EditProfileModal } from '../components/profile/EditProfileModal';
-
-// Single import from barrel
-import {
-  ProfileHeader,
-  EditProfileModal,
-  ProfileAbout,
-  ExperienceSection,
-  EducationSection,
-  SkillsSection,
-  ActivitySection,
-} from '../components/profile';
-```
-
-#### 3. JSDoc Documentation
-
-All components include JSDoc documentation following this pattern:
-
-```typescript
-/**
- * Brief description of the component's purpose.
- * Additional details about functionality and behavior.
- *
- * @module components/feature/ComponentName
- */
-
-/**
- * Props interface with field descriptions.
- */
-interface ComponentNameProps {
-  /** Description of this prop */
-  propName: string;
-}
-
-/**
- * Detailed component description.
- *
- * @param props - Component props
- * @returns The component JSX element
- */
-export function ComponentName({ propName }: ComponentNameProps) {
-  // Implementation
-}
-```
-
-### State Management Patterns
-
-#### Global State (Zustand)
-
-Authentication state is managed globally via Zustand:
-
-```typescript
-// stores/authStore.ts
-interface AuthState {
-  user: User | null;
-  isAuthenticated: boolean;
-  login: (email: string, password: string) => Promise<void>;
-  logout: () => void;
-  updateUser: (user: User) => void;
-}
-```
-
-#### Local State (React useState)
-
-UI-specific state is managed locally within components:
-
-- Loading states
-- Form data
-- Modal visibility
-- Fetched data (profile, posts, skills, etc.)
-
-### Routing Architecture
-
-TanStack Router provides file-based routing with:
-
-- **Dynamic segments**: `profile.$userId.tsx` matches `/profile/123`
-- **Layout routes**: `__root.tsx` wraps all pages with the navbar
-- **Type-safe params**: Route params are typed and accessible via hooks
-
-```typescript
-// Accessing route params
-const { userId } = Route.useParams();
-
-// Programmatic navigation
-const navigate = useNavigate();
-navigate({ to: '/login' });
-```
-
-### API Integration
-
-The `services/api.ts` module provides typed API clients:
-
-```typescript
-// Grouped by feature domain
-export const usersApi = {
-  getProfile: (userId: number) => /* ... */,
-  updateProfile: (data: Partial<User>) => /* ... */,
-  addSkill: (skillName: string) => /* ... */,
-  // ...
-};
-
-export const feedApi = {
-  getUserPosts: (userId: number) => /* ... */,
-  likePost: (postId: number) => /* ... */,
-  // ...
-};
-
-export const connectionsApi = {
-  sendRequest: (userId: number) => /* ... */,
-  getConnectionDegree: (userId: number) => /* ... */,
-  // ...
-};
-```
-
-### Component Guidelines
-
-1. **Size Limit**: Keep components under 200 lines; extract sub-components when larger
-2. **Single Responsibility**: Each component should do one thing well
-3. **Props Interface**: Always define explicit TypeScript interfaces for props
-4. **Documentation**: Include JSDoc comments for all exported components and functions
-5. **Accessibility**: Include `aria-label` for icon-only buttons
-6. **Error Handling**: Log errors to console; consider toast notifications for user feedback
+- CDN and multi-region deployment
+- Kubernetes orchestration
+- Database sharding and read replicas
+- ML pipeline for feed ranking and job matching
+- Real-time notifications (WebSocket/SSE)
+- Email notification system
+- Profile image upload and processing
+- Company pages with admin management
+- Messaging/InMail system
+- Content moderation and spam detection
+- A/B testing framework
+- Skills assessment and certification

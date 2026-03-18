@@ -91,10 +91,11 @@ A cryptocurrency exchange platform supporting real-time price feeds, order match
 └──────────────────────┬──────────────────┬─────────────────────────────┘
                        │ HTTPS (REST)     │ WSS (WebSocket)
                        ▼                  ▼
-              ┌─────────────────────────────────────┐
-              │          API Gateway / LB            │
-              │    (Rate Limiting, TLS Termination)  │
-              └───────────────┬─────────────────────┘
+              ┌──────────────────────────────────────┐
+              │         API Gateway / CDN             │
+              │   (Rate Limiting, TLS Termination,    │
+              │    DDoS Protection, WAF)              │
+              └───────────────┬──────────────────────┘
                               │
            ┌──────────────────┼──────────────────┐
            ▼                  ▼                  ▼
@@ -106,14 +107,22 @@ A cryptocurrency exchange platform supporting real-time price feeds, order match
           │                  │                  │
           └──────────────────┼──────────────────┘
                              │
-      ┌─────────┬────────────┼────────────┬────────────┐
-      ▼         ▼            ▼            ▼            ▼
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐
-│PostgreSQL│ │  Redis/  │ │  Kafka   │ │  Price   │ │  Portfolio   │
-│  (Data)  │ │  Valkey  │ │(Events)  │ │Broadcast │ │   Updater    │
-│DECIMAL   │ │(Sessions │ │          │ │  Worker  │ │   Worker     │
-│(28,18)   │ │ + Cache) │ │          │ │(2s tick) │ │  (60s snap)  │
-└──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────────┘
+    ┌──────────┬─────────────┼─────────────┬──────────────┐
+    ▼          ▼             ▼             ▼              ▼
+┌────────┐ ┌────────┐  ┌────────┐  ┌──────────┐  ┌──────────┐
+│Matching│ │Postgres│  │ Redis/ │  │  Kafka   │  │Prometheus│
+│Engine  │ │  (Data)│  │ Valkey │  │ (Events) │  │+ Grafana │
+│(In-Mem)│ │DECIMAL │  │Sessions│  │          │  │          │
+│        │ │(28,18) │  │+ Cache │  │          │  │          │
+└────────┘ └────────┘  └────────┘  └────┬─────┘  └──────────┘
+                                        │
+                             ┌──────────┼──────────┐
+                             ▼          ▼          ▼
+                       ┌──────────┐┌──────────┐┌──────────┐
+                       │  Price   ││Portfolio ││Analytics │
+                       │Broadcast││ Updater  ││  Worker  │
+                       │ Worker  ││  Worker  ││          │
+                       └──────────┘└──────────┘└──────────┘
 ```
 
 ---
@@ -133,7 +142,13 @@ Handles all client requests through RESTful endpoints and WebSocket connections:
 
 ### 2. Order Matching Engine
 
-In-memory order book per trading pair with price-time priority:
+The matching engine is the core of the exchange. It maintains an in-memory order book per trading pair with price-time priority:
+
+**Data structure**: Two sorted arrays per trading pair:
+- **Bids**: sorted by price DESC, then timestamp ASC (best bid = highest price, earliest)
+- **Asks**: sorted by price ASC, then timestamp ASC (best ask = lowest price, earliest)
+
+**Matching algorithm**:
 
 ```
 placeOrder(userId, {tradingPairId, side, orderType, quantity, price, idempotencyKey})
@@ -149,8 +164,6 @@ placeOrder(userId, {tradingPairId, side, orderType, quantity, price, idempotency
 │   └── If insufficient: reject order
 ├── Insert order record in PostgreSQL
 ├── Add to in-memory order book
-│   ├── Buy (bid): sorted by price DESC, then timestamp ASC
-│   └── Sell (ask): sorted by price ASC, then timestamp ASC
 ├── Run matching algorithm
 │   ├── While best_bid >= best_ask:
 │   │   ├── Match price = earlier order's price
@@ -163,30 +176,29 @@ placeOrder(userId, {tradingPairId, side, orderType, quantity, price, idempotency
 └── Return order result
 ```
 
-### 3. Market Service
+**Why in-memory, not database-backed?** Database-backed matching requires `SELECT ... FOR UPDATE` on the order book for every match attempt, serializing all matching through row locks. At 100K orders/second, row-level locking creates a bottleneck where orders queue behind each other. In-memory matching completes in microseconds, while a database round-trip takes milliseconds. The trade-off: the order book is lost on process restart. Production exchanges solve this by rebuilding from the trade log (event sourcing) or using replicated state machines.
+
+**Why sorted arrays instead of a red-black tree?** For a learning project with < 1000 orders per book, array insertion with `splice` is fast enough. Production exchanges use price-level maps with FIFO queues per level, or custom B-tree variants. The algorithmic complexity difference (O(n) insert vs O(log n)) only matters with millions of orders.
+
+### 3. Market Service (Price Simulation)
 
 Simulates realistic price movement using Geometric Brownian Motion:
 
 ```
-simulatePriceTick(symbol)
-├── Get current price
-├── Calculate new price using GBM:
-│   newPrice = price * exp((mu - sigma^2/2) * dt + sigma * sqrt(dt) * Z)
-│   ├── mu = 0.0001 (slight upward drift)
-│   ├── sigma = per-asset volatility (BTC: 1.5%, DOGE: 5%)
-│   ├── dt = 2/86400 (2 seconds expressed in days)
-│   └── Z = standard normal random (Box-Muller transform)
-├── Clamp to [50%, 200%] of base price
-├── Update candle state (OHLCV for current minute)
-│   ├── Same minute: update high, low, close, volume
-│   └── New minute: start new candle
-├── Update 24h statistics (high, low, volume, change)
-└── Return PriceData {price, change24h, changePercent24h, volume24h, high24h, low24h}
+newPrice = price * exp((mu - sigma^2/2) * dt + sigma * sqrt(dt) * Z)
 ```
 
-### 4. Wallet Service
+Where:
+- `mu = 0.0001`: slight upward drift (crypto tends upward over time)
+- `sigma`: per-asset volatility (BTC 1.5%, DOGE 5% -- more speculative assets are more volatile)
+- `dt = 2/86400`: time step in days (2-second tick interval)
+- `Z`: standard normal random variable via Box-Muller transform
 
-Per-currency wallets with balance reservation pattern:
+GBM is the standard model behind Black-Scholes option pricing. It produces log-normal returns, meaning prices cannot go negative. The multiplicative nature means a 5% move on a $65,000 asset looks proportionally the same as on a $0.15 asset. Prices are clamped to [50%, 200%] of base price to prevent runaway values in long-running sessions.
+
+### 4. Wallet Service (Reserved Balance Pattern)
+
+Per-currency wallets prevent double-spending via balance reservation:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -220,28 +232,42 @@ The `executeTradeTransfer` function runs within a PostgreSQL transaction to atom
 4. Add quote currency to seller (minus maker fee)
 5. Record trade transactions for both parties
 
+**Database constraint**: `CHECK (balance >= reserved_balance)` prevents the system from ever entering an inconsistent state where more is reserved than owned.
+
+**Reserve flow** uses an atomic check-and-update:
+
+```sql
+UPDATE wallets
+SET reserved_balance = reserved_balance + $amount, updated_at = NOW()
+WHERE user_id = $1 AND currency_id = $2
+  AND (balance - reserved_balance) >= $amount
+RETURNING id
+```
+
+If the available balance is insufficient, zero rows are returned and the order is rejected. No separate SELECT is needed.
+
 ### 5. WebSocket Manager
 
-Channel-based pub/sub for real-time data:
+Channel-based pub/sub for real-time data distribution:
 
 ```
 WebSocket Protocol:
 
-Client → Server:
+Client ──▶ Server:
   {"type": "subscribe", "channels": ["ticker:BTC-USD"]}
   {"type": "unsubscribe", "channels": ["ticker:BTC-USD"]}
   {"type": "auth", "userId": "uuid"}
 
-Server → Client:
+Server ──▶ Client:
   {"type": "connected", "clientId": "client_1"}
   {"type": "subscribed", "channels": ["ticker:BTC-USD"]}
   {"type": "prices", "data": {"BTC-USD": {...}, "ETH-USD": {...}}}
   {"channel": "ticker:BTC-USD", "type": "ticker", "symbol": "BTC-USD", "price": 65123.45, ...}
 ```
 
-The main server broadcasts:
-- Per-symbol ticker updates to channel subscribers every 2 seconds
-- All-prices summary to all connected clients every 2 seconds
+The main server broadcasts per-symbol ticker updates to channel subscribers every 2 seconds, and an all-prices summary to all connected clients.
+
+At production scale with 1M WebSocket connections, each API server handles ~50K connections across 20 servers. Kafka provides fan-out: the price broadcaster publishes once, all servers consume and broadcast to their local connections.
 
 ### 6. Price Broadcaster Worker
 
@@ -263,8 +289,6 @@ Background worker that:
 ---
 
 ## Database Schema
-
-### Database Schema
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -439,23 +463,16 @@ CREATE INDEX idx_transactions_user ON transactions(user_id, created_at DESC);
 └──────┬───────┘
        │
        ▼
-┌──────────────┐  ┌──────────────────┐
-│ transactions │  │  price_candles   │
-│              │  │                  │
-│ user_id (FK) │  │ symbol           │
-│ type         │  │ interval         │
-│ currency_id  │  │ open_time        │
-│ amount       │  │ open/high/low/   │
-│ fee          │  │ close/volume     │
-│ reference_id │  └──────────────────┘
+┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ transactions │  │  price_candles   │  │portfolio_snapshots│
+│              │  │                  │  │                  │
+│ user_id (FK) │  │ symbol           │  │ user_id (FK)     │
+│ type         │  │ interval         │  │ total_value_usd  │
+│ currency_id  │  │ open_time        │  │ breakdown (JSONB)│
+│ amount       │  │ open/high/low/   │  │                  │
+│ fee          │  │ close/volume     │  │                  │
+│ reference_id │  └──────────────────┘  └──────────────────┘
 └──────────────┘
-       ┌──────────────────┐
-       │portfolio_snapshots│
-       │                  │
-       │ user_id (FK)     │
-       │ total_value_usd  │
-       │ breakdown (JSONB)│
-       └──────────────────┘
 ```
 
 ---
@@ -490,7 +507,7 @@ CREATE INDEX idx_transactions_user ON transactions(user_id, created_at DESC);
 | DELETE | `/api/v1/orders/:id` | Yes | Cancel an open order |
 | GET | `/api/v1/orders` | Yes | List user's orders (filterable by status) |
 
-### Portfolio & Wallets
+### Portfolio and Wallets
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
@@ -500,71 +517,7 @@ CREATE INDEX idx_transactions_user ON transactions(user_id, created_at DESC);
 | POST | `/api/v1/wallets/deposit` | Yes | Simulate a deposit |
 | GET | `/api/v1/transactions` | Yes | Transaction history |
 
-### Request/Response Examples
-
-**Place a Limit Order:**
-
-Request:
-```
-POST /api/v1/orders
-Content-Type: application/json
-
-{
-  "tradingPairId": "uuid-of-btc-usd",
-  "side": "buy",
-  "orderType": "limit",
-  "quantity": "0.5",
-  "price": "64000",
-  "idempotencyKey": "client-generated-uuid-v4"
-}
-```
-
-Response:
-```
-201 Created
-
-{
-  "order": {
-    "id": "order-uuid",
-    "status": "open",
-    "filledQuantity": "0",
-    "avgFillPrice": null
-  }
-}
-```
-
-**Get Portfolio:**
-
-Response:
-```
-{
-  "totalValueUsd": "165432.50",
-  "holdings": [
-    {
-      "currencyId": "USD",
-      "currencyName": "US Dollar",
-      "balance": "100000.000000000000000000",
-      "reservedBalance": "0.000000000000000000",
-      "available": "100000.000000000000000000",
-      "valueUsd": "100000.00",
-      "isFiat": true,
-      "allocation": "60.45"
-    },
-    {
-      "currencyId": "BTC",
-      "currencyName": "Bitcoin",
-      "balance": "1.500000000000000000",
-      "reservedBalance": "0.000000000000000000",
-      "available": "1.500000000000000000",
-      "valueUsd": "97500.00",
-      "isFiat": false,
-      "allocation": "39.55"
-    }
-  ]
-}
-```
-
-Note: All DECIMAL values are returned as strings to prevent JSON floating-point precision loss.
+All DECIMAL values are returned as strings in API responses to prevent JSON floating-point precision loss.
 
 ---
 
@@ -574,131 +527,51 @@ Note: All DECIMAL values are returned as strings to prevent JSON floating-point 
 
 **Context**: A crypto exchange must handle values ranging from BTC at $65,000 to fractions of a Satoshi at 0.00000001 BTC, all without rounding errors.
 
-**Why DECIMAL(28,18)?**
-- 28 total digits with 18 after the decimal point gives 10 digits before the decimal
-- Supports values from 0.000000000000000001 to 9,999,999,999.999999999999999999
-- Matches Ethereum's 18-decimal precision natively
-- PostgreSQL DECIMAL is exact arithmetic, not IEEE 754 floating point
+**Why DECIMAL(28,18)?** 28 total digits with 18 after the decimal point gives 10 digits before the decimal. Supports values from 0.000000000000000001 to 9,999,999,999.999999999999999999. Matches Ethereum's 18-decimal precision natively. PostgreSQL DECIMAL is exact arithmetic, not IEEE 754 floating point.
 
-**Why not FLOAT or BIGINT?**
-- `FLOAT8` (double precision) has only ~15-17 significant digits. For a value like `65000.123456789012345678`, the trailing digits would silently round. In financial systems, these "small" rounding errors compound across millions of trades and create phantom money -- balances that don't reconcile. The 2012 Knight Capital incident lost $440M in 45 minutes partly due to similar precision issues.
-- `BIGINT` (storing cents/satoshis) avoids rounding but requires every API consumer to know the scaling factor per currency (2 for USD, 8 for BTC, 18 for ETH). DECIMAL encodes this in the schema.
+**Why not FLOAT or BIGINT?** `FLOAT8` (double precision) has only ~15-17 significant digits. For a value like `65000.123456789012345678`, the trailing digits would silently round. In financial systems, these "small" rounding errors compound across millions of trades and create phantom money -- balances that do not reconcile. `BIGINT` (storing cents/satoshis) avoids rounding but requires every API consumer to know the scaling factor per currency (2 for USD, 8 for BTC, 18 for ETH). DECIMAL encodes the precision in the schema itself.
 
-**String serialization in APIs**: All DECIMAL values are cast to `::text` in SQL queries and returned as JSON strings. JavaScript's `Number` type is IEEE 754 double, which cannot represent `0.1 + 0.2 === 0.3` correctly. By using strings, the precision is preserved end-to-end, and the frontend displays values without performing arithmetic.
+**String serialization**: All DECIMAL values are cast to `::text` in SQL queries and returned as JSON strings. JavaScript's `Number` type is IEEE 754 double, which cannot represent `0.1 + 0.2 === 0.3` correctly. By using strings, precision is preserved end-to-end, and the frontend displays values without performing arithmetic.
 
 ### Decision 2: In-Memory Order Book with Price-Time Priority
 
 **Context**: The matching engine must find the best available price and, among orders at the same price, prioritize the earliest order.
 
-**Data structure**: Two sorted arrays per trading pair:
-- Bids: sorted by price DESC, then timestamp ASC
-- Asks: sorted by price ASC, then timestamp ASC
+**Why in-memory, not database-backed?** Database-backed matching requires `SELECT ... FOR UPDATE` on the order book for every match attempt, serializing all matching through row locks. At 100K orders/second, row-level locking creates a bottleneck where orders queue behind each other. In-memory matching completes in microseconds, while a database round-trip takes milliseconds.
 
-**Matching algorithm**:
-```
-while bids[0].price >= asks[0].price:
-    match at earlier order's price
-    fill min(bid_remaining, ask_remaining)
-    remove fully filled orders
-```
-
-**Why in-memory, not database-backed?**
-- Database-backed matching requires `SELECT ... FOR UPDATE` on the order book for every match attempt, serializing all matching through row locks
-- At 100K orders/second, row-level locking creates a bottleneck where orders queue behind each other
-- In-memory matching completes in microseconds, while a database round-trip takes milliseconds
-- The trade-off: the order book is lost on process restart. Production exchanges solve this by rebuilding from the trade log (event sourcing) or using replicated state machines
-
-**Why sorted arrays instead of a red-black tree?**
-- For a learning project with < 1000 orders per book, array insertion with `splice` is fast enough
-- Production exchanges use more sophisticated structures: price-level maps with FIFO queues per level, or custom B-tree variants
-- The algorithmic complexity difference (O(n) insert vs O(log n)) only matters at scale with millions of orders
+The trade-off: the order book is lost on process restart. Production exchanges solve this by rebuilding from the trade log (event sourcing) or using replicated state machines. For this learning project, the trade-off is acceptable because the order book is small and can be rebuilt from the `orders` table on startup.
 
 ### Decision 3: Reserved Balance Pattern for Double-Spend Prevention
 
 **Context**: When a user places a limit buy order for 1 BTC at $64,000, we need to guarantee that $64,000 is available when the order eventually fills -- possibly hours later.
 
-**Pattern**: Each wallet tracks two values:
-- `balance`: total amount owned
-- `reserved_balance`: amount locked by open orders
-- `available = balance - reserved_balance`: spendable amount
+**Pattern**: Each wallet tracks `balance` (total owned) and `reserved_balance` (locked by open orders). Available = balance - reserved. The database constraint `CHECK (balance >= reserved_balance)` prevents the system from ever entering an inconsistent state.
 
-**Database constraint**: `CHECK (balance >= reserved_balance)` prevents the system from ever entering an inconsistent state where more is reserved than owned.
-
-**Reserve flow**:
-```sql
-UPDATE wallets
-SET reserved_balance = reserved_balance + $amount, updated_at = NOW()
-WHERE user_id = $1 AND currency_id = $2
-  AND (balance - reserved_balance) >= $amount
-RETURNING id
-```
-
-This is an atomic check-and-update. If the available balance is insufficient, zero rows are returned and the order is rejected.
-
-**Why not just deduct immediately?**
-- Immediate deduction would show a reduced balance before the order is actually filled
-- If the order is cancelled, we would need to "add back" the funds, which requires tracking what was deducted for which order
-- The reserved model cleanly separates "pending" from "completed" state transitions
+**Why not deduct immediately?** Immediate deduction would show a reduced balance before the order is actually filled. If the order is cancelled, we would need to "add back" the funds, which requires tracking what was deducted for which order. The reserved model cleanly separates "pending" from "completed" state transitions and makes cancellation trivial (just decrease reserved_balance).
 
 ### Decision 4: Geometric Brownian Motion for Price Simulation
 
 **Context**: Need realistic price movement for development and testing without connecting to real market data APIs.
 
-**Model**:
-```
-newPrice = price * exp((mu - sigma^2/2) * dt + sigma * sqrt(dt) * Z)
-```
+GBM is the standard model behind Black-Scholes option pricing. It produces log-normal returns, meaning prices cannot go negative. The multiplicative nature means a 5% move on a $65,000 asset looks proportionally the same as on a $0.15 asset. Different volatility parameters per asset (BTC: 1.5%, DOGE: 5%) create realistic relative movement patterns.
 
-Where:
-- `mu = 0.0001`: slight upward drift (crypto tends upward over time)
-- `sigma`: per-asset volatility (BTC 1.5%, DOGE 5% -- more speculative assets are more volatile)
-- `dt = 2/86400`: time step in days (2-second tick interval)
-- `Z`: standard normal random variable via Box-Muller transform
-
-**Why GBM?**
-- GBM is the standard model behind Black-Scholes option pricing
-- It produces log-normal returns, meaning prices cannot go negative
-- The multiplicative nature means a 5% move on a $65,000 asset looks proportionally the same as on a $0.15 asset
-- Simple enough to implement in ~20 lines, realistic enough for visual credibility
-
-**Limitations and mitigations**:
-- GBM does not model fat tails (flash crashes) or mean reversion
-- Price clamped to [50%, 200%] of base price to prevent runaway values
-- Acceptable for a learning project; production would use real market data feeds
+**Limitations**: GBM does not model fat tails (flash crashes) or mean reversion. Prices are clamped to [50%, 200%] of base price to prevent runaway values. Acceptable for a learning project; production would use real market data feeds from exchanges like Binance or Coinbase via WebSocket API.
 
 ### Decision 5: Kafka for Event Streaming
 
 **Context**: Price updates and trade events need to flow from the matching engine to multiple consumers (WebSocket servers, analytics, candle aggregation).
 
-**Kafka topics**:
-- `price-updates`: Keyed by symbol, consumed by WebSocket servers
-- `trade-events`: Keyed by symbol, consumed by analytics and notification services
-
-**Why Kafka over direct WebSocket broadcasting?**
-- Direct broadcasting works fine for a single-server deployment
-- At scale, with 20+ API servers, each server only sees trades matched locally
-- Kafka provides fan-out: one producer (the matching engine) and many consumers (all WebSocket servers)
-- Kafka also provides durability: if a consumer goes down, it resumes from its last committed offset
+**Why Kafka over direct WebSocket broadcasting?** Direct broadcasting works for a single-server deployment. At scale with 20+ API servers, each server only sees trades matched locally. Kafka provides fan-out: one producer (the matching engine) publishes once, and all consumers (WebSocket servers, analytics) receive the event. Kafka also provides durability: if a consumer goes down, it resumes from its last committed offset, ensuring no events are lost.
 
 **Local simplification**: The price broadcaster worker publishes to Kafka, but the main API server also broadcasts directly via WebSocket. This dual path ensures the frontend works even if Kafka is not running.
 
 ### Decision 6: Idempotent Order Placement via Redis
 
-**Context**: Network failures during order submission (user clicks "Buy", request times out, user retries) can result in duplicate orders if not handled.
+**Context**: Network failures during order submission can result in duplicate orders if not handled.
 
-**Implementation**:
-```
-Client generates UUID v4 as idempotencyKey
-Server checks: redis.get("idempotency:{key}")
-  If found: return cached response (no new order created)
-  If not: process order, then redis.setex("idempotency:{key}", 86400, response)
-```
+**Implementation**: Client generates UUID v4 as idempotency key. Server checks Redis before processing. If found, cached response returned. If not, order processed and result cached with 24-hour TTL.
 
-**Why Redis for idempotency instead of database?**
-- Idempotency checks happen before the main business logic
-- Redis GET is sub-millisecond, while a PostgreSQL query adds 1-5ms
-- The idempotency key is ephemeral (24h TTL), not worth permanent storage
-- If Redis is down, the system falls back to non-idempotent behavior (the `idempotency_key` UNIQUE constraint on the orders table provides a database-level fallback)
+**Why Redis instead of database?** Idempotency checks happen before business logic begins. Redis GET is sub-millisecond; PostgreSQL adds 1-5ms. The keys are ephemeral (24h TTL), not worth permanent storage. If Redis is down, the `idempotency_key` UNIQUE constraint on the orders table provides a database-level fallback -- the order will fail with a constraint violation rather than creating a duplicate.
 
 ---
 
@@ -732,7 +605,7 @@ Three tiers of rate limiting using `express-rate-limit`:
 - Side must be `buy` or `sell`
 - Order type must be `market`, `limit`, or `stop`
 - Quantity validated against `min_order_size` and `max_order_size` per trading pair
-- Idempotency key is a VARCHAR(64) with UNIQUE constraint
+- Idempotency key is VARCHAR(64) with UNIQUE constraint
 
 ---
 
@@ -740,35 +613,19 @@ Three tiers of rate limiting using `express-rate-limit`:
 
 ### Prometheus Metrics
 
-```typescript
-// HTTP request duration histogram
-httpRequestDuration: Histogram
-  labels: method, route, status_code
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]
-
-// Order counter
-orderCounter: Counter
-  labels: side (buy/sell), type (market/limit/cancel), status (placed/cancelled)
-
-// Trade counter
-tradeCounter: Counter (total trades executed)
-
-// WebSocket connection gauge
-activeWebsocketConnections: Gauge
-
-// Order book depth gauge
-orderBookDepth: Gauge
-  labels: symbol, side
-```
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `http_request_duration_seconds` | Histogram | method, route, status_code | API latency SLO tracking |
+| `order_counter` | Counter | side, type, status | Order volume by type |
+| `trade_counter` | Counter | - | Total trades executed |
+| `active_websocket_connections` | Gauge | - | Connection health |
+| `order_book_depth` | Gauge | symbol, side | Book liquidity |
 
 Metrics are exposed at `GET /metrics` in Prometheus exposition format.
 
 ### Structured Logging
 
-Using Pino for JSON-structured logging:
-- Debug level in development
-- Info level in production
-- Contextual fields: `{ error, symbol, userId, userCount }`
+Using Pino for JSON-structured logging with contextual fields: `error`, `symbol`, `userId`, `userCount`. Debug level in development, info level in production.
 
 ### Health Check
 
@@ -788,72 +645,29 @@ GET /api/v1/health
 
 ### Circuit Breaker (Opossum)
 
-```typescript
-const defaultOptions = {
-  timeout: 5000,           // 5 second timeout
-  errorThresholdPercentage: 50,  // Open circuit at 50% error rate
-  resetTimeout: 30000,     // Try again after 30 seconds
-  volumeThreshold: 5,      // Minimum 5 requests before evaluating
-};
-```
-
-The circuit breaker wraps external service calls (database, Redis, Kafka) and prevents cascading failures when a dependency is unhealthy. States:
-- **Closed**: Requests pass through normally
-- **Open**: Requests fail immediately (fast failure, no waiting for timeout)
-- **Half-Open**: One request allowed through to test recovery
-
-### Graceful Shutdown
-
-```typescript
-process.on('SIGTERM', () => {
-  server.close(() => process.exit(0));
-});
-
-process.on('SIGINT', () => {
-  server.close(() => process.exit(0));
-});
-```
-
-The server stops accepting new connections but completes in-flight requests before exiting.
+Wraps external service calls (database, Redis, Kafka) with automatic failure detection:
+- **Timeout**: 5 seconds per call
+- **Error threshold**: 50% error rate opens the circuit
+- **Volume threshold**: Minimum 5 requests before evaluating
+- **Recovery**: 30-second wait, then one test request (half-open)
 
 ### Non-Critical Service Degradation
 
-Kafka failures do not block order processing:
-```typescript
-try {
-  await publishMessage('trade-events', symbol, { ... });
-} catch (_err) {
-  // Non-critical: Kafka may not be available
-}
-```
-
-The trade is recorded in PostgreSQL (the source of truth) regardless of whether the Kafka event was published. The trade event is used for real-time notifications, not for correctness.
+Kafka failures do not block order processing. The trade is recorded in PostgreSQL (the source of truth) regardless of whether the Kafka event was published. The trade event is used for real-time notifications, not for correctness.
 
 ### Database Transaction Safety
 
-All multi-table operations (trade execution, deposit, order cancellation) use explicit PostgreSQL transactions with `BEGIN`/`COMMIT`/`ROLLBACK`:
+All multi-table operations (trade execution, deposit, order cancellation) use explicit PostgreSQL transactions with `BEGIN`/`COMMIT`/`ROLLBACK`. This prevents partial states like "buyer debited but seller not credited."
 
-```typescript
-const client = await pool.connect();
-try {
-  await client.query('BEGIN');
-  // ... multiple operations ...
-  await client.query('COMMIT');
-} catch (error) {
-  await client.query('ROLLBACK');
-  throw error;
-} finally {
-  client.release();
-}
-```
+### Graceful Shutdown
 
-This prevents partial states like "buyer debited but seller not credited."
+SIGTERM and SIGINT handlers complete in-flight requests before process exit, preventing dropped connections during deployments.
 
 ### WebSocket Reconnection
 
 The frontend WebSocket client implements exponential backoff reconnection:
 ```
-delay = min(1000 * 2^attempt, 30000)   // 1s, 2s, 4s, 8s, 16s, 30s max
+delay = min(1000 * 2^attempt, 30000)   -- 1s, 2s, 4s, 8s, 16s, 30s max
 maxAttempts = 10
 ```
 
@@ -881,15 +695,9 @@ On reconnect, the client re-subscribes to all previously subscribed channels.
 
 ### Database Sharding
 
-**User data sharding**:
-- Shard wallets, orders, and transactions by `user_id` hash
-- Each shard contains all data for a subset of users
-- Cross-shard operations only happen during trade settlement (buyer and seller on different shards)
+**User data sharding**: Shard wallets, orders, and transactions by `user_id` hash. Each shard contains all data for a subset of users. Cross-shard operations only happen during trade settlement (buyer and seller on different shards).
 
-**Market data sharding**:
-- Shard price_candles by `symbol` hash
-- Each shard contains all candle data for a subset of trading pairs
-- Read-heavy workload benefits from read replicas per shard
+**Market data sharding**: Shard `price_candles` by `symbol` hash. Each shard contains all candle data for a subset of trading pairs. Read-heavy workload benefits from read replicas per shard.
 
 ### Caching Strategy
 
@@ -946,69 +754,98 @@ Phase 4: Full scale
 
 ## Implementation Notes
 
+This section maps the production architecture above to the actual local implementation running on Docker Compose.
+
+### Local Setup Diagram
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    React SPA (Vite :5173)                     │
+│                                                              │
+│  /              Market overview (asset list, prices)         │
+│  /trade/:symbol Trading view (chart, order book, form)      │
+│  /portfolio     Portfolio dashboard (holdings, allocation)   │
+│  /orders        Order history (open, filled, cancelled)     │
+│  /login, /register                                           │
+└────────────┬──────────────────────────┬──────────────────────┘
+             │ HTTP (REST)              │ WebSocket
+             ▼                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│             Express API + WebSocket Server (:3000)            │
+│             (or 3 instances :3001-3003)                       │
+├──────────────────────────────────────────────────────────────┤
+│  /api/v1/auth/*         Auth (register, login, logout)       │
+│  /api/v1/markets/*      Prices, order book, candles, trades  │
+│  /api/v1/orders         Place/cancel/list orders             │
+│  /api/v1/portfolio      Holdings, history                    │
+│  /api/v1/wallets        Balances, deposit                    │
+│  /api/v1/transactions   Transaction history                  │
+│  /api/v1/health         Health check                         │
+│  /metrics               Prometheus metrics                   │
+│  /ws                    WebSocket endpoint                   │
+└──┬──────────┬──────────┬──────────────────────────────────────┘
+   │          │          │
+   ▼          ▼          ▼
+┌──────┐  ┌──────┐  ┌──────────────────────────────────────┐
+│Postgr│  │Valkey│  │           Kafka (:9092)              │
+│:5432 │  │:6379 │  │   + Zookeeper (:2181)                │
+│      │  │      │  │                                      │
+│DECIMAL│  │sessns│  │  Topic: price-updates (keyed by sym) │
+│(28,18)│  │cache │  │  Topic: trade-events (keyed by sym)  │
+│      │  │idemp.│  │                                      │
+└──────┘  └──────┘  └───────────────┬──────────────────────┘
+                                    │
+                         ┌──────────┼──────────┐
+                         ▼                     ▼
+                  ┌──────────────┐    ┌──────────────────┐
+                  │ Price        │    │ Portfolio         │
+                  │ Broadcaster  │    │ Updater Worker    │
+                  │ Worker       │    │ (60s snapshots)   │
+                  │ (2s ticks)   │    │                   │
+                  └──────────────┘    └──────────────────┘
+```
+
 ### Production-Grade Patterns Actually Implemented
 
-**1. Idempotent Order Placement**
-
-Prevents duplicate orders caused by network retries. The client generates a UUID v4 as an idempotency key, and the server checks Redis before processing. If the key exists, the cached response is returned without creating a new order.
+**1. Idempotent Order Placement** -- Prevents duplicate orders caused by network retries. Client generates UUID v4 as idempotency key; server checks Redis before processing. If the key exists, the cached response is returned without creating a new order. Database UNIQUE constraint on `idempotency_key` provides a fallback.
 
 File: `backend/src/services/idempotency.ts`
 
-```typescript
-export async function checkIdempotencyKey(key: string): Promise<IdempotencyResult> {
-  const existing = await redis.get(`idempotency:${key}`);
-  if (existing) return { exists: true, response: existing };
-  return { exists: false };
-}
-```
-
-This matters at scale because financial operations are not naturally idempotent. Without idempotency keys, a network timeout followed by a retry can buy 2 BTC instead of 1 BTC, costing the user $65,000.
-
-**2. Circuit Breaker (Opossum)**
-
-Wraps external service calls with automatic failure detection and fast-fail behavior.
+**2. Circuit Breaker (Opossum)** -- Wraps external service calls with automatic failure detection. Opens at 50% error rate across 5+ requests; recovers after 30-second timeout. Prevents cascading failures when PostgreSQL, Redis, or Kafka are unhealthy.
 
 File: `backend/src/services/circuitBreaker.ts`
 
-When a dependency (PostgreSQL, Redis, Kafka) fails, the circuit breaker opens after 50% error rate across 5+ requests, preventing cascading failures. After 30 seconds, it allows one test request through.
-
-**3. Prometheus Metrics**
-
-HTTP request duration histograms, order counters, trade counters, and WebSocket connection gauges are collected and exposed at `/metrics`.
+**3. Prometheus Metrics** -- HTTP request duration histograms, order counters (by side/type/status), trade counter, WebSocket connection gauge, and order book depth gauge. Exposed at `GET /metrics`.
 
 File: `backend/src/services/metrics.ts`
 
-This enables real-time monitoring of matching latency, order throughput, and connection health. In production, Prometheus scrapes this endpoint every 15 seconds, and Grafana dashboards visualize trends.
-
-**4. Structured Logging (Pino)**
-
-JSON-structured logs with contextual fields enable log aggregation and querying in production.
+**4. Structured Logging (Pino)** -- JSON-structured logs with contextual fields. Debug level in development, info in production.
 
 File: `backend/src/services/logger.ts`
 
-**5. Rate Limiting**
-
-Three-tier rate limiting protects against abuse: general API (100/min), order placement (10/sec), and authentication (20/15min).
+**5. Three-Tier Rate Limiting** -- General API (100/min), order placement (10/sec), authentication (20/15min). Uses `express-rate-limit` with Redis store.
 
 File: `backend/src/services/rateLimiter.ts`
 
-**6. Health Check Endpoint**
-
-Standard health check at `/api/v1/health` returns server status, timestamp, and uptime for load balancer health probes.
+**6. Health Check** -- `GET /api/v1/health` returns status, timestamp, and uptime for load balancer probes.
 
 File: `backend/src/app.ts`
 
-**7. Graceful Shutdown**
-
-SIGTERM and SIGINT handlers complete in-flight requests before process exit, preventing dropped connections during deployments.
+**7. Graceful Shutdown** -- SIGTERM/SIGINT handlers complete in-flight requests before exit.
 
 File: `backend/src/index.ts`
 
-**8. Database Transaction Isolation**
-
-All multi-table wallet operations use explicit transactions to maintain balance consistency. The wallet table's CHECK constraints provide a second line of defense against negative balances or over-reservation.
+**8. Database Transaction Isolation** -- All multi-table wallet operations use explicit transactions. Wallet CHECK constraints provide a second line of defense against negative balances or over-reservation.
 
 File: `backend/src/services/walletService.ts`
+
+**9. WebSocket with Exponential Backoff Reconnection** -- Frontend client reconnects with 1s, 2s, 4s, 8s... up to 30s delay, re-subscribing to all channels.
+
+File: `frontend/src/hooks/` (WebSocket hook)
+
+**10. In-Memory Order Book with Price-Time Priority** -- Bids sorted DESC by price then ASC by time; asks sorted ASC by price then ASC by time. Matching runs after every order placement.
+
+File: `backend/src/services/orderBook.ts`, `backend/src/services/orderService.ts`
 
 ### What Was Simplified or Substituted
 
@@ -1022,11 +859,12 @@ File: `backend/src/services/walletService.ts`
 | PostgreSQL sharding (Citus) | Single PostgreSQL instance | Sufficient for development scale |
 | OAuth2 / API keys for programmatic access | Session cookies only | Simpler auth for learning project |
 | Fee tiers (maker/taker volume-based) | Fixed 0.1% maker / 0.2% taker | Simplified fee structure |
+| TimescaleDB for candles | PostgreSQL `price_candles` table | Avoids extra dependency |
 
 ### What Was Omitted
 
 - **Blockchain integration**: No actual on-chain deposits/withdrawals, custody, or wallet addresses
-- **CDN for static assets**: Frontend served directly by Vite dev server
+- **CDN** for frontend static assets
 - **Multi-region deployment**: No geographic distribution or latency optimization
 - **Advanced order types**: No stop-limit, trailing stop, iceberg, or FOK/IOC orders
 - **Margin trading / leverage**: No borrowing or liquidation engine
@@ -1035,5 +873,5 @@ File: `backend/src/services/walletService.ts`
 - **Kubernetes / container orchestration**: Docker Compose only
 - **SSL/TLS termination**: Plain HTTP in development
 - **Read replicas**: Single PostgreSQL instance handles all reads and writes
-- **Time-series database**: Candle data in PostgreSQL rather than TimescaleDB
 - **ML-based fraud detection**: No anomaly detection on trading patterns
+- **Grafana dashboards**: Prometheus metrics collected but not visualized

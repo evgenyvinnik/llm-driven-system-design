@@ -2,289 +2,329 @@
 
 ## System Overview
 
-A metrics monitoring and visualization system similar to Datadog or Grafana for collecting, storing, and visualizing time-series data. This design targets a local development/learning environment while demonstrating patterns that scale to production.
+A metrics monitoring and visualization system similar to Datadog or Grafana for collecting, storing, and visualizing time-series data. Core challenges involve high-throughput metrics ingestion, efficient time-series storage with automatic downsampling, real-time dashboard rendering, and alert evaluation.
+
+**Learning Goals:**
+- Design high-throughput time-series ingestion pipelines
+- Implement automatic aggregation and downsampling
+- Build real-time dashboards with multiple visualization types
+- Design alert evaluation engines with state tracking
+
+---
 
 ## Requirements
 
 ### Functional Requirements
 
-- Metrics collection and ingestion via HTTP and batch APIs
-- Time-series data storage with automatic partitioning
-- Real-time dashboards and visualization (line, area, bar, gauge, stat charts)
-- Alerting and notifications (email, webhook)
-- Query and aggregation engine with PromQL-like syntax
-- Custom dashboard creation with drag-and-drop panels
-- Metric retention policies and automatic downsampling
+- **Metrics Ingestion**: Collect metrics via HTTP batch API from applications and agents
+- **Time-Series Storage**: Store raw metrics with automatic partitioning (hypertables)
+- **Aggregation**: Automatic downsampling to 1-minute and 1-hour rollups
+- **Dashboards**: Custom dashboard creation with multiple panel types (line, area, bar, gauge, stat)
+- **Alerting**: Rule-based alerts with configurable thresholds, durations, and notification channels
+- **Query Engine**: Flexible metric queries with time range selection and tag filtering
+- **Retention**: Automatic data lifecycle management (raw → aggregated → purged)
 
 ### Non-Functional Requirements
 
-- **Scalability**: Handle 1,000 metrics/second ingestion locally; design patterns support 100K+ in production
-- **Availability**: 99.5% uptime target (allows ~43 minutes downtime/week for local dev)
-- **Latency**: p95 query response < 500ms for 24-hour ranges, < 2s for 7-day ranges
+- **Throughput**: 100K metrics/second ingestion at production scale
+- **Query Latency**: p95 < 500ms for 24-hour ranges, p95 < 2s for 7-day ranges
+- **Availability**: 99.95% uptime for ingestion, 99.9% for dashboards
 - **Consistency**: Eventual consistency for metrics (seconds-level lag acceptable), strong consistency for dashboard/alert configurations
+- **Retention**: Raw data 7 days, 1-min aggregates 30 days, 1-hour aggregates 1 year
+
+---
 
 ## Capacity Estimation
 
-### Local Development Targets
+### Production Scale
+
+| Metric | Value | Rationale |
+|--------|-------|-----------|
+| Metrics ingestion | 100K/sec | 1000 services x 100 metrics each |
+| Data points/day | 8.64B | 100K/sec x 86,400 sec/day |
+| Raw storage/day | ~200 GB | 8.64B x 24 bytes avg per point |
+| Active dashboards | 10K | Across all teams |
+| Query throughput | 5K queries/sec | 10K dashboards x 10 panels x 0.05 refresh/sec |
+| Alert rules | 50K | Across all services |
+| Unique metric series | 10M | Cardinality across all tags |
+
+### Storage Growth
+
+| Tier | Resolution | Retention | Storage/Year |
+|------|-----------|-----------|-------------|
+| Raw | 1-second | 7 days | ~1.4 TB (rolling) |
+| 1-minute aggregate | 1 minute | 30 days | ~150 GB (rolling) |
+| 1-hour aggregate | 1 hour | 1 year | ~30 GB |
+
+### Local Development Scale
 
 | Metric | Target | Sizing Rationale |
 |--------|--------|------------------|
-| Metrics ingestion | 1,000/sec | 10 services x 100 metrics each |
+| Metrics ingestion | 1,000/sec | 10 simulated services x 100 metrics each |
 | Data points/day | 86.4M | 1,000/sec x 86,400 sec/day |
 | Raw storage/day | ~2 GB | 86.4M x 24 bytes avg per point |
 | Query throughput | 50 queries/sec | 5 dashboards x 10 panels x 1 refresh/sec |
 | Retention (raw) | 7 days | ~14 GB total raw data |
-| Retention (1-min agg) | 30 days | ~1.5 GB aggregated |
-| Retention (1-hour agg) | 1 year | ~300 MB aggregated |
 
-### Component Sizing (Local Dev)
-
-| Component | Resources | Justification |
-|-----------|-----------|---------------|
-| TimescaleDB | 2 GB RAM, 50 GB disk | Handles 14 GB raw + indexes + aggregates |
-| Redis | 256 MB RAM | Cache ~10K query results x 25 KB avg |
-| API Server | 512 MB RAM x 2 instances | Stateless, behind load balancer |
-| Ingestion Worker | 256 MB RAM x 2 instances | Batch writes to reduce DB load |
-| Alert Evaluator | 128 MB RAM | Runs every 10s, evaluates ~100 rules |
+---
 
 ## High-Level Architecture
 
 ```
-                                    +------------------+
-                                    |   Prometheus /   |
-                                    |   StatsD / Apps  |
-                                    +--------+---------+
-                                             |
-                                             v
-+------------------+              +----------+---------+
-|                  |              |                    |
-|  Load Balancer   +<-------------+  Metrics Ingestion |
-|  (nginx:3000)    |              |  API (3001, 3002)  |
-|                  |              |                    |
-+--------+---------+              +----------+---------+
-         |                                   |
-         |                                   v
-         |                        +----------+---------+
-         |                        |                    |
-         |                        |  RabbitMQ Queue    |
-         |                        |  (metrics.ingest)  |
-         |                        |                    |
-         |                        +----------+---------+
-         |                                   |
-         v                                   v
-+--------+---------+              +----------+---------+
-|                  |              |                    |
-|  Query API       |              |  Ingestion Worker  |
-|  (3001, 3002)    |              |  (batch writer)    |
-|                  |              |                    |
-+--------+---------+              +----------+---------+
-         |                                   |
-         v                                   v
-+--------+---------------------------+-------+---------+
-|                                                      |
-|              TimescaleDB (PostgreSQL)                |
-|  +---------------+  +---------------+  +-----------+ |
-|  | metrics_raw   |  | metrics_1min  |  | dashboards| |
-|  | (hypertable)  |  | (cont. agg)   |  | alerts    | |
-|  +---------------+  +---------------+  +-----------+ |
-|                                                      |
-+------------------------------+-----------------------+
-                               |
-                               v
-+------------------+  +--------+---------+  +------------------+
-|                  |  |                  |  |                  |
-|  Redis Cache     |  |  Alert Evaluator |  |  React Frontend  |
-|  (query results) |  |  (cron: 10s)     |  |  (Vite: 5173)    |
-|                  |  |                  |  |                  |
-+------------------+  +------------------+  +------------------+
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Metrics Sources                                    │
+│     (Applications, Prometheus exporters, StatsD agents)              │
+└──────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       API Gateway / Load Balancer                    │
+│                  (Rate limiting, auth, routing)                       │
+└──────────────────────────────────────────────────────────────────────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              ▼                                    ▼
+     ┌──────────────┐                     ┌──────────────┐
+     │  Ingestion   │                     │  Query API   │
+     │  API (N)     │                     │  (N)         │
+     │              │                     │              │
+     │ POST /metrics│                     │ POST /query  │
+     │  → 202       │                     │ GET /dash    │
+     └──────┬───────┘                     └──────┬───────┘
+            │                                    │
+            ▼                                    │
+     ┌──────────────┐                            │
+     │  Message     │                            │
+     │  Queue       │                            │
+     │  (Kafka)     │                            │
+     └──────┬───────┘                            │
+            │                                    │
+            ▼                                    │
+     ┌──────────────┐                            │
+     │  Ingestion   │                            │
+     │  Workers (N) │                            │
+     │              │                            │
+     │  Batch COPY  │                            │
+     │  to TSDB     │                            │
+     └──────┬───────┘                            │
+            │                                    │
+            ▼                                    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       TimescaleDB Cluster                            │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │ metrics      │  │ metrics_1min │  │ metrics_1hr  │              │
+│  │ (hypertable) │  │ (cont. agg)  │  │ (cont. agg)  │              │
+│  │ 7-day retain │  │ 30-day       │  │ 1-year       │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │ dashboards   │  │ panels       │  │ alert_rules  │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+└──────────────────────────────────────────────────────────────────────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              ▼                 ▼                  ▼
+     ┌──────────────┐  ┌──────────────┐   ┌──────────────┐
+     │  Redis       │  │  Alert       │   │  React       │
+     │  (Query      │  │  Evaluator   │   │  Frontend    │
+     │   cache +    │  │  (Periodic)  │   │              │
+     │   sessions)  │  │              │   │  Recharts    │
+     └──────────────┘  └──────────────┘   └──────────────┘
 ```
 
 ### Request Flow: Metrics Ingestion
 
-1. **Client** sends metrics batch to `/api/v1/metrics` (POST)
-2. **Load Balancer** routes to available API server
-3. **API Server** validates payload, enriches with timestamp if missing
-4. **API Server** publishes to RabbitMQ `metrics.ingest` queue (fire-and-forget)
-5. **API Server** returns 202 Accepted immediately
-6. **Ingestion Worker** consumes batches, buffers for 100ms or 1000 points
-7. **Ingestion Worker** bulk inserts to TimescaleDB via `COPY` command
-8. **TimescaleDB** automatically routes to appropriate hypertable chunk
+```
+1. Client sends POST /api/v1/metrics with batch of data points
+2. API validates payload (metric names, tag constraints, timestamps)
+3. API resolves metric definitions (cache metric IDs in Redis, 1-hour TTL)
+4. API publishes batch to message queue (Kafka topic: metrics.ingest)
+5. API returns 202 Accepted immediately (fire-and-forget)
+6. Ingestion Worker consumes batch, buffers for 100ms or 1000 points
+7. Worker bulk-inserts to TimescaleDB via COPY command (10x faster than INSERT)
+8. TimescaleDB routes to appropriate hypertable chunk (1-day intervals)
+9. Continuous aggregates automatically update 1-min and 1-hour rollups
+```
 
 ### Request Flow: Dashboard Query
 
-1. **Frontend** requests `/api/v1/query` with metric name, time range, aggregation
-2. **Load Balancer** routes to available API server
-3. **API Server** generates cache key from query parameters
-4. **API Server** checks Redis cache (TTL: 10s for live data, 5min for historical)
-5. **Cache miss**: Query TimescaleDB using continuous aggregates when possible
-6. **API Server** caches result, returns JSON response
-7. **Frontend** renders chart with Recharts
+```
+1. Frontend requests POST /api/v1/query with metric name, time range, aggregation
+2. API generates deterministic cache key from query parameters (SHA-256)
+3. API checks Redis cache:
+   - Live data (last 1 hour): 10-second TTL
+   - Historical data (> 1 hour ago): 5-minute TTL
+4. Cache miss → route query to appropriate table:
+   - Time range <= 1 hour: metrics (raw, 1s resolution)
+   - Time range <= 24 hours: metrics_1min (1-min resolution)
+   - Time range > 24 hours: metrics_1hour (1-hour resolution)
+5. API caches result in Redis, returns JSON
+6. Frontend renders chart with Recharts
+```
+
+### Request Flow: Alert Evaluation
+
+```
+1. Alert Evaluator runs every 10-30 seconds
+2. Fetch all enabled alert rules from PostgreSQL
+3. For each rule:
+   a. Query recent metric data (window_seconds)
+   b. Evaluate condition (gt, lt, eq, ne) against threshold
+   c. If condition true:
+      - Check Redis for existing alert state
+      - If firing duration exceeds configured window: trigger notification
+      - Record alert_instance in PostgreSQL
+   d. If condition false and previously firing: resolve alert
+4. Send notifications (email, webhook, console)
+```
+
+---
+
+## Core Components
+
+### 1. Ingestion API
+
+Stateless HTTP API accepting metric batches. Validates metric names (alphanumeric + underscores, max 255 chars), tag constraints (max 64-char keys, max 256-char values), and timestamps (within [now - 1 year, now + 5 minutes]). Returns 202 Accepted after queueing.
+
+### 2. Ingestion Workers
+
+Consume from message queue, buffer data points, and bulk-insert to TimescaleDB using the COPY protocol (10x faster than individual INSERTs). Workers are horizontally scalable: adding more consumers increases throughput linearly.
+
+### 3. Query API
+
+Serves dashboard queries with automatic query routing: short time ranges hit raw data, medium ranges hit 1-minute aggregates, long ranges hit 1-hour aggregates. Results are cached in Redis with TTLs based on data freshness.
+
+### 4. TimescaleDB (Time-Series Storage)
+
+PostgreSQL extension providing hypertables (automatic time-based partitioning), continuous aggregates (materialized rollups), and retention policies (automatic chunk deletion). Single database for both time-series data and metadata (dashboards, alerts, users).
+
+### 5. Alert Evaluator
+
+Background process that periodically evaluates all enabled alert rules against recent metric data. Tracks alert state (pending → firing → resolved) with duration-based triggering to prevent flapping. Sends notifications via email (Mailhog for local) or webhooks.
+
+### 6. Redis (Query Cache + Sessions)
+
+Caches query results with short TTLs (10s for live, 5min for historical), metric definition IDs (1-hour TTL), and session data. Rate limiting uses sorted sets for sliding window implementation.
+
+---
 
 ## Database Schema
 
-### Database Schema (TimescaleDB)
-
 ```sql
--- Metric definitions (cached in Redis)
-CREATE TABLE metric_definitions (
-    id              SERIAL PRIMARY KEY,
-    name            VARCHAR(255) NOT NULL,
-    description     TEXT,
-    unit            VARCHAR(50),
-    type            VARCHAR(20) DEFAULT 'gauge',  -- gauge, counter, histogram
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(name)
-);
-CREATE INDEX idx_metric_definitions_name ON metric_definitions(name);
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
--- Raw metrics (hypertable, partitioned by time)
-CREATE TABLE metrics_raw (
-    time            TIMESTAMPTZ NOT NULL,
-    metric_id       INTEGER NOT NULL REFERENCES metric_definitions(id),
-    value           DOUBLE PRECISION NOT NULL,
-    tags            JSONB DEFAULT '{}'::jsonb
-);
-SELECT create_hypertable('metrics_raw', 'time', chunk_time_interval => INTERVAL '1 day');
-CREATE INDEX idx_metrics_raw_metric_time ON metrics_raw(metric_id, time DESC);
-CREATE INDEX idx_metrics_raw_tags ON metrics_raw USING GIN(tags);
-
--- 1-minute continuous aggregate
-CREATE MATERIALIZED VIEW metrics_1min
-WITH (timescaledb.continuous) AS
-SELECT
-    time_bucket('1 minute', time) AS bucket,
-    metric_id,
-    tags,
-    AVG(value) AS avg_value,
-    MIN(value) AS min_value,
-    MAX(value) AS max_value,
-    COUNT(*) AS sample_count
-FROM metrics_raw
-GROUP BY bucket, metric_id, tags
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('metrics_1min',
-    start_offset => INTERVAL '1 hour',
-    end_offset => INTERVAL '1 minute',
-    schedule_interval => INTERVAL '1 minute'
-);
-
--- 1-hour continuous aggregate (for longer time ranges)
-CREATE MATERIALIZED VIEW metrics_1hour
-WITH (timescaledb.continuous) AS
-SELECT
-    time_bucket('1 hour', bucket) AS bucket,
-    metric_id,
-    tags,
-    AVG(avg_value) AS avg_value,
-    MIN(min_value) AS min_value,
-    MAX(max_value) AS max_value,
-    SUM(sample_count) AS sample_count
-FROM metrics_1min
-GROUP BY time_bucket('1 hour', bucket), metric_id, tags
-WITH NO DATA;
-
-SELECT add_continuous_aggregate_policy('metrics_1hour',
-    start_offset => INTERVAL '1 day',
-    end_offset => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '1 hour'
-);
-
--- Retention policies
-SELECT add_retention_policy('metrics_raw', INTERVAL '7 days');
-SELECT add_retention_policy('metrics_1min', INTERVAL '30 days');
-SELECT add_retention_policy('metrics_1hour', INTERVAL '365 days');
-
--- Dashboards
-CREATE TABLE dashboards (
+-- Users
+CREATE TABLE IF NOT EXISTS users (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name            VARCHAR(255) NOT NULL,
-    description     TEXT,
-    owner_id        INTEGER REFERENCES users(id),
-    layout          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    username        VARCHAR(100) NOT NULL UNIQUE,
+    email           VARCHAR(255) NOT NULL UNIQUE,
+    password_hash   VARCHAR(255) NOT NULL,
+    role            VARCHAR(20) DEFAULT 'user',
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Dashboard panels
-CREATE TABLE panels (
+-- Metric definitions (cached in Redis for fast lookups)
+CREATE TABLE IF NOT EXISTS metric_definitions (
+    id              SERIAL PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    tags            JSONB DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(name, tags)
+);
+CREATE INDEX IF NOT EXISTS idx_metric_definitions_name ON metric_definitions(name);
+CREATE INDEX IF NOT EXISTS idx_metric_definitions_tags ON metric_definitions USING GIN(tags);
+
+-- Raw metrics (hypertable with 1-day chunks)
+CREATE TABLE IF NOT EXISTS metrics (
+    time            TIMESTAMPTZ NOT NULL,
+    metric_id       INTEGER NOT NULL REFERENCES metric_definitions(id),
+    value           DOUBLE PRECISION NOT NULL
+);
+SELECT create_hypertable('metrics', 'time',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists => TRUE
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_metric_time ON metrics(metric_id, time DESC);
+
+-- Dashboards
+CREATE TABLE IF NOT EXISTS dashboards (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID REFERENCES users(id) ON DELETE SET NULL,
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    layout          JSONB NOT NULL DEFAULT '{"columns": 12, "rows": 8}'::jsonb,
+    is_public       BOOLEAN DEFAULT false,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dashboards_user ON dashboards(user_id);
+CREATE INDEX IF NOT EXISTS idx_dashboards_public ON dashboards(is_public);
+
+-- Panels
+CREATE TABLE IF NOT EXISTS panels (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     dashboard_id    UUID NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
     title           VARCHAR(255) NOT NULL,
-    type            VARCHAR(50) NOT NULL,  -- line, area, bar, gauge, stat
-    query           TEXT NOT NULL,
-    options         JSONB DEFAULT '{}'::jsonb,
+    panel_type      VARCHAR(50) NOT NULL,  -- line, area, bar, gauge, stat
+    query           JSONB NOT NULL,
     position        JSONB NOT NULL,  -- {x, y, w, h}
+    options         JSONB DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_panels_dashboard ON panels(dashboard_id);
+CREATE INDEX IF NOT EXISTS idx_panels_dashboard ON panels(dashboard_id);
 
 -- Alert rules
-CREATE TABLE alert_rules (
+CREATE TABLE IF NOT EXISTS alert_rules (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name            VARCHAR(255) NOT NULL,
-    query           TEXT NOT NULL,
-    condition       VARCHAR(20) NOT NULL,  -- gt, lt, eq, ne
-    threshold       DOUBLE PRECISION NOT NULL,
-    duration        INTERVAL NOT NULL DEFAULT '5 minutes',
-    severity        VARCHAR(20) DEFAULT 'warning',  -- info, warning, critical
+    description     TEXT,
+    metric_name     VARCHAR(255) NOT NULL,
+    tags            JSONB DEFAULT '{}'::jsonb,
+    condition       JSONB NOT NULL,  -- {operator: 'gt', value: 90}
+    window_seconds  INTEGER NOT NULL DEFAULT 300,
+    severity        VARCHAR(20) DEFAULT 'warning',
+    notifications   JSONB NOT NULL DEFAULT '[{"channel": "console", "target": "default"}]'::jsonb,
     enabled         BOOLEAN DEFAULT true,
-    notification    JSONB NOT NULL,  -- {type: 'email'|'webhook', target: '...'}
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_alert_rules_metric ON alert_rules(metric_name);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled);
 
--- Alert history
-CREATE TABLE alert_events (
+-- Alert instances (fired alerts)
+CREATE TABLE IF NOT EXISTS alert_instances (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    rule_id         UUID NOT NULL REFERENCES alert_rules(id),
-    status          VARCHAR(20) NOT NULL,  -- firing, resolved
+    rule_id         UUID NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+    status          VARCHAR(20) NOT NULL DEFAULT 'firing',
     value           DOUBLE PRECISION,
-    triggered_at    TIMESTAMPTZ DEFAULT NOW(),
-    resolved_at     TIMESTAMPTZ
+    fired_at        TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at     TIMESTAMPTZ,
+    notification_sent BOOLEAN DEFAULT false
 );
-CREATE INDEX idx_alert_events_rule_time ON alert_events(rule_id, triggered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_instances_rule ON alert_instances(rule_id, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_instances_status ON alert_instances(status);
 
--- Users (for auth)
-CREATE TABLE users (
-    id              SERIAL PRIMARY KEY,
-    email           VARCHAR(255) NOT NULL UNIQUE,
-    password_hash   VARCHAR(255) NOT NULL,
-    role            VARCHAR(20) DEFAULT 'viewer',  -- viewer, editor, admin
-    created_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Sessions
-CREATE TABLE sessions (
-    id              VARCHAR(255) PRIMARY KEY,
-    user_id         INTEGER NOT NULL REFERENCES users(id),
-    expires_at      TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_sessions_user ON sessions(user_id);
-CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+-- Retention policy for raw metrics
+SELECT add_retention_policy('metrics', INTERVAL '7 days', if_not_exists => TRUE);
 ```
 
 ### Redis Cache Structure
 
-```
-# Query result cache
-cache:query:{hash}          -> JSON result (TTL: 10s for live, 5min for historical)
+| Pattern | Type | TTL | Purpose |
+|---------|------|-----|---------|
+| `cache:query:{hash}` | String (JSON) | 10s / 5min | Query result cache (live vs historical) |
+| `cache:metric:name:{name}` | String | 1 hour | Metric definition ID lookup |
+| `session:{sessionId}` | Hash | 24 hours | User session data |
+| `ratelimit:ingest:{ip}` | Sorted set | 1 minute | Ingestion rate limiting (10K/min) |
+| `ratelimit:query:{userId}` | Sorted set | 1 minute | Query rate limiting (100/min) |
+| `alert:state:{ruleId}` | String (JSON) | 1 hour | Alert firing duration tracking |
 
-# Metric ID lookup cache
-cache:metric:name:{name}    -> metric_id (TTL: 1 hour)
-
-# Session storage
-session:{session_id}        -> {user_id, role, expires_at} (TTL: 24 hours)
-
-# Rate limiting
-ratelimit:ingest:{ip}       -> counter (TTL: 1 minute, max 10,000)
-ratelimit:query:{user_id}   -> counter (TTL: 1 minute, max 100)
-
-# Alert state (for duration tracking)
-alert:state:{rule_id}       -> {first_triggered, current_value} (TTL: 1 hour)
-```
+---
 
 ## API Design
 
@@ -292,332 +332,161 @@ alert:state:{rule_id}       -> {first_triggered, current_value} (TTL: 1 hour)
 
 ```
 # Metrics Ingestion
-POST   /api/v1/metrics              # Bulk ingest metrics
-  Body: [{name, value, tags?, timestamp?}, ...]
-  Response: 202 Accepted
+POST   /api/v1/metrics              → Bulk ingest metrics (returns 202)
 
 # Metrics Query
-POST   /api/v1/query                # Execute query
-  Body: {query, start, end, step?}
-  Response: {data: [{time, value}, ...], meta: {...}}
-
-GET    /api/v1/metrics              # List metric definitions
-GET    /api/v1/metrics/:name/tags   # Get tag values for metric
+POST   /api/v1/query                → Execute time-series query
+GET    /api/v1/metrics              → List metric definitions
+GET    /api/v1/metrics/:name/tags   → Get tag values for metric
 
 # Dashboards
-GET    /api/v1/dashboards           # List dashboards
-POST   /api/v1/dashboards           # Create dashboard
-GET    /api/v1/dashboards/:id       # Get dashboard with panels
-PUT    /api/v1/dashboards/:id       # Update dashboard
-DELETE /api/v1/dashboards/:id       # Delete dashboard
+GET    /api/v1/dashboards           → List dashboards
+POST   /api/v1/dashboards           → Create dashboard
+GET    /api/v1/dashboards/:id       → Get dashboard with panels
+PUT    /api/v1/dashboards/:id       → Update dashboard
+DELETE /api/v1/dashboards/:id       → Delete dashboard
 
 # Panels
-POST   /api/v1/dashboards/:id/panels    # Add panel
-PUT    /api/v1/panels/:id               # Update panel
-DELETE /api/v1/panels/:id               # Delete panel
+POST   /api/v1/dashboards/:id/panels    → Add panel
+PUT    /api/v1/panels/:id               → Update panel
+DELETE /api/v1/panels/:id               → Delete panel
 
 # Alerts
-GET    /api/v1/alerts               # List alert rules
-POST   /api/v1/alerts               # Create alert rule
-PUT    /api/v1/alerts/:id           # Update alert rule
-DELETE /api/v1/alerts/:id           # Delete alert rule
-GET    /api/v1/alerts/:id/history   # Get alert history
-
-# Admin
-GET    /api/v1/admin/stats          # System statistics
-POST   /api/v1/admin/retention      # Trigger retention cleanup
-GET    /api/v1/admin/health         # Health check
+GET    /api/v1/alerts               → List alert rules
+POST   /api/v1/alerts               → Create alert rule
+PUT    /api/v1/alerts/:id           → Update alert rule
+DELETE /api/v1/alerts/:id           → Delete alert rule
+GET    /api/v1/alerts/:id/history   → Get alert history
+POST   /api/v1/alerts/:id/evaluate  → Manually evaluate alert
 
 # Auth
-POST   /api/v1/auth/login           # Login
-POST   /api/v1/auth/logout          # Logout
-GET    /api/v1/auth/me              # Current user
+POST   /api/v1/auth/login           → Login
+POST   /api/v1/auth/logout          → Logout
+GET    /api/v1/auth/me              → Current user
 ```
+
+---
 
 ## Key Design Decisions
 
-### Time-series Database: TimescaleDB
+### TimescaleDB vs InfluxDB vs ClickHouse
 
-**Decision**: Use TimescaleDB (PostgreSQL extension) over InfluxDB or Prometheus TSDB.
+**Chosen: TimescaleDB (PostgreSQL extension).**
 
-**Rationale**:
-- SQL interface allows complex joins (metrics + dashboards + alerts in one DB)
-- Hypertables automatically partition by time, transparent to application
-- Continuous aggregates provide materialized rollups without application logic
-- Built-in compression (10x reduction on older chunks)
-- PostgreSQL ecosystem: pg_dump, replication, extensive tooling
-- Single database simplifies local development
+The fundamental advantage is having a single database for both time-series data and metadata. Dashboards, alert rules, and user accounts live alongside metrics in the same PostgreSQL instance, enabling SQL joins (e.g., "show all alert rules for metrics on dashboard X") without cross-database coordination. Hypertables transparently partition by time, and continuous aggregates provide materialized rollups without application-level aggregation code.
 
-**Trade-offs**:
-- Slightly higher write latency than specialized TSDBs
-- Requires PostgreSQL expertise
-- Cardinality limits (~10M unique series before performance degrades)
+InfluxDB offers higher raw write throughput, but its query language (InfluxQL/Flux) is less expressive than SQL and it would require a separate database for metadata. ClickHouse excels at OLAP analytics but is overkill for the monitoring use case and has a steeper operational learning curve.
 
-### Data Ingestion Pipeline
+The trade-off is write latency: TimescaleDB is slightly slower than purpose-built TSDBs for individual inserts. We mitigate this with batch COPY writes (10x faster than INSERT) via the ingestion worker pipeline. At 100K points/second, this is well within TimescaleDB's documented throughput ceiling.
 
-**Decision**: Async ingestion via RabbitMQ with batched writes.
+### Async Ingestion via Message Queue
 
-**Flow**:
-1. API accepts metrics, publishes to queue, returns 202 immediately
-2. Worker consumes, buffers for 100ms or 1000 points
-3. Worker uses `COPY` for bulk insert (10x faster than individual INSERTs)
+**Chosen: Fire-and-forget ingestion with queue-backed batch writes.**
 
-**Rationale**:
-- Decouples ingestion rate from database write speed
-- Provides backpressure handling (queue depth monitoring)
-- Enables horizontal scaling of workers
-- Allows retry on transient DB failures
+The ingestion API returns 202 Accepted immediately after publishing to the message queue, decoupling ingestion rate from database write speed. This has three critical benefits:
 
-**Queue Configuration**:
-```javascript
-// RabbitMQ settings
-{
-  queue: 'metrics.ingest',
-  durable: true,
-  prefetch: 100,           // Worker processes 100 messages at a time
-  ack: 'manual',           // Explicit ack after successful write
-  deadLetter: 'metrics.dlq' // Failed messages go here
-}
-```
+1. **Backpressure handling**: If the database slows down, the queue absorbs the burst. Workers process at their own pace without dropping metrics.
+2. **Write amplification**: Individual INSERTs at 100K/sec would create enormous WAL pressure. Batching 1000 points into a single COPY command reduces write amplification by 1000x.
+3. **Horizontal scaling**: Adding more workers linearly increases write throughput without changing the API layer.
 
-### Aggregation and Downsampling
+The cost is eventual consistency: metrics appear in queries a few hundred milliseconds after ingestion. For a monitoring system where dashboards refresh every 10 seconds, this latency is invisible.
 
-**Decision**: Use TimescaleDB continuous aggregates for automatic rollups.
+### Polling vs WebSocket for Dashboard Updates
 
-**Strategy**:
-- Raw data: 1-second resolution, 7-day retention
-- 1-minute aggregates: Automatic, 30-day retention
-- 1-hour aggregates: Automatic, 1-year retention
+**Chosen: HTTP polling with 10-second intervals.**
 
-**Query Routing Logic**:
-```
-Time range <= 1 hour:   Use metrics_raw (1s resolution)
-Time range <= 24 hours: Use metrics_1min (1min resolution)
-Time range > 24 hours:  Use metrics_1hour (1hour resolution)
-```
+WebSocket would reduce latency from ~10 seconds to sub-second, but monitoring dashboards do not require sub-second updates. The typical use case is watching trends over minutes and hours, not reacting to individual data points. Polling is dramatically simpler to implement, debug, and cache. Each poll is a standard HTTP request that benefits from Redis query caching, load balancer distribution, and standard observability tooling.
 
-**Benefits**:
-- Zero application code for rollups
-- Aggregates update incrementally (efficient)
-- Queries automatically faster on longer ranges
+The trade-off is 6x higher request volume (polling every 10s vs a single WebSocket connection). At 5K dashboards with 10 panels each, this means 5K requests/second, which is easily handled by the stateless query API with Redis caching absorbing repeated identical queries.
 
-### Alerting Engine
+---
 
-**Decision**: Pull-based evaluation with configurable intervals.
+## Aggregation and Downsampling
 
-**Design**:
-1. Alert Evaluator runs every 10 seconds
-2. Queries each enabled rule against recent data
-3. Tracks firing duration in Redis
-4. Sends notification only after threshold duration met
-5. Records event in alert_events table
+### Strategy
 
-**Alert States**:
-```
-pending  -> (condition true for duration)  -> firing
-firing   -> (condition false)              -> resolved
-resolved -> (condition true)               -> pending
-```
+TimescaleDB continuous aggregates provide zero-application-code rollups:
 
-**Notification Delivery**:
-- Email: Via SMTP (Mailhog for local dev)
-- Webhook: HTTP POST with retry (3 attempts, exponential backoff)
+| Tier | Resolution | Retention | Source | Update Interval |
+|------|-----------|-----------|--------|-----------------|
+| Raw (`metrics`) | 1 second | 7 days | Direct ingest | Real-time |
+| 1-minute (`metrics_1min`) | 1 minute | 30 days | Continuous aggregate | Every 1 minute |
+| 1-hour (`metrics_1hour`) | 1 hour | 1 year | Continuous aggregate | Every 1 hour |
 
-### Caching Strategy
+### Query Routing Logic
 
-**Decision**: Cache-aside pattern with short TTLs for live data.
+The query API automatically selects the optimal table based on requested time range:
 
-**Rules**:
-| Data Type | TTL | Invalidation |
-|-----------|-----|--------------|
-| Query results (live) | 10s | Time-based expiry |
-| Query results (historical) | 5min | Time-based expiry |
-| Metric definitions | 1 hour | On metric creation |
-| Dashboard configs | 30s | On save (explicit delete) |
+| Requested Range | Table Used | Resolution | Why |
+|-----------------|-----------|------------|-----|
+| <= 1 hour | `metrics` | 1 second | Full fidelity for recent data |
+| <= 24 hours | `metrics_1min` | 1 minute | Sufficient resolution, 60x fewer rows |
+| > 24 hours | `metrics_1hour` | 1 hour | Efficient for trends, 3600x fewer rows |
 
-**Cache Key Generation**:
-```javascript
-function cacheKey(query) {
-  const normalized = {
-    query: query.query.trim().toLowerCase(),
-    start: Math.floor(query.start / 10000) * 10000,  // Round to 10s
-    end: Math.floor(query.end / 10000) * 10000,
-    step: query.step
-  };
-  return `cache:query:${hash(JSON.stringify(normalized))}`;
-}
-```
+This routing is transparent to the frontend. A 7-day dashboard query scans ~168 rows per metric (7 days x 24 hours) instead of 604,800 raw rows.
 
-## Technology Stack
+---
 
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| **Frontend** | React 19 + Vite + TanStack Router | Fast dev experience, type-safe routing |
-| **Visualization** | Recharts | React-native charts, good time-series support |
-| **State Management** | Zustand | Lightweight, no boilerplate |
-| **Styling** | Tailwind CSS | Rapid UI development |
-| **API Layer** | Node.js + Express | Simple, well-understood, good async I/O |
-| **Time-series DB** | TimescaleDB 2.x | SQL + automatic partitioning + aggregates |
-| **Cache** | Redis 7.x / Valkey | Query caching, sessions, rate limiting |
-| **Message Queue** | RabbitMQ | Reliable delivery, DLQ support |
-| **Load Balancer** | nginx | Simple round-robin for local dev |
-| **Dev Email** | Mailhog | Captures email locally |
+## Security
 
-## Security Considerations
+### Authentication
 
-### Authentication and Authorization
+Session-based authentication with Redis store (connect-redis). Sessions have 24-hour TTL. Cookies set with HttpOnly, Secure (in production), SameSite=Lax. Passwords hashed with bcrypt.
 
-**Session-based Authentication**:
-- Login returns session cookie (HttpOnly, Secure, SameSite=Strict)
-- Sessions stored in Redis with 24-hour TTL
-- Session ID: 32-byte random, base64-encoded
+### Authorization (RBAC)
 
-**Role-Based Access Control (RBAC)**:
 | Role | Permissions |
 |------|-------------|
-| viewer | View dashboards, query metrics |
-| editor | Create/edit own dashboards, create alerts |
-| admin | All operations, user management, system config |
-
-**Middleware Implementation**:
-```javascript
-// Auth middleware
-async function requireAuth(req, res, next) {
-  const sessionId = req.cookies.session;
-  if (!sessionId) return res.status(401).json({ error: 'Unauthorized' });
-
-  const session = await redis.get(`session:${sessionId}`);
-  if (!session) return res.status(401).json({ error: 'Session expired' });
-
-  req.user = JSON.parse(session);
-  next();
-}
-
-// RBAC middleware
-function requireRole(...roles) {
-  return (req, res, next) => {
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
-    }
-    next();
-  };
-}
-```
+| `viewer` | View dashboards, query metrics |
+| `editor` | Create/edit own dashboards, create alerts |
+| `admin` | All operations, user management, system configuration |
 
 ### Rate Limiting
 
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| Metrics ingestion | 10,000 req/min per IP | Sliding window |
-| Query API | 100 req/min per user | Sliding window |
-| Login | 5 attempts/min per IP | Fixed window + lockout |
-
-**Implementation** (Redis + sliding window):
-```javascript
-async function rateLimit(key, limit, windowSec) {
-  const now = Date.now();
-  const windowStart = now - (windowSec * 1000);
-
-  await redis.zremrangebyscore(key, 0, windowStart);
-  const count = await redis.zcard(key);
-
-  if (count >= limit) {
-    return { allowed: false, retryAfter: windowSec };
-  }
-
-  await redis.zadd(key, now, `${now}-${Math.random()}`);
-  await redis.expire(key, windowSec);
-  return { allowed: true, remaining: limit - count - 1 };
-}
-```
+| Endpoint | Limit | Window | Implementation |
+|----------|-------|--------|----------------|
+| Metrics ingestion | 10,000 req/min per IP | Sliding window | Redis sorted set |
+| Query API | 100 req/min per user | Sliding window | Redis sorted set |
+| Login | 5 attempts/min per IP | Fixed window + lockout | Redis counter |
 
 ### Input Validation
 
-- Metric names: Alphanumeric + underscores, max 255 chars
-- Tag keys: Alphanumeric + underscores, max 64 chars
-- Tag values: Any string, max 256 chars
-- Queries: Sanitized to prevent SQL injection (parameterized)
-- Timestamps: Must be within [now - 1 year, now + 5 minutes]
+Metric names: alphanumeric + underscores, max 255 chars. Tag keys: alphanumeric + underscores, max 64 chars. Tag values: any string, max 256 chars. Timestamps: within [now - 1 year, now + 5 minutes]. All SQL queries use parameterized statements (Zod validation on API inputs).
+
+---
 
 ## Observability
 
-### Metrics (Self-Monitoring)
+### Self-Monitoring Metrics
 
 The dashboarding system monitors itself using the same infrastructure:
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `ingest_requests_total` | counter | Total ingestion requests |
-| `ingest_points_total` | counter | Total data points ingested |
-| `ingest_latency_ms` | histogram | Ingestion API latency |
-| `query_requests_total` | counter | Total query requests |
-| `query_latency_ms` | histogram | Query execution time |
-| `cache_hits_total` | counter | Redis cache hits |
-| `cache_misses_total` | counter | Redis cache misses |
-| `queue_depth` | gauge | RabbitMQ queue size |
-| `db_connections_active` | gauge | PostgreSQL connection pool usage |
-| `alert_evaluations_total` | counter | Alert rule evaluations |
-| `alerts_firing` | gauge | Currently firing alerts |
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `ingest_requests_total` | Counter | Total ingestion requests |
+| `ingest_points_total` | Counter | Total data points ingested |
+| `ingest_latency_seconds` | Histogram | Ingestion API latency |
+| `query_requests_total` | Counter | Total query requests |
+| `query_latency_seconds` | Histogram | Query execution time |
+| `cache_hits_total` / `cache_misses_total` | Counter | Cache hit rate |
+| `queue_depth` | Gauge | Message queue size |
+| `db_connections_active` / `idle` / `total` | Gauge | Connection pool usage |
+| `alert_evaluations_total` | Counter | Alert rule evaluations |
+| `alerts_firing` | Gauge | Currently firing alerts |
 
-### Logging
+### Structured Logging
 
-**Structured JSON Logging**:
-```javascript
-// Log format
-{
-  "timestamp": "2024-01-15T10:30:00Z",
-  "level": "info",
-  "service": "query-api",
-  "request_id": "abc123",
-  "user_id": 42,
-  "message": "Query executed",
-  "duration_ms": 150,
-  "cache_hit": false,
-  "metric_count": 1440
-}
-```
-
-**Log Levels**:
-- `error`: Unhandled exceptions, database failures
-- `warn`: Rate limit hits, slow queries (> 2s), queue backpressure
-- `info`: Request completion, significant state changes
-- `debug`: Query plans, cache operations (disabled in production)
-
-### Tracing
-
-**Request ID Propagation**:
-- Generate UUID for each incoming request
-- Pass via `X-Request-ID` header to internal services
-- Include in all log entries for correlation
-
-**Key Spans** (for local tracing with console output):
-- `http.request` - Full request lifecycle
-- `db.query` - Database query execution
-- `cache.get/set` - Redis operations
-- `queue.publish` - RabbitMQ publish
+Pino-based JSON logging with pino-http for automatic request logging. Health check requests are filtered from logs to reduce noise. Log levels: error (unhandled exceptions), warn (rate limits, slow queries > 2s), info (request completion), debug (query plans, cache operations).
 
 ### Health Checks
 
-**Endpoint**: `GET /api/v1/admin/health`
+| Endpoint | Purpose | Checks |
+|----------|---------|--------|
+| `/health` | Liveness | Process running |
+| `/health/live` | K8s liveness probe | Simple OK |
+| `/health/ready` | Readiness probe | TimescaleDB + Redis connectivity |
 
-```json
-{
-  "status": "healthy",
-  "version": "1.0.0",
-  "uptime_seconds": 3600,
-  "checks": {
-    "database": { "status": "up", "latency_ms": 5 },
-    "redis": { "status": "up", "latency_ms": 1 },
-    "rabbitmq": { "status": "up", "queue_depth": 42 }
-  }
-}
-```
-
-**Monitoring Alerts** (for the dashboarding system itself):
-- `queue_depth > 10000` for 5 minutes: Ingestion backlog
-- `cache_hit_rate < 50%` for 10 minutes: Cache ineffective
-- `db_connections_active > 80%` for 5 minutes: Connection pool exhaustion
-- `p99_query_latency > 5000ms` for 5 minutes: Query performance degradation
+---
 
 ## Failure Handling
 
@@ -632,531 +501,154 @@ The dashboarding system monitors itself using the same infrastructure:
 
 ### Circuit Breaker Pattern
 
-Applied to external notification endpoints (webhooks):
+Applied to database queries (Opossum library) and external notification endpoints (webhooks). Separate breakers for different operation types (query, ingest, dashboard CRUD). Configuration: timeout 10s, error percentage 40%, reset timeout 60s.
 
-```javascript
-const circuitBreaker = {
-  state: 'closed',        // closed, open, half-open
-  failures: 0,
-  threshold: 5,           // Open after 5 failures
-  resetTimeout: 60000,    // Try again after 1 minute
-  lastFailure: null
-};
+### Dead Letter Queue
 
-async function sendWebhook(url, payload) {
-  if (circuitBreaker.state === 'open') {
-    if (Date.now() - circuitBreaker.lastFailure > circuitBreaker.resetTimeout) {
-      circuitBreaker.state = 'half-open';
-    } else {
-      throw new Error('Circuit open');
-    }
-  }
-
-  try {
-    await fetch(url, { method: 'POST', body: JSON.stringify(payload) });
-    circuitBreaker.failures = 0;
-    circuitBreaker.state = 'closed';
-  } catch (error) {
-    circuitBreaker.failures++;
-    circuitBreaker.lastFailure = Date.now();
-    if (circuitBreaker.failures >= circuitBreaker.threshold) {
-      circuitBreaker.state = 'open';
-    }
-    throw error;
-  }
-}
-```
-
-### Dead Letter Queue (DLQ)
-
-Failed ingestion messages go to `metrics.dlq`:
-- Inspect with RabbitMQ Management UI (http://localhost:15672)
-- Manual replay: Move messages back to main queue
-- Auto-purge after 7 days
+Failed ingestion messages go to `metrics.dlq`. Inspectable via RabbitMQ Management UI. Auto-purge after 7 days.
 
 ### Graceful Degradation
 
 | Failure | Degraded Behavior |
 |---------|-------------------|
-| Redis down | Skip caching, queries hit DB directly |
-| RabbitMQ down | API returns 503, buffer in memory (limited) |
+| Redis down | Skip caching, queries hit DB directly (higher latency) |
+| Message queue down | API returns 503 for ingestion, queries still work |
 | DB read replica down | Route to primary (higher latency) |
 | Alert notification fails | Log error, mark alert as "notification_failed" |
 
-### Backup and Recovery (Local Dev)
+### Cardinality Management
 
-**Database Backup**:
-```bash
-# Daily backup (cron or manual)
-pg_dump -Fc dashboarding > backup_$(date +%Y%m%d).dump
+High-cardinality tags (e.g., `request_id`) cause performance degradation. Prevention: reject metrics with > 100 unique tag combinations per name, limit tag value length to 256 chars. Alert when any metric exceeds 10K unique tag combinations.
 
-# Restore
-pg_restore -d dashboarding backup_20240115.dump
-```
-
-**Data Recovery Priority**:
-1. Dashboard/alert configurations (small, high value)
-2. Metric definitions (small, needed for queries)
-3. Recent raw metrics (last 24h, most valuable)
-4. Aggregated data (can be regenerated from raw)
-
-## Cost Trade-offs
-
-### Storage Optimization
-
-| Strategy | Savings | Trade-off |
-|----------|---------|-----------|
-| Compression (TimescaleDB) | ~10x on old chunks | Slight CPU overhead on reads |
-| Aggressive retention | Linear with retention period | Less historical data |
-| Skip continuous aggregates | ~20% storage | Slower long-range queries |
-| JSONB tags vs normalized | Simpler schema | Higher storage, slower tag queries |
-
-### Compute vs Storage
-
-**Recommendation for local dev**: Optimize for simplicity, not cost.
-
-- Keep all data in single TimescaleDB instance
-- Use continuous aggregates (trade storage for query speed)
-- Cache aggressively (trade memory for DB load)
-
-### Queue Sizing
-
-| Setting | Conservative | Aggressive |
-|---------|--------------|------------|
-| Message TTL | 1 hour | 24 hours |
-| Queue max length | 100K messages | 1M messages |
-| Disk backing | Yes | Yes |
-
-**Recommendation**: Conservative settings for local dev to catch issues early.
+---
 
 ## Scalability Considerations
 
 ### Horizontal Scaling Path
 
-1. **API Servers**: Add more instances behind load balancer (stateless)
-2. **Ingestion Workers**: Add more consumers (RabbitMQ distributes)
-3. **Read Replicas**: Add PostgreSQL replicas for query load
-4. **Redis Cluster**: Shard cache by key hash (future)
-5. **TimescaleDB Multi-node**: Distribute hypertable chunks (future)
+1. **Ingestion API**: Add more stateless instances behind load balancer
+2. **Ingestion Workers**: Add more queue consumers (Kafka distributes partitions)
+3. **Query API**: Add more stateless instances (Redis absorbs cache hits)
+4. **TimescaleDB**: Read replicas for query load, multi-node for distributed hypertable chunks
+5. **Redis**: Redis Cluster for cache sharding
 
-### Cardinality Management
+### What Breaks First
 
-High-cardinality tags (like `request_id`) cause performance issues:
+At 10x scale (1M metrics/sec):
+- **Ingestion write throughput**: Single TimescaleDB node saturates. Solution: multi-node TimescaleDB with distributed hypertables, or separate write nodes.
+- **Cardinality explosion**: 100M unique series degrades query performance. Solution: aggressive tag cardinality limits, pre-aggregation.
+- **Alert evaluation latency**: 500K alert rules at 10-second intervals creates evaluation backlog. Solution: partition rules across multiple evaluator instances by metric name hash.
 
-**Prevention**:
-- Reject metrics with > 100 unique tag combinations per name
-- Limit tag value length to 256 chars
-- Monitor `SELECT COUNT(DISTINCT tags) FROM metrics_raw GROUP BY metric_id`
-
-**Alerting**:
-- Alert when any metric exceeds 10K unique tag combinations
-
-## Future Optimizations
-
-1. **WebSocket for real-time updates**: Replace polling for sub-second dashboards
-2. **Query result streaming**: Large results sent incrementally
-3. **Metric sharding**: Route by metric name hash to different DB nodes
-4. **Pre-computed dashboards**: Background jobs render popular dashboards
-5. **Anomaly detection**: ML-based alerting on metric deviations
-6. **Multi-tenancy**: Isolate metrics by organization/team
-
-## Local Development Setup
-
-### Prerequisites
-
-```bash
-# macOS
-brew install postgresql@16 timescaledb redis rabbitmq
-
-# Or use Docker Compose (recommended)
-docker-compose up -d
-```
-
-### docker-compose.yml
-
-```yaml
-version: '3.8'
-services:
-  timescaledb:
-    image: timescale/timescaledb:latest-pg16
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: dashboarding
-      POSTGRES_PASSWORD: dashboarding
-      POSTGRES_DB: dashboarding
-    volumes:
-      - timescale_data:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-  rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    environment:
-      RABBITMQ_DEFAULT_USER: dashboarding
-      RABBITMQ_DEFAULT_PASS: dashboarding
-
-  mailhog:
-    image: mailhog/mailhog
-    ports:
-      - "1025:1025"
-      - "8025:8025"
-
-volumes:
-  timescale_data:
-```
-
-### Environment Variables
-
-```bash
-# .env
-DATABASE_URL=postgresql://dashboarding:dashboarding@localhost:5432/dashboarding
-REDIS_URL=redis://localhost:6379
-RABBITMQ_URL=amqp://dashboarding:dashboarding@localhost:5672
-SMTP_HOST=localhost
-SMTP_PORT=1025
-SESSION_SECRET=local-dev-secret-change-in-prod
-```
-
-### Running the System
-
-```bash
-# Terminal 1: Infrastructure
-docker-compose up -d
-
-# Terminal 2: API servers
-npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
-
-# Terminal 3: Workers
-npm run dev:worker
-
-# Terminal 4: Alert evaluator
-npm run dev:alerts
-
-# Terminal 5: Frontend
-cd frontend && npm run dev  # Port 5173
-```
+---
 
 ## Trade-offs Summary
 
-| Decision | Alternative | Why Not |
-|----------|-------------|---------|
-| TimescaleDB | InfluxDB | SQL flexibility, single DB for all data |
-| TimescaleDB | ClickHouse | Overkill for local dev, complex setup |
-| RabbitMQ | Kafka | Simpler for message queue use case |
-| Redis | Memcached | Redis has more data structures (sorted sets for rate limiting) |
-| Polling | WebSocket | Simpler, good enough for 10s refresh |
-| Session auth | JWT | Simpler, immediate revocation |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Time-series DB | TimescaleDB | InfluxDB | SQL flexibility, single DB for all data |
+| Time-series DB | TimescaleDB | ClickHouse | Simpler setup, sufficient for monitoring |
+| Message queue | Kafka | RabbitMQ | Better for high-throughput ingestion, partitioned consumers |
+| Dashboard updates | Polling (10s) | WebSocket | Simpler, cacheable, sufficient for monitoring |
+| Auth | Session + Redis | JWT | Immediate revocation, simpler |
+| Cache | Redis (10s/5min TTL) | No cache | 10-100x query reduction |
+| Aggregation | Continuous aggregates | Application-level rollups | Zero code, incremental updates |
+| Alert evaluation | Pull-based (periodic) | Push-based (stream) | Simpler, configurable interval |
+
+---
 
 ## Implementation Notes
 
-This section documents the key implementation decisions and explains WHY each pattern was chosen.
+This section maps the production architecture to the actual local implementation running on Docker + Node.js + Express.
 
-### Why Query Caching Reduces Database Load
-
-Dashboard panels typically refresh every 10-30 seconds, and multiple users often view the same dashboard simultaneously. Without caching, each panel refresh triggers a full database query against large time-series tables, which can have millions of rows.
-
-**Query caching provides:**
-
-1. **Reduced database load**: Identical queries within the TTL window share results. If 10 users view the same dashboard, only 1 database query is executed instead of 10.
-
-2. **Improved latency**: Cache hits return in <1ms compared to 100-500ms for database queries. This dramatically improves perceived dashboard responsiveness.
-
-3. **Better scalability**: Redis can handle 10-100x more read operations than the database. Caching transforms database-bound scaling limits into memory-bound limits.
-
-4. **Protection during traffic spikes**: When a popular dashboard goes viral (e.g., during an incident), the cache absorbs the sudden load increase, preventing database overload.
-
-**Implementation details** (`src/shared/cache.ts`):
-- Cache-aside pattern with `getOrLoad()` helper
-- Deterministic cache keys from query parameters
-- TTL strategy: 10s for live data (freshness), 5 minutes for historical data (performance)
-- Size limits prevent caching extremely large results
-- SHA-256 hash for fixed-length cache keys
-
-### Why RBAC Enables Dashboard Sharing
-
-Role-Based Access Control (RBAC) separates authorization from authentication, enabling fine-grained control over who can view versus edit dashboards.
-
-**The problem without RBAC:**
-- Either everyone can edit dashboards (risky - accidental modifications)
-- Or dashboards are private-only (no sharing)
-
-**How RBAC solves this:**
-
-1. **Safe sharing across teams**: A DevOps engineer creates a critical production dashboard and shares it with the entire engineering team. Team members can VIEW but not accidentally modify or delete the dashboard.
-
-2. **Separation of concerns**:
-   - `viewer` role: Read-only access to public dashboards and metrics
-   - `editor` role: Create/modify own dashboards and alerts
-   - `admin` role: Manage any resource, system configuration
-
-3. **Ownership model**: Dashboard creators maintain control. Only the owner (or admin) can modify or delete a dashboard, even when shared publicly.
-
-**Implementation details** (`src/shared/auth.ts`):
-- Permission-based authorization (e.g., `dashboard:update:own` vs `dashboard:update:any`)
-- `requireOwnerOrAdmin()` middleware checks resource ownership
-- Session stores role for fast authorization checks without database lookups
-
-### Why Circuit Breakers Protect Against Slow Queries
-
-Time-series databases can experience performance degradation under certain conditions: complex queries over long time ranges, high cardinality, or infrastructure issues. Without protection, these slow queries cause cascading failures.
-
-**The cascade failure scenario:**
-1. Database becomes slow (high load, complex query, network issue)
-2. Queries accumulate, waiting for responses
-3. Connection pool exhausts (all connections waiting on slow queries)
-4. New requests can't get database connections
-5. Entire API becomes unresponsive
-6. Users retry, creating more load
-7. System completely fails
-
-**How circuit breakers prevent this:**
-
-1. **Fast failure**: When the circuit opens, requests fail immediately instead of waiting for timeout. Users get an error in 1ms instead of 30 seconds.
-
-2. **Database recovery time**: While the circuit is open, the database has time to complete pending queries and recover without new load.
-
-3. **Automatic testing**: Half-open state periodically tests if the database recovered, automatically restoring normal operation.
-
-4. **Metrics visibility**: Circuit breaker state is exposed via Prometheus metrics, enabling alerts before complete failure.
-
-**Implementation details** (`src/shared/circuitBreaker.ts`):
-- Opossum library provides battle-tested circuit breaker
-- Separate breakers for different operation types (query, ingest, dashboard)
-- Configurable thresholds: timeout (10s), error percentage (40%), reset timeout (60s)
-- Fallback returns empty results instead of error when appropriate
-
-### Why Ingestion Metrics Enable Capacity Planning
-
-Ingestion metrics provide visibility into the data flow rate, which is essential for:
-
-1. **Capacity planning**: By tracking points/second, operators can predict storage growth and plan infrastructure scaling before running out of capacity.
-
-   Example calculation:
-   - Current ingestion: 1,000 points/second
-   - Point size: ~24 bytes
-   - Daily storage: 1,000 * 86,400 * 24 = 2 GB/day
-   - 30-day projection: 60 GB
-
-2. **Anomaly detection**: A sudden drop in ingestion rate indicates data source failures. If monitoring agents stop sending metrics, the ingestion rate drops - this is often the first sign of infrastructure problems.
-
-3. **Rate limiting decisions**: When ingestion rate approaches capacity limits, operators can make informed decisions about throttling or scaling.
-
-4. **Cost forecasting**: In cloud environments, storage costs directly correlate with ingestion rate. Tracking ingestion enables accurate cost predictions.
-
-**Implementation details** (`src/shared/metrics.ts` and `src/services/metricsService.ts`):
-- `ingest_points_total`: Counter for total data points (throughput)
-- `ingest_requests_total`: Counter with status label (success/error)
-- `ingest_latency_seconds`: Histogram for batch write timing
-- Prometheus `/metrics` endpoint for scraping
-- Database connection pool metrics for capacity monitoring
-
-### Shared Module Architecture
-
-The implementation follows a shared module pattern for cross-cutting concerns:
+### Local Architecture
 
 ```
-backend/src/shared/
-├── logger.ts         # Structured JSON logging with pino
-├── metrics.ts        # Prometheus metrics and /metrics endpoint
-├── health.ts         # Health check endpoints (/health, /health/live, /health/ready)
-├── auth.ts           # Session auth and RBAC middleware
-├── cache.ts          # Query result caching with Redis
-└── circuitBreaker.ts # Database query protection
+┌──────────────────────────────────────────────────────────┐
+│                    Frontend (Vite)                        │
+│                  localhost:5173                           │
+│                                                          │
+│  Routes:                                                 │
+│    / (dashboard list)                                    │
+│    /dashboard/:id (dashboard view with panels)           │
+│    /alerts (alert rule management + history)             │
+│    /metrics (metrics explorer)                           │
+│                                                          │
+│  Components: Recharts (line, area, bar, gauge, stat)     │
+│              TimeRangeSelector, DashboardGrid             │
+│              AlertRuleForm, AlertRuleCard, AlertHistory   │
+└───────────────────────────┬──────────────────────────────┘
+                            │ HTTP (polling every 10s)
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│              API Server (Express)                         │
+│           localhost:3001 / 3002 / 3003                    │
+│                                                          │
+│  /api/v1/auth/*           Session auth                   │
+│  /api/v1/metrics          Ingest + query + list          │
+│  /api/v1/dashboards/*     CRUD + panels                  │
+│  /api/v1/alerts/*         Rules + history + evaluate     │
+│  /health, /health/live, /health/ready                    │
+│  /metrics                 Prometheus endpoint            │
+│                                                          │
+│  Background: Alert evaluator (every 30s)                 │
+└─────┬──────────────┬────────────────────────────────────┘
+      │              │
+      ▼              ▼
+┌──────────┐  ┌──────────┐
+│TimescaleDB│  │  Valkey   │
+│  :5432   │  │  :6379   │
+│          │  │          │
+│  metrics │  │ Sessions │
+│  metricsdb│ │ Cache    │
+│  metrics123│ │ Alerts   │
+└──────────┘  └──────────┘
 ```
 
-**Benefits:**
-- Single source of truth for each concern
-- Consistent behavior across all routes and services
-- Easy to test and modify independently
-- Clear separation between business logic and infrastructure
+### Production-Grade Patterns Actually Implemented
 
-## Frontend Architecture
+| Pattern | File | Description |
+|---------|------|-------------|
+| Structured logging | `backend/src/shared/logger.ts` | Pino + pino-http, auto-filtered health check logs, startup/shutdown logging |
+| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP latency histograms, ingestion counters, DB pool gauges, cache hit/miss counters |
+| Circuit breakers | `backend/src/shared/circuitBreaker.ts` | Opossum-based breakers for DB queries, configurable thresholds, fallback handlers |
+| Query caching | `backend/src/shared/cache.ts` | Redis cache-aside with TTL strategy (10s live, 5min historical), SHA-256 cache keys |
+| Health checks | `backend/src/shared/health.ts` | `/health`, `/health/live`, `/health/ready` with TimescaleDB + Redis checks |
+| RBAC auth | `backend/src/shared/auth.ts` | Session-based auth, role middleware (viewer/editor/admin), ownership checks |
+| TimescaleDB hypertables | `backend/db/init.sql` | Automatic time-based partitioning, retention policy (7-day raw) |
+| Alert evaluation | `backend/src/services/alertService.ts` | Periodic evaluator with state tracking, configurable interval |
+| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT handlers, pool draining, Redis disconnect |
+| Security headers | `backend/src/index.ts` | Helmet middleware, CORS, response compression |
+| Input validation | `backend/src/routes/metrics.ts` | Zod schema validation for metric payloads |
+| DB connection pooling | `backend/src/db/pool.ts` | pg Pool with periodic metric reporting |
+| Metric ID caching | `backend/src/services/metricsService.ts` | In-memory + Redis cache for metric definition lookups |
 
-The frontend is built with React 19, TypeScript, Vite, TanStack Router, and Tailwind CSS. It follows a modular component architecture that promotes reusability, testability, and maintainability.
+### Simplifications for Local Development
 
-### Directory Structure
+| Production Design | Local Substitute | Why |
+|-------------------|------------------|-----|
+| Kafka for ingestion queue | Direct DB writes (synchronous) | No Kafka/Zookeeper overhead (Kafka in docker-compose only via profile) |
+| Ingestion worker cluster | Inline writes in API handler | No separate worker process needed at 1K/sec |
+| TimescaleDB multi-node | Single TimescaleDB instance | Sufficient for local data volume |
+| Continuous aggregates | Not configured (query raw data) | Simpler, raw data small enough |
+| Read replicas | Single database | Low query volume |
+| Redis Cluster | Single Valkey instance | < 256 MB cache |
+| CDN / edge cache | Direct Vite dev server | No CDN needed locally |
+| API Gateway + LB | Direct connection on port 3001-3003 | No nginx needed |
+| SMTP provider | Mailhog (docker-compose optional) | Captures emails locally |
+| WebSocket for sub-second updates | HTTP polling (10s) | Simpler, sufficient |
 
-```
-frontend/src/
-├── components/           # Reusable UI components
-│   ├── alerts/           # Alert-specific components
-│   │   ├── index.ts      # Barrel export
-│   │   ├── AlertRuleForm.tsx
-│   │   ├── AlertRuleCard.tsx
-│   │   ├── AlertRuleList.tsx
-│   │   ├── AlertHistoryTable.tsx
-│   │   └── alertUtils.ts
-│   ├── AlertBanner.tsx   # Global alert notification banner
-│   ├── DashboardGrid.tsx # Dashboard panel layout grid
-│   ├── DashboardPanel.tsx # Panel wrapper with type routing
-│   ├── GaugePanel.tsx    # Gauge visualization
-│   ├── Navbar.tsx        # Main navigation
-│   ├── PanelChart.tsx    # Line/area/bar chart panels
-│   ├── StatPanel.tsx     # Single stat display
-│   └── TimeRangeSelector.tsx # Time range picker
-├── hooks/                # Custom React hooks
-│   └── useAlerts.ts      # Alert data fetching and state
-├── routes/               # TanStack Router page components
-│   ├── __root.tsx        # Root layout
-│   ├── index.tsx         # Dashboard list page
-│   ├── dashboard.$dashboardId.tsx # Dashboard view page
-│   ├── alerts.tsx        # Alerts management page
-│   └── metrics.tsx       # Metrics explorer page
-├── services/             # API client functions
-│   └── api.ts            # Typed API calls
-├── stores/               # Zustand state management
-│   ├── dashboardStore.ts
-│   └── alertStore.ts
-├── types/                # TypeScript type definitions
-│   └── index.ts          # Shared types and interfaces
-└── utils/                # Helper utilities
-```
+### What Was Omitted
 
-### Component Design Principles
-
-#### 1. Feature-based Organization
-
-Components are grouped by feature domain (e.g., `components/alerts/`) rather than by component type. This keeps related code together and makes it easier to find and modify.
-
-```
-components/
-├── alerts/              # All alert-related components
-│   ├── AlertRuleForm.tsx
-│   ├── AlertRuleCard.tsx
-│   └── ...
-├── dashboards/          # Dashboard-related components (future)
-└── metrics/             # Metrics-related components (future)
-```
-
-#### 2. Component Composition
-
-Large page components are decomposed into smaller, focused sub-components:
-
-- **Page components** (in `routes/`) orchestrate state and compose sub-components
-- **Container components** handle data fetching and business logic
-- **Presentational components** focus purely on rendering UI
-
-Example decomposition of the Alerts page:
-
-```
-AlertsPage (routes/alerts.tsx)
-├── AlertsHeader         # Page header with create button
-├── ErrorBanner          # Error message display
-├── AlertRuleForm        # Create form (components/alerts/)
-├── AlertTabs            # Tab navigation
-├── AlertRuleList        # Rules list container
-│   └── AlertRuleCard    # Individual rule card
-└── AlertHistoryTable    # History table
-```
-
-#### 3. Custom Hooks for Data Logic
-
-Data fetching and state management are extracted into custom hooks to:
-- Keep components focused on UI rendering
-- Enable reuse across multiple components
-- Simplify testing (mock the hook, not the API)
-
-```typescript
-// hooks/useAlerts.ts
-export function useAlerts(): UseAlertsReturn {
-  // Handles: fetching, polling, CRUD operations, error state
-  return { rules, instances, loading, error, createRule, deleteRule, ... };
-}
-
-// Usage in component
-function AlertsPage() {
-  const { rules, loading, createRule } = useAlerts();
-  // Component only handles rendering
-}
-```
-
-#### 4. Barrel Exports
-
-Each component directory includes an `index.ts` that re-exports all public components and types:
-
-```typescript
-// components/alerts/index.ts
-export { AlertRuleForm } from './AlertRuleForm';
-export type { AlertRuleFormData } from './AlertRuleForm';
-export { AlertRuleCard } from './AlertRuleCard';
-export { AlertRuleList } from './AlertRuleList';
-export { AlertHistoryTable } from './AlertHistoryTable';
-```
-
-This enables clean imports:
-```typescript
-import { AlertRuleForm, AlertRuleList, AlertHistoryTable } from '../components/alerts';
-```
-
-#### 5. JSDoc Documentation
-
-All components and significant functions include JSDoc comments:
-
-```typescript
-/**
- * Renders a card displaying alert rule details and actions.
- *
- * Displays:
- * - Severity badge with color coding
- * - Rule name and description
- * - Condition expression
- * - Toggle, test, and delete action buttons
- *
- * @param props - Component props
- * @returns The rendered alert rule card
- */
-export function AlertRuleCard({ rule, onToggle, onEvaluate, onDelete }: AlertRuleCardProps) {
-  // ...
-}
-```
-
-### Component Size Guidelines
-
-- **Target**: Keep components under 200 lines
-- **Maximum**: 250 lines before considering extraction
-- **Signals to split**:
-  - Multiple distinct visual sections
-  - Complex conditional rendering logic
-  - Repeated patterns that could be generalized
-  - Independent data fetching for sections
-
-### State Management Strategy
-
-| State Type | Solution | Example |
-|------------|----------|---------|
-| Server state | Custom hooks + API calls | `useAlerts()` for alert data |
-| UI state (local) | `useState` | Form visibility, active tab |
-| UI state (shared) | Zustand stores | Selected time range |
-| Form state | `useState` + form components | Alert creation form |
-
-### Styling Conventions
-
-All styling uses Tailwind CSS with custom theme colors defined in `tailwind.config.js`:
-
-- `dashboard-bg`: Dark background (#0f1419)
-- `dashboard-card`: Card background (#1a1f2e)
-- `dashboard-accent`: Border/divider color (#2d3748)
-- `dashboard-text`: Primary text (#e2e8f0)
-- `dashboard-muted`: Secondary text (#718096)
-- `dashboard-highlight`: Accent color (#3b82f6)
-
-Components use semantic color utilities for consistency:
-
-```typescript
-// alertUtils.ts
-export function getSeverityColor(severity: string): string {
-  switch (severity) {
-    case 'critical': return 'bg-red-600 text-white';
-    case 'warning': return 'bg-yellow-600 text-white';
-    default: return 'bg-blue-600 text-white';
-  }
-}
-```
+- CDN for static assets
+- Multi-region deployment and geo-routing
+- Kubernetes orchestration and auto-scaling
+- OAuth/OIDC integration (uses session auth instead)
+- WebSocket for real-time sub-second dashboard updates
+- Query result streaming for large results
+- Metric sharding across database nodes
+- Pre-computed dashboard snapshots
+- Anomaly detection (ML-based alerting)
+- Multi-tenancy with organization isolation
+- Drag-and-drop panel layout editing
+- PromQL query language parser
+- Continuous aggregates for automatic rollups

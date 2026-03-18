@@ -26,61 +26,83 @@ Reddit is a community-driven content platform where users submit posts, vote on 
 ### Non-Functional Requirements
 
 - **Availability**: 99.9% uptime
-- **Latency**: < 100ms for feed loading
-- **Scale**: Support millions of posts, billions of votes
-- **Consistency**: Eventual consistency for vote counts (acceptable delay)
+- **Latency**: < 100ms for feed loading, p99 < 200ms
+- **Scale**: 500M monthly active users, millions of posts/day, billions of votes
+- **Consistency**: Eventual consistency for vote counts (acceptable 5-30s delay)
+- **Throughput**: 100K votes/sec peak, 50K feed reads/sec
 
 ---
 
-## Capacity Estimation (Learning Scale)
+## Capacity Estimation
 
-- **Users**: 100 active users locally
-- **Subreddits**: 20 communities
-- **Posts**: 1,000 posts
-- **Comments**: 10,000 comments
-- **Votes**: 100,000 votes
+### Production Scale
 
-**Storage**: < 100 MB total
+- **Users**: 500M MAU, 50M DAU, 5M peak concurrent
+- **Posts**: 10M new posts/day (~115 posts/sec)
+- **Comments**: 100M new comments/day (~1,150/sec)
+- **Votes**: 1B votes/day (~11,500/sec, peak 100K/sec during viral events)
+- **Feed reads**: 50M DAU * 20 feed views/day = 1B feed requests/day (~11,500 QPS)
+- **Storage**: Posts + comments ~5 TB/year, votes ~50 TB/year (before archival)
+
+### Local Development Scale
+
+- 2-5 concurrent users, ~20 subreddits, ~1,000 posts, ~10,000 comments
+- Single PostgreSQL instance, single Valkey instance
+- No message queue needed (workers run as separate processes with timers)
 
 ---
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Client Layer                            │
-│                    React + Tanstack Router                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        API Gateway                              │
-│                    Node.js + Express                            │
-│   - POST /subreddits, /posts, /comments                         │
-│   - POST /vote                                                  │
-│   - GET /r/:subreddit/hot, /new, /top                          │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Post Service │    │ Vote Service  │    │Comment Service│
-│               │    │               │    │               │
-│ - CRUD posts  │    │ - Cast votes  │    │ - Tree mgmt   │
-│ - Ranking     │    │ - Aggregation │    │ - Threading   │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        └─────────────────────┼─────────────────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────────┬───────────────────────────────────────────┤
-│    PostgreSQL       │              Valkey                       │
-│  - Users, posts     │  - Vote counts (cached)                   │
-│  - Comments, votes  │  - Hot scores (precomputed)               │
-│  - Subreddits       │  - Session storage                        │
-└─────────────────────┴───────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              Clients                                     │
+│                    (Web / Mobile / Third-party Apps)                      │
+└──────────────────────────────┬──────────────────────────────────────────┘
+                               │
+                     ┌─────────▼─────────┐
+                     │       CDN         │
+                     │  (Static assets,  │
+                     │   embedded media) │
+                     └─────────┬─────────┘
+                               │
+                     ┌─────────▼─────────┐
+                     │   API Gateway /   │
+                     │   Load Balancer   │
+                     └─────────┬─────────┘
+                               │
+          ┌────────────────────┼────────────────────┐
+          │                    │                    │
+┌─────────▼────────┐ ┌────────▼────────┐ ┌────────▼────────┐
+│  Post Service    │ │  Vote Service   │ │ Comment Service │
+│  - CRUD posts    │ │  - Cast votes   │ │  - Tree mgmt    │
+│  - Feed ranking  │ │  - Aggregation  │ │  - Threading    │
+└─────────┬────────┘ └────────┬────────┘ └────────┬────────┘
+          │                    │                    │
+          │         ┌──────────┴──────────┐         │
+          │         │                     │         │
+┌─────────▼─────────▼───┐  ┌─────────────▼─────────▼───┐
+│     PostgreSQL         │  │        Valkey/Redis        │
+│  (Users, Posts,        │  │  (Vote counts cached,      │
+│   Comments, Votes,     │  │   Hot scores precomputed,  │
+│   Subreddits, Audit)   │  │   Session storage, Karma)  │
+└────────────────────────┘  └───────────────────────────┘
+          │
+┌─────────▼─────────────────────────────────────────┐
+│              Background Workers                     │
+│  ┌──────────────────┐  ┌─────────────────────┐     │
+│  │ Vote Aggregator  │  │ Ranking Calculator  │     │
+│  │ (every 5-30s)    │  │ (every 60s)         │     │
+│  └──────────────────┘  └─────────────────────┘     │
+└────────────────────────────────────────────────────┘
 ```
+
+At production scale, the architecture would include:
+- **Kafka** for event streaming between services (vote events, post creation events)
+- **Elasticsearch** for full-text search across posts and comments
+- **Read replicas** for feed queries (read-heavy workload)
+- **Sharding** by subreddit_id for horizontal partitioning
+- **CDN** for static assets, embedded media, and pre-rendered feeds
 
 ---
 
@@ -88,112 +110,52 @@ Reddit is a community-driven content platform where users submit posts, vote on 
 
 ### 1. Voting System
 
-**Challenge**: Counting votes efficiently without locking the database
+**Challenge**: Counting votes efficiently without database row locks under high contention.
 
-**Approach 1: Direct Count (Simple)**
-```sql
-UPDATE posts SET score = score + 1 WHERE id = ?
-```
-- **Problem**: Row-level locks under high contention
+At production scale with 100K votes/sec on a viral post, a direct `UPDATE posts SET score = score + 1` approach creates catastrophic row-level lock contention. Every concurrent voter serializes on the same row, turning a microsecond operation into a multi-second queue.
 
-**Approach 2: Write to Vote Table + Async Aggregation (Chosen)**
-```sql
-INSERT INTO votes (user_id, post_id, direction) VALUES (?, ?, 1)
--- Background job aggregates periodically
-```
-- **Pros**: No contention, can detect duplicates
-- **Cons**: Slight delay in score updates (acceptable)
+**Chosen approach: Write to vote table + async aggregation**
 
-**Vote Storage:**
-```sql
-CREATE TABLE votes (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
-  post_id INTEGER REFERENCES posts(id),
-  comment_id INTEGER REFERENCES comments(id),
-  direction SMALLINT NOT NULL, -- 1 = up, -1 = down
-  created_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(user_id, post_id),
-  UNIQUE(user_id, comment_id)
-);
+Votes are inserted into a separate `votes` table with no contention (each INSERT creates a new row). A background worker aggregates vote counts every 5-30 seconds, batch-updating the denormalized `score`, `upvotes`, and `downvotes` columns on posts and comments. This trades real-time accuracy for write throughput. Users see eventual consistency with a 5-30 second delay, which is acceptable because Reddit itself fuzzes displayed scores to prevent vote manipulation.
 
--- Aggregated scores cached in posts/comments tables
--- Background worker updates every 5-30 seconds
-```
+**Why not Redis INCR?** Atomic Redis increments give real-time counts but introduce durability risk. If Redis restarts between increments and persistence, votes are lost. The vote table approach preserves every vote for auditing, fraud detection, and karma recalculation.
 
-### 2. Nested Comments
+### 2. Nested Comments (Materialized Path)
 
-**Challenge**: Efficiently storing and querying tree structures
+**Challenge**: Efficiently storing and querying arbitrarily deep comment trees.
 
-**Approach 1: Adjacency List (Simple)**
-```sql
-CREATE TABLE comments (
-  id SERIAL PRIMARY KEY,
-  parent_id INTEGER REFERENCES comments(id),
-  post_id INTEGER REFERENCES posts(id),
-  ...
-);
-```
-- Requires recursive queries (slow for deep trees)
+| Method | Read Subtree | Insert | Move Subtree |
+|--------|--------------|--------|--------------|
+| Adjacency List | O(n) recursive CTE | O(1) | O(1) |
+| Materialized Path | O(log n) LIKE query | O(1) | O(subtree size) |
+| Nested Sets | O(log n) range query | O(n) renumber | O(n) renumber |
+| Closure Table | O(1) join | O(depth) inserts | O(subtree size) |
 
-**Approach 2: Materialized Path (Chosen)**
-```sql
-CREATE TABLE comments (
-  id SERIAL PRIMARY KEY,
-  post_id INTEGER REFERENCES posts(id),
-  path VARCHAR(255), -- e.g., "1.5.23.102"
-  depth INTEGER,
-  ...
-);
+**Chosen: Materialized Path** with path strings like `"1.5.23.102"` encoding ancestry.
 
--- Fetch all children of comment 5:
-SELECT * FROM comments WHERE path LIKE '1.5.%' ORDER BY path;
-```
-- **Pros**: Single query for subtrees, easy sorting
-- **Cons**: Path updates on moves (rare for comments)
+A single `WHERE path LIKE '1.5.%' ORDER BY path` fetches an entire subtree in tree order. This is the sweet spot for Reddit's access pattern: frequent subtree reads, frequent inserts (new replies), and essentially zero moves (users never rearrange comments). The `varchar_pattern_ops` index on PostgreSQL makes LIKE prefix queries efficient.
 
-**Approach 3: Nested Sets**
-- Complex updates, better for read-heavy trees
-- **Rejected**: Too complex for educational project
+**Trade-off acknowledged**: Moving a comment requires updating all descendant paths, which is O(subtree size). On Reddit, comment moves are essentially non-existent, so this cost is irrelevant.
 
 ### 3. Ranking Algorithms
 
-**Hot Algorithm:**
-```javascript
-// Reddit's hot algorithm (simplified)
-function hotScore(ups, downs, createdAt) {
-  const score = ups - downs
-  const order = Math.log10(Math.max(Math.abs(score), 1))
-  const sign = score > 0 ? 1 : score < 0 ? -1 : 0
-  const epochSeconds = 1134028003 // Reddit epoch
-  const seconds = Math.floor(createdAt.getTime() / 1000) - epochSeconds
-  return Math.round(sign * order + seconds / 45000, 7)
-}
+**Hot algorithm** (Reddit's formula):
+
+```
+score = ups - downs
+order = log10(max(|score|, 1))
+sign = +1 if score > 0, -1 if score < 0, 0 if score = 0
+seconds = (created_at_epoch - reddit_epoch)
+hot_score = sign * order + seconds / 45000
 ```
 
-**Top Algorithm:**
-```javascript
-// Simple: highest score within time range
-function topScore(ups, downs) {
-  return ups - downs
-}
-```
+The time component (`seconds / 45000`) means older posts need exponentially more votes to compete with newer ones. A 12.5-hour-old post needs 10x the score of a new post to rank equally.
 
-**Controversial Algorithm:**
-```javascript
-// High total votes, close to 50/50 split
-function controversialScore(ups, downs) {
-  if (ups <= 0 || downs <= 0) return 0
-  const magnitude = ups + downs
-  const balance = Math.min(ups, downs) / Math.max(ups, downs)
-  return magnitude * balance
-}
-```
+**Controversial algorithm**: `magnitude * (min(ups, downs) / max(ups, downs))`. High total engagement with balanced votes surfaces divisive content.
 
-**Precomputation Strategy:**
-- Recalculate hot scores every 5 minutes for active posts
-- Store in Valkey sorted sets for fast retrieval
-- `ZREVRANGE r:programming:hot 0 24` → top 25 hot posts
+**Wilson score** (for "best" comment sorting): Lower bound of the 95% confidence interval for the upvote proportion. This prevents a comment with 1 upvote / 0 downvotes from ranking above a comment with 100 upvotes / 5 downvotes.
+
+**Precomputation strategy**: A background worker recalculates hot scores every 60 seconds for posts created in the last 7 days. Older posts are frozen. At production scale, these scores would be stored in Valkey sorted sets (`ZREVRANGE r:programming:hot 0 24`) for O(log N) retrieval.
 
 ---
 
@@ -202,431 +164,221 @@ function controversialScore(ups, downs) {
 ### Entity-Relationship Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              REDDIT CLONE - DATABASE SCHEMA                              │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-
-    ┌──────────────┐
-    │    users     │
-    ├──────────────┤         ┌───────────────┐
-    │ id (PK)      │─────────│   sessions    │
-    │ username     │    1:N  ├───────────────┤
-    │ email        │         │ id (PK)       │
-    │ password_hash│         │ user_id (FK)  │──┐
-    │ karma_post   │         │ expires_at    │  │
-    │ karma_comment│         │ created_at    │  │
-    │ role         │         └───────────────┘  │ CASCADE DELETE
-    │ created_at   │                            │ (user deleted = sessions deleted)
-    └──────────────┘◄───────────────────────────┘
-           │
-           │
-    ┌──────┴──────┬─────────────────────────────────────────────┐
-    │             │                                              │
-    │ 1:N         │ 1:N                                          │ 1:N
-    │ (created_by)│ (author_id)                                  │ (author_id)
-    ▼             │                                              │
-┌──────────────┐  │                                              │
-│  subreddits  │  │    ┌──────────────┐         ┌──────────────┐ │
-├──────────────┤  │    │    posts     │         │   comments   │ │
-│ id (PK)      │  │    ├──────────────┤         ├──────────────┤ │
-│ name         │  │    │ id (PK)      │    1:N  │ id (PK)      │ │
-│ title        │  │    │ subreddit_id │◄────────│ post_id (FK) │ │
-│ description  │  │    │ author_id    │◄───┐    │ author_id    │◄┘
-│ created_by   │──┘    │ title        │    │    │ parent_id    │──┐ SELF-REF
-│ subscriber_  │       │ content      │    │    │ path         │◄─┘ (tree structure)
-│   count      │       │ url          │    │    │ depth        │
-│ is_private   │       │ score        │    │    │ content      │
-│ created_at   │       │ upvotes      │    │    │ score        │
-└──────────────┘       │ downvotes    │    │    │ upvotes      │
-       │               │ comment_count│    │    │ downvotes    │
-       │               │ hot_score    │    │    │ is_archived  │
-       │ 1:N           │ is_archived  │    │    │ archived_at  │
-       │               │ archived_at  │    │    │ created_at   │
-       ▼               │ created_at   │    │    └──────────────┘
-┌──────────────┐       └──────────────┘    │           │
-│subscriptions │              │            │           │
-├──────────────┤              │            │           │
-│ user_id (PK) │◄─────────┐   │            │           │
-│ subreddit_id │          │   │ 1:N        │ 1:N       │ 1:N
-│ subscribed_at│          │   │            │           │
-└──────────────┘          │   ▼            │           ▼
-       ▲                  │ ┌──────────────┐           │
-       │                  │ │    votes     │           │
-       │ CASCADE DELETE   │ ├──────────────┤           │
-       │ (both directions)│ │ id (PK)      │           │
-       │                  │ │ user_id (FK) │───────────┘
-       │                  │ │ post_id (FK) │◄──────────┤
-       │                  │ │ comment_id   │◄──────────┘
-┌──────┴───────┐          │ │ direction    │
-│    users     │◄─────────┘ │ created_at   │
-│  (user_id)   │            └──────────────┘
-└──────────────┘                  │
-                                  │ XOR CONSTRAINT:
-                                  │ Either post_id OR comment_id
-                                  │ must be set, not both
-                                  ▼
-                         ┌──────────────┐
-                         │  audit_logs  │
-                         ├──────────────┤
-                         │ id (PK)      │
-                         │ timestamp    │
-                         │ actor_id (FK)│──────► users (SET NULL on delete)
-                         │ actor_ip     │
-                         │ action       │
-                         │ target_type  │
-                         │ target_id    │
-                         │ details      │
-                         │ subreddit_id │──────► subreddits (SET NULL on delete)
-                         └──────────────┘
+┌──────────────┐
+│    users     │
+├──────────────┤         ┌───────────────┐
+│ id (PK)      │─────────│   sessions    │
+│ username     │    1:N  ├───────────────┤
+│ email        │         │ id (PK)       │
+│ password_hash│         │ user_id (FK)  │
+│ karma_post   │         │ expires_at    │
+│ karma_comment│         └───────────────┘
+│ role         │
+│ created_at   │
+└──────────────┘
+       │
+       ├──────────────────────────────────────────┐
+       │ 1:N                                      │ 1:N
+       ▼                                          ▼
+┌──────────────┐    ┌──────────────┐       ┌──────────────┐
+│  subreddits  │    │    posts     │       │   comments   │
+├──────────────┤    ├──────────────┤       ├──────────────┤
+│ id (PK)      │    │ id (PK)      │  1:N  │ id (PK)      │
+│ name         │    │ subreddit_id │◄──────│ post_id (FK) │
+│ title        │    │ author_id    │       │ author_id    │
+│ description  │    │ title        │       │ parent_id    │──┐ SELF-REF
+│ created_by   │    │ content      │       │ path         │◄─┘
+│ subscriber_  │    │ url          │       │ depth        │
+│   count      │    │ score        │       │ content      │
+│ is_private   │    │ upvotes      │       │ score        │
+└──────────────┘    │ downvotes    │       │ upvotes      │
+       │            │ comment_count│       │ downvotes    │
+       │ 1:N        │ hot_score    │       └──────────────┘
+       ▼            │ is_archived  │              │
+┌──────────────┐    └──────────────┘              │ 1:N
+│subscriptions │           │                      ▼
+├──────────────┤           │ 1:N           ┌──────────────┐
+│ user_id (PK) │           ▼               │    votes     │
+│ subreddit_id │    ┌──────────────┐       ├──────────────┤
+│ subscribed_at│    │    votes     │       │ id (PK)      │
+└──────────────┘    │  (post_id)   │       │ user_id (FK) │
+                    └──────────────┘       │ post_id (FK) │
+                                           │ comment_id   │
+                                           │ direction    │
+                                           └──────────────┘
+                                                  │
+                                    XOR: Either post_id OR
+                                    comment_id set, not both
 ```
 
 ### Complete Table Definitions
 
 #### 1. users
-The core user account table storing authentication and karma information.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | id | SERIAL | PRIMARY KEY | Auto-incrementing user identifier |
-| username | VARCHAR(50) | UNIQUE, NOT NULL | Display name for the user |
-| email | VARCHAR(255) | UNIQUE, NOT NULL | Email for authentication and notifications |
+| username | VARCHAR(50) | UNIQUE, NOT NULL | Display name |
+| email | VARCHAR(255) | UNIQUE, NOT NULL | Email for auth |
 | password_hash | VARCHAR(255) | NOT NULL | Bcrypt-hashed password |
-| karma_post | INTEGER | DEFAULT 0 | Accumulated karma from post votes |
-| karma_comment | INTEGER | DEFAULT 0 | Accumulated karma from comment votes |
-| role | VARCHAR(20) | DEFAULT 'user' | User role ('user', 'moderator', 'admin') |
-| created_at | TIMESTAMP | DEFAULT NOW() | Account creation timestamp |
+| karma_post | INTEGER | DEFAULT 0 | Accumulated post karma |
+| karma_comment | INTEGER | DEFAULT 0 | Accumulated comment karma |
+| role | VARCHAR(20) | DEFAULT 'user' | Role: user, moderator, admin |
+| created_at | TIMESTAMP | DEFAULT NOW() | Account creation |
 
-**Design Rationale**: Separate karma for posts and comments allows for richer user profiles and enables different karma thresholds for different actions (e.g., posting in certain subreddits).
+**Design rationale**: Separate karma for posts and comments allows different karma thresholds for different actions (e.g., minimum karma to post in certain subreddits).
 
 #### 2. sessions
-Session-based authentication storage for logged-in users.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | VARCHAR(255) | PRIMARY KEY | Session token (UUID or secure random) |
-| user_id | INTEGER | FK -> users(id) ON DELETE CASCADE | Owner of this session |
-| expires_at | TIMESTAMP | NOT NULL | When the session becomes invalid |
-| created_at | TIMESTAMP | DEFAULT NOW() | Session creation time |
-
-**Design Rationale**: Session-based auth is simpler than JWT for this learning project. ON DELETE CASCADE ensures orphaned sessions are cleaned up when users are deleted.
+| id | VARCHAR(255) | PRIMARY KEY | Session token |
+| user_id | INTEGER | FK -> users ON DELETE CASCADE | Session owner |
+| expires_at | TIMESTAMP | NOT NULL | Expiry time |
+| created_at | TIMESTAMP | DEFAULT NOW() | Creation time |
 
 #### 3. subreddits
-Communities where users post and engage in discussions.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing subreddit identifier |
-| name | VARCHAR(50) | UNIQUE, NOT NULL | URL-friendly name (e.g., "programming") |
-| title | VARCHAR(255) | - | Human-readable title |
-| description | TEXT | - | Community rules and description |
-| created_by | INTEGER | FK -> users(id) | Original creator (no cascade - preserve history) |
-| subscriber_count | INTEGER | DEFAULT 0 | Denormalized count for display |
-| is_private | BOOLEAN | DEFAULT FALSE | Whether the subreddit requires approval to join |
-| created_at | TIMESTAMP | DEFAULT NOW() | Community creation timestamp |
+| id | SERIAL | PRIMARY KEY | Subreddit identifier |
+| name | VARCHAR(50) | UNIQUE, NOT NULL | URL-friendly name |
+| title | VARCHAR(255) | | Human-readable title |
+| description | TEXT | | Community rules and description |
+| created_by | INTEGER | FK -> users (no cascade) | Original creator |
+| subscriber_count | INTEGER | DEFAULT 0 | Denormalized subscriber count |
+| is_private | BOOLEAN | DEFAULT FALSE | Private community flag |
+| created_at | TIMESTAMP | DEFAULT NOW() | Creation timestamp |
 
-**Design Rationale**: `subscriber_count` is denormalized to avoid COUNT(*) on every page load. The `created_by` foreign key has no ON DELETE to preserve subreddit history even if the creator's account is deleted.
+**Design rationale**: `created_by` has no ON DELETE to preserve subreddit history even if the creator deletes their account.
 
 #### 4. subscriptions
-Many-to-many relationship linking users to their subscribed subreddits.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| user_id | INTEGER | PK, FK -> users(id) ON DELETE CASCADE | Subscribing user |
-| subreddit_id | INTEGER | PK, FK -> subreddits(id) ON DELETE CASCADE | Target subreddit |
-| subscribed_at | TIMESTAMP | DEFAULT NOW() | When the subscription was created |
-
-**Design Rationale**: Composite primary key prevents duplicate subscriptions. CASCADE DELETE on both foreign keys ensures clean removal when either the user or subreddit is deleted.
+| user_id | INTEGER | PK, FK -> users ON DELETE CASCADE | Subscriber |
+| subreddit_id | INTEGER | PK, FK -> subreddits ON DELETE CASCADE | Target subreddit |
+| subscribed_at | TIMESTAMP | DEFAULT NOW() | Subscription time |
 
 #### 5. posts
-Content submissions within subreddits.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing post identifier |
-| subreddit_id | INTEGER | FK -> subreddits(id) ON DELETE CASCADE | Target community |
-| author_id | INTEGER | FK -> users(id) ON DELETE SET NULL | Post author |
-| title | VARCHAR(300) | NOT NULL | Post title (Reddit limit is 300 chars) |
-| content | TEXT | - | Text post content (null for link posts) |
-| url | VARCHAR(2048) | - | Link URL (null for text posts) |
+| id | SERIAL | PRIMARY KEY | Post identifier |
+| subreddit_id | INTEGER | FK -> subreddits ON DELETE CASCADE | Target community |
+| author_id | INTEGER | FK -> users ON DELETE SET NULL | Post author |
+| title | VARCHAR(300) | NOT NULL | Post title |
+| content | TEXT | | Text content (null for link posts) |
+| url | VARCHAR(2048) | | Link URL (null for text posts) |
 | score | INTEGER | DEFAULT 0 | Net score (upvotes - downvotes) |
-| upvotes | INTEGER | DEFAULT 0 | Total upvote count |
-| downvotes | INTEGER | DEFAULT 0 | Total downvote count |
+| upvotes | INTEGER | DEFAULT 0 | Total upvotes |
+| downvotes | INTEGER | DEFAULT 0 | Total downvotes |
 | comment_count | INTEGER | DEFAULT 0 | Denormalized comment count |
 | hot_score | DOUBLE PRECISION | DEFAULT 0 | Precomputed hot ranking score |
-| is_archived | BOOLEAN | DEFAULT FALSE | Whether the post is archived |
-| archived_at | TIMESTAMP | - | When the post was archived |
-| created_at | TIMESTAMP | DEFAULT NOW() | Post submission timestamp |
+| is_archived | BOOLEAN | DEFAULT FALSE | Archive flag |
+| archived_at | TIMESTAMP | | Archive timestamp |
+| created_at | TIMESTAMP | DEFAULT NOW() | Submission timestamp |
 
-**Indexes**:
-- `idx_posts_subreddit` - Filter by subreddit
-- `idx_posts_author` - User profile queries
-- `idx_posts_hot_score` - Hot feed sorting
-- `idx_posts_created_at` - New feed sorting
-- `idx_posts_score` - Top feed sorting
-- `idx_posts_not_archived` - Partial index excluding archived posts
+**Indexes**: `(subreddit_id, hot_score DESC)` for hot feeds, `(subreddit_id, created_at DESC)` for new feeds, `(subreddit_id, score DESC)` for top feeds, partial index on `is_archived = FALSE` for active posts.
 
-**Design Rationale**:
-- `ON DELETE CASCADE` for subreddit: If a subreddit is deleted, all its posts go too
-- `ON DELETE SET NULL` for author: Posts survive user deletion (shows as "[deleted]")
-- Denormalized `score`, `upvotes`, `downvotes`, `comment_count` avoid expensive aggregations
-- `hot_score` is precomputed by background worker to avoid CPU-intensive calculations on read
+**Design rationale**: `ON DELETE SET NULL` for author preserves posts as "[deleted]" when users delete accounts. Denormalized score/upvotes/downvotes avoid expensive aggregation queries on the read path.
 
 #### 6. comments
-Nested comment threads using the materialized path pattern.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing comment identifier |
-| post_id | INTEGER | FK -> posts(id) ON DELETE CASCADE | Parent post |
-| author_id | INTEGER | FK -> users(id) ON DELETE SET NULL | Comment author |
-| parent_id | INTEGER | FK -> comments(id) ON DELETE CASCADE | Parent comment (null for top-level) |
+| id | SERIAL | PRIMARY KEY | Comment identifier |
+| post_id | INTEGER | FK -> posts ON DELETE CASCADE | Parent post |
+| author_id | INTEGER | FK -> users ON DELETE SET NULL | Comment author |
+| parent_id | INTEGER | FK -> comments ON DELETE CASCADE | Parent comment (null for top-level) |
 | path | VARCHAR(255) | NOT NULL | Materialized path (e.g., "1.5.23") |
-| depth | INTEGER | DEFAULT 0 | Nesting level (0 = top-level) |
+| depth | INTEGER | DEFAULT 0 | Nesting level |
 | content | TEXT | NOT NULL | Comment body |
 | score | INTEGER | DEFAULT 0 | Net score |
 | upvotes | INTEGER | DEFAULT 0 | Total upvotes |
 | downvotes | INTEGER | DEFAULT 0 | Total downvotes |
-| is_archived | BOOLEAN | DEFAULT FALSE | Whether the comment is archived |
-| archived_at | TIMESTAMP | - | When the comment was archived |
-| created_at | TIMESTAMP | DEFAULT NOW() | Comment submission timestamp |
+| is_archived | BOOLEAN | DEFAULT FALSE | Archive flag |
+| created_at | TIMESTAMP | DEFAULT NOW() | Submission timestamp |
 
-**Indexes**:
-- `idx_comments_path` (varchar_pattern_ops) - Subtree queries with LIKE 'path.%'
-- `idx_comments_post` - All comments for a post
-- `idx_comments_parent` - Direct children of a comment
-- `idx_comments_not_archived` - Partial index for active comments
-
-**Design Rationale**:
-- Materialized path enables single-query subtree fetching: `WHERE path LIKE '1.5.%'`
-- Self-referential `parent_id` with CASCADE DELETE removes entire subtrees when parent is deleted
-- `varchar_pattern_ops` index enables efficient LIKE prefix queries
-- `depth` is redundant (derivable from path) but avoids string parsing for depth limits
+**Indexes**: `(path varchar_pattern_ops)` for subtree queries, `(post_id, created_at)` for chronological listing, `(post_id, score DESC)` for best comment sorting.
 
 #### 7. votes
-Voting records for both posts and comments with mutual exclusion.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing vote identifier |
-| user_id | INTEGER | FK -> users(id) ON DELETE CASCADE | Voter |
-| post_id | INTEGER | FK -> posts(id) ON DELETE CASCADE | Voted post (null if comment vote) |
-| comment_id | INTEGER | FK -> comments(id) ON DELETE CASCADE | Voted comment (null if post vote) |
-| direction | SMALLINT | NOT NULL | Vote direction: 1 (up), -1 (down) |
-| created_at | TIMESTAMP | DEFAULT NOW() | When vote was cast |
+| id | SERIAL | PRIMARY KEY | Vote identifier |
+| user_id | INTEGER | FK -> users ON DELETE CASCADE | Voter |
+| post_id | INTEGER | FK -> posts ON DELETE CASCADE | Voted post (null if comment vote) |
+| comment_id | INTEGER | FK -> comments ON DELETE CASCADE | Voted comment (null if post vote) |
+| direction | SMALLINT | NOT NULL | 1 (up) or -1 (down) |
+| created_at | TIMESTAMP | DEFAULT NOW() | Vote timestamp |
 
-**Constraints**:
-- `unique_post_vote` UNIQUE(user_id, post_id) - One vote per user per post
-- `unique_comment_vote` UNIQUE(user_id, comment_id) - One vote per user per comment
-- `vote_target` CHECK - Ensures exactly one of post_id or comment_id is set
-
-**Indexes**:
-- `idx_votes_user` - User's voting history
-- `idx_votes_post` - All votes on a post
-- `idx_votes_comment` - All votes on a comment
-
-**Design Rationale**:
-- Single votes table for both posts and comments reduces schema complexity
-- XOR constraint ensures data integrity (can't vote on nothing or both)
-- Separate upvotes/downvotes in posts/comments tables enable fuzzing for anti-brigade
-- Full vote history enables fraud detection and karma recalculation
+**Constraints**: `UNIQUE(user_id, post_id)`, `UNIQUE(user_id, comment_id)`, CHECK that exactly one of post_id or comment_id is set.
 
 #### 8. audit_logs
-Security and moderation event tracking.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Auto-incrementing log identifier |
-| timestamp | TIMESTAMP | DEFAULT NOW() | When the event occurred |
-| actor_id | INTEGER | FK -> users(id) ON DELETE SET NULL | User who performed the action |
-| actor_ip | INET | - | IP address of the actor |
-| action | VARCHAR(50) | NOT NULL | Action type (e.g., 'post.delete', 'user.ban') |
-| target_type | VARCHAR(20) | - | Entity type ('post', 'comment', 'user', 'subreddit') |
-| target_id | INTEGER | - | ID of the affected entity |
-| details | JSONB | - | Additional context (before/after values, reasons) |
-| subreddit_id | INTEGER | FK -> subreddits(id) ON DELETE SET NULL | Context subreddit |
+| id | SERIAL | PRIMARY KEY | Log identifier |
+| timestamp | TIMESTAMP | DEFAULT NOW() | Event time |
+| actor_id | INTEGER | FK -> users ON DELETE SET NULL | Acting user |
+| actor_ip | INET | | Client IP address |
+| action | VARCHAR(50) | NOT NULL | Action type (e.g., post.delete, user.ban) |
+| target_type | VARCHAR(20) | | Entity type (post, comment, user, subreddit) |
+| target_id | INTEGER | | Affected entity ID |
+| details | JSONB | | Action-specific context |
+| subreddit_id | INTEGER | FK -> subreddits ON DELETE SET NULL | Context subreddit |
 
-**Indexes**:
-- `idx_audit_timestamp` - Chronological queries
-- `idx_audit_actor` - Actions by specific user
-- `idx_audit_action` - Filter by action type
-- `idx_audit_target` - Find all actions on an entity
-- `idx_audit_subreddit` - Subreddit moderation history
-- `idx_audit_recent` - Partial index for last 90 days (most common queries)
+**Indexes**: `(timestamp DESC)`, `(actor_id)`, `(action)`, `(target_type, target_id)`, partial index on recent 90 days.
 
-**Design Rationale**:
-- SET NULL on foreign keys preserves audit history when users/subreddits are deleted
-- JSONB for details allows flexible schema per action type
-- INET type for IPs enables network-based queries
-- Partial index on recent events optimizes common time-range queries
+### Foreign Key Cascade Behaviors
 
-### Foreign Key Relationships and Cascade Behaviors
-
-| From Table | Column | To Table | On Delete | Rationale |
-|------------|--------|----------|-----------|-----------|
+| From | Column | To | On Delete | Rationale |
+|------|--------|----|-----------|-----------|
 | sessions | user_id | users | CASCADE | Sessions meaningless without user |
-| subreddits | created_by | users | (none) | Preserve subreddit even if creator deleted |
-| subscriptions | user_id | users | CASCADE | Subscriptions meaningless without user |
-| subscriptions | subreddit_id | subreddits | CASCADE | Subscriptions meaningless without subreddit |
+| subreddits | created_by | users | (none) | Preserve subreddit history |
+| posts | author_id | users | SET NULL | Show as "[deleted]" |
 | posts | subreddit_id | subreddits | CASCADE | Posts belong to subreddit lifecycle |
-| posts | author_id | users | SET NULL | Preserve post content, show as "[deleted]" |
-| comments | post_id | posts | CASCADE | Comments belong to post lifecycle |
-| comments | author_id | users | SET NULL | Preserve comment content, show as "[deleted]" |
-| comments | parent_id | comments | CASCADE | Delete entire reply subtree |
-| votes | user_id | users | CASCADE | Vote history doesn't survive user deletion |
-| votes | post_id | posts | CASCADE | Votes on deleted posts are meaningless |
-| votes | comment_id | comments | CASCADE | Votes on deleted comments are meaningless |
-| audit_logs | actor_id | users | SET NULL | Preserve audit trail with null actor |
-| audit_logs | subreddit_id | subreddits | SET NULL | Preserve audit trail with null subreddit |
-
-### Data Flow for Key Operations
-
-#### Creating a Post
-
-```
-1. User submits post
-   └─► INSERT INTO posts (subreddit_id, author_id, title, content, ...)
-
-2. Background worker calculates hot_score
-   └─► UPDATE posts SET hot_score = calculated_value WHERE id = ?
-
-3. Post appears in feeds based on indexes:
-   - Hot: idx_posts_hot_score
-   - New: idx_posts_created_at
-   - Top: idx_posts_score
-```
-
-#### Casting a Vote
-
-```
-1. User votes on post
-   └─► INSERT INTO votes (user_id, post_id, direction)
-       ON CONFLICT (user_id, post_id) DO UPDATE SET direction = ?
-
-2. Background aggregation worker (every 5-30 seconds):
-   └─► SELECT post_id, SUM(direction) as score,
-              SUM(CASE WHEN direction = 1 THEN 1 ELSE 0 END) as upvotes,
-              SUM(CASE WHEN direction = -1 THEN 1 ELSE 0 END) as downvotes
-       FROM votes WHERE post_id IN (recently_voted_posts)
-       GROUP BY post_id
-
-   └─► UPDATE posts SET score = ?, upvotes = ?, downvotes = ?
-       WHERE id = ?
-
-3. Karma calculation:
-   └─► UPDATE users SET karma_post = (
-         SELECT COALESCE(SUM(v.direction), 0)
-         FROM votes v
-         JOIN posts p ON v.post_id = p.id
-         WHERE p.author_id = users.id
-       ) WHERE id = author_id
-```
-
-#### Fetching Comment Thread
-
-```
-1. Fetch all comments for a post in tree order:
-   └─► SELECT * FROM comments
-       WHERE post_id = ? AND is_archived = FALSE
-       ORDER BY path
-
-2. Client reconstructs tree using parent_id and depth
-
-3. For a subtree (e.g., "load more replies"):
-   └─► SELECT * FROM comments
-       WHERE path LIKE '1.5.%'
-       ORDER BY path
-```
-
-#### User Deletion Flow
-
-```
-1. User requests account deletion
-   └─► BEGIN TRANSACTION
-
-2. Cascaded deletions:
-   └─► sessions: CASCADE (deleted automatically)
-   └─► subscriptions: CASCADE (deleted automatically)
-   └─► votes: CASCADE (deleted automatically)
-
-3. Preserved with SET NULL:
-   └─► posts: author_id = NULL (content preserved)
-   └─► comments: author_id = NULL (content preserved)
-   └─► audit_logs: actor_id = NULL (history preserved)
-
-4. Final deletion:
-   └─► DELETE FROM users WHERE id = ?
-
-5. Recalculate karma for affected post authors (optional):
-   └─► Background job triggers karma recalculation
-
-   └─► COMMIT
-```
-
-### Why Tables Are Structured This Way
-
-#### Denormalization Strategy
-
-The schema intentionally denormalizes:
-- `subscriber_count` in subreddits (avoids COUNT on subscriptions)
-- `score`, `upvotes`, `downvotes` in posts/comments (avoids SUM on votes)
-- `comment_count` in posts (avoids COUNT on comments)
-- `hot_score` precomputed (avoids complex calculation on every read)
-
-This trades storage space for read performance, which is appropriate for a read-heavy social platform where writes are batched via background workers.
-
-#### Separation of Votes Table
-
-Instead of storing only the current score, individual votes are preserved to:
-1. Detect and prevent vote manipulation
-2. Allow karma recalculation when needed
-3. Enable vote undo/change functionality
-4. Support future analytics on voting patterns
-
-#### Materialized Path for Comments
-
-The `path` column (e.g., "1.5.23.102") enables:
-- Single-query subtree fetching: `WHERE path LIKE '1.5.%'`
-- Efficient sorting within subtrees
-- Depth limiting without recursion: `WHERE depth <= 5`
-- No recursive CTEs needed (which can be slow on deep trees)
-
-Trade-off: Moving comments requires updating all descendant paths, but comment moves are extremely rare on Reddit-like platforms.
-
-#### Audit Logs as Immutable History
-
-The audit_logs table uses SET NULL instead of CASCADE to ensure:
-- Moderation actions remain visible after user deletion
-- Legal compliance for content moderation audits
-- Investigation capability for security incidents
-
-The JSONB `details` field provides flexibility for action-specific data without schema changes.
+| comments | author_id | users | SET NULL | Preserve comment content |
+| comments | parent_id | comments | CASCADE | Remove entire reply subtree |
+| votes | user_id | users | CASCADE | Vote history removed with user |
+| audit_logs | actor_id | users | SET NULL | Preserve audit trail |
 
 ---
 
 ## API Design
 
 ```
+# Authentication
+POST   /api/auth/register           - Create account
+POST   /api/auth/login              - Login
+POST   /api/auth/logout             - Logout
+GET    /api/auth/me                 - Get current user
+
 # Subreddits
 POST   /api/subreddits              - Create subreddit
 GET    /api/subreddits/:name        - Get subreddit info
-POST   /api/subreddits/:name/subscribe - Subscribe
+POST   /api/subreddits/:name/subscribe - Subscribe/unsubscribe
 
 # Posts
-POST   /api/r/:subreddit/posts      - Create post
-GET    /api/r/:subreddit/:sort      - List posts (hot/new/top)
-GET    /api/posts/:id               - Get post with comments
+POST   /api/r/:subreddit/posts     - Create post
+GET    /api/r/:subreddit/:sort      - List posts (hot/new/top/controversial)
+GET    /api/posts/:id               - Get post with vote status
 
 # Comments
-POST   /api/posts/:id/comments      - Create comment
-GET    /api/posts/:id/comments      - Get comment tree
+POST   /api/posts/:id/comments     - Create comment
+GET    /api/posts/:id/comments     - Get comment tree
 
 # Voting
-POST   /api/vote                    - Cast vote
+POST   /api/vote                   - Cast vote
 Body: { type: "post"|"comment", id: number, direction: 1|-1|0 }
 
-# User
-GET    /api/users/:username         - Get profile
-GET    /api/users/:username/posts   - Get user's posts
+# Users
+GET    /api/users/:username        - Get profile + karma
+GET    /api/users/:username/posts  - User's post history
+
+# Search
+GET    /api/search?q=              - Search posts
 ```
 
 ---
@@ -635,307 +387,130 @@ GET    /api/users/:username/posts   - Get user's posts
 
 ### 1. Eventual Consistency for Vote Counts
 
-**Decision**: Vote counts are eventually consistent (5-30 second delay)
+**Chosen**: Vote counts are eventually consistent with a 5-30 second delay.
 
-**Rationale**:
-- Avoids database contention
-- Users rarely notice slight delays
-- Enables horizontal scaling of vote service
+**Why this works for Reddit**: Users rarely notice slight delays in score updates. Reddit itself fuzzes displayed scores to prevent vote manipulation, so exact real-time accuracy is not a user expectation. The aggregation delay also provides a natural batch window for detecting suspicious voting patterns before scores are committed.
 
-**Alternative**: Real-time counts with Redis atomic increments
-- Better UX but more complex
-- Consider for Phase 2
+**What breaks with the alternative**: Real-time counts via direct `UPDATE posts SET score = score + 1` create row-level locks. On a viral post receiving 10,000 votes/second, every voter waits in a lock queue. Average response time degrades from 5ms to 500ms+, and the database connection pool exhausts within seconds. The application appears "hung" to all users, not just those voting on the viral post, because the connection pool is shared.
+
+**What we give up**: Users see stale scores for up to 30 seconds. On posts receiving few votes, this is imperceptible. On viral posts, the score visually "jumps" in increments rather than ticking up smoothly. This is acceptable because Reddit's fuzzing already causes similar behavior.
 
 ### 2. Materialized Path for Comments
 
-**Decision**: Use path strings like "1.5.23" for tree traversal
+**Chosen**: Path strings like `"1.5.23"` encode comment ancestry.
 
-**Rationale**:
-- Single query to fetch entire subtree
-- Easy depth-based sorting
-- No recursive CTEs needed
+**Why this works**: Reddit's dominant access pattern is "show me all replies under this comment." A single `WHERE path LIKE '1.5.%'` query with a `varchar_pattern_ops` index retrieves an entire subtree in tree order. No recursive CTEs, no multiple round-trips.
 
-**Trade-off**: Path updates on comment moves (but moves are rare)
+**What breaks with adjacency lists**: Fetching a comment tree requires recursive CTEs (`WITH RECURSIVE`), which PostgreSQL executes as iterative breadth-first traversal. For a post with 5,000 comments and 20 levels of nesting, this means 20 sequential query rounds inside the CTE. On a busy database server, this takes 50-200ms per request compared to 5-10ms for a single LIKE query.
+
+**What we give up**: Comment moves require updating all descendant paths. But on Reddit, comments are never moved. This is a textbook case of choosing a data structure optimized for the actual access pattern.
 
 ### 3. Precomputed Hot Scores
 
-**Decision**: Background job recalculates hot scores every 5 minutes
+**Chosen**: Background worker recalculates hot scores every 60 seconds for posts from the last 7 days.
 
-**Rationale**:
-- Hot algorithm is CPU-intensive
-- Same scores used by many users
-- Store in Valkey sorted set for O(log N) retrieval
+**Why precomputation**: The hot algorithm involves `log10`, sign detection, and epoch arithmetic. Calculating this on every feed request for 50 posts means 50 floating-point computations per request. At 11,500 QPS, that is 575,000 computations/second. While individually cheap, precomputation moves this entirely off the read path, letting feed requests be simple sorted index scans.
 
----
-
-## Scalability Considerations
-
-### Database Sharding (Future)
-
-- Shard by subreddit_id (each community independent)
-- Cross-shard queries for user profiles (aggregate across shards)
-
-### Caching Strategy
-
-- **Valkey**: Hot post lists, vote counts, user sessions
-- **CDN**: Static assets, embedded media
-- **Application**: Parsed markdown cache
-
-### Read Replicas
-
-- Separate read/write for post listing (read-heavy)
-- Eventual consistency acceptable for feeds
+**Why 7-day window**: Posts older than 7 days have effectively frozen hot scores because the time component dominates. A 7-day-old post would need millions of votes to compete with a 1-hour-old post with 10 votes. Freezing old scores saves computation without affecting ranking quality.
 
 ---
 
-## Trade-offs Summary
+## Consistency and Idempotency
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Vote counting | Async aggregation | Real-time Redis | Avoid DB contention |
-| Comment tree | Materialized path | Adjacency list | Faster subtree queries |
-| Hot scores | Precomputed cache | On-demand calc | CPU efficiency |
-| Database | PostgreSQL | Cassandra | Relational fits better |
+### Vote Idempotency
+
+Votes use `INSERT ... ON CONFLICT (user_id, post_id) DO UPDATE SET direction = $3`. This ensures:
+- Repeated identical votes are no-ops (idempotent)
+- Changing vote direction is a single atomic operation
+- Removing a vote sets direction to 0 (soft delete)
+
+The background aggregator reads the full vote table state, so duplicate inserts or missed updates self-correct on the next aggregation cycle.
+
+### Karma Recalculation
+
+Karma is derived entirely from the votes table: `SUM(direction) FROM votes JOIN posts ON post_id WHERE author_id = ?`. This means karma is always recalculable from source-of-truth data. If the denormalized `karma_post` column drifts, the aggregation worker corrects it.
+
+### Audit Log Durability
+
+Audit events are fire-and-forget with error suppression. A failed audit write does not block the user-facing operation. This trades audit completeness for availability. At production scale, audit events would flow through Kafka for guaranteed delivery.
 
 ---
 
-## Local Multi-Instance Setup
+## Security / Auth
 
-```bash
-# Terminal 1: API Server
-npm run dev:server1  # Port 3001
-
-# Terminal 2: Vote Aggregation Worker
-npm run dev:worker
-
-# Terminal 3: Hot Score Calculator
-npm run dev:ranking
-
-# Infrastructure
-docker-compose up -d  # PostgreSQL, Valkey
-```
+- **Session-based auth** with Valkey-backed sessions (cookie-based tokens)
+- **bcrypt** password hashing with 12 rounds
+- **Cookie security**: HttpOnly, SameSite=Lax for CSRF protection
+- **Input sanitization**: Parameterized SQL queries prevent injection
+- **CORS**: Restricted to frontend origin
+- **Graceful shutdown**: Rejects new requests with 503 during shutdown, drains in-flight requests
 
 ---
 
 ## Observability
 
-### Metrics (Prometheus + Grafana)
+### Prometheus Metrics
 
-For local development, run Prometheus and Grafana via Docker Compose:
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `reddit_http_request_duration_seconds` | Histogram | API latency by method/route/status |
+| `reddit_http_requests_total` | Counter | Request count by method/route/status |
+| `reddit_votes_total` | Counter | Votes by direction and target type |
+| `reddit_vote_aggregation_lag_seconds` | Gauge | Freshness of aggregated scores |
+| `reddit_vote_aggregation_duration_seconds` | Histogram | Aggregation batch time |
+| `reddit_posts_created_total` | Counter | Post creation rate by subreddit |
+| `reddit_comments_created_total` | Counter | Comment rate by depth bucket |
+| `reddit_comment_tree_depth` | Histogram | Comment nesting depth distribution |
+| `reddit_hot_score_calculation_duration_seconds` | Histogram | Ranking job duration |
+| `reddit_db_pool_size` | Gauge | Connection pool utilization |
+| `reddit_db_query_duration_seconds` | Histogram | Query duration by operation type |
+| `reddit_cache_hits_total` / `reddit_cache_misses_total` | Counter | Cache effectiveness |
+| `reddit_audit_events_total` | Counter | Audit event rate by action/target |
+| `reddit_karma_calculation_duration_seconds` | Histogram | Karma recalculation time |
 
-```yaml
-# Add to docker-compose.yml
-prometheus:
-  image: prom/prometheus:v2.50.0
-  ports:
-    - "9090:9090"
-  volumes:
-    - ./prometheus.yml:/etc/prometheus/prometheus.yml
+### Health Checks
 
-grafana:
-  image: grafana/grafana:10.3.0
-  ports:
-    - "3000:3000"
-  environment:
-    - GF_SECURITY_ADMIN_PASSWORD=admin
-```
+- `GET /health` - Detailed status with PostgreSQL and Valkey latency, memory usage
+- `GET /health/live` - Simple liveness probe (process running)
+- `GET /health/ready` - Readiness probe (all dependencies healthy)
+- `GET /metrics` - Prometheus scrape endpoint
 
-**Key Metrics to Collect:**
+### Structured Logging
 
-| Metric | Type | Description | Alert Threshold |
-|--------|------|-------------|-----------------|
-| `http_request_duration_seconds` | Histogram | API latency by endpoint | p95 > 200ms |
-| `http_requests_total` | Counter | Request count by status code | 5xx rate > 1% |
-| `vote_aggregation_lag_seconds` | Gauge | Time since last vote aggregation | > 60s |
-| `hot_score_calculation_duration` | Histogram | Ranking job performance | p95 > 30s |
-| `db_connection_pool_size` | Gauge | PostgreSQL pool utilization | > 80% capacity |
-| `valkey_memory_used_bytes` | Gauge | Cache memory usage | > 80% limit |
-| `comment_tree_depth` | Histogram | Comment nesting depth | max > 20 |
+Pino logger with JSON output. Each request gets a child logger with request ID, method, path, and user ID for correlation. Slow queries (>100ms) trigger warning-level logs with query text and duration.
 
-**Express Middleware for Metrics:**
-```javascript
-// src/shared/metrics.ts
-import { collectDefaultMetrics, Registry, Histogram, Counter } from 'prom-client'
+### SLO Targets
 
-export const register = new Registry()
-collectDefaultMetrics({ register })
-
-export const httpDuration = new Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'route', 'status'],
-  buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5],
-  registers: [register]
-})
-
-export const voteCounter = new Counter({
-  name: 'votes_total',
-  help: 'Total votes cast',
-  labelNames: ['direction', 'target_type'],
-  registers: [register]
-})
-```
-
-### Logging (Structured JSON)
-
-Use structured logging for easy parsing and filtering:
-
-```javascript
-// src/shared/logger.ts
-import pino from 'pino'
-
-export const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  },
-  base: {
-    service: process.env.SERVICE_NAME || 'reddit-api',
-    version: process.env.npm_package_version
-  }
-})
-
-// Usage examples:
-logger.info({ userId: 123, postId: 456, direction: 1 }, 'vote cast')
-logger.warn({ queueDepth: 1000, lag: 45 }, 'vote aggregation queue building up')
-logger.error({ err, postId: 789 }, 'failed to calculate hot score')
-```
-
-**Log Levels by Environment:**
-- `debug`: Local development (full request/response bodies)
-- `info`: Staging (operations, user actions)
-- `warn`: Production (degraded states, approaching limits)
-- `error`: All environments (failures requiring attention)
-
-### Distributed Tracing (OpenTelemetry)
-
-For local development, use Jaeger for trace visualization:
-
-```yaml
-# Add to docker-compose.yml
-jaeger:
-  image: jaegertracing/all-in-one:1.54
-  ports:
-    - "16686:16686"  # UI
-    - "4318:4318"    # OTLP HTTP
-```
-
-```javascript
-// src/shared/tracing.ts
-import { NodeSDK } from '@opentelemetry/sdk-node'
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
-import { ExpressInstrumentation } from '@opentelemetry/instrumentation-express'
-import { PgInstrumentation } from '@opentelemetry/instrumentation-pg'
-import { IORedisInstrumentation } from '@opentelemetry/instrumentation-ioredis'
-
-const sdk = new NodeSDK({
-  traceExporter: new OTLPTraceExporter({
-    url: 'http://localhost:4318/v1/traces'
-  }),
-  instrumentations: [
-    new ExpressInstrumentation(),
-    new PgInstrumentation(),
-    new IORedisInstrumentation()
-  ]
-})
-
-sdk.start()
-```
-
-**Key Spans to Trace:**
-- `POST /vote` -> `insert_vote` -> `queue_aggregation`
-- `GET /r/:subreddit/hot` -> `cache_lookup` -> `db_fallback` (if miss)
-- `calculate_hot_scores` -> `fetch_posts` -> `update_cache`
-
-### SLI Dashboard (Grafana)
-
-Create a dashboard with these panels:
-
-**Row 1: Request Performance**
-- API latency (p50, p95, p99) over time
-- Request rate by endpoint
-- Error rate (5xx / total)
-
-**Row 2: Vote System Health**
-- Vote aggregation lag (target: < 30s)
-- Votes per minute (trend line)
-- Vote queue depth
-
-**Row 3: Cache Performance**
-- Valkey hit rate (target: > 90%)
-- Cache memory usage
-- Hot score freshness
-
-**SLO Targets:**
 | SLI | Target | Measurement |
 |-----|--------|-------------|
-| Feed load latency | p95 < 100ms | `http_request_duration_seconds{route="/r/:subreddit/:sort"}` |
-| API availability | 99.9% | 1 - (5xx_count / total_count) |
-| Vote visibility delay | < 30s | `vote_aggregation_lag_seconds` |
-| Cache hit rate | > 85% | valkey hits / (hits + misses) |
-
-### Audit Logging
-
-Track security-relevant and moderation events:
-
-```sql
-CREATE TABLE audit_logs (
-  id SERIAL PRIMARY KEY,
-  timestamp TIMESTAMP DEFAULT NOW(),
-  actor_id INTEGER REFERENCES users(id),
-  actor_ip INET,
-  action VARCHAR(50) NOT NULL,
-  target_type VARCHAR(20), -- 'post', 'comment', 'user', 'subreddit'
-  target_id INTEGER,
-  details JSONB,
-  subreddit_id INTEGER REFERENCES subreddits(id)
-);
-
-CREATE INDEX idx_audit_timestamp ON audit_logs(timestamp DESC);
-CREATE INDEX idx_audit_actor ON audit_logs(actor_id);
-CREATE INDEX idx_audit_action ON audit_logs(action);
-```
-
-**Events to Audit:**
-| Action | Details |
-|--------|---------|
-| `user.login` | IP address, user agent |
-| `user.login_failed` | IP address, attempted username |
-| `post.delete` | Deleted by author vs moderator |
-| `comment.delete` | Reason code, moderator ID |
-| `user.ban` | Subreddit, duration, reason |
-| `subreddit.settings_change` | Before/after values |
-| `vote.suspicious` | Rapid voting pattern detected |
-
-```javascript
-// src/shared/audit.ts
-import { pool } from './db'
-
-interface AuditEvent {
-  actorId: number | null
-  actorIp: string
-  action: string
-  targetType?: 'post' | 'comment' | 'user' | 'subreddit'
-  targetId?: number
-  details?: Record<string, unknown>
-  subredditId?: number
-}
-
-export async function audit(event: AuditEvent): Promise<void> {
-  await pool.query(
-    `INSERT INTO audit_logs (actor_id, actor_ip, action, target_type, target_id, details, subreddit_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [event.actorId, event.actorIp, event.action, event.targetType,
-     event.targetId, JSON.stringify(event.details), event.subredditId]
-  )
-}
-```
+| Feed load latency | p95 < 100ms | `reddit_http_request_duration_seconds{route="/r/:subreddit/:sort"}` |
+| API availability | 99.9% | 1 - (5xx / total) |
+| Vote visibility delay | < 30s | `reddit_vote_aggregation_lag_seconds` |
+| Cache hit rate | > 85% | hits / (hits + misses) |
 
 ---
 
-## Data Lifecycle Policies
+## Failure Handling
 
-### Retention and TTL
+- **Vote aggregation failure**: Worker crashes do not lose votes. Votes persist in the `votes` table. On restart, the aggregator recomputes from the full vote state, self-correcting any drift
+- **Ranking worker failure**: Hot scores become stale but still valid. Posts continue to be served in the last-computed order. The `new` and `top` sorts are unaffected (derived from indexes)
+- **Database connection exhaustion**: Pool configured with 20 max connections, 2-second connection timeout. Slow query logging identifies runaway queries before pool exhaustion
+- **Graceful shutdown**: SIGTERM sets `isShuttingDown = true`, rejects new requests with 503, waits for in-flight requests (30-second timeout), then closes database and Redis connections
+
+---
+
+## Scalability Considerations
+
+### Horizontal Scaling Path
+
+1. **API servers**: Stateless (sessions in Valkey), scale behind load balancer. Run 3+ instances for redundancy
+2. **Workers**: Vote aggregator and ranking calculator run independently. Multiple instances can partition by subreddit ranges
+3. **Database reads**: Add PostgreSQL read replicas for feed queries. Write to primary, read from replicas with acceptable lag
+4. **Sharding**: Partition by subreddit_id. Each shard contains a community's posts, comments, and votes. Cross-shard queries needed only for user profiles and home feeds
+5. **Caching**: Valkey sorted sets for hot post lists per subreddit. CDN for static assets. Application-level markdown render cache
+6. **Event streaming**: Kafka for vote events, post creation events, enabling decoupled consumers (search indexing, analytics, notifications)
+
+### Data Lifecycle
 
 | Data Type | Hot Storage | Warm Storage | Cold/Archive | Total Retention |
 |-----------|-------------|--------------|--------------|-----------------|
@@ -946,568 +521,101 @@ export async function audit(event: AuditEvent): Promise<void> {
 | Audit logs | 90 days | 1 year | 7 years (S3) | 7 years |
 | Hot scores | 24 hours | N/A | N/A | Recomputed |
 
-### PostgreSQL Partitioning (for votes)
-
-```sql
--- Partition votes by month for easy archival
-CREATE TABLE votes (
-  id SERIAL,
-  user_id INTEGER NOT NULL,
-  post_id INTEGER,
-  comment_id INTEGER,
-  direction SMALLINT NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-) PARTITION BY RANGE (created_at);
-
--- Create monthly partitions
-CREATE TABLE votes_2024_01 PARTITION OF votes
-  FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-
-CREATE TABLE votes_2024_02 PARTITION OF votes
-  FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
-
--- Script to create future partitions (run monthly via cron)
--- See: src/db/scripts/create-vote-partition.sql
-```
-
-### Archival to Cold Storage (MinIO/S3)
-
-```javascript
-// src/workers/archiver.ts
-import { pool } from '../shared/db'
-import { minioClient } from '../shared/storage'
-import { logger } from '../shared/logger'
-
-async function archiveOldVotes(): Promise<void> {
-  const cutoffDate = new Date()
-  cutoffDate.setMonth(cutoffDate.getMonth() - 12) // 1 year ago
-
-  const partitionName = `votes_${cutoffDate.getFullYear()}_${String(cutoffDate.getMonth() + 1).padStart(2, '0')}`
-
-  // Export partition to JSON
-  const result = await pool.query(
-    `SELECT * FROM ${partitionName}`
-  )
-
-  const archiveData = JSON.stringify(result.rows)
-  const archivePath = `archives/votes/${partitionName}.json.gz`
-
-  // Upload to MinIO (gzip compressed)
-  await minioClient.putObject('reddit-archive', archivePath,
-    zlib.gzipSync(archiveData), {
-      'Content-Type': 'application/json',
-      'Content-Encoding': 'gzip'
-    })
-
-  logger.info({ partition: partitionName, rows: result.rowCount }, 'archived vote partition')
-
-  // Drop the old partition (only after confirming upload)
-  await pool.query(`DROP TABLE IF EXISTS ${partitionName}`)
-}
-```
-
-### Valkey TTL Configuration
-
-```javascript
-// src/shared/cache.ts
-export const TTL = {
-  HOT_SCORES: 5 * 60,      // 5 minutes - recomputed frequently
-  USER_SESSION: 30 * 24 * 3600, // 30 days
-  VOTE_COUNT: 60,          // 1 minute - eventually consistent
-  SUBREDDIT_INFO: 3600,    // 1 hour - rarely changes
-  USER_KARMA: 300          // 5 minutes - aggregated
-}
-
-// Apply TTL when setting cache values
-await valkey.setex(`post:${postId}:score`, TTL.VOTE_COUNT, score)
-await valkey.setex(`user:${userId}:session`, TTL.USER_SESSION, sessionData)
-```
-
-### Backfill and Replay Procedures
-
-**Scenario 1: Rebuild hot scores after algorithm change**
-
-```bash
-# 1. Stop the ranking worker
-docker-compose stop ranking-worker
-
-# 2. Clear existing hot scores in Valkey
-docker exec reddit-valkey valkey-cli KEYS "r:*:hot" | xargs docker exec -i reddit-valkey valkey-cli DEL
-
-# 3. Run backfill script
-npm run backfill:hot-scores
-
-# 4. Restart ranking worker
-docker-compose start ranking-worker
-```
-
-```javascript
-// src/scripts/backfill-hot-scores.ts
-import { pool } from '../shared/db'
-import { valkey } from '../shared/cache'
-import { calculateHotScore } from '../ranking/algorithms'
-
-async function backfillHotScores(): Promise<void> {
-  // Process in batches to avoid memory issues
-  let offset = 0
-  const batchSize = 1000
-
-  while (true) {
-    const posts = await pool.query(
-      `SELECT id, subreddit_id, upvotes, downvotes, created_at
-       FROM posts
-       WHERE created_at > NOW() - INTERVAL '7 days'
-       ORDER BY id
-       LIMIT $1 OFFSET $2`,
-      [batchSize, offset]
-    )
-
-    if (posts.rows.length === 0) break
-
-    for (const post of posts.rows) {
-      const hotScore = calculateHotScore(post.upvotes, post.downvotes, post.created_at)
-      await valkey.zadd(`r:${post.subreddit_id}:hot`, hotScore, post.id)
-    }
-
-    console.log(`Processed ${offset + posts.rows.length} posts`)
-    offset += batchSize
-  }
-}
-
-backfillHotScores().then(() => process.exit(0))
-```
-
-**Scenario 2: Replay votes after aggregation failure**
-
-```bash
-# 1. Identify the gap period from logs
-# Example: aggregation worker was down from 14:00 to 14:30
-
-# 2. Run targeted replay
-npm run replay:votes -- --from "2024-01-15T14:00:00Z" --to "2024-01-15T14:30:00Z"
-```
-
-```javascript
-// src/scripts/replay-votes.ts
-async function replayVotes(from: Date, to: Date): Promise<void> {
-  // Fetch all votes in the time range
-  const votes = await pool.query(
-    `SELECT post_id, comment_id, direction
-     FROM votes
-     WHERE created_at >= $1 AND created_at < $2`,
-    [from, to]
-  )
-
-  // Aggregate by target
-  const postScores = new Map<number, number>()
-  const commentScores = new Map<number, number>()
-
-  for (const vote of votes.rows) {
-    if (vote.post_id) {
-      postScores.set(vote.post_id, (postScores.get(vote.post_id) || 0) + vote.direction)
-    }
-    if (vote.comment_id) {
-      commentScores.set(vote.comment_id, (commentScores.get(vote.comment_id) || 0) + vote.direction)
-    }
-  }
-
-  // Apply aggregated scores (idempotent - overwrites current values)
-  for (const [postId, scoreDelta] of postScores) {
-    await pool.query(
-      `UPDATE posts SET score = score + $1,
-       upvotes = upvotes + CASE WHEN $1 > 0 THEN $1 ELSE 0 END,
-       downvotes = downvotes + CASE WHEN $1 < 0 THEN -$1 ELSE 0 END
-       WHERE id = $2`,
-      [scoreDelta, postId]
-    )
-  }
-
-  console.log(`Replayed ${votes.rowCount} votes`)
-}
-```
-
-**Scenario 3: Restore from archive**
-
-```bash
-# Restore archived votes for analysis
-npm run restore:votes -- --partition 2023_06
-```
+Vote partitioning by month (`PARTITION BY RANGE (created_at)`) enables clean archival: export a partition to S3 as compressed JSON, verify the upload, drop the partition.
 
 ---
 
-## Deployment and Operations
+## Trade-offs Summary
 
-### Rollout Strategy
-
-**Local Development (Docker Compose):**
-
-```bash
-# Standard deployment - rebuild and restart all services
-docker-compose down && docker-compose up -d --build
-
-# Zero-downtime for API changes (run 2 instances)
-docker-compose up -d --scale api=2 --no-recreate
-# ... deploy new version ...
-docker-compose up -d --build api
-docker-compose up -d --scale api=1
-```
-
-**Staged Rollout Checklist:**
-
-1. **Pre-deployment**
-   - [ ] Run `npm run test` - all tests pass
-   - [ ] Run `npm run lint` - no errors
-   - [ ] Run `npm run db:migrate:dry-run` - review SQL changes
-   - [ ] Check disk space on PostgreSQL volume
-
-2. **Database migrations first** (see below)
-
-3. **Deploy workers before API**
-   - Vote aggregation worker
-   - Ranking calculation worker
-   - Archiver worker (if changed)
-
-4. **Deploy API servers**
-   - If multiple instances: rolling restart (one at a time)
-   - Health check endpoint: `GET /health`
-
-5. **Post-deployment**
-   - [ ] Verify `/health` returns 200
-   - [ ] Check Grafana dashboard for error spikes
-   - [ ] Tail logs for unexpected errors: `docker-compose logs -f api`
-   - [ ] Manually test critical paths (vote, post, comment)
-
-### Schema Migrations
-
-Use a migration runner with version tracking:
-
-```sql
--- src/db/migrations/001_initial_schema.sql
--- Already applied, do not modify
-
--- src/db/migrations/002_add_hot_score_index.sql
-CREATE INDEX CONCURRENTLY idx_posts_hot_score ON posts(subreddit_id, hot_score DESC);
-
--- src/db/migrations/003_add_audit_logs.sql
-CREATE TABLE audit_logs (...);
-```
-
-**Migration Commands:**
-
-```bash
-# Preview migrations without applying
-npm run db:migrate:dry-run
-
-# Apply pending migrations
-npm run db:migrate
-
-# Check migration status
-npm run db:migrate:status
-
-# Rollback last migration (if rollback script exists)
-npm run db:migrate:rollback
-```
-
-**Migration Script:**
-
-```javascript
-// src/db/migrate.ts
-import { pool } from '../shared/db'
-import { readdirSync, readFileSync } from 'fs'
-import { join } from 'path'
-
-async function migrate(dryRun = false): Promise<void> {
-  // Create migrations table if not exists
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version VARCHAR(255) PRIMARY KEY,
-      applied_at TIMESTAMP DEFAULT NOW()
-    )
-  `)
-
-  // Get applied migrations
-  const applied = await pool.query('SELECT version FROM schema_migrations')
-  const appliedVersions = new Set(applied.rows.map(r => r.version))
-
-  // Find and sort migration files
-  const migrationsDir = join(__dirname, 'migrations')
-  const files = readdirSync(migrationsDir)
-    .filter(f => f.endsWith('.sql'))
-    .sort()
-
-  for (const file of files) {
-    const version = file.replace('.sql', '')
-    if (appliedVersions.has(version)) continue
-
-    const sql = readFileSync(join(migrationsDir, file), 'utf-8')
-
-    if (dryRun) {
-      console.log(`[DRY RUN] Would apply: ${file}`)
-      console.log(sql)
-      continue
-    }
-
-    console.log(`Applying: ${file}`)
-    await pool.query(sql)
-    await pool.query('INSERT INTO schema_migrations (version) VALUES ($1)', [version])
-  }
-}
-```
-
-**Safe Migration Practices:**
-
-1. **Always use `CONCURRENTLY`** for index creation on large tables
-2. **Add columns as nullable first**, then backfill, then add NOT NULL
-3. **Never drop columns immediately** - mark deprecated, remove in next release
-4. **Test migrations on a copy** of production data if possible
-
-### Rollback Runbooks
-
-**Rollback: Bad API Deployment**
-
-```bash
-# 1. Identify the bad commit
-git log --oneline -5
-
-# 2. Revert to previous working version
-git checkout <previous-commit>
-
-# 3. Rebuild and deploy
-docker-compose up -d --build api
-
-# 4. Verify rollback
-curl http://localhost:3001/health
-docker-compose logs -f api | head -50
-```
-
-**Rollback: Failed Database Migration**
-
-```bash
-# 1. Check which migration failed
-npm run db:migrate:status
-
-# 2. Connect to database and inspect
-docker exec -it reddit-postgres psql -U reddit -d reddit
-
-# 3. Manually revert if needed (example: drop new column)
-ALTER TABLE posts DROP COLUMN IF EXISTS new_column;
-DELETE FROM schema_migrations WHERE version = '004_add_new_column';
-
-# 4. Fix migration file and retry
-npm run db:migrate
-```
-
-**Rollback: Vote Aggregation Issues**
-
-```bash
-# Symptoms: Scores not updating, worker errors in logs
-
-# 1. Check worker status
-docker-compose logs vote-worker | tail -100
-
-# 2. Check for stuck jobs
-docker exec reddit-valkey valkey-cli LLEN vote-aggregation-queue
-
-# 3. Restart worker
-docker-compose restart vote-worker
-
-# 4. If data is inconsistent, run full recalculation
-npm run recalculate:scores -- --all
-```
-
-**Rollback: Cache Corruption**
-
-```bash
-# Symptoms: Stale data, inconsistent hot scores
-
-# 1. Flush specific cache keys
-docker exec reddit-valkey valkey-cli KEYS "r:*:hot" | xargs docker exec -i reddit-valkey valkey-cli DEL
-
-# 2. Or flush entire cache (use cautiously)
-docker exec reddit-valkey valkey-cli FLUSHDB
-
-# 3. Trigger cache rebuild
-npm run backfill:hot-scores
-npm run backfill:vote-counts
-```
-
-**Emergency: Database Connection Exhaustion**
-
-```bash
-# Symptoms: "too many connections" errors
-
-# 1. Check current connections
-docker exec reddit-postgres psql -U reddit -c "SELECT count(*) FROM pg_stat_activity;"
-
-# 2. Kill idle connections
-docker exec reddit-postgres psql -U reddit -c "
-  SELECT pg_terminate_backend(pid)
-  FROM pg_stat_activity
-  WHERE state = 'idle'
-  AND query_start < NOW() - INTERVAL '10 minutes';
-"
-
-# 3. Restart API servers to reset connection pools
-docker-compose restart api
-```
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Vote counting | Async aggregation | Direct UPDATE / Redis INCR | Eliminates row locks, preserves vote audit trail |
+| Comment tree | Materialized path | Adjacency list / Closure table | Single-query subtree fetch, zero-cost inserts |
+| Hot scores | Precomputed by worker | On-demand calculation | Removes computation from read path |
+| Database | PostgreSQL | Cassandra / MongoDB | Relational model fits entity relationships, ACID for votes |
+| Session storage | Valkey + cookie | JWT | Immediate revocation, simpler for server-rendered sessions |
+| Search | PostgreSQL full-text | Elasticsearch | Simpler for learning; Elasticsearch needed at scale |
 
 ---
 
 ## Implementation Notes
 
-This section documents the rationale behind observability and operational features implemented in the backend.
+### Local Architecture
 
-### Why Metrics Enable Hot Post Detection and Spam Prevention
+```
+┌───────────────────┐     ┌───────────────────────────┐
+│   React Frontend  │────▶│   Express API Server      │
+│   localhost:5173   │     │   localhost:3000           │
+└───────────────────┘     │                           │
+                          │  Routes:                  │
+                          │  /api/auth/*              │
+                          │  /api/subreddits/*        │
+                          │  /api/posts/*             │
+                          │  /api/vote                │
+                          │  /api/r/*                 │
+                          │                           │
+                          │  /health, /metrics        │
+                          └──────┬──────────┬─────────┘
+                                 │          │
+                    ┌────────────▼┐   ┌─────▼────────┐
+                    │ PostgreSQL  │   │    Valkey     │
+                    │ :5432       │   │    :6379      │
+                    │ reddit/     │   │  sessions,    │
+                    │ reddit_pwd  │   │  vote cache   │
+                    └─────────────┘   └──────────────┘
 
-Prometheus metrics (`/metrics` endpoint) provide real-time visibility into system behavior that enables:
-
-1. **Hot Post Detection (Rising Feed)**
-   - `reddit_votes_total` counter tracks vote velocity by post type
-   - Comparing vote rates over 5-minute windows identifies "rising" content
-   - Posts receiving 10x normal vote velocity surface in rising feeds
-   - Example: A post getting 50 votes/minute vs the subreddit average of 5 votes/minute
-
-2. **Spam and Brigade Prevention**
-   - `reddit_http_requests_total` by IP or user reveals coordinated activity
-   - Vote velocity spikes without corresponding view increases suggest brigading
-   - `reddit_karma_calculation_duration` spikes indicate suspicious batch voting
-   - Rate limiting thresholds derived from p99 request patterns
-
-3. **Performance Degradation Detection**
-   - `reddit_http_request_duration_seconds` histogram shows latency percentiles
-   - `reddit_db_query_duration_seconds` isolates slow database operations
-   - `reddit_vote_aggregation_lag_seconds` alerts when scores become stale
-   - Prevents user-visible issues by catching problems before complaints
-
-**Implemented Metrics:**
-- HTTP request duration and count by route
-- Vote counts by direction and target type
-- Karma calculation duration
-- Hot score calculation duration and batch size
-- Database connection pool utilization
-- Cache hit/miss ratios
-
-### Why Retention Policies Balance Community History vs Storage Costs
-
-Data lifecycle management (`src/shared/retention.js`) implements tiered storage:
-
-1. **Posts and Comments: Permanent Archival**
-   - Community discussions are valuable historical context
-   - Links in old posts may be referenced years later
-   - Legal requirements for content moderation audits
-   - Compress and move to cold storage (MinIO/S3) after 2 years
-   - Cost: ~$0.004/GB/month in S3 Glacier vs $0.023/GB in PostgreSQL
-
-2. **Votes: 90-Day Detail Retention**
-   - Individual vote records only needed for fraud detection
-   - After 90 days, only aggregate counts matter
-   - Partitioned by month for easy archival
-   - Reduces primary database size by 60-70%
-
-3. **Audit Logs: 7-Year Retention**
-   - Legal compliance (varies by jurisdiction)
-   - Appeals process requires historical records
-   - Hot storage for 90 days (frequent queries)
-   - Warm storage for 1 year (occasional queries)
-   - Cold archive for remaining 6 years
-
-4. **Sessions: 30-Day Expiry**
-   - No value in old session data
-   - Redis TTL handles automatic cleanup
-   - Reduces memory usage in cache layer
-
-**Configuration via Environment:**
-```bash
-POST_HOT_STORAGE_DAYS=365      # Keep in PostgreSQL
-POST_WARM_STORAGE_DAYS=730     # Keep before archival
-VOTE_DETAIL_RETENTION_DAYS=90  # Keep individual votes
-AUDIT_ARCHIVE_YEARS=7          # Total retention
+        ┌──────────────────────────────────────────────┐
+        │           Background Workers                  │
+        │  ┌─────────────────────┐ ┌─────────────────┐ │
+        │  │ Vote Aggregator     │ │ Ranking Calc    │ │
+        │  │ npm run dev:worker  │ │ npm run         │ │
+        │  │ (every 5s)          │ │ dev:ranking     │ │
+        │  │                     │ │ (every 60s)     │ │
+        │  └─────────────────────┘ └─────────────────┘ │
+        └──────────────────────────────────────────────┘
 ```
 
-### Why Audit Logging Enables Moderation Transparency
+### Production-Grade Patterns Implemented
 
-Audit logging (`src/shared/audit.js`) creates immutable records that:
+1. **Async vote aggregation** (`src/workers/voteAggregator.ts`): Background worker polls every 5 seconds, batch-updates post/comment scores from the votes table. Includes Prometheus metrics for aggregation lag and duration. Graceful shutdown ensures in-flight batches complete.
 
-1. **Support Moderation Appeals**
-   - Users can request review of mod actions
-   - Audit log shows: who acted, when, what was done, reason given
-   - Prevents "he said, she said" disputes
-   - Example: User claims post was wrongfully removed; log shows removal reason and moderator
+2. **Hot score precomputation** (`src/workers/rankingCalculator.ts`): Recalculates hot scores every 60 seconds for posts from the last 7 days. Implements the full Reddit hot algorithm (`src/utils/ranking.ts`), including Wilson score for "best" comment sorting and controversial score.
 
-2. **Detect Moderator Abuse**
-   - Pattern analysis across audit logs reveals:
-     - Mods targeting specific users
-     - Unusual removal patterns (e.g., removing only opposing viewpoints)
-     - Time correlation with personal disputes
-   - Query: "Show all removals by mod X in subreddit Y this month"
+3. **Prometheus metrics** (`src/shared/metrics.ts`): 15+ custom metrics covering HTTP requests, vote velocity, aggregation lag, database pool utilization, cache effectiveness, and audit events. Route normalization prevents label cardinality explosion.
 
-3. **Legal Compliance**
-   - Content moderation laws require audit trails
-   - GDPR/CCPA data requests need action history
-   - Law enforcement requests require verifiable records
-   - IP addresses stored for abuse correlation
+4. **Structured logging** (`src/shared/logger.ts`): Pino with JSON output, request-scoped child loggers with trace context (request ID, user ID, method, path). Slow query detection at 100ms threshold.
 
-4. **Security Incident Investigation**
-   - `user.login_failed` events detect brute force attempts
-   - `vote.suspicious` events flag coordinated manipulation
-   - IP-based queries identify compromised accounts
+5. **Audit logging** (`src/shared/audit.ts`): Database-backed audit trail for security events (login/logout, content deletion, user bans, suspicious voting). Convenience functions for common events. Metrics integration for audit event rate tracking.
 
-**Audited Events:**
-- `user.login` / `user.login_failed` - Authentication attempts
-- `post.delete` / `comment.delete` - Content removal
-- `user.ban` / `user.unban` - User moderation
-- `subreddit.settings_change` - Configuration changes
-- `vote.suspicious` - Potential vote manipulation
+6. **Data retention policies** (`src/shared/retention.ts`): Configurable lifecycle policies for posts, comments, votes, sessions, and audit logs. Hot/warm/cold storage tiers with archive path generation.
 
-### Why Graceful Shutdown Prevents Data Loss
+7. **Health checks** (`src/index.ts`): Detailed health endpoint checking PostgreSQL and Valkey connectivity with latency measurement. Separate liveness and readiness probes. Memory usage reporting.
 
-Graceful shutdown handling (`src/index.js`) ensures:
+8. **Graceful shutdown** (`src/index.ts`): SIGTERM/SIGINT handlers that stop accepting connections, drain in-flight requests, and close database/Redis connections with a 30-second timeout.
 
-1. **In-Flight Requests Complete**
-   - Server stops accepting new connections immediately
-   - Existing requests have 30 seconds to complete
-   - Prevents 502/503 errors for users mid-request
-   - Load balancer health check fails, directing traffic elsewhere
+### What Was Simplified
 
-2. **Vote Aggregation Consistency**
-   - Background workers finish current batch before exit
-   - Prevents partial aggregation (some posts updated, others not)
-   - `isShuttingDown` flag stops new batches from starting
-   - Redis queue remains consistent
+| Production Design | Local Implementation |
+|-------------------|---------------------|
+| Kafka event streaming | Direct timer-based workers (setInterval) |
+| Elasticsearch for search | PostgreSQL ILIKE queries |
+| Sharded PostgreSQL | Single PostgreSQL instance |
+| Read replicas | Single database, same pool for reads and writes |
+| CDN for static assets | Vite dev server serves frontend |
+| OAuth/SSO | Cookie-based session auth with bcrypt |
+| Valkey sorted sets for feeds | Direct PostgreSQL `ORDER BY hot_score` |
+| Distributed rate limiting | No rate limiting implemented |
 
-3. **Database Transaction Integrity**
-   - Connection pool `end()` waits for active queries
-   - No orphaned transactions holding locks
-   - Prevents "connection reset" errors in logs
-   - Clean reconnection on next startup
+### What Was Omitted
 
-4. **Cache Persistence**
-   - Redis `quit()` flushes pending writes
-   - Session data persists across restarts
-   - Vote caches remain consistent with database
-
-**Shutdown Sequence:**
-```
-1. SIGTERM/SIGINT received
-2. Set isShuttingDown = true (reject new requests)
-3. server.close() - stop accepting connections
-4. Wait for in-flight requests (max 30s)
-5. pool.end() - close PostgreSQL connections
-6. redis.quit() - close Redis connection
-7. process.exit(0)
-```
-
-**Timeout Safety:**
-- 30-second timeout prevents hung shutdowns
-- Force exit after timeout (exit code 1)
-- Kubernetes terminationGracePeriodSeconds should exceed this
-
----
-
-## Future Optimizations
-
-1. **Bloom filters** for vote deduplication
-2. **Event sourcing** for vote history
-3. **CQRS** for read-optimized feeds
-4. **Elasticsearch** for subreddit search
-5. **Kafka** for cross-service events
+- CDN and multi-region deployment
+- Kubernetes orchestration
+- Database sharding and read replicas
+- Message queue (Kafka/RabbitMQ) for inter-service communication
+- Elasticsearch for full-text search
+- Rate limiting and anti-spam
+- Email notifications
+- Media upload and processing
+- Moderation tools (automod, ban, content removal)
+- A/B testing framework
+- Vote fuzzing for anti-brigade

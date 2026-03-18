@@ -1,162 +1,158 @@
 # Google Sheets - Architecture
 
-A collaborative spreadsheet application with real-time multi-user editing, formula support, and Excel-like interactions.
-
 ## System Overview
 
-### Core Requirements
+A collaborative spreadsheet application with real-time multi-user editing, formula support, and Excel-like interactions. The system supports virtualized rendering of large grids, per-cell conflict resolution, cursor/selection sharing across collaborators, and undo/redo with operation history.
 
-**Functional:**
-- Create, open, and edit spreadsheets
-- Real-time collaboration (multiple users editing simultaneously)
-- Formula calculation with dependency tracking
-- Cell formatting (bold, colors, alignment)
+**Learning goals:** Real-time collaboration via WebSocket, sparse data storage for spreadsheets, grid virtualization with TanStack Virtual, last-write-wins conflict resolution, formula dependency tracking, and production-grade observability patterns.
+
+## Requirements
+
+### Functional Requirements
+- Create, open, and edit spreadsheets with multiple sheets (tabs)
+- Real-time collaboration: multiple users editing simultaneously with visible cursors
+- Formula calculation with dependency tracking (SUM, AVG, IF, etc.)
+- Cell formatting (bold, italic, colors, alignment, font size)
 - Copy/paste with clipboard integration
-- Undo/redo with history management
-- Column/row resizing
-- Keyboard navigation (arrows, Tab, Enter)
+- Undo/redo with per-sheet operation history
+- Column/row resizing with custom dimensions
+- Keyboard navigation (arrows, Tab, Enter, Escape)
+- CSV export
 
-**Non-Functional:**
-- Support 10,000+ rows/columns via virtualization
-- Sub-100ms latency for local edits
-- Conflict resolution for concurrent edits
-- Offline support with sync on reconnect
+### Non-Functional Requirements (Production Scale)
+- Support 100M total spreadsheets with 10M DAU
+- 10,000+ rows/columns per sheet via virtualization
+- Sub-100ms latency for local cell edits (optimistic updates)
+- p99 < 200ms for cell edit persistence and broadcast
+- Support 50 concurrent collaborators per spreadsheet
+- 99.99% uptime for the collaboration service
+- Conflict resolution for concurrent edits to the same cell
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Value | Derivation |
+|--------|-------|------------|
+| Total spreadsheets | 100M | Accumulated across all users |
+| DAU | 10M | Active editors/viewers |
+| Concurrent editors (peak) | 2M | 20% of DAU editing simultaneously |
+| Cell edits/sec (peak) | 500K | 2M editors x ~15 edits/min / 60 |
+| WebSocket connections | 2M | One per active editor |
+| Cells stored (total) | 50B | 100M sheets x avg 500 non-empty cells |
+| Storage per cell | ~200 bytes | raw_value + computed_value + format JSON |
+| Total cell storage | ~10 TB | 50B cells x 200 bytes |
+
+### Storage Breakdown
+
+| Data | Size | Notes |
+|------|------|-------|
+| Cell data | ~10 TB | Sparse storage, only non-empty cells |
+| Edit history | ~5 TB | Forward + inverse operations, pruned after 30 days |
+| Spreadsheet metadata | ~50 GB | Titles, sheet config, column/row dimensions |
+| User data | ~10 GB | Names, colors, session info |
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           Clients                                    │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │   Browser 1  │  │   Browser 2  │  │   Browser 3  │              │
-│  │ (User Alice) │  │  (User Bob)  │  │ (User Carol) │              │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
-│         │                 │                 │                        │
-│         │    WebSocket    │    WebSocket    │                        │
-│         └────────┬────────┴────────┬────────┘                        │
-│                  │                 │                                 │
-│                  ▼                 ▼                                 │
-│         ┌────────────────────────────────────┐                      │
-│         │        WebSocket Server            │                      │
-│         │   (Real-time Collaboration Hub)    │                      │
-│         └────────────────┬───────────────────┘                      │
-│                          │                                           │
-│         ┌────────────────┴───────────────────┐                      │
-│         ▼                                    ▼                      │
-│  ┌──────────────┐                   ┌──────────────┐               │
-│  │  REST API    │                   │    Redis     │               │
-│  │  (CRUD ops)  │                   │  (Pub/Sub +  │               │
-│  │              │                   │   Sessions)  │               │
-│  └──────┬───────┘                   └──────────────┘               │
-│         │                                                           │
-│         ▼                                                           │
-│  ┌──────────────┐                                                   │
-│  │  PostgreSQL  │                                                   │
-│  │ (Persistence)│                                                   │
-│  └──────────────┘                                                   │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Clients                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                       │
+│  │   Browser 1  │  │   Browser 2  │  │   Browser 3  │                       │
+│  │ (User Alice) │  │  (User Bob)  │  │ (User Carol) │                       │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                       │
+│         │    WebSocket    │    WebSocket    │                                 │
+│         └────────┬────────┴────────┬────────┘                                │
+└──────────────────┼─────────────────┼─────────────────────────────────────────┘
+                   │                 │
+                   ▼                 ▼
+          ┌──────────────────────────────────┐
+          │         API Gateway / LB         │
+          └──────────┬───────────────────────┘
+                     │
+     ┌───────────────┼───────────────────────────────┐
+     │               │                               │
+     ▼               ▼                               ▼
+┌──────────┐  ┌──────────────┐              ┌──────────────┐
+│ REST API │  │  WebSocket   │              │   Formula    │
+│ Service  │  │  Gateway     │              │  Calculation │
+│ (CRUD)   │  │  (Collab Hub)│              │  Service     │
+└────┬─────┘  └──────┬───────┘              └──────┬───────┘
+     │               │                             │
+     │         ┌─────┴──────┐                      │
+     │         │ Redis      │                      │
+     │         │ Pub/Sub    │◀─────────────────────┘
+     │         │ + Cache    │
+     │         └────────────┘
+     │               │
+     ▼               ▼
+┌────────────────────────┐
+│      PostgreSQL        │
+│  (Cells, Sheets,       │
+│   History, Users)      │
+└────────────────────────┘
 ```
+
+## Core Components
+
+### WebSocket Collaboration Hub
+
+The WebSocket server is the heart of real-time collaboration. Each client connects with a `spreadsheetId` and receives a user identity (ID, name, color). The server manages:
+
+1. **Room-based grouping** -- Clients editing the same spreadsheet join a room. Messages are broadcast only to room members.
+2. **Message routing** -- Incoming messages are dispatched by type: `CELL_EDIT`, `CURSOR_MOVE`, `SELECTION_CHANGE`, `RESIZE_COLUMN`, `RESIZE_ROW`, `RENAME_SHEET`.
+3. **Heartbeat detection** -- 30-second ping/pong cycle detects stale connections. If a client misses a pong, the connection is terminated and cleanup runs (user left broadcast, room removal, collaborator record deletion).
+4. **Initial state sync** -- On connect, the server sends the full sheet state (all cells, column widths, row heights, active collaborators) so the new client starts with a consistent view.
+
+At production scale, the WebSocket Gateway is a dedicated service tier that handles connection management and fan-out. Redis pub/sub connects multiple gateway instances so a cell edit on one server reaches collaborators connected to different servers. The gateway is stateless except for the WebSocket connections themselves, enabling horizontal scaling.
+
+### Sparse Cell Storage
+
+The core insight for spreadsheet storage is that most cells are empty. A sheet with 10,000 rows and 100 columns has 1M cell positions, but typically only a few thousand contain data. The database stores only non-empty cells with `(sheet_id, row_index, col_index)` as the unique key.
+
+This sparse representation means:
+- A 1M-position sheet with 1,000 non-empty cells stores 1,000 rows, not 1M
+- UPSERT (`ON CONFLICT ... DO UPDATE`) handles both creation and modification with a single statement
+- Deleting a cell's content removes the row entirely
+
+### Last-Write-Wins Conflict Resolution
+
+When two users edit the same cell simultaneously, the last write persists. This is a deliberate simplicity trade-off:
+
+- **Why not OT (Operational Transformation)?** OT is the correct solution for text documents where character-level merging matters (Google Docs). For spreadsheets, each cell is an atomic unit -- there's no meaningful way to "merge" two different values for the same cell. Either Alice's value or Bob's value wins.
+- **Why not CRDTs?** CRDTs add significant complexity (vector clocks, merge functions) and are overkill when the conflict unit is a single cell value. The probability of two users editing the exact same cell at the exact same moment is low in practice.
+- **What users see:** Both users see the final value within one WebSocket round-trip (~50ms). If Alice types "100" and Bob types "200" at the same time, they both converge on whichever write arrived last. The visual feedback is near-instant, so users naturally coordinate by watching each other's cursors.
+
+### Formula Calculation Engine
+
+Formulas (cells starting with `=`) are parsed and evaluated with dependency tracking:
+
+1. **Parsing** -- Extract cell references from the formula string (e.g., `=SUM(A1:A10)` references cells A1 through A10)
+2. **Dependency graph** -- Build a DAG of cell dependencies. When cell A1 changes, all cells that reference A1 are recalculated.
+3. **Topological evaluation** -- Process the dependency graph in topological order to ensure dependent cells are evaluated after their dependencies.
+4. **Circular reference detection** -- Detect cycles in the dependency graph and display an error instead of infinite looping.
+
+At production scale, the formula engine runs as a separate service to avoid blocking the WebSocket event loop. Heavy calculations (large range operations across thousands of cells) are offloaded to worker threads or a dedicated computation cluster.
+
+### Virtualized Grid Rendering
+
+The frontend uses `@tanstack/react-virtual` for both row and column virtualization:
+
+- Only cells visible in the viewport (plus a small overscan buffer) are rendered as DOM nodes
+- A grid of 10,000 rows x 100 columns renders ~50-100 DOM nodes instead of 1M
+- Custom row heights and column widths are supported via sparse storage of non-default dimensions
+- Scroll performance remains smooth because virtualization replaces DOM creation with offset calculation
+
+### Undo/Redo System
+
+The `edit_history` table stores forward and inverse operations for every cell edit:
+
+- **Forward operation**: `{type: "SET_CELL", row: 5, col: 3, value: "new"}` -- what was done
+- **Inverse operation**: `{type: "SET_CELL", row: 5, col: 3, value: "old"}` -- how to undo it
+
+Undo applies the inverse operation; redo re-applies the forward operation. Operations are stored per-sheet and ordered by timestamp, giving each user a linear undo stack. At production scale, edit history is pruned after 30 days to control storage growth.
 
 ## Database Schema
-
-### Entity-Relationship Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              ENTITY RELATIONSHIPS                                 │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                   │
-│     ┌──────────┐                                                                 │
-│     │  users   │                                                                 │
-│     └────┬─────┘                                                                 │
-│          │                                                                        │
-│          │ 1:N (owner_id, nullable)                                              │
-│          ▼                                                                        │
-│     ┌──────────────┐         1:N (CASCADE)        ┌──────────────────┐          │
-│     │ spreadsheets │─────────────────────────────▶│   collaborators  │          │
-│     └──────┬───────┘                              └──────────────────┘          │
-│            │                                              ▲                       │
-│            │ 1:N (CASCADE)                               │                       │
-│            ▼                                     1:N (CASCADE)                   │
-│     ┌──────────────┐                                     │                       │
-│     │    sheets    │                              ┌──────┴─────┐                 │
-│     └──────┬───────┘                              │   users    │                 │
-│            │                                      └────────────┘                 │
-│            │                                                                      │
-│   ┌────────┼────────────────────┬──────────────────────┐                        │
-│   │        │                    │                      │                         │
-│   │ 1:N    │ 1:N               │ 1:N                  │ 1:N                     │
-│   │(CASCADE) (CASCADE)         │(CASCADE)             │(CASCADE)                │
-│   ▼        ▼                    ▼                      ▼                         │
-│ ┌──────┐ ┌────────────┐ ┌─────────────┐ ┌──────────────────┐                    │
-│ │cells │ │column_widths│ │ row_heights │ │   edit_history   │                    │
-│ └──────┘ └────────────┘ └─────────────┘ └──────────────────┘                    │
-│   ▲                                              ▲                               │
-│   │ N:1 (updated_by, nullable)                   │ N:1 (user_id, nullable)      │
-│   └─────────────────────────┬────────────────────┘                               │
-│                             │                                                    │
-│                      ┌──────┴─────┐                                              │
-│                      │   users    │                                              │
-│                      └────────────┘                                              │
-│                                                                                   │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Data Flow Between Tables
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           DATA FLOW: CELL EDIT OPERATION                         │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                   │
-│  1. User authenticates                                                           │
-│     └──▶ users table (lookup by session_id)                                     │
-│                                                                                   │
-│  2. User opens spreadsheet                                                       │
-│     └──▶ spreadsheets table (verify access)                                     │
-│         └──▶ collaborators table (insert presence record)                       │
-│             └──▶ sheets table (load sheet list)                                 │
-│                 └──▶ cells table (load viewport cells)                          │
-│                     └──▶ column_widths, row_heights (load dimensions)           │
-│                                                                                   │
-│  3. User edits a cell                                                            │
-│     └──▶ cells table (UPSERT with updated_by = user.id)                         │
-│         └──▶ edit_history table (INSERT forward + inverse operation)            │
-│             └──▶ WebSocket broadcast to other collaborators                     │
-│                                                                                   │
-│  4. User moves cursor                                                            │
-│     └──▶ collaborators table (UPDATE cursor_row, cursor_col)                    │
-│         └──▶ WebSocket broadcast cursor position                                │
-│                                                                                   │
-│  5. User disconnects                                                             │
-│     └──▶ collaborators table (DELETE or mark stale via last_seen)               │
-│                                                                                   │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Complete PostgreSQL Schema
-
-#### Table: users
-
-Stores user information with session-based authentication. Users are identified by session_id without password requirements.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique user identifier |
-| `session_id` | VARCHAR(100) | UNIQUE NOT NULL | Browser session identifier |
-| `name` | VARCHAR(100) | NOT NULL DEFAULT 'Anonymous' | Display name |
-| `color` | VARCHAR(7) | NOT NULL DEFAULT '#4ECDC4' | Hex color for cursor/presence |
-| `created_at` | TIMESTAMP | DEFAULT NOW() | Account creation time |
-| `last_seen` | TIMESTAMP | DEFAULT NOW() | Last activity timestamp |
-
-**Indexes:**
-- `idx_users_session` on `session_id` - Fast session lookups on every WebSocket connection
-
-**Design Rationale:**
-- UUID primary key enables global uniqueness across distributed systems
-- Session-based auth is simple and sufficient for collaborative editing
-- Color field enables visual differentiation of collaborators in the UI
-- last_seen supports cleanup of inactive users via background jobs
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -169,31 +165,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_session ON users(session_id);
-```
 
----
-
-#### Table: spreadsheets
-
-Top-level document container. Each spreadsheet contains multiple sheets (tabs).
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique spreadsheet identifier |
-| `title` | VARCHAR(255) | NOT NULL DEFAULT 'Untitled Spreadsheet' | Document title |
-| `owner_id` | UUID | REFERENCES users(id) | Owner (NULL if user deleted) |
-| `created_at` | TIMESTAMP | DEFAULT NOW() | Creation timestamp |
-| `updated_at` | TIMESTAMP | DEFAULT NOW() | Last modification timestamp |
-
-**Foreign Keys:**
-- `owner_id` references `users(id)` - Soft reference (no CASCADE), allows orphaned spreadsheets
-
-**Design Rationale:**
-- Soft reference to users allows spreadsheets to persist even if owner account deleted
-- updated_at tracks last modification for sorting lists and cache invalidation
-- Title has a sensible default for quick creation flow
-
-```sql
 CREATE TABLE IF NOT EXISTS spreadsheets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title VARCHAR(255) NOT NULL DEFAULT 'Untitled Spreadsheet',
@@ -201,36 +173,7 @@ CREATE TABLE IF NOT EXISTS spreadsheets (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
-```
 
----
-
-#### Table: sheets
-
-Individual sheets within a spreadsheet (tabs at bottom of UI, like Excel worksheets).
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique sheet identifier |
-| `spreadsheet_id` | UUID | REFERENCES spreadsheets(id) ON DELETE CASCADE | Parent document |
-| `name` | VARCHAR(100) | NOT NULL DEFAULT 'Sheet1' | Tab name |
-| `sheet_index` | INTEGER | NOT NULL DEFAULT 0 | Order of tabs (0-based) |
-| `frozen_rows` | INTEGER | DEFAULT 0 | Number of frozen header rows |
-| `frozen_cols` | INTEGER | DEFAULT 0 | Number of frozen header columns |
-| `created_at` | TIMESTAMP | DEFAULT NOW() | Creation timestamp |
-
-**Foreign Keys:**
-- `spreadsheet_id` references `spreadsheets(id)` with **CASCADE DELETE**
-
-**Indexes:**
-- `idx_sheets_spreadsheet` on `spreadsheet_id` - Fast sheet lookup when loading a spreadsheet
-
-**Design Rationale:**
-- CASCADE delete ensures sheets are removed when parent spreadsheet is deleted
-- sheet_index allows tab reordering via drag-and-drop
-- frozen_rows/cols support Excel-like freeze panes feature for headers
-
-```sql
 CREATE TABLE IF NOT EXISTS sheets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     spreadsheet_id UUID REFERENCES spreadsheets(id) ON DELETE CASCADE,
@@ -242,58 +185,7 @@ CREATE TABLE IF NOT EXISTS sheets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sheets_spreadsheet ON sheets(spreadsheet_id);
-```
 
----
-
-#### Table: cells
-
-Cell data storage using **sparse representation**. Only non-empty cells are stored; empty cells do not exist in the table.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique cell identifier |
-| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Parent sheet |
-| `row_index` | INTEGER | NOT NULL | 0-based row number |
-| `col_index` | INTEGER | NOT NULL | 0-based column number |
-| `raw_value` | TEXT | nullable | User input (formulas start with '=') |
-| `computed_value` | TEXT | nullable | Calculated result for formulas |
-| `format` | JSONB | DEFAULT '{}' | Cell styling (bold, color, etc.) |
-| `updated_at` | TIMESTAMP | DEFAULT NOW() | Last edit timestamp |
-| `updated_by` | UUID | REFERENCES users(id) | Last editor (NULL if user deleted) |
-
-**Constraints:**
-- `UNIQUE(sheet_id, row_index, col_index)` - One cell per position, enables UPSERT pattern
-
-**Foreign Keys:**
-- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
-- `updated_by` references `users(id)` - Soft reference (no CASCADE)
-
-**Indexes:**
-- `idx_cells_sheet` on `sheet_id` - Primary lookup pattern for loading all cells
-- `idx_cells_position` on `(sheet_id, row_index, col_index)` - Range queries for viewport loading
-
-**Design Rationale:**
-- **Sparse storage** is critical for efficiency: a 1M cell grid might only have 1000 non-empty cells
-- raw_value stores exactly what the user typed; computed_value stores calculation results
-- JSONB format enables flexible styling without schema migrations for new properties
-- UNIQUE constraint enables efficient UPSERT (INSERT ON CONFLICT UPDATE)
-- Tracking updated_by enables showing who made the last edit in collaboration
-
-**Format JSONB Structure:**
-```json
-{
-  "bold": true,
-  "italic": false,
-  "color": "#000000",
-  "backgroundColor": "#FFFFFF",
-  "textAlign": "left",
-  "fontSize": 12,
-  "numberFormat": "currency"
-}
-```
-
-```sql
 CREATE TABLE IF NOT EXISTS cells (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
@@ -309,106 +201,21 @@ CREATE TABLE IF NOT EXISTS cells (
 
 CREATE INDEX IF NOT EXISTS idx_cells_sheet ON cells(sheet_id);
 CREATE INDEX IF NOT EXISTS idx_cells_position ON cells(sheet_id, row_index, col_index);
-```
 
----
-
-#### Table: column_widths
-
-Custom column widths using sparse storage. Only columns with non-default widths are stored.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Parent sheet |
-| `col_index` | INTEGER | NOT NULL | 0-based column number |
-| `width` | INTEGER | NOT NULL DEFAULT 100 | Width in pixels |
-
-**Primary Key:** `(sheet_id, col_index)` - Composite natural key
-
-**Foreign Keys:**
-- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
-
-**Design Rationale:**
-- Default width is 100px; only store deviations to save space
-- Composite primary key is the natural unique identifier
-- No separate UUID needed since position uniquely identifies the record
-
-```sql
 CREATE TABLE IF NOT EXISTS column_widths (
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
     col_index INTEGER NOT NULL,
     width INTEGER NOT NULL DEFAULT 100,
     PRIMARY KEY (sheet_id, col_index)
 );
-```
 
----
-
-#### Table: row_heights
-
-Custom row heights using sparse storage. Only rows with non-default heights are stored.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Parent sheet |
-| `row_index` | INTEGER | NOT NULL | 0-based row number |
-| `height` | INTEGER | NOT NULL DEFAULT 32 | Height in pixels |
-
-**Primary Key:** `(sheet_id, row_index)` - Composite natural key
-
-**Foreign Keys:**
-- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
-
-**Design Rationale:**
-- Mirrors column_widths structure for consistency
-- Default height is 32px (comfortable for single-line text)
-- Sparse storage means a 1M row sheet only stores rows with custom heights
-
-```sql
 CREATE TABLE IF NOT EXISTS row_heights (
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
     row_index INTEGER NOT NULL,
     height INTEGER NOT NULL DEFAULT 32,
     PRIMARY KEY (sheet_id, row_index)
 );
-```
 
----
-
-#### Table: collaborators
-
-Tracks active users in a spreadsheet for real-time collaboration. This is **ephemeral data**; rows are cleaned up when users disconnect.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `spreadsheet_id` | UUID | REFERENCES spreadsheets(id) ON DELETE CASCADE | Active document |
-| `user_id` | UUID | REFERENCES users(id) ON DELETE CASCADE | Active user |
-| `cursor_row` | INTEGER | nullable | Current cursor row |
-| `cursor_col` | INTEGER | nullable | Current cursor column |
-| `selection_start_row` | INTEGER | nullable | Selection range start row |
-| `selection_start_col` | INTEGER | nullable | Selection range start column |
-| `selection_end_row` | INTEGER | nullable | Selection range end row |
-| `selection_end_col` | INTEGER | nullable | Selection range end column |
-| `joined_at` | TIMESTAMP | DEFAULT NOW() | When user joined |
-| `last_seen` | TIMESTAMP | DEFAULT NOW() | Last activity (for cleanup) |
-
-**Primary Key:** `(spreadsheet_id, user_id)` - One entry per user per document
-
-**Foreign Keys:**
-- `spreadsheet_id` references `spreadsheets(id)` with **CASCADE DELETE**
-- `user_id` references `users(id)` with **CASCADE DELETE**
-
-**Indexes:**
-- `idx_collaborators_spreadsheet` on `spreadsheet_id` - Get all users in a document
-
-**Design Rationale:**
-- Ephemeral nature: rows represent active WebSocket connections
-- CASCADE on both FKs ensures cleanup when either parent is deleted
-- Cursor position enables rendering other users' cursors
-- Selection range enables showing other users' highlighted areas
-- last_seen enables background job to clean stale connections (24h threshold)
-
-```sql
 CREATE TABLE IF NOT EXISTS collaborators (
     spreadsheet_id UUID REFERENCES spreadsheets(id) ON DELETE CASCADE,
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -424,66 +231,7 @@ CREATE TABLE IF NOT EXISTS collaborators (
 );
 
 CREATE INDEX IF NOT EXISTS idx_collaborators_spreadsheet ON collaborators(spreadsheet_id);
-```
 
----
-
-#### Table: edit_history
-
-Operation log for undo/redo functionality and audit trail. Each entry represents one atomic operation.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | UUID | PRIMARY KEY, DEFAULT gen_random_uuid() | Unique operation identifier |
-| `sheet_id` | UUID | REFERENCES sheets(id) ON DELETE CASCADE | Sheet where operation occurred |
-| `user_id` | UUID | REFERENCES users(id) | Operation author (NULL if deleted) |
-| `operation_type` | VARCHAR(50) | NOT NULL | Operation category |
-| `operation_data` | JSONB | NOT NULL | Forward operation details |
-| `inverse_data` | JSONB | NOT NULL | Reverse operation for undo |
-| `created_at` | TIMESTAMP | DEFAULT NOW() | When operation was performed |
-
-**Foreign Keys:**
-- `sheet_id` references `sheets(id)` with **CASCADE DELETE**
-- `user_id` references `users(id)` - Soft reference (no CASCADE)
-
-**Indexes:**
-- `idx_edit_history_sheet` on `(sheet_id, created_at DESC)` - Retrieve undo stack (most recent first)
-
-**Operation Types:**
-- `SET_CELL` - Cell value or format change
-- `DELETE_CELL` - Cell cleared
-- `RESIZE_COLUMN` - Column width changed
-- `RESIZE_ROW` - Row height changed
-- `PASTE` - Multi-cell paste operation
-- `CUT` - Multi-cell cut operation
-- `FORMAT_RANGE` - Apply formatting to range
-
-**Design Rationale:**
-- Storing both forward and inverse operations enables redo after undo
-- JSONB allows flexible operation schemas without migrations
-- Descending index on created_at optimizes "get last N operations" query
-- 90-day retention policy (via background job) prevents unbounded growth
-
-**Example operation_data and inverse_data:**
-```json
-// SET_CELL operation
-{
-  "operation_data": {
-    "row": 5,
-    "col": 2,
-    "newValue": "=SUM(A1:A5)",
-    "newFormat": { "bold": true }
-  },
-  "inverse_data": {
-    "row": 5,
-    "col": 2,
-    "oldValue": "100",
-    "oldFormat": {}
-  }
-}
-```
-
-```sql
 CREATE TABLE IF NOT EXISTS edit_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     sheet_id UUID REFERENCES sheets(id) ON DELETE CASCADE,
@@ -497,1163 +245,220 @@ CREATE TABLE IF NOT EXISTS edit_history (
 CREATE INDEX IF NOT EXISTS idx_edit_history_sheet ON edit_history(sheet_id, created_at DESC);
 ```
 
----
-
-### Cascade Delete Behavior Summary
-
-| When Deleted | What Happens |
-|--------------|--------------|
-| **User** | Spreadsheets remain (owner_id becomes NULL), Cells remain (updated_by becomes NULL), Collaborator entries deleted (CASCADE), Edit history remains (user_id becomes NULL) |
-| **Spreadsheet** | All sheets deleted (CASCADE), All collaborator entries deleted (CASCADE) |
-| **Sheet** | All cells deleted (CASCADE), All column_widths deleted (CASCADE), All row_heights deleted (CASCADE), All edit_history entries deleted (CASCADE) |
-
-### Index Strategy Summary
-
-| Index | Purpose | Query Pattern |
-|-------|---------|---------------|
-| `idx_users_session` | Session lookup | `WHERE session_id = ?` |
-| `idx_sheets_spreadsheet` | Load spreadsheet | `WHERE spreadsheet_id = ?` |
-| `idx_cells_sheet` | Load all cells | `WHERE sheet_id = ?` |
-| `idx_cells_position` | Viewport loading | `WHERE sheet_id = ? AND row_index BETWEEN ? AND ?` |
-| `idx_collaborators_spreadsheet` | Presence list | `WHERE spreadsheet_id = ?` |
-| `idx_edit_history_sheet` | Undo stack | `WHERE sheet_id = ? ORDER BY created_at DESC LIMIT ?` |
-
-### Storage Estimates
-
-| Data Type | Size Estimate | Calculation |
-|-----------|---------------|-------------|
-| User record | ~150 bytes | UUID (16) + session (100) + name (100) + color (7) + timestamps (16) |
-| Spreadsheet record | ~300 bytes | UUID (16) + title (255) + owner_id (16) + timestamps (16) |
-| Sheet record | ~150 bytes | UUID (16) + spreadsheet_id (16) + name (100) + ints (16) |
-| Cell record | ~200 bytes avg | UUID (16) + sheet_id (16) + indices (8) + values (~150) + format (~50) |
-| Edit history record | ~500 bytes avg | UUID (16) + refs (32) + type (50) + JSONB (~400) |
-
-**Per spreadsheet (typical usage):**
-- 1 spreadsheet record: 300 bytes
-- 3 sheets: 450 bytes
-- 1,000 non-empty cells: 200 KB
-- 50 custom column widths: 2 KB
-- 20 custom row heights: 800 bytes
-- 500 edit history entries (1 week): 250 KB
-- **Total: ~450 KB per active spreadsheet**
-
-### Cell Data Structure
-
-```typescript
-interface CellData {
-  rawValue: string | null;      // User input
-  computedValue: any;           // Calculated result
-  formula?: string;             // If starts with '='
-  format?: CellFormat;
-  error?: string;               // Formula error
-}
-
-interface CellFormat {
-  bold?: boolean;
-  italic?: boolean;
-  color?: string;
-  backgroundColor?: string;
-  textAlign?: 'left' | 'center' | 'right';
-  fontSize?: number;
-  numberFormat?: string;        // Currency, percentage, date
-}
-```
-
-## Real-Time Collaboration
-
-### WebSocket Protocol
-
-#### Connection Flow
-
-```
-1. Client connects: ws://server/ws?spreadsheetId=xxx&token=yyy
-2. Server authenticates token
-3. Server adds client to spreadsheet room
-4. Server broadcasts user presence to room
-5. Server sends current state to new client
-```
-
-#### Message Types
-
-**Client → Server:**
-```typescript
-// Cell edit
-{ type: 'CELL_EDIT', sheetId, row, col, value }
-
-// Selection change
-{ type: 'SELECTION_CHANGE', sheetId, range: { startRow, startCol, endRow, endCol } }
-
-// Cursor move
-{ type: 'CURSOR_MOVE', sheetId, row, col }
-
-// Resize column/row
-{ type: 'RESIZE', sheetId, axis: 'row' | 'column', index, size }
-
-// Request undo
-{ type: 'UNDO', sheetId }
-
-// Request redo
-{ type: 'REDO', sheetId }
-```
-
-**Server → Client:**
-```typescript
-// Cell updated (broadcast)
-{ type: 'CELL_UPDATED', sheetId, row, col, value, computedValue, userId }
-
-// User joined
-{ type: 'USER_JOINED', userId, name, color }
-
-// User left
-{ type: 'USER_LEFT', userId }
-
-// Cursor moved (other user)
-{ type: 'CURSOR_MOVED', userId, row, col }
-
-// Selection changed (other user)
-{ type: 'SELECTION_CHANGED', userId, range }
-
-// Full state sync (on connect)
-{ type: 'STATE_SYNC', cells: Map<string, CellData>, collaborators: User[] }
-
-// Undo/redo result
-{ type: 'HISTORY_APPLIED', operation, direction: 'undo' | 'redo' }
-```
-
-### Conflict Resolution
-
-Using **Operational Transformation (OT)** simplified approach:
-
-1. **Last-Write-Wins per Cell**: Each cell is an independent unit
-2. **Server is Source of Truth**: All edits go through server
-3. **Optimistic Updates**: Client applies locally, reverts if server rejects
-
-```typescript
-// Client-side optimistic update
-function handleCellEdit(row, col, value) {
-  // 1. Apply locally immediately
-  localState.setCell(row, col, value);
-
-  // 2. Send to server with version
-  ws.send({ type: 'CELL_EDIT', row, col, value, version: localVersion });
-
-  // 3. Server broadcasts confirmed change
-  // 4. If version conflict, server sends authoritative value
-}
-
-// Server-side handling
-function handleCellEdit(clientId, edit) {
-  const cell = await db.getCell(edit.sheetId, edit.row, edit.col);
-
-  // Simple last-write-wins
-  await db.updateCell(edit.sheetId, edit.row, edit.col, edit.value);
-
-  // Recalculate formulas that depend on this cell
-  const affectedCells = formulaEngine.recalculate(edit.row, edit.col);
-
-  // Broadcast to all clients in room
-  broadcastToRoom(edit.sheetId, {
-    type: 'CELL_UPDATED',
-    row: edit.row,
-    col: edit.col,
-    value: edit.value,
-    computedValue: cell.computedValue,
-    affectedCells,
-    userId: clientId
-  });
-}
-```
-
-### Presence Indicators
-
-```typescript
-interface Collaborator {
-  userId: string;
-  name: string;
-  color: string;          // Unique color per user
-  cursorPosition: { row: number; col: number } | null;
-  selection: CellRange | null;
-}
-
-// Colors assigned in order
-const COLLABORATOR_COLORS = [
-  '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4',
-  '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F'
-];
-```
-
-## Formula Engine
-
-### HyperFormula Integration
-
-```typescript
-import { HyperFormula } from 'hyperformula';
-
-class FormulaEngine {
-  private hf: HyperFormula;
-  private sheetId: number;
-
-  constructor() {
-    this.hf = HyperFormula.buildEmpty({
-      licenseKey: 'gpl-v3',
-      useArrayArithmetic: true,
-    });
-    this.sheetId = this.hf.addSheet('Sheet1');
-  }
-
-  setCellValue(row: number, col: number, value: string): CellResult {
-    if (value.startsWith('=')) {
-      // Formula
-      this.hf.setCellContents({ sheet: this.sheetId, row, col }, value);
-    } else {
-      // Plain value
-      const parsed = this.parseValue(value);
-      this.hf.setCellContents({ sheet: this.sheetId, row, col }, [[parsed]]);
-    }
-
-    return {
-      computedValue: this.hf.getCellValue({ sheet: this.sheetId, row, col }),
-      dependents: this.getDependentCells(row, col),
-    };
-  }
-
-  getDependentCells(row: number, col: number): Array<{row: number, col: number}> {
-    // Get cells that depend on this cell and need recalculation
-    return this.hf.getCellDependents({ sheet: this.sheetId, row, col })
-      .map(addr => ({ row: addr.row, col: addr.col }));
-  }
-
-  private parseValue(value: string): any {
-    const num = parseFloat(value);
-    if (!isNaN(num)) return num;
-    if (value.toLowerCase() === 'true') return true;
-    if (value.toLowerCase() === 'false') return false;
-    return value;
-  }
-}
-```
-
-### Supported Functions
-
-HyperFormula provides 380+ Excel-compatible functions:
-
-- **Math**: SUM, AVERAGE, MAX, MIN, COUNT, ROUND, ABS, SQRT
-- **Text**: CONCAT, LEFT, RIGHT, MID, LEN, TRIM, UPPER, LOWER
-- **Logical**: IF, AND, OR, NOT, IFERROR
-- **Lookup**: VLOOKUP, HLOOKUP, INDEX, MATCH
-- **Date**: TODAY, NOW, DATE, YEAR, MONTH, DAY
-- **Statistical**: MEDIAN, STDEV, VAR, CORREL
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-<SpreadsheetApp>
-├── <Toolbar>
-│   ├── <FormatButtons>
-│   ├── <FormulaBar>
-│   └── <ShareButton>
-├── <SheetTabs>
-├── <SpreadsheetGrid>
-│   ├── <ColumnHeaders> (frozen)
-│   ├── <RowHeaders> (frozen)
-│   ├── <VirtualizedCells>
-│   │   └── <Cell> (memoized)
-│   ├── <SelectionOverlay>
-│   └── <CollaboratorCursors>
-└── <StatusBar>
-```
-
-### State Management (Zustand)
-
-```typescript
-interface SpreadsheetStore {
-  // Document state
-  spreadsheetId: string;
-  sheets: Sheet[];
-  activeSheetId: string;
-
-  // Cell data (sparse map)
-  cells: Map<string, CellData>;  // key: "sheetId-row-col"
-
-  // Selection
-  activeCell: { row: number; col: number } | null;
-  selection: CellRange | null;
-
-  // Collaborators
-  collaborators: Map<string, Collaborator>;
-
-  // Dimensions
-  columnWidths: Map<number, number>;
-  rowHeights: Map<number, number>;
-
-  // History
-  undoStack: Operation[];
-  redoStack: Operation[];
-
-  // Actions
-  setCell: (row: number, col: number, value: string) => void;
-  setSelection: (range: CellRange) => void;
-  resizeColumn: (col: number, width: number) => void;
-  resizeRow: (row: number, height: number) => void;
-  undo: () => void;
-  redo: () => void;
-}
-```
-
-### Virtualization Strategy
-
-Using TanStack Virtual for efficient rendering:
-
-```typescript
-const rowVirtualizer = useVirtualizer({
-  count: MAX_ROWS,              // 1,000,000 rows
-  getScrollElement: () => containerRef.current,
-  estimateSize: (index) => rowHeights.get(index) ?? 32,
-  overscan: 10,                 // Render 10 extra rows
-});
-
-const columnVirtualizer = useVirtualizer({
-  horizontal: true,
-  count: MAX_COLS,              // 16,384 columns (like Excel)
-  getScrollElement: () => containerRef.current,
-  estimateSize: (index) => columnWidths.get(index) ?? 100,
-  overscan: 5,
-});
-```
+Key schema design decisions:
+
+- **Sparse cell storage** with `UNIQUE(sheet_id, row_index, col_index)` enables UPSERT operations -- a cell edit either inserts a new row or updates the existing one. Empty cells are never stored.
+- **JSONB format column** on cells stores flexible styling without schema changes. Adding a new formatting option (e.g., strikethrough) requires no migration.
+- **Separate dimension tables** (`column_widths`, `row_heights`) use the same sparse pattern -- only non-default dimensions are stored. Default is 100px width and 32px height.
+- **Composite primary keys** on `column_widths`, `row_heights`, and `collaborators` naturally prevent duplicates without additional unique constraints.
+- **CASCADE deletes** propagate through the hierarchy: deleting a spreadsheet removes all sheets, which removes all cells, dimensions, and history.
+- **Soft user references** -- Spreadsheets and edit history use nullable user references so data persists when a user is deleted.
+- **`idx_cells_position`** composite index supports viewport-scoped queries (loading only cells within the visible range).
 
 ## API Design
 
-### REST Endpoints
-
+### Spreadsheets
 ```
-# Spreadsheets
-GET    /api/spreadsheets              # List user's spreadsheets
-POST   /api/spreadsheets              # Create new spreadsheet
-GET    /api/spreadsheets/:id          # Get spreadsheet with sheets
-DELETE /api/spreadsheets/:id          # Delete spreadsheet
-
-# Sheets
-POST   /api/spreadsheets/:id/sheets   # Add sheet
-PATCH  /api/sheets/:sheetId           # Update sheet (rename, reorder)
-DELETE /api/sheets/:sheetId           # Delete sheet
-
-# Cells (for initial load and batch operations)
-GET    /api/sheets/:sheetId/cells     # Get all cells (with pagination)
-PATCH  /api/sheets/:sheetId/cells     # Batch update cells
-
-# Export
-GET    /api/spreadsheets/:id/export?format=csv|xlsx
+GET    /api/spreadsheets              → List all spreadsheets (sorted by updated_at)
+POST   /api/spreadsheets              → Create spreadsheet (auto-creates Sheet1)
+GET    /api/spreadsheets/:id          → Get spreadsheet with sheets
+PATCH  /api/spreadsheets/:id          → Update title
+DELETE /api/spreadsheets/:id          → Delete spreadsheet (cascades)
+GET    /api/spreadsheets/:id/export   → Export sheet to CSV
 ```
 
-### WebSocket Events
-
-See "Real-Time Collaboration" section above.
-
-## Performance Optimizations
-
-### 1. Sparse Cell Storage
-Only store non-empty cells in database and state.
-
-### 2. Lazy Loading
-Load cell data in viewport chunks, not entire sheet.
-
-### 3. Debounced Saves
-Batch cell updates before persisting:
-
-```typescript
-const debouncedSave = useDebouncedCallback(
-  (changes: CellChange[]) => {
-    api.batchUpdateCells(sheetId, changes);
-  },
-  500 // Save after 500ms of inactivity
-);
+### Sheets
+```
+POST   /api/spreadsheets/:id/sheets   → Add sheet (auto-assigns next index)
 ```
 
-### 4. Web Workers for Formulas
-Offload formula calculation to prevent UI blocking:
-
-```typescript
-// formula.worker.ts
-const hf = HyperFormula.buildEmpty({ licenseKey: 'gpl-v3' });
-
-self.onmessage = ({ data }) => {
-  if (data.type === 'CALCULATE') {
-    hf.setCellContents(data.address, data.value);
-    const result = hf.getCellValue(data.address);
-    self.postMessage({ type: 'RESULT', address: data.address, value: result });
-  }
-};
+### Cells
+```
+GET    /api/sheets/:sheetId/cells     → Get all cells (sparse map, "row-col" keys)
+PATCH  /api/sheets/:sheetId/cells     → Batch update cells (transactional)
 ```
 
-### 5. Memoized Cell Rendering
+### WebSocket Protocol
+```
+ws://host/ws?spreadsheetId=xxx&sessionId=xxx&name=Alice
 
-```typescript
-const Cell = memo(function Cell({ row, col, data, isSelected, isActive }) {
-  // ...
-}, (prev, next) => {
-  return prev.row === next.row &&
-         prev.col === next.col &&
-         prev.data === next.data &&
-         prev.isSelected === next.isSelected &&
-         prev.isActive === next.isActive;
-});
+Client → Server:
+  CELL_EDIT        → {sheetId, row, col, value}
+  CURSOR_MOVE      → {sheetId, row, col}
+  SELECTION_CHANGE → {sheetId, startRow, startCol, endRow, endCol}
+  RESIZE_COLUMN    → {sheetId, colIndex, width}
+  RESIZE_ROW       → {sheetId, rowIndex, height}
+  RENAME_SHEET     → {sheetId, name}
+
+Server → Client:
+  INITIAL_STATE    → {cells, sheets, collaborators, dimensions}
+  CELL_UPDATED     → {sheetId, row, col, value, userId}
+  CURSOR_MOVED     → {userId, row, col, userName, userColor}
+  SELECTION_CHANGED → {userId, range}
+  USER_JOINED      → {userId, userName, userColor}
+  USER_LEFT        → {userId}
+  ERROR            → {message}
 ```
 
-## Scalability Considerations
+## Key Design Decisions
 
-### Horizontal Scaling
+### WebSocket vs SSE for Real-Time Collaboration
 
-```
-                    Load Balancer
-                         │
-         ┌───────────────┼───────────────┐
-         ▼               ▼               ▼
-    ┌─────────┐    ┌─────────┐    ┌─────────┐
-    │ Server1 │    │ Server2 │    │ Server3 │
-    └────┬────┘    └────┬────┘    └────┬────┘
-         │              │              │
-         └──────────────┼──────────────┘
-                        ▼
-                  ┌───────────┐
-                  │   Redis   │  ← Pub/Sub for cross-server sync
-                  │  Cluster  │
-                  └───────────┘
-```
+We chose native WebSocket over SSE because spreadsheet collaboration is inherently bidirectional at high frequency. Users send cell edits, cursor moves, and selection changes continuously -- these are not REST-style request/response interactions. SSE would require a parallel REST channel for client-to-server messages, doubling the connection overhead and complicating message ordering. WebSocket gives us a single bidirectional channel with lower per-message overhead (2-byte frame header vs HTTP headers on every POST).
 
-### Redis Pub/Sub for Multi-Server
+The trade-off is that WebSocket connections require sticky sessions or shared state at the load balancer level, and reconnection logic must be implemented manually (unlike SSE's built-in `EventSource` reconnection). We handle this with a 30-second heartbeat and full state sync on reconnect.
 
-```typescript
-// When edit comes in on Server1
-redis.publish(`spreadsheet:${spreadsheetId}`, JSON.stringify({
-  type: 'CELL_UPDATED',
-  ...editData
-}));
+### Last-Write-Wins vs OT/CRDT
 
-// All servers subscribe
-redis.subscribe(`spreadsheet:${spreadsheetId}`, (message) => {
-  // Broadcast to local WebSocket clients
-  wsServer.broadcastToRoom(spreadsheetId, message);
-});
-```
+For cell-level edits, last-write-wins is the right choice. OT (Operational Transformation) is designed for character-level text editing where two users typing in the same paragraph need their keystrokes merged. In a spreadsheet, the atomic unit is a cell value, not a character. If Alice sets cell A1 to "100" and Bob sets A1 to "200", there's no meaningful merge -- one value must win. Last-write-wins provides this with zero coordination overhead.
 
-## Security
+The trade-off: if we later add rich text editing within cells (like Google Sheets' in-cell formatting), we would need OT or CRDTs for that specific feature. For pure value/formula editing, last-write-wins is sufficient and dramatically simpler.
 
-### Authentication
-- Session-based auth stored in Redis
-- WebSocket connection requires valid session token
+### Sparse Storage vs Dense Grid
 
-### Authorization
-- Check spreadsheet permissions before allowing edits
-- Rate limiting on edit operations
+Storing only non-empty cells reduces storage by 99%+ for typical spreadsheets. A sheet with 10,000 rows and 100 columns (1M positions) typically has 1,000-5,000 non-empty cells. The trade-off is that queries like "get all cells in rows 100-200" require an index scan rather than a simple offset calculation. The composite index `(sheet_id, row_index, col_index)` makes this scan efficient enough for real-time use.
 
-### Data Validation
-- Sanitize formula inputs (prevent code injection)
-- Validate cell coordinates
-- Limit maximum spreadsheet/cell size
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Real-time transport | WebSocket | SSE + REST | Bidirectional, lower overhead for high-frequency edits |
+| Conflict resolution | Last-write-wins | OT/CRDT | Cell is atomic unit; merge has no semantic meaning |
+| Cell storage | Sparse (only non-empty) | Dense (all positions) | 99%+ storage reduction |
+| Grid rendering | TanStack Virtual | Full DOM rendering | 10K+ rows with smooth scroll |
+| State management | Zustand | Redux / Context | Minimal boilerplate, selector optimization |
+| Formula evaluation | Server-side | Client-side | Consistent results, dependency tracking at scale |
 
-## Capacity and SLO Targets
+## Consistency and Idempotency
 
-### Local Development Scale
+- **Cell edits** use `ON CONFLICT (sheet_id, row_index, col_index) DO UPDATE` -- the same edit applied twice produces the same result (idempotent UPSERT)
+- **Idempotency keys** in Redis prevent duplicate processing of retried WebSocket messages. The client generates a unique request ID per operation; the server checks Redis before processing. Results are cached for 24 hours. See `src/shared/idempotency.ts`.
+- **Edit history** entries use UUID primary keys -- replaying the same operation does not create duplicate history records
+- **Collaborator presence** uses UPSERT on `(spreadsheet_id, user_id)` -- reconnecting updates the existing record rather than creating duplicates
+- **Batch cell updates** use database transactions -- either all changes commit or none do, preventing partial updates
 
-For this learning project running locally with 2-3 service instances:
+## Security and Auth
 
-| Metric | Target | Rationale |
-|--------|--------|-----------|
-| Concurrent users per spreadsheet | 5-10 | Reasonable for local testing |
-| Spreadsheets per instance | 100 | Memory-bound by WebSocket connections |
-| Cells per spreadsheet | 100,000 | Sparse storage keeps memory low |
-| Max cell value size | 32 KB | Prevent abuse, sufficient for formulas |
-
-### Latency SLOs
-
-| Operation | p50 | p95 | p99 |
-|-----------|-----|-----|-----|
-| Cell edit (local) | 5ms | 15ms | 30ms |
-| Cell edit (broadcast to peers) | 50ms | 100ms | 200ms |
-| Formula recalculation (simple) | 10ms | 50ms | 100ms |
-| Formula recalculation (complex, 1000 deps) | 100ms | 300ms | 500ms |
-| Initial spreadsheet load (10K cells) | 200ms | 500ms | 1s |
-| WebSocket reconnect + state sync | 500ms | 1s | 2s |
-
-### Availability Target
-
-- **Target**: 99% uptime for local development (allows for restarts, debugging)
-- **Error budget**: ~7 hours/month of downtime acceptable
-- **Graceful degradation**: Read-only mode if database unavailable
-
-### Storage Growth Estimates
-
-Assuming active local development usage:
-
-```
-Per spreadsheet (avg):
-- Metadata: 1 KB
-- 1,000 non-empty cells: 100 KB (100 bytes avg per cell with format)
-- Edit history (1 week): 500 KB (500 edits x 1KB each)
-- Total: ~600 KB per spreadsheet
-
-Per user (avg):
-- 20 spreadsheets: 12 MB
-- Session data in Redis: 2 KB
-
-Database growth rate:
-- 10 active spreadsheets, 100 edits/day: 100 KB/day
-- With 90-day history retention: ~9 MB steady state
-```
-
-### RPS Estimates (Local)
-
-| Endpoint | Expected RPS | Burst |
-|----------|--------------|-------|
-| WebSocket messages (all types) | 10-50/s | 200/s |
-| REST API (CRUD) | 1-5/s | 20/s |
-| Cell batch saves | 1-2/s | 10/s |
-
-## Caching Strategy
-
-### Redis Cache Layers
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Cache Architecture                       │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 1: Session Cache (Redis)                              │
-│  - Key: session:{sessionId}                                  │
-│  - TTL: 24 hours (sliding)                                   │
-│  - Contains: userId, permissions, lastActive                 │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 2: Active Spreadsheet Cache (Redis)                   │
-│  - Key: spreadsheet:{id}:state                               │
-│  - TTL: 30 minutes after last access                         │
-│  - Contains: metadata, collaborator list, recent edits       │
-│  - Write-through: updates go to cache + DB simultaneously    │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 3: Cell Data Cache (In-Memory per Server)             │
-│  - LRU cache with 1000 cell limit per spreadsheet            │
-│  - TTL: 5 minutes                                            │
-│  - Invalidated on any edit to that cell                      │
-│  - Populated on viewport scroll                              │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 4: Formula Dependency Graph (In-Memory)               │
-│  - Built per sheet on first formula evaluation               │
-│  - Invalidated when cells with formulas change               │
-│  - No TTL (lives until server restart or sheet unload)       │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Cache Operations
-
-```typescript
-// Session cache - cache-aside pattern
-async function getSession(sessionId: string): Promise<Session | null> {
-  const cached = await redis.get(`session:${sessionId}`);
-  if (cached) {
-    await redis.expire(`session:${sessionId}`, 86400); // Extend TTL
-    return JSON.parse(cached);
-  }
-  return null;
-}
-
-// Spreadsheet state - write-through pattern
-async function updateCell(spreadsheetId: string, cell: CellUpdate): Promise<void> {
-  // Write to both cache and DB
-  await Promise.all([
-    redis.hset(`spreadsheet:${spreadsheetId}:cells`, `${cell.row}:${cell.col}`, JSON.stringify(cell)),
-    db.query('INSERT INTO cells ... ON CONFLICT DO UPDATE ...', [cell])
-  ]);
-
-  // Invalidate in-memory caches on other servers via pub/sub
-  await redis.publish(`invalidate:${spreadsheetId}`, JSON.stringify({ row: cell.row, col: cell.col }));
-}
-```
-
-### Cache Invalidation Rules
-
-| Event | Invalidation Action |
-|-------|---------------------|
-| Cell edit | Invalidate cell cache + dependent formula caches |
-| User joins spreadsheet | Refresh collaborator list cache |
-| User leaves/disconnects | Update collaborator cache after 30s grace period |
-| Spreadsheet deleted | Delete all related Redis keys |
-| Server restart | Cold start, caches rebuild on demand |
-
-### Cache Hit Rate Targets
-
-| Cache Layer | Target Hit Rate | Action if Below |
-|-------------|-----------------|-----------------|
-| Session cache | 99% | Check session TTL, verify login flow |
-| Spreadsheet metadata | 95% | Increase cache TTL |
-| Cell data (viewport) | 80% | Increase overscan in virtualizer |
-| Formula results | 70% | Acceptable due to frequent edits |
+- Session-based authentication via cookie with session ID
+- No password required (anonymous collaboration with display names)
+- CORS restricted to frontend origin
+- WebSocket connections validated on handshake (spreadsheetId required)
+- At production scale: OAuth2 for user identity, per-spreadsheet ACLs (owner, editor, viewer, commenter), rate limiting on cell edits per user, input sanitization for formula injection
 
 ## Observability
 
-### Metrics (Prometheus)
-
-```typescript
-// Key metrics to expose on /metrics endpoint
-const metrics = {
-  // WebSocket
-  ws_connections_active: Gauge,           // Current WebSocket connections
-  ws_messages_received_total: Counter,    // Messages by type
-  ws_messages_sent_total: Counter,
-  ws_message_latency_ms: Histogram,       // Broadcast latency
-
-  // Spreadsheet operations
-  cell_edits_total: Counter,              // By spreadsheet (sampled)
-  formula_calculations_total: Counter,
-  formula_calculation_duration_ms: Histogram,
-
-  // Cache
-  cache_hits_total: Counter,              // By cache layer
-  cache_misses_total: Counter,
-
-  // Database
-  db_query_duration_ms: Histogram,        // By query type
-  db_pool_connections_active: Gauge,
-  db_pool_connections_waiting: Gauge,
-
-  // Error tracking
-  errors_total: Counter,                  // By error type and endpoint
-};
-```
-
-### Logging Strategy
-
-```typescript
-// Structured logging with pino
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label }),
-  },
-});
-
-// Log levels by operation type
-// ERROR: Database failures, WebSocket errors, formula crashes
-// WARN: Cache misses on hot paths, slow queries (>100ms), reconnection failures
-// INFO: User join/leave, spreadsheet create/delete, export requests
-// DEBUG: Individual cell edits (sampled 1%), cache operations
-```
-
-### Key Log Events
-
-```typescript
-// User actions (INFO)
-logger.info({ userId, spreadsheetId, action: 'join' }, 'User joined spreadsheet');
-logger.info({ userId, spreadsheetId, action: 'leave', duration: sessionMs }, 'User left spreadsheet');
-
-// Performance warnings (WARN)
-logger.warn({ spreadsheetId, cellCount, durationMs }, 'Slow initial load');
-logger.warn({ query, durationMs }, 'Slow database query');
-
-// Errors (ERROR)
-logger.error({ err, spreadsheetId, userId }, 'WebSocket broadcast failed');
-logger.error({ err, formula, cellRef }, 'Formula evaluation error');
-```
-
-### Health Checks
-
-```typescript
-// GET /health - for load balancer
-app.get('/health', async (req, res) => {
-  const checks = {
-    database: await checkDatabase(),    // Simple SELECT 1
-    redis: await checkRedis(),          // PING
-    wsServer: wsServer.clients.size,    // WebSocket connections
-  };
-
-  const healthy = checks.database && checks.redis;
-  res.status(healthy ? 200 : 503).json({
-    status: healthy ? 'healthy' : 'unhealthy',
-    checks,
-    uptime: process.uptime(),
-  });
-});
-
-// GET /ready - for traffic routing
-app.get('/ready', async (req, res) => {
-  // Ready only after initial DB connection and cache warmup
-  res.status(isReady ? 200 : 503).json({ ready: isReady });
-});
-```
-
-### Alerting Thresholds (Local Development)
-
-| Metric | Warning | Critical |
-|--------|---------|----------|
-| WebSocket latency p95 | >200ms | >500ms |
-| Database query p95 | >100ms | >500ms |
-| Cache hit rate | <70% | <50% |
-| Active connections | >50 | >100 |
-| Error rate | >1% | >5% |
-| Memory usage | >70% | >90% |
+- **Prometheus metrics** (prom-client): WebSocket connections gauge, messages received/sent counters with type labels, message processing latency histogram, cell edit counter, formula calculation duration, cache hit/miss counters, database query duration by operation, circuit breaker state gauge, idempotency hit/miss counters, error counter by type and component, database pool size. See `src/shared/metrics.ts`.
+- **Structured logging** (Pino): JSON-formatted logs with service name, PID, request context. Child loggers for component-scoped context (WebSocket, API). Pretty-printed in development, machine-readable in production. See `src/shared/logger.ts`.
+- **Health check**: `GET /health` checks PostgreSQL and Redis connectivity with latency measurements. Returns detailed status per dependency. See `src/index.ts`.
+- **Readiness check**: `GET /ready` for Kubernetes readiness probes -- returns 200 only when both database and Redis are reachable.
 
 ## Failure Handling
 
-### Retry Policies
+- **Circuit breakers** (Opossum) wrap Redis pub/sub, database queries, and WebSocket broadcasts. When Redis pub/sub fails, the circuit opens and the system degrades to single-server mode -- cell edits still work locally but are not broadcast to other server instances. See `src/shared/circuitBreaker.ts`.
+- **WebSocket heartbeat**: 30-second ping/pong cycle. Stale connections are terminated and cleaned up (collaborator record removed, user-left broadcast sent).
+- **Graceful shutdown**: SIGTERM handler stops accepting new connections, closes all WebSocket clients with code 1001, drains the database pool, and disconnects Redis.
+- **Cache resilience**: All cache operations fail open -- if Redis is unavailable, the system falls through to PostgreSQL. Cache errors are logged but never surface to the user.
+- **Reconnection**: On WebSocket disconnect, the client reconnects and receives a full state sync, ensuring consistency even after extended disconnection.
 
-```typescript
-// Database operations - exponential backoff
-const dbRetryConfig = {
-  retries: 3,
-  minTimeout: 100,    // Start at 100ms
-  maxTimeout: 2000,   // Cap at 2s
-  factor: 2,          // Double each time
-  retryOn: ['ECONNREFUSED', 'ETIMEDOUT', '40001'], // Serialization failure
-};
+## Scalability Considerations
 
-// WebSocket reconnection - client-side
-const wsReconnectConfig = {
-  retries: 10,
-  minDelay: 1000,     // Start at 1s
-  maxDelay: 30000,    // Cap at 30s
-  jitter: 0.3,        // Add 30% randomness to prevent thundering herd
-};
+**What breaks first at scale:**
 
-// Redis operations - fail fast for cache, retry for pub/sub
-const cacheRetryConfig = {
-  retries: 1,         // Single retry for cache reads
-  timeout: 50,        // Fail fast, DB is fallback
-};
+1. **WebSocket connections per server** -- Each connection consumes memory for buffers, user state, and room membership. At 50K connections per server (~200MB), a fleet of 40 servers handles 2M concurrent editors. Horizontal scaling requires Redis pub/sub for cross-server broadcast.
 
-const pubsubRetryConfig = {
-  retries: 5,
-  minTimeout: 500,
-};
-```
+2. **Cell edit fan-out** -- A spreadsheet with 50 collaborators requires broadcasting each edit to 49 other connections. For a popular template spreadsheet with 1000 viewers, this fan-out becomes expensive. Solution: dedicated broadcast workers that dequeue edits from Redis and fan out to connected clients, decoupling write latency from fan-out cost.
 
-### Idempotency
+3. **Formula recalculation cascades** -- Changing a cell that is referenced by 10,000 other cells triggers a cascade of recalculations. Solution: batch formula evaluation with debouncing (aggregate changes over 100ms, then recalculate once), and offload heavy computation to worker threads.
 
-```typescript
-// Cell edits are naturally idempotent (last-write-wins)
-// For operations that are not:
+4. **Edit history growth** -- Every cell edit creates a history entry. A heavily edited spreadsheet with 1M edits over its lifetime accumulates significant data. Solution: compact history after 30 days (merge adjacent edits to the same cell), archive old history to cold storage.
 
-interface IdempotentRequest {
-  idempotencyKey: string;  // Client-generated UUID
-  operation: string;
-  payload: any;
-}
+**Scaling path:**
+- Horizontal WebSocket gateway behind load balancer with sticky sessions
+- Redis Cluster for pub/sub fan-out across gateway instances
+- Read replicas for spreadsheet list queries and cell loading
+- Separate formula computation service with worker pool
+- CDN for static assets
+- Sharding spreadsheets across database instances by spreadsheet ID
 
-// Store completed operations in Redis with 24h TTL
-async function executeIdempotent(req: IdempotentRequest): Promise<any> {
-  const cacheKey = `idempotent:${req.idempotencyKey}`;
+## Trade-offs Summary
 
-  // Check if already processed
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  // Execute operation
-  const result = await executeOperation(req);
-
-  // Store result for replay
-  await redis.setex(cacheKey, 86400, JSON.stringify(result));
-
-  return result;
-}
-```
-
-### Circuit Breaker Pattern
-
-```typescript
-import CircuitBreaker from 'opossum';
-
-// Wrap database calls
-const dbBreaker = new CircuitBreaker(executeDbQuery, {
-  timeout: 5000,           // 5s timeout per request
-  errorThresholdPercentage: 50,  // Open after 50% failures
-  resetTimeout: 10000,     // Try again after 10s
-  volumeThreshold: 5,      // Minimum 5 requests before calculating
-});
-
-dbBreaker.on('open', () => {
-  logger.error('Database circuit breaker OPEN - failing fast');
-});
-
-dbBreaker.on('halfOpen', () => {
-  logger.info('Database circuit breaker HALF-OPEN - testing');
-});
-
-dbBreaker.on('close', () => {
-  logger.info('Database circuit breaker CLOSED - normal operation');
-});
-
-// Fallback behavior when circuit is open
-dbBreaker.fallback(async () => {
-  // Return cached data if available, otherwise error
-  const cached = await redis.get(cacheKey);
-  if (cached) return JSON.parse(cached);
-  throw new Error('Database unavailable and no cached data');
-});
-```
-
-### Graceful Degradation
-
-| Failure | Degraded Behavior |
-|---------|-------------------|
-| Redis down | Sessions fail (must login again), pub/sub disabled (single-server mode) |
-| Database down | Read from cache only, writes queued in memory (limit 1000), return 503 for new spreadsheets |
-| WebSocket disconnect | Queue edits locally (up to 100), sync on reconnect, show "reconnecting" indicator |
-| Formula engine crash | Return `#ERROR!` in cell, log error, continue with other cells |
-| High memory | Evict oldest spreadsheet caches, reduce overscan, reject new connections |
-
-### Error Recovery
-
-```typescript
-// On WebSocket reconnect - full state sync
-ws.on('open', async () => {
-  // 1. Request current state from server
-  ws.send({ type: 'SYNC_REQUEST', lastVersion: localVersion });
-
-  // 2. Server responds with STATE_SYNC message
-  // 3. Merge server state with local pending edits
-  // 4. Replay local edits that weren't acknowledged
-  pendingEdits.forEach(edit => ws.send(edit));
-});
-
-// On database recovery
-dbBreaker.on('close', async () => {
-  // Flush queued writes
-  const queue = await getWriteQueue();
-  for (const write of queue) {
-    await executeDbQuery(write);
-  }
-  logger.info({ count: queue.length }, 'Flushed write queue after DB recovery');
-});
-```
-
-## Data Lifecycle Policies
-
-### Retention Periods
-
-| Data Type | Retention | Rationale |
-|-----------|-----------|-----------|
-| Spreadsheet data | Indefinite | User content, never auto-delete |
-| Edit history | 90 days | Support undo, audit, rollback |
-| Collaborator sessions | 24 hours after disconnect | Clean up stale presence data |
-| Redis cache entries | 30 minutes (sliding) | Memory management |
-| Idempotency keys | 24 hours | Sufficient for retry scenarios |
-| Server logs | 7 days | Local dev, keep storage manageable |
-
-### Cleanup Jobs
-
-```typescript
-// Run daily cleanup job (node-cron or simple setInterval)
-async function dailyCleanup(): Promise<void> {
-  const stats = {
-    editHistoryDeleted: 0,
-    staleSessionsDeleted: 0,
-    orphanedCellsDeleted: 0,
-  };
-
-  // 1. Purge old edit history
-  const historyResult = await db.query(`
-    DELETE FROM edit_history
-    WHERE created_at < NOW() - INTERVAL '90 days'
-    RETURNING id
-  `);
-  stats.editHistoryDeleted = historyResult.rowCount;
-
-  // 2. Clean stale collaborator sessions
-  const sessionResult = await db.query(`
-    DELETE FROM collaborators
-    WHERE last_seen < NOW() - INTERVAL '24 hours'
-    RETURNING session_id
-  `);
-  stats.staleSessionsDeleted = sessionResult.rowCount;
-
-  // 3. Optional: Find orphaned cells (sheets deleted but cells remain)
-  const orphanResult = await db.query(`
-    DELETE FROM cells c
-    WHERE NOT EXISTS (SELECT 1 FROM sheets s WHERE s.id = c.sheet_id)
-    RETURNING id
-  `);
-  stats.orphanedCellsDeleted = orphanResult.rowCount;
-
-  logger.info(stats, 'Daily cleanup completed');
-}
-
-// Schedule: Run at 3 AM local time
-cron.schedule('0 3 * * *', dailyCleanup);
-```
-
-### Soft Delete for Spreadsheets
-
-```sql
--- Add deleted_at column for soft delete
-ALTER TABLE spreadsheets ADD COLUMN deleted_at TIMESTAMP;
-
--- Soft delete instead of hard delete
-UPDATE spreadsheets SET deleted_at = NOW() WHERE id = $1;
-
--- Exclude deleted in queries
-SELECT * FROM spreadsheets WHERE owner_id = $1 AND deleted_at IS NULL;
-
--- Permanent deletion after 30 days
-DELETE FROM spreadsheets WHERE deleted_at < NOW() - INTERVAL '30 days';
-```
-
-### Backup Strategy (Local Development)
-
-```bash
-# Simple pg_dump backup script (run manually or via cron)
-#!/bin/bash
-BACKUP_DIR="./backups"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-# Create backup
-pg_dump -U postgres google_sheets > "$BACKUP_DIR/backup_$TIMESTAMP.sql"
-
-# Keep only last 5 backups
-ls -t "$BACKUP_DIR"/*.sql | tail -n +6 | xargs -r rm
-
-echo "Backup completed: backup_$TIMESTAMP.sql"
-```
-
-### Export on Demand
-
-```typescript
-// Allow users to export their data
-app.get('/api/spreadsheets/:id/export', async (req, res) => {
-  const format = req.query.format || 'json';
-  const spreadsheet = await getSpreadsheetWithCells(req.params.id);
-
-  switch (format) {
-    case 'json':
-      res.json(spreadsheet);
-      break;
-    case 'csv':
-      res.setHeader('Content-Type', 'text/csv');
-      res.send(convertToCsv(spreadsheet));
-      break;
-    case 'xlsx':
-      const buffer = await convertToXlsx(spreadsheet);
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.send(buffer);
-      break;
-  }
-});
-```
-
-## Technology Stack
-
-| Component | Technology |
-|-----------|------------|
-| Frontend | React 19, TypeScript, Vite |
-| Virtualization | TanStack Virtual |
-| State Management | Zustand |
-| Formulas | HyperFormula |
-| Backend | Node.js, Express |
-| WebSocket | ws library |
-| Database | PostgreSQL |
-| Cache/Pub-Sub | Redis |
-| Containerization | Docker Compose |
-
-## References
-
-- [TanStack Virtual Documentation](https://tanstack.com/virtual/latest)
-- [HyperFormula Guide](https://hyperformula.handsontable.com/)
-- [Operational Transformation](https://en.wikipedia.org/wiki/Operational_transformation)
-- [Google Sheets API Design](https://developers.google.com/sheets/api/reference/rest)
-- [Excel Online Architecture](https://docs.microsoft.com/en-us/office/dev/add-ins/excel/)
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| WebSocket | Bidirectional, low overhead | SSE + REST | High-frequency cell edits need minimal framing |
+| Last-write-wins | Simple, no coordination | OT/CRDT | Cell is atomic; no merge semantics |
+| Sparse storage | 99% storage savings | Dense grid storage | Most cells are empty |
+| Redis caching | Write-through, 15-30 min TTL | No cache | Reduce DB load for active spreadsheets by 80%+ |
+| JSONB for format | Flexible, no migrations | Typed columns | New formatting options without schema changes |
+| Edit history | Full forward + inverse ops | Snapshot-based undo | Supports collaborative undo without conflicts |
 
 ## Implementation Notes
 
-This section documents the production-ready improvements implemented in the backend codebase and explains WHY each change improves the system's reliability, observability, and performance.
-
-### 1. Prometheus Metrics for Cell Operations
-
-**What:** Added comprehensive Prometheus metrics using `prom-client` for:
-- WebSocket connections (active count, messages received/sent, latency histograms)
-- Cell operations (edit count, edit latency, formula calculations)
-- Cache performance (hits, misses, operation duration by cache type)
-- Database queries (duration histograms by query type, connection pool stats)
-- Error tracking (by type and component)
-- Circuit breaker state and fallback invocations
-- Health check status
-
-**Why:** Prometheus metrics are the foundation of production observability. Without metrics, you're flying blind:
-- **Capacity Planning:** Track `ws_connections_active` to know when to scale horizontally
-- **Performance Monitoring:** `cell_edit_latency_ms` histograms reveal p50/p95/p99 latencies for SLO tracking
-- **Cache Effectiveness:** Compare `cache_hits_total` vs `cache_misses_total` to validate caching strategy
-- **Alerting:** Set thresholds on `errors_total` or `db_query_duration_ms` for proactive incident response
-- **Debugging:** Correlate spikes in `formula_calculations_total` with increased latency
-
-**Files:** `src/shared/metrics.ts`, integrated into `src/index.ts`, `src/websocket/server.ts`, `src/api/routes.ts`
-
-### 2. Structured Logging with Pino
-
-**What:** Replaced `console.log` statements with pino structured logging:
-- JSON output format for log aggregation
-- Log levels (error, warn, info, debug) for filtering
-- Request correlation with pino-http middleware
-- Child loggers for component-scoped context (api, websocket)
-- Pretty printing in development mode
-
-**Why:** Structured logging is essential for production debugging and monitoring:
-- **Log Aggregation:** JSON format integrates seamlessly with ELK Stack, Datadog, CloudWatch
-- **Searchability:** Query logs by `spreadsheetId`, `userId`, `component`, or any structured field
-- **Performance:** Pino is one of the fastest Node.js loggers (10x faster than winston)
-- **Context Preservation:** Child loggers ensure every log from WebSocket operations includes `{ component: 'websocket' }`
-- **Noise Reduction:** Log levels allow filtering out debug logs in production while keeping them in development
-
-**Files:** `src/shared/logger.ts`, integrated throughout the codebase
-
-### 3. Comprehensive Health Check Endpoints
-
-**What:** Added three health-related endpoints:
-- `GET /health` - Full health check with database and Redis connectivity, latency measurements
-- `GET /ready` - Kubernetes-style readiness probe (only returns 200 when fully ready to serve traffic)
-- `GET /metrics` - Prometheus metrics endpoint for scraping
-
-**Why:** Health checks are critical for production deployments:
-- **Load Balancer Routing:** `/health` returns 503 when database is down, allowing LB to route traffic elsewhere
-- **Kubernetes Deployments:** `/ready` prevents traffic to pods still warming up or connecting to dependencies
-- **Dependency Visibility:** Response includes per-dependency status and latency, enabling root cause analysis
-- **Graceful Degradation:** The system can report unhealthy before completely failing, allowing for recovery actions
-
-**Files:** `src/index.ts`
-
-### 4. Redis Caching for Spreadsheet Data
-
-**What:** Implemented multi-layer Redis caching with:
-- Spreadsheet metadata cache (30 min TTL)
-- Cell data cache using Redis Hashes for granular updates (15 min TTL)
-- Collaborator presence cache (5 min TTL)
-- Write-through pattern for consistency
-- Cache invalidation on updates
-
-**Why:** Caching is essential for real-time collaborative applications:
-- **Reduced Database Load:** Active spreadsheets are accessed repeatedly; caching reduces DB queries by 80%+
-- **Lower Latency:** Redis operations are 10-100x faster than PostgreSQL queries
-- **Connection Efficiency:** WebSocket connections query the same spreadsheet; cache serves all after first hit
-- **Scalability:** Shared Redis cache enables horizontal scaling across multiple server instances
-- **Graceful Degradation:** If cache misses, we fall back to database transparently
-
-**Implementation Details:**
-- Redis Hashes for cells allow updating single cells without rewriting entire cache
-- TTLs prevent stale data accumulation
-- Metrics track cache hit rates for optimization
-
-**Files:** `src/shared/cache.ts`, integrated into `src/websocket/server.ts`, `src/api/routes.ts`
-
-### 5. Idempotency for Cell Updates
-
-**What:** Added idempotency handling for cell edit operations:
-- Client can include `requestId` in cell edit messages
-- Server checks Redis for previously processed requests
-- If found, returns cached result without re-processing
-- Results stored with 24-hour TTL for retry scenarios
-
-**Why:** Idempotency prevents duplicate operations from network issues:
-- **Network Retries:** When a client retries a failed request, the server won't apply the same edit twice
-- **Consistent Responses:** Replayed requests return the same response as the original
-- **Data Integrity:** Prevents race conditions where the same cell edit is applied multiple times
-- **At-Least-Once Delivery:** Combined with client retries, ensures edits are never lost
-
-**Example Scenario:**
-1. Client sends cell edit with `requestId: "abc123"`
-2. Server processes edit, stores result in Redis
-3. Network drops before client receives ACK
-4. Client retries with same `requestId`
-5. Server finds cached result, returns it without re-processing
-
-**Files:** `src/shared/idempotency.ts`, integrated into `src/websocket/server.ts`
-
-### 6. Circuit Breaker for Collaborative Sync
-
-**What:** Implemented circuit breaker pattern using `opossum` for:
-- Redis pub/sub operations (cross-server sync)
-- Configurable thresholds (50% error rate, 10s recovery time)
-- Fallback behavior (continue in single-server mode)
-- State tracking and metrics
-
-**Why:** Circuit breakers prevent cascading failures:
-- **Fail Fast:** When Redis pub/sub is down, don't wait for timeouts on every cell edit
-- **Graceful Degradation:** Cell edits continue locally; real-time sync resumes when Redis recovers
-- **System Stability:** Prevents a failing dependency from exhausting resources (connections, threads)
-- **Recovery Detection:** Half-open state automatically tests if the service has recovered
-
-**How It Works:**
-1. **Closed State (Normal):** Pub/sub calls go through normally
-2. **Open State (Failing):** After 50% failures, circuit opens; calls fail immediately with fallback
-3. **Half-Open State (Testing):** After 10 seconds, one test call is allowed to check recovery
-4. **Recovery:** If test succeeds, circuit closes and normal operation resumes
-
-**Trade-off:** When circuit is open, multi-server sync is disabled. Users on different servers won't see each other's edits until recovery. This is acceptable because:
-- Single-server edits continue working (most common case)
-- Users see "reconnecting" indicator (can add this on frontend)
-- Full sync occurs on WebSocket reconnect
-
-**Files:** `src/shared/circuitBreaker.ts`, integrated into `src/websocket/server.ts`
-
-### Shared Modules Architecture
-
-The implementation follows a clean shared module pattern under `src/shared/`:
+### Local Setup Diagram
 
 ```
-src/shared/
-├── cache.ts           # Redis caching for spreadsheet data
-├── circuitBreaker.ts  # Opossum circuit breaker wrappers
-├── db.ts              # PostgreSQL connection pool
-├── idempotency.ts     # Idempotent request handling
-├── logger.ts          # Pino structured logging
-├── metrics.ts         # Prometheus metrics definitions
-└── redis.ts           # Redis client and pub/sub helpers
+┌─────────────────┐         ┌──────────────────────────────────────┐
+│   React SPA     │  HTTP   │        Express + WS Server           │
+│  localhost:5173  │────────▶│        localhost:3000                │
+│  (Vite + TS)    │◀── WS ──│                                      │
+│                 │         │  REST: /api/spreadsheets, /api/sheets │
+│  Components:    │         │  WS:   /ws (collaboration hub)       │
+│  SpreadsheetGrid│         │                                      │
+│  (TanStack      │         │  Shared modules:                     │
+│   Virtual)      │         │    db, redis, cache, logger,         │
+│  FormulaBar     │         │    metrics, circuitBreaker,          │
+│  SheetTabs      │         │    idempotency                       │
+│  CollabCursors  │         │                                      │
+│                 │         │  Endpoints: /health, /ready, /metrics │
+│  Store: Zustand │         └──────────┬──────────┬────────────────┘
+└─────────────────┘                    │          │
+                                ┌──────┴───┐ ┌────┴────┐
+                                │PostgreSQL│ │ Valkey  │
+                                │  :5432   │ │  :6379  │
+                                │  sheets  │ │  cache, │
+                                │          │ │ pub/sub,│
+                                │          │ │idempot. │
+                                └──────────┘ └─────────┘
 ```
 
-**Benefits:**
-- **Separation of Concerns:** Each module handles one responsibility
-- **Testability:** Shared modules can be mocked in unit tests
-- **Reusability:** Metrics, logging, and caching are available across all services
-- **Consistency:** All components use the same patterns for observability
+### Production-Grade Patterns Implemented
 
-### Dependencies Added
+1. **Redis caching with write-through** -- Spreadsheet metadata cached for 30 minutes, cell data cached for 15 minutes using Redis Hashes for granular per-cell updates. Cache is invalidated on writes and fails open on Redis errors. See `src/shared/cache.ts`.
 
-```json
-{
-  "dependencies": {
-    "prom-client": "^15.x",    // Prometheus metrics
-    "pino": "^9.x",            // Structured logging
-    "pino-http": "^10.x",      // HTTP request logging
-    "opossum": "^8.x"          // Circuit breaker
-  }
-}
-```
+2. **Idempotency keys** -- Client-generated request IDs are checked against Redis before processing cell edits. Results cached for 24 hours to handle delayed retries. Includes metrics for hit/miss tracking. See `src/shared/idempotency.ts`.
 
-### Configuration
+3. **Circuit breakers** (Opossum) -- Three breakers: Redis pub/sub (1s timeout, falls back to single-server mode), database queries (5s timeout), WebSocket broadcast (2s timeout, silent failure with client resync). All emit Prometheus metrics. See `src/shared/circuitBreaker.ts`.
 
-All new features support environment variable configuration:
+4. **Prometheus metrics** (prom-client) -- 20+ metrics covering WebSocket connections, message latency, cell edits, formula calculations, cache hit rates, database query duration, circuit breaker state, idempotency tracking, and error counts. Exposed at `GET /metrics`. See `src/shared/metrics.ts`.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LOG_LEVEL` | `info` | Pino log level (fatal, error, warn, info, debug, trace) |
-| `NODE_ENV` | - | Set to `production` for JSON logs, otherwise pretty-print |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
+5. **Structured logging** (Pino) -- JSON logs with service name and component context. Child loggers for WebSocket and API scoping. Pretty-printed in development via pino-pretty. Request logging via pino-http with auto-filtering of health/metrics endpoints. See `src/shared/logger.ts`.
 
-### Testing the Implementation
+6. **Health and readiness checks** -- `GET /health` checks PostgreSQL and Redis with latency measurements and detailed status per dependency. `GET /ready` for Kubernetes-style readiness probes. Both update Prometheus gauges. See `src/index.ts`.
 
-```bash
-# Start infrastructure
-docker-compose up -d
+7. **Graceful shutdown** -- SIGTERM handler closes HTTP server, terminates WebSocket clients with code 1001, drains database pool, and disconnects Redis. See `src/index.ts`.
 
-# Run migrations
-npm run db:migrate
+8. **WebSocket heartbeat** -- 30-second ping/pong cycle detects and terminates stale connections. Cleanup broadcasts user-left events and removes collaborator records. See `src/websocket/index.ts`.
 
-# Start server
-npm run dev
+### Simplifications vs Production
 
-# Check health
-curl http://localhost:3001/health
+| Component | Local Implementation | Production Equivalent |
+|-----------|---------------------|----------------------|
+| Database | Single PostgreSQL instance | Sharded by spreadsheet_id with read replicas |
+| WebSocket | Single server with in-memory rooms | WebSocket gateway fleet with Redis pub/sub fan-out |
+| Auth | Session ID cookie, no password | OAuth2 with per-spreadsheet ACLs |
+| Formulas | Basic formula handler | Dedicated formula computation service with worker pool |
+| Caching | Redis write-through cache | Redis Cluster with tiered caching |
+| Conflict resolution | Last-write-wins (per cell) | Same, but with OT for rich text within cells |
+| Edit history | Full storage, no pruning | 30-day retention with compaction and archival |
+| Export | CSV only | CSV, XLSX, PDF via worker service |
 
-# View metrics
-curl http://localhost:3001/metrics
-
-# Watch logs (structured JSON)
-LOG_LEVEL=debug npm run dev
-```
-
+### Omitted from Local Implementation
+- CDN for static assets
+- Multi-region deployment
+- Kubernetes orchestration
+- OAuth2 and per-spreadsheet access control
+- Rich text editing within cells (would need OT/CRDT)
+- Copy/paste across sheets
+- Range selection and bulk formatting
+- Import from XLSX/CSV
+- Version history UI (data stored but no UI)
+- Rate limiting
+- Distributed tracing (OpenTelemetry)
+- Cross-server WebSocket broadcast (single server only)

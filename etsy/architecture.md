@@ -2,7 +2,7 @@
 
 ## System Overview
 
-Etsy is a marketplace for handmade and vintage goods. Unlike Amazon's uniform catalog, Etsy has highly varied products with unique descriptions requiring sophisticated search and personalization.
+Etsy is a marketplace for handmade and vintage goods. Unlike Amazon's uniform catalog, Etsy has highly varied products with unique descriptions requiring sophisticated search and personalization. Core challenges include multi-seller checkout, search relevance for non-standardized products, and personalization with sparse user signals.
 
 **Learning Goals:**
 - Build multi-seller marketplace architecture
@@ -12,62 +12,54 @@ Etsy is a marketplace for handmade and vintage goods. Unlike Amazon's uniform ca
 
 ---
 
-## Traffic Estimates and Capacity Planning
+## Requirements
 
-### Local Development Baseline
+### Functional Requirements
 
-For this learning project, we model a scaled-down version suitable for local development while maintaining realistic proportions.
+1. **Shops**: Sellers create and manage shops with products
+2. **Search**: Find products across inconsistently described handmade goods
+3. **Cart**: Multi-seller cart with grouped checkout
+4. **Orders**: Per-seller order creation and fulfillment
+5. **Favorites**: Save products and shops for later
+6. **Reviews**: Purchase-linked reviews for trust signals
+7. **Personalization**: Recommendations based on browsing and purchase history
 
-| Metric | Local Dev Value | Production Equivalent |
-|--------|-----------------|----------------------|
-| DAU | 50 users | 5M users |
-| MAU | 200 users | 20M users |
-| Peak concurrent | 10 users | 100K users |
-| Products in catalog | 10,000 | 100M |
-| Active shops | 100 | 5M |
+### Non-Functional Requirements
 
-### Request Patterns
-
-| Operation | Local RPS (peak) | Avg Payload Size | Notes |
-|-----------|------------------|------------------|-------|
-| Search queries | 5 RPS | 2 KB response | Elasticsearch query |
-| Product page view | 10 RPS | 8 KB (with images meta) | Heaviest read path |
-| Add to cart | 1 RPS | 500 bytes | Write operation |
-| Checkout | 0.5 RPS | 2 KB | Transaction-heavy |
-| Homepage/feed | 3 RPS | 15 KB | Personalized content |
-
-### Sizing Derived from Traffic
-
-**PostgreSQL:**
-- Single instance sufficient for local dev
-- Products table: ~10,000 rows x 2 KB avg = 20 MB
-- Orders: ~500 rows/day x 1 KB = 500 KB/day
-- No sharding needed locally; production would shard by shop_id
-
-**Elasticsearch:**
-- Single node, 1 shard, 0 replicas for local dev
-- Index size: 10,000 products x 3 KB = 30 MB
-- Production: 3 shards per 10M products, 1 replica each
-
-**Redis/Valkey Cache:**
-- 128 MB allocation for local dev
-- Session storage: 50 users x 2 KB = 100 KB
-- Product cache: 1,000 hot products x 8 KB = 8 MB
-- Cart cache: 50 carts x 5 KB = 250 KB
-
-**RabbitMQ (if implemented):**
-- Single queue for order processing
-- Target throughput: 10 messages/second locally
-- Production: 10K messages/second with 3-node cluster
+- **Availability**: 99.95% for checkout, 99.5% for search
+- **Latency**: < 50ms p50 for search, < 100ms p50 for product pages
+- **Scale**: 100M products, 5M active shops, 20M MAU
+- **Consistency**: Strong for inventory (unique items have quantity=1, overselling means lost sale)
 
 ---
 
-## SLO/SLA Targets and Error Budgets
+## Capacity Estimation
 
-### Service Level Objectives
+### Production Scale
 
-| Endpoint | p50 Latency | p95 Latency | p99 Latency | Availability Target |
-|----------|-------------|-------------|-------------|---------------------|
+| Metric | Value | Derivation |
+|--------|-------|------------|
+| DAU | 5M | ~25% of 20M MAU |
+| Peak concurrent | 100K | 2% of DAU during peak hours |
+| Products | 100M | Across 5M active shops |
+| Search queries/sec | 10,000 | Peak during holiday season |
+| Orders/day | 500K | ~6 orders/second average |
+
+### Storage Estimates
+
+| Data | Size | Growth |
+|------|------|--------|
+| Products + descriptions | 300 GB | 100 GB/year |
+| Product images | 30 TB | 10 TB/year |
+| Elasticsearch index | 60 GB | Mirrors active products |
+| Orders | 1 TB | 500 GB/year |
+| Reviews | 50 GB | 20 GB/year |
+| User favorites + history | 20 GB | 10 GB/year |
+
+### SLO/SLA Targets
+
+| Endpoint | p50 Latency | p95 Latency | p99 Latency | Availability |
+|----------|-------------|-------------|-------------|--------------|
 | Search | 50ms | 150ms | 300ms | 99.5% |
 | Product page | 30ms | 100ms | 200ms | 99.9% |
 | Add to cart | 20ms | 50ms | 100ms | 99.9% |
@@ -76,329 +68,330 @@ For this learning project, we model a scaled-down version suitable for local dev
 
 ### Error Budgets
 
-**Monthly Error Budget Calculation:**
-- 99.9% availability = 43 minutes downtime/month
-- 99.5% availability = 3.6 hours downtime/month
-
 | Service | Availability | Monthly Error Budget | Action Threshold |
-|---------|--------------|---------------------|------------------|
+|---------|-------------|---------------------|------------------|
 | Checkout flow | 99.95% | 22 minutes | Halt deploys at 50% consumed |
 | Cart operations | 99.9% | 43 minutes | Alert at 25% consumed |
-| Search | 99.5% | 3.6 hours | Degrade gracefully to cached results |
+| Search | 99.5% | 3.6 hours | Degrade to cached results |
 | Personalization | 99.0% | 7.2 hours | Fall back to trending products |
-
-### How SLOs Drive Architecture Decisions
-
-**Replication choices:**
-- PostgreSQL: Single primary for local dev; production uses 1 primary + 2 read replicas
-- Read replicas handle product reads (99.9% availability requirement)
-- Writes go to primary (checkout requires strong consistency)
-
-**Caching choices (driven by latency SLOs):**
-- Product pages need 30ms p50: Cache product data in Redis (1ms read vs 5ms DB)
-- Search needs 50ms p50: Cache frequent queries in Redis (bypass Elasticsearch)
-- Personalization can tolerate 80ms: Compute real-time, cache for 5 minutes
-
-**Graceful degradation:**
-- If personalization exceeds error budget, serve cached trending products
-- If search exceeds budget, serve category listings from PostgreSQL
-- If Elasticsearch is down, return "search temporarily unavailable" (don't block checkout)
 
 ---
 
-## Caching and Edge Strategy
-
-### Cache Architecture Overview
+## High-Level Architecture
 
 ```
-[Browser] --> [CDN/Edge] --> [Load Balancer] --> [App Server] --> [Redis Cache] --> [PostgreSQL/ES]
-                 |                                    |
-            Static assets                      Cache-aside pattern
-            (images, CSS, JS)                  for dynamic data
-```
-
-### CDN Layer (Simulated Locally)
-
-For local development, we skip CDN but design for it:
-
-| Asset Type | TTL | Cache-Control Header |
-|------------|-----|---------------------|
-| Product images | 30 days | `public, max-age=2592000, immutable` |
-| CSS/JS bundles | 1 year | `public, max-age=31536000, immutable` (versioned) |
-| Shop logos/banners | 7 days | `public, max-age=604800` |
-| API responses | No CDN cache | `private, no-store` |
-
-**Production CDN strategy:**
-- Use path-based routing: `/static/*` to CDN, `/api/*` to origin
-- Image optimization: WebP conversion at edge
-- Geographic distribution: Cache product images in buyer's region
-
-### Redis/Valkey Caching Strategy
-
-**Cache-Aside Pattern (Read-Heavy Data):**
-
-Used for: Product details, shop profiles, category listings
-
-```javascript
-async function getProduct(productId) {
-  const cacheKey = `product:${productId}`
-
-  // 1. Try cache first
-  const cached = await redis.get(cacheKey)
-  if (cached) {
-    return JSON.parse(cached)
-  }
-
-  // 2. Cache miss: fetch from DB
-  const product = await db('products').where({ id: productId }).first()
-
-  // 3. Populate cache with TTL
-  await redis.setex(cacheKey, 300, JSON.stringify(product)) // 5 min TTL
-
-  return product
-}
-```
-
-**Write-Through Pattern (Consistency-Critical Data):**
-
-Used for: Cart contents, inventory counts
-
-```javascript
-async function updateCartItem(userId, productId, quantity) {
-  const cacheKey = `cart:${userId}`
-
-  // 1. Write to database first (source of truth)
-  await db('cart_items')
-    .where({ user_id: userId, product_id: productId })
-    .update({ quantity })
-
-  // 2. Immediately update cache
-  const cart = await db('cart_items').where({ user_id: userId })
-  await redis.setex(cacheKey, 1800, JSON.stringify(cart)) // 30 min TTL
-
-  return cart
-}
-```
-
-### Cache TTL Configuration
-
-| Data Type | TTL | Pattern | Rationale |
-|-----------|-----|---------|-----------|
-| Product details | 5 min | Cache-aside | Products change rarely; 5 min staleness acceptable |
-| Shop profiles | 10 min | Cache-aside | Shop info stable; longer TTL reduces DB load |
-| Search results | 2 min | Cache-aside | Balance freshness with Elasticsearch load |
-| Cart contents | 30 min | Write-through | Must reflect user actions immediately |
-| Session data | 24 hours | Write-through | Standard session lifetime |
-| Trending products | 15 min | Cache-aside | Computed aggregation; expensive to recalculate |
-| User favorites | 5 min | Cache-aside | Favorites change infrequently |
-| Inventory count | 30 sec | Cache-aside | Critical for "only 1 left" accuracy |
-
-### Cache Invalidation Rules
-
-**Event-Driven Invalidation:**
-
-```javascript
-// When product is updated by seller
-async function updateProduct(productId, updates) {
-  await db('products').where({ id: productId }).update(updates)
-
-  // Invalidate product cache
-  await redis.del(`product:${productId}`)
-
-  // Invalidate search cache for affected categories
-  const product = await db('products').where({ id: productId }).first()
-  await redis.del(`search:category:${product.category_id}:*`)
-
-  // Invalidate shop product list cache
-  await redis.del(`shop:${product.shop_id}:products`)
-}
-```
-
-**Invalidation Patterns by Event:**
-
-| Event | Invalidate Keys | Notes |
-|-------|-----------------|-------|
-| Product updated | `product:{id}`, `shop:{shop_id}:products` | Immediate invalidation |
-| Product sold | `product:{id}`, `trending:*` | Update inventory + rankings |
-| New review added | `product:{id}`, `shop:{shop_id}:rating` | Recalculate averages |
-| Shop profile updated | `shop:{shop_id}` | Direct key invalidation |
-| Checkout completed | `cart:{user_id}`, `product:{id}` for each item | Clear cart, update inventory |
-
-**Stampede Prevention:**
-
-```javascript
-async function getProductWithLock(productId) {
-  const cacheKey = `product:${productId}`
-  const lockKey = `lock:product:${productId}`
-
-  const cached = await redis.get(cacheKey)
-  if (cached) return JSON.parse(cached)
-
-  // Try to acquire lock (prevents multiple DB queries on cache miss)
-  const acquired = await redis.set(lockKey, '1', 'EX', 5, 'NX')
-
-  if (!acquired) {
-    // Another process is fetching; wait and retry
-    await sleep(50)
-    return getProductWithLock(productId)
-  }
-
-  try {
-    const product = await db('products').where({ id: productId }).first()
-    await redis.setex(cacheKey, 300, JSON.stringify(product))
-    return product
-  } finally {
-    await redis.del(lockKey)
-  }
-}
-```
-
-### Local Development Cache Setup
-
-```bash
-# Start Redis via Docker (from project root)
-docker run -d --name etsy-redis -p 6379:6379 redis:7-alpine
-
-# Or via Homebrew
-brew install redis
-brew services start redis
-```
-
-**Environment variables:**
-```bash
-REDIS_URL=redis://localhost:6379
-CACHE_DEFAULT_TTL=300
-CACHE_ENABLED=true  # Set to false to bypass cache during debugging
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            Client Layer                                  │
+│  Homepage  │  Search  │  Shop Pages  │  Cart  │  Checkout  │  Favorites  │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                       CDN / Edge Layer                                   │
+│    Static Assets (images, CSS, JS)  │  API routing  │  Image CDN        │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          API Gateway / LB                                │
+│          Auth  │  Rate Limiting  │  Request Routing                      │
+└──────────────────────────────────────────────────────────────────────────┘
+        │              │              │              │              │
+        ▼              ▼              ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
+│   Shop     │ │  Search    │ │   Cart     │ │   Order    │ │ Personal-  │
+│  Service   │ │  Service   │ │  Service   │ │  Service   │ │ ization    │
+│            │ │            │ │            │ │            │ │  Service   │
+│ - CRUD     │ │ - ES query │ │ - Multi-   │ │ - Per-shop │ │ - Favorites│
+│ - Products │ │ - Synonyms │ │   seller   │ │   orders   │ │ - History  │
+│ - Reviews  │ │ - Fuzzy    │ │   grouping │ │ - Fulfillmt│ │ - Similar  │
+│ - Ratings  │ │ - Facets   │ │ - Reserve  │ │ - Reviews  │ │   products │
+└────────────┘ └────────────┘ └────────────┘ └────────────┘ └────────────┘
+        │              │              │              │              │
+        ▼              ▼              ▼              ▼              ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           Data Layer                                     │
+├──────────────────┬──────────────────┬────────────────────────────────────┤
+│    PostgreSQL    │  Elasticsearch   │         Valkey/Redis               │
+│  - Shops, Users  │  - Product search│  - Sessions                       │
+│  - Products      │  - Synonym filter│  - Product cache                  │
+│  - Orders        │  - Fuzzy match   │  - Search cache                   │
+│  - Reviews       │  - Shop boosting │  - Cart cache                     │
+│  - Favorites     │                  │  - Trending products              │
+│  - View history  │                  │                                    │
+└──────────────────┴──────────────────┴────────────────────────────────────┘
 ```
 
 ---
 
 ## Core Components
 
-### 1. Multi-Seller Cart
+### 1. Multi-Seller Cart and Checkout
 
-**Challenge**: Cart contains items from multiple sellers
+**Challenge**: A buyer's cart contains items from multiple sellers. Each seller handles their own fulfillment with different shipping timelines.
 
-```javascript
-// Group cart by seller for checkout
-async function getCartSummary(userId) {
-  const items = await db('cart_items')
-    .join('products', 'cart_items.product_id', 'products.id')
-    .join('shops', 'products.shop_id', 'shops.id')
-    .where({ 'cart_items.user_id': userId })
-    .select('cart_items.*', 'products.title', 'products.price', 'shops.name as shop_name', 'shops.id as shop_id')
+**Cart Grouping**: Items are grouped by shop at display time. The cart table stores individual items; grouping happens via a JOIN to `products` and `shops`.
 
-  // Group by shop
-  const byShop = items.reduce((acc, item) => {
-    if (!acc[item.shop_id]) {
-      acc[item.shop_id] = { shop_name: item.shop_name, items: [], subtotal: 0 }
-    }
-    acc[item.shop_id].items.push(item)
-    acc[item.shop_id].subtotal += item.price * item.quantity
-    return acc
-  }, {})
+**Checkout Flow**:
+1. Group cart items by `shop_id`
+2. For each shop group, validate inventory (unique items may have quantity=1)
+3. Within a single database transaction:
+   - Create one `order` per shop (independent fulfillment)
+   - Copy cart items to `order_items`
+   - Decrement product quantities
+   - Update shop `sales_count`
+4. Clear cart
+5. Return list of created orders
 
-  return { shops: Object.values(byShop), total: items.reduce((sum, i) => sum + i.price * i.quantity, 0) }
-}
-```
+**Why Separate Orders Per Seller:**
 
-### 2. Search Relevance
+A single unified order would require coordinating fulfillment across multiple independent sellers. Seller A in Portland ships in 3 days; Seller B in Brooklyn ships in 7 days. A single order status would be misleading (is it "shipped" when one of three sellers ships?). Separate orders allow independent tracking, simpler dispute resolution (buyer disputes with one seller, not the platform), and seller-specific shipping calculations. The trade-off is that the buyer sees multiple order confirmations instead of one, and payment must be split across sellers -- at production scale this requires a marketplace payment processor like Stripe Connect.
 
-**Handmade Product Search Challenges:**
-- Varied terminology (handmade, handcrafted, artisan)
-- Misspellings in descriptions
-- Unique product names
+### 2. Search Relevance for Handmade Products
 
-```json
-{
-  "settings": {
-    "analysis": {
-      "analyzer": {
-        "etsy_analyzer": {
-          "type": "custom",
-          "tokenizer": "standard",
-          "filter": ["lowercase", "synonym_filter", "stemmer"]
-        }
-      },
-      "filter": {
-        "synonym_filter": {
-          "type": "synonym",
-          "synonyms": [
-            "handmade, handcrafted, artisan, homemade",
-            "vintage, antique, retro, old"
-          ]
-        }
-      }
-    }
-  }
-}
-```
+**Challenge**: Handmade products are described inconsistently. A ceramic mug might be tagged "handmade," "handcrafted," "artisan," or "homemade." Misspellings are common in seller-written descriptions.
 
-### 3. Personalization
+**Elasticsearch Configuration:**
 
-**Sparse Signal Handling:**
-```javascript
-// For users with limited history, fall back to category-based
-async function getPersonalizedFeed(userId) {
-  const history = await getUserHistory(userId)
+The search uses a custom `etsy_analyzer` with three layers:
+- **Synonym filter**: Maps equivalent terms (`handmade, handcrafted, artisan, homemade` and `vintage, antique, retro, old`)
+- **Stemmer**: Matches "necklaces" when searching "necklace"
+- **Fuzzy matching**: Handles typos (edit distance of 2)
 
-  if (history.views.length < 5) {
-    // Cold start: Show trending in broad categories
-    return getTrendingProducts()
-  }
+**Relevance Boosting:**
 
-  // Extract preferences from history
-  const categories = extractTopCategories(history)
-  const priceRange = extractPriceRange(history)
-  const styles = extractStyles(history)
+Search results are boosted by shop quality signals using `function_score`:
+- Shop rating (higher-rated shops rank higher)
+- Sales count (shops with more sales rank higher)
+- Recency (newer listings get a small boost)
 
-  // Find similar products
-  return findSimilarProducts({ categories, priceRange, styles })
-}
-```
+This prevents a brand-new shop with zero reviews from outranking established sellers for the same keywords.
+
+**Why Synonym Filters over Machine-Learned Embeddings:**
+
+ML-based semantic search (BERT embeddings, vector similarity) would better handle the vocabulary gap between buyer queries and seller descriptions. However, it requires embedding infrastructure (model serving, vector database), significantly increases search latency (50ms embedding + 30ms vector search vs 20ms synonym-enhanced keyword search), and is harder to debug ("why did this result appear?"). Synonym filters are transparent, tunable, and operationally simple. The trade-off is manual maintenance -- when new terminology emerges (e.g., "upcycled"), synonyms must be manually added to the filter.
+
+### 3. Personalization with Sparse Signals
+
+**Challenge**: Most Etsy buyers have limited purchase history (many buy once for a specific occasion). Traditional collaborative filtering fails with sparse data.
+
+**Cold-Start Strategy:**
+- Users with < 5 views: Show trending products by broad category
+- Users with 5-20 views: Extract top categories and price ranges from view history, find similar products
+- Users with 20+ views: Full personalization with category affinity, price range, style preferences
+
+**Similar Products:**
+
+Elasticsearch `more_like_this` query finds products with similar descriptions and tags. This works well for Etsy because product descriptions are rich text with many distinctive terms.
+
+**Favorites as Explicit Signals:**
+
+Unlike implicit signals (page views), favorites are explicit interest indicators. Users can favorite both products and shops. This provides higher-confidence personalization data than view history, which may include accidental clicks.
 
 ---
 
 ## Database Schema
 
 ```sql
+-- Users
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  username VARCHAR(50) UNIQUE NOT NULL,
+  full_name VARCHAR(200),
+  role VARCHAR(20) DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Categories
+CREATE TABLE categories (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  slug VARCHAR(100) UNIQUE NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Shops
 CREATE TABLE shops (
   id SERIAL PRIMARY KEY,
-  owner_id INTEGER REFERENCES users(id),
-  name VARCHAR(100) UNIQUE NOT NULL,
+  owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(100) NOT NULL,
+  slug VARCHAR(100) UNIQUE NOT NULL,
   description TEXT,
-  banner_image VARCHAR(500),
-  logo_image VARCHAR(500),
-  rating DECIMAL(2, 1),
+  location VARCHAR(200),
+  shipping_policy JSONB,
+  return_policy TEXT,
+  rating DECIMAL(2, 1) DEFAULT 0,
+  review_count INTEGER DEFAULT 0,
   sales_count INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW()
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Products
 CREATE TABLE products (
   id SERIAL PRIMARY KEY,
-  shop_id INTEGER REFERENCES shops(id),
+  shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE,
+  category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
   title VARCHAR(200) NOT NULL,
   description TEXT,
   price DECIMAL(10, 2) NOT NULL,
-  quantity INTEGER DEFAULT 1, -- Often 1 for handmade
-  category_id INTEGER REFERENCES categories(id),
+  quantity INTEGER DEFAULT 1,     -- Often 1 for handmade/unique
   tags TEXT[],
   images TEXT[],
-  is_vintage BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW()
+  is_vintage BOOLEAN DEFAULT false,
+  is_handmade BOOLEAN DEFAULT true,
+  shipping_price DECIMAL(10, 2) DEFAULT 0,
+  processing_time VARCHAR(50),
+  view_count INTEGER DEFAULT 0,
+  favorite_count INTEGER DEFAULT 0,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Favorites (items and shops)
+-- Favorites (polymorphic: products and shops)
 CREATE TABLE favorites (
-  user_id INTEGER REFERENCES users(id),
-  favoritable_type VARCHAR(20), -- 'product' or 'shop'
-  favoritable_id INTEGER,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  favoritable_type VARCHAR(20) NOT NULL,  -- 'product' or 'shop'
+  favoritable_id INTEGER NOT NULL,
   created_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (user_id, favoritable_type, favoritable_id)
 );
+
+-- View history (for personalization)
+CREATE TABLE view_history (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  viewed_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Cart items
+CREATE TABLE cart_items (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  quantity INTEGER DEFAULT 1 CHECK (quantity > 0),
+  added_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(user_id, product_id)
+);
+
+-- Orders (one per shop per checkout)
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL,
+  order_number VARCHAR(50) NOT NULL,
+  subtotal DECIMAL(10, 2) NOT NULL,
+  shipping DECIMAL(10, 2) DEFAULT 0,
+  total DECIMAL(10, 2) NOT NULL,
+  shipping_address JSONB,
+  status VARCHAR(30) DEFAULT 'pending',
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Order items
+CREATE TABLE order_items (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  title VARCHAR(200) NOT NULL,
+  price DECIMAL(10, 2) NOT NULL,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  image_url VARCHAR(500),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Reviews (linked to purchase)
+CREATE TABLE reviews (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  comment TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
 ```
+
+### Index Strategy
+
+```sql
+CREATE INDEX idx_products_shop ON products(shop_id);
+CREATE INDEX idx_products_category ON products(category_id);
+CREATE INDEX idx_products_price ON products(price);
+CREATE INDEX idx_products_active ON products(is_active);
+CREATE INDEX idx_favorites_user ON favorites(user_id);
+CREATE INDEX idx_view_history_user ON view_history(user_id, viewed_at DESC);
+CREATE INDEX idx_cart_user ON cart_items(user_id);
+CREATE INDEX idx_orders_buyer ON orders(buyer_id);
+CREATE INDEX idx_orders_shop ON orders(shop_id);
+CREATE INDEX idx_reviews_product ON reviews(product_id);
+CREATE INDEX idx_reviews_shop ON reviews(shop_id);
+CREATE INDEX idx_shops_slug ON shops(slug);
+```
+
+---
+
+## API Design
+
+### Public API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/products` | List products (paginated, filterable) |
+| GET | `/api/products/:id` | Product detail |
+| GET | `/api/products/:id/similar` | Similar products (ES more_like_this) |
+| GET | `/api/search` | Search with filters and facets |
+| GET | `/api/categories` | Category list |
+| GET | `/api/categories/:slug/products` | Products in category |
+| GET | `/api/shops/:slug` | Shop profile |
+| GET | `/api/shops/:slug/products` | Shop product list |
+
+### Authenticated API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/auth/register` | Create account |
+| POST | `/api/auth/login` | Login |
+| POST | `/api/auth/logout` | Logout |
+| GET | `/api/cart` | Get cart (grouped by shop) |
+| POST | `/api/cart` | Add item to cart |
+| PUT | `/api/cart/:id` | Update quantity |
+| DELETE | `/api/cart/:id` | Remove from cart |
+| POST | `/api/checkout` | Create orders (one per shop) |
+| GET | `/api/orders` | Order history |
+| GET | `/api/favorites` | User favorites (products and shops) |
+| POST | `/api/favorites` | Add favorite |
+| DELETE | `/api/favorites/:type/:id` | Remove favorite |
+| POST | `/api/reviews` | Submit review (must have purchased) |
+
+### Seller API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/shops` | Create shop |
+| PUT | `/api/shops/:id` | Update shop |
+| GET | `/api/shops/:id/orders` | Shop orders |
+| GET | `/api/shops/:id/analytics` | Shop analytics |
+| POST | `/api/shops/:id/products` | Create product |
+| PUT | `/api/shops/:id/products/:pid` | Update product |
+| DELETE | `/api/shops/:id/products/:pid` | Delete product |
+
+### Health and Observability
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/health` | Liveness + service status |
+| GET | `/metrics` | Prometheus metrics |
 
 ---
 
@@ -406,286 +399,234 @@ CREATE TABLE favorites (
 
 ### 1. Orders Split by Seller
 
-**Decision**: Create separate order records per seller
+**Decision**: Create separate order records per seller during checkout.
 
-**Rationale**:
-- Each seller handles own fulfillment
-- Different shipping timelines
-- Simpler dispute resolution
+Each seller handles their own fulfillment with different shipping timelines and locations. A unified order would require coordinating across independent sellers, leading to confusing order statuses ("partially shipped" when 1 of 3 sellers ships). Separate orders enable independent tracking, simpler dispute resolution (buyer disputes with one seller), and seller-specific shipping calculations. The trade-off is that buyers see multiple order confirmations and the platform must handle payment splitting across sellers. At production scale, Stripe Connect handles marketplace payouts; locally, payment is simulated.
 
 ### 2. Synonym-Enhanced Search
 
-**Decision**: Use synonym filters for product search
+**Decision**: Custom Elasticsearch analyzer with synonym filters for handmade product terminology.
 
-**Rationale**:
-- Handmade products described inconsistently
-- Improves recall without hurting precision
+Exact-match search fails for Etsy because sellers describe identical products differently ("handmade" vs "handcrafted" vs "artisan"). The synonym filter maps these to equivalent terms at index time, improving recall without hurting precision. Combined with fuzzy matching (edit distance 2), this handles both vocabulary gaps and typos. The trade-off is manual synonym maintenance -- when new terminology emerges in the maker community, the synonym list must be updated manually. ML-based semantic search would handle this automatically but adds significant infrastructure complexity.
+
+### 3. Unique Item Inventory
+
+**Decision**: Individual product-level quantity tracking (often quantity=1) instead of aggregate inventory.
+
+Handmade items are frequently one-of-a-kind. Once sold, there is no restocking -- the sale is lost forever. This makes inventory accuracy even more critical than for mass-produced goods. For unique items, a 15-minute cart reservation (at production scale) prevents the scenario where two buyers see "in stock," both add to cart, and one discovers during checkout that the item was sold. The trade-off is that cart reservations temporarily reduce availability for popular items -- if a buyer reserves a unique necklace and abandons their cart, no one else can buy it for 15 minutes.
+
+---
+
+## Caching and Edge Strategy
+
+### Cache Architecture
+
+```
+[Browser] ──▶ [CDN/Edge] ──▶ [Load Balancer] ──▶ [App Server] ──▶ [Redis Cache] ──▶ [PostgreSQL/ES]
+                 │                                      │
+            Static assets                         Cache-aside pattern
+            (images, CSS, JS)                     for dynamic data
+```
+
+### Redis/Valkey Caching Strategy
+
+**Cache-Aside Pattern** (read-heavy data: product details, shop profiles):
+1. Check Redis first (1ms)
+2. On miss, query PostgreSQL (5ms) or Elasticsearch (50ms for similar products)
+3. Populate cache with TTL
+
+**Write-Through Pattern** (consistency-critical: cart contents, inventory counts):
+1. Write to PostgreSQL first (source of truth)
+2. Immediately update Redis cache
+
+### Cache TTL Configuration
+
+| Data Type | TTL | Pattern | Rationale |
+|-----------|-----|---------|-----------|
+| Product details | 5 min | Cache-aside | Products change rarely; 5 min staleness acceptable |
+| Shop profiles | 10 min | Cache-aside | Shop info stable; longer TTL reduces DB load |
+| Search results | 2 min | Cache-aside | Balance freshness with ES load |
+| Cart contents | 30 min | Write-through | Must reflect user actions immediately |
+| Session data | 24 hours | Write-through | Standard session lifetime |
+| Trending products | 15 min | Cache-aside | Expensive aggregation |
+| Inventory count | 30 sec | Cache-aside | Critical for "only 1 left" accuracy |
+
+### Stampede Prevention
+
+When a popular product's cache expires, hundreds of concurrent requests would all miss cache and hit the database simultaneously. A Redis-based lock (`SETNX` with 5-second TTL) ensures only one request fetches from the database while others wait and retry.
+
+### Cache Invalidation
+
+Event-driven invalidation on product update, product sold, new review, and checkout completion. Each event invalidates specific cache keys (product, shop product list, trending) to avoid stale data without full cache flushes.
+
+---
+
+## Consistency and Idempotency
+
+### Checkout Idempotency
+
+The checkout endpoint accepts an `Idempotency-Key` header. The middleware checks for existing completed operations and returns cached responses. Concurrent duplicate requests are rejected with 409 Conflict. Failed operations allow retry with the same key.
+
+**Why This Matters for Etsy:**
+
+Unique items (quantity=1) make duplicate orders catastrophic. If a double-click creates two orders for a one-of-a-kind handmade necklace, the second order is unfulfillable. Idempotency ensures the second request returns the existing order instead of creating a new one.
+
+### Inventory Consistency
+
+Checkout validates inventory and decrements quantities within a single PostgreSQL transaction. For unique items (quantity=1), this is effectively a compare-and-swap: the transaction checks `quantity > 0` and sets `quantity = 0` atomically.
+
+---
+
+## Observability
+
+### Metrics (Prometheus)
+
+Key metrics exposed at `GET /metrics`:
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `etsy_product_views_total` | Counter | category_id | Product page traffic |
+| `etsy_search_latency_seconds` | Histogram | query_type | Search performance |
+| `etsy_search_queries_total` | Counter | has_filters | Filter usage patterns |
+| `etsy_orders_created_total` | Counter | status | Order volume |
+| `etsy_order_value_dollars` | Histogram | - | Order value distribution |
+| `etsy_cache_hits_total` | Counter | cache_type | Cache effectiveness |
+| `etsy_cache_misses_total` | Counter | cache_type | Cache miss rate |
+| `etsy_circuit_breaker_state` | Gauge | service | ES, payment health |
+| `etsy_checkout_duration_seconds` | Histogram | - | Checkout SLO tracking |
+
+### Structured Logging (Pino)
+
+JSON-formatted logs with service name, environment, and ISO timestamps. Context-specific loggers for orders, search, and general application events.
+
+### Health Checks
+
+The `/api/health` endpoint reports:
+- Overall status (`ok` or `degraded`)
+- PostgreSQL connectivity and latency
+- Redis connectivity and latency
+- Circuit breaker states (Elasticsearch, payment)
+- Uptime
+
+### Graceful Degradation
+
+SLO-driven degradation strategy:
+- If personalization exceeds error budget, serve cached trending products
+- If search exceeds budget, serve category listings from PostgreSQL
+- If Elasticsearch is down, return "search temporarily unavailable" (never block checkout)
+
+---
+
+## Failure Handling
+
+### Circuit Breakers
+
+Circuit breakers (Opossum library) protect against cascading failures:
+
+| Service | Timeout | Error Threshold | Reset Timeout | Fallback |
+|---------|---------|-----------------|---------------|----------|
+| Elasticsearch (search) | 3s | 50% of 10 requests | 15s | PostgreSQL ILIKE search |
+| Elasticsearch (similar) | 3s | 50% of 10 requests | 15s | Return empty array |
+| Payment gateway | 5s | 25% of 5 requests | 30s | Queue as payment_pending |
+
+**Search Fallback:**
+
+When the Elasticsearch circuit breaker opens, search degrades to PostgreSQL `ILIKE` queries. This provides basic text matching without synonyms, fuzzy matching, or facets -- but search remains functional rather than returning errors.
+
+---
+
+## Scalability Considerations
+
+### Horizontal Scaling Path
+
+1. **API servers**: Stateless, scale behind load balancer. Sessions in Redis.
+2. **PostgreSQL**: Read replicas for product browsing and shop pages. Writes (orders, inventory) to primary.
+3. **Elasticsearch**: Add nodes, increase shard count (3 shards per 10M products, 1 replica each).
+4. **Redis cluster**: Shard cache and session data across nodes.
+5. **Shop-based sharding**: At extreme scale, shard PostgreSQL by shop_id for write-heavy operations.
+
+### What Breaks First
+
+1. **Elasticsearch indexing lag**: Product updates from thousands of sellers take seconds to appear in search. Solution: dedicated indexing pipeline with batched updates.
+2. **Single PostgreSQL write primary**: Checkout transaction contention during peak sales. Solution: shard by shop_id.
+3. **Similar products query latency**: `more_like_this` on 100M products is expensive. Solution: precompute and cache similar products.
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Order structure | Split by seller | Single order | Fulfillment reality |
-| Search | Synonyms + fuzzy | Exact match | Product variety |
-| Inventory | Individual tracking | Aggregate | Unique items |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Order structure | Split by seller | Single unified order | Independent fulfillment reality |
+| Search | Synonyms + fuzzy matching | ML semantic search | Operationally simpler, debuggable |
+| Inventory | Per-product quantity tracking | Aggregate inventory | Unique items require individual tracking |
+| Caching | Redis cache-aside + stampede lock | No cache | 99% DB load reduction for popular products |
+| Personalization | View history + favorites | Collaborative filtering | Works with sparse signals |
+| Circuit breakers | Opossum library | Custom implementation | Battle-tested, metrics integration |
+| Logging | Pino (JSON) | Morgan (text) | Structured for log aggregation |
 
 ---
 
 ## Implementation Notes
 
-This section documents the key infrastructure patterns implemented in the backend code and explains the reasoning behind each decision.
+This section documents the actual local implementation and maps production-scale design to what runs on Docker + Node.js + React.
 
-### Why Caching Reduces Database Load for Popular Listings
-
-Popular products on Etsy receive disproportionately high traffic. A trending handmade item might receive thousands of views per hour, while most products see only a handful. Without caching, each product page view would require:
-
-1. A PostgreSQL query to fetch product details (~5ms)
-2. A PostgreSQL query to fetch shop information (~3ms)
-3. An Elasticsearch query for similar products (~50ms)
-
-**Implementation**: The `shared/cache.js` module implements cache-aside with stampede prevention:
-
-```javascript
-// From src/shared/cache.js
-export async function cacheAsideWithLock(key, fetchFn, ttl, cacheType) {
-  const cached = await getFromCache(key, cacheType);
-  if (cached !== null) return cached;  // Cache hit: 1ms response
-
-  // Acquire lock to prevent thundering herd
-  const lockKey = `lock:${key}`;
-  const acquired = await redis.set(lockKey, '1', 'EX', 5, 'NX');
-  // ... fetch from DB only once, then cache
-}
-```
-
-**Measured impact**:
-- Cache hit latency: ~1ms (Redis)
-- Cache miss latency: ~60ms (DB + Elasticsearch)
-- For a product with 1,000 views/hour with 5-minute TTL:
-  - Without cache: 1,000 DB queries/hour
-  - With cache: 12 DB queries/hour (99% reduction)
-
-**TTL choices**:
-- Product details: 5 minutes (products rarely change)
-- Shop profiles: 10 minutes (even more stable)
-- Search results: 2 minutes (balance freshness vs ES load)
-- Trending products: 15 minutes (expensive aggregation)
-
-### Why Idempotency Prevents Duplicate Orders
-
-Checkout is a critical path where duplicate submissions are common:
-- User double-clicks the "Place Order" button
-- Network timeout triggers automatic retry
-- Mobile app retries on connection restore
-
-Without idempotency, each submission creates a new order, charging the customer multiple times.
-
-**Implementation**: The `shared/idempotency.js` middleware intercepts checkout requests:
-
-```javascript
-// From src/shared/idempotency.js
-export function idempotencyMiddleware(options = {}) {
-  return async (req, res, next) => {
-    const idempotencyKey = req.headers['idempotency-key'];
-
-    // Check if we've seen this key before
-    const existing = await checkIdempotencyKey(idempotencyKey);
-    if (existing.exists && existing.state === 'COMPLETED') {
-      // Return the cached response instead of processing again
-      return res.status(existing.statusCode).json(existing.result);
-    }
-
-    // Acquire lock to prevent concurrent processing
-    const acquired = await startIdempotentOperation(idempotencyKey);
-    if (!acquired) {
-      return res.status(409).json({ error: 'Request already processing' });
-    }
-    // ...
-  };
-}
-```
-
-**How it works**:
-1. Client generates unique `Idempotency-Key` header (e.g., `user123:checkout:1705234567`)
-2. First request: acquires lock, processes order, stores result
-3. Duplicate requests: return cached result without re-processing
-4. Key expires after 24 hours (configurable)
-
-**Edge cases handled**:
-- Concurrent requests: Lock prevents race conditions
-- Processing failures: Key is deleted to allow retry
-- Partial failures: Transaction rollback ensures atomicity
-
-### Why Metrics Enable Seller Analytics and Search Optimization
-
-Etsy sellers need visibility into their shop performance. Search engineers need to understand query patterns. Operations need to detect issues before they impact users.
-
-**Implementation**: The `shared/metrics.js` module exposes Prometheus metrics:
-
-```javascript
-// Key metrics collected
-export const productViews = new client.Counter({
-  name: 'etsy_product_views_total',
-  labelNames: ['category_id'],
-});
-
-export const searchLatency = new client.Histogram({
-  name: 'etsy_search_latency_seconds',
-  labelNames: ['query_type'],
-  buckets: [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 1],
-});
-
-export const ordersCreated = new client.Counter({
-  name: 'etsy_orders_created_total',
-  labelNames: ['status'],
-});
-```
-
-**Seller analytics enabled**:
-- `etsy_product_views_total{category_id}`: Which categories get most traffic?
-- `etsy_orders_by_shop_total{shop_id}`: Order volume per shop
-- `etsy_order_value_dollars`: Average order value distribution
-
-**Search optimization insights**:
-- `etsy_search_queries_total{has_filters}`: How often do users filter?
-- `etsy_search_results_count`: Are searches returning enough results?
-- `etsy_search_latency_seconds{query_type}`: Keyword vs browse performance
-
-**Operational monitoring**:
-- `etsy_cache_hits_total` vs `etsy_cache_misses_total`: Cache effectiveness
-- `etsy_circuit_breaker_state{service}`: Service health
-- `etsy_checkout_duration_seconds`: Checkout performance SLO tracking
-
-### Why Circuit Breakers Protect Checkout Flow
-
-The checkout flow depends on external services (payment gateway, Elasticsearch for inventory validation). If these services fail or slow down, the entire checkout could hang, causing:
-- Poor user experience (spinning loading indicators)
-- Thread pool exhaustion (cascading failures)
-- Revenue loss (abandoned carts)
-
-**Implementation**: The `shared/circuit-breaker.js` uses the opossum library:
-
-```javascript
-// From src/shared/circuit-breaker.js
-const CIRCUIT_CONFIGS = {
-  payment: {
-    timeout: 5000,                    // Fail fast after 5s
-    errorThresholdPercentage: 25,     // Open after 25% failures
-    resetTimeout: 30000,              // Try again after 30s
-    volumeThreshold: 5,               // Need 5 requests to calculate
-  },
-  search: {
-    timeout: 3000,
-    errorThresholdPercentage: 50,     // More tolerant for search
-    resetTimeout: 15000,
-    volumeThreshold: 10,
-  },
-};
-```
-
-**Payment circuit breaker behavior**:
-1. **Closed state**: All requests pass through normally
-2. **Failures accumulate**: If 25% of last 5 requests fail...
-3. **Open state**: Requests immediately fail-fast with fallback
-4. **Half-open state**: After 30s, allow one test request
-5. **Recovery**: If test succeeds, close circuit; if fails, re-open
-
-**Fallback strategies**:
-- Payment failure: Queue order as "payment_pending", process later
-- Elasticsearch down: Fall back to PostgreSQL ILIKE search
-- Similar products unavailable: Return empty array (non-critical)
-
-```javascript
-// From src/routes/products.js
-searchCircuitBreaker.init(
-  async (query, filters) => await searchProducts(query, filters),
-  async (query, filters) => {
-    logger.warn('Elasticsearch unavailable, falling back to PostgreSQL');
-    return await fallbackSearch(query, filters);  // Degraded but functional
-  }
-);
-```
-
-**Why this matters for Etsy**:
-- Checkout must never hang indefinitely
-- Search degradation is preferable to search unavailability
-- Payment retries should be queued, not failed permanently
-
----
-
-## Observability Stack
-
-### Logging (Pino)
-
-Structured JSON logging enables log aggregation and querying:
-
-```javascript
-// From src/shared/logger.js
-const logger = pino({
-  base: {
-    service: 'etsy-backend',
-    environment: config.nodeEnv,
-  },
-  timestamp: pino.stdTimeFunctions.isoTime,
-});
-
-// Context-specific loggers
-export const orderLogger = createLogger('orders');
-export const searchLogger = createLogger('elasticsearch');
-```
-
-**Log format example**:
-```json
-{
-  "level": "info",
-  "time": "2024-01-16T12:00:00.000Z",
-  "service": "etsy-backend",
-  "context": "orders",
-  "userId": 123,
-  "orderId": 456,
-  "msg": "Checkout completed"
-}
-```
-
-### Health Checks
-
-The `/api/health` endpoint provides comprehensive service status:
-
-```javascript
-// Response structure
-{
-  "status": "ok",  // or "degraded"
-  "uptime": 3600,
-  "services": {
-    "postgres": { "status": "healthy", "latencyMs": 2 },
-    "redis": { "status": "healthy", "latencyMs": 1 }
-  },
-  "circuitBreakers": {
-    "elasticsearch": { "state": "closed" },
-    "payment": { "state": "closed" }
-  }
-}
-```
-
-### Prometheus Metrics
-
-Available at `/metrics` for scraping:
+### Local Architecture
 
 ```
-# Product metrics
-etsy_product_views_total{category_id="1"} 1234
-
-# Search performance
-etsy_search_latency_seconds_bucket{query_type="keyword",le="0.1"} 950
-etsy_search_latency_seconds_bucket{query_type="keyword",le="0.5"} 990
-
-# Circuit breaker state (0=closed, 1=open, 2=half-open)
-etsy_circuit_breaker_state{service="elasticsearch"} 0
-etsy_circuit_breaker_state{service="payment"} 0
-
-# Cache effectiveness
-etsy_cache_hits_total{cache_type="product"} 9500
-etsy_cache_misses_total{cache_type="product"} 500
+┌───────────────────┐         ┌────────────────────┐
+│  React Frontend   │────────▶│  Express Backend   │
+│  localhost:5173   │         │  localhost:3001     │
+└───────────────────┘         └────────────────────┘
+                                 │      │      │
+                    ┌────────────┘      │      └────────────┐
+                    ▼                   ▼                    ▼
+            ┌──────────────┐  ┌──────────────┐  ┌────────────────┐
+            │  PostgreSQL  │  │    Valkey     │  │ Elasticsearch  │
+            │  :5432       │  │    :6379      │  │   :9200        │
+            └──────────────┘  └──────────────┘  └────────────────┘
 ```
+
+### Production-Grade Patterns Actually Implemented
+
+| Pattern | File | Purpose |
+|---------|------|---------|
+| Cache-aside + stampede lock | `backend/src/shared/cache.ts` | Redis caching with lock-based stampede prevention |
+| Idempotency middleware | `backend/src/shared/idempotency.ts` | Prevents duplicate orders on checkout retry |
+| Circuit breaker | `backend/src/shared/circuit-breaker.ts` | Protects Elasticsearch and payment calls (Opossum) |
+| Structured logging | `backend/src/shared/logger.ts` | Pino JSON logs with context-specific loggers |
+| Prometheus metrics | `backend/src/shared/metrics.ts` | Product views, search latency, order counters, cache hit rates |
+| Elasticsearch search | `backend/src/services/elasticsearch.ts` | Custom analyzer, synonym filter, function_score boosting |
+| Redis sessions | `backend/src/services/redis.ts` | Session storage via connect-redis |
+| Multi-seller checkout | `backend/src/routes/orders.ts` | Per-shop order creation within a transaction |
+| Favorites | `backend/src/routes/favorites.ts` | Polymorphic favorites (products and shops) |
+| View history | `backend/src/routes/products.ts` | Tracks product views for personalization |
+| Similar products | `backend/src/routes/products.ts` | ES more_like_this query |
+| Health checks | `backend/src/index.ts` | `/api/health` with DB, Redis, circuit breaker status |
+
+### What Was Simplified or Substituted
+
+| Production | Local | Reason |
+|------------|-------|--------|
+| CDN for product images | Direct URL references (picsum.photos) | No image storage infrastructure |
+| Stripe Connect (marketplace payouts) | Simulated payment | No real payment splitting |
+| Cart reservations (15 min for unique items) | No reservation | Simplified; checkout validates at purchase time |
+| Message queue (order events) | Synchronous processing | No RabbitMQ/Kafka in docker-compose |
+| Multi-region Elasticsearch | Single node, 1 shard, 0 replicas | Sufficient for local dev |
+| Multiple API instances + LB | Single Express server (supports 3001-3003) | Can test with multiple ports |
+| Kubernetes | docker-compose | Sufficient for local development |
+| Rate limiting | No rate limiting | Not needed locally |
+
+### What Was Omitted
+
+- **Message queue**: No RabbitMQ or Kafka; order events processed synchronously
+- **CDN**: No static asset caching or image optimization
+- **Multi-region replication**: Single PostgreSQL and Elasticsearch instances
+- **Kubernetes orchestration**: docker-compose only
+- **Real payment processing**: No Stripe or payment gateway integration
+- **OAuth / SSO**: Session-based auth only
+- **Personalized homepage recommendations**: View history is tracked but no recommendation engine
+- **"Because you viewed" suggestions**: Not implemented
+- **Order archival**: No tiered storage or data lifecycle management
+- **Audit logging**: No immutable audit trail (unlike Shopify and Amazon implementations)
+- **Cart reservations**: Unique items are not reserved on add-to-cart
