@@ -2,7 +2,9 @@
 
 ## System Overview
 
-A privacy-aware search engine for social media posts with real-time indexing, personalized ranking, and sub-second latency.
+A privacy-aware search engine for social media posts with real-time indexing, personalized ranking, and sub-second latency. The core challenge is filtering search results based on who can see each post without sacrificing query performance -- solved via precomputed visibility fingerprints stored alongside documents in the search index.
+
+**Learning goals:** Elasticsearch query construction with privacy filtering, visibility fingerprint design, two-phase ranking (retrieval + re-ranking), circuit breaker patterns for search availability, search suggestion systems.
 
 ## Requirements
 
@@ -38,327 +40,252 @@ A privacy-aware search engine for social media posts with real-time indexing, pe
 - 5-year retention = 900TB+ of index data
 - Sharding strategy required from day one
 
+### Local Development Scale
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Users | 100 | Seeded test accounts |
+| Posts | 10,000 | Seeded sample content |
+| Searches/day | 500 | Manual + automated testing |
+| Elasticsearch index | < 100MB | Single shard, no replicas |
+
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Load Balancer                              │
-└─────────────────────────────────────────────────────────────────────┘
-                                    │
-           ┌────────────────────────┼────────────────────────┐
-           │                        │                        │
-   ┌───────▼───────┐       ┌───────▼───────┐       ┌───────▼───────┐
-   │Search Service │       │Search Service │       │Search Service │
-   │   (Node.js)   │       │   (Node.js)   │       │   (Node.js)   │
-   └───────┬───────┘       └───────┬───────┘       └───────┬───────┘
-           │                        │                        │
-           └────────────────────────┼────────────────────────┘
-                                    │
-        ┌───────────────────────────┼───────────────────────────┐
-        │                           │                           │
-┌───────▼───────┐          ┌───────▼───────┐          ┌───────▼───────┐
-│   PostgreSQL  │          │ Elasticsearch │          │     Redis     │
-│  (Users/Posts)│          │   (Search)    │          │   (Cache)     │
-└───────────────┘          └───────────────┘          └───────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              CDN / Edge Cache                                 │
+│                    (Static assets, suggestion responses)                       │
+└───────────────────────────────┬──────────────────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────────────────┐
+│                         API Gateway / Load Balancer                            │
+│                   (Rate limiting, auth, SSL termination)                       │
+└──────┬─────────────────┬─────────────────┬──────────────────────────────────┘
+       │                 │                 │
+       ▼                 ▼                 ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│Search Service│  │ Post Service │  │ Auth Service  │
+│- Query build │  │- CRUD        │  │- Sessions     │
+│- Privacy     │  │- Index sync  │  │- RBAC         │
+│  filtering   │  │              │  │               │
+│- Ranking     │  │              │  │               │
+│- Suggestions │  │              │  │               │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       │    ┌────────────▼──────────┐      │
+       │    │  Indexing Pipeline    │      │
+       │    │  (Kafka consumers)   │      │
+       │    │  - Extract hashtags  │      │
+       │    │  - Compute           │      │
+       │    │    fingerprints      │      │
+       │    │  - Bulk index to ES  │      │
+       │    └────────────┬─────────┘      │
+       │                 │                 │
+  ┌────▼─────────────────▼─────────────────▼────┐
+  │            Data Layer                         │
+  │                                               │
+  │  ┌──────────────┐  ┌──────────────────────┐  │
+  │  │ Elasticsearch│  │     PostgreSQL        │  │
+  │  │ Cluster      │  │     (Sharded)         │  │
+  │  │              │  │                       │  │
+  │  │ - Posts index │  │ - Users              │  │
+  │  │ - BM25 + rank│  │ - Posts (source of    │  │
+  │  │ - Visibility │  │   truth)              │  │
+  │  │   filtering  │  │ - Friendships         │  │
+  │  │              │  │ - Search history      │  │
+  │  └──────────────┘  └──────────────────────┘  │
+  │                                               │
+  │  ┌──────────────┐                             │
+  │  │    Redis     │                             │
+  │  │              │                             │
+  │  │ - Visibility │                             │
+  │  │   cache      │                             │
+  │  │ - Sessions   │                             │
+  │  │ - Trending   │                             │
+  │  │   searches   │                             │
+  │  │ - Suggestion │                             │
+  │  │   cache      │                             │
+  │  └──────────────┘                             │
+  └───────────────────────────────────────────────┘
 ```
 
 ### Core Components
 
-1. **Search Service (Stateless)**
-   - Receives search queries from clients
-   - Orchestrates the search flow
-   - Applies privacy filtering and ranking
-   - Horizontally scalable
+| Component | Responsibility | Production Technology |
+|-----------|---------------|----------------------|
+| **Search Service** | Query building, privacy filtering, ranking | Stateless microservice |
+| **Post Service** | Post CRUD, triggers indexing pipeline | Stateless microservice |
+| **Auth Service** | Session management, RBAC | Stateless microservice |
+| **Indexing Pipeline** | Async post indexing with fingerprint computation | Kafka consumer workers |
+| **Elasticsearch** | Full-text search, relevance scoring, filtering | ES Cluster (1000+ shards) |
+| **PostgreSQL** | Source of truth for users, posts, friendships | Sharded cluster |
+| **Redis** | Visibility cache, sessions, trending searches | Redis Cluster |
 
-2. **PostgreSQL**
-   - Source of truth for users, posts, friendships
-   - ACID transactions for data integrity
-   - Used for auth and user management
+## Request Flows
 
-3. **Elasticsearch**
-   - Full-text search index
-   - Stores post documents with visibility fingerprints
-   - Handles scoring and highlighting
+### Search Flow (Privacy-Aware)
 
-4. **Redis**
-   - Caches user visibility sets
-   - Stores session data
-   - Tracks trending searches
-   - Caches search suggestions
+```
+1. Client ──▶ POST /api/v1/search { query: "birthday party", filters: {...} }
+                    │
+                    ▼
+2. Auth middleware validates session token (Redis lookup)
+                    │
+                    ▼
+3. Build visibility set for user:
+   a. Check Redis cache (visibility:{userId}, TTL 15min)
+   b. On miss: Query friendships table for accepted friends
+   c. Construct fingerprint set:
+      ["PUBLIC", "PRIVATE:{userId}", "FRIENDS:{userId}",
+       "FRIENDS:{friend1}", "FRIENDS:{friend2}", ...]
+   d. Cache result in Redis
+                    │
+                    ▼
+4. Build Elasticsearch query:
+   - must: multi_match on content, author_name, hashtags (BM25)
+   - filter: terms query on visibility_fingerprints (privacy)
+   - filter: date_range, post_type (user filters)
+   - should: boost posts from friends (terms on author_id, boost: 2.0)
+   - should: boost own posts (term on author_id, boost: 3.0)
+   - sort: _score DESC, engagement_score DESC, created_at DESC
+                    │
+                    ▼
+5. Execute via circuit breaker (timeout 5s, retry 2x)
+                    │
+                    ▼
+6. Transform results: extract highlights, compute snippets
+                    │
+                    ▼
+7. Record search in history (async), update trending searches (async)
+                    │
+                    ▼
+8. Return { results, next_cursor, total_estimate, took_ms }
+```
+
+### Post Indexing Flow
+
+```
+1. Client ──▶ POST /api/v1/posts { content, visibility, post_type }
+                    │
+                    ▼
+2. Insert into PostgreSQL (source of truth)
+                    │
+                    ▼
+3. Compute visibility fingerprints:
+   - public ──▶ ["PUBLIC"]
+   - friends ──▶ ["FRIENDS:{authorId}"]
+   - private ──▶ ["PRIVATE:{authorId}"]
+                    │
+                    ▼
+4. Extract hashtags (#word) and mentions (@word) from content
+                    │
+                    ▼
+5. Calculate engagement score: likes + (comments × 2) + (shares × 3)
+                    │
+                    ▼
+6. Index document to Elasticsearch with refresh=true
+                    │
+                    ▼
+7. Post is immediately searchable
+```
+
+### Friendship Change Flow
+
+```
+1. User A accepts friend request from User B
+                    │
+                    ▼
+2. Update friendships table (bidirectional rows)
+                    │
+                    ▼
+3. Invalidate visibility cache for both users:
+   - DEL visibility:{userA}
+   - DEL visibility:{userB}
+                    │
+                    ▼
+4. Next search recomputes fresh visibility set
+   (no post re-indexing needed -- fingerprints are stable)
+```
 
 ## Database Schema
 
-### PostgreSQL Schema
+### PostgreSQL Tables
 
-The database consists of five tables that support user authentication, content management, social relationships, and search analytics. The complete schema is available in `/backend/src/db/init.sql`.
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  username VARCHAR(50) UNIQUE NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  display_name VARCHAR(100) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  avatar_url VARCHAR(500),
+  role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
-#### Entity-Relationship Diagram
+CREATE TABLE posts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  visibility VARCHAR(20) DEFAULT 'friends'
+    CHECK (visibility IN ('public', 'friends', 'friends_of_friends', 'private')),
+  post_type VARCHAR(20) DEFAULT 'text'
+    CHECK (post_type IN ('text', 'photo', 'video', 'link')),
+  media_url VARCHAR(500),
+  like_count INTEGER DEFAULT 0,
+  comment_count INTEGER DEFAULT 0,
+  share_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              ENTITY RELATIONSHIPS                                │
-└─────────────────────────────────────────────────────────────────────────────────┘
+CREATE TABLE friendships (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  friend_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status VARCHAR(20) DEFAULT 'pending'
+    CHECK (status IN ('pending', 'accepted', 'blocked')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, friend_id)
+);
 
-                              ┌──────────────────┐
-                              │      users       │
-                              ├──────────────────┤
-                              │ id (PK)          │
-                              │ username         │
-                              │ email            │
-                              │ display_name     │
-                              │ password_hash    │
-                              │ avatar_url       │
-                              │ role             │
-                              │ created_at       │
-                              │ updated_at       │
-                              └────────┬─────────┘
-                                       │
-           ┌───────────────────────────┼───────────────────────────┐
-           │                           │                           │
-           │ 1:N                       │ 1:N                       │ 1:N
-           ▼                           ▼                           ▼
-┌──────────────────┐        ┌──────────────────┐        ┌──────────────────┐
-│      posts       │        │   friendships    │        │  search_history  │
-├──────────────────┤        ├──────────────────┤        ├──────────────────┤
-│ id (PK)          │        │ id (PK)          │        │ id (PK)          │
-│ author_id (FK)───┼────────│ user_id (FK)─────┼────────│ user_id (FK)     │
-│ content          │        │ friend_id (FK)───┼───┐    │ query            │
-│ visibility       │        │ status           │   │    │ filters (JSONB)  │
-│ post_type        │        │ created_at       │   │    │ results_count    │
-│ media_url        │        └──────────────────┘   │    │ created_at       │
-│ like_count       │                               │    └──────────────────┘
-│ comment_count    │        ┌──────────────────────┘
-│ share_count      │        │ (self-referential)
-│ created_at       │        │
-│ updated_at       │        │                           ┌──────────────────┐
-└──────────────────┘        │                           │     sessions     │
-                            │                           ├──────────────────┤
-                            │                           │ id (PK)          │
-                            └───────────────────────────│ user_id (FK)     │
-                                                        │ token            │
-                                                        │ expires_at       │
-                                                        │ created_at       │
-                                                        └──────────────────┘
+CREATE TABLE search_history (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  query VARCHAR(500) NOT NULL,
+  filters JSONB,
+  results_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
 
-LEGEND:
-  PK = Primary Key
-  FK = Foreign Key
-  1:N = One-to-Many relationship
-  ──► = Foreign key reference direction
-```
-
-#### Table Definitions
-
-##### users
-The central identity table for all user accounts.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | UUID | PK, DEFAULT gen_random_uuid() | Unique user identifier |
-| username | VARCHAR(50) | UNIQUE, NOT NULL | Public username for @mentions |
-| email | VARCHAR(255) | UNIQUE, NOT NULL | Email address for login |
-| display_name | VARCHAR(100) | NOT NULL | Human-readable name shown in UI |
-| password_hash | VARCHAR(255) | NOT NULL | bcrypt-hashed password |
-| avatar_url | VARCHAR(500) | | URL to profile picture |
-| role | VARCHAR(20) | CHECK (user, admin), DEFAULT 'user' | Authorization level |
-| created_at | TIMESTAMPTZ | DEFAULT NOW() | Account creation time |
-| updated_at | TIMESTAMPTZ | DEFAULT NOW(), auto-trigger | Last profile modification |
-
-**Design rationale:**
-- UUID primary keys enable distributed ID generation without coordination
-- Separate username/email allows login by either method
-- Display name supports internationalization (non-ASCII names)
-- Role column enables admin features without separate admin table
-
-##### posts
-User-generated content with visibility controls and denormalized engagement metrics.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | UUID | PK, DEFAULT gen_random_uuid() | Unique post identifier |
-| author_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | Post creator |
-| content | TEXT | NOT NULL | Post body text (indexed to Elasticsearch) |
-| visibility | VARCHAR(20) | CHECK (public, friends, friends_of_friends, private), DEFAULT 'friends' | Access control level |
-| post_type | VARCHAR(20) | CHECK (text, photo, video, link), DEFAULT 'text' | Content type for filtering |
-| media_url | VARCHAR(500) | | URL to attached media (if applicable) |
-| like_count | INTEGER | DEFAULT 0 | Denormalized like count |
-| comment_count | INTEGER | DEFAULT 0 | Denormalized comment count |
-| share_count | INTEGER | DEFAULT 0 | Denormalized share count |
-| created_at | TIMESTAMPTZ | DEFAULT NOW() | Post creation time |
-| updated_at | TIMESTAMPTZ | DEFAULT NOW(), auto-trigger | Last post edit time |
-
-**Design rationale:**
-- Denormalized counters avoid expensive COUNT(*) aggregations at read time
-- Visibility enum maps directly to Elasticsearch visibility fingerprints
-- Post types enable faceted search filtering
-- ON DELETE CASCADE ensures orphan posts are removed when user is deleted
-
-##### friendships
-Directional social graph edges representing friend relationships.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | UUID | PK, DEFAULT gen_random_uuid() | Relationship identifier |
-| user_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | The user who owns this relationship |
-| friend_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | The friend in the relationship |
-| status | VARCHAR(20) | CHECK (pending, accepted, blocked), DEFAULT 'pending' | Relationship state |
-| created_at | TIMESTAMPTZ | DEFAULT NOW() | When relationship was created |
-| | | UNIQUE(user_id, friend_id) | Prevents duplicate relationships |
-
-**Design rationale:**
-- Directional design: each accepted friendship creates two rows (A->B and B->A)
-- Enables fast queries: "SELECT friend_id FROM friendships WHERE user_id = ? AND status = 'accepted'"
-- Status supports friend request workflow (pending -> accepted) and blocking
-- Self-referential FK to users enables friends-of-friends queries via join
-- ON DELETE CASCADE: when a user is deleted, all their friendships are removed
-
-**Data flow for visibility computation:**
-1. User searches for posts
-2. System queries `friendships` for user's accepted friends
-3. Builds visibility fingerprint set: `["PUBLIC", "PRIVATE:{user_id}", "FRIENDS:{friend_id}", ...]`
-4. Elasticsearch filters posts by fingerprint intersection
-
-##### search_history
-Analytics table for tracking search queries.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | UUID | PK, DEFAULT gen_random_uuid() | Search record identifier |
-| user_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | User who searched |
-| query | VARCHAR(500) | NOT NULL | Search query text |
-| filters | JSONB | | Applied filters (date_range, post_type, etc.) |
-| results_count | INTEGER | DEFAULT 0 | Number of results returned |
-| created_at | TIMESTAMPTZ | DEFAULT NOW() | When search was performed |
-
-**Design rationale:**
-- JSONB for filters enables flexible schema evolution without migrations
-- results_count helps identify low-yield queries for improvement
-- Subject to 90-day retention (cleaned by scheduled job)
-- Used for: trending searches, search suggestions, analytics
-
-##### sessions
-Authentication session storage (also cached in Redis).
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | UUID | PK, DEFAULT gen_random_uuid() | Session identifier |
-| user_id | UUID | FK -> users(id) ON DELETE CASCADE, NOT NULL | Session owner |
-| token | VARCHAR(255) | UNIQUE, NOT NULL | Session token (cookie value) |
-| expires_at | TIMESTAMPTZ | NOT NULL | Session expiration time |
-| created_at | TIMESTAMPTZ | DEFAULT NOW() | Session creation time |
-
-**Design rationale:**
-- Token uniqueness prevents collision attacks
-- Explicit expires_at enables both database cleanup and application validation
-- ON DELETE CASCADE: deleting a user invalidates all their sessions
-- Redis caching reduces database load for high-frequency auth checks
-
-#### Indexes
-
-| Table | Index | Columns | Purpose |
-|-------|-------|---------|---------|
-| posts | idx_posts_author_id | author_id | User profile page queries |
-| posts | idx_posts_created_at | created_at DESC | Chronological feeds, date filtering |
-| posts | idx_posts_visibility | visibility | Privacy-aware query optimization |
-| friendships | idx_friendships_user_id | user_id | Friend list lookups |
-| friendships | idx_friendships_friend_id | friend_id | Reverse friend lookups |
-| friendships | idx_friendships_status | status | Filter by relationship state |
-| search_history | idx_search_history_user_id | user_id | User's recent searches |
-| search_history | idx_search_history_created_at | created_at DESC | Trending queries, cleanup |
-| sessions | idx_sessions_token | token | Auth token validation |
-| sessions | idx_sessions_user_id | user_id | Logout all devices feature |
-
-#### Foreign Key Cascade Behaviors
-
-All foreign keys use `ON DELETE CASCADE`:
-
-| Relationship | Cascade Effect | Rationale |
-|--------------|----------------|-----------|
-| posts.author_id -> users.id | User deletion removes all their posts | Prevents orphan content; supports GDPR right-to-erasure |
-| friendships.user_id -> users.id | User deletion removes outgoing relationships | Maintains referential integrity |
-| friendships.friend_id -> users.id | User deletion removes incoming relationships | Bidirectional cleanup |
-| search_history.user_id -> users.id | User deletion removes search history | Privacy compliance |
-| sessions.user_id -> users.id | User deletion invalidates all sessions | Security requirement |
-
-**Why CASCADE over SET NULL:**
-- Social graph integrity: orphan friendships pointing to deleted users would corrupt visibility computation
-- Privacy: deleted users should have no residual data in the system
-- Simplicity: application code doesn't need to handle null foreign keys
-
-**Why not RESTRICT:**
-- User deletion should always succeed without manual cleanup
-- Dependent data has no value after user deletion
-
-#### Triggers
-
-| Trigger | Table | Event | Function | Purpose |
-|---------|-------|-------|----------|---------|
-| update_users_updated_at | users | BEFORE UPDATE | update_updated_at_column() | Audit timestamp |
-| update_posts_updated_at | posts | BEFORE UPDATE | update_updated_at_column() | Edit tracking |
-
-The `update_updated_at_column()` function automatically sets `updated_at = NOW()` on any row modification, ensuring accurate audit trails without application-layer responsibility.
-
-#### Data Flow Examples
-
-**1. Creating a new post:**
-```
-Application                    PostgreSQL                    Elasticsearch
-    │                              │                              │
-    ├─ INSERT INTO posts ──────────►                              │
-    │  (author_id, content,        │                              │
-    │   visibility, post_type)     │                              │
-    │                              │                              │
-    │  ◄─── id, created_at ────────┤                              │
-    │                              │                              │
-    ├─ Compute visibility ─────────┼──────────────────────────────►
-    │  fingerprints                │  INDEX document with         │
-    │                              │  fingerprints                │
-    │                              │                              │
-    │  ◄───────────────────────────┼─── searchable immediately ───┤
+CREATE TABLE sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token VARCHAR(255) UNIQUE NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
 ```
 
-**2. Searching for posts (privacy-aware):**
-```
-User Query         Search Service           PostgreSQL         Elasticsearch
-    │                    │                       │                   │
-    ├─ search "party" ──►│                       │                   │
-    │                    │                       │                   │
-    │                    ├─ GET user's friends ──►                   │
-    │                    │   FROM friendships    │                   │
-    │                    │   WHERE status='accepted'                 │
-    │                    │                       │                   │
-    │                    │  ◄─── friend_ids ─────┤                   │
-    │                    │                       │                   │
-    │                    ├─ Build visibility set: ─────────────────►│
-    │                    │   ["PUBLIC",          │  Filter by       │
-    │                    │    "PRIVATE:user",    │  visibility_     │
-    │                    │    "FRIENDS:friend1", │  fingerprints    │
-    │                    │    ...]               │                  │
-    │                    │                       │                   │
-    │                    │  ◄──────── matching posts ───────────────┤
-    │                    │                       │                   │
-    │  ◄─ ranked results ┤                       │                   │
+### Key Indexes
+
+```sql
+CREATE INDEX idx_posts_author_id ON posts(author_id);
+CREATE INDEX idx_posts_created_at ON posts(created_at DESC);
+CREATE INDEX idx_posts_visibility ON posts(visibility);
+CREATE INDEX idx_friendships_user_id ON friendships(user_id);
+CREATE INDEX idx_friendships_friend_id ON friendships(friend_id);
+CREATE INDEX idx_friendships_status ON friendships(status);
+CREATE INDEX idx_search_history_user_id ON search_history(user_id);
+CREATE INDEX idx_search_history_created_at ON search_history(created_at DESC);
+CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);
 ```
 
-**3. Accepting a friend request:**
-```
-Application                    PostgreSQL                    Redis (Cache)
-    │                              │                              │
-    ├─ UPDATE friendships ─────────►                              │
-    │  SET status='accepted'       │                              │
-    │  WHERE user_id=B, friend_id=A│                              │
-    │                              │                              │
-    ├─ INSERT INTO friendships ────►                              │
-    │  (user_id=A, friend_id=B,    │                              │
-    │   status='accepted')         │                              │
-    │                              │                              │
-    ├─ Invalidate visibility cache ┼──────────────────────────────►
-    │  for users A and B           │  DEL visibility:A            │
-    │                              │  DEL visibility:B            │
-    │                              │                              │
-    │  (Next search will           │                              │
-    │   recompute fresh set)       │                              │
-```
+### Triggers
+
+`update_updated_at_column()` function automatically sets `updated_at = NOW()` on any row modification for users and posts tables.
 
 ### Elasticsearch Document Schema
 
@@ -371,21 +298,61 @@ Application                    PostgreSQL                    Redis (Cache)
   "hashtags": ["#birthday", "#party"],
   "mentions": ["@friend1"],
   "created_at": "2024-01-15T10:30:00Z",
+  "updated_at": "2024-01-15T10:30:00Z",
   "visibility": "friends",
-  "visibility_fingerprints": ["PUBLIC", "FRIENDS:user123"],
+  "visibility_fingerprints": ["FRIENDS:user123"],
   "post_type": "text",
   "engagement_score": 125.0,
   "like_count": 50,
   "comment_count": 25,
+  "share_count": 0,
   "language": "en"
 }
 ```
+
+### Redis Data Structures
+
+| Key Pattern | Type | TTL | Purpose |
+|-------------|------|-----|---------|
+| `visibility:{userId}` | String (JSON) | 15 min | Cached visibility fingerprint set |
+| `session:{token}` | String (JSON) | 24h | User session data |
+| `trending:searches` | Sorted Set | Rolling | Trending search queries (score = frequency) |
+| `suggestions:{prefix}` | String (JSON) | 1 min | Cached typeahead suggestions |
 
 ## API Design
 
 ### Core Endpoints
 
-#### Search
+```
+Search
+POST   /api/v1/search                Search posts with filters
+GET    /api/v1/search/suggestions     Typeahead suggestions
+GET    /api/v1/search/trending        Trending search queries
+GET    /api/v1/search/recent          User's recent searches
+DELETE /api/v1/search/history         Clear search history
+
+Posts
+POST   /api/v1/posts                  Create post (triggers indexing)
+GET    /api/v1/posts/:id              Get single post
+PUT    /api/v1/posts/:id              Update post (re-indexes)
+DELETE /api/v1/posts/:id              Delete post (removes from index)
+
+Auth
+POST   /api/v1/auth/register          Create account
+POST   /api/v1/auth/login             Login, returns session token
+POST   /api/v1/auth/logout            Invalidate session
+GET    /api/v1/auth/me                Get current user
+
+Admin
+GET    /api/v1/admin/stats            System statistics
+GET    /api/v1/admin/users            List all users
+GET    /api/v1/admin/posts            List all posts
+GET    /api/v1/admin/search-history   View search history
+POST   /api/v1/admin/reindex          Trigger full reindex
+```
+
+### Search Request/Response
+
 ```
 POST /api/v1/search
 {
@@ -401,772 +368,271 @@ POST /api/v1/search
 Response:
 {
   "results": [...],
-  "next_cursor": "abc123",
+  "next_cursor": "20",
   "total_estimate": 1500,
   "took_ms": 45
 }
 ```
 
-#### Suggestions
-```
-GET /api/v1/search/suggestions?q=birth&limit=5
-
-Response:
-{
-  "suggestions": [
-    {"text": "birthday party", "type": "query"},
-    {"text": "#birthday", "type": "hashtag"}
-  ]
-}
-```
-
 ## Key Design Decisions
 
-### 1. Privacy-Aware Search with Visibility Fingerprints
+### Privacy-Aware Search with Visibility Fingerprints
 
-The key challenge is filtering search results based on who can see each post.
+This is the most critical design decision. The naive approach -- searching for all matching posts, then filtering by permission -- is O(n) in the number of results and would time out at scale (10M results x permission check = seconds).
 
-**Naive Approach (Too Slow):**
-1. Search for "birthday party" -> 10 million results
-2. For each result, check if user can see it -> O(n) permission checks
+**Chosen: Precomputed visibility fingerprints.** Each post stores an array of fingerprint strings in its Elasticsearch document. At query time, we compute the user's visibility set (the set of fingerprints they can access) and use an Elasticsearch `terms` filter to include only matching documents. Elasticsearch handles this as an inverted index lookup -- O(1) per document, evaluated during query execution, not post-hoc.
 
-**Solution: Precomputed Visibility Fingerprints**
+The trade-off: when friendships change, visibility sets must be recomputed. But fingerprints are stable -- `FRIENDS:user123` means "visible to friends of user123" and doesn't change when user123 gains or loses friends. Only the user's visibility set (cached in Redis for 15 minutes) needs invalidation. No post re-indexing is required for friendship changes. This is a decisive advantage over alternatives that embed friend lists directly in documents.
 
-Each post stores visibility fingerprints:
-- Public posts: `["PUBLIC"]`
-- Friends-only: `["FRIENDS:author_id"]`
-- Private: `["PRIVATE:author_id"]`
+### Two-Phase Ranking
 
-At query time, we compute the user's visibility set:
-- Always includes: `"PUBLIC"`
-- Includes: `"PRIVATE:user_id"` (own posts)
-- Includes: `"FRIENDS:friend_id"` for each friend
+**Phase 1 (Elasticsearch retrieval):** BM25 text relevance with fuzziness, engagement score boost, recency decay. This phase retrieves the top-N candidates efficiently using Elasticsearch's inverted index.
 
-The search query includes a terms filter on visibility_fingerprints, which Elasticsearch handles efficiently.
+**Phase 2 (Application-layer re-ranking):** Friend relationship boosting (2x for friends' posts, 3x for own posts). This requires social graph data not available in the search index. The two-phase approach avoids denormalizing the entire social graph into Elasticsearch while still delivering personalized results.
 
-### 2. Personalized Ranking
+The alternative -- embedding friend IDs in Elasticsearch function_score queries -- would require updating documents whenever friendships change, creating write amplification proportional to post count.
 
-**Two-Phase Ranking:**
+### Synchronous vs Asynchronous Indexing
 
-1. **Elasticsearch (Retrieval):**
-   - BM25 text relevance
-   - Recency boost (exponential decay)
-   - Engagement score boost
+**Chosen for learning: Synchronous indexing** with `refresh=true`. Posts are immediately searchable after creation. This is simple and provides a better developer experience for testing.
 
-2. **Application Layer (Re-ranking):**
-   - Friend relationship boosting
-   - Social proximity signals
-   - User's historical preferences
+**Production alternative: Kafka-based async indexing.** Posts are published to a Kafka topic, consumed by indexer workers, and bulk-indexed to Elasticsearch. This decouples write throughput from index throughput, enables replay on index corruption, and allows the indexing pipeline to include enrichment (language detection, toxicity scoring). The trade-off is indexing lag (typically < 5 seconds), which is acceptable for a social search product.
 
-### 3. Real-Time Indexing
+## Consistency and Idempotency
 
-Posts are indexed immediately upon creation:
-1. POST /api/v1/posts creates post in PostgreSQL
-2. Immediately indexes to Elasticsearch with refresh=true
-3. Post is searchable within milliseconds
+### Search Consistency Model
 
-For production scale, we'd use an event-driven pipeline with Kafka.
+| Data | Consistency | Rationale |
+|------|-------------|-----------|
+| Post visibility | Eventually consistent (< 15 min) | Visibility cache TTL; friendship changes invalidate cache |
+| Search index | Eventually consistent (< 5s production, immediate local) | Async indexing pipeline in production |
+| Search history | Strong (PostgreSQL) | Direct insert, no caching |
+| Trending searches | Eventually consistent | Redis sorted set, approximate counts |
 
-## Technology Stack
+### Privacy Consistency
 
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| **Application** | Node.js + Express | Fast development, async I/O, TypeScript support |
-| **Database** | PostgreSQL 16 | ACID, relational data, JSON support |
-| **Search** | Elasticsearch 8.11 | Full-text search, relevance scoring, horizontal scaling |
-| **Cache** | Redis 7 | Fast key-value, TTL support, sorted sets for trending |
-| **Frontend** | React 19 + Vite | Modern React features, fast development |
-| **State** | Zustand | Simple, minimal boilerplate |
-| **Routing** | TanStack Router | Type-safe routing |
-| **Styling** | Tailwind CSS | Utility-first, fast iteration |
+Privacy filtering must never show a post to an unauthorized user, even at the cost of temporarily hiding authorized content. The visibility cache TTL (15 minutes) means a newly accepted friend may not see your posts in search for up to 15 minutes. This is acceptable because: (1) the friendship itself is confirmed immediately, (2) the friend's feed shows posts regardless, (3) 15-minute search delay is not user-visible.
 
-## Scalability Considerations
+## Security
 
-### Horizontal Scaling
+### Authentication
 
-1. **Search Services**: Stateless, add more instances behind load balancer
-2. **Elasticsearch**: Add shards and replicas as data grows
-3. **PostgreSQL**: Read replicas for query scaling
-4. **Redis**: Cluster mode for cache distribution
+- **Session-based auth**: Token stored in Redis with 24-hour expiry, PostgreSQL as backup
+- **Password hashing**: bcrypt with salt
+- **Token format**: UUID v4, passed via `Authorization: Bearer {token}` header
 
-### Data Partitioning
+### Authorization (RBAC)
 
-- **Posts**: Hash by post_id across Elasticsearch shards
-- **Time-based**: Hot/cold tiers (recent posts on faster nodes)
-- **Geographic**: Regional clusters for lower latency
+| Role | Permissions |
+|------|-------------|
+| **user** | Search, create/edit/delete own posts, manage friendships |
+| **admin** | All user permissions + view all users/posts, system stats, trigger reindex |
 
-## Trade-offs Summary
+### Input Validation
 
-| Decision | Trade-off |
-|----------|-----------|
-| Visibility fingerprints | Faster queries vs. re-indexing on relationship changes |
-| Immediate indexing | Real-time search vs. potential consistency lag |
-| Redis for suggestions | Fast typeahead vs. additional infrastructure |
-| Session-based auth | Simplicity vs. JWT scalability |
-
-### Alternatives Considered
-
-1. **Solr vs Elasticsearch**: Chose ES for better real-time indexing and operational simplicity
-2. **MongoDB vs PostgreSQL**: Chose PG for relational data (friendships) and ACID guarantees
-3. **Memcached vs Redis**: Chose Redis for data structures (sorted sets, pub/sub)
+- Zod schemas for all request validation
+- SQL injection prevention via parameterized queries
+- IP-based rate limiting (1000 requests per 15 minutes per IP)
+- Content length limits on search queries and post content
 
 ## Observability
 
-**Key Metrics to Track:**
-- Search latency (p50, p95, p99)
-- Indexing lag (time from post creation to searchable)
-- Cache hit rates (visibility sets, suggestions)
-- Elasticsearch cluster health
-- Query throughput by endpoint
-
-**Alerting:**
-- Search latency > 500ms
-- Elasticsearch cluster yellow/red
-- Redis connection failures
-- Error rate > 1%
-
-## Security Considerations
-
-1. **Authentication**: Session-based with Redis, secure cookie storage
-2. **Authorization**: Role-based (user vs admin), post ownership checks
-3. **Input Validation**: Zod schemas for request validation
-4. **Rate Limiting**: IP-based limiting on search endpoints
-5. **SQL Injection**: Parameterized queries throughout
-
-## Data Lifecycle Policies
-
-### Retention and TTL
-
-| Data Type | Retention Period | Storage Tier | Rationale |
-|-----------|------------------|--------------|-----------|
-| **Posts (PostgreSQL)** | Forever | Primary | Source of truth, never deleted (soft delete only) |
-| **Posts (Elasticsearch)** | 2 years hot, 5 years warm | Hot/Warm | Active search index; older posts rarely searched |
-| **Search History** | 90 days | Primary | Privacy and storage efficiency |
-| **Session Data (Redis)** | 24 hours | Memory | Short-lived auth sessions |
-| **Visibility Cache (Redis)** | 15 minutes | Memory | Invalidated on friendship changes |
-| **Trending Searches (Redis)** | 24 hours rolling | Memory | Recency-weighted rankings |
-
-### TTL Implementation
-
-**Elasticsearch Index Lifecycle Management (ILM):**
-```json
-{
-  "policy": {
-    "phases": {
-      "hot": {
-        "min_age": "0ms",
-        "actions": {
-          "rollover": {
-            "max_primary_shard_size": "50gb",
-            "max_age": "30d"
-          }
-        }
-      },
-      "warm": {
-        "min_age": "60d",
-        "actions": {
-          "shrink": { "number_of_shards": 1 },
-          "forcemerge": { "max_num_segments": 1 },
-          "allocate": { "require": { "data": "warm" } }
-        }
-      },
-      "cold": {
-        "min_age": "730d",
-        "actions": {
-          "freeze": {}
-        }
-      },
-      "delete": {
-        "min_age": "1825d",
-        "actions": { "delete": {} }
-      }
-    }
-  }
-}
-```
-
-**Redis TTL Configuration (Local Development):**
-```bash
-# Set in Redis config or per-key
-# Visibility sets: 15 minutes
-SET visibility:user123 "{...}" EX 900
-
-# Session data: 24 hours
-SET session:abc123 "{...}" EX 86400
-
-# Search suggestions: 1 hour
-SET suggestions:birth "{...}" EX 3600
-```
-
-### Cold Storage Archival
-
-**Local Development Setup:**
-- Use MinIO as S3-compatible cold storage
-- Archive posts older than 2 years to MinIO buckets
-- Keep metadata in PostgreSQL with `archived_at` timestamp
-
-**Archival Process:**
-1. Daily cron job identifies posts older than 2 years not yet archived
-2. Export post content to JSON, compress with gzip
-3. Upload to MinIO bucket: `archives/posts/YYYY/MM/post-{id}.json.gz`
-4. Update PostgreSQL: `SET archived_at = NOW(), content = NULL`
-5. Delete from Elasticsearch warm tier
-
-**Retrieval:**
-- Search only returns archived post ID + metadata
-- On-demand retrieval from MinIO when user clicks "View archived post"
-- Cache retrieved archived posts in Redis for 1 hour
-
-### Backfill and Replay Procedures
-
-**Scenario 1: Elasticsearch Index Corruption**
-```bash
-# 1. Create new index with current mapping
-curl -X PUT "localhost:9200/posts_v2" -H 'Content-Type: application/json' -d @mappings.json
-
-# 2. Reindex from PostgreSQL (local development script)
-npm run db:reindex-posts
-
-# 3. Alias swap for zero-downtime
-curl -X POST "localhost:9200/_aliases" -d '{
-  "actions": [
-    { "remove": { "index": "posts_v1", "alias": "posts" } },
-    { "add": { "index": "posts_v2", "alias": "posts" } }
-  ]
-}'
-```
-
-**Scenario 2: Replay from Event Log (if Kafka is used)**
-```bash
-# Reset consumer group offset to replay events
-kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group post-indexer \
-  --topic post-events \
-  --reset-offsets --to-datetime 2024-01-01T00:00:00.000 \
-  --execute
-
-# Restart indexer to replay
-npm run dev:indexer
-```
-
-**Scenario 3: Partial Reindex (date range)**
-```sql
--- Find posts needing reindex
-SELECT id FROM posts
-WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31'
-  AND updated_at > indexed_at;
-
--- Mark for reindex queue
-UPDATE posts SET needs_reindex = true WHERE ...;
-```
-
-## Deployment and Operations
-
-### Rollout Strategy
-
-**Local Development (Multi-Instance Testing):**
-```bash
-# Start 3 instances on different ports
-npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
-npm run dev:server3  # Port 3003
-npm run dev:lb       # Nginx on port 3000, round-robin
-```
-
-**Canary Deployment Pattern:**
-1. Deploy new version to `server1` only (33% traffic)
-2. Monitor for 10 minutes: error rate, latency, ES query patterns
-3. If healthy, deploy to `server2` (66% traffic)
-4. Monitor for 10 minutes
-5. Complete rollout to `server3` (100% traffic)
-
-**Feature Flags (Simple Implementation):**
-```typescript
-// config/features.ts
-export const features = {
-  newRankingAlgorithm: process.env.FEATURE_NEW_RANKING === 'true',
-  bloomFilterVisibility: false, // Disabled until stable
-  mlReranking: false,
-};
-
-// Usage in search service
-if (features.newRankingAlgorithm) {
-  results = await applyNewRanking(results);
-} else {
-  results = await applyLegacyRanking(results);
-}
-```
-
-### Schema Migrations
-
-**PostgreSQL Migrations:**
-```bash
-# Migration file naming: 001_create_users.sql, 002_create_posts.sql, etc.
-# Located in: backend/src/db/migrations/
-
-# Run migrations
-npm run db:migrate
-
-# Rollback last migration
-npm run db:rollback
-
-# Check migration status
-npm run db:status
-```
-
-**Migration Best Practices (enforced by code review):**
-- Always add columns as nullable or with defaults
-- Never drop columns in the same release that removes code using them
-- Use `CREATE INDEX CONCURRENTLY` for large tables
-- Add rollback SQL in comments at top of migration file
-
-**Example Migration with Rollback:**
-```sql
--- Migration: 015_add_indexed_at_to_posts.sql
--- Rollback: ALTER TABLE posts DROP COLUMN indexed_at;
-
-ALTER TABLE posts ADD COLUMN indexed_at TIMESTAMP;
-CREATE INDEX CONCURRENTLY idx_posts_indexed_at ON posts(indexed_at);
-```
-
-**Elasticsearch Mapping Changes:**
-```bash
-# For adding new fields (non-breaking):
-curl -X PUT "localhost:9200/posts/_mapping" -d '{
-  "properties": {
-    "new_field": { "type": "keyword" }
-  }
-}'
-
-# For breaking changes (requires reindex):
-# 1. Create posts_v2 with new mapping
-# 2. Reindex: POST _reindex { "source": {"index": "posts_v1"}, "dest": {"index": "posts_v2"} }
-# 3. Swap alias
-```
-
-### Rollback Runbooks
-
-**Runbook 1: Application Rollback**
-```bash
-# Symptoms: Error rate spike, 5xx responses
-# Time to execute: 2 minutes
-
-# 1. Check current version
-git log --oneline -1
-
-# 2. Rollback to previous commit
-git checkout HEAD~1
-
-# 3. Restart services
-npm run dev:restart-all
-
-# 4. Verify health
-curl http://localhost:3000/health
-
-# 5. Post-incident: Document what went wrong
-```
-
-**Runbook 2: Database Migration Rollback**
-```bash
-# Symptoms: Application errors related to schema
-# Time to execute: 5 minutes
-
-# 1. Stop all application instances
-pkill -f "node.*server"
-
-# 2. Execute rollback SQL (from migration file comments)
-psql -U postgres -d fb_search -c "ALTER TABLE posts DROP COLUMN indexed_at;"
-
-# 3. Revert application code
-git checkout HEAD~1
-
-# 4. Restart services
-npm run dev:restart-all
-```
-
-**Runbook 3: Elasticsearch Recovery**
-```bash
-# Symptoms: Search returning errors, cluster red/yellow
-# Time to execute: 10-30 minutes
-
-# 1. Check cluster health
-curl localhost:9200/_cluster/health?pretty
-
-# 2. If yellow (unassigned replicas), usually self-heals. Wait 5 min.
-
-# 3. If red (unassigned primary shards):
-# Check which shards are unassigned
-curl localhost:9200/_cat/shards?h=index,shard,prirep,state,unassigned.reason
-
-# 4. For local dev, simplest fix is often:
-docker-compose down
-docker-compose up -d elasticsearch
-npm run db:reindex-posts  # Rebuild index from PostgreSQL
-```
-
-**Runbook 4: Redis Cache Clear**
-```bash
-# Symptoms: Stale data, visibility filtering wrong
-# Time to execute: 1 minute
-
-# 1. Clear all visibility caches
-redis-cli KEYS "visibility:*" | xargs redis-cli DEL
-
-# 2. Clear all sessions (forces re-login)
-redis-cli KEYS "session:*" | xargs redis-cli DEL
-
-# 3. Clear search suggestions
-redis-cli KEYS "suggestions:*" | xargs redis-cli DEL
-```
-
-## Capacity and Cost Guardrails
-
-### Alert Thresholds
-
-| Metric | Warning | Critical | Action |
-|--------|---------|----------|--------|
-| **Search latency p95** | > 300ms | > 500ms | Check ES cluster, add caching |
-| **Elasticsearch heap** | > 70% | > 85% | Increase JVM heap or add nodes |
-| **Kafka consumer lag** | > 10,000 | > 100,000 | Scale indexer instances |
-| **PostgreSQL connections** | > 80 | > 95 | Check connection leaks |
-| **Redis memory** | > 70% | > 85% | Increase maxmemory or evict |
-| **Disk usage (ES)** | > 75% | > 85% | Add nodes or archive old data |
-| **Cache hit rate** | < 80% | < 60% | Review TTLs, increase cache size |
-| **Error rate** | > 0.5% | > 2% | Check logs, rollback if needed |
-
-### Local Development Alerts (docker-compose)
-
-Add Prometheus alerting rules for local testing:
-```yaml
-# prometheus/alerts.yml
-groups:
-  - name: fb-post-search
-    rules:
-      - alert: HighSearchLatency
-        expr: histogram_quantile(0.95, rate(search_latency_seconds_bucket[5m])) > 0.3
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Search p95 latency above 300ms"
-
-      - alert: ElasticsearchClusterYellow
-        expr: elasticsearch_cluster_health_status{color="yellow"} == 1
-        for: 5m
-        labels:
-          severity: warning
-
-      - alert: KafkaConsumerLag
-        expr: kafka_consumer_group_lag > 10000
-        for: 5m
-        labels:
-          severity: warning
-
-      - alert: LowCacheHitRate
-        expr: rate(redis_cache_hits[5m]) / (rate(redis_cache_hits[5m]) + rate(redis_cache_misses[5m])) < 0.8
-        for: 10m
-        labels:
-          severity: warning
-```
-
-### Storage Growth Monitoring
-
-**Elasticsearch Index Size:**
-```bash
-# Check index sizes
-curl localhost:9200/_cat/indices?v&s=store.size:desc
-
-# Expected growth for local dev: ~50MB/day with sample data
-# Alert if posts index grows > 10GB (local) or > 100GB (per shard, prod)
-```
-
-**PostgreSQL Table Sizes:**
-```sql
--- Check table sizes
-SELECT relname, pg_size_pretty(pg_total_relation_size(relid))
-FROM pg_catalog.pg_statio_user_tables
-ORDER BY pg_total_relation_size(relid) DESC;
-
--- Estimated local dev sizes after 1 month:
--- posts: ~100MB
--- users: ~10MB
--- search_history: ~50MB (with 90-day TTL cleanup)
-```
-
-### Cache Hit Rate Targets
-
-| Cache | Target Hit Rate | TTL | Size Limit (Local) |
-|-------|-----------------|-----|-------------------|
-| Visibility sets | > 90% | 15 min | 100MB |
-| Search suggestions | > 85% | 1 hour | 50MB |
-| User profiles | > 95% | 5 min | 20MB |
-| Session data | N/A (not a cache) | 24 hours | 10MB |
-
-**Monitoring Cache Performance:**
-```bash
-# Redis cache stats
-redis-cli INFO stats | grep -E "(keyspace_hits|keyspace_misses)"
-
-# Calculate hit rate
-# hit_rate = keyspace_hits / (keyspace_hits + keyspace_misses)
-```
-
-### Queue Lag Monitoring
-
-**Kafka Consumer Lag (if using event-driven indexing):**
-```bash
-# Check consumer lag
-kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --describe --group post-indexer
-
-# Healthy: LAG < 1000 per partition
-# Warning: LAG > 10,000
-# Critical: LAG > 100,000 (posts not searchable for minutes)
-```
-
-**Indexing Lag Metric:**
-```typescript
-// Track time between post creation and searchability
-const indexingLag = Date.now() - post.created_at.getTime();
-metrics.histogram('indexing_lag_ms', indexingLag);
-
-// Target: p99 < 5000ms (5 seconds)
-// Alert if p99 > 30000ms (30 seconds)
-```
-
-### Cost Optimization Guidelines
-
-**Local Development Resource Limits (docker-compose):**
-```yaml
-services:
-  elasticsearch:
-    mem_limit: 2g  # Don't exceed 2GB locally
-    environment:
-      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
-
-  postgres:
-    mem_limit: 512m
-
-  redis:
-    mem_limit: 256m
-    command: redis-server --maxmemory 200mb --maxmemory-policy allkeys-lru
-```
-
-**Cost Tradeoffs:**
-| Decision | Cost Implication | Mitigation |
-|----------|------------------|------------|
-| 2-year hot index retention | High ES storage | ILM to warm tier at 60 days |
-| 15-min visibility cache TTL | More Redis memory | LRU eviction, monitor hit rate |
-| Real-time indexing | Higher ES write load | Batch indexing option for bulk imports |
-| Full-text + engagement scoring | Complex ES queries | Query caching for popular searches |
-
-## Implementation Notes
-
-This section documents the implementation rationale for the observability and resilience features added to the backend.
-
-### Index Retention: Balancing Search Relevance vs Storage
-
-**Why:** Index retention policies balance search quality against infrastructure costs.
-
-**Implementation:**
-- **Hot tier (0-60 days):** Recent posts are most frequently searched and need fastest access. Stored on high-performance SSDs with full indexing.
-- **Warm tier (60-730 days):** Older posts receive fewer searches. Shrunk to single shard, force-merged for read optimization, moved to cheaper storage.
-- **Cold tier (730-1825 days):** Rarely searched archival data. Frozen indexes use minimal resources while remaining searchable.
-- **Delete (>5 years):** Data beyond retention period removed to control costs.
-
-**Trade-off:** Aggressive retention (e.g., 30-day hot) saves storage but degrades search experience for users looking for older content. The 60-day hot tier was chosen based on analysis showing 90%+ of searches target content less than 2 months old.
-
-**Configuration:** See `backend/src/shared/retention.ts` and `backend/src/shared/alertThresholds.ts` for retention constants.
-
-### Cache Hit Metrics: Enabling Performance Optimization
-
-**Why:** Cache hit rate is the primary indicator of cache effectiveness and directly impacts search latency and database load.
-
-**Implementation:**
-- **Visibility cache:** Tracks hits/misses for user visibility sets. Target: >90% hit rate.
-- **Suggestions cache:** Tracks typeahead cache effectiveness. Target: >85% hit rate.
-- **Prometheus metrics:** `cache_hits_total` and `cache_misses_total` counters with `cache_type` labels.
-
-**How to use:**
-```promql
-# Calculate cache hit rate over 5 minutes
-rate(cache_hits_total{cache_type="visibility"}[5m]) /
-(rate(cache_hits_total{cache_type="visibility"}[5m]) +
- rate(cache_misses_total{cache_type="visibility"}[5m]))
-```
-
-**Optimization actions:**
-- Hit rate <80%: Increase TTL or cache size
-- Hit rate >95%: TTL may be too long (stale data risk) or cache is oversized
-
-**Configuration:** See `backend/src/shared/metrics.ts` for metric definitions.
-
-### Circuit Breakers: Protecting Search Availability
-
-**Why:** When Elasticsearch becomes unhealthy (overloaded, network issues, cluster problems), continuing to send requests causes:
-1. Thread pool exhaustion in the application
-2. Cascading failures to other services
-3. Poor user experience with timeout errors
-
-**Implementation:**
-- **Consecutive breaker:** Opens after 5 consecutive failures
-- **Half-open after 30s:** Allows test requests to check recovery
-- **Timeout:** 5s per request before counting as failure
-- **Metrics:** Circuit state transitions tracked for alerting
-
-**States:**
-- **Closed:** Normal operation, requests pass through
-- **Open:** Fast-fail mode, requests rejected immediately with helpful error
-- **Half-open:** Testing mode, limited requests allowed to probe recovery
-
-**Graceful degradation:** When circuit is open, search returns error but:
-- Suggestions can fall back to trending searches (Redis-only)
-- Health check shows degraded status
-- Load balancer can route traffic away
-
-**Configuration:** See `backend/src/shared/circuitBreaker.ts` and thresholds in `alertThresholds.ts`.
-
-### Index Lag Alerts: Enabling Freshness Monitoring
-
-**Why:** Search freshness is a key user experience metric. Users expect new posts to be searchable immediately.
-
-**Implementation:**
-- **Lag histogram:** Measures time from `post.created_at` to index completion
-- **Buckets:** 0.1s, 0.5s, 1s, 2s, 5s, 10s, 30s, 60s for p95/p99 calculation
-- **Alerting thresholds:**
-  - Warning: p99 > 5s
-  - Critical: p99 > 30s
-
-**How to monitor:**
-```promql
-# p99 indexing lag over 5 minutes
-histogram_quantile(0.99, rate(indexing_lag_seconds_bucket[5m]))
-```
-
-**Root causes to investigate:**
-- High lag: Elasticsearch cluster overloaded, network latency, bulk indexing backlog
-- Kafka consumer lag (if event-driven): Consumer processing too slow, need more partitions/consumers
-
-**Configuration:** See `backend/src/shared/metrics.ts` for histogram and `alertThresholds.ts` for thresholds.
-
-### Prometheus Metrics Summary
+### Metrics (Prometheus Format)
 
 | Metric | Type | Labels | Purpose |
 |--------|------|--------|---------|
-| `search_queries_total` | Counter | status, has_user | Track search volume and error rate |
+| `search_queries_total` | Counter | status, has_user | Search volume and error rate |
 | `search_latency_seconds` | Histogram | status | SLA monitoring (p50, p95, p99) |
+| `search_results_total` | Counter | has_results | Zero-result query tracking |
 | `cache_hits_total` | Counter | cache_type | Cache effectiveness |
 | `cache_misses_total` | Counter | cache_type | Cache effectiveness |
-| `indexing_lag_seconds` | Histogram | - | Search freshness monitoring |
-| `posts_indexed_total` | Counter | operation | Index write volume |
-| `circuit_breaker_state` | Gauge | service | Resilience monitoring |
-| `http_requests_total` | Counter | method, path, status_code | API traffic analysis |
+| `indexing_lag_seconds` | Histogram | - | Post creation to searchable lag |
+| `posts_indexed_total` | Counter | operation | Index write volume (create/update/delete) |
+| `circuit_breaker_state` | Gauge | service | ES circuit breaker state |
+| `http_requests_total` | Counter | method, path, status_code | API traffic |
 | `http_request_duration_seconds` | Histogram | method, path | Endpoint latency |
+| `db_query_latency_seconds` | Histogram | operation | Database performance |
+| `elasticsearch_docs_count` | Gauge | - | Index document count |
+| `elasticsearch_index_size_bytes` | Gauge | - | Index storage size |
 
-### Endpoints
+### Health Check Endpoints
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /metrics` | Prometheus metrics (Prometheus text format) |
-| `GET /health` | Comprehensive health check (JSON) |
+| `GET /health` | Comprehensive check (PostgreSQL, Elasticsearch, Redis) |
 | `GET /livez` | Kubernetes liveness probe |
-| `GET /readyz` | Kubernetes readiness probe |
+| `GET /readyz` | Kubernetes readiness probe (all dependencies) |
+| `GET /metrics` | Prometheus metrics (text format) |
 
-## Frontend Architecture
+### Alerting Thresholds
 
-The frontend follows a component-based architecture using React 19 with TypeScript, TanStack Router for navigation, and Zustand for state management.
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| Search latency p95 | > 300ms | > 500ms | Check ES cluster, add caching |
+| Elasticsearch heap | > 70% | > 85% | Increase JVM heap or add nodes |
+| PostgreSQL connections | > 80 | > 95 | Check connection leaks |
+| Cache hit rate | < 80% | < 60% | Review TTLs, increase cache size |
+| Error rate | > 0.5% | > 2% | Check logs, rollback if needed |
+| Indexing lag p99 | > 5s | > 30s | Scale indexer workers |
 
-### Directory Structure
+### Logging
+
+Structured JSON logs via Pino with domain-specific log functions: `logSearch()` (query, userId, filters, resultsCount, durationMs), `logIndexing()` (postId, operation, durationMs, lagMs), `logCircuitBreakerStateChange()` (service, state). Log levels configurable via `LOG_LEVEL` environment variable.
+
+## Failure Handling
+
+### Circuit Breaker for Elasticsearch
+
+The circuit breaker (cockatiel library) protects against cascading failures when Elasticsearch is unavailable. Without it, application threads block on ES timeouts (5-30 seconds), exhausting the connection pool and causing the entire API to hang.
+
+**Configuration:** Opens after 5 consecutive failures, half-opens after 30 seconds. Timeout of 5 seconds per request. Retry up to 2 times with exponential backoff (100ms to 2s).
+
+**Graceful degradation when circuit is open:**
+- Search returns "service temporarily unavailable" error
+- Suggestions fall back to trending searches (Redis-only, no ES call)
+- Health check shows degraded status
+- Post creation still works (PostgreSQL insert succeeds, indexing queued for retry)
+
+### Data Lifecycle Policies
+
+| Data Type | Retention | Rationale |
+|-----------|-----------|-----------|
+| Posts (PostgreSQL) | Forever | Source of truth, soft delete only |
+| Posts (Elasticsearch) | 2 years hot, 5 years warm | Older posts rarely searched |
+| Search history | 90 days | Privacy and storage efficiency |
+| Visibility cache (Redis) | 15 minutes | Invalidated on friendship changes |
+| Session data (Redis) | 24 hours | Short-lived auth sessions |
+| Trending searches (Redis) | Rolling 24 hours | Recency-weighted rankings |
+
+## Scalability Considerations
+
+### Horizontal Scaling Path
+
+1. **Search Services**: Stateless, add instances behind load balancer.
+2. **Elasticsearch**: Add shards and replicas as data grows. Target: < 50GB per primary shard.
+3. **PostgreSQL**: Read replicas for friendship queries. Shard by user_id when write throughput demands it.
+4. **Redis**: Cluster mode for visibility cache distribution.
+5. **Indexing Pipeline**: Scale Kafka consumer workers independently based on consumer lag.
+
+### Data Partitioning
+
+- **Elasticsearch**: Hash by post_id across 1000+ shards. Hot/cold tiers with ILM (hot < 60 days on SSDs, warm 60-730 days on HDDs, cold > 730 days frozen).
+- **PostgreSQL**: Partition posts by created_at for efficient time-range queries. Shard friendships by user_id.
+- **Geographic**: Regional ES clusters with cross-cluster search for global queries.
+
+### Search Quality at Scale
+
+- **Bloom filters**: Compact visibility set representation for users with thousands of friends (reduces terms filter size).
+- **ML re-ranking**: Gradient boosted trees trained on click-through rate for Phase 2 ranking.
+- **Query caching**: Cache results for popular queries (10-second TTL) to handle search spikes.
+- **Federated search**: Merge results from multiple regional clusters with latency-weighted scoring.
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Privacy filtering | Visibility fingerprints | Per-query permission checks | O(1) filter vs O(n) post-hoc check |
+| Ranking | Two-phase (ES + app) | Full ES function_score | Avoids denormalizing social graph into ES |
+| Indexing | Synchronous (local) / Kafka (production) | Direct ES writes only | Decouples write path, enables replay |
+| Search engine | Elasticsearch | Solr, Meilisearch | Better real-time indexing, operational maturity |
+| Primary database | PostgreSQL | MongoDB | Relational data (friendships), ACID guarantees |
+| Cache | Redis | Memcached | Data structures (sorted sets for trending), TTL |
+| Session storage | Redis + PostgreSQL | JWT | Immediate revocation, simpler token management |
+| Input validation | Zod schemas | Manual validation | Type-safe, composable, auto-documentation |
+| Circuit breaker | Cockatiel | Opossum | Composable policies (retry + timeout + breaker) |
+
+## Implementation Notes
+
+This section maps the production architecture to the actual local implementation.
+
+### Local Architecture
 
 ```
-frontend/src/
-├── components/           # Reusable UI components
-│   ├── admin/           # Admin dashboard components
-│   │   ├── index.ts     # Barrel export
-│   │   ├── AdminTabs.tsx
-│   │   ├── HealthStatusBar.tsx
-│   │   ├── OverviewTab.tsx
-│   │   ├── PostsTable.tsx
-│   │   ├── SearchHistoryTable.tsx
-│   │   ├── StatCard.tsx
-│   │   └── UsersTable.tsx
-│   ├── Header.tsx       # Application header
-│   ├── SearchBar.tsx    # Search input with typeahead
-│   ├── SearchFilters.tsx
-│   ├── SearchResultCard.tsx
-│   └── SearchResults.tsx
-├── routes/              # TanStack Router file-based routes
-│   ├── __root.tsx       # Root layout
-│   ├── index.tsx        # Home/search page
-│   ├── admin.tsx        # Admin dashboard (orchestrator)
-│   ├── login.tsx
-│   └── register.tsx
-├── services/            # API client layer
-│   └── api.ts           # Backend API calls
-├── stores/              # Zustand state stores
-│   └── authStore.ts     # Authentication state
-├── types/               # TypeScript type definitions
-│   └── index.ts         # Shared types
-└── main.tsx             # Application entry point
+┌─────────────────┐
+│  React Frontend │
+│  Vite :5173     │
+│                 │
+│  Search Bar     │
+│  + Typeahead    │
+│  Search Filters │
+│  Result Cards   │
+│  Admin Dashboard│
+└────────┬────────┘
+         │ HTTP
+         ▼
+┌─────────────────┐
+│  Express API    │
+│  :3000          │
+│                 │
+│  Search Service │
+│  Post Service   │
+│  Visibility Svc │
+│  Indexing Svc   │
+│  Auth Service   │
+│  Admin Ctrl     │
+└──┬──────┬───┬───┘
+   │      │   │
+   ▼      ▼   ▼
+┌─────┐┌─────┐┌──────────────┐
+│ PG  ││Redis││Elasticsearch │
+│:5432││:6379││    :9200     │
+│fb_  ││     ││              │
+│post_││     ││  posts index │
+│srch ││     ││  (1 shard,   │
+│     ││     ││   0 replicas)│
+└─────┘└─────┘└──────────────┘
 ```
 
-### Component Design Principles
+### Production Patterns Actually Implemented
 
-1. **Single Responsibility**: Each component handles one concern
-2. **Composition over Inheritance**: Complex UIs built from smaller components
-3. **Props Down, Events Up**: Data flows down, actions bubble up via callbacks
-4. **JSDoc Documentation**: All exported components have JSDoc comments
+| Pattern | File | What It Does |
+|---------|------|-------------|
+| **Visibility fingerprints** | `backend/src/services/visibilityService.ts` | Computes user visibility set from friendships, caches in Redis for 15 min |
+| **Privacy-aware search** | `backend/src/services/searchService.ts` | Builds ES bool query with visibility_fingerprints terms filter |
+| **Friend-boosted ranking** | `backend/src/services/searchService.ts` | Adds should clauses for friend posts (2x) and own posts (3x) |
+| **Real-time indexing** | `backend/src/services/indexingService.ts` | Synchronous ES indexing with fingerprint computation, hashtag/mention extraction |
+| **Bulk indexing** | `backend/src/services/indexingService.ts` | Batch index for seeding and reindex operations |
+| **Circuit breaker** (Cockatiel) | `backend/src/shared/circuitBreaker.ts` | Wraps all ES calls with timeout (5s) + retry (2x) + consecutive breaker (5 failures) |
+| **Prometheus metrics** (prom-client) | `backend/src/shared/metrics.ts` | 15+ custom metrics: search, cache, indexing, circuit breaker, HTTP, DB |
+| **Structured logging** (Pino) | `backend/src/shared/logger.ts` | Domain-specific log functions (logSearch, logIndexing, logCircuitBreakerStateChange) |
+| **Health checks** | `backend/src/shared/healthCheck.ts` | /health (comprehensive), /livez, /readyz with PostgreSQL + ES + Redis checks |
+| **Alert thresholds** | `backend/src/shared/alertThresholds.ts` | Configurable thresholds for circuit breaker, retention, cache TTLs |
+| **Data retention** | `backend/src/shared/retention.ts` | Retention constants for search history (90 days), sessions, visibility cache |
+| **Search history cleanup** | `backend/src/scripts/cleanup-search-history.ts` | Removes search_history entries older than retention period |
+| **Database migrations** | `backend/src/shared/migrations.ts` | Migration runner with rollback support |
+| **Rate limiting** (express-rate-limit) | `backend/src/index.ts` | IP-based rate limiting (1000 req/15min) |
+| **Input validation** (Zod) | Controllers | Schema-based request validation |
+| **Typeahead suggestions** | `backend/src/services/searchService.ts` | Hashtag aggregations (ES), trending searches (Redis), user name matching (PG) |
+| **ES index management** | `backend/src/config/elasticsearch.ts` | Index creation with mapping, analyzers, field types |
+| **Admin dashboard** | `frontend/src/routes/admin.tsx` + `frontend/src/components/admin/` | System stats, user/post management, health status, search history, reindex trigger |
 
-### Admin Dashboard Components
+### What Was Simplified or Substituted
 
-The admin dashboard (`/admin` route) is decomposed into focused sub-components:
+| Production Design | Local Implementation | Why |
+|-------------------|---------------------|-----|
+| API Gateway (Kong/Envoy) | Direct Express routing | Single service |
+| Kafka indexing pipeline | Synchronous indexing with refresh=true | No async infra needed |
+| ES Cluster (1000+ shards) | Single-node ES (1 shard, 0 replicas) | Dev scale |
+| PostgreSQL sharding | Single PostgreSQL instance | 100 users |
+| Redis Cluster | Single Valkey instance | All cache fits in memory |
+| OAuth/JWT auth | Session-based with bcrypt | Simpler |
+| ML re-ranking | Friend boost + engagement score | No training data |
+| CDN for static assets | Vite dev server | Local only |
+| ILM hot/warm/cold tiers | Single index, no lifecycle | Dev scale |
+| Bloom filters for visibility | Full fingerprint arrays | Small friend lists |
 
-| Component | Lines | Responsibility |
-|-----------|-------|----------------|
-| `admin.tsx` | ~180 | Route orchestration, state management, data loading |
-| `AdminTabs.tsx` | ~65 | Tab navigation with icons |
-| `HealthStatusBar.tsx` | ~90 | Service health indicators, reindex button |
-| `OverviewTab.tsx` | ~105 | Statistics cards and breakdown panels |
-| `UsersTable.tsx` | ~80 | User list with role badges |
-| `PostsTable.tsx` | ~75 | Posts list with visibility/type badges |
-| `SearchHistoryTable.tsx` | ~70 | Search query history |
-| `StatCard.tsx` | ~60 | Reusable metric card |
+### What Was Omitted
 
-### Component Communication
-
-```
-AdminPage (Route Component)
-    │
-    ├── HealthStatusBar
-    │     └── onReindex callback → parent handles API call
-    │
-    ├── AdminTabs
-    │     └── onTabChange callback → parent updates activeTab state
-    │
-    └── Tab Content (conditional render)
-          ├── OverviewTab (receives stats prop)
-          ├── UsersTable (receives users prop)
-          ├── PostsTable (receives posts prop)
-          └── SearchHistoryTable (receives history prop)
-```
-
-### State Management
-
-- **Local State**: Component-specific UI state (active tab, loading flags)
-- **Zustand Store**: Authentication state (`authStore`)
-- **Server State**: Data fetched from API, stored in component state
-
-### Styling
-
-- Tailwind CSS for utility-first styling
-- Consistent color scheme with `primary-*` palette
-- Responsive grid layouts (1-4 columns based on viewport)
-
-## Future Optimizations
-
-1. **Bloom Filters**: Compact visibility set representation
-2. **Two-Tier Indexing**: Hot (memory) / Cold (disk) separation
-3. **ML Ranking**: Gradient boosted trees for personalization
-4. **Query Caching**: Cache popular search results
-5. **Federated Search**: Merge results from multiple data centers
-6. **Content Moderation**: Flag and filter inappropriate content in search
+- CDN / edge caching
+- Kafka for async indexing pipeline and event replay
+- Elasticsearch ILM (Index Lifecycle Management) for hot/warm/cold tiers
+- ML-based re-ranking (gradient boosted trees)
+- Bloom filter visibility optimization
+- Multi-region deployment with cross-cluster search
+- Kubernetes orchestration
+- MinIO/S3 for cold storage archival
+- Query result caching for popular searches
+- Language detection for multilingual search
+- Content moderation integration
+- A/B testing hooks for ranking algorithm experiments
+- Load balancer (nginx/HAProxy) -- though multi-instance is supported via `npm run dev:server1/2/3`

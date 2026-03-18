@@ -2,13 +2,14 @@
 
 ## System Overview
 
-GitHub is a code hosting platform built on Git. Core challenges involve Git storage, code search, and collaborative workflows like pull requests.
+GitHub is a code hosting platform built on Git. Core challenges involve Git object storage, code search with symbol extraction, collaborative pull request workflows with multiple merge strategies, and reliable webhook delivery.
 
 **Learning Goals:**
-- Understand Git internals and storage
-- Build code search systems
-- Design collaborative PR workflows
-- Implement webhook delivery systems
+- Understand Git internals and storage (objects, pack files, refs)
+- Build code search with Elasticsearch and symbol extraction
+- Design PR workflows with merge, squash, and rebase strategies
+- Implement reliable webhook delivery with retry semantics
+- Model repository ownership (user vs. organization)
 
 ---
 
@@ -16,18 +17,22 @@ GitHub is a code hosting platform built on Git. Core challenges involve Git stor
 
 ### Functional Requirements
 
-1. **Repos**: Create, clone, push, pull
-2. **PRs**: Create, review, merge pull requests
-3. **Search**: Find code across repositories
-4. **Actions**: Run CI/CD workflows
-5. **Webhooks**: Notify external systems of events
+1. **Repositories**: Create, delete, browse files, view commits, manage branches
+2. **Pull Requests**: Create, review with inline comments, merge (merge/squash/rebase)
+3. **Issues**: Create, assign, label, close, comment
+4. **Code Search**: Full-text search across repositories with language filtering and symbol extraction
+5. **Discussions**: Threaded conversations per repository with answers
+6. **Webhooks**: Configure per-repository webhooks with delivery tracking
+7. **Organizations**: Create organizations, manage members, org-owned repositories
+8. **Stars & Forks**: Star repositories, fork with source tracking
 
 ### Non-Functional Requirements
 
-- **Availability**: 99.99% for Git operations
-- **Latency**: < 100ms for API requests
-- **Scale**: 200M repos, 1B files indexed
-- **Durability**: No data loss (critical)
+- **Availability**: 99.99% for Git operations (push, pull, clone)
+- **Latency**: < 100ms for API requests, < 500ms for search queries
+- **Scale**: 200M repositories, 1B files indexed for search
+- **Durability**: Zero data loss for Git objects (critical)
+- **Consistency**: Strong consistency for Git refs, eventual consistency for search index
 
 ---
 
@@ -35,30 +40,43 @@ GitHub is a code hosting platform built on Git. Core challenges involve Git stor
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│  Web UI │ Git CLI │ GitHub CLI │ IDE Extensions                 │
+│                         Client Layer                            │
+│     Web UI │ Git CLI │ GitHub CLI │ IDE Extensions               │
 └─────────────────────────────────────────────────────────────────┘
                               │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│   Git Server  │    │   API Server  │    │ Search Service│
-│               │    │               │    │               │
-│ - SSH/HTTPS   │    │ - REST/GraphQL│    │ - Code index  │
-│ - Pack files  │    │ - PRs, Issues │    │ - Elasticsearch│
-│ - LFS         │    │ - Webhooks    │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    API Gateway / CDN                             │
+│          (Auth, Rate Limiting, TLS, Static Assets)              │
+└─────────────────────────────────────────────────────────────────┘
         │                     │                     │
         ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│  Git Server   │    │  API Server   │    │Search Service │
+│               │    │               │    │               │
+│ - SSH/HTTPS   │    │ - REST API    │    │ - Code index  │
+│ - Pack files  │    │ - PRs, Issues │    │ - Symbols     │
+│ - Refs        │    │ - Discussions │    │ - Language     │
+│ - LFS         │    │ - Webhooks    │    │   detection   │
+└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
+        │                    │                     │
+        ▼                    ▼                     ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Storage Layer                              │
-├─────────────┬─────────────┬─────────────────────────────────────┤
-│ Git Storage │ PostgreSQL  │           Elasticsearch             │
-│ (Object store)│ - Repos    │           - Code search             │
-│ - Blobs     │ - PRs       │           - Symbols                 │
-│ - Trees     │ - Users     │                                     │
-│ - Commits   │ - Webhooks  │                                     │
-└─────────────┴─────────────┴─────────────────────────────────────┘
+│                    Message Queue (optional)                      │
+│         (Webhook delivery, search indexing, notifications)      │
+└─────────────────────────────────────────────────────────────────┘
+        │                    │                     │
+        ▼                    ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        Storage Layer                            │
+├──────────────┬──────────────┬──────────────┬────────────────────┤
+│ Git Storage  │  PostgreSQL  │    Redis     │  Elasticsearch     │
+│ (Bare repos) │  - Repos     │  - Sessions  │  - Code search     │
+│ - Objects    │  - PRs       │  - Cache     │  - Symbols         │
+│ - Pack files │  - Issues    │  - Rate limit│                    │
+│ - Refs       │  - Webhooks  │              │                    │
+│              │  - Audit logs│              │                    │
+└──────────────┴──────────────┴──────────────┴────────────────────┘
 ```
 
 ---
@@ -67,299 +85,62 @@ GitHub is a code hosting platform built on Git. Core challenges involve Git stor
 
 ### 1. Git Object Storage
 
+Git repositories are stored as bare repositories on the filesystem. Each repository lives at `/repositories/{owner}/{repo}.git`.
+
 **Git Object Types:**
-- **Blob**: File content (compressed)
-- **Tree**: Directory structure
-- **Commit**: Commit metadata + tree pointer
-- **Tag**: Annotated tag
+- **Blob**: File content (compressed with zlib)
+- **Tree**: Directory structure (references blobs and other trees)
+- **Commit**: Commit metadata + parent pointer + tree pointer
+- **Tag**: Annotated tag with signature
 
-**Storage Strategy:**
-```
-/repositories
-  /{owner}
-    /{repo}
-      /objects
-        /pack
-          pack-abc123.pack
-          pack-abc123.idx
-      /refs
-        /heads
-          main
-          feature-branch
-        /tags
-          v1.0.0
-```
+**Content-Addressing:** Objects are stored by their SHA-1 hash, enabling natural deduplication. The same file content across different repositories or branches is stored once.
 
-**Object Deduplication:**
-```javascript
-// Git objects are content-addressed (SHA-1 hash of content)
-// Same file in multiple repos = stored once
-
-async function storeObject(content, type) {
-  const hash = sha1(`${type} ${content.length}\0${content}`)
-  const existing = await objectStore.exists(hash)
-
-  if (!existing) {
-    await objectStore.put(hash, compress(content))
-  }
-
-  return hash
-}
-```
+**Pack Files:** Loose objects are periodically packed into pack files with delta compression, reducing storage and improving clone/fetch performance.
 
 ### 2. Pull Request Workflow
 
-**PR State Machine:**
-```
-OPEN → REVIEW_REQUIRED → APPROVED → MERGED
-  │         │               │          │
-  └─────────┴───────────────┴──────────┘
-                  │
-              CLOSED (without merge)
-```
+PRs follow a state machine: `OPEN` --> `REVIEW_REQUIRED` --> `APPROVED` --> `MERGED`, with `CLOSED` reachable from any state.
 
-**Merge Strategies:**
-```javascript
-async function mergePR(prId, strategy) {
-  const pr = await getPR(prId)
+**Three Merge Strategies:**
+- **Merge commit**: Creates a merge commit preserving full branch history
+- **Squash merge**: Combines all branch commits into a single commit on base
+- **Rebase merge**: Replays branch commits on top of base branch tip
 
-  switch (strategy) {
-    case 'merge':
-      // Create merge commit
-      await git.merge(pr.headBranch, pr.baseBranch)
-      break
-
-    case 'squash':
-      // Combine all commits into one
-      const commits = await git.log(pr.baseBranch, pr.headBranch)
-      const squashed = squashCommits(commits)
-      await git.commit(squashed, pr.baseBranch)
-      break
-
-    case 'rebase':
-      // Replay commits on top of base
-      await git.rebase(pr.headBranch, pr.baseBranch)
-      break
-  }
-
-  await closePR(prId, 'merged')
-  await emitWebhook('pull_request.merged', pr)
-}
-```
+The merge operation is atomic: compute diff, validate no conflicts, execute the git operation, update PR metadata (merged_at, merged_by, additions, deletions, changed_files), and close the PR in a single transaction.
 
 ### 3. Code Search
 
 **Indexing Pipeline:**
-```
-Push Event → Parse Files → Extract Symbols → Index to Elasticsearch
-                │
-                ├── Language detection
-                ├── Tokenization
-                └── Symbol extraction (functions, classes)
-```
+1. On repository creation or push event, files are extracted from the repository
+2. Language detection by file extension
+3. Content tokenized with a code-aware analyzer (camel case splitting, identifier extraction)
+4. Symbols extracted (function and class declarations via regex patterns)
+5. Indexed to Elasticsearch with repo_id, path, content, language, and nested symbols
 
-**Elasticsearch Index:**
-```json
-{
-  "mappings": {
-    "properties": {
-      "repo_id": { "type": "keyword" },
-      "path": { "type": "keyword" },
-      "content": { "type": "text", "analyzer": "code_analyzer" },
-      "language": { "type": "keyword" },
-      "symbols": {
-        "type": "nested",
-        "properties": {
-          "name": { "type": "keyword" },
-          "kind": { "type": "keyword" },
-          "line": { "type": "integer" }
-        }
-      }
-    }
-  }
-}
-```
-
-**Search Query:**
-```javascript
-async function searchCode(query, { language, repo, path }) {
-  return await es.search({
-    index: 'code',
-    body: {
-      query: {
-        bool: {
-          must: [
-            { match: { content: query } }
-          ],
-          filter: [
-            language && { term: { language } },
-            repo && { term: { repo_id: repo } },
-            path && { wildcard: { path: path } }
-          ].filter(Boolean)
-        }
-      },
-      highlight: {
-        fields: { content: {} }
-      }
-    }
-  })
-}
-```
+**Search Features:**
+- Full-text code search with highlighting
+- Language filter
+- Repository scope filter
+- Path wildcard filter
+- Symbol search (functions, classes)
 
 ### 4. Webhook Delivery
 
-**Reliable Delivery:**
-```javascript
-async function deliverWebhook(webhookId, event, payload) {
-  const webhook = await getWebhook(webhookId)
+Webhooks are configured per-repository with a URL, optional secret, and event filter list. Delivery follows a reliable pattern:
 
-  // Queue for delivery
-  await webhookQueue.add({
-    webhookId,
-    event,
-    payload,
-    attempt: 1,
-    scheduledAt: Date.now()
-  })
-}
-
-// Worker processes queue
-async function processWebhookJob(job) {
-  const { webhookId, payload, attempt } = job
-
-  try {
-    const response = await fetch(webhook.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-GitHub-Event': job.event,
-        'X-Hub-Signature': sign(payload, webhook.secret)
-      },
-      body: JSON.stringify(payload)
-    })
-
-    if (!response.ok && attempt < 10) {
-      // Retry with exponential backoff
-      await webhookQueue.add({
-        ...job,
-        attempt: attempt + 1,
-        scheduledAt: Date.now() + Math.pow(2, attempt) * 1000
-      })
-    }
-
-    await logDelivery(webhookId, response.status, payload)
-  } catch (error) {
-    await logDelivery(webhookId, 'error', { error: error.message })
-  }
-}
-```
+1. Event occurs (push, PR opened, issue created)
+2. Find all active webhooks for the repository that subscribe to the event type
+3. For each webhook, create a delivery record and attempt HTTP POST
+4. Sign the payload with HMAC-SHA256 using the webhook secret
+5. On failure, retry with exponential backoff (up to 10 attempts)
+6. Log delivery status, response, and latency to the `webhook_deliveries` table
 
 ---
 
 ## Database Schema
 
-### Entity-Relationship Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            USER & ORGANIZATION LAYER                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌──────────┐         ┌───────────────────┐         ┌──────────────┐        │
-│  │  users   │◄────────│ organization_     │─────────▶│ organizations│        │
-│  │          │         │ members           │          │              │        │
-│  └────┬─────┘         └───────────────────┘          └──────┬───────┘        │
-│       │                                                      │               │
-│       │ created_by                                           │               │
-│       │                                                      │               │
-│       ▼                                                      ▼               │
-│  ┌─────────────────────────────────────────────────────────────────┐        │
-│  │                        repositories                              │        │
-│  │  (owner_id XOR org_id - repository belongs to user OR org)      │        │
-│  └─────────────────────────────────┬───────────────────────────────┘        │
-│                                    │                                         │
-└────────────────────────────────────┼─────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────┼─────────────────────────────────────────┐
-│                     REPOSITORY ENGAGEMENT LAYER                              │
-├────────────────────────────────────┼─────────────────────────────────────────┤
-│                                    │                                         │
-│        ┌───────────────────────────┼───────────────────────────┐            │
-│        │                           │                           │            │
-│        ▼                           ▼                           ▼            │
-│  ┌───────────┐              ┌───────────┐              ┌───────────┐        │
-│  │   stars   │              │   forks   │              │collabora- │        │
-│  │           │              │           │              │   tors    │        │
-│  └───────────┘              └───────────┘              └───────────┘        │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     ISSUE & PR TRACKING LAYER                                │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  repositories ─────────┬──────────────┬──────────────┬──────────────────────│
-│                        │              │              │                       │
-│                        ▼              ▼              ▼                       │
-│                  ┌─────────┐   ┌─────────────┐  ┌────────────┐              │
-│                  │ issues  │   │pull_requests│  │ discussions│              │
-│                  └────┬────┘   └──────┬──────┘  └─────┬──────┘              │
-│                       │               │               │                      │
-│         ┌─────────────┼───────────────┼───────────────┤                      │
-│         │             │               │               │                      │
-│         ▼             ▼               ▼               ▼                      │
-│   ┌───────────┐ ┌──────────┐   ┌──────────┐   ┌────────────────┐            │
-│   │  labels   │ │ comments │   │ reviews  │   │ discussion_    │            │
-│   └─────┬─────┘ │(issue/pr)│   └────┬─────┘   │ comments       │            │
-│         │       └──────────┘        │         └────────────────┘            │
-│         │                           │                                        │
-│   ┌─────┴─────────────┐       ┌─────┴─────────────┐                         │
-│   │  issue_labels     │       │  review_comments  │                         │
-│   │  pr_labels        │       │  (inline code)    │                         │
-│   └───────────────────┘       └───────────────────┘                         │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     AUTOMATION & INTEGRATION LAYER                           │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  repositories ─────────┬────────────────────────────────────────────────────│
-│                        │                                                     │
-│                        ▼                                                     │
-│                  ┌───────────┐                                               │
-│                  │ webhooks  │                                               │
-│                  └─────┬─────┘                                               │
-│                        │                                                     │
-│                        ▼                                                     │
-│              ┌───────────────────┐                                           │
-│              │ webhook_deliveries│                                           │
-│              └───────────────────┘                                           │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     SYSTEM & SECURITY LAYER                                  │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌──────────────┐   ┌───────────────┐   ┌─────────────────┐                 │
-│  │   sessions   │   │  audit_logs   │   │idempotency_keys │                 │
-│  │              │   │               │   │                 │                 │
-│  └──────────────┘   └───────────────┘   └─────────────────┘                 │
-│                                                                              │
-│  ┌──────────────┐                                                            │
-│  │notifications │                                                            │
-│  └──────────────┘                                                            │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Complete Table Definitions
-
-#### User & Organization Tables
-
 ```sql
--- Users table - Core user identity
+-- Users
 CREATE TABLE users (
   id SERIAL PRIMARY KEY,
   username VARCHAR(100) UNIQUE NOT NULL,
@@ -371,12 +152,12 @@ CREATE TABLE users (
   location VARCHAR(255),
   company VARCHAR(255),
   website VARCHAR(500),
-  role VARCHAR(20) DEFAULT 'user',         -- 'user' or 'admin'
+  role VARCHAR(20) DEFAULT 'user',
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Organizations table - Team/company accounts
+-- Organizations
 CREATE TABLE organizations (
   id SERIAL PRIMARY KEY,
   name VARCHAR(100) UNIQUE NOT NULL,
@@ -385,137 +166,130 @@ CREATE TABLE organizations (
   avatar_url VARCHAR(500),
   website VARCHAR(500),
   location VARCHAR(255),
-  created_by INTEGER REFERENCES users(id), -- Organization creator
+  created_by INTEGER REFERENCES users(id),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Organization members - User membership in organizations
+-- Organization Members
 CREATE TABLE organization_members (
   id SERIAL PRIMARY KEY,
   org_id INTEGER REFERENCES organizations(id) ON DELETE CASCADE,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  role VARCHAR(20) DEFAULT 'member',       -- 'owner', 'admin', 'member'
+  role VARCHAR(20) DEFAULT 'member',  -- 'owner', 'admin', 'member'
   created_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(org_id, user_id)                  -- User can only be member once per org
+  UNIQUE(org_id, user_id)
 );
-```
 
-#### Repository Tables
-
-```sql
--- Repositories table - Git repository metadata
+-- Repositories
 CREATE TABLE repositories (
   id SERIAL PRIMARY KEY,
-  owner_id INTEGER REFERENCES users(id),   -- Personal repository owner
-  org_id INTEGER REFERENCES organizations(id), -- Organization owner
+  owner_id INTEGER REFERENCES users(id),
+  org_id INTEGER REFERENCES organizations(id),
   name VARCHAR(100) NOT NULL,
   description TEXT,
   is_private BOOLEAN DEFAULT FALSE,
   default_branch VARCHAR(100) DEFAULT 'main',
-  storage_path VARCHAR(500),               -- Path to bare git repo on disk
-  language VARCHAR(50),                    -- Primary programming language
-  stars_count INTEGER DEFAULT 0,           -- Denormalized star count
-  forks_count INTEGER DEFAULT 0,           -- Denormalized fork count
-  watchers_count INTEGER DEFAULT 0,        -- Denormalized watcher count
+  storage_path VARCHAR(500),
+  language VARCHAR(50),
+  stars_count INTEGER DEFAULT 0,       -- Denormalized counters
+  forks_count INTEGER DEFAULT 0,
+  watchers_count INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   CONSTRAINT unique_user_repo UNIQUE(owner_id, name),
   CONSTRAINT unique_org_repo UNIQUE(org_id, name),
-  -- Repository belongs to either a user OR an organization, never both
   CONSTRAINT owner_or_org CHECK (
     (owner_id IS NOT NULL AND org_id IS NULL) OR
     (owner_id IS NULL AND org_id IS NOT NULL)
   )
 );
 
--- Repository collaborators - External users with access
+CREATE INDEX idx_repos_owner ON repositories(owner_id);
+CREATE INDEX idx_repos_org ON repositories(org_id);
+
+-- Collaborators
 CREATE TABLE collaborators (
   id SERIAL PRIMARY KEY,
   repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  permission VARCHAR(20) DEFAULT 'read',   -- 'read', 'triage', 'write', 'maintain', 'admin'
+  permission VARCHAR(20) DEFAULT 'read',  -- 'read', 'triage', 'write', 'maintain', 'admin'
   created_at TIMESTAMP DEFAULT NOW(),
   UNIQUE(repo_id, user_id)
 );
 
--- Stars - User favorites
+-- Stars
 CREATE TABLE stars (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
   created_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(user_id, repo_id)                 -- User can only star once
+  UNIQUE(user_id, repo_id)
 );
 
--- Forks - Repository fork relationships
+-- Forks
 CREATE TABLE forks (
   id SERIAL PRIMARY KEY,
   source_repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
   forked_repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
   created_at TIMESTAMP DEFAULT NOW()
 );
-```
 
-#### Issue Tracking Tables
-
-```sql
--- Issues table - Bug reports and feature requests
+-- Issues
 CREATE TABLE issues (
   id SERIAL PRIMARY KEY,
   repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
-  number INTEGER NOT NULL,                 -- Repository-scoped issue number
+  number INTEGER NOT NULL,
   title VARCHAR(500) NOT NULL,
   body TEXT,
-  state VARCHAR(20) DEFAULT 'open',        -- 'open', 'closed'
+  state VARCHAR(20) DEFAULT 'open',
   author_id INTEGER REFERENCES users(id),
   assignee_id INTEGER REFERENCES users(id),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   closed_at TIMESTAMP,
-  UNIQUE(repo_id, number)                  -- Issue numbers are unique per repo
+  UNIQUE(repo_id, number)
 );
 
--- Labels table - Issue/PR categorization
+CREATE INDEX idx_issues_repo ON issues(repo_id);
+CREATE INDEX idx_issues_author ON issues(author_id);
+
+-- Labels
 CREATE TABLE labels (
   id SERIAL PRIMARY KEY,
   repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
   name VARCHAR(50) NOT NULL,
-  color VARCHAR(7) DEFAULT '#1a73e8',      -- Hex color code
+  color VARCHAR(7) DEFAULT '#1a73e8',
   description TEXT,
-  UNIQUE(repo_id, name)                    -- Labels are unique per repo
+  UNIQUE(repo_id, name)
 );
 
--- Issue labels - Many-to-many junction
+-- Issue Labels (junction)
 CREATE TABLE issue_labels (
   id SERIAL PRIMARY KEY,
   issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
   label_id INTEGER REFERENCES labels(id) ON DELETE CASCADE,
   UNIQUE(issue_id, label_id)
 );
-```
 
-#### Pull Request Tables
-
-```sql
--- Pull Requests table - Code review and merge workflow
+-- Pull Requests
 CREATE TABLE pull_requests (
   id SERIAL PRIMARY KEY,
   repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
-  number INTEGER NOT NULL,                 -- Repository-scoped PR number
+  number INTEGER NOT NULL,
   title VARCHAR(500) NOT NULL,
   body TEXT,
-  state VARCHAR(20) DEFAULT 'open',        -- 'open', 'closed', 'merged'
-  head_branch VARCHAR(100) NOT NULL,       -- Source branch
-  head_sha VARCHAR(40),                    -- Latest commit on head branch
-  base_branch VARCHAR(100) NOT NULL,       -- Target branch
-  base_sha VARCHAR(40),                    -- Commit on base branch at PR creation
+  state VARCHAR(20) DEFAULT 'open',     -- 'open', 'closed', 'merged'
+  head_branch VARCHAR(100) NOT NULL,
+  head_sha VARCHAR(40),
+  base_branch VARCHAR(100) NOT NULL,
+  base_sha VARCHAR(40),
   author_id INTEGER REFERENCES users(id),
   merged_by INTEGER REFERENCES users(id),
   merged_at TIMESTAMP,
-  additions INTEGER DEFAULT 0,             -- Lines added
-  deletions INTEGER DEFAULT 0,             -- Lines removed
-  changed_files INTEGER DEFAULT 0,         -- Number of files changed
+  additions INTEGER DEFAULT 0,
+  deletions INTEGER DEFAULT 0,
+  changed_files INTEGER DEFAULT 0,
   is_draft BOOLEAN DEFAULT FALSE,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
@@ -523,7 +297,10 @@ CREATE TABLE pull_requests (
   UNIQUE(repo_id, number)
 );
 
--- PR labels - Many-to-many junction
+CREATE INDEX idx_prs_repo ON pull_requests(repo_id);
+CREATE INDEX idx_prs_author ON pull_requests(author_id);
+
+-- PR Labels (junction)
 CREATE TABLE pr_labels (
   id SERIAL PRIMARY KEY,
   pr_id INTEGER REFERENCES pull_requests(id) ON DELETE CASCADE,
@@ -531,32 +308,34 @@ CREATE TABLE pr_labels (
   UNIQUE(pr_id, label_id)
 );
 
--- Reviews - PR approval/rejection workflow
+-- Reviews
 CREATE TABLE reviews (
   id SERIAL PRIMARY KEY,
   pr_id INTEGER REFERENCES pull_requests(id) ON DELETE CASCADE,
   reviewer_id INTEGER REFERENCES users(id),
-  state VARCHAR(20),                       -- 'approved', 'changes_requested', 'commented', 'pending'
+  state VARCHAR(20),                    -- 'approved', 'changes_requested', 'commented', 'pending'
   body TEXT,
-  commit_sha VARCHAR(40),                  -- Commit SHA at time of review
+  commit_sha VARCHAR(40),
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Review comments - Inline code comments during review
+CREATE INDEX idx_reviews_pr ON reviews(pr_id);
+
+-- Review Comments (inline code comments)
 CREATE TABLE review_comments (
   id SERIAL PRIMARY KEY,
   review_id INTEGER REFERENCES reviews(id) ON DELETE CASCADE,
   pr_id INTEGER REFERENCES pull_requests(id) ON DELETE CASCADE,
   user_id INTEGER REFERENCES users(id),
-  path VARCHAR(500),                       -- File path being commented on
-  line INTEGER,                            -- Line number in diff
-  side VARCHAR(10),                        -- 'LEFT' or 'RIGHT' side of diff
+  path VARCHAR(500),
+  line INTEGER,
+  side VARCHAR(10),
   body TEXT NOT NULL,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Comments - General comments on issues and PRs
+-- Comments (issues and PRs)
 CREATE TABLE comments (
   id SERIAL PRIMARY KEY,
   issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
@@ -565,1214 +344,437 @@ CREATE TABLE comments (
   body TEXT NOT NULL,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
-  -- Comment belongs to either an issue OR a PR, never both
   CONSTRAINT issue_or_pr CHECK (
     (issue_id IS NOT NULL AND pr_id IS NULL) OR
     (issue_id IS NULL AND pr_id IS NOT NULL)
   )
 );
-```
 
-#### Discussion Tables
+CREATE INDEX idx_comments_issue ON comments(issue_id);
+CREATE INDEX idx_comments_pr ON comments(pr_id);
 
-```sql
--- Discussions - Q&A and community discussions
+-- Discussions
 CREATE TABLE discussions (
   id SERIAL PRIMARY KEY,
   repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
   number INTEGER NOT NULL,
   title VARCHAR(500) NOT NULL,
   body TEXT,
-  category VARCHAR(50),                    -- 'general', 'ideas', 'q-and-a', 'show-and-tell'
+  category VARCHAR(50),
   author_id INTEGER REFERENCES users(id),
   is_answered BOOLEAN DEFAULT FALSE,
-  answer_comment_id INTEGER,               -- ID of accepted answer
+  answer_comment_id INTEGER,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   UNIQUE(repo_id, number)
 );
 
--- Discussion comments - Threaded replies with nesting
+-- Discussion Comments (threaded)
 CREATE TABLE discussion_comments (
   id SERIAL PRIMARY KEY,
   discussion_id INTEGER REFERENCES discussions(id) ON DELETE CASCADE,
   user_id INTEGER REFERENCES users(id),
-  parent_id INTEGER REFERENCES discussion_comments(id), -- Self-reference for threading
+  parent_id INTEGER REFERENCES discussion_comments(id),
   body TEXT NOT NULL,
   upvotes INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
-```
 
-#### Webhook Tables
-
-```sql
--- Webhooks - External system integrations
+-- Webhooks
 CREATE TABLE webhooks (
   id SERIAL PRIMARY KEY,
   repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
   url VARCHAR(500) NOT NULL,
-  secret VARCHAR(100),                     -- HMAC signing secret
-  events TEXT[],                           -- Array of event types to trigger on
+  secret VARCHAR(100),
+  events TEXT[],
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Webhook deliveries - Delivery history and retry tracking
+-- Webhook Deliveries
 CREATE TABLE webhook_deliveries (
   id SERIAL PRIMARY KEY,
   webhook_id INTEGER REFERENCES webhooks(id) ON DELETE CASCADE,
-  event VARCHAR(50),                       -- Event type that triggered delivery
-  payload JSONB,                           -- Full event payload
-  response_status INTEGER,                 -- HTTP response status code
-  response_body TEXT,                      -- Response from external system
-  duration_ms INTEGER,                     -- Request duration
-  attempt INTEGER DEFAULT 1,               -- Retry attempt number
+  event VARCHAR(50),
+  payload JSONB,
+  response_status INTEGER,
+  response_body TEXT,
+  duration_ms INTEGER,
+  attempt INTEGER DEFAULT 1,
   delivered_at TIMESTAMP DEFAULT NOW()
 );
-```
 
-#### System Tables
-
-```sql
--- Sessions - User authentication sessions
+-- Sessions
 CREATE TABLE sessions (
   id SERIAL PRIMARY KEY,
   session_id VARCHAR(255) UNIQUE NOT NULL,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  data JSONB,                              -- Session metadata
+  data JSONB,
   expires_at TIMESTAMP NOT NULL,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Notifications - User notification inbox
+-- Notifications
 CREATE TABLE notifications (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  type VARCHAR(50),                        -- 'mention', 'review_requested', 'pr_merged', etc.
+  type VARCHAR(50),
   title VARCHAR(255),
   message TEXT,
-  url VARCHAR(500),                        -- Link to related resource
+  url VARCHAR(500),
   is_read BOOLEAN DEFAULT FALSE,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Audit logs - Security-sensitive operation tracking
-CREATE TABLE audit_logs (
-  id SERIAL PRIMARY KEY,
-  timestamp TIMESTAMP DEFAULT NOW(),
-  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, -- Preserve log even if user deleted
-  action VARCHAR(100) NOT NULL,            -- 'repo.create', 'pr.merge', 'user.login', etc.
-  resource_type VARCHAR(50) NOT NULL,      -- 'repository', 'user', 'webhook', etc.
-  resource_id VARCHAR(100),
-  ip_address INET,
-  user_agent TEXT,
-  request_id VARCHAR(64),                  -- For distributed tracing correlation
-  details JSONB DEFAULT '{}',              -- Additional context
-  outcome VARCHAR(20) DEFAULT 'success'    -- 'success', 'denied', 'error'
-);
-
--- Idempotency keys - Prevent duplicate operations
-CREATE TABLE idempotency_keys (
-  key VARCHAR(64) PRIMARY KEY,
-  operation_type VARCHAR(50) NOT NULL,     -- 'pr_create', 'issue_create', etc.
-  resource_id INTEGER,                     -- ID of created resource
-  response_body JSONB,                     -- Cached response for replay
-  created_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-### Indexes
-
-```sql
--- Repository lookup indexes
-CREATE INDEX idx_repos_owner ON repositories(owner_id);
-CREATE INDEX idx_repos_org ON repositories(org_id);
-
--- Issue and PR lookup indexes
-CREATE INDEX idx_issues_repo ON issues(repo_id);
-CREATE INDEX idx_issues_author ON issues(author_id);
-CREATE INDEX idx_prs_repo ON pull_requests(repo_id);
-CREATE INDEX idx_prs_author ON pull_requests(author_id);
-
--- Comment lookup indexes
-CREATE INDEX idx_comments_issue ON comments(issue_id);
-CREATE INDEX idx_comments_pr ON comments(pr_id);
-CREATE INDEX idx_reviews_pr ON reviews(pr_id);
-
--- Star lookup indexes (for showing user's starred repos and repo star count)
-CREATE INDEX idx_stars_user ON stars(user_id);
-CREATE INDEX idx_stars_repo ON stars(repo_id);
-
--- Notification inbox (unread first)
 CREATE INDEX idx_notifications_user ON notifications(user_id, is_read);
 
--- Audit log query indexes
-CREATE INDEX idx_audit_timestamp ON audit_logs(timestamp);
-CREATE INDEX idx_audit_user ON audit_logs(user_id);
-CREATE INDEX idx_audit_resource ON audit_logs(resource_type, resource_id);
-CREATE INDEX idx_audit_action ON audit_logs(action);
-
--- Idempotency key cleanup index
-CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
-```
-
-### Foreign Key Relationships and Cascade Behaviors
-
-| Parent Table | Child Table | FK Column | ON DELETE Behavior | Rationale |
-|--------------|-------------|-----------|-------------------|-----------|
-| `users` | `organizations` | `created_by` | NO ACTION | Preserve org history |
-| `users` | `organization_members` | `user_id` | CASCADE | Remove membership when user deleted |
-| `organizations` | `organization_members` | `org_id` | CASCADE | Remove all members when org deleted |
-| `users` | `repositories` | `owner_id` | NO ACTION | Prevent accidental repo deletion |
-| `organizations` | `repositories` | `org_id` | NO ACTION | Prevent accidental repo deletion |
-| `repositories` | `collaborators` | `repo_id` | CASCADE | Remove collaborators with repo |
-| `users` | `collaborators` | `user_id` | CASCADE | Remove access when user deleted |
-| `users` | `stars` | `user_id` | CASCADE | Remove stars when user deleted |
-| `repositories` | `stars` | `repo_id` | CASCADE | Remove stars when repo deleted |
-| `repositories` | `forks` | `source_repo_id` | CASCADE | Remove fork records with source |
-| `repositories` | `forks` | `forked_repo_id` | CASCADE | Remove fork records with fork |
-| `repositories` | `issues` | `repo_id` | CASCADE | Delete issues with repo |
-| `repositories` | `labels` | `repo_id` | CASCADE | Delete labels with repo |
-| `issues` | `issue_labels` | `issue_id` | CASCADE | Remove label associations |
-| `labels` | `issue_labels` | `label_id` | CASCADE | Remove label associations |
-| `repositories` | `pull_requests` | `repo_id` | CASCADE | Delete PRs with repo |
-| `pull_requests` | `pr_labels` | `pr_id` | CASCADE | Remove label associations |
-| `pull_requests` | `reviews` | `pr_id` | CASCADE | Delete reviews with PR |
-| `reviews` | `review_comments` | `review_id` | CASCADE | Delete comments with review |
-| `pull_requests` | `review_comments` | `pr_id` | CASCADE | Delete comments with PR |
-| `issues` | `comments` | `issue_id` | CASCADE | Delete comments with issue |
-| `pull_requests` | `comments` | `pr_id` | CASCADE | Delete comments with PR |
-| `repositories` | `discussions` | `repo_id` | CASCADE | Delete discussions with repo |
-| `discussions` | `discussion_comments` | `discussion_id` | CASCADE | Delete comments with discussion |
-| `discussion_comments` | `discussion_comments` | `parent_id` | NO ACTION | Preserve thread structure |
-| `repositories` | `webhooks` | `repo_id` | CASCADE | Delete webhooks with repo |
-| `webhooks` | `webhook_deliveries` | `webhook_id` | CASCADE | Delete delivery logs with webhook |
-| `users` | `sessions` | `user_id` | CASCADE | Invalidate sessions when user deleted |
-| `users` | `notifications` | `user_id` | CASCADE | Delete notifications with user |
-| `users` | `audit_logs` | `user_id` | SET NULL | Preserve audit trail even if user deleted |
-
-### Data Flow Between Tables
-
-#### 1. User Creates a Repository
-
-```
-users ──[owner_id]──▶ repositories
-                          │
-                          ├──▶ Creates default labels (optional)
-                          └──▶ Creates webhook subscriptions (optional)
-```
-
-#### 2. User Opens a Pull Request
-
-```
-users ──[author_id]──▶ pull_requests ◀──[repo_id]── repositories
-                              │
-                              ├──▶ pr_labels (apply labels)
-                              ├──▶ reviews (request reviews)
-                              │        └──▶ review_comments (inline feedback)
-                              └──▶ comments (general discussion)
-```
-
-#### 3. Pull Request Merge Flow
-
-```
-pull_requests ──[merge]──▶ Update state to 'merged'
-      │                         │
-      │                         └──▶ Set merged_by, merged_at
-      │
-      └──▶ webhooks ──▶ webhook_deliveries (emit 'pull_request.merged')
-                              │
-                              └──▶ Retry on failure (attempt counter)
-```
-
-#### 4. Repository Fork Flow
-
-```
-repositories (source) ──▶ forks ◀── repositories (fork)
-      │                                    │
-      │                                    └──[owner_id]── users
-      │
-      └──▶ Update forks_count (denormalized)
-```
-
-#### 5. Issue Lifecycle
-
-```
-users ──[author_id]──▶ issues ◀──[repo_id]── repositories
-                           │
-                           ├──[assignee_id]──▶ users (assignment)
-                           ├──▶ issue_labels ◀── labels
-                           ├──▶ comments (discussion)
-                           │
-                           └──▶ notifications ──▶ users (mentions, assignments)
-```
-
-#### 6. Code Review Flow
-
-```
-pull_requests ──▶ reviews ──▶ review_comments
-      │               │              │
-      │               │              └── Inline comments on specific lines
-      │               │
-      │               └── Review state: 'approved', 'changes_requested'
-      │
-      └──▶ Merge blocked until required approvals met
-```
-
-### Why Tables Are Structured This Way
-
-#### 1. Separation of Users and Organizations
-**Design**: Organizations are separate entities with a membership junction table.
-**Rationale**: Organizations can have multiple owners, different permission models, and billing separate from personal accounts. The membership table allows flexible role assignment.
-
-#### 2. Repository Owner Constraint (XOR Check)
-**Design**: `owner_id IS NOT NULL XOR org_id IS NOT NULL`
-**Rationale**: A repository must belong to exactly one owner (user or organization). This constraint prevents ambiguous ownership and simplifies permission checking.
-
-#### 3. Denormalized Counts (stars_count, forks_count)
-**Design**: Store counts directly on repositories instead of computing via COUNT(*).
-**Rationale**: Popular repositories can have millions of stars. Denormalized counts provide O(1) read performance. The tradeoff is maintaining consistency during star/unstar operations (handled via triggers or application logic).
-
-#### 4. Repository-Scoped Numbers (issues.number, pull_requests.number)
-**Design**: Auto-incrementing numbers unique per repository, not globally.
-**Rationale**: Matches GitHub's URL scheme (`/owner/repo/issues/42`). Humans find sequential per-repo numbers easier to reference than global UUIDs.
-
-#### 5. Separate Comments Table with Polymorphic FK
-**Design**: Single comments table with mutually exclusive issue_id/pr_id.
-**Rationale**: Issues and PRs share the same comment format and operations. A single table simplifies queries for "all comments by user" and reduces schema duplication. The CHECK constraint ensures data integrity.
-
-#### 6. Review Comments Separate from Reviews
-**Design**: review_comments linked to both reviews and PRs.
-**Rationale**: Inline code comments are tied to specific review sessions but must persist even if the review is updated. The dual FK allows querying all comments on a PR while maintaining review grouping.
-
-#### 7. Threaded Discussion Comments (parent_id self-reference)
-**Design**: Self-referential FK for nested replies.
-**Rationale**: GitHub Discussions support threaded conversations. The self-reference with ON DELETE NO ACTION preserves reply context even if parent is somehow orphaned.
-
-#### 8. Webhook Delivery Log
-**Design**: Separate table for delivery attempts.
-**Rationale**: Each webhook event may require multiple delivery attempts (retries). Logging each attempt enables debugging delivery issues, computing delivery latency metrics, and auditing integration health.
-
-#### 9. Audit Logs with SET NULL on User Delete
-**Design**: user_id FK uses ON DELETE SET NULL instead of CASCADE.
-**Rationale**: Audit logs serve as a permanent security record. If a user is deleted, we must preserve the audit trail with user_id = NULL rather than losing critical security information.
-
-#### 10. Idempotency Keys Table
-**Design**: Dedicated table for idempotency tracking.
-**Rationale**: Webhook retries and network issues can cause duplicate requests. Storing idempotency keys in PostgreSQL (not Redis) ensures transactional consistency with resource creation. The 24-hour TTL is implemented via a cleanup job using the created_at index.
-
----
-
-## Key Design Decisions
-
-### 1. Object Store for Git Data
-
-**Decision**: Store Git objects in object storage, not database
-
-**Rationale**:
-- Git objects are immutable (content-addressed)
-- Object storage optimized for large blobs
-- Enables deduplication across repos
-
-### 2. Elasticsearch for Code Search
-
-**Decision**: Separate search index from Git storage
-
-**Rationale**:
-- Git objects not optimized for full-text search
-- Elasticsearch handles tokenization, ranking
-- Async indexing doesn't block pushes
-
-### 3. Queue-Based Webhook Delivery
-
-**Decision**: Async delivery with retry queue
-
-**Rationale**:
-- Decouples event creation from delivery
-- Handles slow/failing endpoints
-- Provides delivery history
-
----
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Git storage | Object store | Database | Performance, dedup |
-| Code search | Elasticsearch | PostgreSQL FTS | Scale, features |
-| Webhooks | Queue-based | Synchronous | Reliability |
-| PRs | Single table | Event sourced | Simplicity |
-
----
-
-## Consistency and Idempotency
-
-### Consistency Model by Operation
-
-| Operation | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Git push/fetch | Strong (per-repo) | Git ref updates use file locks; pack operations are atomic |
-| PR create/merge | Strong | PostgreSQL transactions ensure PR state integrity |
-| Code search index | Eventual (seconds) | Async indexing after push; search lag acceptable |
-| Webhook delivery | At-least-once | Retries may cause duplicates; receivers must be idempotent |
-| User sessions | Eventual (Redis) | Session replication across Redis replicas has small lag |
-
-### Idempotency Keys
-
-**PR Operations:**
-```javascript
-// Client generates idempotency key for PR creation
-// Stored in PostgreSQL to detect replays within 24 hours
-
-async function createPR(prData, idempotencyKey) {
-  // Check for existing operation with same key
-  const existing = await db.query(
-    `SELECT pr_id FROM idempotency_keys
-     WHERE key = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
-    [idempotencyKey]
-  )
-
-  if (existing.rows.length > 0) {
-    // Return cached result instead of creating duplicate
-    return await getPR(existing.rows[0].pr_id)
-  }
-
-  return await db.transaction(async (tx) => {
-    const pr = await tx.query(
-      `INSERT INTO pull_requests (repo_id, title, head_branch, base_branch, author_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [prData.repoId, prData.title, prData.headBranch, prData.baseBranch, prData.authorId]
-    )
-
-    // Store idempotency key
-    await tx.query(
-      `INSERT INTO idempotency_keys (key, pr_id) VALUES ($1, $2)`,
-      [idempotencyKey, pr.rows[0].id]
-    )
-
-    return pr.rows[0]
-  })
-}
-```
-
-**Webhook Delivery:**
-```javascript
-// Each webhook delivery has unique delivery_id
-// Receivers use X-GitHub-Delivery header for deduplication
-
-async function deliverWebhook(webhookId, event, payload) {
-  const deliveryId = uuidv4()
-
-  await webhookQueue.add({
-    deliveryId,           // Unique per delivery attempt
-    webhookId,
-    event,
-    payload,
-    attempt: 1
-  })
-
-  // Receiver should check: has deliveryId been processed?
-  // If yes, return 200 OK without re-processing
-}
-```
-
-### Conflict Resolution
-
-**Git Push Conflicts:**
-- Git itself handles ref update conflicts via compare-and-swap
-- Push rejected if remote ref has advanced (non-fast-forward)
-- Client must pull, resolve, and retry
-
-**PR Merge Conflicts:**
-```javascript
-async function checkMergeability(prId) {
-  const pr = await getPR(prId)
-
-  try {
-    // Attempt merge in temporary worktree
-    await git.checkout(pr.baseBranch, { worktree: tempDir })
-    await git.merge(pr.headBranch, { noCommit: true, noFf: true })
-
-    return { mergeable: true, conflicts: [] }
-  } catch (error) {
-    // Parse conflict files from error
-    const conflicts = parseConflicts(error.message)
-    return { mergeable: false, conflicts }
-  } finally {
-    await cleanup(tempDir)
-  }
-}
-```
-
-### Idempotency Keys Table
-
-```sql
-CREATE TABLE idempotency_keys (
-  key VARCHAR(64) PRIMARY KEY,
-  pr_id INTEGER REFERENCES pull_requests(id),
-  response_body JSONB,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Clean up old keys daily
-CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
-
--- Cleanup job (run via cron or scheduled task)
--- DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours';
-```
-
----
-
-## Caching and Edge Strategy
-
-### Cache Architecture
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Browser   │────▶│     CDN     │────▶│   Origin    │
-│             │     │ (static)    │     │   Servers   │
-└─────────────┘     └─────────────┘     └─────────────┘
-                                              │
-                    ┌─────────────┐           │
-                    │   Valkey    │◀──────────┘
-                    │   (Redis)   │
-                    └─────────────┘
-                          │
-                    ┌─────────────┐
-                    │ PostgreSQL  │
-                    └─────────────┘
-```
-
-### Cache Strategy by Data Type
-
-| Data | Strategy | TTL | Invalidation |
-|------|----------|-----|--------------|
-| Static assets (JS/CSS) | CDN with versioned URLs | 1 year | New deploy = new URL |
-| Repository metadata | Cache-aside (Valkey) | 5 min | On push, settings change |
-| User profile/avatar | Cache-aside (Valkey) | 15 min | On profile update |
-| File content (blob) | Cache-aside (Valkey) | 1 hour | Immutable (content-addressed) |
-| Search results | No cache | N/A | Real-time required |
-| PR diff | Cache-aside (Valkey) | 10 min | On PR update, new commits |
-
-### Cache-Aside Implementation
-
-```javascript
-// Valkey (Redis-compatible) cache-aside pattern
-const CACHE_TTL = {
-  REPO_METADATA: 300,      // 5 minutes
-  FILE_CONTENT: 3600,      // 1 hour (blobs are immutable)
-  USER_PROFILE: 900,       // 15 minutes
-  PR_DIFF: 600             // 10 minutes
-}
-
-async function getRepository(repoId) {
-  const cacheKey = `repo:${repoId}`
-
-  // Try cache first
-  const cached = await valkey.get(cacheKey)
-  if (cached) {
-    return JSON.parse(cached)
-  }
-
-  // Cache miss - fetch from database
-  const repo = await db.query(
-    'SELECT * FROM repositories WHERE id = $1',
-    [repoId]
-  )
-
-  if (repo.rows.length > 0) {
-    await valkey.setex(
-      cacheKey,
-      CACHE_TTL.REPO_METADATA,
-      JSON.stringify(repo.rows[0])
-    )
-    return repo.rows[0]
-  }
-
-  return null
-}
-
-// File content caching (content-addressed, so longer TTL is safe)
-async function getFileContent(repoId, sha, path) {
-  const cacheKey = `blob:${repoId}:${sha}:${path}`
-
-  const cached = await valkey.get(cacheKey)
-  if (cached) return cached
-
-  const content = await git.show(`${sha}:${path}`, { cwd: repoPath })
-
-  // Blobs are immutable - cache for 1 hour
-  await valkey.setex(cacheKey, CACHE_TTL.FILE_CONTENT, content)
-  return content
-}
-```
-
-### Cache Invalidation
-
-```javascript
-// Event-driven invalidation on push
-async function handlePushEvent(repoId, commits) {
-  const invalidationKeys = [
-    `repo:${repoId}`,           // Repository metadata
-    `repo:${repoId}:tree:*`,    // File trees
-    `repo:${repoId}:commits:*`  // Commit lists
-  ]
-
-  // Use SCAN + DEL for pattern matching (avoid KEYS in production)
-  for (const pattern of invalidationKeys) {
-    if (pattern.includes('*')) {
-      await scanAndDelete(pattern)
-    } else {
-      await valkey.del(pattern)
-    }
-  }
-
-  // Invalidate all open PRs for this repo (diffs may have changed)
-  const openPRs = await db.query(
-    'SELECT id FROM pull_requests WHERE repo_id = $1 AND state = $2',
-    [repoId, 'open']
-  )
-
-  for (const pr of openPRs.rows) {
-    await valkey.del(`pr:${pr.id}:diff`)
-  }
-}
-
-async function scanAndDelete(pattern) {
-  let cursor = '0'
-  do {
-    const [newCursor, keys] = await valkey.scan(cursor, 'MATCH', pattern, 'COUNT', 100)
-    cursor = newCursor
-    if (keys.length > 0) {
-      await valkey.del(...keys)
-    }
-  } while (cursor !== '0')
-}
-```
-
-### CDN Configuration (for Static Assets)
-
-```javascript
-// Express middleware for static asset headers
-app.use('/static', express.static('dist', {
-  maxAge: '1y',                    // Cache for 1 year
-  immutable: true,                 // Signal content won't change
-  etag: false,                     // Versioned URLs make etags unnecessary
-  setHeaders: (res, path) => {
-    res.set('Cache-Control', 'public, max-age=31536000, immutable')
-  }
-}))
-
-// API responses - no caching by default
-app.use('/api', (req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate')
-  next()
-})
-```
-
-### Local Development Cache Setup
-
-```yaml
-# docker-compose.yml addition for Valkey
-services:
-  valkey:
-    image: valkey/valkey:7
-    ports:
-      - "6379:6379"
-    command: valkey-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-    volumes:
-      - valkey-data:/data
-```
-
----
-
-## Observability
-
-### Metrics (Prometheus)
-
-**Key Metrics to Collect:**
-
-```javascript
-const promClient = require('prom-client')
-
-// Request latency histogram
-const httpRequestDuration = new promClient.Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'HTTP request latency in seconds',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
-})
-
-// Git operation latency
-const gitOperationDuration = new promClient.Histogram({
-  name: 'git_operation_duration_seconds',
-  help: 'Git operation latency in seconds',
-  labelNames: ['operation', 'repo_size_bucket'],  // clone, push, fetch
-  buckets: [0.1, 0.5, 1, 5, 10, 30, 60]
-})
-
-// Cache hit/miss counter
-const cacheHits = new promClient.Counter({
-  name: 'cache_hits_total',
-  help: 'Total cache hits',
-  labelNames: ['cache_type']  // repo, file, pr_diff
-})
-
-const cacheMisses = new promClient.Counter({
-  name: 'cache_misses_total',
-  help: 'Total cache misses',
-  labelNames: ['cache_type']
-})
-
-// Webhook delivery status
-const webhookDeliveries = new promClient.Counter({
-  name: 'webhook_deliveries_total',
-  help: 'Total webhook delivery attempts',
-  labelNames: ['status', 'event_type']  // success, failed, retrying
-})
-
-// Search query latency
-const searchLatency = new promClient.Histogram({
-  name: 'search_query_duration_seconds',
-  help: 'Search query latency in seconds',
-  labelNames: ['query_type'],  // code, file, symbol
-  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5]
-})
-
-// Active connections gauge
-const activeConnections = new promClient.Gauge({
-  name: 'active_connections',
-  help: 'Number of active connections',
-  labelNames: ['type']  // http, websocket, git_ssh
-})
-```
-
-**Metrics Endpoint:**
-```javascript
-app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', promClient.register.contentType)
-  res.end(await promClient.register.metrics())
-})
-```
-
-### Structured Logging
-
-```javascript
-const pino = require('pino')
-
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  },
-  base: {
-    service: 'github-api',
-    version: process.env.APP_VERSION || 'dev'
-  }
-})
-
-// Request logging middleware
-app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || uuidv4()
-  req.log = logger.child({
-    requestId,
-    method: req.method,
-    path: req.path,
-    userId: req.user?.id
-  })
-
-  const start = Date.now()
-  res.on('finish', () => {
-    req.log.info({
-      statusCode: res.statusCode,
-      durationMs: Date.now() - start
-    }, 'request completed')
-  })
-
-  next()
-})
-
-// Example operation logging
-async function mergePR(prId, strategy, log) {
-  log.info({ prId, strategy }, 'starting PR merge')
-
-  try {
-    const result = await performMerge(prId, strategy)
-    log.info({ prId, mergeCommit: result.sha }, 'PR merged successfully')
-    return result
-  } catch (error) {
-    log.error({ prId, error: error.message, stack: error.stack }, 'PR merge failed')
-    throw error
-  }
-}
-```
-
-### Distributed Tracing (OpenTelemetry)
-
-```javascript
-const { NodeTracerProvider } = require('@opentelemetry/sdk-trace-node')
-const { SimpleSpanProcessor } = require('@opentelemetry/sdk-trace-base')
-const { JaegerExporter } = require('@opentelemetry/exporter-jaeger')
-const { registerInstrumentations } = require('@opentelemetry/instrumentation')
-const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http')
-const { PgInstrumentation } = require('@opentelemetry/instrumentation-pg')
-
-const provider = new NodeTracerProvider()
-const jaegerExporter = new JaegerExporter({
-  endpoint: process.env.JAEGER_ENDPOINT || 'http://localhost:14268/api/traces'
-})
-
-provider.addSpanProcessor(new SimpleSpanProcessor(jaegerExporter))
-provider.register()
-
-registerInstrumentations({
-  instrumentations: [
-    new HttpInstrumentation(),
-    new PgInstrumentation()
-  ]
-})
-
-// Manual span for git operations
-const tracer = provider.getTracer('github-api')
-
-async function cloneRepository(repoId, destination) {
-  return tracer.startActiveSpan('git.clone', async (span) => {
-    span.setAttribute('repo.id', repoId)
-    span.setAttribute('destination', destination)
-
-    try {
-      const result = await git.clone(repoPath, destination)
-      span.setAttribute('objects.count', result.objectCount)
-      return result
-    } catch (error) {
-      span.recordException(error)
-      span.setStatus({ code: 2, message: error.message })
-      throw error
-    } finally {
-      span.end()
-    }
-  })
-}
-```
-
-### SLI Dashboards and Alert Thresholds
-
-**Service Level Indicators (SLIs):**
-
-| SLI | Target | Alert Threshold | Measurement |
-|-----|--------|-----------------|-------------|
-| API Availability | 99.9% | < 99.5% over 5 min | `sum(http_requests{status!~"5.."}) / sum(http_requests)` |
-| API Latency (p95) | < 200ms | > 500ms over 5 min | `histogram_quantile(0.95, http_request_duration_seconds)` |
-| Git Push Latency (p95) | < 5s | > 10s over 5 min | `histogram_quantile(0.95, git_operation_duration_seconds{operation="push"})` |
-| Search Latency (p95) | < 500ms | > 1s over 5 min | `histogram_quantile(0.95, search_query_duration_seconds)` |
-| Webhook Delivery Rate | 99% | < 95% over 15 min | `sum(webhook_deliveries{status="success"}) / sum(webhook_deliveries)` |
-| Cache Hit Rate | > 80% | < 60% over 15 min | `sum(cache_hits) / (sum(cache_hits) + sum(cache_misses))` |
-
-**Prometheus Alerting Rules:**
-
-```yaml
-# prometheus-alerts.yml
-groups:
-  - name: github-api-alerts
-    rules:
-      - alert: HighErrorRate
-        expr: |
-          sum(rate(http_request_duration_seconds_count{status_code=~"5.."}[5m]))
-          / sum(rate(http_request_duration_seconds_count[5m])) > 0.005
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High error rate detected (> 0.5%)"
-
-      - alert: HighAPILatency
-        expr: |
-          histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 0.5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "API p95 latency > 500ms"
-
-      - alert: WebhookDeliveryFailures
-        expr: |
-          sum(rate(webhook_deliveries_total{status="failed"}[15m]))
-          / sum(rate(webhook_deliveries_total[15m])) > 0.05
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Webhook delivery failure rate > 5%"
-
-      - alert: LowCacheHitRate
-        expr: |
-          sum(rate(cache_hits_total[15m]))
-          / (sum(rate(cache_hits_total[15m])) + sum(rate(cache_misses_total[15m]))) < 0.6
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Cache hit rate below 60%"
-```
-
-### Audit Logging
-
-```sql
--- Audit log table for security-sensitive operations
+-- Audit Logs
 CREATE TABLE audit_logs (
   id SERIAL PRIMARY KEY,
   timestamp TIMESTAMP DEFAULT NOW(),
-  user_id INTEGER REFERENCES users(id),
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   action VARCHAR(100) NOT NULL,
   resource_type VARCHAR(50) NOT NULL,
   resource_id VARCHAR(100),
   ip_address INET,
   user_agent TEXT,
   request_id VARCHAR(64),
-  details JSONB,
-  outcome VARCHAR(20) DEFAULT 'success'  -- success, denied, error
+  details JSONB DEFAULT '{}',
+  outcome VARCHAR(20) DEFAULT 'success'
 );
 
 CREATE INDEX idx_audit_timestamp ON audit_logs(timestamp);
 CREATE INDEX idx_audit_user ON audit_logs(user_id);
 CREATE INDEX idx_audit_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX idx_audit_action ON audit_logs(action);
+
+-- Idempotency Keys
+CREATE TABLE idempotency_keys (
+  key VARCHAR(64) PRIMARY KEY,
+  operation_type VARCHAR(50) NOT NULL,
+  resource_id INTEGER,
+  response_body JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
 ```
 
-```javascript
-// Audit logging middleware for sensitive operations
-const AUDITED_ACTIONS = [
-  'repo.create', 'repo.delete', 'repo.visibility_change',
-  'pr.merge', 'pr.close',
-  'webhook.create', 'webhook.delete',
-  'user.permission_change', 'user.login', 'user.logout',
-  'branch_protection.create', 'branch_protection.delete'
-]
+---
 
-async function auditLog(action, resourceType, resourceId, details, req, outcome = 'success') {
-  await db.query(
-    `INSERT INTO audit_logs
-     (user_id, action, resource_type, resource_id, ip_address, user_agent, request_id, details, outcome)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [
-      req.user?.id,
-      action,
-      resourceType,
-      resourceId,
-      req.ip,
-      req.headers['user-agent'],
-      req.headers['x-request-id'],
-      JSON.stringify(details),
-      outcome
-    ]
-  )
-}
+## API Design
 
-// Usage example
-app.delete('/api/repos/:owner/:repo', async (req, res) => {
-  const { owner, repo } = req.params
+### REST Endpoints
 
-  try {
-    await deleteRepository(owner, repo)
-    await auditLog('repo.delete', 'repository', `${owner}/${repo}`, {}, req, 'success')
-    res.status(204).end()
-  } catch (error) {
-    await auditLog('repo.delete', 'repository', `${owner}/${repo}`,
-      { error: error.message }, req, 'error')
-    throw error
-  }
-})
+```
+POST   /api/auth/register                     Register new user
+POST   /api/auth/login                        Login
+POST   /api/auth/logout                       Logout
+GET    /api/auth/me                           Get current user
+
+GET    /api/repos                             List repositories
+POST   /api/repos                             Create repository
+GET    /api/repos/:owner/:repo                Get repository details
+PATCH  /api/repos/:owner/:repo/settings       Update repo settings
+DELETE /api/repos/:owner/:repo                Delete repository
+
+GET    /api/repos/:owner/:repo/tree/:branch   Browse file tree
+GET    /api/repos/:owner/:repo/blob/:branch/* View file content
+GET    /api/repos/:owner/:repo/branches       List branches
+GET    /api/repos/:owner/:repo/commits        List commits
+
+GET    /api/repos/:owner/:repo/collaborators  List collaborators
+POST   /api/repos/:owner/:repo/collaborators  Add collaborator
+DELETE /api/repos/:owner/:repo/collaborators/:userId  Remove collaborator
+
+GET    /api/:owner/:repo/pulls                List pull requests
+POST   /api/:owner/:repo/pulls                Create pull request
+GET    /api/:owner/:repo/pulls/:number        Get PR details with diff
+POST   /api/:owner/:repo/pulls/:number/merge  Merge PR (strategy param)
+POST   /api/:owner/:repo/pulls/:number/reviews  Submit review
+POST   /api/:owner/:repo/pulls/:number/comments  Add review comment
+
+GET    /api/:owner/:repo/issues               List issues
+POST   /api/:owner/:repo/issues               Create issue
+GET    /api/:owner/:repo/issues/:number       Get issue details
+PATCH  /api/:owner/:repo/issues/:number       Update issue
+POST   /api/:owner/:repo/issues/:number/comments  Add comment
+
+GET    /api/:owner/:repo/discussions          List discussions
+POST   /api/:owner/:repo/discussions          Create discussion
+POST   /api/:owner/:repo/discussions/:number/comments  Add comment
+
+GET    /api/search                            Search code (query, language, repo)
+
+GET    /api/users/:username                   Get user profile
+GET    /api/users/:username/repos             List user repositories
+POST   /api/repos/:owner/:repo/star           Star repository
+DELETE /api/repos/:owner/:repo/star           Unstar repository
 ```
 
-### Local Development Observability Stack
+---
 
-```yaml
-# docker-compose.yml additions for observability
-services:
-  prometheus:
-    image: prom/prometheus:v2.45.0
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.retention.time=7d'
+## Key Design Decisions
 
-  grafana:
-    image: grafana/grafana:10.0.0
-    ports:
-      - "3030:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./grafana-dashboards:/etc/grafana/provisioning/dashboards
+### 1. Bare Git Repositories on Filesystem vs. Object Store
 
-  jaeger:
-    image: jaegertracing/all-in-one:1.47
-    ports:
-      - "16686:16686"   # UI
-      - "14268:14268"   # Accept traces
+**Decision**: Store repositories as bare Git repositories on the local filesystem.
 
-volumes:
-  grafana-data:
-```
+Git operations (diff, merge, log, tree) require the native Git object model. Storing objects in a database or S3 would require reimplementing Git's pack file format, delta compression, and ref management. Using bare repos with `simple-git` and `isomorphic-git` libraries provides full Git functionality. The trade-off is that filesystem storage doesn't scale horizontally -- at GitHub's scale, you'd shard repositories across storage servers with a routing layer. For a learning project, filesystem storage is the pragmatic choice.
 
-**prometheus.yml:**
-```yaml
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+### 2. Repository-Scoped Numbering for Issues and PRs
 
-rule_files:
-  - alerts.yml
+**Decision**: Use `(repo_id, number)` composite unique constraints with application-level counter management.
 
-scrape_configs:
-  - job_name: 'github-api'
-    static_configs:
-      - targets: ['host.docker.internal:3000']
-    metrics_path: '/metrics'
-```
+GitHub uses sequential numbers per repository (issue #1, PR #2, etc.). A global auto-increment would produce non-sequential numbers per repo. The application maintains a counter per repository and increments it atomically when creating issues or PRs. The trade-off is that the counter must be managed carefully to avoid duplicates under concurrent creation -- the `UNIQUE(repo_id, number)` constraint is the safety net.
+
+### 3. XOR Constraint for Repository Ownership
+
+**Decision**: Use a CHECK constraint `(owner_id IS NOT NULL AND org_id IS NULL) OR (owner_id IS NULL AND org_id IS NOT NULL)` on the repositories table.
+
+A repository belongs to either a user or an organization, never both. Modeling this as a single polymorphic `owner_type` column loses foreign key integrity. The XOR constraint with separate `owner_id` and `org_id` columns preserves referential integrity while enforcing the business rule at the database level.
+
+### 4. Denormalized Counters for Stars/Forks/Watchers
+
+**Decision**: Store `stars_count`, `forks_count`, and `watchers_count` directly on the repositories table rather than computing them with COUNT queries.
+
+Repository listing pages display these counts for every visible repository. Computing `COUNT(*)` from junction tables for each repository in a list would be expensive. Denormalized counters are updated atomically when stars/forks are added or removed. The trade-off is potential drift if the application crashes between modifying the junction table and updating the counter -- a periodic reconciliation job can fix this.
+
+### 5. Elasticsearch for Code Search vs. PostgreSQL Full-Text Search
+
+**Decision**: Use Elasticsearch with a custom code analyzer for code search.
+
+Code search requires tokenization that understands programming language constructs: camelCase splitting, identifier extraction, and symbol-level search. PostgreSQL's full-text search uses natural language tokenizers that don't handle code well (e.g., `getUserName` should match a search for "user name"). Elasticsearch's custom analyzer pipeline handles this. The trade-off is eventual consistency -- pushed code takes a moment to become searchable.
+
+---
+
+## Consistency and Idempotency
+
+### Git Ref Consistency
+
+Git refs (branch pointers, tags) require strong consistency. A push that updates `refs/heads/main` must be atomic and fail if the ref has moved since the client's last fetch. This is enforced by Git's compare-and-swap semantics for ref updates.
+
+### Idempotency Keys
+
+PR creation and issue creation accept idempotency keys to prevent duplicates from client retries. Keys are stored in the `idempotency_keys` table with the operation result. A background job cleans up expired keys hourly.
+
+### Audit Logging
+
+Security-sensitive operations (repository deletion, collaborator changes, admin actions) are logged to the `audit_logs` table with user ID, action, resource, IP address, user agent, and request ID. Logs are queryable via admin API endpoints.
+
+---
+
+## Security and Auth
+
+- **Session-based authentication** with Redis-backed session store
+- **Session ID** passed via `X-Session-Id` header (7-day TTL)
+- **Role-based access**: `user` and `admin` roles
+- **Repository permissions**: owner, admin, maintain, write, triage, read (via collaborators table)
+- **Private repositories**: only owner, org members, and collaborators can access
+- **Audit logging**: security-sensitive operations logged with IP and user agent
+- **CORS** restricted to frontend origin
+
+---
+
+## Observability
+
+### Prometheus Metrics
+
+The `/metrics` endpoint exposes comprehensive application metrics:
+
+**HTTP Metrics:**
+- `github_http_request_duration_seconds{method, route, status_code}` -- request latency histogram
+- `github_http_requests_total{method, route, status_code}` -- request counts
+- `github_active_connections{type}` -- active connections by type (http, websocket, git_ssh)
+
+**Git Metrics:**
+- `github_git_operation_duration_seconds{operation}` -- git operation latency (push, clone, merge, diff)
+- `github_git_operations_total{operation, status}` -- operation counts with success/failure/timeout/rejected
+- `github_pushes_total{status}` -- push operations
+
+**Cache Metrics:**
+- `github_cache_hits_total{cache_type}` / `github_cache_misses_total{cache_type}` -- cache effectiveness
+- `github_cache_operation_duration_seconds{operation}` -- cache operation latency
+
+**Business Metrics:**
+- `github_prs_created_total{status}` / `github_prs_merged_total{strategy}` -- PR activity
+- `github_issues_created_total{status}` / `github_issues_closed_total` -- issue activity
+
+**Infrastructure Metrics:**
+- `github_circuit_breaker_state{service}` -- current state (0=closed, 1=open, 2=half-open)
+- `github_circuit_breaker_trips_total{service}` -- trip count
+- `github_webhook_deliveries_total{status, event_type}` -- webhook delivery status
+- `github_webhook_delivery_duration_seconds{status}` -- delivery latency
+- `github_idempotency_duplicates_total{operation}` -- duplicate request detection
+
+### Structured Logging
+
+Pino JSON logger with request correlation. Pretty-print in development, JSON in production. Request logger middleware attaches request context to all downstream log entries.
+
+### Health Checks
+
+- `GET /health` -- checks PostgreSQL, Redis, reports circuit breaker status, uptime, and version
+- `GET /health/live` -- liveness probe (server running)
+- `GET /health/ready` -- readiness probe (PostgreSQL and Redis reachable)
+
+---
+
+## Failure Handling
+
+### Circuit Breaker Pattern
+
+Circuit breakers (Opossum) protect git operations from cascading failures.
+
+| Setting | Value |
+|---------|-------|
+| Timeout | 30 seconds (git operations can be slow) |
+| Error threshold | 50% of requests |
+| Reset timeout | 30 seconds |
+| Volume threshold | 5 requests minimum |
+
+Protected operations: clone, branches, commits, tree, diff, merge, push. Each gets its own circuit breaker instance with independent state. Admin endpoints allow viewing and manually resetting circuit breakers.
+
+### Graceful Shutdown
+
+SIGTERM/SIGINT handlers stop accepting new requests, close the HTTP server, drain PostgreSQL connection pool, and close Redis connection before exiting.
+
+### Elasticsearch Optional
+
+If Elasticsearch is unavailable at startup, the server logs a warning and continues. Search endpoints return errors, but all other functionality works.
+
+---
+
+## Scalability Considerations
+
+| Bottleneck | Scaling Strategy |
+|------------|-----------------|
+| Git storage | Shard repositories across storage servers with consistent hashing |
+| API throughput | Horizontal scaling behind load balancer (stateless with Redis sessions) |
+| Code search | Elasticsearch cluster with sharding by repository, replicas for reads |
+| Database | Read replicas for listing, connection pooling, partition large tables |
+| Webhook delivery | Async queue (RabbitMQ/SQS) with dedicated worker pool |
+| Large diffs | Streaming diff computation, pagination for 1000+ file changes |
+| Clone/Fetch | Pack file caching, partial clone support, bandwidth throttling |
+
+---
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Git storage | Bare repos on filesystem | Database/S3 objects | Native Git operations without reimplementation |
+| Code search | Elasticsearch | PostgreSQL FTS | Code-aware tokenization (camelCase, identifiers) |
+| Auth | Session + Redis | JWT | Immediate revocation, simpler for server-rendered UI |
+| Repo ownership | XOR constraint (owner_id/org_id) | Polymorphic owner_type | Preserves foreign key integrity |
+| Issue numbering | Per-repo counter + UNIQUE | Global auto-increment | Matches GitHub's user-facing model |
+| Star counts | Denormalized on repos | COUNT query | Avoids N+1 on listing pages |
+| Webhook delivery | Inline with retry | Async queue | Simpler for MVP, queue needed at scale |
+| Merge strategies | Git CLI via simple-git | Custom merge implementation | Correct behavior, battle-tested |
 
 ---
 
 ## Implementation Notes
 
-This section documents the rationale behind key implementation decisions for caching, idempotency, audit logging, and metrics.
+This section documents the actual local setup and maps production concepts to the Docker + Node.js + React implementation.
 
-### Why Caching Reduces Load for Popular Repositories
-
-**Problem**: Popular repositories (e.g., React, Linux kernel) receive millions of requests daily. Each request to view files, branches, or commits triggers expensive git operations and database queries.
-
-**Solution**: Redis cache-aside pattern with tiered TTLs:
-
-```javascript
-// Cache TTLs based on data volatility
-CACHE_TTL = {
-  REPO_METADATA: 300,      // 5 minutes - changes infrequently
-  FILE_TREE: 600,          // 10 minutes - changes on push
-  FILE_CONTENT: 3600,      // 1 hour - immutable by SHA
-  PR_DIFF: 600,            // 10 minutes - changes on commits
-  BRANCHES: 60,            // 1 minute - changes frequently
-}
-```
-
-**Benefits**:
-1. **Reduces database load by 80-90%** for read-heavy workloads (most repository views are reads)
-2. **Reduces git operation overhead** - `git ls-tree` and `git show` are expensive for large repos
-3. **Improves latency** - Redis response time (~1ms) vs database (~10-50ms) vs git operations (~100-500ms)
-4. **Enables horizontal scaling** - Cache absorbs traffic spikes from trending repositories
-
-**Cache Invalidation Strategy**:
-- Push events trigger invalidation of repository caches via `/api/repos/:owner/:repo/push`
-- PR merges invalidate both PR diff cache and repository caches
-- Settings changes invalidate repository metadata cache
-- Pattern-based deletion using SCAN (not KEYS) for production safety
-
-### Why Idempotency Prevents Duplicate Issues from Webhook Retries
-
-**Problem**: Webhooks follow at-least-once delivery semantics. When a webhook delivery times out:
-1. The receiver may have processed the request
-2. The sender retries the delivery
-3. Result: Duplicate issues/PRs created
-
-**Example Scenario**:
-```
-1. User clicks "Create Issue" button
-2. Request succeeds on server, issue #42 created
-3. Network timeout before response reaches client
-4. Client retries with same data
-5. Without idempotency: Issue #43 created (duplicate!)
-6. With idempotency: Cached response for #42 returned
-```
-
-**Solution**: Idempotency keys stored in PostgreSQL with 24-hour TTL:
-
-```javascript
-// Client includes idempotency key in header
-POST /api/owner/repo/issues
-Headers:
-  Idempotency-Key: abc123-unique-request-id
-
-// Server checks for existing key before creating resource
-const { cached, response } = await withIdempotencyTransaction(
-  idempotencyKey,
-  'issue_create',
-  async (tx) => {
-    // Create issue atomically with idempotency key storage
-    const issue = await tx.query('INSERT INTO issues...');
-    return { resourceId: issue.id, response: issue };
-  }
-);
-
-if (cached) {
-  // Return cached response instead of creating duplicate
-  return res.status(200).json(response);
-}
-```
-
-**Benefits**:
-1. **Prevents duplicate resources** from webhook retries, network issues, or double-clicks
-2. **Transactional consistency** - idempotency key stored atomically with resource
-3. **Automatic cleanup** - keys expire after 24 hours
-4. **Metrics visibility** - `github_idempotency_duplicates_total` tracks deduplication rate
-
-### Why Audit Logging Enables Security Investigations
-
-**Problem**: Security incidents require answering questions like:
-- "Who deleted this repository and when?"
-- "What permissions did user X have access to before the breach?"
-- "Which IP addresses accessed sensitive repositories in the last 24 hours?"
-
-**Solution**: Comprehensive audit logging for security-sensitive operations:
-
-```sql
-CREATE TABLE audit_logs (
-  id SERIAL PRIMARY KEY,
-  timestamp TIMESTAMP DEFAULT NOW(),
-  user_id INTEGER REFERENCES users(id),
-  action VARCHAR(100) NOT NULL,        -- e.g., 'repo.delete', 'collaborator.add'
-  resource_type VARCHAR(50) NOT NULL,  -- e.g., 'repository', 'user'
-  resource_id VARCHAR(100),
-  ip_address INET,
-  user_agent TEXT,
-  request_id VARCHAR(64),              -- For distributed tracing
-  details JSONB,                       -- Additional context
-  outcome VARCHAR(20)                  -- 'success', 'denied', 'error'
-);
-```
-
-**Audited Actions**:
-- Repository: create, delete, visibility change, settings change
-- Pull Requests: create, merge, close
-- Issues: create, close
-- Permissions: collaborator add/remove, permission changes
-- Authentication: login, logout, failed login attempts
-- Webhooks: create, delete, update
-
-**Benefits**:
-1. **Security investigations** - Full audit trail of who did what, when, from where
-2. **Compliance** - SOC 2, GDPR, HIPAA require audit logs for access control
-3. **Forensics** - Request ID enables correlation with application logs and traces
-4. **Access patterns** - Detect unusual access patterns (e.g., bulk downloads)
-
-**Query Examples**:
-```sql
--- Who accessed this repository in the last 24 hours?
-SELECT * FROM audit_logs
-WHERE resource_type = 'repository'
-  AND resource_id = '123'
-  AND timestamp > NOW() - INTERVAL '24 hours';
-
--- What sensitive actions did this user perform?
-SELECT * FROM audit_logs
-WHERE user_id = 456
-  AND action IN ('repo.delete', 'collaborator.permission_change')
-ORDER BY timestamp DESC;
-```
-
-### Why Metrics Enable CI/CD Optimization
-
-**Problem**: CI/CD pipelines are black boxes without metrics. Teams cannot answer:
-- "Why did build times increase this week?"
-- "Which repositories have the slowest merge times?"
-- "Are our webhooks being delivered reliably?"
-
-**Solution**: Prometheus metrics for all key operations:
-
-```javascript
-// Metrics exposed at /metrics endpoint
-github_http_request_duration_seconds    // API latency histogram
-github_git_operation_duration_seconds   // Git operation latency
-github_prs_created_total                // PR creation rate
-github_prs_merged_total                 // PR merge rate by strategy
-github_ci_runs_total                    // CI run counts by status
-github_ci_run_duration_seconds          // CI run duration
-github_webhook_deliveries_total         // Webhook success/failure rate
-github_cache_hits_total                 // Cache hit rate
-github_circuit_breaker_state            // Circuit breaker status
-```
-
-**SLI Examples**:
-| SLI | Target | Alert Threshold |
-|-----|--------|-----------------|
-| API Availability | 99.9% | < 99.5% over 5 min |
-| API Latency (p95) | < 200ms | > 500ms over 5 min |
-| PR Merge Time (p95) | < 5s | > 10s over 5 min |
-| Webhook Delivery Rate | 99% | < 95% over 15 min |
-| Cache Hit Rate | > 80% | < 60% over 15 min |
-
-**Benefits**:
-1. **Identify bottlenecks** - High git_operation_duration indicates storage issues
-2. **Capacity planning** - Track growth in CI runs, PRs, and repository size
-3. **Incident detection** - Circuit breaker trips indicate systemic failures
-4. **Performance optimization** - Low cache hit rate suggests ineffective caching
-5. **Business metrics** - Track adoption (PRs created, issues resolved)
-
-### Circuit Breaker Pattern for Git Operations
-
-**Problem**: Git operations can fail when:
-- Storage is overloaded
-- Repository is corrupted
-- Disk is full
-- Network issues to distributed storage
-
-Without protection, failures cascade:
-1. Request waits for slow git operation
-2. Connection pool exhausted
-3. All requests start failing
-4. System becomes unresponsive
-
-**Solution**: Opossum circuit breaker for all git operations:
-
-```javascript
-const CIRCUIT_OPTIONS = {
-  timeout: 30000,                // Fail after 30 seconds
-  errorThresholdPercentage: 50,  // Open if 50% fail
-  resetTimeout: 30000,           // Try again after 30 seconds
-  volumeThreshold: 5,            // Need 5+ requests to evaluate
-};
-
-// Wrap git operations
-const tree = await withCircuitBreaker('git_tree', () =>
-  gitService.getTree(owner, repo, ref, treePath)
-);
-```
-
-**States**:
-- **Closed**: Normal operation, requests go through
-- **Open**: Requests fail immediately (fast failure)
-- **Half-Open**: Allow one request to test recovery
-
-**Benefits**:
-1. **Fast failure** - Users see error immediately instead of waiting 30s
-2. **Prevent cascade** - Connection pool stays healthy
-3. **Allow recovery** - Storage has time to recover without load
-4. **Visibility** - `github_circuit_breaker_state` metric shows current state
-5. **Admin control** - Manual reset endpoint for operators
-
----
-
-## Shared Module Architecture
-
-The implementation adds these shared modules under `backend/src/shared/`:
+### Local Architecture
 
 ```
-shared/
-├── logger.js           # Pino structured logging with request context
-├── metrics.js          # Prometheus metrics and middleware
-├── cache.js            # Redis cache-aside pattern implementation
-├── audit.js            # Security audit logging
-├── idempotency.js      # Idempotency key handling
-└── circuitBreaker.js   # Opossum circuit breaker for git operations
+┌──────────────────────────┐        ┌──────────────────────────┐
+│  Frontend (React 19)     │ :5173  │  Backend (Express)       │ :3000
+│  Vite + TanStack Router  │───────▶│  Routes + Services       │
+│  Zustand + Tailwind CSS  │        │  Git Operations          │
+└──────────────────────────┘        └────────────┬─────────────┘
+                                                 │
+                                    ┌────────────┼────────────┐
+                                    ▼            ▼            ▼
+                              ┌──────────┐ ┌──────────┐ ┌──────────┐
+                              │ Postgres │ │  Redis   │ │   ES     │
+                              │  :5432   │ │  :6379   │ │  :9200   │
+                              └──────────┘ └──────────┘ └──────────┘
+                                                 │
+                                    ┌────────────┘
+                                    ▼
+                              ┌──────────────────┐
+                              │  /repositories/  │
+                              │  (bare git repos)│
+                              └──────────────────┘
 ```
 
-Each module is:
-- **Self-contained** - Single responsibility
-- **Configurable** - Environment-based settings
-- **Observable** - Emits metrics and logs
-- **Testable** - Can be mocked in unit tests
+### Production-Grade Patterns Actually Implemented
+
+| Pattern | Implementation | File Path |
+|---------|---------------|-----------|
+| Circuit breakers | Opossum wrapping all git operations with per-operation instances | `backend/src/shared/circuitBreaker.ts` |
+| Prometheus metrics | 15+ custom metrics (HTTP, git, cache, PR, issue, webhook, circuit breaker) | `backend/src/shared/metrics.ts` |
+| Structured logging | Pino JSON logger with request middleware | `backend/src/shared/logger.ts` |
+| Audit logging | Security-sensitive operations logged with IP, user agent, request ID | `backend/src/shared/audit.ts` |
+| Idempotency | DB-backed idempotency keys with periodic cleanup | `backend/src/shared/idempotency.ts` |
+| Cache layer | Redis caching for repo metadata, file trees, PR diffs | `backend/src/shared/cache.ts` |
+| Health checks | /health (PG + Redis + circuit breakers), /health/live, /health/ready | `backend/src/index.ts` |
+| Metrics middleware | Per-request latency tracking and counting | `backend/src/shared/metrics.ts` |
+| Admin endpoints | Circuit breaker status/reset, audit log query | `backend/src/index.ts` |
+| Session auth | Redis-backed sessions with X-Session-Id header | `backend/src/middleware/auth.ts` |
+| Code search | Elasticsearch with code tokenizer, symbol extraction, language detection | `backend/src/services/search.ts` |
+| Git operations | simple-git + isomorphic-git for bare repository management | `backend/src/services/git.ts` |
+| Graceful shutdown | SIGTERM/SIGINT handlers with connection draining | `backend/src/index.ts` |
+
+### What Was Simplified or Substituted
+
+| Production Concept | Local Substitute |
+|-------------------|-----------------|
+| Distributed git storage (DGit/Ceph) | Local filesystem `/repositories/` |
+| Git protocol server (SSH + Smart HTTP) | Express routes calling simple-git CLI |
+| API Gateway with rate limiting | Single Express server with CORS |
+| Microservices (Git, API, Search) | Monolithic Express app with route modules |
+| Elasticsearch cluster | Single-node ES 8.12 in Docker |
+| Redis Cluster | Single Valkey 7 instance |
+| OAuth / GitHub Apps | Session-based auth with bcrypt passwords |
+| CDN for static assets | Vite dev server |
+| Webhook queue (SQS/RabbitMQ) | Inline webhook delivery |
+| Kubernetes | Docker Compose for infrastructure |
+| Multi-region / geo-routing | Single machine, localhost |
+
+### What Was Omitted
+
+- SSH protocol support for git push/pull
+- Git LFS (Large File Storage)
+- Branch protection rules and required status checks
+- Conflict detection and resolution UI in PRs
+- CI/CD runner (GitHub Actions equivalent)
+- Real-time notifications (WebSocket)
+- Markdown rendering
+- Repository forking (table exists, git fork logic not implemented)
+- Webhook secret verification and HMAC signing
+- Rate limiting middleware
+- Repository templates
+- GitHub Pages equivalent
+- Dependabot / security scanning
+- Code owners (CODEOWNERS file)
+- Protected branches
+
+### Frontend Architecture
+
+The frontend uses React 19 + TypeScript + Vite + TanStack Router + Zustand + Tailwind CSS.
+
+Key components:
+- `CodeViewer.tsx` -- syntax-highlighted file content viewer
+- `DiffViewer.tsx` -- side-by-side diff display for PRs
+- `FileTree.tsx` -- repository file browser with directory navigation
+- `Header.tsx` -- global navigation with search
+- `IssueCard.tsx` -- issue list item
+- `RepoCard.tsx` -- repository list card with stats
+
+Routes follow GitHub's URL structure:
+- `/:owner/:repo` -- repository overview
+- `/:owner/:repo/tree/:branch/*` -- file tree browsing
+- `/:owner/:repo/blob/:branch/*` -- file content viewing
+- `/:owner/:repo/pulls` -- PR list
+- `/:owner/:repo/pull/:number` -- PR detail with diff
+- `/:owner/:repo/issues` -- issue list
+- `/:owner/:repo/issues/:number` -- issue detail
+- `/:owner/:repo/discussions` -- discussions
+- `/search` -- code search
+- `/new` -- create repository
+- `/login`, `/register` -- authentication

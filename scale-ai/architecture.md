@@ -1,104 +1,114 @@
 # Scale AI - Data Labeling & ML Training Platform
 
-## Overview
+## System Overview
 
-A crowdsourced data collection platform for training machine learning models. Users contribute labeled drawing data through a simple game interface, administrators manage the dataset and trigger model training, and implementors use the trained model for inference.
+A crowdsourced data collection platform for training machine learning models. Users contribute labeled drawing data through a game interface, administrators manage the dataset and trigger model training, and implementors use trained models for inference. The system is designed to handle millions of concurrent contributors, store billions of labeled samples, and serve low-latency model inference.
 
-## Core Requirements
+## Requirements
 
 ### Functional Requirements
 
 **Data Collection Portal (End Users)**
 - Draw shapes on a canvas (line, heart, circle, square, triangle)
-- Touch and mouse input support
-- Clear visual feedback and instructions
+- Touch and mouse input support with clear visual feedback
 - Session tracking (anonymous or authenticated)
-- Gamification elements (progress, streaks)
+- Gamification elements (progress tracking, streaks)
 
 **Admin Portal**
 - View collected data statistics (count per shape, quality metrics)
 - Browse and filter individual submissions
-- Flag/remove low-quality data
-- Trigger model training jobs
+- Flag/remove low-quality data with soft delete support
+- Trigger model training jobs with configurable hyperparameters
 - Monitor training progress and model performance
-- Compare model versions
+- Compare model versions, activate best model
 
 **Implementor Portal**
-- Load trained model
-- Request shape generation/recognition
-- Test model with custom inputs
+- Load trained model and classify drawings
+- Generate shapes based on trained prototypes
 - View inference latency and confidence scores
 
 ### Non-Functional Requirements
 
-- Handle 10,000+ concurrent users drawing
-- Store millions of drawing samples efficiently
-- Training jobs complete within reasonable time
-- Model inference < 100ms latency
-- All portals run locally for development
+| Requirement | Target | Rationale |
+|-------------|--------|-----------|
+| Availability | 99.9% (8.7h downtime/year) | Collection can tolerate brief outages; lost drawings are acceptable |
+| Collection throughput | 100,000 concurrent drawing submissions | Flash crowd scenarios (viral campaigns, school assignments) |
+| Write latency | < 200ms for drawing submission | User perceives submission as instant |
+| Inference latency | < 100ms p99 | Real-time classification feedback |
+| Training throughput | Process 10M drawings in < 4 hours | Daily retraining on full dataset |
+| Storage efficiency | < 50KB per drawing (stroke data) | Stroke JSON is 10-100x smaller than rasterized images |
+| Model accuracy | > 95% on 5-class shape recognition | Simple geometric shapes are well-constrained |
 
-## Scale Estimates
+## Capacity Estimation
 
-| Metric | Estimate |
-|--------|----------|
-| Concurrent users | 10,000 |
-| Drawings per user per session | 10-50 |
-| Drawing data size | ~5-50KB per drawing (stroke data) |
-| Total drawings (1 month) | 10M+ |
-| Storage (1 month) | 100GB - 500GB |
-| Training job frequency | Daily or on-demand |
-| Model inference QPS | 1,000+ |
+### Production Scale
+
+| Metric | Value | Calculation |
+|--------|-------|-------------|
+| Daily Active Users | 1M | |
+| Drawings per user per session | 10-50 | |
+| Drawings per day | 20M | ~230 RPS average, ~2,000 RPS peak |
+| Drawing data size | 5-50 KB | Stroke data JSON |
+| Total drawings (1 month) | 600M | |
+| Raw storage (1 month) | 6-30 TB | Before compression |
+| Training job frequency | Daily or on-demand | |
+| Model inference QPS | 10,000+ | Real-time classification |
+| Metadata storage | ~200 GB/month | PostgreSQL rows for drawings table |
+
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Concurrent users | 1-5 |
+| Drawings per day | 100-500 |
+| Storage growth | ~25 MB/day |
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────────────────┐
 │                              FRONTEND LAYER                                  │
-├─────────────────┬─────────────────────┬─────────────────────────────────────┤
-│  Drawing Game   │    Admin Portal     │         Implementor Portal          │
-│  (React + Canvas)│   (React + Charts) │        (React + Canvas)             │
-└────────┬────────┴──────────┬──────────┴──────────────────┬──────────────────┘
+├─────────────────┬─────────────────────┬──────────────────────────────────────┤
+│  Drawing Game   │    Admin Portal     │         Implementor Portal           │
+│  (React+Canvas) │   (React+Charts)    │        (React+Canvas)                │
+└────────┬────────┴──────────┬──────────┴──────────────────┬───────────────────┘
          │                   │                              │
          ▼                   ▼                              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              API GATEWAY                                     │
-│                    (Load Balancer / Rate Limiting)                          │
-└────────┬────────────────────┬─────────────────────────────┬─────────────────┘
-         │                    │                              │
-         ▼                    ▼                              ▼
-┌─────────────────┐  ┌─────────────────┐           ┌─────────────────┐
-│  Collection     │  │  Admin          │           │  Inference      │
-│  Service        │  │  Service        │           │  Service        │
-│  (Express)      │  │  (Express)      │           │  (Express/Py)   │
-└────────┬────────┘  └────────┬────────┘           └────────┬────────┘
-         │                    │                              │
-         ▼                    │                              │
-┌─────────────────┐           │                              │
-│  Message Queue  │◄──────────┘                              │
-│  (RabbitMQ)     │                                          │
-└────────┬────────┘                                          │
-         │                                                   │
-         ▼                                                   │
-┌─────────────────┐                                          │
-│  Training       │                                          │
-│  Worker         │                                          │
-│  (Python)       │                                          │
-└────────┬────────┘                                          │
-         │                                                   │
-         ▼                                                   ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        API Gateway / Load Balancer                           │
+│              (Rate Limiting, TLS Termination, Routing)                       │
+└────────┬───────────────────┬──────────────────────────────┬──────────────────┘
+         │                   │                              │
+         ▼                   ▼                              ▼
+┌─────────────────┐ ┌─────────────────┐           ┌─────────────────┐
+│  Collection     │ │  Admin          │           │  Inference      │
+│  Service        │ │  Service        │           │  Service        │
+│  (Express.js)   │ │  (Express.js)   │           │  (Express.js)   │
+│  Stateless,     │ │  Session Auth   │           │  Model Cache    │
+│  High Throughput│ │                 │           │                 │
+└────────┬────────┘ └────────┬────────┘           └────────┬────────┘
+         │                   │                              │
+         │                   │                              │
+         ▼                   ▼                              ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
 │                              DATA LAYER                                      │
-├─────────────────┬─────────────────────┬─────────────────────────────────────┤
-│   PostgreSQL    │    Object Storage   │         Model Registry              │
-│   (Metadata)    │    (Drawing Data)   │         (Trained Models)            │
-└─────────────────┴─────────────────────┴─────────────────────────────────────┘
+├─────────────────┬─────────────────┬───────────────┬──────────────────────────┤
+│   PostgreSQL    │  Object Storage │    Redis      │      RabbitMQ            │
+│   (Metadata,    │  (Drawings,     │  (Sessions,   │   (Training Jobs,        │
+│    Jobs,        │   Models)       │   Cache,      │    Async Tasks)          │
+│    Models)      │                 │   Idempotency)│                          │
+└─────────────────┴────────┬────────┴───────────────┴──────────┬───────────────┘
+                           │                                    │
+                           ▼                                    ▼
+                  ┌─────────────────┐                  ┌─────────────────┐
+                  │  S3 / Object    │                  │ Training Worker │
+                  │  Storage        │                  │ (Python/PyTorch)│
+                  │  (Drawings +    │◄─────────────────│ GPU-accelerated │
+                  │   Models)       │                  │                 │
+                  └─────────────────┘                  └─────────────────┘
 ```
 
 ## Database Schema
-
-### PostgreSQL Schema
-
-The complete schema is available at `backend/src/db/init.sql`. Below is the full implementation with all tables, indexes, and constraints.
 
 ```sql
 -- Extensions
@@ -110,17 +120,19 @@ CREATE TABLE users (
     session_id VARCHAR(255) UNIQUE NOT NULL,
     role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
     total_drawings INT DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE INDEX idx_users_session ON users(session_id);
+CREATE INDEX idx_users_role ON users(role);
 
 -- Shape definitions for the drawing game
 CREATE TABLE shapes (
     id SERIAL PRIMARY KEY,
-    name VARCHAR(50) UNIQUE NOT NULL,  -- 'line', 'heart', 'circle', 'square', 'triangle'
+    name VARCHAR(50) UNIQUE NOT NULL,
     description TEXT,
     difficulty INT DEFAULT 1 CHECK (difficulty BETWEEN 1 AND 5),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Drawing submissions from users
@@ -128,27 +140,37 @@ CREATE TABLE drawings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     shape_id INT REFERENCES shapes(id) ON DELETE CASCADE,
-    stroke_data_path VARCHAR(500) NOT NULL,  -- Path in MinIO object storage
+    stroke_data_path VARCHAR(500) NOT NULL,  -- Path in object storage
     metadata JSONB DEFAULT '{}',  -- canvas size, duration, stroke count, device type
     quality_score FLOAT CHECK (quality_score IS NULL OR quality_score BETWEEN 0 AND 1),
     is_flagged BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL  -- Soft delete support
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ DEFAULT NULL  -- Soft delete support
 );
+CREATE INDEX idx_drawings_shape ON drawings(shape_id);
+CREATE INDEX idx_drawings_user ON drawings(user_id);
+CREATE INDEX idx_drawings_created ON drawings(created_at DESC);
+CREATE INDEX idx_drawings_quality ON drawings(quality_score) WHERE quality_score IS NOT NULL;
+CREATE INDEX idx_drawings_flagged ON drawings(is_flagged) WHERE is_flagged = TRUE;
+CREATE INDEX idx_drawings_deleted_at ON drawings(deleted_at);
 
 -- Training job management
 CREATE TABLE training_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    status VARCHAR(50) DEFAULT 'pending' CHECK (status IN ('pending', 'queued', 'running', 'completed', 'failed')),
+    status VARCHAR(50) DEFAULT 'pending'
+        CHECK (status IN ('pending', 'queued', 'running', 'completed', 'failed', 'cancelled')),
     config JSONB DEFAULT '{}',  -- hyperparameters, data filters, epochs
     error_message TEXT,
-    started_at TIMESTAMP WITH TIME ZONE,
-    completed_at TIMESTAMP WITH TIME ZONE,
+    progress JSONB DEFAULT '{}',  -- current_epoch, total_epochs, current_loss, phase
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
     metrics JSONB,  -- accuracy, loss, confusion matrix
-    model_path VARCHAR(500),  -- Path in MinIO when completed
+    model_path VARCHAR(500),  -- Path in object storage when completed
     created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE INDEX idx_training_jobs_status ON training_jobs(status);
+CREATE INDEX idx_training_jobs_created ON training_jobs(created_at DESC);
 
 -- Trained model versions
 CREATE TABLE models (
@@ -157,10 +179,14 @@ CREATE TABLE models (
     version VARCHAR(50) NOT NULL,
     is_active BOOLEAN DEFAULT FALSE,
     accuracy FLOAT CHECK (accuracy IS NULL OR accuracy BETWEEN 0 AND 1),
-    model_path VARCHAR(500) NOT NULL,  -- Path in MinIO
-    config JSONB DEFAULT '{}',  -- Model architecture details
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    model_path VARCHAR(500) NOT NULL,  -- Path in object storage
+    config JSONB DEFAULT '{}',  -- Model architecture details, prototype data
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- Unique partial index ensures only one active model at a time
+CREATE UNIQUE INDEX idx_models_active ON models(is_active) WHERE is_active = TRUE;
+CREATE INDEX idx_models_version ON models(version);
+CREATE INDEX idx_models_created ON models(created_at DESC);
 
 -- Admin users with email/password authentication
 CREATE TABLE admin_users (
@@ -168,32 +194,9 @@ CREATE TABLE admin_users (
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     name VARCHAR(255),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-
--- Indexes for users
-CREATE INDEX idx_users_session ON users(session_id);
-CREATE INDEX idx_users_role ON users(role);
-
--- Indexes for drawings (optimized for common query patterns)
-CREATE INDEX idx_drawings_shape ON drawings(shape_id);
-CREATE INDEX idx_drawings_user ON drawings(user_id);
-CREATE INDEX idx_drawings_created ON drawings(created_at DESC);
-CREATE INDEX idx_drawings_quality ON drawings(quality_score) WHERE quality_score IS NOT NULL;
-CREATE INDEX idx_drawings_flagged ON drawings(is_flagged) WHERE is_flagged = TRUE;
-CREATE INDEX idx_drawings_deleted_at ON drawings(deleted_at);
-
--- Indexes for training_jobs
-CREATE INDEX idx_training_jobs_status ON training_jobs(status);
-CREATE INDEX idx_training_jobs_created ON training_jobs(created_at DESC);
-
--- Indexes for models (ensures only one active model at a time)
-CREATE UNIQUE INDEX idx_models_active ON models(is_active) WHERE is_active = TRUE;
-CREATE INDEX idx_models_version ON models(version);
-CREATE INDEX idx_models_created ON models(created_at DESC);
-
--- Indexes for admin_users
 CREATE INDEX idx_admin_users_email ON admin_users(email);
 
 -- Seed data: 5 shapes for the drawing game
@@ -205,23 +208,12 @@ INSERT INTO shapes (name, description, difficulty) VALUES
     ('heart', 'A classic heart shape symbolizing love', 3);
 ```
 
-**Schema Notes:**
-- **Soft deletes:** The `drawings.deleted_at` column enables soft delete functionality. Queries should filter `WHERE deleted_at IS NULL` to exclude deleted drawings.
-- **Partial indexes:** Flagged and quality score indexes use `WHERE` clauses to reduce index size and improve performance.
-- **Single active model constraint:** The unique partial index on `models.is_active` ensures only one model can be active at a time.
-- **Timezone-aware timestamps:** All timestamps use `TIMESTAMP WITH TIME ZONE` for consistent handling across timezones.
-- **Check constraints:** Enforce valid ranges for `role`, `status`, `difficulty`, `quality_score`, and `accuracy`.
-
 ### Drawing Data Format (Stored in Object Storage)
 
 ```json
 {
-  "id": "uuid",
   "shape": "circle",
-  "canvas": {
-    "width": 400,
-    "height": 400
-  },
+  "canvas": { "width": 400, "height": 400 },
   "strokes": [
     {
       "points": [
@@ -233,284 +225,240 @@ INSERT INTO shapes (name, description, difficulty) VALUES
     }
   ],
   "duration_ms": 2500,
-  "device": "mouse|touch",
-  "user_agent": "..."
+  "device": "mouse"
 }
 ```
 
-## Component Deep Dives
+**Why stroke data instead of images:** Stroke JSON preserves temporal information (drawing order, speed), pressure data, and device type — all valuable for ML training. It is also 10-100x smaller than rasterized images. Images can be rendered at training time at any resolution (64x64, 128x128) from the same stroke data.
 
-### Drawing Collection Service
+## Core Components
+
+### Collection Service
 
 **Responsibilities:**
-- Receive drawing submissions via WebSocket or REST
+- Receive drawing submissions via REST API
 - Validate and sanitize input data
-- Store stroke data in object storage
+- Store stroke data in object storage (MinIO/S3)
 - Create metadata record in PostgreSQL
-- Optional: Real-time quality scoring
+- Idempotency protection against duplicate submissions
 
 **API Endpoints:**
 ```
-POST /api/drawings          # Submit a completed drawing
-GET  /api/shapes            # Get list of available shapes
-GET  /api/user/stats        # Get user's drawing statistics
-WS   /ws/drawing            # Real-time stroke streaming (optional)
+POST /api/drawings          Submit a completed drawing
+GET  /api/shapes            Get list of available shapes
+GET  /api/user/stats        Get user's drawing statistics
+GET  /health                Health check (liveness)
+GET  /health/ready          Readiness probe (dependencies)
+GET  /metrics               Prometheus metrics
 ```
 
 **Design Considerations:**
-- Batch writes to reduce DB load
-- Pre-signed URLs for direct object storage upload
-- Client-side stroke simplification to reduce data size
+- Stateless: scales horizontally behind a load balancer
+- Batch writes deferred to future optimization (currently single-insert)
+- Pre-signed URLs for direct-to-storage upload at production scale
 
 ### Admin Service
 
 **Responsibilities:**
 - Aggregate statistics across all drawings
-- Provide data browsing and filtering
-- Manage training job lifecycle
-- Model comparison and deployment
+- Data browsing and filtering with pagination
+- Quality scoring and flagged data management
+- Training job lifecycle (create, monitor, cancel)
+- Model comparison and activation
 
 **API Endpoints:**
 ```
-GET  /api/admin/stats                    # Dashboard statistics
-GET  /api/admin/drawings                 # Paginated drawing list
-POST /api/admin/drawings/:id/flag        # Flag low-quality data
-POST /api/admin/training/start           # Trigger training job
-GET  /api/admin/training/:id             # Training job status
-GET  /api/admin/models                   # List trained models
-POST /api/admin/models/:id/activate      # Set active model
+POST /api/admin/auth/login          Admin login
+POST /api/admin/auth/logout         Admin logout
+GET  /api/admin/auth/me             Current admin user
+GET  /api/admin/stats               Dashboard statistics
+GET  /api/admin/drawings            Paginated drawing list with filters
+POST /api/admin/drawings/:id/flag   Flag low-quality data
+DELETE /api/admin/drawings/:id      Soft-delete drawing
+POST /api/admin/drawings/:id/restore Restore soft-deleted drawing
+GET  /api/admin/quality/analyze     Batch quality analysis
+POST /api/admin/training/start      Trigger training job
+GET  /api/admin/training/:id        Training job status
+GET  /api/admin/models              List trained models
+POST /api/admin/models/:id/activate Set active model
+POST /api/admin/cleanup/run         Trigger data cleanup
+GET  /metrics                       Prometheus metrics
 ```
 
-### Training Worker
+### Training Worker (Python)
 
 **Responsibilities:**
-- Poll for pending training jobs
-- Fetch training data from storage
-- Train ML model (CNN for shape recognition)
-- Save model to registry
-- Report metrics back to admin service
+- Consume training jobs from RabbitMQ
+- Fetch training data from object storage
+- Preprocess: convert stroke data to images (64x64 grayscale)
+- Augment: rotation, scaling, noise
+- Train CNN model (PyTorch)
+- Evaluate: accuracy, confusion matrix
+- Save model and prototype data to object storage
+- Report metrics back to PostgreSQL
 
 **Training Pipeline:**
-```python
-# Simplified training flow
-1. Fetch drawings from object storage (filtered by job config)
-2. Preprocess: Convert stroke data to images
-3. Augment: Rotation, scaling, noise
-4. Train: CNN model (e.g., MobileNet, custom small net)
-5. Evaluate: Accuracy, confusion matrix
-6. Save: Model to registry, metrics to DB
+```
+1. Receive job from RabbitMQ
+2. Fetch drawings from MinIO/S3 (filtered by job config)
+3. Convert stroke JSON → 64x64 grayscale images
+4. Apply data augmentation (rotation, flip, noise)
+5. Train CNN model (configurable epochs, batch size, learning rate)
+6. Evaluate on held-out test set
+7. Save model weights + prototype data to object storage
+8. Update training_jobs and models tables in PostgreSQL
+9. Acknowledge message in RabbitMQ
 ```
 
 ### Inference Service
 
 **Responsibilities:**
-- Load active model
-- Accept drawing input
-- Return classification with confidence
-- Optional: Generate shapes based on prompts
+- Load active model information from database
+- Classify drawings based on stroke data (currently heuristic-based; production uses actual ML model)
+- Generate shapes using trained prototypes or procedural fallbacks
+- Report inference latency and confidence metrics
 
 **API Endpoints:**
 ```
-POST /api/inference/classify    # Classify a drawing
-POST /api/inference/generate    # Generate a shape (if generative model)
-GET  /api/inference/model/info  # Current model info
+POST /api/inference/classify    Classify a drawing (returns shape + confidence)
+POST /api/inference/generate    Generate a shape (returns stroke data)
+GET  /api/inference/model/info  Current active model info
+GET  /metrics                   Prometheus metrics
 ```
 
-## Key Technical Decisions
+## Key Design Decisions
 
-### Drawing Data Storage
+### 1. Drawing Storage: Stroke Data (JSON) vs. Rasterized Images
 
-**Option 1: Store as image (PNG/SVG)**
-- Pros: Easy to use with standard ML pipelines
-- Cons: Loses temporal/pressure data, larger storage
+**Chosen**: Store stroke data as JSON in object storage, render to images at training time.
 
-**Option 2: Store as stroke data (JSON)**
-- Pros: Compact, preserves all information, can render to image
-- Cons: Requires preprocessing for training
+**Why stroke data works for ML data collection:**
+- Preserves all information: temporal ordering, drawing speed, pressure, device type. This enables future stroke-based models (RNN/Transformer on sequences) in addition to CNN on images.
+- 10-100x smaller than PNG images. A typical drawing is 5-50KB as JSON vs. 100KB-1MB as a high-resolution image. At 600M drawings/month, this saves 6-60 TB of storage.
+- Flexible training: the same stroke data can be rendered at any resolution (64x64, 128x128, 256x256) without storing multiple copies.
 
-**Recommendation:** Store stroke data (JSON) in object storage, render to images at training time. This preserves maximum information and enables future use cases (e.g., stroke-based models).
+**Why rasterized images fail for this use case:** Storing only images loses temporal information permanently. If a future model architecture benefits from stroke order (e.g., "did the user draw a circle clockwise or counterclockwise?"), that data is gone. Additionally, at 600M samples, image storage costs are prohibitive.
 
-### Real-time vs Batch Submission
+**What we give up:** Training requires a preprocessing step (stroke-to-image rendering) that adds ~30 minutes to each training job. This is acceptable because training runs are infrequent (daily or on-demand) and the rendering step parallelizes trivially.
 
-**Option 1: WebSocket streaming**
-- Pros: Can show real-time feedback, partial saves
-- Cons: More complex, higher server load
+### 2. Submission Model: REST on Completion vs. WebSocket Streaming
 
-**Option 2: Submit on completion**
-- Pros: Simpler, lower load, easier batching
-- Cons: Lost data if user leaves mid-drawing
+**Chosen**: Submit complete drawing via REST POST on completion.
 
-**Recommendation:** Start with submit-on-completion (simpler), add WebSocket streaming later if needed.
+**Why batch submission works:**
+- Simpler client and server implementation. No persistent connection management, no partial-drawing state tracking.
+- Lower server load. WebSocket connections consume memory per connected client. At 100K concurrent users, this is 100K persistent connections.
+- Natural idempotency boundary. A complete drawing submission is a single atomic operation that can be retried safely with an idempotency key.
 
-### ML Framework
+**Why WebSocket streaming fails at this scale:**
+Streaming every stroke point in real-time generates 50-200 messages per drawing per second. At 100K concurrent users, this is 5-20M messages/s — enormous infrastructure cost for minimal benefit. Real-time stroke streaming would be justified only if the product required live collaborative drawing or immediate feedback during drawing.
 
-**For local development:**
-- TensorFlow.js (runs in browser for quick testing)
-- PyTorch (training worker)
+**What we give up:** If a user closes the browser mid-drawing, the drawing is lost. This is acceptable for a gamified data collection tool where each drawing takes 3-10 seconds. Users can simply draw again.
 
-**Model architecture for shape recognition:**
-- Small CNN (few layers, optimized for speed)
-- Input: 64x64 or 128x128 grayscale images
-- Output: Softmax over shape classes
+### 3. Training Architecture: Message Queue + Python Worker
 
-### Object Storage (Local Dev)
+**Chosen**: Admin triggers training via REST API, job published to RabbitMQ, Python worker consumes and trains.
 
-**Options:**
-- MinIO (S3-compatible, Docker-friendly)
-- Local filesystem with path-based storage
-- PostgreSQL BYTEA (for small-scale testing)
+**Why message queue decoupling works:**
+- Training jobs take minutes to hours. Synchronous API calls would timeout. The queue allows fire-and-forget job submission with async progress monitoring.
+- Worker can run on GPU hardware separate from the API servers. No need to provision GPUs for every API server instance.
+- Natural retry semantics. If the worker crashes mid-training, the unacknowledged message is requeued and picked up by another worker.
+- Progress reporting via PostgreSQL updates. The admin portal polls job status without coupling to the worker.
 
-**Recommendation:** MinIO for realistic S3-like behavior, fallback to filesystem for simplicity.
+**Why not in-process training:**
+Node.js API servers are not suitable for GPU-bound ML training. Python + PyTorch is the standard for ML workflows. Running training in a separate process also isolates failures — a training crash doesn't bring down the API.
 
-## Scaling Considerations
+### 4. Model Activation: Atomic Single-Active-Model
 
-### Data Collection at Scale
+**Chosen**: PostgreSQL unique partial index ensures only one model can be `is_active = TRUE` at a time. Activation is an atomic transaction: deactivate current, activate new.
 
-```
-Problem: 10K concurrent users submitting drawings
-
-Solutions:
-1. Horizontal scaling of collection service
-2. Message queue for async processing
-3. Client-side batching (submit multiple drawings at once)
-4. Pre-signed URLs for direct-to-storage uploads
-```
-
-### Training Large Datasets
-
-```
-Problem: Training on millions of drawings
-
-Solutions:
-1. Streaming data loader (don't load all into memory)
-2. Distributed training (multiple GPUs/workers)
-3. Incremental training (fine-tune on new data)
-4. Data sampling (train on representative subset)
-```
-
-### Model Serving
-
-```
-Problem: Low-latency inference at scale
-
-Solutions:
-1. Model optimization (quantization, pruning)
-2. Batch inference
-3. Edge deployment (TensorFlow.js in browser)
-4. Model caching (keep warm in memory)
-```
-
-## Local Development Setup
-
-```bash
-# Start infrastructure
-docker-compose up -d  # PostgreSQL, MinIO, RabbitMQ
-
-# Run services on different ports
-npm run dev:collection  # Port 3001
-npm run dev:admin       # Port 3002
-npm run dev:inference   # Port 3003
-
-# Run training worker
-python training/worker.py
-
-# Frontend (all portals)
-cd frontend && npm run dev  # Port 5173
-```
-
-## Security Considerations
-
-- Rate limiting on drawing submissions (prevent spam)
-- Admin portal authentication required
-- Validate drawing data format and size limits
-- Sanitize user inputs (prevent injection)
-- CORS configuration for API endpoints
-
-## Monitoring & Observability
-
-**Metrics to track:**
-- Drawings submitted per minute
-- Drawing size distribution
-- Quality score distribution
-- Training job duration and success rate
-- Model accuracy over time
-- Inference latency percentiles
-
-**Logging:**
-- Structured JSON logs
-- Request tracing (correlation IDs)
-- Training job progress logs
-
-## Consistency and Idempotency Semantics
-
-### Write Consistency Model
-
-| Operation | Consistency Level | Rationale |
-|-----------|------------------|-----------|
-| Drawing submission | Eventual | Loss of a single drawing is acceptable; high write throughput is critical |
-| Training job creation | Strong | Must guarantee exactly-once job creation to avoid duplicate training runs |
-| Model activation | Strong | Active model state must be immediately consistent across all inference instances |
-| User stats update | Eventual | Can be reconciled asynchronously via background job |
-
-**Drawing Submissions (Eventual Consistency):**
-- Writes to PostgreSQL and MinIO are not transactional
-- If MinIO write succeeds but PostgreSQL fails, orphan detection job cleans up hourly
-- If PostgreSQL write succeeds but MinIO fails, the `drawings` row has null `stroke_data_path` and is excluded from training
-
-**Training Jobs (Strong Consistency):**
-- Uses PostgreSQL transaction with `SELECT ... FOR UPDATE` on job creation
-- Job ID is UUID generated server-side, preventing duplicate job creation on retry
-
-### Idempotency Implementation
-
-**Drawing Submissions:**
-```typescript
-// Client generates idempotency key before submission
-const idempotencyKey = `${sessionId}:${shapeId}:${Date.now()}`;
-
-// Server checks Redis before processing
-const exists = await redis.get(`idem:drawing:${idempotencyKey}`);
-if (exists) return { status: 'already_processed', drawingId: exists };
-
-// After successful save, mark as processed with 1-hour TTL
-await redis.setex(`idem:drawing:${idempotencyKey}`, 3600, drawingId);
-```
-
-**Training Job Triggers:**
-```typescript
-// Admin clicks "Start Training" - use job config hash as idempotency key
-const configHash = crypto.createHash('sha256').update(JSON.stringify(jobConfig)).digest('hex');
-const idempotencyKey = `training:${configHash}:${new Date().toISOString().slice(0,10)}`;
-
-// Check for existing pending/running job with same config from today
-const existing = await db.query(`
-  SELECT id FROM training_jobs
-  WHERE status IN ('pending', 'running')
-    AND config_hash = $1
-    AND created_at > NOW() - INTERVAL '24 hours'
-`, [configHash]);
-if (existing.rows.length > 0) return { jobId: existing.rows[0].id, status: 'already_exists' };
-```
-
-### Conflict Resolution
-
-**Concurrent Drawing Submissions:**
-- No conflicts possible: each drawing gets a unique UUID, no updates to existing records
-- Quality score updates use last-write-wins (admin override is final)
-
-**Model Activation Race:**
 ```sql
--- Atomic model activation (only one active model at a time)
 BEGIN;
 UPDATE models SET is_active = FALSE WHERE is_active = TRUE;
 UPDATE models SET is_active = TRUE WHERE id = $1;
 COMMIT;
 ```
 
-**Replay Handling:**
-- Drawing submissions: Safe to replay due to idempotency keys
-- Training jobs: Config hash prevents duplicate training on same data
-- Model activation: Idempotent by nature (activating already-active model is no-op)
+**Why this works:** All inference service instances query the `models` table for the active model. The unique partial index (`CREATE UNIQUE INDEX idx_models_active ON models(is_active) WHERE is_active = TRUE`) guarantees database-level enforcement of the single-active constraint, preventing split-brain scenarios where different inference instances serve different models.
+
+## Consistency and Idempotency
+
+### Write Consistency Model
+
+| Operation | Consistency | Rationale |
+|-----------|-------------|-----------|
+| Drawing submission | Eventual | Loss of a single drawing is acceptable; high throughput is critical |
+| Training job creation | Strong | Must guarantee exactly-once to avoid duplicate training runs |
+| Model activation | Strong | Active model must be immediately consistent across all inference instances |
+| User stats update | Eventual | Reconciled asynchronously |
+
+**Drawing Submissions:**
+- Writes to PostgreSQL and MinIO are not transactional across systems
+- If MinIO write succeeds but PostgreSQL fails: orphan detection job cleans up hourly
+- If PostgreSQL write succeeds but MinIO fails: drawing row has null path, excluded from training
+
+### Idempotency Implementation
+
+**Drawing Submissions:** Client generates idempotency key from `sessionId:shapeId:timestamp`. Server checks Redis before processing. After successful save, marks as processed with 1-hour TTL. Prevents duplicate drawings from network retries and double-clicks.
+
+**Training Jobs:** Config hash + date serves as natural idempotency key. Server checks for existing pending/running job with same config from the same day before creating a new one.
+
+### Conflict Resolution
+
+- **Drawing submissions**: No conflicts possible — each drawing gets a unique UUID
+- **Quality score updates**: Last-write-wins (admin override is final)
+- **Model activation**: Atomic PostgreSQL transaction with unique partial index
+
+## Security
+
+### Authentication Model
+
+| Portal | Auth Method | Storage |
+|--------|-------------|---------|
+| Drawing game | Anonymous session (auto-generated session_id) | PostgreSQL users table |
+| Admin portal | Email + password (bcrypt, cost 12) | Redis-backed sessions, httpOnly cookies |
+| Inference API | No auth (public) | N/A |
+
+### Rate Limiting
+
+- Drawing submissions: configurable per IP
+- Admin API: session-based, authenticated users only
+- Inference API: per IP rate limiting
+
+### Input Validation
+
+- Drawing data: validate stroke format, canvas dimensions, enforce size limit
+- Sanitize filenames and user inputs
+- CORS configuration for API endpoints
+
+## Observability
+
+### Metrics (Prometheus)
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `http_requests_total` | Counter | method, route, status_code | Request volume and error rate |
+| `http_request_duration_seconds` | Histogram | method, route | Latency percentiles |
+| `drawings_total` | Counter | shape, status | Drawing submission volume |
+| `inference_requests_total` | Counter | model_version, predicted_shape | Inference volume |
+| `inference_latency_seconds` | Histogram | model_version | Inference latency |
+| `generation_requests_total` | Counter | model_version, shape | Shape generation volume |
+| `external_service_calls_total` | Counter | service, operation, status | Dependency health |
+| `circuit_breaker_state` | Gauge | service | 0=closed, 1=half-open, 2=open |
+
+### SLI Targets
+
+| SLI | Target | Alert Threshold |
+|-----|--------|-----------------|
+| Collection API p99 latency | < 200ms | > 500ms for 5m |
+| Inference p99 latency | < 100ms | > 200ms for 5m |
+| Error rate (5xx) | < 0.5% | > 2% for 5m |
+| Training job success rate | > 95% | < 80% for 24h |
+| Circuit breaker open | 0 | Any service open > 5min |
+
+### Structured Logging (Pino)
+
+JSON logs with consistent fields: `level`, `time`, `service` (collection/admin/inference), `requestId`, `msg`, plus context-specific fields (drawingId, shape, modelVersion, processingTimeMs). Child loggers inherit request context for correlated log traces.
 
 ## Failure Handling
 
@@ -523,686 +471,184 @@ COMMIT;
 | RabbitMQ publish | Exponential | 500ms, 1s, 2s, 4s | 5 |
 | Training data fetch | Linear | 1s between attempts | 3 |
 
-**Collection Service - Drawing Upload:**
-```typescript
-async function saveDrawing(drawing: DrawingData, idempotencyKey: string): Promise<string> {
-  // Check idempotency first
-  const cached = await redis.get(`idem:drawing:${idempotencyKey}`);
-  if (cached) return cached;
+### Circuit Breakers
 
-  let minioPath: string | null = null;
-
-  // Retry MinIO upload with exponential backoff
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      minioPath = await minio.putObject(bucket, `drawings/${drawing.id}.json`, JSON.stringify(drawing));
-      break;
-    } catch (err) {
-      if (attempt === 3) throw new Error('MinIO upload failed after retries');
-      await sleep(100 * Math.pow(2, attempt));
-    }
-  }
-
-  // PostgreSQL insert (separate retry loop)
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      await db.query(`INSERT INTO drawings (id, shape_id, stroke_data_path, ...) VALUES ($1, $2, $3, ...)`,
-        [drawing.id, drawing.shapeId, minioPath]);
-      break;
-    } catch (err) {
-      if (attempt === 2) {
-        // Log for orphan cleanup job, but don't fail the request
-        console.error('DB insert failed, MinIO object is orphaned:', minioPath);
-        throw err;
-      }
-      await sleep(50 * Math.pow(2, attempt));
-    }
-  }
-
-  await redis.setex(`idem:drawing:${idempotencyKey}`, 3600, drawing.id);
-  return drawing.id;
-}
-```
-
-### Circuit Breaker Pattern
-
-**Implementation for External Dependencies (Local Dev):**
-```typescript
-// Simple circuit breaker for learning purposes
-class CircuitBreaker {
-  private failures = 0;
-  private lastFailure = 0;
-  private state: 'closed' | 'open' | 'half-open' = 'closed';
-
-  constructor(
-    private threshold: number = 5,      // Open after 5 failures
-    private resetTimeout: number = 30000 // Try again after 30s
-  ) {}
-
-  async call<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.state === 'open') {
-      if (Date.now() - this.lastFailure > this.resetTimeout) {
-        this.state = 'half-open';
-      } else {
-        throw new Error('Circuit breaker is open');
-      }
-    }
-
-    try {
-      const result = await fn();
-      this.onSuccess();
-      return result;
-    } catch (err) {
-      this.onFailure();
-      throw err;
-    }
-  }
-
-  private onSuccess() {
-    this.failures = 0;
-    this.state = 'closed';
-  }
-
-  private onFailure() {
-    this.failures++;
-    this.lastFailure = Date.now();
-    if (this.failures >= this.threshold) {
-      this.state = 'open';
-    }
-  }
-}
-
-// Usage
-const minioBreaker = new CircuitBreaker(5, 30000);
-const result = await minioBreaker.call(() => minio.putObject(...));
-```
-
-**Circuit Breaker Configuration:**
 | Service | Failure Threshold | Reset Timeout | Fallback Behavior |
 |---------|------------------|---------------|-------------------|
-| MinIO | 5 failures | 30s | Return 503, client retries later |
-| PostgreSQL | 3 failures | 15s | Return 503, queue in memory (short-term) |
-| RabbitMQ | 5 failures | 60s | Write to dead-letter table in PostgreSQL |
-| Training Worker | 2 failures | 120s | Mark job as 'failed', notify admin |
+| PostgreSQL | 3 consecutive | 15s | Return 503 with Retry-After header |
+| MinIO | 5 consecutive | 30s | Reject submissions with 503 |
+| RabbitMQ | 5 consecutive | 60s | Write to dead-letter table in PostgreSQL |
 
-### Disaster Recovery (Local Development Context)
-
-For a local learning project, DR focuses on data protection and quick recovery:
-
-**Backup Strategy:**
-```bash
-# PostgreSQL: Daily logical backup (cron job or manual)
-pg_dump -h localhost -U user scale_ai > backup_$(date +%Y%m%d).sql
-
-# MinIO: Sync to local backup directory
-mc mirror local/drawings ./backups/minio/drawings/
-
-# Combined backup script (run before major changes)
-#!/bin/bash
-BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-pg_dump -h localhost -U user scale_ai > "$BACKUP_DIR/postgres.sql"
-mc mirror local/drawings "$BACKUP_DIR/minio/"
-echo "Backup complete: $BACKUP_DIR"
-```
-
-**Restore Procedure:**
-```bash
-# 1. Stop all services
-docker-compose down
-
-# 2. Restore PostgreSQL
-docker-compose up -d postgres
-psql -h localhost -U user -d scale_ai < backup_20240115.sql
-
-# 3. Restore MinIO
-docker-compose up -d minio
-mc mirror ./backups/minio/drawings/ local/drawings/
-
-# 4. Restart all services
-docker-compose up -d
-```
-
-**Backup Testing Checklist (Monthly):**
-- [ ] Restore PostgreSQL backup to a test database
-- [ ] Verify row counts match: `SELECT COUNT(*) FROM drawings`
-- [ ] Restore random MinIO objects and verify JSON validity
-- [ ] Run inference on restored model to verify functionality
-- [ ] Document restore time and any issues encountered
-
-### Failure Scenarios and Responses
+### Failure Scenarios
 
 | Failure | Detection | Response | Recovery |
 |---------|-----------|----------|----------|
-| MinIO down | Circuit breaker trips | Return 503, log to file | Retry after reset timeout |
-| PostgreSQL down | Connection timeout | Return 503, queue minimal data in Redis | Drain Redis queue on recovery |
-| RabbitMQ down | Publish fails | Write to `dead_letter_jobs` table | Background job replays on recovery |
-| Training worker crash | Job timeout (30min) | Mark job as 'failed' | Admin manually restarts job |
-| Model file corrupted | Inference throws error | Fall back to previous model version | Re-run training job |
+| MinIO down | Circuit breaker opens | Reject uploads, return 503 | Retry after reset timeout |
+| PostgreSQL down | Connection pool errors | All API requests fail | Alert immediately |
+| RabbitMQ down | Publish fails | Write job to PostgreSQL table | Replay on recovery |
+| Training worker crash | Job timeout (30min) | Mark job as 'failed' | Admin restarts manually |
+| Model file corrupted | Inference error | Fall back to previous model | Re-run training |
 
-## Data Lifecycle Policies
+### Graceful Shutdown
+
+All services handle SIGTERM/SIGINT: stop cleanup scheduler (collection), close database connections, log shutdown reason, exit cleanly.
+
+## Data Lifecycle
 
 ### Retention Policies
 
-| Data Type | Hot Storage | Warm Storage | Cold/Archive | Deletion |
-|-----------|-------------|--------------|--------------|----------|
-| Drawings (stroke JSON) | 30 days | 30-180 days | 180+ days | Never (training data) |
-| Drawing metadata (PostgreSQL) | Indefinite | N/A | N/A | Never |
-| Training jobs | Indefinite | N/A | N/A | Completed jobs > 1 year: archive |
-| Model files | Active + last 5 versions | Older versions | N/A | After 2 years if unused |
-| User sessions | 7 days | N/A | N/A | Auto-expire |
-| Inference logs | 7 days | 7-30 days | N/A | 30 days |
+| Data Type | Retention | Action |
+|-----------|-----------|--------|
+| Drawing stroke data | Indefinite (training data) | Never delete; tier to cold storage after 180 days |
+| Drawing metadata (PostgreSQL) | Indefinite | Archive completed training jobs > 1 year |
+| Soft-deleted drawings | 30 days | Permanent delete (DB + MinIO) |
+| Flagged drawings | 90 days | Soft-delete (archive) |
+| Model files | Active + last 5 versions | Delete unused models after 2 years |
+| User sessions (Redis) | 7 days | Auto-expire via TTL |
+| Idempotency keys (Redis) | 1 hour | Auto-expire via TTL |
+| Cached stats (Redis) | 5 minutes | Auto-expire via TTL |
 
-### TTL Implementation
+### Storage Tiering (Production)
 
-**Redis Keys:**
-```typescript
-// Session data: 7 days
-await redis.setex(`session:${sessionId}`, 7 * 24 * 3600, sessionData);
-
-// Idempotency keys: 1 hour (enough to handle retries)
-await redis.setex(`idem:drawing:${key}`, 3600, drawingId);
-
-// Cached stats: 5 minutes
-await redis.setex('stats:dashboard', 300, JSON.stringify(stats));
-
-// Rate limit counters: 1 minute window
-await redis.setex(`ratelimit:${ip}`, 60, count);
+```
+Hot  (0-30 days):   S3 Standard — fast access for active training
+Warm (30-180 days): S3 Infrequent Access — still accessible for retraining
+Cold (180+ days):   S3 Glacier — compressed, archive only
 ```
 
-**PostgreSQL Cleanup Jobs:**
-```sql
--- Run daily: Archive old inference logs
-INSERT INTO inference_logs_archive
-SELECT * FROM inference_logs WHERE created_at < NOW() - INTERVAL '30 days';
-DELETE FROM inference_logs WHERE created_at < NOW() - INTERVAL '30 days';
+## Scalability Considerations
 
--- Run weekly: Clean up orphaned drawings (MinIO exists, DB doesn't)
--- Implemented as a Node.js script that lists MinIO objects and checks DB
-```
+### Data Collection at Scale
 
-### Storage Tiering (Local Dev Simulation)
+At 100K concurrent users submitting drawings:
+1. **Horizontal scaling** of collection service (stateless, behind load balancer)
+2. **Pre-signed URLs** for direct-to-storage uploads (bypass API server for binary data)
+3. **Client-side batching** (submit multiple drawings in single request)
+4. **Message queue** for async post-processing (quality scoring, metadata enrichment)
 
-For learning purposes, simulate tiering with different MinIO buckets:
+### Training Large Datasets
 
-```yaml
-# docker-compose.yml buckets represent tiers
-# In production: S3 Standard → S3 Infrequent Access → S3 Glacier
+At 600M drawings:
+1. **Streaming data loader** — don't load all into memory; stream from storage
+2. **Distributed training** — multiple GPUs/workers for parallel training
+3. **Data sampling** — train on representative subset; validate on full set
+4. **Incremental training** — fine-tune on new data rather than retraining from scratch
 
-# Local simulation:
-# - drawings-hot/    : Recent 30 days, fast access
-# - drawings-warm/   : 30-180 days, still accessible
-# - drawings-archive/: 180+ days, compressed JSON
-```
+### Model Serving at Scale
 
-**Tiering Job (Background Worker):**
-```typescript
-// Run daily at 2 AM
-async function tieringJob() {
-  // Move drawings older than 30 days from hot to warm
-  const hotToWarm = await db.query(`
-    SELECT id, stroke_data_path FROM drawings
-    WHERE created_at < NOW() - INTERVAL '30 days'
-      AND stroke_data_path LIKE 'drawings-hot/%'
-  `);
+At 10,000 inference QPS:
+1. **Model caching** — keep model weights warm in memory (no disk I/O per request)
+2. **Batch inference** — group multiple classification requests
+3. **Edge deployment** — TensorFlow.js in browser for zero-latency classification
+4. **Model optimization** — quantization, pruning for smaller/faster models
 
-  for (const row of hotToWarm.rows) {
-    const data = await minio.getObject('drawings-hot', row.id + '.json');
-    await minio.putObject('drawings-warm', row.id + '.json', data);
-    await minio.removeObject('drawings-hot', row.id + '.json');
-    await db.query(`UPDATE drawings SET stroke_data_path = $1 WHERE id = $2`,
-      [`drawings-warm/${row.id}.json`, row.id]);
-  }
+### What Breaks First
 
-  // Move drawings older than 180 days from warm to archive (compressed)
-  const warmToArchive = await db.query(`
-    SELECT id, stroke_data_path FROM drawings
-    WHERE created_at < NOW() - INTERVAL '180 days'
-      AND stroke_data_path LIKE 'drawings-warm/%'
-  `);
+1. **Object storage write throughput** at ~2,000 drawings/s — mitigated by pre-signed URLs and horizontal collection scaling
+2. **PostgreSQL connections** at ~1,000 concurrent — mitigated by connection pooling and read replicas
+3. **Training worker GPU** at >600M drawings — mitigated by data sampling and distributed training
 
-  for (const row of warmToArchive.rows) {
-    const data = await minio.getObject('drawings-warm', row.id + '.json');
-    const compressed = zlib.gzipSync(data);
-    await minio.putObject('drawings-archive', row.id + '.json.gz', compressed);
-    await minio.removeObject('drawings-warm', row.id + '.json');
-    await db.query(`UPDATE drawings SET stroke_data_path = $1 WHERE id = $2`,
-      [`drawings-archive/${row.id}.json.gz`, row.id]);
-  }
-}
-```
+## Trade-offs Summary
 
-### Backfill and Replay Procedures
-
-**Scenario 1: Reprocess All Drawings with New Quality Scoring Algorithm**
-```bash
-# 1. Create backfill job in admin UI or via API
-POST /api/admin/backfill
-{
-  "type": "quality_rescore",
-  "filter": { "created_after": "2024-01-01" },
-  "batch_size": 1000
-}
-
-# 2. Worker processes in batches
-# - Fetches drawings in chunks of 1000
-# - Applies new scoring algorithm
-# - Updates quality_score in PostgreSQL
-# - Logs progress to backfill_jobs table
-```
-
-**Scenario 2: Replay Failed Training Job with Fixed Data**
-```typescript
-// Admin UI: "Replay Training Job" button
-async function replayTrainingJob(originalJobId: string) {
-  const original = await db.query(`SELECT config FROM training_jobs WHERE id = $1`, [originalJobId]);
-
-  // Create new job with same config but updated timestamp
-  const newJob = await db.query(`
-    INSERT INTO training_jobs (config, status, replay_of)
-    VALUES ($1, 'pending', $2)
-    RETURNING id
-  `, [original.rows[0].config, originalJobId]);
-
-  // Publish to RabbitMQ
-  await rabbit.publish('training_jobs', { jobId: newJob.rows[0].id });
-
-  return newJob.rows[0].id;
-}
-```
-
-**Scenario 3: Backfill Missing MinIO Objects from Backup**
-```bash
-#!/bin/bash
-# Compare MinIO objects with PostgreSQL records, restore missing from backup
-
-# 1. Get list of expected objects from PostgreSQL
-psql -h localhost -U user -d scale_ai -t -c \
-  "SELECT stroke_data_path FROM drawings WHERE stroke_data_path IS NOT NULL" \
-  > expected_objects.txt
-
-# 2. Get list of actual objects in MinIO
-mc ls --recursive local/drawings | awk '{print $NF}' > actual_objects.txt
-
-# 3. Find missing objects
-comm -23 <(sort expected_objects.txt) <(sort actual_objects.txt) > missing_objects.txt
-
-# 4. Restore from backup
-while read object; do
-  if [ -f "./backups/minio/$object" ]; then
-    mc cp "./backups/minio/$object" "local/$object"
-    echo "Restored: $object"
-  else
-    echo "MISSING FROM BACKUP: $object"
-  fi
-done < missing_objects.txt
-```
-
-**Backfill Job Tracking:**
-```sql
--- Track backfill job progress
-CREATE TABLE backfill_jobs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    type VARCHAR(50) NOT NULL,  -- 'quality_rescore', 'tier_migration', 'replay'
-    status VARCHAR(50) DEFAULT 'pending',
-    total_items INT,
-    processed_items INT DEFAULT 0,
-    failed_items INT DEFAULT 0,
-    config JSONB,
-    error_log JSONB,
-    started_at TIMESTAMP,
-    completed_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-```
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Drawing storage format | Stroke JSON | Rasterized images | 10-100x smaller, preserves temporal data |
+| Submission model | REST on completion | WebSocket streaming | Simpler, lower load, natural idempotency |
+| Training trigger | RabbitMQ job queue | Synchronous API | Training takes minutes; async is required |
+| ML framework | PyTorch (Python worker) | TensorFlow.js (in-browser) | GPU training, mature ecosystem |
+| Object storage | S3 (MinIO locally) | PostgreSQL BYTEA | Scales to petabytes; BYTEA doesn't |
+| Admin auth | Session-based (Redis) | JWT | Immediate revocation, simpler |
+| Inference placeholder | Heuristic analysis | Full ML model | Proves API contract; swap for real model later |
+| Model activation | Single-active with DB constraint | Feature flags | Simpler; unique index enforces invariant |
 
 ## Implementation Notes
 
-This section documents the reliability and observability patterns implemented in the backend services, explaining the rationale behind each design decision.
+This section documents the actual local development setup and maps production design decisions to the working implementation.
 
-### Idempotency Middleware
-
-**What it does:** Prevents duplicate submissions by tracking processed requests in Redis with TTL-based keys.
-
-**Why it matters:**
-- **Network failures cause retries:** When a client submits a drawing but doesn't receive a response (network timeout, server restart), it will retry. Without idempotency, this creates duplicate drawings in the database.
-- **User double-clicks:** Users may accidentally click "Submit" multiple times before the UI disables the button.
-- **Client-side retry logic:** Modern HTTP clients (Axios, fetch with retry) automatically retry on network errors.
-
-**How it works:**
-1. Client sends request with `X-Idempotency-Key` header (or one is generated from request body hash)
-2. Middleware checks Redis for existing response with that key
-3. If found, returns cached response immediately (no re-processing)
-4. If not found, marks as "processing" and forwards to handler
-5. After handler completes, caches the response with configurable TTL (default: 1 hour)
-
-**Trade-offs:**
-- Requires Redis dependency (already in use for caching)
-- Adds ~1-2ms latency per request for Redis check
-- TTL must balance between catching retries (short enough) and not growing unbounded (long enough)
-
-```typescript
-// Usage in collection service
-app.post('/api/drawings',
-  idempotencyMiddleware('drawing', { ttlSeconds: 3600 }),
-  async (req, res) => { ... }
-)
-```
-
-### Circuit Breakers
-
-**What it does:** Detects when external services (PostgreSQL, MinIO, RabbitMQ) are failing and "opens" to reject requests immediately, giving the service time to recover.
-
-**Why it matters:**
-- **Prevents cascade failures:** When MinIO is down, continuing to call it wastes resources, increases latency, and may exhaust connection pools. Circuit breakers fail fast with a clear error.
-- **Enables graceful degradation:** When the circuit opens, the service returns HTTP 503 with `Retry-After` header, allowing load balancers and clients to retry intelligently.
-- **Protects downstream services:** A struggling database doesn't need 10,000 new connections per second. Circuit breakers reduce load during recovery.
-
-**How it works:**
-1. **Closed state (normal):** All requests pass through. Failures are counted.
-2. **Open state (failing):** After N consecutive failures, requests are rejected immediately without calling the service.
-3. **Half-open state (testing):** After a reset timeout, a few requests are allowed through. If they succeed, the circuit closes. If they fail, it reopens.
-
-**Configuration per service:**
-
-| Service    | Failure Threshold | Reset Timeout | Rationale |
-|------------|------------------|---------------|-----------|
-| PostgreSQL | 3 failures       | 15 seconds    | Critical dependency, fast recovery detection |
-| MinIO      | 5 failures       | 30 seconds    | More tolerant, object storage is async |
-| RabbitMQ   | 5 failures       | 60 seconds    | Longer timeout, messages can queue in dead-letter table |
-
-```typescript
-// Usage with circuit breaker
-const result = await minioCircuitBreaker.execute(async () => {
-  return uploadDrawing(drawingId, strokeData)
-})
-```
-
-### Retry Logic with Exponential Backoff
-
-**What it does:** Automatically retries failed operations with increasing delays between attempts.
-
-**Why it matters:**
-- **Transient failures are common:** Network hiccups, brief resource contention, and temporary overloads resolve themselves quickly.
-- **Exponential backoff prevents thundering herd:** If 1000 requests fail simultaneously and all retry after 1 second, you create a spike. Exponential delays spread retries over time.
-- **Jitter prevents synchronized retries:** Adding randomness to delays prevents all clients from retrying at exactly the same moment.
-
-**Retry presets:**
-
-| Operation  | Max Retries | Initial Delay | Max Delay | Backoff |
-|------------|------------|---------------|-----------|---------|
-| MinIO      | 4          | 100ms         | 2000ms    | 2x      |
-| PostgreSQL | 3          | 50ms          | 500ms     | 2x      |
-| RabbitMQ   | 5          | 500ms         | 5000ms    | 2x      |
-
-```typescript
-// Example: Upload with retry
-const result = await withRetry(
-  () => minio.putObject(bucket, key, data),
-  { maxRetries: 4, initialDelayMs: 100, operationName: 'minio-upload' }
-)
-```
-
-### Structured Logging with Pino
-
-**What it does:** Outputs JSON-formatted logs with consistent structure for log aggregation and analysis.
-
-**Why it matters:**
-- **Debuggability:** When investigating a bug, you can filter logs by `requestId`, `userId`, or `endpoint` to trace a single request across services.
-- **Alerting:** Log aggregation tools (Loki, Elasticsearch, CloudWatch) can parse JSON logs and trigger alerts on error patterns.
-- **Performance:** Pino is one of the fastest Node.js loggers, with minimal overhead even at high log volumes.
-
-**Log structure:**
-```json
-{
-  "level": "info",
-  "time": "2024-01-15T10:30:00.000Z",
-  "service": "collection",
-  "requestId": "abc-123",
-  "msg": "Drawing saved successfully",
-  "drawingId": "uuid-...",
-  "shape": "circle",
-  "processingTimeMs": 45
-}
-```
-
-**Child loggers for request context:**
-```typescript
-const reqLogger = createChildLogger({
-  requestId: req.headers['x-request-id'],
-  userId: session?.userId,
-})
-reqLogger.info({ msg: 'Processing request', endpoint: '/api/drawings' })
-```
-
-### Prometheus Metrics
-
-**What it does:** Exposes a `/metrics` endpoint with Prometheus-formatted metrics for scraping.
-
-**Why it matters:**
-- **Visibility:** Metrics show request rates, error rates, latencies, and resource usage in real-time.
-- **Alerting:** Set alerts on error rate > 1%, p99 latency > 500ms, or circuit breaker open.
-- **Capacity planning:** Historical metrics show traffic patterns and help predict when to scale.
-
-**Key metrics exposed:**
-
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| `http_requests_total` | Counter | method, route, status_code | Request volume and success rate |
-| `http_request_duration_seconds` | Histogram | method, route | Latency percentiles |
-| `drawings_total` | Counter | shape, status | Business metric for drawing submissions |
-| `external_service_calls_total` | Counter | service, operation, status | Dependency health |
-| `circuit_breaker_state` | Gauge | service | 0=closed, 1=half-open, 2=open |
+### Local Architecture
 
 ```
-# Example /metrics output
-http_requests_total{method="POST",route="/api/drawings",status_code="201"} 12345
-http_request_duration_seconds_bucket{method="POST",route="/api/drawings",le="0.1"} 11000
-drawings_total{shape="circle",status="success"} 3456
-circuit_breaker_state{service="minio"} 0
+┌─────────────────────────────────────────────────────────┐
+│                  Web Browser (React)                     │
+│   Drawing Game │ Admin Portal │ Implementor Portal       │
+│                   Port 5173                              │
+└────────┬──────────────┬──────────────────┬───────────────┘
+         │              │                  │
+         ▼              ▼                  ▼
+┌─────────────┐ ┌─────────────┐ ┌─────────────────┐
+│ Collection  │ │   Admin     │ │   Inference     │
+│ Service     │ │   Service   │ │   Service       │
+│ Port 3001   │ │   Port 3002 │ │   Port 3003     │
+└──────┬──────┘ └──────┬──────┘ └──────┬──────────┘
+       │               │               │
+       └───────────────┼───────────────┘
+                       │
+    ┌──────────────────┼──────────────────────┐
+    │         ┌────────┼────────┐             │
+    ▼         ▼        ▼        ▼             ▼
+┌──────┐ ┌──────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+│Redis │ │MinIO │ │PostgreSQL│ │ RabbitMQ │ │ Training │
+│:6379 │ │:9000 │ │  :5432   │ │  :5672   │ │ Worker   │
+└──────┘ └──────┘ └──────────┘ └──────────┘ │ (Python) │
+                                             └──────────┘
 ```
 
-### Health Check Endpoints
+Three separate Express microservices run independently on different ports. All infrastructure runs via Docker Compose, including a Python training worker that consumes jobs from RabbitMQ. The frontend uses hash-based routing (`/`, `#admin`, `#implement`) to switch between portals.
 
-**What it does:** Provides `/health`, `/health/live`, and `/health/ready` endpoints for container orchestration.
+### Production Patterns Actually Implemented
 
-**Why it matters:**
-- **Container orchestration:** Kubernetes uses liveness probes to restart unhealthy containers and readiness probes to route traffic only to ready instances.
-- **Load balancer integration:** Load balancers use health checks to remove unhealthy backends from rotation.
-- **Debugging:** The full `/health` endpoint shows dependency status and circuit breaker states for troubleshooting.
+| Pattern | File Path | Description |
+|---------|-----------|-------------|
+| Microservice decomposition | `backend/src/collection/`, `admin/`, `inference/` | Three independent Express services with separate entry points |
+| Idempotency middleware | `backend/src/shared/idempotency.ts` | Redis-backed dedup for drawing submissions; prevents duplicates from retries and double-clicks |
+| Circuit breakers | `backend/src/shared/circuitBreaker.ts` | Wraps PostgreSQL and MinIO calls; fails fast when dependencies are unhealthy; returns 503 with Retry-After |
+| Retry with exponential backoff | `backend/src/shared/retry.ts` | Configurable retry presets for MinIO, PostgreSQL, and RabbitMQ operations |
+| Prometheus metrics (prom-client) | `backend/src/shared/metrics.ts` | HTTP requests, inference latency, generation latency, external service calls, circuit breaker state |
+| Structured logging (Pino) | `backend/src/shared/logger.ts` | JSON logs with service name, request IDs, child loggers for request context |
+| Health checks (3-tier) | `backend/src/shared/healthCheck.ts` | `/health`, `/health/live`, `/health/ready` with dependency status and circuit breaker state |
+| Session-based admin auth | `backend/src/shared/auth.ts` | Redis-backed sessions with httpOnly cookies for admin portal |
+| Data lifecycle cleanup | `backend/src/shared/cleanup.ts` | Scheduled job: permanently deletes soft-deleted drawings after 30 days, archives flagged after 90 days |
+| Quality scoring | `backend/src/shared/quality.ts` | Automated quality assessment of drawings |
+| Training job queue | `backend/src/shared/queue.ts` | RabbitMQ publish/consume for training jobs between admin service and Python worker |
+| Object storage abstraction | `backend/src/shared/storage.ts` | MinIO client for drawing uploads and model storage, bucket management |
+| Database transactions | `backend/src/shared/db.ts` | `withTransaction()` helper for multi-step operations |
+| Redis caching | `backend/src/shared/cache.ts` | Dashboard stats cache, session storage with configurable TTL |
+| Soft deletes | `backend/src/db/init.sql` | `deleted_at` column on drawings for trash/restore functionality |
+| Prototype-based generation | `backend/src/shared/prototype.ts` | Generates shapes from trained prototype data with variation |
+| Heuristic classifier | `backend/src/inference/index.ts` | Placeholder inference using stroke analysis (bounding box, aspect ratio, stroke count) |
+| Python training worker | `training/worker.py` | Consumes RabbitMQ jobs, trains PyTorch CNN, saves models to MinIO |
+| Vitest test suite | `backend/src/collection/app.test.ts` | Unit tests with mocked shared modules |
+| Graceful shutdown | All service entry points | SIGTERM/SIGINT handlers clean up resources |
 
-**Endpoint semantics:**
+### What Was Simplified or Substituted
 
-| Endpoint | Purpose | Returns 200 when... |
-|----------|---------|---------------------|
-| `/health/live` | Liveness probe | Process is running (always 200) |
-| `/health/ready` | Readiness probe | All dependencies are healthy |
-| `/health` | Full status | Always (but body shows status details) |
+| Production Design | Local Substitute | Impact |
+|-------------------|------------------|--------|
+| S3 multi-region | MinIO single instance (Docker) | No replication; single point of failure |
+| Redis Cluster | Single Valkey instance (Docker) | No partitioning |
+| PostgreSQL primary + replicas | Single PostgreSQL instance (Docker) | No read replicas |
+| GPU-accelerated training | CPU training on local machine | Slower training; sufficient for 5 shapes |
+| Real ML inference model | Heuristic-based stroke analysis | Proves API contract; low accuracy |
+| API Gateway / Load Balancer | Direct connection to individual services | No unified entry point; each service on its own port |
+| Pre-signed URLs for upload | API-proxied uploads | Higher API server load |
+| OAuth / social login | Anonymous sessions (auto-generated) | No real user identity |
+| Storage tiering (hot/warm/cold) | Single MinIO bucket | No lifecycle management |
+| Distributed training | Single-process PyTorch | No data parallelism |
 
-```json
-// GET /health response
-{
-  "status": "healthy",
-  "service": "collection",
-  "version": "0.1.0",
-  "uptime": 3600,
-  "dependencies": [
-    { "name": "postgres", "status": "healthy", "latencyMs": 2 },
-    { "name": "redis", "status": "healthy", "latencyMs": 1 },
-    { "name": "minio", "status": "healthy", "latencyMs": 5 }
-  ],
-  "circuitBreakers": [
-    { "name": "minio", "state": "closed", "failures": 0 }
-  ]
-}
-```
+### What Was Omitted
 
-### Data Lifecycle Management
-
-**What it does:** Scheduled jobs clean up old data based on configurable retention policies.
-
-**Why it matters:**
-- **Storage cost control:** Without cleanup, storage grows indefinitely. Old flagged drawings waste space.
-- **Performance:** Large tables slow down queries. Archiving old data keeps the hot dataset manageable.
-- **Compliance:** Some data may need deletion after retention periods expire.
-
-**Cleanup jobs:**
-
-| Job | Retention | Action |
-|-----|-----------|--------|
-| Soft-deleted drawings | 30 days | Permanently delete (DB + MinIO) |
-| Flagged drawings | 90 days | Soft-delete (archive) |
-| Orphaned data | N/A | Detect MinIO objects without DB records or vice versa |
-
-**Configuration via environment variables:**
-```bash
-CLEANUP_INTERVAL_HOURS=24          # How often to run cleanup
-CLEANUP_DRY_RUN=false              # Set to true to log without deleting
-SOFT_DELETE_RETENTION_DAYS=30     # Days before permanent deletion
-FLAGGED_RETENTION_DAYS=90         # Days before flagged drawings are archived
-```
-
-**Manual cleanup trigger (admin API):**
-```bash
-POST /api/admin/cleanup/run
-{ "dryRun": true, "batchSize": 100 }
-```
-
-### Summary: Defense in Depth
-
-These patterns work together to create a resilient system:
-
-1. **Idempotency** prevents duplicate data from client retries
-2. **Retries** handle transient failures automatically
-3. **Circuit breakers** prevent cascade failures when retries aren't enough
-4. **Health checks** enable orchestrators to route around unhealthy instances
-5. **Metrics** provide visibility into system health
-6. **Structured logs** enable debugging when things go wrong
-7. **Cleanup jobs** maintain system hygiene over time
-
-Each pattern addresses a specific failure mode, and together they provide defense in depth against the inevitable failures of distributed systems.
-
-## Frontend Architecture
-
-The frontend is built with React 18 + TypeScript + Vite, following a feature-based organization pattern. Components are organized by domain and reusability.
-
-### Directory Structure
-
-```
-frontend/src/
-├── components/           # Shared, reusable components
-│   ├── DrawingCard/     # Drawing thumbnail with actions (flag, delete, restore)
-│   ├── PostItCanvas/    # Skeuomorphic drawing canvas
-│   └── StrokeThumbnail/ # Renders stroke data as SVG thumbnail
-├── routes/              # Feature-based pages
-│   ├── admin/           # Admin dashboard (data management)
-│   │   ├── AdminDashboard.tsx    # Main container with auth and state management
-│   │   ├── AdminDashboard.css    # Dashboard-specific styles
-│   │   └── components/           # Dashboard-specific components
-│   │       ├── index.ts          # Barrel exports
-│   │       ├── AdminLogin.tsx    # Authentication form
-│   │       ├── StatCard.tsx      # Metric display card
-│   │       ├── OverviewTab.tsx   # Dashboard overview with stats
-│   │       ├── DrawingsTab.tsx   # Drawing gallery with filters
-│   │       ├── QualityTab.tsx    # Batch quality analysis
-│   │       └── TrainingTab.tsx   # Model training management
-│   └── implement/       # Implementor portal (model testing)
-│       └── ImplementorPortal.tsx
-├── services/            # API clients
-│   └── api.ts           # Typed API functions for all backend services
-├── App.tsx              # Root component with routing
-└── main.tsx             # Application entry point
-```
-
-### Component Organization Principles
-
-**1. Feature Encapsulation**
-Each major feature (admin, implement) has its own directory under `routes/`. Complex pages like AdminDashboard have a nested `components/` directory for page-specific sub-components that are not reused elsewhere.
-
-**2. Shared vs. Local Components**
-- `src/components/`: Reusable across multiple features (e.g., DrawingCard is used in both admin gallery and could be used in user history)
-- `routes/<feature>/components/`: Specific to that feature, not exported globally
-
-**3. Barrel Exports**
-Each component directory has an `index.ts` for clean imports:
-```typescript
-// Clean import from barrel
-import { AdminLogin, StatCard, OverviewTab } from './components'
-
-// Instead of multiple individual imports
-import { AdminLogin } from './components/AdminLogin'
-import { StatCard } from './components/StatCard'
-```
-
-**4. Component Size Guidelines**
-- Target: Under 200 lines per component
-- Complex components are split into logical sub-components
-- Each component has a single responsibility
-
-### Admin Dashboard Architecture
-
-The AdminDashboard is the most complex page, organized as follows:
-
-```
-AdminDashboard (Container Component)
-├── Manages: auth state, data fetching, global error state
-├── Provides: callbacks to child components for mutations
-│
-├── AdminLogin         # Shown when not authenticated
-├── DashboardHeader    # Title and user menu
-├── DashboardNav       # Tab navigation
-└── Tab Components (conditional rendering)
-    ├── OverviewTab    # Stats cards + charts
-    ├── DrawingsTab    # Gallery + filters
-    ├── QualityTab     # Analysis controls + results
-    └── TrainingTab    # Model list + training controls
-```
-
-**State Management**
-- Container (AdminDashboard) owns all shared state
-- Tab components receive data via props
-- Mutations trigger callbacks that update container state
-- Local UI state (filters, form inputs) managed within tab components
-
-**Data Flow**
-```
-API → AdminDashboard (fetches, caches) → Tab Components (display, user actions)
-                    ↑                                      │
-                    └──────────────────────────────────────┘
-                          (callbacks trigger refetch)
-```
-
-### Styling Approach
-
-- **CSS Modules**: Each component has a co-located `.css` file
-- **Class naming**: BEM-like conventions (`.admin-header`, `.stat-card`, `.filter-group`)
-- **No global styles**: Except for base resets in `index.css`
-
-### JSDoc Documentation
-
-All components and significant functions have JSDoc comments:
-
-```typescript
-/**
- * StatCard component - Displays a single statistic with title and value.
- * Used in the admin dashboard overview to show key metrics.
- * @module routes/admin/components/StatCard
- */
-
-/**
- * @param props - Component props
- * @param props.title - Label for the statistic
- * @param props.value - The statistic value
- * @param props.color - Color theme (blue, green, red, purple)
- */
-export function StatCard({ title, value, color }: StatCardProps) { ... }
-```
-
-## Future Enhancements
-
-1. **Active Learning:** Prioritize collecting drawings for underperforming classes
-2. **Quality Estimation:** Auto-score drawings based on similarity to known good examples
-3. **Generative Models:** Train models to generate shapes (VAE, GAN)
-4. **Multi-task Learning:** Train single model for recognition + generation
-5. **Federated Learning:** Train on-device without centralizing data
-6. **Gamification:** Leaderboards, achievements, challenges
+- API Gateway / unified load balancer across microservices
+- CDN for static assets
+- Kubernetes orchestration
+- Database sharding
+- Multi-region deployment
+- Pre-signed URLs for direct-to-storage uploads
+- Distributed / GPU training
+- Real-time WebSocket streaming of drawing strokes
+- TensorFlow.js in-browser inference
+- Model A/B testing framework
+- Data augmentation pipeline (separate from training)
+- Batch inference API
+- Model quantization / optimization
+- End-to-end integration tests
+- Client-side stroke simplification / compression

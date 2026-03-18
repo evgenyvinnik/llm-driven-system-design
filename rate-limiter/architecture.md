@@ -2,121 +2,191 @@
 
 ## System Overview
 
-An API rate limiting service to prevent abuse, implementing multiple algorithms for different use cases.
+A distributed API rate limiting service that prevents abuse by tracking request counts per client across multiple API gateway nodes. The system implements five rate limiting algorithms (Fixed Window, Sliding Window, Sliding Log, Token Bucket, Leaky Bucket) with centralized state in Redis, providing consistent enforcement regardless of which gateway node handles a request. This project explores distributed counting, sub-millisecond latency constraints, and graceful degradation under infrastructure failures.
 
 ## Requirements
 
 ### Functional Requirements
 
-- **Request Counting** - Track number of requests per client/API key
-- **Multiple Algorithms** - Support different rate limiting strategies:
-  - Fixed Window Counter
-  - Sliding Window Counter
-  - Sliding Window Log
-  - Token Bucket
-  - Leaky Bucket
-- **Distributed Limiting** - Work across multiple API servers consistently
-- **Custom Rules** - Configure different limits per endpoint, user tier, API key
-- **Response Headers** - Return remaining quota and reset time to clients
+- **Request Counting**: Track number of requests per client/API key across all gateway nodes
+- **Multiple Algorithms**: Support Fixed Window, Sliding Window Counter, Sliding Window Log, Token Bucket, and Leaky Bucket strategies
+- **Distributed Limiting**: Enforce limits consistently across N API gateway nodes sharing Redis state
+- **Custom Rules**: Configure different limits per endpoint, user tier, and API key
+- **Response Headers**: Return standard `X-RateLimit-*` headers with remaining quota and reset time
+- **Batch Checking**: Check multiple identifiers in a single request for batch operations
 
 ### Non-Functional Requirements
 
-- **Low Latency** - Rate check must add <5ms to request processing
-- **High Availability** - Must not become a single point of failure
-- **Accuracy** - Limits should be respected within 1-5% tolerance
-- **Scalability** - Handle 100K+ requests per second per Redis instance
+- **Low Latency**: Rate check must add < 5ms to request processing (5% of 100ms latency budget)
+- **High Availability**: Must not become a single point of failure; fail-open on Redis outage
+- **Accuracy**: Limits respected within 1-5% tolerance (depending on algorithm)
+- **Scalability**: Handle 100K+ requests per second per Redis instance; 1M+ with sharding
+- **Observability**: Full Prometheus metrics for tuning limits and detecting abuse
 
 ### Out of Scope
 
 - DDoS protection (layer 3/4 attacks)
-- Geographic-based limiting
+- Geographic-based rate limiting
 - Machine learning-based anomaly detection
+- Request content inspection
 
 ## Capacity Estimation
 
-### Assumptions
-- 100,000 API customers
-- 1 million requests per second across all APIs
-- Average customer makes 100 requests/second during peak
-- 10 API gateway nodes
+### Production Scale
+
+| Metric | Value |
+|--------|-------|
+| API customers | 100,000 |
+| Total RPS (all APIs) | 1,000,000 |
+| Peak per-customer RPS | 100 |
+| API gateway nodes | 10 |
+| RPS per gateway node | 100,000 |
 
 ### Storage Estimates
-- Rate limit state per customer: ~100 bytes
-- 100,000 customers x 100 bytes = 10 MB
-- With sliding window buckets: ~50 MB total
+
+| Data | Size | Notes |
+|------|------|-------|
+| Rate limit state per customer | ~100 bytes | Counter + metadata |
+| Total active state (Redis) | ~10 MB | 100K customers x 100 bytes |
+| With sliding window buckets | ~50 MB | 2 windows per customer |
+| With sliding log (worst case) | ~500 MB | 1000 timestamps per customer |
 
 ### Latency Budget
-- Total API latency target: 100ms
-- Rate limiting overhead: <5ms (5% of budget)
-- Network round-trip to Redis: ~1ms within same datacenter
+
+| Component | Budget |
+|-----------|--------|
+| Total API latency target | 100 ms |
+| Rate limiting overhead | < 5 ms (5%) |
+| Network to Redis (same DC) | ~1 ms |
+| Redis operation | ~0.1 ms |
+| Lua script execution | ~0.5 ms |
 
 ## High-Level Architecture
 
 ```
-┌──────────────┐     ┌───────────────────────────────────────────────────┐
-│   Client     │────▶│                  API Gateway                      │
-│              │     │  ┌─────────────┐  ┌──────────┐  ┌─────────────┐  │
-└──────────────┘     │  │ Auth        │──│  Rate    │──│  Route to   │  │
-                     │  │ Middleware  │  │  Limiter │  │  Backend    │  │
-                     │  └─────────────┘  └────┬─────┘  └─────────────┘  │
-                     └────────────────────────┼──────────────────────────┘
-                                              │
-                     ┌────────────────────────┼────────────────────────┐
-                     │                        │                        │
-              ┌──────▼──────┐         ┌───────▼───────┐        ┌───────▼───────┐
-              │ API Gateway │         │ API Gateway   │        │ API Gateway   │
-              │   Node 1    │         │   Node 2      │        │   Node N      │
-              └──────┬──────┘         └───────┬───────┘        └───────┬───────┘
-                     │                        │                        │
-                     └────────────────────────┼────────────────────────┘
-                                              │
-                                    ┌─────────▼─────────┐
-                                    │   Redis Cluster   │
-                                    │  (Rate Counters)  │
-                                    └─────────┬─────────┘
-                                              │
-                                    ┌─────────▼─────────┐
-                                    │    PostgreSQL     │
-                                    │  (Configuration)  │
-                                    └───────────────────┘
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   Client A   │  │   Client B   │  │   Client N   │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         │
+                ┌────────▼────────┐
+                │   L7 Load       │
+                │   Balancer      │
+                └────────┬────────┘
+                         │
+         ┌───────────────┼───────────────┐
+         │               │               │
+┌────────▼────────┐ ┌────▼────────┐ ┌────▼────────┐
+│  API Gateway 1  │ │ API Gateway 2│ │API Gateway N│
+│  ┌────────────┐ │ │             │ │             │
+│  │ Auth MW    │ │ │  (same      │ │  (same      │
+│  ├────────────┤ │ │   stack)    │ │   stack)    │
+│  │ Rate Limit │ │ │             │ │             │
+│  │ Middleware │ │ │             │ │             │
+│  ├────────────┤ │ │             │ │             │
+│  │ Route to   │ │ │             │ │             │
+│  │ Backend    │ │ │             │ │             │
+│  └────────────┘ │ │             │ │             │
+└────────┬────────┘ └──────┬──────┘ └──────┬──────┘
+         │                 │               │
+         └─────────────────┼───────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │     Redis Cluster       │
+              │   (Rate Limit State)    │
+              │                         │
+              │  Counters, Sorted Sets, │
+              │  Hashes, Lua Scripts    │
+              └────────────┬────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │      PostgreSQL         │
+              │   (Rule Configuration)  │
+              └────────────┬────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │      RabbitMQ           │
+              │  (Metrics Aggregation,  │
+              │   Audit Events)         │
+              └─────────────────────────┘
 ```
 
-### Core Components
+## Core Components
 
-1. **Rate Limiter Middleware** - Express middleware that intercepts requests
-2. **Algorithm Factory** - Creates appropriate rate limiter based on configuration
-3. **Redis Client** - Manages distributed state
-4. **Metrics Collector** - Tracks performance and usage metrics
-5. **Configuration Service** - Loads rules from PostgreSQL (future)
+### 1. Rate Limiter Middleware
+
+Express middleware that intercepts every request before it reaches the backend. Extracts the client identifier (API key, user ID, or IP), selects the appropriate algorithm based on configuration, and either allows or denies the request.
+
+**Critical design constraint:** The middleware must add < 5ms to every request. This means no database queries in the hot path -- only Redis operations.
+
+### 2. Algorithm Factory
+
+Creates the appropriate rate limiter instance based on the rule configuration. Each algorithm implements a common interface (`check`, `getState`, `reset`) but uses different Redis data structures and Lua scripts internally.
+
+### 3. Algorithm Implementations
+
+| Algorithm | Redis Structure | Atomicity | Accuracy | Memory | Best For |
+|-----------|----------------|-----------|----------|--------|----------|
+| Fixed Window | `INCR` + `EXPIRE` | Native atomic | Low (2x burst at boundary) | Very low | Simple quotas |
+| Sliding Window | Two `INCR` keys (current + previous) | Native atomic | ~98% | Low | General purpose (default) |
+| Sliding Log | `ZADD` sorted set | Native atomic | 100% exact | High (stores every timestamp) | Exact counting |
+| Token Bucket | `HSET` hash + Lua script | Lua atomic | N/A (rate-based) | Low | Controlled bursts |
+| Leaky Bucket | `HSET` hash + Lua script | Lua atomic | N/A (rate-based) | Low | Smooth output rate |
+
+**Why Lua scripts for Token/Leaky Bucket:** These algorithms require read-compute-write sequences (read current tokens, calculate refill since last access, update state). Without Lua, a race condition between two gateway nodes could both read "5 tokens available" and both allow a request, granting 2 tokens from a budget of 1. Lua scripts execute atomically on the Redis server, eliminating this race.
+
+### 4. Circuit Breaker (Opossum)
+
+Wraps all Redis operations. When Redis becomes unavailable, the circuit breaker prevents every request from waiting for the connection timeout (3-30 seconds), which would cause thread pool exhaustion and cascading latency spikes across all API clients. Instead, the circuit opens after 5 failures in 30 seconds and immediately falls back to the configured degradation mode (fail-open or fail-closed).
+
+### 5. Metrics Collector
+
+Prometheus metrics exposed at `/metrics` for monitoring rate limit operations, latency distributions, circuit breaker states, and Redis health. These metrics enable data-driven tuning of rate limits.
+
+### 6. Background Workers
+
+- **Analytics Worker**: Consumes metrics from RabbitMQ and persists aggregated data to PostgreSQL for historical analysis
+- **Metrics Worker**: Processes rate limit decision events for audit logging and anomaly detection
 
 ## Database Schema
 
-### Redis Keys Structure
+### Redis Key Structure
 
 ```
 # Fixed Window
-ratelimit:fixed:{identifier}:{window_start}  -> count (integer)
+ratelimit:fixed:{identifier}:{window_start}  → count (integer)
+TTL: 2x window size
 
 # Sliding Window
-ratelimit:sliding:{identifier}:{window_number}  -> count (integer)
+ratelimit:sliding:{identifier}:{window_number}  → count (integer)
+TTL: 2x window size
 
 # Sliding Log
-ratelimit:log:{identifier}  -> sorted set (timestamp -> request_id)
+ratelimit:log:{identifier}  → sorted set (score: timestamp, member: request_id)
+TTL: window size + 1 minute
 
 # Token Bucket
-ratelimit:token:{identifier}  -> hash {tokens: float, last_refill: timestamp}
+ratelimit:token:{identifier}  → hash { tokens: float, last_refill: timestamp }
+TTL: 24 hours (reset inactive buckets)
 
 # Leaky Bucket
-ratelimit:leaky:{identifier}  -> hash {water: float, last_leak: timestamp}
+ratelimit:leaky:{identifier}  → hash { water: float, last_leak: timestamp }
+TTL: 24 hours
 
-# Metrics
-metrics:{minute}  -> hash {total, allowed, denied, latency_sum}
-metrics:latencies:{minute}  -> list of latency values
+# Metrics (short-lived)
+metrics:{minute}  → hash { total, allowed, denied, latency_sum }
+TTL: 1 hour
 ```
 
-### PostgreSQL Schema (Future)
+**Why explicit TTLs on every key:** Redis stores all state in memory. Without TTL, inactive API keys accumulate indefinitely. At 1M unique keys with 200 bytes each, that is 200MB of dead state after a year. TTL ensures automatic cleanup. The 2x window multiplier for sliding window keys ensures the previous window's count is available for the weighted calculation.
+
+### PostgreSQL Schema
+
+Defined in `backend/src/db/init.sql`. Used for rule configuration and historical metrics, not in the hot path.
 
 ```sql
+-- Rate limit rules (future: dynamic configuration)
 CREATE TABLE rate_limit_rules (
     id              SERIAL PRIMARY KEY,
     name            VARCHAR(100) NOT NULL,
@@ -130,8 +200,28 @@ CREATE TABLE rate_limit_rules (
     refill_rate     DECIMAL(10,2),
     leak_rate       DECIMAL(10,2),
     priority        INTEGER DEFAULT 0,
-    enabled         BOOLEAN DEFAULT true
+    enabled         BOOLEAN DEFAULT true,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Historical metrics for analysis
+CREATE TABLE rate_limit_metrics (
+    id              SERIAL PRIMARY KEY,
+    timestamp       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    identifier      VARCHAR(255) NOT NULL,
+    algorithm       VARCHAR(50) NOT NULL,
+    allowed         BOOLEAN NOT NULL,
+    remaining       INTEGER,
+    latency_ms      DECIMAL(10,2)
+);
+
+-- Cleanup function (keep last 7 days)
+CREATE OR REPLACE FUNCTION clean_old_metrics() RETURNS void AS $$
+BEGIN
+    DELETE FROM rate_limit_metrics WHERE timestamp < NOW() - INTERVAL '7 days';
+END;
+$$ LANGUAGE plpgsql;
 ```
 
 ## API Design
@@ -143,10 +233,11 @@ CREATE TABLE rate_limit_rules (
 | `/api/ratelimit/check` | POST | Check rate limit and consume token |
 | `/api/ratelimit/state/:id` | GET | Get current state without consuming |
 | `/api/ratelimit/reset/:id` | DELETE | Reset rate limit for identifier |
-| `/api/ratelimit/batch-check` | POST | Check multiple identifiers |
-| `/api/metrics` | GET | Get aggregated metrics |
-| `/api/metrics/health` | GET | Health check endpoint |
-| `/api/algorithms` | GET | List available algorithms |
+| `/api/ratelimit/batch-check` | POST | Check multiple identifiers atomically |
+| `/api/metrics` | GET | Aggregated metrics dashboard |
+| `/api/metrics/health` | GET | Health check (Redis, PG, RabbitMQ) |
+| `/api/algorithms` | GET | List available algorithms with descriptions |
+| `/metrics` | GET | Prometheus metrics endpoint |
 
 ### Response Headers
 
@@ -155,224 +246,113 @@ X-RateLimit-Limit: 100
 X-RateLimit-Remaining: 99
 X-RateLimit-Reset: 1704067260
 X-RateLimit-Algorithm: sliding_window
-Retry-After: 60  (only when rate limited)
+Retry-After: 60  (only when rate limited, 429 response)
 ```
 
 ## Key Design Decisions
 
-### Distributed Counting with Redis
+### 1. Centralized vs. Local Rate Limiting
 
-All rate limiting state is stored in Redis, which provides:
-- Atomic operations (INCR, ZADD)
-- Sub-millisecond latency
-- Built-in expiration
-- Lua scripting for complex atomic operations
+**Chosen: Centralized Redis** for accuracy across distributed gateway nodes.
 
-### Algorithm Selection
+With 10 API gateway nodes, a client sending 100 requests could hit all 10 nodes. Local-only counting would see 10 requests per node and allow all 100, even if the limit is 50. Centralized Redis ensures all nodes share a single counter, enforcing the limit globally.
 
-| Algorithm | Accuracy | Memory | Burst Handling | Use Case |
-|-----------|----------|--------|----------------|----------|
-| Fixed Window | Low | Very Low | Allows 2x at boundary | Simple quotas |
-| Sliding Window | ~98% | Low | Smooth | General purpose (default) |
-| Sliding Log | 100% | High | Perfect | Exact counting |
-| Token Bucket | N/A | Low | Controlled bursts | Traffic shaping |
-| Leaky Bucket | N/A | Low | No bursts | Smooth output rate |
+**The trade-off is latency and availability:** Every rate check adds a ~1-2ms Redis round-trip. If Redis fails, rate limiting fails. We accept this because:
+- 1-2ms is within our 5ms budget
+- The circuit breaker + fail-open strategy prevents Redis failures from blocking legitimate users
+- Rate limiting protects against sustained abuse patterns, not individual requests; missing a few checks during a brief Redis outage is acceptable
 
-### Fail-Open Strategy
+**Alternative rejected: Pure local limiting** would be faster (no network hop) but would allow N*limit requests across N nodes. For security-sensitive APIs, this inaccuracy is unacceptable.
 
-When Redis is unavailable, requests are allowed to pass (fail-open) because:
-- Rate limiting protects against sustained abuse, not individual requests
-- Temporary failures should not block legitimate users
-- Aggressive alerting compensates for the risk
+### 2. Sliding Window Counter as Default Algorithm
 
-## Technology Stack
+**Chosen: Sliding Window Counter** with ~98% accuracy.
 
-- **Application Layer**: Node.js + Express + TypeScript
-- **Data Layer**: Redis 7 (primary), PostgreSQL 16 (configuration)
-- **Caching Layer**: Redis (same as data layer)
-- **Frontend**: React 19 + Vite + Tailwind CSS + Zustand
+The Fixed Window algorithm has a well-known boundary burst problem: a client can send `limit` requests at the end of window 1 and `limit` requests at the start of window 2, effectively consuming 2x the limit within a 1x time window. For a 100 req/min limit, this means 200 requests in a 2-second window spanning the boundary.
 
-## Scalability Considerations
+The Sliding Window Counter eliminates this by weighting the previous window's count proportionally. At 30 seconds into a 60-second window, it calculates: `previous_count * 0.5 + current_count`. This smooths the boundary burst from 2x to ~1.01x with minimal additional memory (one extra key per identifier).
 
-### Horizontal Scaling
+**Why not Sliding Log (100% accurate)?** The Sliding Log stores every request timestamp in a sorted set. For a client making 100 req/sec, that is 6,000 entries per minute. At 100K active clients, that is 600M entries consuming ~6GB of Redis memory. The ~2% error of Sliding Window is acceptable for rate limiting, and the 100x memory savings matters.
 
-1. **API Servers**: Stateless, scale horizontally behind load balancer
-2. **Redis**: Use Redis Cluster for sharding by identifier hash
-3. **Local Caching**: Implement in-memory cache with periodic sync for hot paths
+### 3. Fail-Open on Redis Failure
 
-### Performance Optimizations
+**Chosen: Fail-open (allow requests when Redis is down).**
 
-1. **Lua Scripts**: Atomic multi-step operations for Token/Leaky Bucket
-2. **Pipelining**: Batch Redis operations where possible
-3. **Connection Pooling**: Reuse Redis connections
+Rate limiting protects against sustained abuse -- bots, scrapers, credential stuffing attacks that send thousands of requests over minutes to hours. A 30-second Redis outage does not enable meaningful abuse because the attacker would need to know Redis is down and execute their attack within that window.
 
-## Trade-offs Summary
+Fail-closed (deny all requests when Redis is down) would turn every Redis hiccup into a full service outage. Redis connection blips are common during deployments, network reconfigurations, and maintenance. Making rate limiting a hard dependency of every API call means Redis availability directly determines API availability.
 
-### Trade-off 1: Centralized vs. Local Rate Limiting
+**Exception: Security-critical endpoints** (authentication, payment) should fail-closed because the cost of unauthorized access exceeds the cost of brief unavailability. The implementation makes this configurable per-endpoint via `DEGRADATION_MODE`.
 
-**Chose**: Centralized Redis for accuracy
-**Trade-off**: Adds 1-2ms latency; Redis becomes critical dependency
-**Alternative**: Pure local limiting (faster but limits can be exceeded)
+## Consistency and Idempotency
 
-### Trade-off 2: Exact vs. Approximate Counting
+### Rate Check Idempotency
 
-**Chose**: Sliding window counter (approximate)
-**Trade-off**: ~1-2% error tolerance acceptable for most use cases
-**Alternative**: Sliding log for exact counting (10x more memory)
+Rate limit checks are inherently idempotent in the mathematical sense: calling `check("user_123")` twice subtracts two tokens, which is the correct behavior (two requests should consume two tokens). However, for retried requests that failed after the check but before the response, we support optional idempotency keys.
+
+**Idempotency key format:** `check:{identifier}:{timestamp_bucket}`
+
+This ensures that a retried request within the same second-bucket does not double-decrement the counter. The 1-second bucket granularity is intentional: finer granularity would prevent legitimate rapid requests; coarser would allow abuse.
+
+### Retry Strategy
+
+All Redis operations use exponential backoff with jitter:
+
+| Attempt | Delay | With 25% Jitter |
+|---------|-------|-----------------|
+| 1st retry | 100 ms | 75-125 ms |
+| 2nd retry | 200 ms | 150-250 ms |
+| 3rd retry | 400 ms | 300-500 ms |
+| After 3 failures | Fail-open | Circuit breaker trips |
+
+**Why jitter:** Without jitter, all gateway nodes retry simultaneously after a Redis blip, creating a "thundering herd" that can prevent Redis from recovering.
+
+## Security
+
+- **Identifier validation**: Sanitize and length-limit all identifiers to prevent Redis key injection
+- **Self-rate-limiting**: The rate limiter API itself is rate-limited to prevent recursive abuse
+- **Secure Redis**: TLS connections in production; no auth in local dev for simplicity
+- **IP fallback**: When API key is missing, fall back to IP-based limiting
+- **Sensitive field redaction**: Authorization headers and API keys are redacted from Pino logs
 
 ## Observability
 
-### Key Metrics
+### Prometheus Metrics
 
-- `rate_limit_checks_total` - Total checks by result (allowed/denied)
-- `rate_limit_latency` - Histogram of check latencies
-- `rate_limit_remaining` - Gauge of remaining quota per identifier
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `ratelimiter_checks_total{result, algorithm}` | Counter | Allowed vs denied ratio per algorithm |
+| `ratelimiter_check_duration_seconds{algorithm}` | Histogram | Latency distribution (must stay < 5ms p99) |
+| `ratelimiter_active_identifiers` | Gauge | Memory pressure indicator |
+| `ratelimiter_circuit_breaker_state{name, state}` | Gauge | Redis health visibility (open/closed/half-open) |
+| `ratelimiter_circuit_breaker_calls_total{name, result}` | Counter | Circuit breaker call outcomes |
+| `ratelimiter_fallback_activations_total{reason}` | Counter | How often fail-open is triggered |
+| `ratelimiter_redis_connected` | Gauge | Redis connection status |
+| `ratelimiter_redis_operation_duration_seconds{operation}` | Histogram | Redis operation latency |
+| `ratelimiter_redis_operations_total{operation, result}` | Counter | Redis operation outcomes |
+| `ratelimiter_http_requests_total{method, path, status}` | Counter | HTTP request tracking |
+| `ratelimiter_http_request_duration_seconds{method, path}` | Histogram | HTTP latency |
+| `ratelimiter_remaining_quota{identifier_hash}` | Gauge | Sampled remaining quota |
+
+### Tuning Workflow
+
+1. **High denial rate (>10%)**: Limits may be too restrictive. Check `ratelimiter_checks_total{result="denied"}` / total. Consider increasing limits for specific endpoints.
+2. **Low denial rate (<1%)**: Limits may be too permissive. Attackers might not be hitting limits.
+3. **Latency spikes**: Check `ratelimiter_check_duration_seconds` p99. Should be < 5ms. Investigate Redis connectivity.
+4. **Memory growth**: Check `ratelimiter_active_identifiers`. May need shorter TTLs or key cleanup.
 
 ### Alerting Rules
 
-- High denial rate (>10% in 5 minutes)
-- Rate limiter latency p99 > 10ms
-- Redis connection failures
-
-## Security Considerations
-
-- Validate identifiers to prevent injection
-- Rate limit the rate limiter API itself
-- Use secure Redis connections in production
-- Implement IP-based fallback for missing API keys
-
-## Async Queue/Stream for Background Jobs
-
-### Queue Architecture
-
-For background jobs and fanout operations, we use RabbitMQ as the message broker. This handles async workloads without impacting the critical path of rate limit checks.
-
-```
-┌─────────────────┐     ┌────────────────┐     ┌──────────────────┐
-│  API Gateway    │────▶│   RabbitMQ     │────▶│  Worker Nodes    │
-│  (Publishers)   │     │   (Broker)     │     │  (Consumers)     │
-└─────────────────┘     └────────────────┘     └──────────────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-              ┌─────▼─────┐        ┌──────▼──────┐
-              │  Metrics  │        │   Audit     │
-              │  Queue    │        │   Queue     │
-              └───────────┘        └─────────────┘
-```
-
-### Queue Types and Purpose
-
-| Queue Name | Purpose | Delivery Semantics | TTL |
-|------------|---------|-------------------|-----|
-| `ratelimit.metrics.aggregate` | Batch metrics for PostgreSQL | At-least-once | 1 hour |
-| `ratelimit.audit.events` | Rate limit decision audit log | At-least-once | 24 hours |
-| `ratelimit.rules.sync` | Config change fanout to API nodes | At-most-once | 5 minutes |
-| `ratelimit.alerts.trigger` | Threshold breach notifications | At-least-once | 30 minutes |
-
-### Message Schemas
-
-**Metrics Aggregation Message:**
-```json
-{
-  "message_id": "uuid-v4",
-  "timestamp": 1704067200,
-  "window_minute": "2024-01-01T00:00:00Z",
-  "metrics": {
-    "total_checks": 15420,
-    "allowed": 14893,
-    "denied": 527,
-    "p50_latency_ms": 0.8,
-    "p99_latency_ms": 3.2
-  },
-  "node_id": "gateway-1"
-}
-```
-
-**Audit Event Message:**
-```json
-{
-  "message_id": "uuid-v4",
-  "idempotency_key": "check:{identifier}:{timestamp_ms}",
-  "event_type": "rate_limit_decision",
-  "identifier": "api_key_abc123",
-  "algorithm": "sliding_window",
-  "allowed": false,
-  "remaining": 0,
-  "limit": 100,
-  "timestamp": 1704067200123
-}
-```
-
-### Delivery Semantics and Backpressure
-
-**At-least-once delivery** for metrics and audit:
-- Publisher confirms enabled (`channel.confirmSelect()`)
-- Consumer sends ACK only after successful processing
-- Dead-letter queue (DLQ) for messages that fail 3 retries
-
-**Backpressure handling:**
-- Prefetch limit of 100 messages per consumer
-- Queue length alarm at 10,000 messages triggers scaling
-- Circuit breaker on queue publish after 5 consecutive failures
-
-### Local Development Setup
-
-```yaml
-# docker-compose.yml addition
-rabbitmq:
-  image: rabbitmq:3.12-management
-  ports:
-    - "5672:5672"   # AMQP
-    - "15672:15672" # Management UI
-  environment:
-    RABBITMQ_DEFAULT_USER: ratelimit
-    RABBITMQ_DEFAULT_PASS: ratelimit_dev
-  volumes:
-    - rabbitmq_data:/var/lib/rabbitmq
-```
-
-**Native installation (macOS):**
-```bash
-brew install rabbitmq
-brew services start rabbitmq
-# Create vhost and user
-rabbitmqctl add_vhost ratelimit
-rabbitmqctl add_user ratelimit ratelimit_dev
-rabbitmqctl set_permissions -p ratelimit ratelimit ".*" ".*" ".*"
-```
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| HighDenialRate | denial rate > 10% for 5 min | Warning |
+| CircuitBreakerOpen | Redis circuit breaker open for 1 min | Critical |
+| HighLatency | check p99 > 10ms for 5 min | Warning |
+| RedisDisconnected | `ratelimiter_redis_connected` = 0 for 1 min | Critical |
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency Keys
-
-All retryable operations use idempotency keys to prevent duplicate processing.
-
-**Idempotency Key Format:**
-```
-{operation}:{identifier}:{timestamp_bucket}
-```
-
-Example: `check:api_key_abc123:1704067200000` (1-second bucket for rate checks)
-
-**Retry Configuration:**
-```typescript
-const retryConfig = {
-  maxRetries: 3,
-  initialDelayMs: 100,
-  maxDelayMs: 2000,
-  backoffMultiplier: 2,
-  jitterFactor: 0.25  // 25% random jitter
-};
-```
-
-**Retry Flow:**
-1. First attempt fails -> wait 100ms (+ 0-25ms jitter)
-2. Second attempt fails -> wait 200ms (+ 0-50ms jitter)
-3. Third attempt fails -> wait 400ms (+ 0-100ms jitter)
-4. After 3 failures -> fail-open for rate checks, DLQ for async jobs
-
-### Circuit Breaker Pattern
+### Circuit Breaker Configuration
 
 Each external dependency has its own circuit breaker:
 
@@ -383,465 +363,154 @@ Each external dependency has its own circuit breaker:
 | PostgreSQL | 5 failures in 60s | 30 seconds | 2 |
 | RabbitMQ | 5 failures in 30s | 15 seconds | 3 |
 
-**Circuit Breaker States:**
+### Circuit Breaker State Machine
+
 ```
-CLOSED -> (failures exceed threshold) -> OPEN
-OPEN -> (recovery timeout) -> HALF_OPEN
-HALF_OPEN -> (success) -> CLOSED
-HALF_OPEN -> (failure) -> OPEN
-```
-
-**Implementation (using opossum library):**
-```typescript
-import CircuitBreaker from 'opossum';
-
-const redisBreaker = new CircuitBreaker(redisOperation, {
-  timeout: 3000,           // 3s operation timeout
-  errorThresholdPercentage: 50,
-  resetTimeout: 10000,     // 10s before trying again
-  volumeThreshold: 5       // Minimum requests before opening
-});
-
-redisBreaker.on('open', () => {
-  logger.warn('Redis circuit opened - failing open for rate checks');
-  metrics.increment('circuit_breaker.redis.open');
-});
-
-redisBreaker.fallback(() => ({
-  allowed: true,           // Fail-open
-  fallback: true,
-  remaining: -1,
-  resetAt: Date.now() + 60000
-}));
+CLOSED ──(failures exceed threshold)──▶ OPEN
+  ▲                                       │
+  │                              (recovery timeout)
+  │                                       │
+  │                                       ▼
+  └──────(test requests succeed)──── HALF-OPEN
+                                          │
+                              (test requests fail)
+                                          │
+                                          ▼
+                                        OPEN
 ```
 
-### Disaster Recovery (Local Development Simulation)
+### Failure Scenarios
 
-For learning purposes, we simulate multi-region behavior with multiple local instances.
+| Scenario | Behavior | Recovery |
+|----------|----------|----------|
+| Redis down | Circuit opens, fail-open for rate checks | Auto-recover when Redis returns; counters reset naturally |
+| Redis slow (>3s) | Circuit opens on timeout | Half-open tests after 10s |
+| PostgreSQL down | Rule config unavailable; use cached/default rules | No impact on hot-path rate checks |
+| RabbitMQ down | Metrics queue fails; rate checks unaffected | Retry metrics on reconnection |
+| Network partition | Inconsistent counts across partitioned nodes | Eventual consistency on heal; brief over-limit |
 
-**Simulated Setup:**
-```
-┌────────────────────────────────────────────────────────────────┐
-│ Local Machine                                                  │
-│                                                                │
-│  "Region A" (Primary)          "Region B" (Replica)           │
-│  ┌─────────────────┐           ┌─────────────────┐            │
-│  │ Redis :6379     │◀─────────▶│ Redis :6380     │            │
-│  │ (Master)        │  Replicate│ (Slave)         │            │
-│  └─────────────────┘           └─────────────────┘            │
-│  ┌─────────────────┐           ┌─────────────────┐            │
-│  │ API :3001       │           │ API :3002       │            │
-│  └─────────────────┘           └─────────────────┘            │
-│  ┌─────────────────┐           ┌─────────────────┐            │
-│  │ PostgreSQL :5432│◀─────────▶│ PG Read :5433   │            │
-│  │ (Primary)       │ Streaming │ (Replica)       │            │
-│  └─────────────────┘           └─────────────────┘            │
-└────────────────────────────────────────────────────────────────┘
-```
+## Scalability Considerations
 
-**Failover Procedure (manual for learning):**
-1. Detect primary failure (health check fails 3 times)
-2. Promote Redis replica: `redis-cli -p 6380 REPLICAOF NO ONE`
-3. Update API config to point to new primary
-4. Promote PostgreSQL replica if needed
-5. Verify state consistency
+### Horizontal Scaling
 
-**Backup and Restore Testing:**
+| Component | Strategy |
+|-----------|----------|
+| API Gateway nodes | Stateless, scale behind load balancer |
+| Redis | Redis Cluster, shard by identifier hash |
+| Local caching | In-memory cache with periodic sync for hot paths (future) |
 
-Redis backup (RDB snapshot):
-```bash
-# Create backup
-redis-cli BGSAVE
-cp /var/lib/redis/dump.rdb ./backups/redis-$(date +%Y%m%d).rdb
+### Performance Optimizations
 
-# Restore (stop Redis first)
-cp ./backups/redis-20240101.rdb /var/lib/redis/dump.rdb
-redis-server
-```
+1. **Lua scripts**: Atomic multi-step operations for Token/Leaky Bucket eliminate round-trips
+2. **Redis pipelining**: Batch Redis commands where possible (batch-check endpoint)
+3. **Connection pooling**: Reuse Redis connections across requests
+4. **Key design**: Short key names, LowCardinality identifiers to minimize Redis memory
 
-PostgreSQL backup:
-```bash
-# Backup
-pg_dump -h localhost -U ratelimit -d ratelimit_db > ./backups/pg-$(date +%Y%m%d).sql
+### What Breaks First
 
-# Restore
-psql -h localhost -U ratelimit -d ratelimit_db < ./backups/pg-20240101.sql
-```
+At 100K RPS per Redis instance, Redis CPU becomes the bottleneck (Lua script execution is single-threaded). Mitigation: shard across Redis Cluster by identifier hash, spreading load across N shards.
 
-**Backup Testing Schedule (for learning):**
-- Weekly: Practice Redis failover
-- Monthly: Practice full restore from backup
-- Document recovery time and any issues encountered
+At 1M+ unique identifiers, Redis memory grows linearly. Mitigation: shorter TTLs for inactive identifiers, or a two-tier approach with local in-memory cache for hot identifiers synced periodically to Redis.
 
-## Data Lifecycle Policies
+## Async Queue/Stream Architecture
 
-### Redis TTL Strategy
+For background jobs and fanout operations, RabbitMQ handles async workloads without impacting the critical path of rate limit checks.
 
-All rate limit keys have explicit TTLs to prevent unbounded growth.
+### Queue Types
 
-| Key Pattern | TTL | Rationale |
-|-------------|-----|-----------|
-| `ratelimit:fixed:*` | 2x window size | Covers full window + buffer |
-| `ratelimit:sliding:*` | 2x window size | Covers current + previous window |
-| `ratelimit:log:*` | window size + 1 minute | Sliding log entries auto-expire |
-| `ratelimit:token:*` | 24 hours | Reset daily inactive buckets |
-| `ratelimit:leaky:*` | 24 hours | Reset daily inactive buckets |
-| `metrics:*` | 1 hour | Aggregated to PostgreSQL |
-| `metrics:latencies:*` | 15 minutes | Short-lived detailed data |
+| Queue Name | Purpose | Delivery | TTL |
+|------------|---------|----------|-----|
+| `ratelimit.metrics.aggregate` | Batch metrics to PostgreSQL | At-least-once | 1 hour |
+| `ratelimit.audit.events` | Rate limit decision audit log | At-least-once | 24 hours |
+| `ratelimit.rules.sync` | Config change fanout to API nodes | At-most-once | 5 minutes |
+| `ratelimit.alerts.trigger` | Threshold breach notifications | At-least-once | 30 minutes |
 
-**Implementation:**
-```typescript
-// Set TTL when writing
-await redis.setex(key, ttlSeconds, value);
+### Data Lifecycle
 
-// For hash keys
-await redis.hset(key, field, value);
-await redis.expire(key, ttlSeconds);
-```
+| Data | Hot Storage | Warm | Cold | Delete After |
+|------|-------------|------|------|-------------|
+| Rate limit rules | PostgreSQL (indefinite) | N/A | N/A | Manual |
+| Redis state | In-memory (TTL-based) | N/A | N/A | Auto-expire |
+| Hourly metrics | PostgreSQL (7 days) | Compressed (30 days) | S3 (1 year) | 1 year |
+| Audit events | PostgreSQL (24 hours) | Compressed (7 days) | S3 (30 days) | 30 days |
 
-### PostgreSQL Data Retention
+## Trade-offs Summary
 
-| Table | Hot Storage | Warm Storage | Cold Storage | Delete |
-|-------|-------------|--------------|--------------|--------|
-| `rate_limit_rules` | Indefinite | N/A | N/A | Manual |
-| `metrics_hourly` | 7 days | 30 days (compressed) | 1 year | After 1 year |
-| `audit_events` | 24 hours | 7 days | 30 days | After 30 days |
-| `alert_history` | 7 days | 30 days | 90 days | After 90 days |
-
-**Archival Schema:**
-```sql
--- Hot table (current data)
-CREATE TABLE metrics_hourly (
-    id SERIAL PRIMARY KEY,
-    hour_bucket TIMESTAMP NOT NULL,
-    identifier VARCHAR(255),
-    total_checks BIGINT,
-    allowed BIGINT,
-    denied BIGINT,
-    p50_latency_ms DECIMAL(8,2),
-    p99_latency_ms DECIMAL(8,2),
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Warm table (compressed, older data)
-CREATE TABLE metrics_hourly_archive (
-    id SERIAL PRIMARY KEY,
-    hour_bucket TIMESTAMP NOT NULL,
-    data JSONB NOT NULL,  -- Compressed aggregates
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Partition by month for easier archival
-CREATE TABLE audit_events (
-    id BIGSERIAL,
-    event_time TIMESTAMP NOT NULL,
-    identifier VARCHAR(255),
-    event_data JSONB
-) PARTITION BY RANGE (event_time);
-
-CREATE TABLE audit_events_2024_01 PARTITION OF audit_events
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-```
-
-**Archival Cron Job (runs daily at 3 AM):**
-```bash
-#!/bin/bash
-# archive_old_data.sh
-
-# Archive metrics older than 7 days
-psql -c "
-INSERT INTO metrics_hourly_archive (hour_bucket, data)
-SELECT hour_bucket, jsonb_build_object(
-    'total_checks', SUM(total_checks),
-    'allowed', SUM(allowed),
-    'denied', SUM(denied)
-)
-FROM metrics_hourly
-WHERE hour_bucket < NOW() - INTERVAL '7 days'
-GROUP BY hour_bucket;
-
-DELETE FROM metrics_hourly
-WHERE hour_bucket < NOW() - INTERVAL '7 days';
-"
-
-# Drop partitions older than 30 days
-psql -c "DROP TABLE IF EXISTS audit_events_$(date -d '30 days ago' +%Y_%m);"
-```
-
-### Cold Storage (MinIO/S3 for Local Dev)
-
-For audit logs and historical metrics beyond warm storage:
-
-```yaml
-# docker-compose.yml addition
-minio:
-  image: minio/minio
-  ports:
-    - "9000:9000"
-    - "9001:9001"
-  environment:
-    MINIO_ROOT_USER: ratelimit
-    MINIO_ROOT_PASSWORD: ratelimit_dev
-  command: server /data --console-address ":9001"
-  volumes:
-    - minio_data:/data
-```
-
-**Cold Storage Structure:**
-```
-s3://ratelimit-archive/
-├── metrics/
-│   └── year=2024/month=01/metrics-2024-01-01.parquet
-├── audit/
-│   └── year=2024/month=01/day=01/audit-2024-01-01.jsonl.gz
-└── backups/
-    ├── redis/
-    │   └── dump-2024-01-01.rdb.gz
-    └── postgres/
-        └── backup-2024-01-01.sql.gz
-```
-
-### Backfill and Replay Procedures
-
-**Scenario 1: Replay missed audit events**
-```bash
-# Identify gap
-psql -c "SELECT MIN(event_time), MAX(event_time) FROM audit_events;"
-
-# Replay from RabbitMQ DLQ
-# 1. Move messages from DLQ back to main queue
-rabbitmqctl eval 'rabbit_amqqueue:move_messages(<<"audit_dlq">>, <<"audit_events">>).'
-
-# 2. Or replay from cold storage
-aws s3 cp s3://ratelimit-archive/audit/year=2024/month=01/day=15/ ./replay/
-gunzip ./replay/*.gz
-# Import via worker script
-node scripts/replay-audit.js ./replay/
-```
-
-**Scenario 2: Backfill metrics after outage**
-```typescript
-// scripts/backfill-metrics.ts
-async function backfillMetricsFromRedis(startTime: Date, endTime: Date) {
-  // Scan Redis for metrics keys in time range
-  const keys = await redis.keys(`metrics:${formatMinute(startTime)}*`);
-
-  for (const key of keys) {
-    const data = await redis.hgetall(key);
-    await insertMetricsToPostgres({
-      hour_bucket: parseHourFromKey(key),
-      total_checks: parseInt(data.total),
-      allowed: parseInt(data.allowed),
-      denied: parseInt(data.denied),
-      backfilled: true
-    });
-  }
-}
-```
-
-**Scenario 3: Restore rate limit state after Redis failure**
-```bash
-# If Redis data is lost, rate limits reset naturally
-# No backfill needed - counters start fresh
-# Log the incident for audit purposes
-
-# For token/leaky bucket, you may want to restore from backup
-# to preserve accumulated tokens/water levels
-redis-cli -p 6379 --rdb ./backups/redis-latest.rdb
-```
-
-### Data Cleanup Commands
-
-```bash
-# Manual cleanup commands for local development
-
-# Clear all rate limit keys (testing)
-redis-cli KEYS "ratelimit:*" | xargs -r redis-cli DEL
-
-# Clear metrics older than 1 hour
-redis-cli KEYS "metrics:*" | while read key; do
-  if [[ $(redis-cli TTL "$key") -lt 0 ]]; then
-    redis-cli DEL "$key"
-  fi
-done
-
-# Vacuum PostgreSQL after large deletes
-psql -c "VACUUM ANALYZE metrics_hourly;"
-```
-
-## Future Optimizations
-
-1. **Local Caching**: Hybrid approach with local counters synced periodically
-2. **Rule Engine**: Dynamic rules from PostgreSQL with caching
-3. **Analytics**: Historical analysis of rate limit patterns
-4. **Distributed Tracing**: OpenTelemetry integration
-5. ~~**Prometheus Export**: Native Prometheus metrics endpoint~~ (Implemented)
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| State store | Centralized Redis | Local in-memory | Accuracy across distributed nodes; 1-2ms latency acceptable |
+| Default algorithm | Sliding Window (~98%) | Sliding Log (100%) | 100x less memory; 2% error acceptable for rate limiting |
+| Redis failure | Fail-open | Fail-closed | Rate limiting protects against sustained abuse, not individual requests |
+| Atomicity | Lua scripts for complex algos | Multi-command transactions | Lua is atomic on server; MULTI/EXEC has race window between WATCH and EXEC |
+| Metrics pipeline | RabbitMQ async | Synchronous writes | Metrics must not add latency to the rate check hot path |
+| Rule storage | PostgreSQL | Redis | Rules change rarely; PG provides SQL queries, schema, backups |
+| Clock source | Redis server time (via Lua) | Client system time | Eliminates clock skew across distributed gateway nodes |
 
 ## Implementation Notes
 
-This section explains the rationale behind key implementation decisions in the codebase.
+This section maps the production architecture to what actually runs locally with Docker + Node.js + React.
 
-### Why Circuit Breakers Prevent Rate Limiter from Blocking All Requests
+### Local Architecture
 
-Without a circuit breaker, a Redis failure would cause every rate limit check to wait for the connection timeout (typically 3-30 seconds) before failing. In a high-traffic system handling thousands of requests per second, this causes:
-
-1. **Thread/Connection Pool Exhaustion**: Each blocked request holds a connection, quickly exhausting the pool
-2. **Cascading Latency**: Request latency spikes from milliseconds to seconds
-3. **Timeout Storms**: All requests eventually fail simultaneously, creating thundering herd problems
-
-The circuit breaker solves this by:
-
-```typescript
-// After 5 failures in 30 seconds, circuit OPENS
-// All subsequent requests IMMEDIATELY fail/fallback - no waiting
-// After 10 seconds, circuit goes HALF-OPEN and tests 3 requests
-// If successful, circuit CLOSES and normal operation resumes
+```
+┌──────────────────────────────────────────────────────────┐
+│                     Local Machine                         │
+│                                                           │
+│  ┌─────────────┐    ┌────────────────────────────────┐   │
+│  │  Frontend    │    │       Backend (Express)         │   │
+│  │  Vite :5173  │───▶│  :3001 (or :3001-3003)         │   │
+│  │  React +     │    │                                 │   │
+│  │  Tailwind    │    │  Algorithms: 5 implementations  │   │
+│  │              │    │  Middleware: rate-limit.ts       │   │
+│  └─────────────┘    └──────┬──────────┬──────────┬────┘   │
+│                             │          │          │        │
+│                     ┌───────▼──┐ ┌─────▼─────┐ ┌─▼──────┐ │
+│                     │  Redis   │ │ PostgreSQL│ │RabbitMQ│ │
+│                     │  :6379   │ │   :5432   │ │  :5672 │ │
+│                     │ (Valkey) │ │ratelimiter│ │ :15672 │ │
+│                     └──────────┘ └───────────┘ └────────┘ │
+│                                                           │
+│  Optional:  Redis Commander :8081 (dev profile)           │
+│                                                           │
+│                     docker-compose up -d                   │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**Key insight**: It's better to allow some potentially rate-limited requests through immediately than to block ALL requests waiting for a dead Redis. The circuit breaker trades accuracy for availability.
+### Production-Grade Patterns Implemented
 
-Our implementation (`src/shared/circuit-breaker.ts`) uses opossum with these defaults:
-- **Timeout**: 3 seconds (fails fast if Redis is slow)
-- **Error Threshold**: 50% (opens after half the requests fail)
-- **Reset Timeout**: 10 seconds (tests recovery quickly)
-- **Volume Threshold**: 5 requests minimum before opening
+| Pattern | File(s) | Description |
+|---------|---------|-------------|
+| 5 rate limiting algorithms | `src/algorithms/*.ts` | Fixed Window, Sliding Window, Sliding Log, Token Bucket, Leaky Bucket with Redis Lua scripts for atomicity. |
+| Circuit breaker (Opossum) | `src/shared/circuit-breaker.ts` | Wraps Redis operations with configurable failure threshold, recovery timeout, and Prometheus metrics per circuit state. |
+| Prometheus metrics (prom-client) | `src/shared/metrics.ts` | 15+ metrics covering rate limit checks, latency, circuit breaker state, Redis health, HTTP requests, and fallback activations. Exposed at `GET /metrics`. |
+| Structured JSON logging (Pino) | `src/shared/logger.ts` | Environment-aware log levels, sensitive field redaction, custom serializers, pino-pretty in dev. |
+| Fail-open degradation | `src/config/index.ts`, `src/middleware/rate-limit.ts` | Configurable `DEGRADATION_MODE` (allow/deny) when Redis is unavailable. |
+| RabbitMQ async workers | `src/workers/analytics-worker.ts`, `src/workers/metrics-worker.ts`, `src/shared/queue.ts` | Background workers consuming from metrics and audit queues. |
+| Health checks | `src/index.ts` | `/api/metrics/health` checking Redis, PostgreSQL, and RabbitMQ connectivity. |
+| Multi-instance support | `package.json` scripts | `dev:server1` (:3001), `dev:server2` (:3002), `dev:server3` (:3003) for testing distributed behavior. |
+| TTL management | `src/config/index.ts`, `src/utils/redis.ts` | Explicit TTLs on all Redis keys with configurable window multipliers. |
+| Response headers | `src/middleware/rate-limit.ts` | Standard `X-RateLimit-*` headers on every response. |
 
-### Why Graceful Degradation Decisions Matter (Fail-Open vs Fail-Closed)
+### Simplifications from Production Design
 
-The choice between fail-open and fail-closed has significant business implications:
+| Production Design | Local Substitute | Impact |
+|-------------------|-----------------|--------|
+| Redis Cluster (sharded) | Single Valkey instance (:6379) | No sharding; single point of failure |
+| Multiple API gateway nodes | Single Express process (or 3 via dev scripts) | No real load balancing |
+| L7 Load Balancer | Direct HTTP | No TLS, no request distribution |
+| Dynamic rule engine from PostgreSQL | Hardcoded config in `src/config/index.ts` | Rules require code changes to update |
+| Local in-memory cache tier | Not implemented | Every check hits Redis (no hot-path optimization) |
+| Prometheus + Grafana + Alertmanager | Metrics endpoint only | Metrics exposed but no scraping/visualization/alerting infrastructure |
+| Multi-region Redis with replication | Not implemented | No failover testing |
+| OAuth/JWT for API authentication | No authentication | API is open |
+| S3/MinIO cold storage for audit logs | Not implemented | All data stays in PostgreSQL |
 
-**Fail-Open (Default, Recommended for Rate Limiting)**
-```
-Redis Down → Allow all requests
-```
-- **Rationale**: Rate limiting protects against sustained abuse (bots, scrapers, DoS), not individual requests
-- **Risk**: Temporary abuse during outage (minutes to hours)
-- **Mitigation**: Aggressive alerting, quick recovery, Redis HA
-- **Business Impact**: Users experience normal service during infrastructure issues
+### What Was Omitted
 
-**Fail-Closed (Alternative for Security-Critical Systems)**
-```
-Redis Down → Deny all requests
-```
-- **Use Case**: Financial transactions, authentication endpoints, compliance-regulated APIs
-- **Risk**: Complete service outage during Redis failure
-- **Mitigation**: Multi-region Redis, local fallback cache
-- **Business Impact**: Users blocked but no unauthorized access possible
-
-Our implementation (`src/config/index.ts`) makes this configurable:
-```typescript
-config.degradation.mode = process.env.DEGRADATION_MODE || 'allow';
-```
-
-The middleware (`src/middleware/rate-limit.ts`) respects this setting:
-- `allow`: Logs warning, increments fallback metric, continues request
-- `deny`: Returns 503 Service Unavailable immediately
-
-### Why TTL Prevents Unbounded Memory Growth
-
-Redis stores all rate limit state in memory. Without TTL, memory grows until:
-1. **OOM Killer**: Linux kills Redis process
-2. **Eviction**: Redis starts evicting keys randomly (losing rate limit data)
-3. **Swap Thrashing**: Performance degrades catastrophically
-
-**Problem Scenario Without TTL:**
-- 1 million unique API keys
-- Each key stores ~200 bytes of state
-- Fixed window: 1 key per window × 2 windows = 400 bytes/key
-- Sliding log: Could store thousands of timestamps per key
-- After 1 year: Inactive keys accumulate, memory grows unbounded
-
-**Solution with TTL:**
-```typescript
-// From src/config/index.ts
-config.ttl = {
-  windowMultiplier: 2,        // Key TTL = windowSeconds × 2
-  bucketStateTtl: 86400,      // Token/leaky bucket: 24 hours
-  metricsTtl: 3600,           // Metrics: 1 hour
-  latencyDetailsTtl: 900,     // Latency samples: 15 minutes
-};
-```
-
-**Why 2x Window Size?**
-For sliding window algorithm, we need both current AND previous window counts:
-```
-Window 1 (12:00-12:01) ← Need this for weighted calculation
-Window 2 (12:01-12:02) ← Current window
-```
-At 12:01:30, we're 50% into Window 2 but need 50% weight from Window 1.
-TTL = 2x window ensures previous window data is available.
-
-**Implementation** (`src/utils/redis.ts`):
-```typescript
-export function calculateKeyTtl(windowSeconds: number): number {
-  return Math.ceil(windowSeconds * config.ttl.windowMultiplier);
-}
-```
-
-### Why Metrics Enable Rate Limit Tuning
-
-Without metrics, rate limiting is a black box:
-- Are limits too restrictive (blocking legitimate users)?
-- Are limits too permissive (allowing abuse)?
-- Which endpoints need different limits?
-- What's the actual request distribution?
-
-**Key Metrics Exposed** (`src/shared/metrics.ts`):
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `ratelimiter_checks_total{result, algorithm}` | Counter | Allowed vs denied ratio per algorithm |
-| `ratelimiter_check_duration_seconds` | Histogram | Latency distribution for tuning timeouts |
-| `ratelimiter_active_identifiers` | Gauge | Memory pressure indicator |
-| `ratelimiter_circuit_breaker_state` | Gauge | Redis health visibility |
-| `ratelimiter_fallback_activations_total` | Counter | Degradation frequency |
-
-**Tuning Workflow:**
-1. **High Denial Rate** (>10%): Limits may be too restrictive
-   - Check `ratelimiter_checks_total{result="denied"}` / total
-   - Consider increasing limits for specific endpoints
-
-2. **Low Denial Rate** (<1%): Limits may be too permissive
-   - Attackers might not be hitting limits
-   - Consider tightening limits or adding per-endpoint rules
-
-3. **Latency Spikes**: Redis performance issues
-   - Check `ratelimiter_check_duration_seconds` p99
-   - Should be <5ms for healthy operation
-
-4. **Memory Growth**: Too many active identifiers
-   - Check `ratelimiter_active_identifiers`
-   - May need shorter TTLs or key cleanup
-
-**Prometheus Endpoint**: `GET /metrics`
-```
-# HELP ratelimiter_checks_total Total number of rate limit checks performed
-# TYPE ratelimiter_checks_total counter
-ratelimiter_checks_total{result="allowed",algorithm="sliding_window"} 15234
-ratelimiter_checks_total{result="denied",algorithm="sliding_window"} 127
-```
-
-**Alerting Rules Example (Prometheus):**
-```yaml
-groups:
-  - name: rate-limiter
-    rules:
-      - alert: HighDenialRate
-        expr: |
-          sum(rate(ratelimiter_checks_total{result="denied"}[5m])) /
-          sum(rate(ratelimiter_checks_total[5m])) > 0.1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Rate limiter denial rate above 10%"
-
-      - alert: CircuitBreakerOpen
-        expr: ratelimiter_circuit_breaker_state{state="open"} == 1
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Redis circuit breaker is open"
-```
-
+- **Local caching tier**: Hybrid approach with in-memory counters synced periodically to Redis for the hottest identifiers. This would reduce Redis RPS by 10-100x.
+- **Dynamic rule engine**: Loading rate limit rules from PostgreSQL with caching and config change fanout via RabbitMQ. Currently rules are hardcoded.
+- **Distributed tracing**: OpenTelemetry integration for end-to-end request tracing across gateway nodes.
+- **Grafana dashboards**: Visual monitoring of the Prometheus metrics already being collected.
+- **Multi-region deployment**: Geographic distribution with per-region Redis instances and cross-region sync.
+- **Kubernetes/container orchestration**: Auto-scaling gateway nodes based on traffic volume.
+- **Rate limit analytics UI**: Historical analysis of rate limit patterns, abuse detection trends, and limit tuning recommendations.

@@ -24,10 +24,35 @@ Stripe is a payment processing platform with APIs for accepting payments. Core c
 
 ### Non-Functional Requirements
 
-- **Latency**: < 500ms for payment authorization
+- **Latency**: < 500ms for payment authorization (p99)
 - **Availability**: 99.999% for payment processing
-- **Accuracy**: Zero tolerance for financial errors
+- **Accuracy**: Zero tolerance for financial errors (debits = credits invariant)
 - **Security**: PCI DSS Level 1 compliance
+- **Durability**: No financial data loss under any failure scenario
+
+---
+
+## Capacity Estimation
+
+### Production Scale
+
+| Metric | Value | Calculation |
+|--------|-------|-------------|
+| Daily Payment Volume | 1.44M transactions/day | 50 RPS peak * 3600s * 8 peak hours |
+| Ledger Entries/Day | 4.32M | 3 entries per transaction (receivable, payable, fee) |
+| Storage Growth | ~500 MB/day | Transactions + ledger + audit log with indexes |
+| Idempotency Keys/Day | 4.32M | 1 key per transaction, 200 bytes each, 24h TTL |
+| Webhook Events/Day | 2.88M | ~2 events per payment (created + succeeded/failed) |
+| Peak Redis Memory | ~1 GB | Idempotency keys + BullMQ webhook queue |
+
+### Local Development Scale
+
+| Metric | Value |
+|--------|-------|
+| Merchants | 1-10 seeded |
+| Concurrent API Requests | 5-20 |
+| Storage | < 100 MB total |
+| Redis Memory | < 50 MB |
 
 ---
 
@@ -42,7 +67,7 @@ Stripe is a payment processing platform with APIs for accepting payments. Core c
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    API Gateway                                  │
-│            (Rate limiting, Auth, Idempotency)                   │
+│       (Rate Limiting, Auth, TLS Termination, Routing)           │
 └─────────────────────────────────────────────────────────────────┘
         │                     │                     │
         ▼                     ▼                     ▼
@@ -59,16 +84,23 @@ Stripe is a payment processing platform with APIs for accepting payments. Core c
 │                    Ledger Service                               │
 │              (Double-entry bookkeeping)                         │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────────────────────────────────┤
-│   PostgreSQL    │              Card Networks                    │
-│   - Ledger      │              - Visa, MC, Amex                 │
-│   - Merchants   │              - Authorization                  │
-│   - Accounts    │              - Settlement                     │
-└─────────────────┴───────────────────────────────────────────────┘
+        │                                     │
+        ▼                                     ▼
+┌───────────────────┐              ┌───────────────────┐
+│    PostgreSQL     │              │   Redis / Valkey   │
+│  - Ledger         │              │  - Idempotency     │
+│  - Merchants      │              │  - Sessions        │
+│  - Audit log      │              │  - Rate limiting   │
+│  - Risk data      │              │  - Webhook queue   │
+└───────────────────┘              └───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│  Card Networks    │
+│  - Visa, MC, Amex │
+│  - Authorization  │
+│  - Settlement     │
+└───────────────────┘
 ```
 
 ---
@@ -77,781 +109,313 @@ Stripe is a payment processing platform with APIs for accepting payments. Core c
 
 ### 1. Payment Intent Flow
 
-**Two-Phase Payment:**
-```javascript
-// Step 1: Create Payment Intent
-async function createPaymentIntent(merchantId, amount, currency, idempotencyKey) {
-  // Check idempotency
-  const existing = await redis.get(`idempotency:${idempotencyKey}`)
-  if (existing) {
-    return JSON.parse(existing)
-  }
+The Payment Intent is the central abstraction. It follows a two-phase flow: create (reserve), then confirm (authorize + capture).
 
-  const intent = await db.transaction(async (tx) => {
-    // Create intent record
-    const intent = await tx.query(`
-      INSERT INTO payment_intents (merchant_id, amount, currency, status)
-      VALUES ($1, $2, $3, 'requires_payment_method')
-      RETURNING *
-    `, [merchantId, amount, currency])
-
-    return intent.rows[0]
-  })
-
-  // Store for idempotency (24 hours)
-  await redis.setex(`idempotency:${idempotencyKey}`, 86400, JSON.stringify(intent))
-
-  return intent
-}
-
-// Step 2: Confirm Payment Intent
-async function confirmPaymentIntent(intentId, paymentMethodId) {
-  const intent = await getPaymentIntent(intentId)
-
-  if (intent.status !== 'requires_payment_method') {
-    throw new Error('Invalid intent state')
-  }
-
-  // Get payment method (tokenized card)
-  const paymentMethod = await getPaymentMethod(paymentMethodId)
-
-  // Risk assessment
-  const riskScore = await fraudService.assessRisk({
-    intent,
-    paymentMethod,
-    merchantId: intent.merchant_id
-  })
-
-  if (riskScore > 0.8) {
-    await updateIntent(intentId, 'requires_action') // 3D Secure
-    return { status: 'requires_action', action: '3ds_redirect' }
-  }
-
-  // Authorize with card network
-  const authResult = await cardNetwork.authorize({
-    amount: intent.amount,
-    currency: intent.currency,
-    cardToken: paymentMethod.card_token,
-    merchantId: intent.merchant_id
-  })
-
-  if (authResult.approved) {
-    await db.transaction(async (tx) => {
-      // Update intent
-      await tx.query(`
-        UPDATE payment_intents
-        SET status = 'succeeded', auth_code = $2
-        WHERE id = $1
-      `, [intentId, authResult.authCode])
-
-      // Create ledger entries
-      await createLedgerEntries(tx, {
-        type: 'charge',
-        amount: intent.amount,
-        merchantId: intent.merchant_id,
-        intentId
-      })
-    })
-
-    // Send webhook
-    await webhookService.send(intent.merchant_id, 'payment_intent.succeeded', intent)
-
-    return { status: 'succeeded' }
-  }
-
-  await updateIntent(intentId, 'failed', authResult.declineCode)
-  return { status: 'failed', declineCode: authResult.declineCode }
-}
+**State Machine:**
 ```
+requires_payment_method ──▶ requires_confirmation ──▶ processing
+        │                                                  │
+        ▼                                          ┌───────┴──────┐
+    canceled                                       ▼              ▼
+                                            requires_capture   succeeded
+                                                  │               │
+                                                  ▼               ▼
+                                              succeeded        failed
+```
+
+**Confirm Flow:**
+1. Attach payment method (tokenized card)
+2. Run fraud risk assessment (rule-based + ML)
+3. If risk > 0.8, require 3D Secure (requires_action state)
+4. Authorize with card network via circuit breaker
+5. On approval: create ledger entries atomically, fire webhook
+6. On decline: record decline code, fire webhook
 
 ### 2. Double-Entry Ledger
 
-**Accounting Entries:**
-```javascript
-async function createLedgerEntries(tx, { type, amount, merchantId, intentId }) {
-  const entries = []
+Every payment creates balanced ledger entries within a single database transaction. The fundamental invariant is that the sum of all debits must equal the sum of all credits.
 
-  if (type === 'charge') {
-    // Debit customer funds receivable
-    entries.push({
-      account: 'funds_receivable',
-      debit: amount,
-      credit: 0
-    })
+**Charge entry set (2.9% + 30 cents fee on $100):**
 
-    // Credit merchant payable (minus fees)
-    const fee = Math.round(amount * 0.029 + 30) // 2.9% + 30¢
-    entries.push({
-      account: `merchant:${merchantId}:payable`,
-      debit: 0,
-      credit: amount - fee
-    })
+| Account | Debit | Credit |
+|---------|-------|--------|
+| `funds_receivable` | $100.00 | -- |
+| `merchant:{id}:payable` | -- | $97.01 |
+| `revenue:transaction_fees` | -- | $2.99 |
 
-    // Credit revenue (fees)
-    entries.push({
-      account: 'revenue:transaction_fees',
-      debit: 0,
-      credit: fee
-    })
-  }
+**Refund entry set (full refund):**
 
-  // Insert all entries atomically
-  for (const entry of entries) {
-    await tx.query(`
-      INSERT INTO ledger_entries
-        (account, debit, credit, intent_id, created_at)
-      VALUES ($1, $2, $3, $4, NOW())
-    `, [entry.account, entry.debit, entry.credit, intentId])
-  }
+| Account | Debit | Credit |
+|---------|-------|--------|
+| `merchant:{id}:payable` | $97.01 | -- |
+| `revenue:transaction_fees` | $2.99 | -- |
+| `funds_receivable` | -- | $100.00 |
 
-  // Verify debits = credits (invariant)
-  const totals = entries.reduce((acc, e) => ({
-    debit: acc.debit + e.debit,
-    credit: acc.credit + e.credit
-  }), { debit: 0, credit: 0 })
-
-  if (totals.debit !== totals.credit) {
-    throw new Error('Ledger imbalance detected')
-  }
-}
-```
+The ledger service verifies balance after each transaction and raises a critical alert on any imbalance.
 
 ### 3. Idempotency Handling
 
-**Preventing Duplicate Charges:**
-```javascript
-class IdempotencyMiddleware {
-  async handle(req, res, next) {
-    const idempotencyKey = req.headers['idempotency-key']
+Idempotency prevents duplicate charges from network retries, client double-clicks, and load balancer retries.
 
-    if (!idempotencyKey) {
-      return next()
-    }
+**Flow:**
+1. Client sends `Idempotency-Key` header with each request
+2. Server acquires Redis lock via `SET NX` (prevents concurrent duplicates)
+3. If key exists with `completed` status, return cached response
+4. If key exists with `pending` status, return 409 Conflict
+5. Process request, cache result with 24-hour TTL
+6. Release lock
 
-    const cacheKey = `idempotency:${req.merchantId}:${idempotencyKey}`
-
-    // Try to acquire lock
-    const acquired = await redis.set(cacheKey + ':lock', '1', 'NX', 'EX', 60)
-
-    if (!acquired) {
-      // Another request is processing
-      return res.status(409).json({ error: 'Request in progress' })
-    }
-
-    try {
-      // Check for cached response
-      const cached = await redis.get(cacheKey)
-      if (cached) {
-        const { statusCode, body } = JSON.parse(cached)
-        return res.status(statusCode).json(body)
-      }
-
-      // Capture response
-      const originalJson = res.json.bind(res)
-      res.json = (body) => {
-        // Cache successful responses for 24 hours
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          redis.setex(cacheKey, 86400, JSON.stringify({
-            statusCode: res.statusCode,
-            body
-          }))
-        }
-        return originalJson(body)
-      }
-
-      next()
-    } finally {
-      // Release lock
-      await redis.del(cacheKey + ':lock')
-    }
-  }
-}
-```
+Keys are namespaced per-merchant (`idempotency:{merchantId}:{key}`) to prevent cross-merchant conflicts.
 
 ### 4. Fraud Detection
 
-**Risk Scoring:**
-```javascript
-class FraudService {
-  async assessRisk(context) {
-    const { intent, paymentMethod, merchantId } = context
-    const scores = []
+Risk scoring combines rule-based checks with signal aggregation:
 
-    // Velocity checks
-    const recentCharges = await this.getRecentCharges(paymentMethod.id, '1 hour')
-    if (recentCharges > 3) {
-      scores.push({ rule: 'velocity_1h', score: 0.4 })
-    }
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| Velocity (1hr) | 0.4 | > 3 charges on same card in 1 hour |
+| Geo mismatch | 0.3 | Card country differs from IP country |
+| High amount | 0.2 | > 5x merchant average transaction |
+| Device reputation | Variable | Known fraud device fingerprint |
+| ML model | 0.5x | Trained on amount, BIN, time patterns |
 
-    // Geographic checks
-    const cardCountry = paymentMethod.card_country
-    const ipCountry = await geoip.lookup(context.ipAddress)
-    if (cardCountry !== ipCountry) {
-      scores.push({ rule: 'geo_mismatch', score: 0.3 })
-    }
-
-    // Amount checks
-    const avgAmount = await this.getMerchantAvgAmount(merchantId)
-    if (intent.amount > avgAmount * 5) {
-      scores.push({ rule: 'high_amount', score: 0.2 })
-    }
-
-    // Device fingerprint
-    const deviceRisk = await this.checkDeviceReputation(context.deviceFingerprint)
-    scores.push({ rule: 'device', score: deviceRisk })
-
-    // ML model
-    const mlScore = await this.mlPredict({
-      amount: intent.amount,
-      merchantCategory: context.merchantCategory,
-      cardBin: paymentMethod.card_bin,
-      hourOfDay: new Date().getHours(),
-      dayOfWeek: new Date().getDay()
-    })
-    scores.push({ rule: 'ml_model', score: mlScore * 0.5 })
-
-    // Combine scores
-    const totalScore = scores.reduce((sum, s) => sum + s.score, 0)
-    const normalizedScore = Math.min(totalScore, 1)
-
-    // Log for analysis
-    await this.logRiskAssessment(intent.id, scores, normalizedScore)
-
-    return normalizedScore
-  }
-}
-```
+Scores are normalized to 0-1. Decisions: allow (< 0.5), review (0.5-0.8), block (> 0.8).
 
 ### 5. Webhook Delivery
 
-**Reliable Event Delivery:**
-```javascript
-class WebhookService {
-  async send(merchantId, eventType, data) {
-    const merchant = await getMerchant(merchantId)
-    if (!merchant.webhook_url) return
+Webhooks use reliable async delivery via a job queue:
 
-    const event = {
-      id: `evt_${uuid()}`,
-      type: eventType,
-      data,
-      created: Date.now()
-    }
-
-    // Sign payload
-    const signature = this.signPayload(event, merchant.webhook_secret)
-
-    // Queue for delivery with retries
-    await queue.add('webhook_delivery', {
-      merchantId,
-      url: merchant.webhook_url,
-      event,
-      signature
-    }, {
-      attempts: 5,
-      backoff: {
-        type: 'exponential',
-        delay: 1000 // 1s, 2s, 4s, 8s, 16s
-      }
-    })
-  }
-
-  async deliverWebhook(job) {
-    const { url, event, signature } = job.data
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Stripe-Signature': signature
-      },
-      body: JSON.stringify(event),
-      timeout: 30000
-    })
-
-    if (!response.ok) {
-      throw new Error(`Webhook failed: ${response.status}`)
-    }
-
-    // Log successful delivery
-    await db.query(`
-      INSERT INTO webhook_deliveries (event_id, merchant_id, status, delivered_at)
-      VALUES ($1, $2, 'delivered', NOW())
-    `, [event.id, job.data.merchantId])
-  }
-
-  signPayload(payload, secret) {
-    const timestamp = Math.floor(Date.now() / 1000)
-    const signedPayload = `${timestamp}.${JSON.stringify(payload)}`
-    const signature = crypto
-      .createHmac('sha256', secret)
-      .update(signedPayload)
-      .digest('hex')
-
-    return `t=${timestamp},v1=${signature}`
-  }
-}
-```
+1. Payment event occurs (e.g., `payment_intent.succeeded`)
+2. Event stored in `webhook_events` table
+3. Delivery job enqueued with exponential backoff (5 attempts: 1s, 2s, 4s, 8s, 16s)
+4. Payload signed with HMAC-SHA256: `t={timestamp},v1={hmac(timestamp.payload, secret)}`
+5. Delivery status tracked in `webhook_deliveries` table
+6. Failed deliveries retry with per-merchant circuit breaker
 
 ---
 
 ## Database Schema
 
 ```sql
--- Merchants
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Merchants table
 CREATE TABLE merchants (
-  id UUID PRIMARY KEY,
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   name VARCHAR(200) NOT NULL,
-  email VARCHAR(200) NOT NULL,
+  email VARCHAR(200) NOT NULL UNIQUE,
   webhook_url VARCHAR(500),
   webhook_secret VARCHAR(100),
-  api_key_hash VARCHAR(100),
-  status VARCHAR(20) DEFAULT 'active',
-  created_at TIMESTAMP DEFAULT NOW()
+  api_key VARCHAR(64) NOT NULL UNIQUE,
+  api_key_hash VARCHAR(100) NOT NULL,
+  status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Payment Intents
-CREATE TABLE payment_intents (
-  id UUID PRIMARY KEY,
-  merchant_id UUID REFERENCES merchants(id),
-  amount INTEGER NOT NULL, -- In cents
-  currency VARCHAR(3) NOT NULL,
-  status VARCHAR(30) NOT NULL,
-  payment_method_id UUID,
-  auth_code VARCHAR(50),
-  decline_code VARCHAR(50),
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+CREATE INDEX idx_merchants_api_key ON merchants(api_key);
+CREATE INDEX idx_merchants_email ON merchants(email);
+
+-- Customers table
+CREATE TABLE customers (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  email VARCHAR(200),
+  name VARCHAR(200),
+  phone VARCHAR(50),
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+CREATE INDEX idx_customers_merchant ON customers(merchant_id);
+CREATE INDEX idx_customers_email ON customers(email);
 
 -- Payment Methods (tokenized cards)
 CREATE TABLE payment_methods (
-  id UUID PRIMARY KEY,
-  customer_id UUID,
-  card_token VARCHAR(100), -- Encrypted
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
+  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  type VARCHAR(20) NOT NULL DEFAULT 'card' CHECK (type IN ('card', 'bank_account')),
+  card_token VARCHAR(100),
   card_last4 VARCHAR(4),
   card_brand VARCHAR(20),
-  card_exp_month INTEGER,
-  card_exp_year INTEGER,
-  card_country VARCHAR(2),
+  card_exp_month INTEGER CHECK (card_exp_month >= 1 AND card_exp_month <= 12),
+  card_exp_year INTEGER CHECK (card_exp_year >= 2024),
+  card_country VARCHAR(2) DEFAULT 'US',
   card_bin VARCHAR(6),
-  created_at TIMESTAMP DEFAULT NOW()
+  billing_details JSONB DEFAULT '{}',
+  is_default BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Ledger Entries (double-entry)
-CREATE TABLE ledger_entries (
-  id BIGSERIAL PRIMARY KEY,
-  account VARCHAR(100) NOT NULL,
-  debit INTEGER DEFAULT 0,
-  credit INTEGER DEFAULT 0,
-  intent_id UUID REFERENCES payment_intents(id),
-  created_at TIMESTAMP DEFAULT NOW(),
+CREATE INDEX idx_payment_methods_customer ON payment_methods(customer_id);
+CREATE INDEX idx_payment_methods_merchant ON payment_methods(merchant_id);
 
-  CONSTRAINT positive_amounts CHECK (debit >= 0 AND credit >= 0)
+-- Payment Intents (core payment lifecycle)
+CREATE TABLE payment_intents (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
+  amount INTEGER NOT NULL CHECK (amount > 0),
+  currency VARCHAR(3) NOT NULL DEFAULT 'usd',
+  status VARCHAR(30) NOT NULL DEFAULT 'requires_payment_method' CHECK (status IN (
+    'requires_payment_method', 'requires_confirmation', 'requires_action',
+    'processing', 'requires_capture', 'canceled', 'succeeded', 'failed'
+  )),
+  payment_method_id UUID REFERENCES payment_methods(id),
+  capture_method VARCHAR(20) DEFAULT 'automatic' CHECK (capture_method IN ('automatic', 'manual')),
+  auth_code VARCHAR(50),
+  decline_code VARCHAR(50),
+  error_message TEXT,
+  description TEXT,
+  metadata JSONB DEFAULT '{}',
+  idempotency_key VARCHAR(100),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_ledger_account ON ledger_entries(account);
-CREATE INDEX idx_ledger_intent ON ledger_entries(intent_id);
+CREATE INDEX idx_payment_intents_merchant ON payment_intents(merchant_id);
+CREATE INDEX idx_payment_intents_customer ON payment_intents(customer_id);
+CREATE INDEX idx_payment_intents_status ON payment_intents(status);
+CREATE UNIQUE INDEX idx_payment_intents_idempotency ON payment_intents(merchant_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+
+-- Charges (successful payment records)
+CREATE TABLE charges (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
+  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  amount INTEGER NOT NULL CHECK (amount > 0),
+  amount_refunded INTEGER DEFAULT 0 CHECK (amount_refunded >= 0),
+  currency VARCHAR(3) NOT NULL DEFAULT 'usd',
+  status VARCHAR(20) NOT NULL DEFAULT 'succeeded'
+    CHECK (status IN ('pending', 'succeeded', 'failed', 'refunded', 'partially_refunded')),
+  payment_method_id UUID REFERENCES payment_methods(id),
+  fee INTEGER DEFAULT 0,
+  net INTEGER DEFAULT 0,
+  description TEXT,
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_charges_merchant ON charges(merchant_id);
+CREATE INDEX idx_charges_payment_intent ON charges(payment_intent_id);
 
 -- Refunds
 CREATE TABLE refunds (
-  id UUID PRIMARY KEY,
-  payment_intent_id UUID REFERENCES payment_intents(id),
-  amount INTEGER NOT NULL,
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  charge_id UUID NOT NULL REFERENCES charges(id) ON DELETE CASCADE,
+  payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
+  amount INTEGER NOT NULL CHECK (amount > 0),
   reason VARCHAR(100),
-  status VARCHAR(20) DEFAULT 'pending',
-  created_at TIMESTAMP DEFAULT NOW()
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'succeeded', 'failed', 'canceled')),
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+CREATE INDEX idx_refunds_charge ON refunds(charge_id);
+
+-- Ledger Entries (double-entry bookkeeping)
+CREATE TABLE ledger_entries (
+  id BIGSERIAL PRIMARY KEY,
+  transaction_id UUID NOT NULL,
+  account VARCHAR(100) NOT NULL,
+  debit INTEGER DEFAULT 0 CHECK (debit >= 0),
+  credit INTEGER DEFAULT 0 CHECK (credit >= 0),
+  currency VARCHAR(3) NOT NULL DEFAULT 'usd',
+  payment_intent_id UUID REFERENCES payment_intents(id),
+  charge_id UUID REFERENCES charges(id),
+  refund_id UUID REFERENCES refunds(id),
+  description TEXT,
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  CONSTRAINT positive_entry CHECK (debit > 0 OR credit > 0),
+  CONSTRAINT single_direction CHECK (NOT (debit > 0 AND credit > 0))
+);
+
+CREATE INDEX idx_ledger_account ON ledger_entries(account);
+CREATE INDEX idx_ledger_transaction ON ledger_entries(transaction_id);
+CREATE INDEX idx_ledger_payment_intent ON ledger_entries(payment_intent_id);
+CREATE INDEX idx_ledger_created ON ledger_entries(created_at);
+
+-- Webhook Events and Deliveries
+CREATE TABLE webhook_events (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  type VARCHAR(100) NOT NULL,
+  data JSONB NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE webhook_deliveries (
+  id BIGSERIAL PRIMARY KEY,
+  event_id UUID NOT NULL REFERENCES webhook_events(id) ON DELETE CASCADE,
+  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  url VARCHAR(500) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'delivered', 'failed')),
+  attempts INTEGER DEFAULT 0,
+  next_retry_at TIMESTAMP WITH TIME ZONE,
+  last_error TEXT,
+  response_status INTEGER,
+  delivered_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_webhook_deliveries_pending ON webhook_deliveries(status, next_retry_at)
+  WHERE status = 'pending';
 
 -- Disputes (chargebacks)
 CREATE TABLE disputes (
-  id UUID PRIMARY KEY,
-  payment_intent_id UUID REFERENCES payment_intents(id),
-  amount INTEGER NOT NULL,
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  charge_id UUID NOT NULL REFERENCES charges(id) ON DELETE CASCADE,
+  payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
+  amount INTEGER NOT NULL CHECK (amount > 0),
   reason VARCHAR(100),
-  status VARCHAR(20) DEFAULT 'needs_response',
-  evidence_due_by TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW()
+  status VARCHAR(30) DEFAULT 'needs_response'
+    CHECK (status IN ('needs_response', 'under_review', 'won', 'lost', 'warning_closed')),
+  evidence JSONB DEFAULT '{}',
+  evidence_due_by TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Webhook Deliveries
-CREATE TABLE webhook_deliveries (
+-- Idempotency Keys tracking
+CREATE TABLE idempotency_keys (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+  key VARCHAR(100) NOT NULL,
+  request_path VARCHAR(255) NOT NULL,
+  request_body_hash VARCHAR(64),
+  response_status INTEGER,
+  response_body JSONB,
+  locked_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  expires_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() + INTERVAL '24 hours',
+  UNIQUE(merchant_id, key)
+);
+
+-- Risk Assessments
+CREATE TABLE risk_assessments (
   id BIGSERIAL PRIMARY KEY,
-  event_id VARCHAR(100) NOT NULL,
-  merchant_id UUID REFERENCES merchants(id),
-  status VARCHAR(20) NOT NULL,
-  attempts INTEGER DEFAULT 1,
-  last_error TEXT,
-  delivered_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW()
+  payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
+  risk_score DECIMAL(5,4) NOT NULL CHECK (risk_score >= 0 AND risk_score <= 1),
+  risk_level VARCHAR(20) NOT NULL CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+  signals JSONB NOT NULL DEFAULT '[]',
+  decision VARCHAR(20) NOT NULL CHECK (decision IN ('allow', 'review', 'block')),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-```
 
----
-
-## Key Design Decisions
-
-### 1. Idempotency Keys
-
-**Decision**: Require idempotency keys for all mutating operations
-
-**Rationale**:
-- Prevents duplicate charges from network retries
-- Allows safe retry logic in client SDKs
-- Critical for financial accuracy
-
-### 2. Double-Entry Ledger
-
-**Decision**: Use double-entry bookkeeping for all financial movements
-
-**Rationale**:
-- Every transaction balances (debits = credits)
-- Complete audit trail
-- Easy reconciliation
-
-### 3. Webhook Signatures
-
-**Decision**: Sign all webhook payloads with HMAC
-
-**Rationale**:
-- Merchants can verify authenticity
-- Prevents replay attacks (timestamp in signature)
-- Industry standard pattern
-
----
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Idempotency | Per-request key | Database constraints | Flexibility, reliability |
-| Ledger | Double-entry | Single-entry | Accuracy, auditability |
-| Webhooks | Async with retry | Sync callbacks | Reliability, decoupling |
-| Card storage | Tokenization | Encryption | PCI scope reduction |
-
----
-
-## Capacity Planning and Traffic Sizing
-
-### Target Scale (Local Development Simulation)
-
-For learning purposes, we simulate a mid-sized payment processor:
-
-| Metric | Local Dev Target | Notes |
-|--------|------------------|-------|
-| DAU (Daily Active Users) | 1,000 merchants | Simulated via load testing |
-| MAU (Monthly Active Users) | 5,000 merchants | Includes dormant accounts |
-| Peak Payment RPS | 50 req/s | Represents busy checkout period |
-| Sustained Payment RPS | 10 req/s | Normal business hours |
-| Webhook Delivery RPS | 100 req/s | 2x payment rate (multiple events per payment) |
-| Average Payload Size | 2 KB | Payment intent request/response |
-| Max Payload Size | 50 KB | Webhook with full event data |
-
-### Component Sizing
-
-**PostgreSQL (Primary Database):**
-```
-Daily Transactions: 50 RPS * 3600 * 8 peak hours = 1.44M/day
-Ledger Entries: 3 entries per transaction = 4.32M entries/day
-Storage Growth: ~500 MB/day (with indexes)
-
-Local Dev Config:
-- Connection pool: 10 connections (3 instances = 30 total)
-- shared_buffers: 256 MB
-- work_mem: 64 MB
-- Vacuum: Daily at 3 AM local time
-```
-
-**Redis (Idempotency + Cache):**
-```
-Idempotency Keys: 50 RPS * 86400 sec = 4.32M keys/day
-Key Size: ~200 bytes (key + cached response)
-Memory: 4.32M * 200 bytes = ~864 MB (with 24h TTL, keys expire)
-Peak Memory: ~1 GB
-
-Local Dev Config:
-- maxmemory: 1GB
-- maxmemory-policy: volatile-lru
-- Eviction: Keys with TTL evicted first
-```
-
-**Message Queue (BullMQ/Redis):**
-```
-Webhook Jobs: 100 events/s peak
-Job Size: ~5 KB per job (event payload + metadata)
-Retry Queue Depth: 1000 jobs max (with exponential backoff)
-Queue Memory: ~50 MB
-
-Local Dev Config:
-- Concurrency: 10 workers per instance
-- Rate limit: 50 jobs/s (prevent overwhelming merchant endpoints)
-- Stalled job check: every 30 seconds
-```
-
-### Sharding Strategy (Production Simulation)
-
-For local development, we simulate sharding concepts without actual distribution:
-
-```javascript
-// Merchant-based sharding simulation
-function getShardId(merchantId) {
-  // 4 logical shards for local dev
-  const hash = crypto.createHash('md5').update(merchantId).digest('hex')
-  return parseInt(hash.substring(0, 8), 16) % 4
-}
-
-// Shard distribution for 1000 merchants:
-// Shard 0: ~250 merchants, ~12.5 RPS
-// Shard 1: ~250 merchants, ~12.5 RPS
-// Shard 2: ~250 merchants, ~12.5 RPS
-// Shard 3: ~250 merchants, ~12.5 RPS
-```
-
----
-
-## Observability
-
-### Metrics (Prometheus)
-
-**Key Metrics to Collect:**
-
-```javascript
-// Payment Service Metrics
-const metrics = {
-  // Request metrics
-  payment_requests_total: new Counter({
-    name: 'payment_requests_total',
-    help: 'Total payment requests',
-    labelNames: ['method', 'status', 'merchant_id']
-  }),
-
-  payment_request_duration_seconds: new Histogram({
-    name: 'payment_request_duration_seconds',
-    help: 'Payment request duration',
-    labelNames: ['method', 'status'],
-    buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
-  }),
-
-  // Business metrics
-  payment_amount_cents: new Histogram({
-    name: 'payment_amount_cents',
-    help: 'Payment amounts in cents',
-    buckets: [100, 500, 1000, 5000, 10000, 50000, 100000]
-  }),
-
-  active_payment_intents: new Gauge({
-    name: 'active_payment_intents',
-    help: 'Currently active payment intents',
-    labelNames: ['status']
-  }),
-
-  // Fraud metrics
-  fraud_score_distribution: new Histogram({
-    name: 'fraud_score_distribution',
-    help: 'Fraud score distribution',
-    buckets: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-  }),
-
-  fraud_blocked_total: new Counter({
-    name: 'fraud_blocked_total',
-    help: 'Payments blocked by fraud detection',
-    labelNames: ['rule']
-  }),
-
-  // Webhook metrics
-  webhook_deliveries_total: new Counter({
-    name: 'webhook_deliveries_total',
-    help: 'Webhook delivery attempts',
-    labelNames: ['status', 'attempt']
-  }),
-
-  webhook_queue_depth: new Gauge({
-    name: 'webhook_queue_depth',
-    help: 'Current webhook queue size'
-  }),
-
-  // Infrastructure metrics
-  db_connection_pool_size: new Gauge({
-    name: 'db_connection_pool_size',
-    help: 'Database connection pool size',
-    labelNames: ['state'] // active, idle, waiting
-  }),
-
-  redis_memory_bytes: new Gauge({
-    name: 'redis_memory_bytes',
-    help: 'Redis memory usage'
-  }),
-
-  idempotency_cache_hits_total: new Counter({
-    name: 'idempotency_cache_hits_total',
-    help: 'Idempotency key cache hits'
-  })
-}
-```
-
-### SLI Dashboards
-
-**Service Level Indicators:**
-
-| SLI | Target | Measurement | Alert Threshold |
-|-----|--------|-------------|-----------------|
-| Availability | 99.99% | Successful responses / Total requests | < 99.9% over 5 min |
-| Latency (p50) | < 100ms | payment_request_duration_seconds | > 150ms over 5 min |
-| Latency (p99) | < 500ms | payment_request_duration_seconds | > 750ms over 5 min |
-| Error Rate | < 0.1% | 5xx responses / Total requests | > 0.5% over 5 min |
-| Webhook Delivery | 99.9% | Delivered / Total within 1 hour | < 99% over 15 min |
-| Ledger Balance | 100% | Sum(debits) = Sum(credits) | Any imbalance |
-
-**Grafana Dashboard Panels:**
-
-```json
-{
-  "dashboard": "Stripe Payment System",
-  "panels": [
-    {
-      "title": "Payment Request Rate",
-      "query": "rate(payment_requests_total[5m])",
-      "type": "graph"
-    },
-    {
-      "title": "Payment Latency (p99)",
-      "query": "histogram_quantile(0.99, rate(payment_request_duration_seconds_bucket[5m]))",
-      "type": "graph",
-      "alert": { "threshold": 0.5, "for": "5m" }
-    },
-    {
-      "title": "Error Rate",
-      "query": "rate(payment_requests_total{status=~'5..'}[5m]) / rate(payment_requests_total[5m])",
-      "type": "graph",
-      "alert": { "threshold": 0.005, "for": "5m" }
-    },
-    {
-      "title": "Fraud Block Rate",
-      "query": "rate(fraud_blocked_total[1h])",
-      "type": "graph"
-    },
-    {
-      "title": "Webhook Queue Depth",
-      "query": "webhook_queue_depth",
-      "type": "graph",
-      "alert": { "threshold": 500, "for": "10m" }
-    },
-    {
-      "title": "Idempotency Cache Hit Rate",
-      "query": "rate(idempotency_cache_hits_total[5m]) / rate(payment_requests_total[5m])",
-      "type": "stat"
-    }
-  ]
-}
-```
-
-### Structured Logging
-
-**Log Format (JSON):**
-
-```javascript
-const logger = pino({
-  level: 'info',
-  formatters: {
-    level: (label) => ({ level: label })
-  },
-  base: {
-    service: 'payment-service',
-    version: process.env.APP_VERSION,
-    environment: process.env.NODE_ENV
-  }
-})
-
-// Payment request logging
-function logPaymentRequest(req, result, duration) {
-  logger.info({
-    event: 'payment_request',
-    trace_id: req.headers['x-trace-id'],
-    span_id: generateSpanId(),
-    merchant_id: req.merchantId,
-    intent_id: result.intentId,
-    amount: req.body.amount,
-    currency: req.body.currency,
-    status: result.status,
-    duration_ms: duration,
-    idempotency_key: req.headers['idempotency-key'],
-    ip_address: hashIp(req.ip), // Hashed for privacy
-    user_agent: req.headers['user-agent']
-  })
-}
-
-// Error logging with context
-function logPaymentError(req, error, context) {
-  logger.error({
-    event: 'payment_error',
-    trace_id: req.headers['x-trace-id'],
-    merchant_id: req.merchantId,
-    error_type: error.constructor.name,
-    error_message: error.message,
-    error_code: error.code,
-    stack: error.stack,
-    context
-  })
-}
-```
-
-### Distributed Tracing (OpenTelemetry)
-
-```javascript
-const { trace, context, SpanStatusCode } = require('@opentelemetry/api')
-const tracer = trace.getTracer('payment-service')
-
-async function confirmPaymentIntent(intentId, paymentMethodId, parentContext) {
-  const span = tracer.startSpan('confirmPaymentIntent', {
-    attributes: {
-      'payment.intent_id': intentId,
-      'payment.method_id': paymentMethodId
-    }
-  }, parentContext)
-
-  try {
-    // Fraud check span
-    const fraudSpan = tracer.startSpan('fraudService.assessRisk', {}, trace.setSpan(context.active(), span))
-    const riskScore = await fraudService.assessRisk({ intentId, paymentMethodId })
-    fraudSpan.setAttribute('fraud.score', riskScore)
-    fraudSpan.end()
-
-    // Card network authorization span
-    const authSpan = tracer.startSpan('cardNetwork.authorize', {}, trace.setSpan(context.active(), span))
-    const authResult = await cardNetwork.authorize({ intentId })
-    authSpan.setAttribute('auth.approved', authResult.approved)
-    authSpan.setAttribute('auth.code', authResult.authCode)
-    authSpan.end()
-
-    // Ledger update span
-    const ledgerSpan = tracer.startSpan('ledger.createEntries', {}, trace.setSpan(context.active(), span))
-    await createLedgerEntries(intentId)
-    ledgerSpan.end()
-
-    span.setStatus({ code: SpanStatusCode.OK })
-    return { status: 'succeeded' }
-  } catch (error) {
-    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message })
-    span.recordException(error)
-    throw error
-  } finally {
-    span.end()
-  }
-}
-```
-
-### Audit Logging
-
-**Financial Audit Trail:**
-
-```sql
--- Audit log table for compliance
+-- Audit Log (PCI DSS Requirement 10, SOX compliance)
 CREATE TABLE audit_log (
-  id BIGSERIAL PRIMARY KEY,
-  timestamp TIMESTAMP DEFAULT NOW(),
-  actor_type VARCHAR(20) NOT NULL, -- 'merchant', 'admin', 'system'
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('merchant', 'admin', 'system', 'api')),
   actor_id VARCHAR(100) NOT NULL,
-  action VARCHAR(50) NOT NULL,
+  action VARCHAR(100) NOT NULL,
   resource_type VARCHAR(50) NOT NULL,
   resource_id VARCHAR(100) NOT NULL,
   old_value JSONB,
@@ -859,568 +423,183 @@ CREATE TABLE audit_log (
   ip_address VARCHAR(45),
   user_agent TEXT,
   trace_id VARCHAR(100),
-  metadata JSONB
+  metadata JSONB,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_audit_timestamp ON audit_log(timestamp);
-CREATE INDEX idx_audit_actor ON audit_log(actor_type, actor_id);
-CREATE INDEX idx_audit_resource ON audit_log(resource_type, resource_id);
-CREATE INDEX idx_audit_action ON audit_log(action);
+CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp);
+CREATE INDEX idx_audit_log_actor ON audit_log(actor_type, actor_id);
+CREATE INDEX idx_audit_log_resource ON audit_log(resource_type, resource_id);
+CREATE INDEX idx_audit_log_action ON audit_log(action);
+CREATE INDEX idx_audit_log_trace ON audit_log(trace_id) WHERE trace_id IS NOT NULL;
+
+-- Ledger balance views
+CREATE OR REPLACE VIEW account_balances AS
+SELECT account, currency,
+  SUM(debit) as total_debit, SUM(credit) as total_credit,
+  SUM(debit) - SUM(credit) as balance
+FROM ledger_entries
+GROUP BY account, currency;
+
+CREATE OR REPLACE VIEW merchant_balances AS
+SELECT m.id as merchant_id, m.name as merchant_name,
+  COALESCE(l.currency, 'usd') as currency,
+  COALESCE(SUM(l.credit) - SUM(l.debit), 0) as available_balance,
+  COUNT(DISTINCT l.payment_intent_id) as transaction_count
+FROM merchants m
+LEFT JOIN ledger_entries l ON l.account = 'merchant:' || m.id || ':payable'
+GROUP BY m.id, m.name, l.currency;
+
+CREATE OR REPLACE VIEW daily_revenue AS
+SELECT DATE(created_at) as date,
+  SUM(credit) as revenue,
+  COUNT(DISTINCT payment_intent_id) as transaction_count
+FROM ledger_entries
+WHERE account = 'revenue:transaction_fees'
+GROUP BY DATE(created_at)
+ORDER BY date DESC;
 ```
 
-```javascript
-// Audit logging service
-class AuditLogger {
-  async log(event) {
-    await db.query(`
-      INSERT INTO audit_log (
-        actor_type, actor_id, action, resource_type, resource_id,
-        old_value, new_value, ip_address, user_agent, trace_id, metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    `, [
-      event.actorType,
-      event.actorId,
-      event.action,
-      event.resourceType,
-      event.resourceId,
-      JSON.stringify(event.oldValue),
-      JSON.stringify(event.newValue),
-      event.ipAddress,
-      event.userAgent,
-      event.traceId,
-      JSON.stringify(event.metadata)
-    ])
-  }
+---
 
-  // Required audit events for payment systems
-  async logPaymentCreated(intent, context) {
-    await this.log({
-      actorType: 'merchant',
-      actorId: intent.merchant_id,
-      action: 'payment_intent.created',
-      resourceType: 'payment_intent',
-      resourceId: intent.id,
-      newValue: { amount: intent.amount, currency: intent.currency },
-      ...context
-    })
-  }
+## API Design
 
-  async logPaymentConfirmed(intent, context) {
-    await this.log({
-      actorType: 'system',
-      actorId: 'payment-service',
-      action: 'payment_intent.confirmed',
-      resourceType: 'payment_intent',
-      resourceId: intent.id,
-      oldValue: { status: 'requires_payment_method' },
-      newValue: { status: intent.status, auth_code: intent.auth_code },
-      ...context
-    })
-  }
+### REST Endpoints
 
-  async logRefundIssued(refund, context) {
-    await this.log({
-      actorType: 'merchant',
-      actorId: refund.merchant_id,
-      action: 'refund.created',
-      resourceType: 'refund',
-      resourceId: refund.id,
-      newValue: { amount: refund.amount, reason: refund.reason },
-      ...context
-    })
-  }
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/v1/merchants` | Admin | Create merchant account |
+| POST | `/v1/merchants/:id/rotate-key` | Merchant | Rotate API key |
+| POST | `/v1/customers` | Merchant | Create customer |
+| GET | `/v1/customers` | Merchant | List customers |
+| POST | `/v1/payment_methods` | Merchant | Tokenize a card |
+| POST | `/v1/payment_intents` | Merchant | Create payment intent |
+| POST | `/v1/payment_intents/:id/confirm` | Merchant | Confirm with payment method |
+| POST | `/v1/payment_intents/:id/capture` | Merchant | Capture authorized amount |
+| POST | `/v1/payment_intents/:id/cancel` | Merchant | Cancel intent |
+| GET | `/v1/payment_intents/:id` | Merchant | Retrieve intent |
+| PATCH | `/v1/payment_intents/:id` | Merchant | Update intent metadata |
+| POST | `/v1/refunds` | Merchant | Create refund |
+| GET | `/v1/charges` | Merchant | List charges |
+| GET | `/v1/balance` | Merchant | Get merchant balance |
+| POST | `/v1/webhooks` | Merchant | Configure webhook endpoint |
+| GET | `/metrics` | Internal | Prometheus metrics |
+| GET | `/health` | None | Health check |
 
-  async logApiKeyRotated(merchantId, context) {
-    await this.log({
-      actorType: 'merchant',
-      actorId: merchantId,
-      action: 'api_key.rotated',
-      resourceType: 'merchant',
-      resourceId: merchantId,
-      metadata: { key_prefix: context.newKeyPrefix },
-      ...context
-    })
-  }
-}
-```
+**Authentication:** API key in `Authorization: Bearer sk_live_...` header. Keys are hashed (SHA-256) and stored; the raw key is returned only at creation.
 
-### Alert Thresholds
+---
 
-| Alert | Condition | Severity | Action |
-|-------|-----------|----------|--------|
-| High Error Rate | > 1% 5xx for 5 min | Critical | Page on-call |
-| Payment Latency Spike | p99 > 1s for 5 min | Warning | Investigate |
-| Ledger Imbalance | Any debit != credit | Critical | Halt payments, investigate |
-| Webhook Queue Backup | > 1000 pending for 10 min | Warning | Scale workers |
-| Webhook Delivery Failure | > 5% failed for 15 min | Warning | Check merchant endpoints |
-| Redis Memory High | > 80% maxmemory | Warning | Review TTLs |
-| DB Connection Pool Exhausted | 0 idle connections for 1 min | Critical | Scale DB or reduce load |
-| Fraud Block Rate Spike | > 10% blocked for 5 min | Warning | Review fraud rules |
-| Idempotency Lock Contention | > 100 409s per minute | Warning | Check for retry storms |
+## Key Design Decisions
+
+### 1. Idempotency Keys for All Mutating Operations
+
+**Chosen:** Per-request idempotency keys with Redis caching and database persistence.
+**Alternative:** Database unique constraints only.
+**Rationale:** Network retries are inevitable in payment systems. A client timeout does not mean the charge failed -- the server may have succeeded. Without idempotency, retries produce duplicate charges. Redis provides sub-millisecond duplicate detection, while the database constraint serves as a durability fallback if Redis is unavailable. The 24-hour TTL balances storage cost against realistic retry windows.
+
+### 2. Double-Entry Ledger Over Single-Entry
+
+**Chosen:** Double-entry bookkeeping where every transaction creates balanced entries.
+**Alternative:** Single-entry accounting with running balance columns.
+**Rationale:** Single-entry systems hide errors. If a balance column is corrupted, there is no way to detect or reconcile it. Double-entry provides a self-verifying invariant (debits = credits) that catches bugs, data corruption, and fraud. The cost is 3x more rows in the ledger table, but for a payment system where accuracy outweighs storage cost, this is a clear win. The `account_balances` view provides fast balance lookups without materializing totals.
+
+### 3. Webhook Queue with Exponential Backoff
+
+**Chosen:** Async delivery via BullMQ with 5 retry attempts and HMAC signatures.
+**Alternative:** Synchronous HTTP callbacks during payment processing.
+**Rationale:** Synchronous callbacks would block payment confirmation on merchant endpoint availability. If a merchant's server is down, the payment would fail or timeout -- unacceptable for a payment platform. Async delivery with retries decouples payment success from notification delivery. HMAC signatures prevent forged webhooks, and timestamps prevent replay attacks.
+
+---
+
+## Consistency and Idempotency
+
+**Transaction Boundaries:** All payment state transitions and ledger entries are wrapped in a single PostgreSQL transaction. If the ledger entry fails, the payment intent status is rolled back. This guarantees that the financial record always matches the payment state.
+
+**Idempotency Key Lifecycle:**
+1. Client generates key (should be tied to the logical operation, e.g., `order_12345_payment`)
+2. Server checks Redis for existing key via `SET NX` (atomic lock acquisition)
+3. On cache miss, process request and store result
+4. On cache hit, return stored result without reprocessing
+5. Keys expire after 24 hours
+
+**Consistency Guarantees:**
+- Ledger: Strong consistency (PostgreSQL ACID transactions)
+- Idempotency: Strong (Redis lock + database fallback)
+- Webhooks: Eventual (async delivery with at-least-once semantics)
+
+---
+
+## Security / Auth
+
+| Control | Implementation |
+|---------|---------------|
+| API Authentication | API key hash comparison per request |
+| Key Rotation | New key generated, old key invalidated atomically |
+| Card Tokenization | Cards stored as tokens, raw PANs never persisted |
+| Webhook Verification | HMAC-SHA256 signatures with timestamp |
+| Audit Trail | Append-only `audit_log` table for all financial operations |
+| Input Validation | Amount > 0, valid currency, valid status transitions |
+| Rate Limiting | Per-merchant, per-endpoint (via Redis counters) |
+
+---
+
+## Observability
+
+### Metrics (Prometheus)
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `payment_requests_total` | Counter | method, endpoint, status_code, merchant_id | Request volume |
+| `payment_request_duration_seconds` | Histogram | method, endpoint, status | Latency distribution |
+| `payment_amount_cents` | Histogram | currency, status | Payment amount distribution |
+| `payment_success_total` | Counter | currency, payment_method_type | Success rate tracking |
+| `payment_failure_total` | Counter | decline_code, currency | Decline analysis |
+| `fraud_score_distribution` | Histogram | decision | Risk score distribution |
+| `fraud_blocked_total` | Counter | rule, risk_level | Fraud block rate |
+| `webhook_deliveries_total` | Counter | event_type, status, attempt | Webhook reliability |
+| `webhook_queue_depth` | Gauge | -- | Queue backlog |
+| `idempotency_cache_hits_total` | Counter | -- | Duplicate detection rate |
+| `circuit_breaker_state` | Gauge | service | Dependency health |
+| `ledger_imbalances_total` | Counter | -- | Financial integrity |
+| `db_connection_pool_size` | Gauge | state | Database health |
+
+### SLI Targets
+
+| SLI | Target | Alert Threshold |
+|-----|--------|-----------------|
+| Availability | 99.99% | < 99.9% over 5 min |
+| Latency (p50) | < 100ms | > 150ms over 5 min |
+| Latency (p99) | < 500ms | > 750ms over 5 min |
+| Error Rate | < 0.1% | > 0.5% over 5 min |
+| Webhook Delivery | 99.9% within 1 hour | < 99% over 15 min |
+| Ledger Balance | 100% balanced | Any imbalance |
+
+### Structured Logging
+
+JSON logs via Pino with consistent fields: `service`, `trace_id`, `span_id`, `merchant_id`, `event`, `duration_ms`. IP addresses are hashed for privacy compliance. Sensitive fields (API keys, card data) are never logged.
 
 ---
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency Keys
-
-**Client-Side Retry Logic:**
-
-```javascript
-class StripeClient {
-  constructor(apiKey, options = {}) {
-    this.apiKey = apiKey
-    this.maxRetries = options.maxRetries || 3
-    this.baseDelay = options.baseDelay || 500 // ms
-  }
-
-  async createPaymentIntent(params) {
-    // Generate idempotency key if not provided
-    const idempotencyKey = params.idempotencyKey || `pi_${Date.now()}_${randomBytes(8).toString('hex')}`
-
-    return this.requestWithRetry('POST', '/v1/payment_intents', params, idempotencyKey)
-  }
-
-  async requestWithRetry(method, path, body, idempotencyKey) {
-    let lastError
-    let attempt = 0
-
-    while (attempt < this.maxRetries) {
-      attempt++
-
-      try {
-        const response = await this.makeRequest(method, path, body, idempotencyKey)
-
-        // Success
-        return response
-
-      } catch (error) {
-        lastError = error
-
-        // Don't retry on client errors (4xx except 409, 429)
-        if (error.statusCode >= 400 && error.statusCode < 500) {
-          if (error.statusCode === 409) {
-            // Request in progress, wait and retry
-            await this.delay(this.baseDelay * attempt)
-            continue
-          }
-          if (error.statusCode === 429) {
-            // Rate limited, use Retry-After header
-            const retryAfter = error.headers['retry-after'] || attempt * 2
-            await this.delay(retryAfter * 1000)
-            continue
-          }
-          // Other 4xx errors are not retryable
-          throw error
-        }
-
-        // Retry on network errors and 5xx
-        if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.statusCode >= 500) {
-          const delay = this.baseDelay * Math.pow(2, attempt - 1) + Math.random() * 100
-          await this.delay(delay)
-          continue
-        }
-
-        throw error
-      }
-    }
-
-    throw lastError
-  }
-
-  async makeRequest(method, path, body, idempotencyKey) {
-    return fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-        'Idempotency-Key': idempotencyKey
-      },
-      body: JSON.stringify(body),
-      timeout: 30000
-    })
-  }
-
-  delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms))
-  }
-}
-```
-
-**Server-Side Idempotency with Replay Protection:**
-
-```javascript
-class IdempotencyService {
-  constructor(redis, options = {}) {
-    this.redis = redis
-    this.lockTTL = options.lockTTL || 60 // seconds
-    this.responseTTL = options.responseTTL || 86400 // 24 hours
-  }
-
-  async executeWithIdempotency(key, merchantId, operation) {
-    const fullKey = `idempotency:${merchantId}:${key}`
-    const lockKey = `${fullKey}:lock`
-
-    // Try to acquire lock
-    const lockAcquired = await this.redis.set(lockKey, process.pid, 'NX', 'EX', this.lockTTL)
-
-    if (!lockAcquired) {
-      // Check if there's already a cached response
-      const cached = await this.redis.get(fullKey)
-      if (cached) {
-        const { response, createdAt } = JSON.parse(cached)
-        return { cached: true, response, createdAt }
-      }
-      // Still processing, tell client to wait
-      throw new IdempotencyConflictError('Request with this idempotency key is currently being processed')
-    }
-
-    try {
-      // Check for cached response (in case lock expired and reacquired)
-      const cached = await this.redis.get(fullKey)
-      if (cached) {
-        return { cached: true, ...JSON.parse(cached) }
-      }
-
-      // Execute the operation
-      const response = await operation()
-
-      // Cache the response
-      await this.redis.setex(fullKey, this.responseTTL, JSON.stringify({
-        response,
-        createdAt: Date.now()
-      }))
-
-      return { cached: false, response }
-
-    } finally {
-      // Release lock
-      await this.redis.del(lockKey)
-    }
-  }
-}
-```
-
-### Circuit Breaker Pattern
-
-**Implementation for External Services:**
-
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5
-    this.successThreshold = options.successThreshold || 3
-    this.timeout = options.timeout || 30000 // 30 seconds
-    this.resetTimeout = options.resetTimeout || 60000 // 1 minute
-
-    this.state = 'CLOSED' // CLOSED, OPEN, HALF_OPEN
-    this.failureCount = 0
-    this.successCount = 0
-    this.lastFailureTime = null
-    this.nextAttempt = null
-  }
-
-  async execute(operation) {
-    if (this.state === 'OPEN') {
-      if (Date.now() < this.nextAttempt) {
-        throw new CircuitBreakerOpenError('Circuit breaker is open')
-      }
-      // Transition to half-open
-      this.state = 'HALF_OPEN'
-    }
-
-    try {
-      const result = await this.withTimeout(operation)
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      throw error
-    }
-  }
-
-  async withTimeout(operation) {
-    return Promise.race([
-      operation(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Operation timed out')), this.timeout)
-      )
-    ])
-  }
-
-  onSuccess() {
-    if (this.state === 'HALF_OPEN') {
-      this.successCount++
-      if (this.successCount >= this.successThreshold) {
-        this.reset()
-      }
-    } else {
-      this.failureCount = 0
-    }
-  }
-
-  onFailure() {
-    this.failureCount++
-    this.lastFailureTime = Date.now()
-
-    if (this.state === 'HALF_OPEN' || this.failureCount >= this.failureThreshold) {
-      this.state = 'OPEN'
-      this.nextAttempt = Date.now() + this.resetTimeout
-      this.successCount = 0
-    }
-  }
-
-  reset() {
-    this.state = 'CLOSED'
-    this.failureCount = 0
-    this.successCount = 0
-    this.lastFailureTime = null
-    this.nextAttempt = null
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      failureCount: this.failureCount,
-      successCount: this.successCount,
-      lastFailureTime: this.lastFailureTime,
-      nextAttempt: this.nextAttempt
-    }
-  }
-}
-
-// Usage for card network calls
-const cardNetworkBreaker = new CircuitBreaker({
-  failureThreshold: 5,
-  successThreshold: 3,
-  timeout: 10000, // 10 second timeout for card authorization
-  resetTimeout: 30000 // Try again after 30 seconds
-})
-
-async function authorizePayment(params) {
-  return cardNetworkBreaker.execute(async () => {
-    return cardNetwork.authorize(params)
-  })
-}
-```
-
-**Circuit Breakers by Service:**
+### Circuit Breakers
 
 | Service | Failure Threshold | Reset Timeout | Fallback |
 |---------|-------------------|---------------|----------|
-| Card Network (Visa) | 5 failures in 1 min | 30 seconds | Try alternate processor |
-| Card Network (Mastercard) | 5 failures in 1 min | 30 seconds | Try alternate processor |
-| Fraud ML Service | 3 failures in 1 min | 15 seconds | Use rule-based scoring only |
-| Webhook Delivery | Per-merchant, 10 failures | 5 minutes | Queue for later retry |
-| GeoIP Service | 5 failures in 1 min | 1 minute | Skip geo check, log warning |
+| Card Network | 5 consecutive | 30 seconds | Return 503, merchant retries |
+| Fraud ML Service | 3 consecutive | 15 seconds | Rule-based scoring only |
+| Webhook Delivery | 10 consecutive | 60 seconds | Queue for later |
+| GeoIP Service | 5 consecutive | 60 seconds | Skip geo checks |
 
-### Multi-Region Disaster Recovery (Production Simulation)
+### Retry Strategy
 
-For local development, we simulate multi-region concepts with multiple instances:
-
-```javascript
-// Simulated region configuration
-const regions = {
-  primary: {
-    id: 'us-east-1',
-    dbHost: 'localhost:5432',
-    redisHost: 'localhost:6379',
-    apiPort: 3001
-  },
-  secondary: {
-    id: 'us-west-2',
-    dbHost: 'localhost:5433', // Replica
-    redisHost: 'localhost:6380',
-    apiPort: 3002
-  }
-}
-
-// Health check for region failover
-class RegionHealthChecker {
-  async checkRegionHealth(region) {
-    const checks = await Promise.all([
-      this.checkDatabase(region),
-      this.checkRedis(region),
-      this.checkCardNetwork()
-    ])
-
-    return {
-      region: region.id,
-      healthy: checks.every(c => c.healthy),
-      checks
-    }
-  }
-
-  async checkDatabase(region) {
-    try {
-      const start = Date.now()
-      await db.query('SELECT 1')
-      return { service: 'database', healthy: true, latency: Date.now() - start }
-    } catch (error) {
-      return { service: 'database', healthy: false, error: error.message }
-    }
-  }
-}
-
-// Failover coordinator
-class FailoverCoordinator {
-  constructor() {
-    this.currentRegion = 'primary'
-    this.healthChecker = new RegionHealthChecker()
-  }
-
-  async evaluateFailover() {
-    const primaryHealth = await this.healthChecker.checkRegionHealth(regions.primary)
-    const secondaryHealth = await this.healthChecker.checkRegionHealth(regions.secondary)
-
-    if (!primaryHealth.healthy && secondaryHealth.healthy) {
-      await this.initiateFailover('secondary')
-    }
-  }
-
-  async initiateFailover(targetRegion) {
-    logger.warn({ event: 'failover_initiated', from: this.currentRegion, to: targetRegion })
-
-    // Drain in-flight requests (wait up to 30 seconds)
-    await this.drainRequests(30000)
-
-    // Switch traffic
-    this.currentRegion = targetRegion
-
-    // Verify new region is serving traffic
-    await this.verifyFailover()
-
-    logger.info({ event: 'failover_complete', region: targetRegion })
-  }
-}
-```
-
-**DR Runbook for Local Testing:**
-
-```markdown
-## Disaster Recovery Test Procedure
-
-### Scenario 1: Primary Database Failure
-1. Stop primary PostgreSQL: `docker stop stripe-postgres-primary`
-2. Verify API returns 503 for new payments
-3. Promote replica: `docker exec stripe-postgres-replica pg_ctl promote`
-4. Update connection string in environment
-5. Verify payments resume
-6. Expected RTO: < 5 minutes
-
-### Scenario 2: Redis Failure
-1. Stop Redis: `docker stop stripe-redis`
-2. Verify idempotency falls back to database-based locking
-3. Verify webhook queue persisted and resumes on restart
-4. Restart Redis: `docker start stripe-redis`
-5. Expected RTO: < 2 minutes (degraded mode), < 5 minutes (full recovery)
-
-### Scenario 3: Card Network Outage
-1. Enable card network mock failure mode
-2. Verify circuit breaker opens after 5 failures
-3. Verify payments return appropriate error to merchants
-4. Verify automatic recovery when mock is disabled
-```
-
-### Backup and Restore Testing
-
-**Backup Configuration:**
-
-```yaml
-# docker-compose.yml backup configuration
-services:
-  postgres-backup:
-    image: prodrigestivill/postgres-backup-local
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_DB: stripe
-      POSTGRES_USER: stripe
-      POSTGRES_PASSWORD: stripe_password
-      SCHEDULE: "@hourly"
-      BACKUP_KEEP_HOURS: 24
-      BACKUP_KEEP_DAYS: 7
-    volumes:
-      - ./backups:/backups
-```
-
-**Backup Test Script:**
-
-```bash
-#!/bin/bash
-# backup-test.sh - Run weekly to verify backup integrity
-
-set -e
-
-BACKUP_DIR="./backups"
-TEST_DB="stripe_restore_test"
-LATEST_BACKUP=$(ls -t $BACKUP_DIR/*.sql.gz | head -1)
-
-echo "Testing backup: $LATEST_BACKUP"
-
-# Create test database
-docker exec stripe-postgres createdb -U stripe $TEST_DB
-
-# Restore backup
-gunzip -c $LATEST_BACKUP | docker exec -i stripe-postgres psql -U stripe -d $TEST_DB
-
-# Verify data integrity
-MERCHANT_COUNT=$(docker exec stripe-postgres psql -U stripe -d $TEST_DB -t -c "SELECT COUNT(*) FROM merchants")
-LEDGER_BALANCE=$(docker exec stripe-postgres psql -U stripe -d $TEST_DB -t -c "SELECT SUM(debit) - SUM(credit) FROM ledger_entries")
-
-echo "Merchants restored: $MERCHANT_COUNT"
-echo "Ledger balance check: $LEDGER_BALANCE"
-
-if [ "$LEDGER_BALANCE" != "0" ]; then
-  echo "ERROR: Ledger imbalance detected in backup!"
-  exit 1
-fi
-
-# Cleanup
-docker exec stripe-postgres dropdb -U stripe $TEST_DB
-
-echo "Backup verification passed!"
-```
-
-**Point-in-Time Recovery Testing:**
-
-```javascript
-// PITR test helper
-async function testPointInTimeRecovery() {
-  const testTimestamp = new Date()
-
-  // Create a test payment
-  const testPayment = await createPaymentIntent({
-    amount: 1000,
-    currency: 'usd',
-    merchantId: 'test_merchant',
-    idempotencyKey: `pitr_test_${testTimestamp.getTime()}`
-  })
-
-  console.log(`Created test payment: ${testPayment.id} at ${testTimestamp.toISOString()}`)
-
-  // Simulate waiting for WAL archival
-  await delay(5000)
-
-  // Create another payment we want to "lose"
-  const afterPayment = await createPaymentIntent({
-    amount: 2000,
-    currency: 'usd',
-    merchantId: 'test_merchant',
-    idempotencyKey: `pitr_after_${Date.now()}`
-  })
-
-  console.log(`Created after payment: ${afterPayment.id}`)
-
-  // Instructions for PITR recovery
-  console.log(`
-    To test PITR recovery:
-    1. Stop the database
-    2. Restore to timestamp: ${testTimestamp.toISOString()}
-    3. Verify payment ${testPayment.id} exists
-    4. Verify payment ${afterPayment.id} does NOT exist
-  `)
-}
-```
+| Operation | Retries | Backoff | Notes |
+|-----------|---------|---------|-------|
+| Card authorization | 2 | Exponential (200ms base) | Idempotency key prevents duplicates |
+| Fraud check | 3 | Exponential (100ms base) | Falls back to rules on exhaustion |
+| Webhook delivery | 5 | Exponential (1s, 2s, 4s, 8s, 16s) | Per-event idempotency |
+| Database write | 0 | -- | Transactions should not retry |
 
 ### Failure Mode Summary
 
@@ -1429,243 +608,112 @@ async function testPointInTimeRecovery() {
 | Network timeout | Request timeout | Retry with idempotency key | Automatic |
 | Duplicate request | Idempotency key match | Return cached response | Automatic |
 | Database down | Health check failure | Return 503, alert on-call | Manual failover |
-| Redis down | Connection error | Fall back to DB locking | Auto-reconnect |
-| Card network down | Circuit breaker open | Return decline, try alternate | Auto after reset timeout |
-| Webhook endpoint down | HTTP error | Exponential backoff retry | Manual merchant fix |
+| Redis down | Connection error | Fall back to DB-based locking | Auto-reconnect |
+| Card network down | Circuit breaker open | Return decline with 503 | Auto after reset timeout |
 | Ledger imbalance | Balance check failure | Halt writes, alert critical | Manual investigation |
-| Fraud service down | Circuit breaker | Rule-based fallback | Auto after reset |
+
+---
+
+## Scalability Considerations
+
+### Scaling Path
+
+| Component | Current | Next Step | Production Scale |
+|-----------|---------|-----------|-----------------|
+| API Servers | 1 process | 3 instances on ports 3001-3003 | Stateless, behind ALB, auto-scale |
+| PostgreSQL | Single instance | Primary + sync replica | Sharded by merchant_id |
+| Redis | Single instance | Sentinel for HA | Cluster mode, 3+ nodes |
+| Webhook Workers | BullMQ in-process | Dedicated worker processes | Separate worker fleet, rate-limited per merchant |
+
+### Sharding Strategy
+
+Merchant-based sharding is the natural partition key because:
+- All queries are scoped to a single merchant (API key auth)
+- No cross-merchant joins needed
+- Even distribution with consistent hashing
+- Merchant isolation prevents noisy-neighbor problems
+
+### What Breaks First
+
+1. **PostgreSQL write throughput** -- the ledger table grows fastest. Solution: partition by `created_at`, archive entries older than 90 days.
+2. **Webhook delivery** -- high-volume merchants generate webhook storms. Solution: per-merchant rate limiting and dedicated worker pools.
+3. **Redis memory** -- idempotency keys accumulate. Solution: tune TTL, use cluster mode.
+
+---
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Idempotency storage | Redis + DB fallback | DB-only constraints | Sub-ms lookups, graceful Redis failure |
+| Ledger model | Double-entry | Single-entry balance | Self-verifying invariant, audit trail |
+| Webhook delivery | Async queue (BullMQ) | Sync callbacks | Decouple payment success from merchant uptime |
+| Card storage | Tokenization | Encryption at rest | Minimizes PCI scope |
+| Fraud scoring | Rules + signals | ML-only | Rules provide baseline when ML is unavailable |
+| Circuit breaker | Cockatiel library | Custom implementation | Battle-tested, supports retry + breaker composition |
 
 ---
 
 ## Implementation Notes
 
-This section documents the critical observability and reliability implementations added to the codebase.
+### Local Architecture
 
-### WHY Idempotency is CRITICAL for Payment Systems
-
-Idempotency is the single most important concept in payment system design. Here's why:
-
-**The Problem: Network Unreliability**
 ```
-Customer clicks "Pay" -> Request sent -> Network timeout -> Did the charge happen?
-                                                          -> Customer retries
-                                                          -> DOUBLE CHARGE!
-```
-
-**The Solution: Idempotency Keys**
-```javascript
-// Client sends unique key with each logical payment attempt
-POST /v1/payment_intents
-Headers: {
-  'Idempotency-Key': 'order_12345_payment_attempt_1'
-}
-
-// Server behavior:
-// 1. First request: Process payment, cache result with key
-// 2. Retry (same key): Return cached result without reprocessing
-// 3. Different key: Process as new payment
+┌─────────────┐     ┌─────────────────────────────────────┐
+│  Frontend    │     │  Backend (Express)  :3000            │
+│  React+Vite  │────▶│                                     │
+│  :5173       │     │  Routes: paymentIntents, charges,   │
+└─────────────┘     │  refunds, webhooks, merchants,      │
+                     │  customers, paymentMethods, balance │
+                     │                                     │
+                     │  Services: cardNetwork (simulated), │
+                     │  fraud, ledger, webhooks (BullMQ)   │
+                     │                                     │
+                     │  Shared: logger, metrics, audit,    │
+                     │  circuitBreaker, idempotency        │
+                     └──────────┬──────────┬──────────────┘
+                                │          │
+                     ┌──────────▼──┐  ┌────▼──────────┐
+                     │ PostgreSQL  │  │ Valkey/Redis   │
+                     │ :5432       │  │ :6379          │
+                     │ stripe_db   │  │ Idempotency,   │
+                     │             │  │ BullMQ queues  │
+                     └─────────────┘  └───────────────┘
 ```
 
-**Implementation Details:**
-- Keys are namespaced per-merchant to prevent cross-merchant conflicts
-- Redis provides sub-millisecond lookup with automatic TTL expiration (24 hours)
-- Lock acquisition prevents concurrent duplicate requests (returns 409 Conflict)
-- Response caching includes status code and body for exact replay
-- Keys are validated (max 255 chars) to prevent abuse
+### Production Patterns Actually Implemented
 
-**Files:**
-- `/backend/src/middleware/idempotency.js` - Express middleware
-- `/backend/src/db/redis.js` - Redis helpers for key storage and locking
+| Pattern | File(s) | Why It Matters |
+|---------|---------|---------------|
+| **Idempotency** | `backend/src/middleware/idempotency.ts`, `backend/src/db/redis.ts` | Prevents duplicate charges from retries. Uses Redis `SET NX` for atomic lock acquisition with 24h TTL. |
+| **Double-entry ledger** | `backend/src/services/ledger.ts`, `backend/src/db/init.sql` | Guarantees financial accuracy. Every charge creates balanced debit/credit entries with invariant verification. |
+| **Circuit breakers** | `backend/src/shared/circuitBreaker.ts` | Uses Cockatiel library. Pre-configured breakers for card network, fraud service, webhooks, and GeoIP. Metrics-integrated state tracking. |
+| **Prometheus metrics** | `backend/src/shared/metrics.ts` | 25+ metrics covering payments, fraud, webhooks, infrastructure, idempotency, circuit breakers, and ledger operations. Exposed at `/metrics`. |
+| **Structured logging** | `backend/src/shared/logger.ts` | Pino with JSON output, trace/span IDs, privacy-aware IP hashing, and child loggers for request context. |
+| **Audit logging** | `backend/src/shared/audit.ts`, `backend/src/db/init.sql` | Append-only `audit_log` table. Logs payment intents, charges, refunds, fraud checks, ledger entries, API key rotations. |
+| **Webhook queue** | `backend/src/services/webhooks.ts` | BullMQ with exponential backoff, HMAC-SHA256 signatures, and delivery tracking. |
+| **Fraud scoring** | `backend/src/services/fraud.ts` | Rule-based risk assessment with velocity, amount, and geographic signals. Stores assessments in `risk_assessments` table. |
+| **Health checks** | `backend/src/index.ts` | `/health` (basic), `/health/detailed` (PostgreSQL + Redis checks with latency). |
 
----
+### What Was Simplified or Substituted
 
-### WHY Audit Logging is Required for Financial Compliance
+| Production Component | Local Substitute | Notes |
+|---------------------|-----------------|-------|
+| Real card networks (Visa, MC) | Simulated card network service | `backend/src/services/cardNetwork.ts` uses random delays and configurable decline rates |
+| PCI-compliant card vault | In-database tokenization | Cards stored as simulated tokens, no actual encryption HSM |
+| Multi-region deployment | Single-process, multi-port (`dev:server1/2/3`) | Stateless design supports horizontal scaling |
+| ML fraud model | Rule-based scoring only | Velocity, amount, and geo-mismatch signals |
+| OAuth/JWT | API key authentication | Simple hash comparison per request |
+| Rate limiting (WAF/CDN) | Not implemented | Would use `express-rate-limit` or Redis counters |
 
-Audit logging isn't optional for payment systems - it's a legal and regulatory requirement.
+### What Was Omitted
 
-**Regulatory Requirements:**
-1. **PCI DSS Requirement 10**: "Track and monitor all access to network resources and cardholder data"
-2. **SOX Compliance**: Financial records must be immutable and auditable
-3. **GDPR Article 30**: Processing activities must be documented
-4. **Dispute Resolution**: Evidence for chargeback disputes
-
-**What We Log:**
-```javascript
-// Every financial operation creates an immutable audit record
-{
-  id: 'uuid',
-  timestamp: '2024-01-15T10:30:00Z',
-  actor_type: 'merchant',           // Who performed the action
-  actor_id: 'merch_abc123',
-  action: 'payment_intent.confirmed', // What action was taken
-  resource_type: 'payment_intent',
-  resource_id: 'pi_xyz789',
-  old_value: { status: 'requires_confirmation' },
-  new_value: { status: 'succeeded', auth_code: 'ABC123' },
-  ip_address: '192.168.1.1',        // Where it came from
-  trace_id: 'trace_123',            // For distributed tracing correlation
-  metadata: { charge_id: 'ch_456' }
-}
-```
-
-**Key Design Decisions:**
-- **Append-only table**: No UPDATE or DELETE operations allowed
-- **Separate from operational data**: Audit logs are stored in dedicated table
-- **Indexed for common queries**: By timestamp, actor, resource, and action
-- **Privacy-aware**: IP addresses can be hashed if needed
-
-**Files:**
-- `/backend/src/shared/audit.js` - Audit logging service
-- `/backend/src/db/init.sql` - `audit_log` table definition
-
----
-
-### WHY Circuit Breakers Protect Against Payment Processor Outages
-
-Payment systems depend on external services (card networks, fraud services) that can fail. Circuit breakers prevent cascading failures.
-
-**The Problem: Cascade Failure**
-```
-Card Network Slow -> All requests queue -> Thread pool exhausted
-                  -> Database connections exhaust -> Entire API down
-                  -> Other merchants affected -> Widespread outage
-```
-
-**The Solution: Circuit Breaker Pattern**
-```
-CLOSED (normal) ─── failures exceed threshold ──> OPEN (failing fast)
-      ^                                                 │
-      │                                         wait timeout
-      │                                                 │
-      └────── successes restore confidence ──── HALF-OPEN (testing)
-```
-
-**Implementation:**
-```javascript
-// Using cockatiel library for circuit breaker
-const cardNetworkBreaker = createPaymentCircuitBreaker('card_network', {
-  halfOpenAfterMs: 30000,        // Try again after 30 seconds
-  breaker: new ConsecutiveBreaker(5), // Open after 5 consecutive failures
-});
-
-// Usage in card authorization
-export async function authorize(params) {
-  return cardNetworkBreaker.execute(async () => {
-    return authorizeInternal(params);
-  });
-}
-```
-
-**Circuit Breaker Configuration by Service:**
-| Service | Failure Threshold | Reset Timeout | Fallback |
-|---------|-------------------|---------------|----------|
-| Card Network | 5 consecutive | 30 seconds | Return 503, merchant retries |
-| Fraud ML | 3 consecutive | 15 seconds | Rule-based scoring only |
-| Webhook Delivery | 10 consecutive | 60 seconds | Queue for later |
-| GeoIP Service | 5 consecutive | 60 seconds | Skip geo checks |
-
-**Files:**
-- `/backend/src/shared/circuitBreaker.js` - Circuit breaker implementation
-- `/backend/src/services/cardNetwork.js` - Card network with circuit breaker
-
----
-
-### WHY Metrics Enable Fraud Detection
-
-Metrics aren't just for operations - they're essential for detecting and preventing fraud in real-time.
-
-**Fraud Detection via Metrics:**
-```javascript
-// Key fraud indicators tracked in Prometheus
-fraud_score_distribution        // Distribution shows unusual spikes
-fraud_blocked_total             // Sudden increase = attack
-payment_failure_total           // High decline rate = card testing
-payment_amount_cents            // Unusual amounts = anomaly
-```
-
-**Alert-Based Fraud Detection:**
-| Metric Pattern | Potential Fraud | Action |
-|---------------|-----------------|--------|
-| 10x normal decline rate in 5 min | Card testing attack | Block IP, alert |
-| Fraud score spike (>50% high-risk) | Credential stuffing | Enable 3DS, review |
-| Many small payments to same merchant | Carding | Velocity limits |
-| Payments from unusual geographies | Account takeover | Step-up authentication |
-
-**Key Metrics for Fraud:**
-```javascript
-// Collected in /backend/src/shared/metrics.js
-fraud_score_distribution    // Histogram of risk scores
-fraud_blocked_total         // Counter by rule and risk level
-fraud_check_duration        // Latency of fraud checks
-payment_failure_total       // Failures by decline code
-payment_success_total       // Success by currency and method
-```
-
-**SLIs That Indicate Fraud:**
-- Decline rate > 10% (normal: 2-3%)
-- Fraud block rate > 5% (normal: 0.1-0.5%)
-- 3DS challenge rate spike
-- Unusual geographic distribution
-
-**Files:**
-- `/backend/src/shared/metrics.js` - Prometheus metrics definitions
-- `/backend/src/routes/paymentIntents.js` - Metrics collection in payment flow
-
----
-
-### Implemented Observability Stack
-
-**1. Structured Logging (Pino)**
-```javascript
-// JSON logs with consistent fields
-{
-  "level": "info",
-  "time": "2024-01-15T10:30:00.000Z",
-  "service": "stripe-payment-api",
-  "trace_id": "abc123",
-  "event": "payment_succeeded",
-  "intent_id": "pi_xyz",
-  "amount": 2500,
-  "duration_ms": 145.23
-}
-```
-
-**2. Prometheus Metrics (/metrics endpoint)**
-```
-# Payment metrics
-payment_requests_total{method="POST",endpoint="/v1/payment_intents"} 1234
-payment_request_duration_seconds_bucket{le="0.5"} 980
-payment_success_total{currency="usd"} 890
-payment_failure_total{decline_code="insufficient_funds"} 45
-
-# Infrastructure metrics
-db_connection_pool_size{state="active"} 5
-redis_memory_bytes 52428800
-circuit_breaker_state{service="card_network"} 0
-```
-
-**3. Health Check Endpoints**
-- `GET /health` - Basic health (for load balancer)
-- `GET /health/detailed` - Full dependency checks
-- `GET /ready` - Readiness probe (Kubernetes)
-- `GET /live` - Liveness probe (Kubernetes)
-
-**4. Graceful Shutdown**
-- SIGTERM/SIGINT handling
-- Drain in-flight requests (30 second timeout)
-- Close database and Redis connections cleanly
-
----
-
-### File Summary
-
-| File | Purpose |
-|------|---------|
-| `/backend/src/shared/logger.js` | Pino-based structured JSON logging |
-| `/backend/src/shared/metrics.js` | Prometheus metrics collection |
-| `/backend/src/shared/audit.js` | Financial operation audit logging |
-| `/backend/src/shared/circuitBreaker.js` | Circuit breaker and retry logic |
-| `/backend/src/services/cardNetwork.js` | Card network with circuit breaker |
-| `/backend/src/routes/paymentIntents.js` | Payment routes with full observability |
-| `/backend/src/index.js` | Main app with health checks and metrics endpoint |
-| `/backend/src/db/init.sql` | Database schema including audit_log table |
+- CDN / WAF / DDoS protection
+- Multi-region failover and replication
+- Kubernetes orchestration
+- 3D Secure redirect flow
+- Settlement batching and payout scheduling
+- Dispute lifecycle management (table exists, workflow not implemented)
+- Multi-currency support and FX conversion
+- PCI DSS network segmentation
+- Data archival and cold storage tiering

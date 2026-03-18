@@ -2,279 +2,314 @@
 
 ## System Overview
 
-A hotel reservation and management system with inventory management, pricing, and booking capabilities. This design targets a local development learning environment while demonstrating production-grade patterns.
+A hotel reservation and management system with inventory management, dynamic pricing, and booking capabilities. The system handles search across thousands of hotels, prevents room overselling under concurrent access, and supports both guest and hotel admin workflows.
 
 ## Requirements
 
 ### Functional Requirements
 
-- Hotel and room inventory management
-- Search and filtering (location, dates, price, amenities)
+- Hotel and room inventory management (CRUD for hotels, room types, pricing)
+- Search and filtering (location, dates, price, amenities, star rating)
 - Booking and reservation system with double-booking prevention
-- Pricing and availability with dynamic pricing support
-- Payment processing (simulated for local development)
+- Dynamic pricing with date-specific overrides
+- Payment processing with reservation hold pattern (15-minute expiry)
 - Booking modifications and cancellations
-- Reviews and ratings
-- Loyalty programs (stretch goal)
+- Reviews and ratings for completed stays
+- Hotel admin dashboard for managing properties
 
 ### Non-Functional Requirements
 
-- **Scalability:** Support 100 concurrent users locally; design patterns should extend to 10K+ concurrent users
-- **Availability:** 99.9% uptime target (allows ~8.7 hours downtime/year in production)
-- **Latency:** Search p95 < 500ms, Booking p95 < 1s, Page loads p95 < 2s
-- **Consistency:** Strong consistency for bookings (no double-booking), eventual consistency acceptable for search (5-minute stale data OK)
+- **Scalability**: Support 5,000 peak concurrent sessions, 500 RPS search, 10 RPS bookings
+- **Availability**: 99.9% uptime (allows ~8.7 hours downtime/year)
+- **Latency**: Search p95 < 500ms, Booking p95 < 1s, Page loads p95 < 2s
+- **Consistency**: Strong consistency for bookings (no double-booking), eventual consistency acceptable for search (5-minute stale data OK)
 
 ## Capacity Estimation
 
-### Local Development Targets
+### Production Scale
 
-| Metric | Local Dev | Production Extrapolation |
-|--------|-----------|-------------------------|
-| Daily Active Users (DAU) | 10-50 | 100,000 |
-| Peak concurrent sessions | 10 | 5,000 |
-| Searches per second (peak) | 5 RPS | 500 RPS |
-| Bookings per second (peak) | 0.1 RPS | 10 RPS |
-| Hotels in system | 100 | 50,000 |
-| Room types per hotel (avg) | 5 | 5 |
-| Bookings per day | 10 | 10,000 |
+| Metric | Value |
+|--------|-------|
+| Daily Active Users (DAU) | 100,000 |
+| Peak concurrent sessions | 5,000 |
+| Searches per second (peak) | 500 RPS |
+| Bookings per second (peak) | 10 RPS |
+| Hotels in system | 50,000 |
+| Room types per hotel (avg) | 5 |
+| Bookings per day | 10,000 |
 
-### Storage Growth (Local Development)
+### Storage Requirements (Production)
 
-| Data Type | Size per Unit | Units/Month | Monthly Growth | 1-Year Total |
-|-----------|---------------|-------------|----------------|--------------|
-| Hotels | 2 KB | 10 | 20 KB | 240 KB |
-| Room Types | 1 KB | 50 | 50 KB | 600 KB |
-| Bookings | 500 B | 300 | 150 KB | 1.8 MB |
-| Reviews | 1 KB | 100 | 100 KB | 1.2 MB |
-| User Sessions (Redis) | 200 B | 500 | 100 KB | Rotating (TTL) |
-| Search Index (ES) | 5 KB/hotel | 100 total | - | 500 KB |
-
-**Total storage for 1 year local dev:** ~5 MB PostgreSQL, ~500 KB Elasticsearch, ~1 MB Redis peak
-
-### Component Sizing (Local Development)
-
-Based on capacity estimates:
-
-| Component | Local Config | Rationale |
-|-----------|-------------|-----------|
-| PostgreSQL | Single instance, 256 MB RAM | 5 MB data fits in memory, no replication needed |
-| Redis | Single instance, 128 MB RAM | Session store + availability cache < 10 MB |
-| Elasticsearch | Single node, 512 MB heap | 100 hotels, minimal indexing load |
-| API Server | 2-3 instances on ports 3001-3003 | Demonstrate load balancing, each 256 MB |
-| Background Worker | 1 instance | Process expired reservations, ES sync |
+| Data Type | Size per Unit | Annual Volume | Annual Growth |
+|-----------|---------------|---------------|---------------|
+| Hotels | 2 KB | 50,000 | 100 MB |
+| Room Types | 1 KB | 250,000 | 250 MB |
+| Bookings | 500 B | 3.65M | 1.8 GB |
+| Reviews | 1 KB | 1M | 1 GB |
+| Search Index (ES) | 5 KB/hotel | 50,000 | 250 MB |
+| Sessions (Redis) | 200 B | 5,000 peak | Rotating (TTL) |
 
 ## High-Level Architecture
 
 ```
-                                    +------------------+
-                                    |   Load Balancer  |
-                                    |   (nginx:3000)   |
-                                    +--------+---------+
-                                             |
-              +------------------------------+------------------------------+
-              |                              |                              |
-     +--------v--------+          +----------v--------+          +----------v--------+
-     |  API Server 1   |          |   API Server 2    |          |   API Server 3    |
-     |   (port 3001)   |          |    (port 3002)    |          |    (port 3003)    |
-     +--------+--------+          +----------+--------+          +----------+--------+
-              |                              |                              |
-              +------------------------------+------------------------------+
-                                             |
-        +------------------------------------+------------------------------------+
-        |                    |                    |                    |          |
-+-------v-------+   +--------v-------+   +-------v-------+   +--------v-------+   |
-|  PostgreSQL   |   |     Redis      |   | Elasticsearch |   |   RabbitMQ     |   |
-|  (port 5432)  |   |  (port 6379)   |   |  (port 9200)  |   |  (port 5672)   |   |
-+---------------+   +----------------+   +---------------+   +----------------+   |
-                                                                                  |
-                                                              +-------------------v--+
-                                                              |  Background Worker   |
-                                                              | (reservation expiry, |
-                                                              |  ES sync, cleanup)   |
-                                                              +----------------------+
+┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+│   Guest Browser  │   │  Hotel Admin UI  │   │   Mobile App     │
+└────────┬─────────┘   └────────┬─────────┘   └────────┬─────────┘
+         │                      │                       │
+         └──────────────────────┼───────────────────────┘
+                                ▼
+┌───────────────────────────────────────────────────────────────┐
+│                    CDN (Static Assets)                        │
+└───────────────────────────┬───────────────────────────────────┘
+                            ▼
+┌───────────────────────────────────────────────────────────────┐
+│              API Gateway / Load Balancer                      │
+│         (Rate limiting, SSL termination, routing)            │
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ API Server  │     │ API Server  │     │ API Server  │
+│    (1)      │     │    (2)      │     │    (N)      │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       └───────────────────┼───────────────────┘
+                           │
+    ┌──────────────────────┼──────────────────────┐
+    │                      │                      │
+    ▼                      ▼                      ▼
+┌─────────────┐    ┌─────────────┐    ┌──────────────────┐
+│ PostgreSQL  │    │ Redis/      │    │ Elasticsearch    │
+│ Primary     │    │ Valkey      │    │                  │
+│             │    │             │    │ Hotel search     │
+│ Hotels      │    │ Sessions    │    │ Geo queries      │
+│ Rooms       │    │ Avail cache │    │ Faceted filters  │
+│ Bookings    │    │ Dist. locks │    │                  │
+│ Users       │    │ Idempotency │    │                  │
+│ Reviews     │    │             │    │                  │
+└──────┬──────┘    └─────────────┘    └──────────────────┘
+       │
+       ▼
+┌─────────────┐
+│ PostgreSQL  │
+│ Read        │
+│ Replicas    │
+└─────────────┘
+
+                   ┌──────────────────┐
+                   │  Background      │
+                   │  Worker          │
+                   │                  │
+                   │ - Reservation    │
+                   │   expiry         │
+                   │ - ES sync        │
+                   │ - Notifications  │
+                   └──────────────────┘
 ```
 
 ### Core Components
 
-| Component | Responsibility | Technology |
-|-----------|---------------|------------|
-| API Gateway/LB | Route requests, SSL termination, rate limiting | nginx |
-| API Server | Business logic, authentication, request handling | Node.js + Express |
-| PostgreSQL | Source of truth for hotels, rooms, bookings, users | PostgreSQL 16 |
-| Redis | Session storage, availability caching, distributed locks | Redis/Valkey 7 |
-| Elasticsearch | Full-text search, geo queries, faceted filtering | Elasticsearch 8 |
-| RabbitMQ | Async job processing, ES sync, notifications | RabbitMQ 3.12 |
-| Background Worker | Process queued jobs, cleanup expired reservations | Node.js |
+| Component | Responsibility |
+|-----------|---------------|
+| API Gateway/LB | Route requests, SSL termination, rate limiting |
+| API Server | Business logic, authentication, request handling (Node.js + Express) |
+| PostgreSQL | Source of truth for hotels, rooms, bookings, users (ACID) |
+| Redis/Valkey | Session storage, availability caching, distributed locks, idempotency |
+| Elasticsearch | Full-text search, geo-distance queries, faceted filtering |
+| Background Worker | Expire stale reservations, sync ES index, send notifications |
 
-### Request Flow Examples
+## Core Components / Request Flows
 
-#### Search Flow (Read-Heavy, Eventually Consistent)
+### Search Flow (Read-Heavy, Eventually Consistent)
+
 ```
 1. User submits search (location: "NYC", dates: Jan 15-17, guests: 2)
-2. nginx routes to API Server (round-robin)
+2. Load balancer routes to API Server (round-robin)
 3. API Server queries Elasticsearch for matching hotels
-   - Geo-distance filter (50km from NYC center)
-   - Amenity filters, price range
+   - Geo-distance filter (50km from city center)
+   - Amenity filters, price range, star rating
    - Returns hotel IDs + metadata
 4. For each hotel, check Redis availability cache
    - Cache key: availability:{hotel_id}:{YYYY-MM}
    - If cache miss, query PostgreSQL and populate cache (TTL: 5 min)
-5. Filter to hotels with available rooms
+5. Filter to hotels with available rooms for the date range
 6. Return ranked results to user
 ```
 
-#### Booking Flow (Write, Strongly Consistent)
+### Booking Flow (Write, Strongly Consistent)
+
 ```
 1. User selects hotel, room type, dates (Jan 15-17)
-2. API Server begins PostgreSQL transaction
-3. SELECT ... FOR UPDATE on room_types row (pessimistic lock)
-4. Check availability: no overlapping confirmed bookings for dates
-5. If available:
-   a. Insert booking with status='reserved', expires_at=NOW()+15min
-   b. Commit transaction
-   c. Invalidate Redis availability cache for affected dates
-   d. Return reservation_id to user
-6. If unavailable:
-   a. Rollback transaction
-   b. Return 409 Conflict with alternative suggestions
-7. User completes payment within 15 minutes
-8. Update booking status='confirmed', clear expires_at
-9. Publish "booking.confirmed" event to RabbitMQ for notifications
+2. Generate idempotency key from: userId + hotelId + roomTypeId + checkIn + checkOut
+3. Check Redis for existing booking with this idempotency key
+4. Acquire distributed lock: lock:room:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}
+5. Begin PostgreSQL transaction
+   a. SELECT ... FOR UPDATE on room_types row (pessimistic lock)
+   b. Check availability: count overlapping confirmed/reserved bookings vs total_rooms
+   c. If available: INSERT booking with status='reserved', reserved_until=NOW()+15min
+   d. COMMIT
+6. Invalidate Redis availability cache for affected dates
+7. Return reservation to user (15-minute payment window)
+8. On payment: UPDATE booking status='confirmed', clear reserved_until
+9. Release distributed lock
 ```
 
-#### Reservation Expiry Flow (Background)
+### Reservation Expiry Flow (Background)
+
 ```
-1. Worker polls every 60 seconds
-2. Query: SELECT * FROM bookings WHERE status='reserved' AND expires_at < NOW()
-3. For each expired reservation:
-   a. Update status='expired'
+Every 60 seconds:
+1. SELECT * FROM bookings WHERE status='reserved' AND reserved_until < NOW()
+2. For each expired reservation:
+   a. UPDATE status='expired'
    b. Invalidate availability cache
-   c. Log for analytics
+   c. Increment bookings_expired_total metric
 ```
 
 ## Database Schema
 
-### Database Schema
-
 ```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 -- Users table
 CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    role VARCHAR(50) DEFAULT 'guest', -- 'guest', 'hotel_admin', 'system_admin'
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  first_name VARCHAR(100) NOT NULL,
+  last_name VARCHAR(100) NOT NULL,
+  phone VARCHAR(20),
+  role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'hotel_admin', 'admin')),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX idx_users_email ON users(email);
 
 -- Hotels table
 CREATE TABLE hotels (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    owner_id UUID REFERENCES users(id),
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    address TEXT NOT NULL,
-    city VARCHAR(100) NOT NULL,
-    country VARCHAR(100) NOT NULL,
-    latitude DECIMAL(10, 8) NOT NULL,
-    longitude DECIMAL(11, 8) NOT NULL,
-    star_rating INTEGER CHECK (star_rating BETWEEN 1 AND 5),
-    amenities JSONB DEFAULT '[]',
-    images JSONB DEFAULT '[]',
-    status VARCHAR(50) DEFAULT 'active', -- 'active', 'inactive', 'pending'
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  owner_id UUID REFERENCES users(id),
+  name VARCHAR(255) NOT NULL,
+  description TEXT,
+  address TEXT NOT NULL,
+  city VARCHAR(100) NOT NULL,
+  state VARCHAR(100),
+  country VARCHAR(50) NOT NULL,
+  postal_code VARCHAR(20),
+  latitude DECIMAL(10, 8),
+  longitude DECIMAL(11, 8),
+  star_rating INTEGER CHECK (star_rating BETWEEN 1 AND 5),
+  amenities TEXT[] DEFAULT '{}',
+  check_in_time TIME DEFAULT '15:00',
+  check_out_time TIME DEFAULT '11:00',
+  cancellation_policy TEXT DEFAULT 'Free cancellation up to 24 hours before check-in',
+  images TEXT[] DEFAULT '{}',
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_hotels_city ON hotels(city);
-CREATE INDEX idx_hotels_owner ON hotels(owner_id);
-CREATE INDEX idx_hotels_status ON hotels(status);
+CREATE INDEX idx_hotels_country ON hotels(country);
+CREATE INDEX idx_hotels_location ON hotels(latitude, longitude);
+CREATE INDEX idx_hotels_active ON hotels(is_active) WHERE is_active = true;
 
 -- Room types table
 CREATE TABLE room_types (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    hotel_id UUID REFERENCES hotels(id) ON DELETE CASCADE,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    base_price DECIMAL(10, 2) NOT NULL,
-    max_guests INTEGER NOT NULL,
-    total_rooms INTEGER NOT NULL, -- Total inventory
-    amenities JSONB DEFAULT '[]',
-    images JSONB DEFAULT '[]',
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  hotel_id UUID REFERENCES hotels(id) ON DELETE CASCADE,
+  name VARCHAR(100) NOT NULL,
+  description TEXT,
+  capacity INTEGER NOT NULL CHECK (capacity > 0),
+  bed_type VARCHAR(50),
+  total_count INTEGER NOT NULL CHECK (total_count > 0),
+  base_price DECIMAL(10, 2) NOT NULL CHECK (base_price > 0),
+  amenities TEXT[] DEFAULT '{}',
+  images TEXT[] DEFAULT '{}',
+  size_sqm INTEGER,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_room_types_hotel ON room_types(hotel_id);
+CREATE INDEX idx_room_types_active ON room_types(is_active) WHERE is_active = true;
 
--- Price overrides for dynamic pricing
-CREATE TABLE price_overrides (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    room_type_id UUID REFERENCES room_types(id) ON DELETE CASCADE,
-    date DATE NOT NULL,
-    price DECIMAL(10, 2) NOT NULL,
-    reason VARCHAR(100), -- 'weekend', 'holiday', 'high_demand', 'promotion'
-    UNIQUE(room_type_id, date)
+-- Pricing overrides table (for dynamic pricing)
+CREATE TABLE pricing_overrides (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  room_type_id UUID REFERENCES room_types(id) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  price DECIMAL(10, 2) NOT NULL CHECK (price > 0),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(room_type_id, date)
 );
-CREATE INDEX idx_price_overrides_room_date ON price_overrides(room_type_id, date);
+CREATE INDEX idx_pricing_overrides_room_date ON pricing_overrides(room_type_id, date);
 
 -- Bookings table
 CREATE TABLE bookings (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id),
-    hotel_id UUID REFERENCES hotels(id),
-    room_type_id UUID REFERENCES room_types(id),
-    check_in DATE NOT NULL,
-    check_out DATE NOT NULL,
-    guests INTEGER NOT NULL,
-    total_price DECIMAL(10, 2) NOT NULL,
-    status VARCHAR(50) DEFAULT 'reserved', -- 'reserved', 'confirmed', 'cancelled', 'completed', 'expired'
-    guest_name VARCHAR(255) NOT NULL,
-    guest_email VARCHAR(255) NOT NULL,
-    special_requests TEXT,
-    expires_at TIMESTAMP, -- For reserved bookings
-    cancelled_at TIMESTAMP,
-    idempotency_key VARCHAR(255) UNIQUE, -- Prevent duplicate bookings
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    CONSTRAINT valid_dates CHECK (check_out > check_in)
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id),
+  hotel_id UUID REFERENCES hotels(id),
+  room_type_id UUID REFERENCES room_types(id),
+  check_in DATE NOT NULL,
+  check_out DATE NOT NULL,
+  room_count INTEGER NOT NULL CHECK (room_count > 0),
+  guest_count INTEGER NOT NULL CHECK (guest_count > 0),
+  total_price DECIMAL(10, 2) NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending'
+    CHECK (status IN ('pending', 'reserved', 'confirmed', 'cancelled', 'completed', 'expired')),
+  payment_id VARCHAR(100),
+  idempotency_key VARCHAR(64) UNIQUE,
+  reserved_until TIMESTAMP WITH TIME ZONE,
+  guest_first_name VARCHAR(100) NOT NULL,
+  guest_last_name VARCHAR(100) NOT NULL,
+  guest_email VARCHAR(255) NOT NULL,
+  guest_phone VARCHAR(20),
+  special_requests TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT valid_dates CHECK (check_out > check_in)
 );
+CREATE INDEX idx_bookings_hotel_dates ON bookings(hotel_id, room_type_id, check_in, check_out);
 CREATE INDEX idx_bookings_user ON bookings(user_id);
-CREATE INDEX idx_bookings_hotel ON bookings(hotel_id);
-CREATE INDEX idx_bookings_room_type ON bookings(room_type_id);
-CREATE INDEX idx_bookings_dates ON bookings(room_type_id, check_in, check_out);
 CREATE INDEX idx_bookings_status ON bookings(status);
-CREATE INDEX idx_bookings_expires ON bookings(expires_at) WHERE status = 'reserved';
+CREATE INDEX idx_bookings_reserved_until ON bookings(reserved_until) WHERE status = 'reserved';
 
 -- Reviews table
 CREATE TABLE reviews (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    booking_id UUID REFERENCES bookings(id) UNIQUE,
-    user_id UUID REFERENCES users(id),
-    hotel_id UUID REFERENCES hotels(id),
-    rating INTEGER CHECK (rating BETWEEN 1 AND 5),
-    title VARCHAR(255),
-    content TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  booking_id UUID REFERENCES bookings(id) UNIQUE,
+  user_id UUID REFERENCES users(id),
+  hotel_id UUID REFERENCES hotels(id),
+  rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  title VARCHAR(200),
+  content TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_reviews_hotel ON reviews(hotel_id);
 CREATE INDEX idx_reviews_user ON reviews(user_id);
+
+-- Sessions table
+CREATE TABLE sessions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  token VARCHAR(255) UNIQUE NOT NULL,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
 ```
 
 ### Availability Query
 
+Uses `generate_series` to check each night in the date range and find the peak concurrent bookings:
+
 ```sql
--- Get available rooms for a room type on given dates
--- Uses generate_series to check each night in the range
-SELECT rt.total_rooms - COALESCE(booked.count, 0) AS available_rooms
+SELECT rt.total_count - COALESCE(booked.count, 0) AS available_rooms
 FROM room_types rt
 LEFT JOIN (
     SELECT room_type_id, MAX(nightly_bookings) AS count
     FROM (
-        SELECT
-            room_type_id,
-            d::date,
-            COUNT(*) AS nightly_bookings
+        SELECT room_type_id, d::date, COUNT(*) AS nightly_bookings
         FROM bookings b
         CROSS JOIN generate_series(b.check_in, b.check_out - INTERVAL '1 day', '1 day') AS d
         WHERE b.room_type_id = $1
@@ -287,354 +322,166 @@ LEFT JOIN (
 WHERE rt.id = $1;
 ```
 
-### Storage Strategy
-
-| Data Type | Storage Engine | Rationale |
-|-----------|---------------|-----------|
-| Users, Hotels, Bookings | PostgreSQL | ACID transactions, relational integrity |
-| Sessions | Redis (TTL: 24h) | Fast lookup, automatic expiry |
-| Availability Cache | Redis (TTL: 5min) | Read-heavy, tolerates stale data |
-| Search Index | Elasticsearch | Full-text, geo queries, faceted search |
-| Job Queue | RabbitMQ | Reliable delivery, dead-letter handling |
-
 ### Caching Strategy
 
 | Cache Key Pattern | TTL | Invalidation Trigger |
 |------------------|-----|---------------------|
 | `session:{session_id}` | 24 hours | Logout, password change |
-| `availability:{hotel_id}:{YYYY-MM}` | 5 minutes | Booking create/cancel/expire |
+| `availability:{hotel_id}:{room_type_id}:{checkIn}:{checkOut}` | 5 minutes | Booking create/cancel/expire |
 | `hotel:{hotel_id}` | 10 minutes | Hotel update |
 | `search:{query_hash}` | 2 minutes | None (short TTL only) |
 
-**Cache-Aside Pattern:**
-1. Check Redis for cached value
-2. On miss, query PostgreSQL
-3. Store result in Redis with TTL
-4. Return to caller
-
-**Invalidation Strategy:**
-- Booking operations explicitly delete affected cache keys
-- Use Redis key patterns: `DEL availability:hotel123:*` when hotel changes significantly
+Cache-aside pattern: check Redis first, on miss query PostgreSQL, store with TTL, return.
 
 ## API Design
 
 ### Core Endpoints
 
-#### Authentication
 ```
-POST /api/v1/auth/register     # Create user account
-POST /api/v1/auth/login        # Create session
-POST /api/v1/auth/logout       # Destroy session
-GET  /api/v1/auth/me           # Get current user
-```
+Authentication
+  POST   /api/v1/auth/register          Create user account
+  POST   /api/v1/auth/login             Create session
+  POST   /api/v1/auth/logout            Destroy session
+  GET    /api/v1/auth/me                Get current user
 
-#### Hotels (Public)
-```
-GET  /api/v1/hotels            # List hotels with filters
-GET  /api/v1/hotels/:id        # Get hotel details
-GET  /api/v1/hotels/:id/rooms  # Get room types and availability
-```
+Hotels (Public)
+  GET    /api/v1/hotels                 List hotels with filters
+  GET    /api/v1/hotels/:id             Get hotel details
+  GET    /api/v1/hotels/:id/rooms       Get room types and availability
+  GET    /api/v1/hotels/:id/reviews     Get hotel reviews
 
-#### Search
-```
-POST /api/v1/search            # Search hotels
-{
-  "location": "New York",
-  "checkIn": "2024-01-15",
-  "checkOut": "2024-01-17",
-  "guests": 2,
-  "priceMin": 100,
-  "priceMax": 500,
-  "amenities": ["wifi", "parking"],
-  "starRating": [4, 5]
-}
-```
+Search
+  POST   /api/v1/hotels/search          Search hotels (ES + availability)
 
-#### Bookings
-```
-POST   /api/v1/bookings              # Create reservation
-GET    /api/v1/bookings              # List user's bookings
-GET    /api/v1/bookings/:id          # Get booking details
-POST   /api/v1/bookings/:id/confirm  # Confirm after payment
-POST   /api/v1/bookings/:id/cancel   # Cancel booking
-```
+Bookings
+  POST   /api/v1/bookings               Create reservation (idempotent)
+  GET    /api/v1/bookings               List user's bookings
+  GET    /api/v1/bookings/:id           Get booking details
+  POST   /api/v1/bookings/:id/confirm   Confirm after payment
+  POST   /api/v1/bookings/:id/cancel    Cancel booking
+  POST   /api/v1/bookings/:id/review    Submit review for completed stay
 
-#### Reviews
-```
-POST /api/v1/bookings/:id/review  # Submit review for completed stay
-GET  /api/v1/hotels/:id/reviews   # Get hotel reviews
-```
-
-#### Admin Endpoints
-```
-GET    /api/v1/admin/hotels              # List admin's hotels
-POST   /api/v1/admin/hotels              # Create hotel
-PUT    /api/v1/admin/hotels/:id          # Update hotel
-DELETE /api/v1/admin/hotels/:id          # Delete hotel
-GET    /api/v1/admin/hotels/:id/bookings # List hotel bookings
-POST   /api/v1/admin/rooms               # Create room type
-PUT    /api/v1/admin/rooms/:id           # Update room type
-PUT    /api/v1/admin/rooms/:id/pricing   # Set price overrides
+Admin
+  GET    /api/v1/admin/hotels           List admin's hotels
+  POST   /api/v1/admin/hotels           Create hotel
+  PUT    /api/v1/admin/hotels/:id       Update hotel
+  GET    /api/v1/admin/hotels/:id/bookings   List hotel bookings
+  POST   /api/v1/admin/rooms            Create room type
+  PUT    /api/v1/admin/rooms/:id        Update room type
+  PUT    /api/v1/admin/rooms/:id/pricing    Set price overrides
 ```
 
 ## Key Design Decisions
 
-### Inventory Management and Overbooking
+### 1. Concurrency Control: Pessimistic Locking + Distributed Lock
 
-**Approach:** Strict inventory with optional soft limits for overbooking.
+**Chose**: `SELECT ... FOR UPDATE` inside a Redis distributed lock
 
-```sql
--- Room types can have soft_limit for overbooking
-ALTER TABLE room_types ADD COLUMN soft_limit INTEGER; -- NULL = no overbooking
+**Why this works**: Hotel booking has a critical invariant: the number of confirmed+reserved bookings for a room type on any given night must not exceed `total_count`. With multiple API servers, a database-level lock alone is insufficient because two servers can both read "1 room available" before either commits. The Redis distributed lock ensures only one server processes a booking for the same room type and date range at a time.
 
--- Availability check respects either total_rooms or soft_limit
--- soft_limit typically = total_rooms * 1.05 (5% overbooking)
-```
+**Alternative**: Optimistic locking with version fields. Rejected because booking success rate matters more than throughput. At a 1:100 booking-to-search ratio, lock contention is rare, and a failed optimistic lock retry creates a poor user experience ("Sorry, try again").
 
-**Trade-off:** Overbooking increases revenue but requires a rebooking workflow when inventory is truly exhausted. For local dev, we implement strict limits only.
+**Trade-off**: ~30ms additional latency for lock acquisition. Acceptable given the 1-second p95 booking target.
 
-### Concurrency Control for Bookings
+### 2. Two-Phase Search: Elasticsearch + PostgreSQL
 
-**Approach:** Pessimistic locking with `SELECT ... FOR UPDATE`.
+**Chose**: Elasticsearch for matching/filtering, PostgreSQL for real-time availability
 
-```sql
-BEGIN;
--- Lock the room type row
-SELECT * FROM room_types WHERE id = $1 FOR UPDATE;
+**Why this works**: Full-text search, geo-distance queries, and faceted filtering are Elasticsearch strengths. But availability data changes with every booking and must be accurate. Combining both gives fast search (~50ms for ES) with accurate availability (~10ms per hotel from Redis cache or PostgreSQL).
 
--- Check availability (from previous query)
--- ...
+**Alternative**: PostgreSQL-only search with `tsvector` and PostGIS. Would work but lacks faceted filtering, relevance scoring, and scales poorly for geo queries across 50,000 hotels.
 
--- Insert booking
-INSERT INTO bookings (...) VALUES (...);
+**Trade-off**: Additional infrastructure (Elasticsearch cluster). Justified because search is the primary user interaction and must be fast.
 
-COMMIT;
-```
+### 3. Reservation Hold Pattern (15-Minute Expiry)
 
-**Why pessimistic over optimistic:**
-- Booking success rate matters more than throughput
-- 1:100 booking-to-search ratio means lock contention is rare
-- Simpler than retry loops with version checks
+**Chose**: Bookings start as "reserved" with 15-minute payment window, then "confirmed" after payment
 
-**Fallback for high contention:** If flash sales cause deadlocks, add Redis distributed lock as overflow:
-```
-SETNX lock:room_type:{id} {uuid} EX 30
-```
+**Why this works**: Prevents cart abandonment from blocking inventory indefinitely. Users get time to enter payment details without losing their room. Background worker expires stale reservations and releases inventory.
 
-### Dynamic Pricing
+**Alternative**: No reservation phase (instant confirm-or-reject). Rejected because payment processing takes 5-30 seconds, and without a hold, another user could book the last room while the first user's payment is processing.
 
-**Approach:** Base price with date-specific overrides.
+**Trade-off**: Some inventory is temporarily locked in abandoned carts. Mitigated by 15-minute expiry (shorter than Booking.com's 30-minute hold).
 
-```javascript
-async function getRoomPrice(roomTypeId, date) {
-  // Check for override
-  const override = await db.query(
-    'SELECT price FROM price_overrides WHERE room_type_id = $1 AND date = $2',
-    [roomTypeId, date]
-  );
-  if (override.rows.length > 0) {
-    return override.rows[0].price;
-  }
+### 4. Dynamic Pricing with Override Table
 
-  // Fall back to base price
-  const room = await db.query(
-    'SELECT base_price FROM room_types WHERE id = $1',
-    [roomTypeId]
-  );
-  return room.rows[0].base_price;
-}
-```
+**Chose**: Base price per room type with date-specific overrides in `pricing_overrides` table
 
-**Future enhancement:** Demand-based pricing using booking velocity and search volume.
+**Why this works**: Hotels set a base price (e.g., $150/night for Standard) and override specific dates (New Year's Eve: $300, slow Tuesday: $99). Simple to implement, easy for hotel admins to manage.
 
-### Search and Filtering
+**Alternative**: Algorithmic pricing based on demand signals. Deferred to future phase because it requires historical booking data and ML infrastructure.
 
-**Approach:** Two-phase search combining Elasticsearch speed with PostgreSQL accuracy.
+## Consistency and Idempotency
 
-**Phase 1 - Elasticsearch (fast, eventually consistent):**
-```json
-{
-  "query": {
-    "bool": {
-      "must": [
-        { "match": { "city": "New York" } }
-      ],
-      "filter": [
-        { "geo_distance": { "distance": "50km", "location": "40.7128,-74.0060" } },
-        { "range": { "min_price": { "lte": 500 } } },
-        { "terms": { "amenities": ["wifi", "parking"] } }
-      ]
-    }
-  }
-}
-```
+### Idempotency for Booking Creation
 
-**Phase 2 - PostgreSQL (accurate availability):**
-For each candidate hotel from ES, query real-time availability.
+Every booking request generates a deterministic idempotency key from `SHA-256(userId + hotelId + roomTypeId + checkIn + checkOut + roomCount)`. The system checks Redis cache first, then the `idempotency_key` column (unique constraint) in the bookings table.
 
-**Optimization:** Cache availability aggressively. For local dev, 5-minute cache is sufficient.
+Duplicate requests return the existing booking instead of creating a new one. This prevents double-charging from network retries, double-clicks, and load balancer retries.
 
-## Technology Stack
+### Distributed Lock for Room Selection
 
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| **Frontend** | React 19 + TypeScript + Vite | Modern, fast dev experience |
-| **Routing** | TanStack Router | Type-safe, file-based routing |
-| **State** | Zustand | Simple, minimal boilerplate |
-| **Styling** | Tailwind CSS | Rapid UI development |
-| **API Server** | Node.js + Express | JavaScript ecosystem, async I/O |
-| **Database** | PostgreSQL 16 | ACID, JSON support, mature |
-| **Cache** | Redis 7 / Valkey | Sessions, caching, distributed locks |
-| **Search** | Elasticsearch 8 | Full-text, geo queries |
-| **Queue** | RabbitMQ 3.12 | Reliable messaging, dead-letter queues |
-| **Load Balancer** | nginx | Proven, easy configuration |
+Redis SETNX with unique lock IDs and 30-second TTL. Lua script for atomic check-and-delete on release. Exponential backoff with jitter for retry. Lock key format: `lock:room:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}`.
 
-## Scalability Considerations
+## Security / Auth
 
-### Horizontal Scaling Points
+### Authentication
 
-| Component | Scaling Strategy |
-|-----------|-----------------|
-| API Servers | Add instances behind nginx (stateless) |
-| PostgreSQL | Read replicas for search, primary for writes |
-| Redis | Redis Cluster for cache, Sentinel for HA |
-| Elasticsearch | Add nodes to cluster |
-| Workers | Add instances (RabbitMQ handles distribution) |
+Session-based with Redis-backed storage. Sessions stored with 24-hour TTL, HTTP-only secure cookies.
 
-### Database Sharding (Future)
+### Authorization (RBAC)
 
-If PostgreSQL becomes a bottleneck:
-- Shard bookings by `hotel_id` hash
-- Keep hotels/rooms on primary (rarely updated)
-- Use Citus or application-level sharding
-
-### Local Dev Scaling Demo
-
-Run multiple API instances to demonstrate load balancing:
-```bash
-npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
-npm run dev:server3  # Port 3003
-npm run dev:lb       # nginx on port 3000
-```
-
-## Security Considerations
-
-### Authentication and Authorization
-
-**Authentication:** Session-based with Redis storage.
-```javascript
-// Session creation on login
-const sessionId = crypto.randomUUID();
-await redis.setex(`session:${sessionId}`, 86400, JSON.stringify({
-  userId: user.id,
-  role: user.role,
-  createdAt: Date.now()
-}));
-res.cookie('session_id', sessionId, { httpOnly: true, secure: true, sameSite: 'strict' });
-```
-
-**Authorization (RBAC):**
 | Role | Permissions |
 |------|-------------|
-| `guest` | Search, book, view own bookings, submit reviews |
+| `user` | Search, book, view own bookings, submit reviews |
 | `hotel_admin` | Manage own hotels, view hotel bookings, set pricing |
-| `system_admin` | All operations, user management, system config |
-
-```javascript
-// Middleware example
-function requireRole(...roles) {
-  return (req, res, next) => {
-    if (!req.user || !roles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    next();
-  };
-}
-
-// Usage
-app.post('/api/v1/admin/hotels', requireRole('hotel_admin', 'system_admin'), createHotel);
-```
+| `admin` | All operations, user management, system config |
 
 ### Rate Limiting
 
-| Endpoint Pattern | Limit | Window |
-|-----------------|-------|--------|
+| Endpoint | Limit | Window |
+|----------|-------|--------|
 | `/api/v1/auth/login` | 5 requests | 1 minute |
-| `/api/v1/search` | 30 requests | 1 minute |
+| `/api/v1/hotels/search` | 30 requests | 1 minute |
 | `/api/v1/bookings` (POST) | 10 requests | 1 minute |
 | Default | 100 requests | 1 minute |
 
-```javascript
-// Using express-rate-limit
-const loginLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  message: { error: 'Too many login attempts, try again later' }
-});
-app.post('/api/v1/auth/login', loginLimiter, loginHandler);
-```
-
-### Input Validation
-
-- Validate all inputs with Zod schemas
-- Sanitize SQL parameters (parameterized queries only)
-- Escape HTML in user-generated content (reviews, hotel descriptions)
-
 ### Data Protection
 
-- Passwords hashed with bcrypt (cost factor 12)
-- Session cookies: `httpOnly`, `secure`, `sameSite=strict`
-- Database connections use SSL in production
-- No PII in logs (mask emails, redact card numbers)
+- Passwords hashed with bcryptjs
+- Parameterized queries prevent SQL injection
+- No PII in logs
 
 ## Observability
 
 ### Metrics (Prometheus)
 
-```javascript
-// Key metrics to track
-const metrics = {
-  // Request metrics
-  http_requests_total: new Counter({ name: 'http_requests_total', labelNames: ['method', 'path', 'status'] }),
-  http_request_duration_seconds: new Histogram({ name: 'http_request_duration_seconds', labelNames: ['method', 'path'] }),
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_requests_total{method,path,status}` | Counter | Request volume and error rates |
+| `http_request_duration_seconds{method,path}` | Histogram | Latency distribution |
+| `bookings_created_total{status}` | Counter | Booking creation by outcome |
+| `bookings_confirmed_total{hotel_id}` | Counter | Successful confirmations |
+| `bookings_cancelled_total{hotel_id,reason}` | Counter | Cancellation tracking |
+| `bookings_expired_total` | Counter | Stale reservation expiry |
+| `booking_creation_duration_seconds` | Histogram | End-to-end booking latency |
+| `search_duration_seconds` | Histogram | Search latency |
+| `availability_cache_hits_total` | Counter | Cache effectiveness |
+| `availability_cache_misses_total` | Counter | Cache misses |
+| `distributed_lock_acquisitions_total{resource,success}` | Counter | Lock contention |
+| `distributed_lock_wait_seconds{resource}` | Histogram | Lock wait time |
+| `circuit_breaker_state{service}` | Gauge | Circuit breaker status |
+| `circuit_breaker_failures_total{service}` | Counter | CB failure count |
+| `idempotent_requests_total{deduplicated}` | Counter | Duplicate detection |
+| `db_pool_active` | Gauge | Connection pool health |
 
-  // Business metrics
-  bookings_created_total: new Counter({ name: 'bookings_created_total', labelNames: ['status'] }),
-  bookings_expired_total: new Counter({ name: 'bookings_expired_total' }),
-  search_latency_seconds: new Histogram({ name: 'search_latency_seconds' }),
-  availability_cache_hits_total: new Counter({ name: 'availability_cache_hits_total' }),
-  availability_cache_misses_total: new Counter({ name: 'availability_cache_misses_total' }),
+### Structured Logging
 
-  // Infrastructure metrics
-  db_pool_active: new Gauge({ name: 'db_pool_active' }),
-  redis_connected: new Gauge({ name: 'redis_connected' }),
-  elasticsearch_cluster_health: new Gauge({ name: 'elasticsearch_cluster_health' })
-};
-```
+Pino JSON logging with trace IDs propagated from load balancer (`X-Request-ID`). Business events (booking created, payment confirmed, reservation expired) logged with structured context.
 
-### Logging (Structured JSON)
+### Health Checks
 
-```javascript
-// Log format
-{
-  "timestamp": "2024-01-15T10:30:00Z",
-  "level": "info",
-  "service": "api-server",
-  "traceId": "abc123",
-  "message": "Booking created",
-  "bookingId": "uuid",
-  "hotelId": "uuid",
-  "userId": "uuid",
-  "durationMs": 245
-}
-```
-
-### Distributed Tracing
-
-- Generate `traceId` at nginx (X-Request-ID header)
-- Propagate through all service calls
-- Include in logs for cross-service correlation
+Multi-level health endpoints checking PostgreSQL, Redis, Elasticsearch. Returns component status with latencies. Supports liveness and readiness probes.
 
 ### Alerting Thresholds
 
@@ -644,28 +491,7 @@ const metrics = {
 | Error rate (5xx) | > 1% | > 5% |
 | Database connections | > 80% pool | > 95% pool |
 | Redis memory | > 70% | > 90% |
-| Queue depth | > 1000 | > 5000 |
 | Booking failure rate | > 5% | > 10% |
-
-### Local Dev Monitoring Stack
-
-```yaml
-# docker-compose.monitoring.yml
-services:
-  prometheus:
-    image: prom/prometheus:v2.45.0
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-
-  grafana:
-    image: grafana/grafana:10.0.0
-    ports:
-      - "3030:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-```
 
 ## Failure Handling
 
@@ -673,658 +499,138 @@ services:
 
 | Operation | Retries | Backoff | Idempotency |
 |-----------|---------|---------|-------------|
-| Elasticsearch query | 3 | Exponential (100ms, 200ms, 400ms) | Safe (read) |
+| Elasticsearch query | 3 | Exponential | Safe (read-only) |
 | Redis cache | 1 | None | Safe (cache-aside) |
 | Booking creation | 0 | None | Idempotency key required |
 | Payment confirmation | 3 | Exponential | Idempotency key required |
-| Queue publish | 3 | Exponential | Message deduplication |
-
-### Idempotency Keys
-
-```javascript
-// Booking creation with idempotency
-app.post('/api/v1/bookings', async (req, res) => {
-  const idempotencyKey = req.headers['x-idempotency-key'];
-  if (!idempotencyKey) {
-    return res.status(400).json({ error: 'X-Idempotency-Key header required' });
-  }
-
-  // Check if already processed
-  const existing = await db.query(
-    'SELECT id, status FROM bookings WHERE idempotency_key = $1',
-    [idempotencyKey]
-  );
-  if (existing.rows.length > 0) {
-    return res.status(200).json({ booking: existing.rows[0], deduplicated: true });
-  }
-
-  // Process new booking...
-});
-```
 
 ### Circuit Breaker Pattern
 
-```javascript
-// For external services (future: payment gateway)
-const circuitBreaker = new CircuitBreaker({
-  failureThreshold: 5,        // Open after 5 failures
-  resetTimeout: 30000,        // Try again after 30s
-  monitorInterval: 10000      // Check every 10s
-});
+Uses Opossum library for circuit breakers on external service calls:
 
-async function processPayment(bookingId, amount) {
-  return circuitBreaker.execute(async () => {
-    return await paymentGateway.charge(bookingId, amount);
-  });
-}
-```
+| Service | Failure Threshold | Reset Timeout | Call Timeout |
+|---------|------------------|---------------|-------------|
+| Payment | 30% failures | 60s | 10s |
+| Availability API | 50% failures | 30s | 3s |
+| Elasticsearch | 50% failures | 20s | 5s |
+
+Each circuit breaker has a fallback: payment queues for later, availability returns "unavailable", Elasticsearch falls back to PostgreSQL search.
 
 ### Graceful Degradation
 
 | Failure | Degraded Behavior |
 |---------|------------------|
-| Elasticsearch down | Search falls back to PostgreSQL (slower, limited) |
-| Redis down | Sessions fail (force re-login), skip cache |
-| RabbitMQ down | Write to local file queue, process when restored |
-| Payment gateway down | Queue booking, notify user of delay |
+| Elasticsearch down | Search falls back to PostgreSQL (slower, limited filtering) |
+| Redis down | Sessions fail (force re-login), skip availability cache, use DB locks only |
+| Payment gateway down | Queue booking, notify user of delay via circuit breaker fallback |
 
-### Database Failure Recovery
+## Scalability Considerations
 
-```javascript
-// Connection pool with automatic reconnection
-const pool = new Pool({
-  connectionTimeoutMillis: 5000,
-  idleTimeoutMillis: 30000,
-  max: 20,
-  // Retry logic
-  connectionRetries: 3,
-  retryDelayMs: 1000
-});
+### Horizontal Scaling
 
-pool.on('error', (err) => {
-  console.error('Unexpected database error', err);
-  // Alert, but pool will attempt reconnection
-});
-```
+| Component | Strategy |
+|-----------|----------|
+| API Servers | Add instances behind LB (stateless) |
+| PostgreSQL | Read replicas for search/availability reads |
+| Redis | Redis Cluster for cache, Sentinel for HA |
+| Elasticsearch | Add nodes to cluster |
 
-### Disaster Recovery (Production Considerations)
+### Database Scaling Path
 
-| Component | Backup Strategy | RTO | RPO |
-|-----------|----------------|-----|-----|
-| PostgreSQL | Daily full + WAL streaming | 1 hour | 5 minutes |
-| Redis | RDB snapshots (hourly) | 15 minutes | 1 hour |
-| Elasticsearch | Snapshots to S3 (daily) | 2 hours | 24 hours |
-
-For local development: Rely on Docker volumes and `docker-compose down -v` awareness.
-
-## Cost Tradeoffs
-
-### Local Development Resource Usage
-
-| Component | Memory | CPU | Disk |
-|-----------|--------|-----|------|
-| PostgreSQL | 256 MB | 0.5 core | 100 MB |
-| Redis | 128 MB | 0.1 core | 10 MB |
-| Elasticsearch | 512 MB | 0.5 core | 200 MB |
-| RabbitMQ | 128 MB | 0.1 core | 50 MB |
-| API Server (x3) | 768 MB | 0.3 core | - |
-| nginx | 32 MB | 0.1 core | - |
-| **Total** | **~2 GB** | **~2 cores** | **~400 MB** |
-
-### Production Cost Optimization
-
-| Decision | Cost Impact | Trade-off |
-|----------|-------------|-----------|
-| Single Redis (no cluster) | -$50/mo | Reduced availability |
-| Elasticsearch 1 node | -$100/mo | No search HA |
-| Aggressive caching (5min TTL) | -$30/mo | Slightly stale search results |
-| Reserved instances | -40% | 1-year commitment |
-| Spot instances for workers | -60% | Interruption handling needed |
+1. **Current**: Single PostgreSQL instance
+2. **Next**: Read replicas for search and availability queries
+3. **Future**: Shard bookings by `hotel_id` hash (Citus or application-level)
 
 ### When to Add Components
 
-| Trigger | Action | Estimated Cost |
-|---------|--------|----------------|
-| p95 latency > 500ms | Add API server instance | +$20/mo |
-| Cache hit rate < 80% | Increase Redis memory | +$10/mo |
-| DB CPU > 70% sustained | Add read replica | +$50/mo |
-| Search latency > 200ms | Add ES node | +$100/mo |
+| Trigger | Action |
+|---------|--------|
+| p95 latency > 500ms | Add API server instance |
+| Cache hit rate < 80% | Increase Redis memory or TTL |
+| DB CPU > 70% sustained | Add read replica |
+| Search latency > 200ms | Add ES node |
 
 ## Trade-offs Summary
 
-### Considered Alternatives
-
-| Decision | Alternative | Why Not Chosen |
-|----------|-------------|----------------|
-| PostgreSQL for bookings | MongoDB | Need ACID transactions for inventory |
-| Redis sessions | JWT tokens | Simpler revocation with Redis |
-| Pessimistic locking | Optimistic locking | Lower complexity, acceptable throughput |
-| RabbitMQ | Kafka | Simpler for job queue, no event sourcing needed |
-| Elasticsearch | PostgreSQL full-text | Better geo queries, faceted search |
-
-### Known Limitations
-
-1. **Single primary database:** Write throughput limited (~1000 TPS). Acceptable for learning project.
-2. **No multi-region:** All components in single region. Add read replicas and CDN for production.
-3. **Simulated payments:** No real payment gateway integration. Add Stripe/PayPal for production.
-4. **No mobile app:** API designed for web. Add mobile SDK and push notifications for production.
-
-## Future Optimizations
-
-### Short Term (Next Implementation Phase)
-- [x] Add comprehensive test suite (unit, integration, e2e)
-- [x] Implement Prometheus metrics collection
-- [ ] Add Grafana dashboards
-- [ ] Load test booking concurrency with k6
-
-### Medium Term
-- [ ] Payment gateway integration (Stripe test mode)
-- [ ] Email notifications via SendGrid/Mailgun
-- [ ] Image upload to MinIO (S3-compatible)
-- [ ] Admin analytics dashboard
-
-### Long Term (Production Readiness)
-- [ ] Multi-region deployment
-- [ ] Database read replicas
-- [ ] CDN for static assets
-- [ ] Mobile app API endpoints
-- [ ] Loyalty program implementation
-- [ ] Machine learning for dynamic pricing
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Primary database | PostgreSQL | MongoDB | ACID transactions for inventory, relational integrity |
+| Session storage | Redis sessions | JWT | Simpler revocation, no token rotation |
+| Booking concurrency | Pessimistic locking | Optimistic locking | Higher success rate, rare contention |
+| Search engine | Elasticsearch | PostgreSQL full-text | Better geo queries, faceted search |
+| Message queue | None (background jobs) | RabbitMQ/Kafka | Simpler for current scale, add when needed |
+| Reservation hold | 15-minute expiry | Instant confirm/reject | Payment processing needs time window |
+| Pricing model | Base + date overrides | Algorithmic pricing | Simple to implement, easy for hotel admins |
 
 ## Implementation Notes
 
-This section documents the key patterns implemented in the backend and explains WHY each pattern is necessary for a production-grade hotel booking system.
+This section documents the actual local implementation: what production patterns are implemented, what was simplified, and what was omitted.
 
-### 1. Idempotency for Booking Creation
-
-**Location:** `backend/src/shared/idempotency.js`, `backend/src/services/bookingService.js`
-
-**Implementation:**
-```javascript
-// Generate idempotency key from booking parameters
-const idempotencyKey = generateIdempotencyKey(userId, {
-  hotelId, roomTypeId, checkIn, checkOut, roomCount
-});
-
-// Check for existing booking with same key
-const existing = await checkIdempotency(idempotencyKey);
-if (existing) {
-  return { ...existing, deduplicated: true };
-}
-```
-
-**WHY idempotency prevents double-charging guests:**
-
-1. **Network Failures Cause Retries:** When a user submits a booking, the request may time out even though the booking was successfully created on the server. The user sees an error and clicks "Book Again."
-
-2. **Double-Click Prevention:** Users frequently double-click submit buttons. Without idempotency, each click creates a new booking.
-
-3. **Load Balancer Retries:** Some load balancers automatically retry failed requests. This can create duplicate bookings without any user action.
-
-4. **Payment Implications:** Each booking triggers a payment charge. Without idempotency:
-   - Guest books room for $200/night
-   - Network timeout occurs
-   - Guest retries, creating second $200 booking
-   - Guest is charged $400 for what they thought was one room
-
-**Our Solution:**
-- Generate SHA-256 hash from: userId + hotelId + roomTypeId + checkIn + checkOut + roomCount
-- Store hash in `idempotency_key` column (unique constraint)
-- On duplicate request, return existing booking instead of creating new one
-- Cache idempotency results in Redis for 24 hours for fast lookups
-
-### 2. Distributed Locking for Room Selection
-
-**Location:** `backend/src/shared/distributedLock.js`, `backend/src/services/bookingService.js`
-
-**Implementation:**
-```javascript
-// Create lock resource for room type and dates
-const lockResource = createRoomLockResource(hotelId, roomTypeId, checkIn, checkOut);
-
-// Execute booking within distributed lock
-const booking = await withLock(lockResource, async () => {
-  return this._executeBookingTransaction(bookingData, userId);
-});
-```
-
-**WHY distributed locking prevents room overselling:**
-
-1. **Multiple API Servers:** In production, multiple API server instances handle requests. Each server has no knowledge of what other servers are doing.
-
-2. **Race Condition Without Locking:**
-   ```
-   Time T0: Server A receives booking for Room 101, Jan 15
-   Time T0: Server B receives booking for Room 101, Jan 15
-   Time T1: Server A checks availability -> 1 room available
-   Time T1: Server B checks availability -> 1 room available
-   Time T2: Server A creates booking (success)
-   Time T2: Server B creates booking (success - OVERSOLD!)
-   ```
-
-3. **Database Locks Are Insufficient:** PostgreSQL `SELECT ... FOR UPDATE` only works within a single database transaction on a single connection. It cannot prevent concurrent requests on different servers from both seeing "available" before either commits.
-
-4. **Financial Impact of Overselling:**
-   - Guest A arrives at hotel, has confirmed booking
-   - Guest B arrives at hotel, also has confirmed booking for same room
-   - Hotel must provide free upgrade, pay for alternative hotel, or offer refund + compensation
-   - Customer trust is destroyed
-
-**Our Solution:**
-- Use Redis SETNX for distributed locking with unique lock IDs
-- Lock key: `lock:room:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}`
-- Lock TTL: 30 seconds (prevents deadlocks from crashed processes)
-- Retry with exponential backoff for contention
-- Lua script for atomic check-and-delete on release
-
-### 3. Availability Caching
-
-**Location:** `backend/src/services/bookingService.js`
-
-**Implementation:**
-```javascript
-// Try cache first
-const cacheKey = `availability:check:${hotelId}:${roomTypeId}:${checkIn}:${checkOut}`;
-const cached = await redis.get(cacheKey);
-if (cached) {
-  metrics.availabilityCacheHitsTotal.inc();
-  return JSON.parse(cached);
-}
-
-// Cache miss: query database
-const availability = await queryDatabase(...);
-await redis.setex(cacheKey, 300, JSON.stringify(availability)); // 5 min TTL
-```
-
-**WHY availability caching reduces database load:**
-
-1. **Search Page Load Pattern:**
-   - User searches for "hotels in NYC, Jan 15-17"
-   - System returns 50 hotels
-   - For each hotel, check availability for 3-5 room types
-   - Total: 150-250 availability queries per search
-
-2. **Database Impact Without Caching:**
-   - Each availability check runs complex date-range queries with `generate_series`
-   - At 100 concurrent users searching: 15,000-25,000 queries/second
-   - PostgreSQL connection pool exhausted
-   - Query latency increases from 10ms to 500ms+
-
-3. **Availability Changes Infrequently:**
-   - Bookings happen at ~1:100 ratio vs. searches
-   - Once availability is calculated, it's valid until next booking
-   - 5-minute cache provides 90%+ hit rate during peak hours
-
-4. **Intelligent Cache Invalidation:**
-   - On booking create/confirm/cancel, delete relevant cache keys
-   - Pattern: `availability:*:{hotelId}:{roomTypeId}:*`
-   - Ensures cache never serves stale data after state change
-
-**Cache Key Strategy:**
-```
-availability:{hotelId}:{roomTypeId}:{year}-{month}  # Calendar view (monthly)
-availability:check:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}  # Specific date range
-```
-
-### 4. Booking Metrics for Revenue Optimization
-
-**Location:** `backend/src/shared/metrics.js`, exposed at `/metrics`
-
-**Key Metrics Implemented:**
-
-```javascript
-// Business metrics
-bookings_created_total{status, hotel_id}
-bookings_confirmed_total{hotel_id}
-bookings_cancelled_total{hotel_id, reason}
-bookings_expired_total
-booking_revenue_total_cents{hotel_id, room_type_id}
-booking_creation_duration_seconds
-
-// Search metrics
-search_requests_total{has_dates, city}
-search_duration_seconds
-search_results_count
-
-// Availability metrics
-availability_cache_hits_total
-availability_cache_misses_total
-availability_checks_total{cache_hit}
-```
-
-**WHY booking metrics enable revenue optimization:**
-
-1. **Conversion Funnel Analysis:**
-   ```
-   search_requests_total: 10,000
-   bookings_created_total{status="reserved"}: 500
-   bookings_confirmed_total: 400
-   ```
-   - Search-to-booking ratio: 5%
-   - Booking-to-confirmation ratio: 80%
-   - 20% abandonment at payment = revenue opportunity
-
-2. **Reservation Hold Optimization:**
-   - `bookings_expired_total` tracks reservations that weren't confirmed
-   - High expiry rate suggests hold time too long (inventory blocked)
-   - Low expiry rate suggests hold time could be extended
-
-3. **Dynamic Pricing Signals:**
-   - `search_requests_total{city="NYC"}` by hour shows demand patterns
-   - High search volume + low availability = raise prices
-   - Low search volume + high availability = promotional pricing
-
-4. **Cache Efficiency:**
-   - `availability_cache_hits_total / availability_checks_total` = hit rate
-   - If hit rate < 80%, consider longer TTL or pre-warming
-
-5. **SLO Monitoring:**
-   - `booking_creation_duration_seconds` p95 should be < 1s
-   - `search_duration_seconds` p95 should be < 500ms
-   - Alerts when latency exceeds thresholds
-
-### 5. Circuit Breaker Pattern
-
-**Location:** `backend/src/shared/circuitBreaker.js`
-
-**Implementation:**
-```javascript
-const paymentBreaker = createPaymentCircuitBreaker(async (bookingId, amount) => {
-  return await paymentGateway.charge(bookingId, amount);
-});
-
-// Fallback when circuit is open
-breaker.fallback(async (bookingId, amount) => {
-  return { success: false, queued: true, message: 'Payment queued' };
-});
-```
-
-**WHY circuit breakers prevent cascading failures:**
-
-1. **External Service Dependencies:** Payment gateways, email services, and other external APIs can fail or become slow.
-
-2. **Cascading Failure Pattern:**
-   - Payment service becomes slow (5s response time)
-   - All booking confirmations wait 5s
-   - Thread pool exhausted
-   - Entire API becomes unresponsive
-   - Users cannot even search for hotels
-
-3. **Circuit Breaker States:**
-   - **Closed:** Normal operation, requests pass through
-   - **Open:** Service failed too many times, fail fast with fallback
-   - **Half-Open:** Try one request to see if service recovered
-
-4. **Configuration:**
-   - Payment service: Open after 30% failures, wait 60s before retry
-   - Availability service: Open after 50% failures, wait 30s
-
-### 6. Structured JSON Logging
-
-**Location:** `backend/src/shared/logger.js`
-
-**Implementation:**
-```javascript
-logger.info({
-  bookingId: booking.id,
-  hotelId,
-  totalPrice: booking.totalPrice,
-  traceId: req.traceId,
-  durationSeconds,
-}, 'Booking created successfully');
-```
-
-**Output:**
-```json
-{
-  "level": "info",
-  "time": "2024-01-15T10:30:00.000Z",
-  "service": "hotel-booking-api",
-  "traceId": "abc123-def456",
-  "bookingId": "booking-789",
-  "hotelId": "hotel-456",
-  "totalPrice": 450.00,
-  "durationSeconds": 0.245,
-  "msg": "Booking created successfully"
-}
-```
-
-**Benefits:**
-- Machine-parseable for log aggregation (ELK, Datadog)
-- Trace ID correlation across distributed services
-- Sensitive data redaction (passwords, card numbers)
-- Consistent format for alerting rules
-
-## Frontend Architecture
-
-This section documents the frontend component organization and design patterns used in the React application.
-
-### Technology Stack
-
-| Technology | Purpose |
-|------------|---------|
-| React 19 | UI library with modern features |
-| TypeScript | Static typing for maintainability |
-| Vite | Fast build tooling and dev server |
-| TanStack Router | Type-safe file-based routing |
-| Zustand | Lightweight state management |
-| Tailwind CSS | Utility-first CSS framework |
-
-### Directory Structure
+### Local Setup Diagram
 
 ```
-frontend/src/
-├── components/           # Reusable UI components
-│   ├── admin/           # Admin-specific components
-│   │   ├── index.ts     # Barrel export for admin components
-│   │   ├── AdminRoomTypeCard.tsx
-│   │   ├── BookingsTable.tsx
-│   │   ├── CreateHotelModal.tsx
-│   │   ├── DashboardHotelCard.tsx
-│   │   ├── HotelHeader.tsx
-│   │   ├── HotelSelector.tsx
-│   │   ├── PricingModal.tsx
-│   │   ├── RoomTypeModal.tsx
-│   │   └── StatsGrid.tsx
-│   ├── icons/           # SVG icon components
-│   │   ├── index.ts     # Barrel export for icons
-│   │   ├── ChevronLeftIcon.tsx
-│   │   └── CloseIcon.tsx
-│   ├── AvailabilityCalendar.tsx
-│   ├── BookingCard.tsx
-│   ├── Header.tsx
-│   ├── HotelCard.tsx
-│   ├── RoomTypeCard.tsx
-│   └── SearchBar.tsx
-├── hooks/               # Custom React hooks
-├── routes/              # TanStack Router file-based routes
-│   ├── admin.hotels.$hotelId.tsx  # Hotel management page
-│   ├── admin.index.tsx            # Admin dashboard
-│   ├── hotels.$hotelId.tsx        # Hotel detail page
-│   ├── index.tsx                  # Home page
-│   └── ...
-├── services/            # API client and external services
-│   └── api.ts           # Centralized API calls
-├── stores/              # Zustand state stores
-│   └── authStore.ts     # Authentication state
-├── types/               # TypeScript type definitions
-│   └── index.ts         # Shared interfaces
-└── utils/               # Utility functions
-    └── index.ts         # Formatting, helpers
+┌──────────────────┐
+│  React Frontend  │
+│  localhost:5173   │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  Express API     │
+│  localhost:3000   │
+│  (or 3001-3003)  │
+└──┬─────┬─────┬───┘
+   │     │     │
+   ▼     ▼     ▼
+┌──────┐ ┌──────┐ ┌───────────────┐
+│Pg    │ │Redis/│ │Elasticsearch  │
+│:5432 │ │Valkey│ │:9200          │
+│      │ │:6379 │ │               │
+└──────┘ └──────┘ └───────────────┘
 ```
 
-### Component Design Principles
+### Production Patterns Actually Implemented
 
-#### 1. Single Responsibility
+| Pattern | File Path | Description |
+|---------|-----------|-------------|
+| **Distributed Locking** | `backend/src/shared/distributedLock.ts` | Redis SETNX with unique lock IDs, Lua script release, exponential backoff, `withLock` helper |
+| **Idempotency** | `backend/src/shared/idempotency.ts` | SHA-256 key generation, Redis cache + DB check, middleware for `X-Idempotency-Key` header |
+| **Circuit Breaker** | `backend/src/shared/circuitBreaker.ts` | Opossum-based breakers for payment, availability, Elasticsearch with fallbacks |
+| **Prometheus Metrics** | `backend/src/shared/metrics.ts` | Business metrics (bookings, search, cache), infrastructure metrics, exposed at `/metrics` |
+| **Health Checks** | `backend/src/shared/healthCheck.ts` | Multi-component health with latency tracking |
+| **Structured Logging** | `backend/src/shared/logger.ts` | Pino JSON logging with request context |
+| **Reservation Expiry** | `backend/src/index.ts` | Background interval (60s) expiring stale reservations |
+| **Two-Phase Search** | `backend/src/services/searchService.ts` | Elasticsearch matching + PostgreSQL availability verification |
+| **Dynamic Pricing** | `backend/src/services/roomService.ts` | Base price with date-specific overrides from `pricing_overrides` table |
+| **Availability Caching** | `backend/src/services/booking/` | Redis cache-aside with invalidation on booking state changes |
+| **Pessimistic Locking** | `backend/src/services/booking/` | `SELECT ... FOR UPDATE` inside distributed lock for booking creation |
 
-Each component should do one thing well. Large components are decomposed into smaller, focused sub-components:
+### What Was Simplified or Substituted
 
-```tsx
-// Bad: Monolithic component with 500+ lines
-function AdminDashboard() {
-  // All logic, state, and rendering in one file
-}
+| Production Design | Local Substitute | Reason |
+|-------------------|------------------|--------|
+| CDN for static assets | Vite dev server serves directly | No CDN needed for local dev |
+| API Gateway (Kong/Envoy) | Express handles routing directly | Single process sufficient |
+| Multiple API instances + nginx LB | Single instance (or 3 via `dev:server1/2/3`) | Can demo load balancing manually |
+| Payment gateway (Stripe) | Simulated payment processing | No real payment integration |
+| Redis Cluster/Sentinel | Single Redis instance | Sufficient for dev workloads |
+| ES cluster (3+ nodes) | Single Elasticsearch node | 512MB heap, single-node mode |
+| RabbitMQ for async jobs | In-process `setInterval` background jobs | Simpler for dev |
+| Real email notifications | Not implemented | No SMTP service configured |
+| PostgreSQL read replicas | Single PostgreSQL instance | Sufficient for dev |
 
-// Good: Composed from smaller components
-function AdminDashboard() {
-  return (
-    <div>
-      <DashboardHeader />
-      <HotelSelector />
-      <StatsGrid />
-      <BookingsTable />
-    </div>
-  );
-}
-```
+### What Was Omitted
 
-#### 2. Component Size Guidelines
-
-| Component Type | Target Lines | Maximum Lines |
-|---------------|--------------|---------------|
-| Route pages | 150-250 | 300 |
-| Feature components | 100-150 | 200 |
-| UI primitives | 30-50 | 100 |
-| Icons | 15-30 | 50 |
-
-When a component exceeds these limits, consider extracting sub-components.
-
-#### 3. JSDoc Documentation
-
-All exported components and significant functions include JSDoc comments:
-
-```tsx
-/**
- * Modal component for creating and editing hotel room types.
- * Provides a form for room details including name, capacity, pricing, and amenities.
- *
- * @param props - Component props
- * @returns A modal dialog for room type management
- *
- * @example
- * ```tsx
- * <RoomTypeModal
- *   hotelId="hotel-123"
- *   room={null}
- *   onClose={() => setShowModal(false)}
- *   onSuccess={() => refreshData()}
- * />
- * ```
- */
-export function RoomTypeModal({ hotelId, room, onClose, onSuccess }: RoomTypeModalProps) {
-  // ...
-}
-```
-
-#### 4. Icon Components
-
-SVG icons are extracted into dedicated components, never inlined:
-
-```tsx
-// components/icons/ChevronLeftIcon.tsx
-export function ChevronLeftIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" {...props}>
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-    </svg>
-  );
-}
-
-// Usage in components
-import { ChevronLeftIcon } from '@/components/icons';
-<ChevronLeftIcon className="w-4 h-4" />
-```
-
-#### 5. Barrel Exports
-
-Component directories use `index.ts` files for clean imports:
-
-```tsx
-// components/admin/index.ts
-export { RoomTypeModal } from './RoomTypeModal';
-export { PricingModal } from './PricingModal';
-export { CreateHotelModal } from './CreateHotelModal';
-// ...
-
-// Usage in route files
-import { RoomTypeModal, PricingModal, CreateHotelModal } from '@/components/admin';
-```
-
-### Admin Components
-
-The admin section uses a modular component architecture:
-
-| Component | Purpose | Lines |
-|-----------|---------|-------|
-| `CreateHotelModal` | Form modal for adding new hotels | ~250 |
-| `RoomTypeModal` | Form modal for room type CRUD | ~250 |
-| `PricingModal` | Form modal for dynamic pricing | ~160 |
-| `HotelHeader` | Hotel summary in management view | ~110 |
-| `AdminRoomTypeCard` | Room type card with actions | ~150 |
-| `HotelSelector` | Sidebar hotel picker | ~75 |
-| `DashboardHotelCard` | Hotel summary on dashboard | ~95 |
-| `StatsGrid` | Booking statistics display | ~85 |
-| `BookingsTable` | Recent bookings table | ~165 |
-
-### State Management
-
-**Zustand** is used for global state (authentication), while component-local state handles UI concerns:
-
-```tsx
-// Global state with Zustand
-const { user, isAuthenticated } = useAuthStore();
-
-// Local state for UI
-const [showModal, setShowModal] = useState(false);
-const [formData, setFormData] = useState({ name: '', ... });
-```
-
-### API Service Layer
-
-All API calls are centralized in `services/api.ts`:
-
-```tsx
-// services/api.ts
-export const api = {
-  getHotel: (id: string) => fetch(`/api/hotels/${id}`).then(r => r.json()),
-  createHotel: (data: CreateHotelInput) => fetch('/api/hotels', { method: 'POST', body: JSON.stringify(data) }),
-  // ...
-};
-
-// Usage in components
-import { api } from '@/services/api';
-const hotel = await api.getHotel(hotelId);
-```
-
-### Route Organization
-
-Routes follow TanStack Router's file-based conventions:
-
-| File | URL | Description |
-|------|-----|-------------|
-| `index.tsx` | `/` | Home page with search |
-| `login.tsx` | `/login` | Authentication page |
-| `admin.tsx` | `/admin` | Admin layout wrapper |
-| `admin.index.tsx` | `/admin/` | Admin dashboard |
-| `admin.hotels.$hotelId.tsx` | `/admin/hotels/:hotelId` | Hotel management |
-| `hotels.$hotelId.tsx` | `/hotels/:hotelId` | Public hotel details |
-
-### Type Safety
-
-All components use TypeScript interfaces for props:
-
-```tsx
-interface RoomTypeModalProps {
-  /** The hotel ID this room type belongs to */
-  hotelId: string;
-  /** Existing room type to edit, or null for creating a new one */
-  room: RoomType | null;
-  /** Callback when the modal is closed without saving */
-  onClose: () => void;
-  /** Callback when the room type is successfully saved */
-  onSuccess: () => void;
-}
-```
-
-Shared types are defined in `types/index.ts` and imported throughout the application.
-
+- **CDN / Edge caching** - No static asset distribution
+- **Multi-region deployment** - Single-machine setup
+- **Kubernetes orchestration** - Docker Compose only
+- **Real payment gateway** - Simulated payments
+- **Email/SMS notifications** - No notification delivery
+- **Image upload to object storage** - Hotel images stored as URL references
+- **Database read replicas** - Single PostgreSQL instance
+- **Redis Sentinel/Cluster** - Single Redis instance
+- **Automated schema migrations** - Uses init.sql loaded at container start
+- **Mobile app API** - Web-only
+- **Loyalty program** - Not implemented
+- **Overbooking strategy** - Strict inventory limits only
+- **ML-based dynamic pricing** - Manual date overrides only

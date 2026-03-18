@@ -65,36 +65,34 @@ Gmail is a web-based email client supporting thread-based conversations, per-use
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client (Browser)                         │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
-│  │ Sidebar  │  │Thread    │  │ Thread   │  │   Compose    │   │
-│  │ (Labels) │  │ List     │  │  View    │  │    Modal     │   │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────────┘   │
-└────────────────────────┬────────────────────────────────────────┘
-                         │ HTTPS
-                         ▼
-               ┌─────────────────┐
-               │   API Gateway   │
-               │  (Rate Limit)   │
-               └────────┬────────┘
-                         │
-         ┌───────────────┼───────────────┐
-         ▼               ▼               ▼
-┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-│  API Server │  │  API Server │  │  API Server │
-│   (Node.js) │  │   (Node.js) │  │   (Node.js) │
-└──────┬──────┘  └──────┬──────┘  └──────┬──────┘
-       │                │                │
-       └────────────────┼────────────────┘
-                        │
-     ┌──────────┬───────┼───────┬───────────┐
-     ▼          ▼       ▼       ▼           ▼
-┌────────┐ ┌────────┐ ┌────┐ ┌──────┐ ┌─────────┐
-│Postgres│ │ Redis/ │ │ ES │ │Search│ │  Blob   │
-│ (Data) │ │ Valkey │ │    │ │Indexer│ │ Storage │
-│        │ │(Cache) │ │    │ │Worker│ │  (S3)   │
-└────────┘ └────────┘ └────┘ └──────┘ └─────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            CDN / Edge Network                                │
+│                    (Static assets, TLS termination)                           │
+└───────────────────────────────────┬──────────────────────────────────────────┘
+                                    │ HTTPS
+                                    ▼
+                          ┌─────────────────────┐
+                          │    API Gateway       │
+                          │  (Rate limit, auth)  │
+                          └──────────┬──────────┘
+                                     │
+                   ┌─────────────────┼─────────────────┐
+                   ▼                 ▼                 ▼
+           ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+           │  API Server  │  │  API Server  │  │  API Server  │
+           │  (Node.js)   │  │  (Node.js)   │  │  (Node.js)   │
+           └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+                  │                 │                 │
+                  └─────────────────┼─────────────────┘
+                                    │
+          ┌──────────┬──────────────┼──────────────┬───────────┐
+          ▼          ▼              ▼              ▼           ▼
+   ┌───────────┐ ┌────────┐ ┌───────────┐ ┌────────────┐ ┌─────────┐
+   │PostgreSQL │ │ Redis/ │ │Elastic-   │ │  Search    │ │  Blob   │
+   │ (Primary  │ │ Valkey │ │search     │ │  Indexer   │ │ Storage │
+   │ + Replicas│ │(Cache +│ │ Cluster   │ │  Worker    │ │  (S3)   │
+   │  + Shards)│ │Session)│ │           │ │            │ │         │
+   └───────────┘ └────────┘ └───────────┘ └────────────┘ └─────────┘
 ```
 
 ---
@@ -140,6 +138,7 @@ Handles email send flow within a database transaction:
 ```
 sendMessage(senderId, {to, cc, bcc, subject, bodyText, threadId})
 ├── BEGIN TRANSACTION
+├── Check idempotency key (return existing if duplicate)
 ├── Look up recipient user IDs by email
 ├── Create or update thread
 │   ├── New thread: INSERT with subject and snippet
@@ -439,9 +438,9 @@ CREATE INDEX idx_threads_last_message ON threads(last_message_at DESC);
 
 **Why it works**: A single email thread can have 5 participants. Alice reads it, Bob has not. Charlie archived it. Each user needs independent flags. A separate table with a UNIQUE(thread_id, user_id) constraint makes this natural -- each row is one user's view of one thread.
 
-**Why the alternative fails**: Embedding read/starred flags in the thread table would force a single state for all users. Using a JSONB column like `user_states: {alice: {read: true}}` would make queries painfully slow at scale -- you cannot efficiently index inside JSONB for "find all unread threads for user X".
+**Why the alternative fails**: Embedding read/starred flags in the thread table would force a single state for all users. Using a JSONB column like `user_states: {alice: {read: true}}` would make queries painfully slow at scale -- you cannot efficiently index inside JSONB for "find all unread threads for user X". At 1.8 billion users, scanning JSONB per-row to filter unread threads for a single user would produce full table scans every time the inbox loads.
 
-**Trade-off**: More JOINs on every thread list query (thread + thread_user_state + thread_labels + labels). We accept this because the JOIN is on indexed columns and the query pattern is predictable.
+**Trade-off**: More JOINs on every thread list query (thread + thread_user_state + thread_labels + labels). We accept this because the JOIN is on indexed columns and the query pattern is predictable. The composite index on `(user_id, is_trashed, is_archived)` ensures the filter is fast.
 
 ### 2. Elasticsearch with visible_to for Search Privacy
 
@@ -449,9 +448,9 @@ CREATE INDEX idx_threads_last_message ON threads(last_message_at DESC);
 
 **Why it works**: BCC recipients see the message in their search results because their user ID is in `visible_to`. But other recipients do not see the BCC recipient because `visible_to` is per-document, not per-query. The indexer includes `[sender, to_recipients, cc_recipients, bcc_recipients]` in `visible_to`, so each participant can find the message.
 
-**Why PostgreSQL full-text search fails**: PostgreSQL `tsvector` search does not natively support "only return results where this user is a participant." You would need to JOIN with message_recipients on every search, which destroys performance at scale. Elasticsearch's inverted index with term filtering handles this efficiently.
+**Why PostgreSQL full-text search fails**: PostgreSQL `tsvector` search does not natively support "only return results where this user is a participant." You would need to JOIN with message_recipients on every search, which destroys performance at scale. With 300 billion emails per day, a JOIN-based search across a normalized schema would require cross-shard queries that cannot meet the 500ms p99 latency target. Elasticsearch's inverted index with term filtering handles this efficiently because `visible_to` is pre-computed at index time.
 
-**Trade-off**: Requires maintaining a separate search index via a background worker. Search results may lag 5-10 seconds behind newly sent messages. For email, this latency is acceptable.
+**Trade-off**: Requires maintaining a separate search index via a background worker. Search results may lag 5-10 seconds behind newly sent messages. For email, this latency is acceptable -- users do not search for messages they sent seconds ago.
 
 ### 3. Optimistic Locking for Drafts
 
@@ -459,9 +458,9 @@ CREATE INDEX idx_threads_last_message ON threads(last_message_at DESC);
 
 **Why it works**: When Tab A loads draft version 3 and Tab B loads draft version 3, both see the same content. Tab A saves first, incrementing to version 4. Tab B tries to save with `WHERE version = 3`, which matches 0 rows. The API returns 409 Conflict with the current draft state, and the client can show "This draft was modified in another window."
 
-**Why pessimistic locking (SELECT FOR UPDATE) fails**: Drafts auto-save every few seconds. Holding a row lock for the duration of editing would block other tabs indefinitely. With hundreds of millions of users, lock contention on the drafts table would be catastrophic.
+**Why pessimistic locking (SELECT FOR UPDATE) fails**: Drafts auto-save every few seconds. Holding a row lock for the duration of editing would block other tabs indefinitely. With hundreds of millions of users, lock contention on the drafts table would be catastrophic. The database connection pool would exhaust as connections wait on locked rows, eventually cascading into API server unresponsiveness.
 
-**Trade-off**: The client must handle 409 responses gracefully. We implement a simple "last write wins" with user notification rather than complex merge logic.
+**Trade-off**: The client must handle 409 responses gracefully. We implement a simple "last write wins" with user notification rather than complex merge logic. This is acceptable because draft editing is typically a single-user activity -- multi-tab conflicts are the exception, not the rule.
 
 ---
 
@@ -597,33 +596,69 @@ Applied to external service calls (Elasticsearch):
 
 ## Implementation Notes
 
+This section maps the production architecture above to the actual local implementation running on Docker + Node.js + React.
+
+### Local Architecture
+
+```
+┌─────────────────────────────────┐
+│     Browser (localhost:5173)    │
+│  React + TanStack Router +     │
+│  Zustand + Tailwind CSS        │
+└───────────────┬─────────────────┘
+                │ HTTP
+                ▼
+┌─────────────────────────────────┐
+│  Express API (localhost:3001)   │
+│  Routes: auth, threads,        │
+│  messages, labels, drafts,     │
+│  search, contacts              │
+│  + /metrics + /api/health      │
+└──────┬──────┬──────┬────────────┘
+       │      │      │
+       ▼      ▼      ▼
+┌────────┐ ┌──────┐ ┌────────────────┐
+│Postgres│ │Valkey│ │ Elasticsearch  │
+│ :5432  │ │:6379 │ │    :9200       │
+└────────┘ └──────┘ └───────┬────────┘
+                            │
+                    ┌───────┴────────┐
+                    │ Search Indexer │
+                    │   (Worker)     │
+                    └────────────────┘
+```
+
 ### Production-Grade Patterns Implemented
 
-1. **Circuit Breakers (Opossum)**: Protects against Elasticsearch failures. When search fails >50% of requests, circuit opens and returns empty results rather than timing out.
-
-2. **Rate Limiting (express-rate-limit + Redis)**: Distributed rate limiting across multiple API server instances using Redis as shared state.
-
-3. **Prometheus Metrics (prom-client)**: HTTP request duration, email send counts, search latency, draft conflicts, cache hit ratios -- all exposed at `/metrics`.
-
-4. **Structured Logging (Pino)**: JSON-formatted logs with request ID tracing, user context, and query timing. Enables log aggregation and distributed tracing.
-
-5. **Health Checks**: Liveness, readiness, and detailed health endpoints checking all dependencies.
+| Pattern | Library | File Path | Purpose |
+|---------|---------|-----------|---------|
+| Circuit breakers | opossum | `backend/src/services/circuitBreaker.ts` | Protects against Elasticsearch failures; opens after 50% failure rate, returns empty search results as fallback |
+| Rate limiting | express-rate-limit + rate-limit-redis | `backend/src/services/rateLimiter.ts` | Distributed rate limiting across API instances using Redis as shared state |
+| Prometheus metrics | prom-client | `backend/src/services/metrics.ts` | HTTP duration, email send counts, search latency, draft conflicts, cache hit ratios exposed at `/metrics` |
+| Structured logging | pino + pino-http | `backend/src/services/logger.ts` | JSON logs with request ID tracing, user context, query timing |
+| Health checks | custom | `backend/src/routes/` | Liveness, readiness, detailed dependency checks |
+| Optimistic locking | PostgreSQL version column | `backend/src/services/draftService.ts` | Draft conflict detection via conditional UPDATE with 409 response |
+| Background indexing | polling worker | `backend/src/workers/search-indexer.ts` | Polls PostgreSQL for new messages, indexes into Elasticsearch with `visible_to` privacy filter |
 
 ### What Was Simplified
 
-- Single PostgreSQL instance instead of sharded cluster
-- Simulated email delivery (messages stay within the system)
-- No attachment storage (schema ready, MinIO integration omitted)
-- Session auth instead of OAuth/JWT
-- Single Elasticsearch node instead of clustered setup
+| Production Design | Local Substitute | Impact |
+|-------------------|------------------|--------|
+| Sharded PostgreSQL cluster | Single PostgreSQL 16 instance | All data on one node; no partition-level queries |
+| Clustered Elasticsearch | Single ES 8.11 node | No index sharding or hot/warm tiers |
+| S3 blob storage for attachments | Schema-only (MinIO omitted) | Attachment metadata stored, files not uploaded |
+| OAuth/JWT federation | Session-based auth with bcrypt | Single auth mechanism, no SSO |
+| CDN for static assets | Vite dev server | No edge caching |
+| Multiple API instances behind LB | Single Express server (can run 3 via npm scripts) | No load balancing by default |
 
 ### What Was Omitted
 
-- CDN for static assets
+- CDN and edge caching
 - Multi-region deployment
 - Kubernetes orchestration
 - Email spam filtering (ML-based)
 - POP3/IMAP protocol support
-- Push notifications
-- Calendar integration
-- Real-time updates (WebSocket for new mail notifications)
+- Push notifications / WebSocket for real-time new mail
+- Calendar and contacts integration
+- Attachment storage (MinIO/S3)
+- Database sharding and read replicas
