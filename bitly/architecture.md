@@ -492,6 +492,132 @@ On SIGTERM/SIGINT: stop accepting new connections, drain in-flight requests, clo
 | Cache invalidation | TTL-based (24h) | Event-driven | Simpler, acceptable staleness for URLs |
 | Queue technology | RabbitMQ | Kafka | Easier operations, sufficient throughput |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (Header + Outlet + Footer)
+├── / (HomePage)
+│   └── UrlShortener
+├── /login (LoginPage)
+│   └── AuthForms
+├── /dashboard (DashboardPage) [auth required]
+│   ├── UrlShortener
+│   └── UrlList
+│       └── AnalyticsModal (per-URL click analytics)
+└── /admin (AdminPage) [admin role required]
+    └── AdminDashboard
+        ├── StatsSection (system overview, top URLs)
+        ├── UrlsSection (search, toggle active/inactive)
+        ├── UsersSection (role management)
+        └── KeyPoolSection (pool stats, repopulate)
+```
+
+The root layout (`__root.tsx`) renders a persistent `Header` with role-aware navigation (Home, Dashboard for users, Admin for admins) and a footer. All child routes render into the `<Outlet />` within this shared layout.
+
+### TanStack Router Structure
+
+The project uses TanStack Router's file-based routing with routes defined in `frontend/src/routes/`. The route tree is auto-generated into `routeTree.gen.ts`.
+
+| Route File | Path | Purpose |
+|------------|------|---------|
+| `__root.tsx` | N/A | Root layout with Header, Outlet, Footer |
+| `index.tsx` | `/` | Public landing page with URL shortener |
+| `login.tsx` | `/login` | Login/register forms; redirects to `/dashboard` if already authenticated |
+| `dashboard.tsx` | `/dashboard` | Authenticated user's URL management |
+| `admin.tsx` | `/admin` | Admin dashboard; redirects non-admins to `/dashboard` |
+
+Route guards are implemented imperatively: each protected route calls `checkAuth()` via `useEffect` and navigates away if the user is missing or lacks the required role. There is no centralized route middleware; each route handles its own auth check.
+
+### Zustand Stores
+
+**`authStore`** -- Manages user session state with `persist` middleware to survive page reloads. Stores the `user` object (id, email, role) in localStorage. Provides `login`, `register`, `logout`, and `checkAuth` actions. `checkAuth` calls `GET /api/v1/auth/me` to validate the server-side session cookie; if the session is expired or invalid, the user is cleared from the store.
+
+**`urlStore`** -- Manages the authenticated user's URL list. Provides `createUrl`, `loadUrls`, and `deleteUrl` actions. On `createUrl`, the new URL is prepended to the local array immediately (optimistic local update) so the user sees the result without waiting for a full list reload. The `createdUrl` field holds the most recently created URL for the success display with copy-to-clipboard functionality.
+
+### Data Fetching Pattern
+
+All API calls are centralized in `frontend/src/services/api.ts` as a single `api` object organized by resource (`auth`, `urls`, `analytics`, `admin`). Each method wraps `fetch` with `credentials: 'include'` to send the httpOnly session cookie. A shared `handleResponse` function parses JSON and throws typed errors on non-2xx responses. There is no query caching library (no React Query or SWR) -- data is fetched imperatively via `useEffect` or Zustand actions and stored in component state or Zustand stores.
+
+### Key UI Patterns
+
+**Tabbed admin dashboard**: The `AdminDashboard` component uses a `useState`-driven tab system (`stats`, `urls`, `users`, `keys`). Each tab is a separate sub-component that fetches its own data on mount. Tabs are not lazy-loaded; switching tabs mounts and unmounts the sub-component, triggering fresh API calls.
+
+**Analytics modal**: Clicking "Analytics" on any URL in `UrlList` opens a modal overlay that fetches `GET /api/v1/analytics/{shortCode}` on mount and displays clicks by day, top referrers, and device breakdown. The modal is rendered conditionally based on `selectedUrl` state.
+
+**Optimistic delete with confirmation**: Delete actions in `UrlList` use a two-step flow -- clicking "Delete" shows "Confirm" and "Cancel" buttons. On confirmation, the URL is removed from the Zustand store immediately and the API call fires in the background. Errors are displayed if the API call fails, but the URL is not re-added (no rollback).
+
+**Copy to clipboard**: Both `UrlShortener` (on creation) and `UrlList` provide clipboard copy for short URLs using `navigator.clipboard.writeText`.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, why it matters for a URL shortener, and how it works in practice.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is a method of restricting system access based on roles assigned to users rather than checking individual permissions for each action. Each user has a role (in this system, either `user` or `admin`), and each API endpoint checks the caller's role before allowing the operation.
+
+**Why Bitly needs it:** A URL shortener has two distinct user personas with fundamentally different access needs. Regular users should only manage their own URLs and view their own analytics. Admins need system-wide visibility: viewing all URLs, managing any user, monitoring the key pool, and deactivating malicious links. Without RBAC, either every user would have admin power (dangerous -- anyone could deactivate anyone's URLs) or no one would have admin power (no way to moderate abuse).
+
+**How it works here:** The `users` table has a `role` column constrained to `('user', 'admin')`. The auth middleware (`backend/src/middleware/auth.ts`) reads the session cookie, looks up the user, and attaches the user object (including role) to `req.user`. Admin endpoints check `req.user.role === 'admin'` before proceeding. If the check fails, the server returns 403 Forbidden. The frontend mirrors this by conditionally rendering the "Admin" navigation link only when `user.role === 'admin'` in the auth store.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called lazy-loading) is a caching strategy where the application checks the cache first for each read request. On a cache hit, the cached value is returned immediately without touching the database. On a cache miss, the application queries the database, stores the result in the cache for future requests, and then returns it. The cache is not automatically synchronized with the database -- the application is responsible for keeping them consistent.
+
+**Why Bitly needs it:** The redirect path (`GET /{short_code}`) is the hottest path in the entire system. At production scale, this endpoint handles 100,000+ requests per second with a 100:1 read-to-write ratio. Every redirect that hits PostgreSQL costs ~20ms; every redirect that hits Redis costs ~0.5ms. Cache-aside naturally adapts to the Zipf-distributed access pattern of URL shorteners -- a small percentage of URLs receive the vast majority of traffic. Those hot URLs stay in cache because they are accessed frequently, while cold URLs expire via TTL and do not consume cache memory.
+
+**How it works here:** The `urlCache` object in `backend/src/utils/cache.ts` provides `get`, `set`, `delete`, and `exists` methods. On redirect, the server calls `urlCache.get(shortCode)`. If the result is non-null (cache hit), it redirects immediately. If null (cache miss), it queries PostgreSQL, calls `urlCache.set(shortCode, longUrl)` with a 24-hour TTL, and then redirects. On URL creation, `urlCache.set` is called immediately (write-through) so the first redirect never misses cache. On URL deactivation, `urlCache.delete` removes the stale entry. Every hit and miss increments a Prometheus counter (`cache_hits_total` / `cache_misses_total`) so operators can monitor the cache hit ratio and alert if it drops below 80%.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing dependency. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the operation. After a cooldown period, the circuit enters a "half-open" state where a single test request is allowed through. If it succeeds, the circuit closes and normal operation resumes. If it fails, the circuit reopens.
+
+**Why Bitly needs it:** The API server depends on PostgreSQL, Redis, and RabbitMQ. If PostgreSQL becomes slow (e.g., a long-running query is holding locks), continuing to send queries will exhaust the connection pool, causing all requests to hang -- not just database-dependent ones. The circuit breaker detects the slowdown (via timeout or error rate), stops sending queries to PostgreSQL, and returns errors immediately. This prevents cascading failure where one slow dependency brings down the entire service. It also gives the failing dependency time to recover without being hammered by retry storms.
+
+**How it works here:** The `createCircuitBreaker` function in `backend/src/utils/circuitBreaker.ts` wraps async functions with the Opossum circuit breaker library. Configuration: 3-5 second timeout per operation, circuit opens when 50% of requests fail within a 10-second window, and resets after 30 seconds. There are separate configurations for database operations (5s timeout, higher volume threshold) and Redis operations (1s timeout, since cache should be fast). State changes are logged via Pino and exposed as a Prometheus gauge (`circuit_breaker_state`) with values 0 (closed/healthy), 0.5 (half-open/testing), and 1 (open/failing).
+
+### Structured Logging
+
+**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text strings. Each log entry has consistent fields (timestamp, level, service, message) plus context-specific fields that vary by event type. This enables log aggregation tools (ELK stack, Datadog, CloudWatch) to filter, search, and alert on specific fields rather than parsing unstructured text with regular expressions.
+
+**Why Bitly needs it:** A URL shortener running multiple API server instances generates enormous log volume -- every redirect, every cache hit/miss, every rate limit event produces a log entry. At 100,000 redirects per second, searching through unstructured text logs ("redirect for abc123 took 2ms from IP 1.2.3.4") is impractical. Structured logging with fields like `{ "short_code": "abc123", "duration_ms": 2, "cache_hit": true }` enables operators to filter for slow redirects (`duration_ms > 50`), track specific short codes, or aggregate error rates by endpoint -- all without writing custom parsers.
+
+**How it works here:** The `logger` in `backend/src/utils/logger.ts` uses Pino, a high-performance JSON logger for Node.js. Each log entry includes: `level`, `time` (epoch ms), `service` (server instance identifier), `req_id` (request correlation ID), `method`, `path`, `status`, `duration_ms`, and `cache_hit` (for redirect requests). Sensitive headers (cookies, authorization) are redacted from request logs. Child loggers are created per-request to carry the request ID through the entire call chain, enabling correlated log traces across cache, database, and queue operations.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals. The application exposes a `/metrics` endpoint returning metric values in Prometheus text format. Prometheus stores these time series and enables querying, alerting, and dashboarding (typically via Grafana). Metrics come in three types: counters (monotonically increasing values like total requests), gauges (point-in-time values like active connections), and histograms (distributions like request latency percentiles).
+
+**Why Bitly needs it:** A URL shortener must monitor several critical health signals that are invisible without instrumentation. Is the cache hit ratio above 90%? Is the key pool running low? Is the redirect p99 latency under 50ms? Are rate limit hits spiking (indicating abuse)? Is the analytics queue backing up? Without metrics, operators discover problems only when users complain. With metrics, they can set alerts and detect issues before they impact users. The metrics also enable capacity planning -- if redirects per second are growing 10% monthly, operators can plan infrastructure scaling.
+
+**How it works here:** The `backend/src/utils/metrics.ts` file uses the `prom-client` library to define and register metrics. Key metrics: `http_requests_total` (counter, labeled by method/endpoint/status), `http_request_duration_seconds` (histogram for latency percentiles), `url_redirects_total` (counter, labeled by cache hit/miss), `cache_hits_total` / `cache_misses_total` (counters for cache ratio), `key_pool_available` (gauge for remaining keys), `rate_limit_hits_total` (counter for abuse detection), `circuit_breaker_state` (gauge per dependency), and `queue_messages_pending` (gauge for analytics queue depth). Express middleware records request duration automatically. The `/metrics` endpoint is scraped by Prometheus.
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make to an API within a time window. When a client exceeds the limit, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header. Rate limits are typically tracked per IP address for unauthenticated endpoints and per user ID for authenticated endpoints, using atomic counters in Redis with TTL-based expiration.
+
+**Why Bitly needs it:** Without rate limiting, a single malicious actor could exhaust the key pool by creating millions of URLs, overwhelm the analytics pipeline by scripting millions of fake clicks, or brute-force login credentials. URL shorteners are also attractive targets for abuse -- creating thousands of short URLs pointing to phishing sites. Rate limiting provides three defenses: it prevents resource exhaustion (key pool, database connections), it slows down brute-force attacks (5 attempts per minute on auth endpoints), and it ensures fair usage (no single user can monopolize URL creation capacity).
+
+**How it works here:** Rate limiting is implemented in `backend/src/index.ts` using `express-rate-limit` with Redis as the backing store. Four rate limit tiers: URL creation (100 per hour per IP), redirects (1,000 per minute per IP), auth endpoints (5 per minute per IP), and authenticated API calls (200 per minute per user). Redis-based tracking uses atomic `INCR` with `EXPIRE` for sliding window counting. When a client hits the limit, the response includes `X-RateLimit-Remaining` and `Retry-After` headers. Rate limit hits are counted in the `rate_limit_hits_total` Prometheus metric for abuse pattern detection.
+
+### Idempotency
+
+**What it is:** Idempotency means that performing the same operation multiple times produces the same result as performing it once. For API endpoints, this means that if a client sends the same request twice (due to a network timeout, browser retry, or double-click), the server returns the same response without creating duplicate resources. The server achieves this by generating a fingerprint of each request, checking whether that fingerprint was already processed, and returning the cached response if so.
+
+**Why Bitly needs it:** URL creation allocates a unique short code from the key pool. If a client submits a URL creation request, the network drops the response, and the client retries, the server would create two different short codes for the same long URL -- wasting key pool resources and confusing the user who now has two links for the same destination. At scale with millions of URL creations per day, even a 1% retry rate means 10,000 wasted keys daily. Idempotency ensures retries return the original short code without consuming additional keys.
+
+**How it works here:** The `idempotencyMiddleware` in `backend/src/utils/idempotency.ts` intercepts POST requests to URL creation. It generates a SHA-256 fingerprint from `{ long_url, custom_code, user_id }` (or uses a client-provided `Idempotency-Key` header). It checks Redis for `idempotency:{fingerprint}`. If found, it returns the cached response immediately (incrementing `idempotency_hits_total` in Prometheus). If not found, it intercepts `res.json()` to cache the successful response in Redis with a 24-hour TTL. If Redis is down, the middleware degrades gracefully -- it logs the error and proceeds without idempotency protection rather than failing the request.
+
+### Health Checks
+
+**What it is:** Health check endpoints are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers (to route traffic away from unhealthy instances), container orchestrators (to restart failed containers), and monitoring systems (to trigger alerts). There are typically three tiers: liveness (is the process running?), readiness (can it serve traffic?), and deep (are all dependencies healthy?).
+
+**Why Bitly needs it:** A URL shortener running behind a load balancer with multiple API server instances needs health checks to ensure traffic is only routed to healthy instances. If one instance loses its Redis connection, the load balancer should stop sending redirect traffic to it (since every redirect would miss cache and hit the database). If an instance's database connection pool is exhausted, it should be temporarily removed from rotation. Without health checks, the load balancer distributes traffic blindly, and users randomly experience errors depending on which instance their request hits.
+
+**How it works here:** Three endpoints are implemented in `backend/src/index.ts`: `/health` returns 200 if the process is alive (liveness probe for Kubernetes). `/health/detailed` checks each dependency (PostgreSQL connectivity, Redis connectivity, key pool remaining count, RabbitMQ channel status) and returns a JSON report with per-dependency latency measurements and status. `/ready` returns 200 only if all critical dependencies (PostgreSQL and Redis) are reachable, making it suitable as a load balancer health check. If any critical dependency is unreachable, `/ready` returns 503 and the load balancer stops routing traffic to that instance.
+
 ## Implementation Notes
 
 This section documents the actual local development setup and maps production design decisions to the working implementation.

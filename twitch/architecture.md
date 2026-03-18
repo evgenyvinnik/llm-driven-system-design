@@ -612,6 +612,167 @@ On SIGTERM:
 | Chat persistence | PostgreSQL | Cassandra | Simpler operations; partition by time at scale |
 | Viewer counts | Redis INCR + periodic flush | Real-time DB writes | Reduces write pressure; eventual consistency acceptable |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+RootLayout (fixed header + Outlet + AuthModal)
+├── / (HomePage)
+│   ├── StreamCard[] (live channel grid)
+│   └── Category grid (browseable categories)
+├── /browse (BrowsePage)
+│   └── StreamCard[] (all live channels)
+├── /category/$slug (CategoryPage)
+│   └── StreamCard[] (channels in category)
+├── /$channelName (ChannelPage)
+│   ├── VideoPlayer (HLS.js player / placeholder)
+│   ├── Channel Info (avatar, title, category, follower count)
+│   ├── Follow / Subscribe buttons
+│   └── Chat (sidebar)
+│       ├── Message list (badges, colored usernames, emotes)
+│       ├── Emote picker
+│       └── Message input
+├── /following (FollowingPage)
+│   └── StreamCard[] (followed channels)
+└── /dashboard (DashboardPage)
+    └── Stream controls (go live, stream key, channel settings)
+```
+
+The `RootLayout` renders a persistent fixed header with the Twitch logo, navigation links (Browse, Following), a search bar, and user controls (login/register buttons or user dropdown). The header stays fixed at the top while the content area scrolls beneath it. The `AuthModal` is rendered at the root level and controlled by `showAuthModal` state, appearing as an overlay for login/register flows.
+
+### TanStack Router Structure
+
+The project uses TanStack Router with **programmatic route definitions** (not file-based routing). Routes are defined in `routeTree.gen.ts` using `createRootRoute` and `createRoute` with explicit parent-child relationships.
+
+| Route | Path | Component | Purpose |
+|-------|------|-----------|---------|
+| Root | N/A | `RootLayout` | Fixed header, WebSocket lifecycle, auth state |
+| Index | `/` | `HomePage` | Featured live channels + category grid |
+| Browse | `/browse` | `BrowsePage` | All live channels, filterable |
+| Category | `/category/$slug` | `CategoryPage` | Channels streaming in a category |
+| Channel | `/$channelName` | `ChannelPage` | Video player + chat + channel info |
+| Following | `/following` | `FollowingPage` | Channels the user follows |
+| Dashboard | `/dashboard` | `DashboardPage` | Creator controls (go live, settings) |
+
+The channel route (`/$channelName`) uses a dynamic parameter and is placed last in the route tree because TanStack Router matches routes in order -- placing it earlier would intercept `/browse` and `/following` as channel names.
+
+### Zustand Stores
+
+**`authStore`** -- Manages user authentication state. Unlike the Bitly and Dropbox projects, this store does not use `persist` middleware -- the user state is refreshed from the server on every page load via `fetchUser()` (called in `RootLayout`'s `useEffect`). This design choice prioritizes session accuracy over avoiding the initial loading flash, since Twitch's auth state affects real-time features (chat authentication, follow/subscribe buttons) that must be current.
+
+**`chatStore`** -- The most complex store, managing the entire WebSocket lifecycle and chat state. Key fields and behavior:
+- `socket`: The raw WebSocket instance. Created once in `RootLayout` on mount, closed on unmount.
+- `connected` / `authenticated`: Connection state tracking. The WebSocket connects immediately, then authenticates by sending `{ type: "auth", userId, username }` once the user data is available.
+- `currentChannel`: The channel ID the user is currently viewing. When navigating to a channel, `joinChannel(channelId)` is called, which first leaves any previously joined channel.
+- `messages`: An array of `ChatMessage` objects, capped at 200 entries. New messages are appended and old ones are dropped from the front (`messages.slice(-199)`), preventing memory growth during long viewing sessions.
+- `viewerCount`: Updated by periodic `viewer_update` WebSocket messages from the server.
+- `emotes`: Array of available emotes for the emote picker.
+
+The chat store handles four WebSocket message types from the server: `auth_success` (authentication confirmed), `joined` (channel joined, includes recent message history and viewer count), `chat` (new message in the channel), and `viewer_update` (periodic viewer count update).
+
+### Data Fetching Pattern
+
+API calls are organized by resource across five exported objects in `frontend/src/services/api.ts`: `authApi`, `channelApi`, `categoryApi`, `streamApi`, `userApi`, and `emoteApi`. Each uses a shared `request<T>()` helper with credentials and JSON headers.
+
+Data fetching is entirely `useEffect`-based with local component state. There is no React Query, SWR, or Zustand-based data caching for API responses. Each page component fetches its own data on mount:
+- `HomePage` uses `Promise.all` to fetch live channels and categories in parallel.
+- `ChannelPage` fetches the channel by name, then joins the chat channel via WebSocket.
+- `BrowsePage` and `CategoryPage` fetch channel lists with pagination parameters.
+
+### Real-Time Updates (WebSocket Chat)
+
+The WebSocket connection is the architectural centerpiece of the frontend. It is established once in `RootLayout` via `useChatStore().connect()` and persists for the entire session. The connection lifecycle:
+
+1. `RootLayout` mounts and calls `connect()`, creating a WebSocket to `/ws/chat`.
+2. When the user logs in (or on mount if already authenticated), `authenticate(userId, username)` sends an auth message over the WebSocket.
+3. When the user navigates to a channel page, `ChannelPage` calls `joinChannel(channelId)`. The store first leaves any previous channel, then joins the new one.
+4. Incoming `chat` messages are appended to the `messages` array in the store. The `Chat` component renders them with auto-scroll to the bottom via a `ref` and `scrollIntoView`.
+5. When the user navigates away from a channel, the cleanup function in `ChannelPage`'s `useEffect` calls `leaveChannel(channelId)`.
+6. On unmount (page close/navigation away), `RootLayout` calls `disconnect()`.
+
+### Key UI Patterns
+
+**Persistent WebSocket connection**: The WebSocket connects once and stays connected across route changes. This is critical for a chat application because reconnecting on every page navigation would lose the message stream and create visible reconnection delays. The trade-off is that the connection persists even on pages where chat is not visible (home, browse, following).
+
+**Skeleton loading states**: The `ChannelPage` and `HomePage` render animated skeleton placeholders (`animate-pulse` with gray boxes) while data is loading, matching Twitch's actual loading experience. This provides immediate visual feedback before API responses arrive.
+
+**Color-coded usernames**: The `getUserColor` function generates consistent colors from usernames using a hash function. The same username always gets the same color, matching Twitch's behavior where each chatter has a unique color in the chat.
+
+**Emote rendering**: The `Chat` component parses message text by splitting on whitespace and checking each word against a list of known emote codes. Emotes are rendered as bracketed text (`[Kappa]`) rather than images (since emote image assets are not included). The emote picker is a toggleable panel below the message list showing available emote codes.
+
+**Follow/subscribe optimistic toggle**: The follow button in `ChannelPage` updates the local `isFollowing` state immediately on click before the API call completes. If the API call fails, an error is logged but the UI state is not reverted -- the user would need to click again.
+
+**Stream card grid**: `StreamCard` components display channel thumbnails in responsive grids (1-4 columns depending on viewport width). Each card shows the channel name, title, category, viewer count, and a "LIVE" indicator. Cards link to `/$channelName` for navigation.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, why it matters for a live streaming platform, and how it works in practice.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is a method of restricting system access based on roles assigned to users rather than checking individual permissions for each action. Each user has a role, and the system defines what each role is allowed to do.
+
+**Why Twitch needs it:** A live streaming platform has five distinct permission levels that must be enforced in real-time during live chat: Viewer (can send messages), Subscriber (can use subscriber emotes), Moderator (can ban, timeout, and delete messages in a specific channel), Broadcaster (can manage their own channel's moderators and stream key), and Admin (platform-wide control). These roles have a clear hierarchy where each level includes the permissions of all levels below it. Without RBAC, there would be no way to let moderators enforce chat rules, and all moderation would fall on the broadcaster -- which is unsustainable during streams with thousands of concurrent chatters.
+
+**How it works here:** The `users` table has a `role` column (`user`, `admin`, `moderator`). Channel-specific roles are tracked in separate tables: `channel_moderators` maps users to channels where they have moderator privileges, and `subscriptions` tracks subscriber status per channel. When a user sends a chat message, the server checks: (1) is the user banned from this channel (`channel_bans` table)? (2) is the user rate-limited? (3) what badges should be attached to the message (subscriber tier, moderator status, broadcaster)? When a moderation action is requested (ban, timeout, message delete), the server checks whether the actor is a moderator for that specific channel, the broadcaster, or a platform admin. All moderation actions are logged in an audit trail with actor, target, reason, and timestamp.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside is a caching strategy where the application checks the cache first on each read, queries the database on a miss, and populates the cache for future requests. The cache is not automatically synchronized with the database -- the application manages population and invalidation.
+
+**Why Twitch needs it:** Channel data is fetched on every page navigation -- viewing a channel page, browsing categories, and loading the home page all query channel information. The `channels` table includes denormalized fields (`follower_count`, `subscriber_count`, `current_viewers`, `is_live`) that are read far more often than they are updated. Without caching, every viewer opening a channel page would query PostgreSQL for the same channel data, creating unnecessary load. At 10M concurrent viewers, even if each viewer loads a channel page once per session, that is millions of identical queries. Caching channel data in Redis for a short TTL (1-5 minutes) collapses these identical queries into a single database read per TTL window.
+
+**How it works here:** Session data is the primary cache-aside use case. Sessions are stored in the PostgreSQL `sessions` table but cached in Redis at `sess:{sessionId}` with a TTL matching the session expiration. On each authenticated request, the server checks Redis first. On a miss, it queries PostgreSQL and populates Redis. Viewer counts are stored directly in Redis (not cache-aside but Redis-native) using `INCR` and `DECR` operations, flushed periodically to PostgreSQL by the stream simulator. Stream state (`is_live`) is also tracked in Redis for fast lookups during channel browsing.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker monitors calls to an external dependency and stops sending requests when the dependency is failing, preventing cascading failures. It transitions between Closed (normal), Open (rejecting all calls), and Half-Open (testing recovery) states.
+
+**Why Twitch needs it:** The chat system is the most latency-sensitive component. Chat messages are published to Redis pub/sub for cross-pod fan-out. If Redis becomes unresponsive, every chat message send would hang waiting for the Redis timeout (potentially several seconds), causing message queues to back up and WebSocket connections to stall. Users would see their messages "not sending" and potentially disconnect. The circuit breaker detects Redis failures and immediately falls back to local-pod-only broadcast -- messages are still delivered to clients connected to the same server instance, providing degraded but functional chat. This is far better than hanging indefinitely.
+
+**How it works here:** The circuit breaker in `backend/src/utils/circuitBreaker.ts` uses the Opossum library. It wraps the Redis `publish` call used for chat message fan-out. When the circuit opens (Redis is down), the fallback behavior broadcasts the message only to WebSocket clients connected to the local server instance. This means users connected to different server instances will not see each other's messages during the outage, but chat remains functional within each pod. The circuit breaker state is exposed as a Prometheus gauge for monitoring and included in the health check response.
+
+### Structured Logging
+
+**What it is:** Structured logging emits log entries as JSON objects with consistent, typed fields instead of free-form text. Each entry has standard fields plus context-specific metadata.
+
+**Why Twitch needs it:** A live streaming platform generates high-volume, diverse log events: WebSocket connections/disconnections, chat messages (potentially thousands per second in popular channels), moderation actions (bans, timeouts, message deletions), stream start/stop events, subscription purchases, and follow/unfollow actions. Without structured logging, investigating "why was user X banned from channel Y?" requires searching through text logs for the username and channel. With structured fields like `{ "action": "ban", "actor": "mod123", "target": "user456", "channel": "streamer789", "reason": "spam" }`, the query is trivial.
+
+**How it works here:** The logger in `backend/src/utils/logger.ts` uses Pino with JSON format. Request ID propagation is implemented via middleware that attaches a unique `requestId` to each HTTP request and WebSocket connection. Chat events have their own structured fields: `channelId`, `userId`, `username`, `messageLength`, `badges`. Moderation actions use a separate audit logger (in `backend/src/utils/audit.ts`) that writes tamper-evident log entries with `actor`, `target`, `action`, `reason`, and `timestamp`. HTTP request logging uses `pino-http` middleware for automatic request/response logging with duration and status code.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a pull-based monitoring system that scrapes metric values from `/metrics` endpoints at regular intervals. Applications expose counters, gauges, and histograms that Prometheus stores as time-series data for querying and alerting.
+
+**Why Twitch needs it:** A live streaming platform has several critical real-time metrics that require continuous monitoring. WebSocket connection count indicates chat system load and capacity. Chat messages per second per channel reveals whether rate limiting is working and identifies viral streams. Subscription creation rate (especially gift subs during events) affects revenue monitoring. Moderation action rate indicates community health. Circuit breaker state shows dependency health. Without metrics, operators would not know if chat is silently dropping messages, if a popular stream is overwhelming the chat infrastructure, or if the Redis circuit breaker has been open for the last 30 minutes.
+
+**How it works here:** The `backend/src/utils/metrics.ts` module registers metrics via `prom-client`. Key metrics: `websocket_connections_active` (gauge -- active WebSocket connections, critical for capacity planning), `chat_messages_total` (counter -- total chat messages sent and received), `chat_rate_limit_hits_total` (counter -- rate limit enforcement), `chat_dedup_total` (counter -- duplicate message detection), `stream_events_total` (counter -- stream start/stop events), `subscription_created_total` (counter by tier and gift status), `moderation_actions_total` (counter by action type: ban, timeout, delete), `http_request_duration_seconds` (histogram for API latency), and `circuit_breaker_state` (gauge per dependency).
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests or actions a client can perform within a time window. When the limit is exceeded, the action is rejected. In a chat system, rate limiting controls how frequently a user can send messages.
+
+**Why Twitch needs it:** Without chat rate limiting, a single user could flood a channel's chat with hundreds of messages per second, drowning out legitimate conversation and overwhelming the Redis pub/sub fan-out. Chat spam also degrades the experience for all viewers in the channel. Twitch's chat rate limiting serves three purposes: preventing spam (1 message per second default), enabling moderator control (configurable slow mode: 5s, 30s, etc.), and providing a benefit to subscribers (higher rate limits as an incentive to subscribe).
+
+**How it works here:** Chat rate limiting is implemented in `backend/src/services/redis.ts` using Redis-backed per-user-per-channel counters. The key pattern is `ratelimit:chat:{userId}:{channelId}` with a 1-second TTL for normal mode. When slow mode is enabled by a moderator, the TTL increases to the configured slow mode duration. Subscribers get a higher rate limit (2 messages per second instead of 1). When a user exceeds the rate limit, the server sends an `error` type WebSocket message back to the client with the message "Rate limited. Please wait before sending another message." The rate limit hit is counted in the `chat_rate_limit_hits_total` Prometheus metric.
+
+### Idempotency
+
+**What it is:** Idempotency ensures that performing the same operation multiple times produces the same result as performing it once. For APIs and WebSocket messages, this prevents duplicate processing from network retries.
+
+**Why Twitch needs it:** Three operations require idempotency protection. First, chat messages: WebSocket reconnections or client retries could cause the same message to be delivered twice. In a fast-moving chat, duplicate messages are visually noticeable and annoying. Second, subscription purchases: a network retry on a subscription request must not charge the user twice. Third, stream start/stop: if a broadcaster's OBS reconnects rapidly, multiple "start stream" events could arrive simultaneously, creating duplicate stream records.
+
+**How it works here:** Chat message deduplication uses a per-message unique ID with Redis-based tracking (`TTL 5 minutes`). Each message is assigned an ID by the client (or generated server-side). Before fan-out, the server checks if the message ID was already processed. Subscription idempotency uses an `Idempotency-Key` header with a 24-hour TTL in Redis -- the same subscription request always returns the same result. Stream state changes use Redis locks (TTL 10 seconds) to serialize concurrent start/stop requests for the same channel, preventing race conditions. The `follow` operation uses the database `UNIQUE(user_id, channel_id)` constraint as a natural idempotency mechanism -- duplicate follow requests simply fail the constraint and return success.
+
+### Health Checks
+
+**What it is:** Health check endpoints report whether an application instance is functioning correctly and can serve traffic. They enable load balancers to route traffic away from unhealthy instances and monitoring systems to trigger alerts.
+
+**Why Twitch needs it:** The Twitch backend serves both HTTP API requests and WebSocket chat connections from the same process. These have different health requirements. An instance might have a healthy database connection (can serve API requests for channels and categories) but an unhealthy Redis connection (cannot fan out chat messages). The health check system must distinguish between these failure modes so the load balancer can make appropriate routing decisions. Additionally, the WebSocket nature of chat means that connection-level health matters -- an instance that cannot accept new WebSocket connections should stop receiving traffic even if its HTTP endpoints work.
+
+**How it works here:** Three health endpoints are implemented in `backend/src/utils/health.ts`: `/health` performs a comprehensive check of both PostgreSQL and Redis, returning a JSON report with per-dependency status and latency. `/health/live` is a simple liveness probe that returns 200 if the process is alive (for Kubernetes to decide whether to restart the container). `/health/ready` checks that both PostgreSQL and Redis are reachable and returns 200 only if both are healthy (for the load balancer to decide whether to route traffic). The graceful shutdown handler in `backend/src/index.ts` stops accepting new connections, sends a `server_shutdown` message to all connected WebSocket clients, waits for in-flight requests to complete (10-second timeout), and then closes database and Redis connections.
+
 ---
 
 ## Implementation Notes

@@ -568,3 +568,145 @@ This section maps the production architecture above to the local Docker + Node.j
 - Database sharding / read replicas
 - OAuth authentication
 - Smart scheduling (increase frequency for volatile products)
+
+## Frontend Architecture
+
+This section describes the React frontend implementation: component hierarchy, state management, routing, data fetching patterns, and key UI behaviors.
+
+### Technology Stack
+
+| Technology | Purpose |
+|-----------|---------|
+| React 19 + TypeScript | UI framework with type safety |
+| TanStack Router | File-based routing with type-safe params |
+| Zustand | Lightweight global state management |
+| Axios | HTTP client with interceptors for auth and error handling |
+| Recharts | Interactive price history charts |
+| date-fns | Date formatting and relative time display |
+| Tailwind CSS | Utility-first CSS styling |
+| Vite | Development server and build tool |
+
+### Route Structure
+
+TanStack Router file-based routing in `frontend/src/routes/`:
+
+| File | Path | Description |
+|------|------|-------------|
+| `__root.tsx` | (layout) | Root layout with auth check on mount, Layout wrapper, loading spinner |
+| `index.tsx` | `/` | Dashboard showing tracked products and add-product form (requires auth) |
+| `login.tsx` | `/login` | Login form |
+| `register.tsx` | `/register` | Registration form |
+| `products.$productId.tsx` | `/products/:productId` | Product detail with price chart, stats, and alert settings |
+| `alerts.tsx` | `/alerts` | Notification center for price drop alerts |
+| `admin.tsx` | `/admin` | Admin dashboard with scraper stats and domain configurations |
+
+### Zustand Stores
+
+The frontend uses three Zustand stores for domain-separated global state:
+
+**`authStore.ts`** -- Authentication state without persistence middleware. Stores user object and auth status. On app load, `checkAuth()` reads a token from localStorage and validates it via `authService.getCurrentUser()`. If the token is invalid or missing, the store clears state and sets `isLoading: false`. Includes an `updateSettings()` action for email notification preferences. Unlike the other projects in this repo, this store does not use Zustand's `persist` middleware -- instead it manually checks localStorage for the token.
+
+**`productStore.ts`** -- Product tracking state. Manages the list of tracked products with CRUD operations. `fetchProducts()` loads all products from the API. `addProduct()` optimistically prepends the new product to the list (newest first). `updateProduct()` optimistically merges updates into the local list. `deleteProduct()` optimistically removes the product from the list. Each action delegates to the `productService` module for the actual API call. Error state is tracked per-store, not per-operation.
+
+**`alertStore.ts`** -- Alert notification state. Maintains a list of price drop alerts with an `unreadCount` for badge display. `markAsRead()` optimistically marks an alert as read in local state and decrements the unread count. `markAllAsRead()` sets all alerts to read and zeroes the count. `fetchUnreadCount()` is called separately (e.g., on navigation) to update the badge without loading full alert data. Errors in `fetchUnreadCount` are silently swallowed to avoid disrupting the UI for a non-critical feature.
+
+### Component Hierarchy
+
+```
+__root (Layout wrapper with auth check)
+├── Layout
+│   └── Header (nav links, alert badge with unreadCount)
+├── HomePage
+│   ├── AddProductForm (URL input, target price, notify-any-drop checkbox)
+│   └── ProductCard[] (image, title, domain, current price, link to detail)
+├── ProductDetailPage
+│   ├── Product info header (image, title, domain, current price)
+│   ├── Price statistics (lowest, highest, average for selected period)
+│   ├── PriceChart (Recharts LineChart with avg/min/max lines + target ReferenceLine)
+│   ├── Time range selector (30d, 90d, 180d, 365d toggle buttons)
+│   └── Alert settings editor (target price input, notify-any-drop toggle)
+├── AlertsPage (alert list with read/unread styling, mark-read, delete)
+└── AdminPage (system statistics, scraper configurations, job queue status)
+```
+
+### Data Fetching Pattern
+
+The frontend uses Axios (`services/api.ts`) with two interceptors. The request interceptor reads a token from localStorage and attaches it as a `Bearer` token in the `Authorization` header. The response interceptor catches 401 errors, removes the stale token from localStorage, and redirects to `/login`. Typed service modules (`services/products.ts`, `services/alerts.ts`, `services/auth.ts`) wrap Axios calls and return typed data. Zustand stores call these service modules and manage loading/error state internally.
+
+### Key UI Patterns
+
+**Price history charts with Recharts**: The `PriceChart` component renders a `ResponsiveContainer` containing a `LineChart` with three `Line` elements: average price (solid blue), min price (dashed green), and max price (dashed red). A `ReferenceLine` marks the user's target price as a dashed yellow horizontal line when configured. The Y-axis domain is calculated from actual data bounds with 10% padding. A custom `Tooltip` component shows formatted prices for all three series on hover. When no data exists, a gray placeholder with "No price history available yet" is shown.
+
+**Time range selector**: The product detail page has toggle buttons for 30d, 90d, 180d, and 365d ranges. Selecting a range updates the `selectedDays` state, which triggers a `useEffect` to call `getDailyPrices(productId, selectedDays)`. The API returns data from TimescaleDB continuous aggregates, and the price statistics (lowest, highest, average) are recalculated from the returned data.
+
+**Inline alert settings editing**: The product detail page has an alert settings section that toggles between view mode (showing current target price and notify-any-drop status) and edit mode (form with inputs). Edit mode is entered via an "Edit" button and exited via "Save" (which calls `updateProduct`) or "Cancel". This inline editing pattern avoids a separate settings page.
+
+**Auth-guarded routes**: Route components check `isAuthenticated` from the auth store and render `<Navigate to="/login" />` if false. This is a client-side guard -- the API also enforces authentication, so the frontend guard is a UX convenience that prevents seeing a broken page before the API returns 401.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before. Each explanation covers what the pattern is, what problem it solves, and how it works in this project.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of checking "can user X do action Y?" for every user individually, the system checks "does user X have a role that permits action Y?" This decouples permission logic from individual user identities.
+
+**What problem it solves**: Without RBAC, authorization logic scatters throughout the codebase as ad-hoc checks. When new admin capabilities are added (like managing scraper configurations or retrying failed jobs), every endpoint must be audited. RBAC centralizes permission decisions: a middleware checks the user's role against the route's required role before the handler executes. If the role does not match, the request is rejected with 403 Forbidden.
+
+**How it works in this project**: The `users` table has a `role` column constrained to `('user', 'admin')`. Regular users can only manage their own tracked products and alerts. Admin users can access `/api/v1/admin/*` endpoints to view system statistics, update scraper configurations per domain, view the job queue, and retry failed scrape jobs. The auth middleware loads the session from Redis, retrieves the user role, and attaches it to the request object. Admin routes check `req.user.role === 'admin'` via middleware.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns it. On a cache hit, the cached value is returned directly, skipping the database entirely. The cache is "aside" from the main data flow -- it is not in the write path, and the database is the source of truth.
+
+**What problem it solves**: Price history queries hit TimescaleDB continuous aggregates, which are efficient but still require a database round-trip. For dashboard views where many users view the same product's price chart, caching avoids redundant queries. With 10,000 tracked products and frequent dashboard refreshes, cache-aside reduces database load from O(users * products) to O(products) per cache TTL period.
+
+**How it works in this project**: Price history for dashboard display is cached in Redis with key pattern `cache:product:{productId}:prices` and a 5-minute TTL. When a user views a product's price chart, the server checks Redis first. On cache miss, it queries the `daily_prices` continuous aggregate, stores the JSON result in Redis, and returns it. On scrape completion, product and price caches are invalidated so the next read reflects the new price. Scraper configurations are also cached with a 10-minute TTL and invalidated when an admin updates them.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker is a stability pattern borrowed from electrical engineering. It wraps calls to an external service and monitors failure rates. When failures exceed a threshold, the circuit "opens" and immediately rejects subsequent calls without attempting them, giving the failing service time to recover. After a timeout, the circuit enters a "half-open" state where it allows a limited number of test requests. If those succeed, the circuit closes and normal operation resumes.
+
+**What problem it solves**: When scraping an e-commerce site, that site may start rate-limiting, returning errors, or timing out. Without a circuit breaker, the scraper would continue hammering the failing site, wasting worker capacity and potentially getting the scraper's IP permanently banned. The circuit breaker stops futile requests immediately, preserving worker capacity for domains that are healthy, and automatically resumes scraping when the target site recovers.
+
+**How it works in this project**: The Cockatiel library (`backend/src/shared/resilience.ts`) provides per-domain circuit breakers. Each e-commerce domain gets its own circuit breaker instance with independent state tracking. Configuration: opens after 5 consecutive failures, stays open for 60 seconds, then allows 3 test requests in half-open state. State transitions are logged and exposed as Prometheus gauge metrics (`price_tracker_circuit_breaker_state`). This per-domain isolation is critical: if Amazon is down, Best Buy and Walmart scraping continues unaffected.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable JSON rather than free-form text strings. Each log entry has well-defined fields: timestamp, log level, message, and arbitrary contextual key-value pairs (product ID, domain, scrape duration). This contrasts with `console.log("Scraped amazon.com in 2.3s")` which is human-readable but impossible to reliably parse.
+
+**What problem it solves**: When debugging why a particular product's price is not updating, you need to find the relevant log entries among millions of scrape operations. Free-form text requires regex searching that breaks when messages change. Structured logs enable precise queries: "show all entries where `domain = amazon.com` and `level = error` in the last hour." Log aggregation tools can index JSON fields for sub-second search.
+
+**How it works in this project**: Pino (`backend/src/utils/logger.ts`) outputs JSON logs with correlation IDs. Each log entry includes contextual data like `domain`, `product_id`, `scrape_duration_ms`. Key logged events: `scrape_complete` (with domain, status, duration), `scrape_failed` (with error type, retry count), `alert_triggered` (with alert type, old/new price), `circuit_state_change` (with domain, old/new state). Sensitive data (passwords, session tokens) is automatically redacted by Pino's redaction configuration. In development, `pino-pretty` reformats JSON into colored, human-readable output.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system. The application exposes a `/metrics` HTTP endpoint that returns numerical measurements. A Prometheus server scrapes this endpoint periodically and stores the values. Grafana queries this data to create dashboards and trigger alerts. The three main metric types are: counters (monotonically increasing, like "total scrapes"), histograms (distribution of values, like "scrape duration in buckets"), and gauges (point-in-time values, like "queue depth").
+
+**What problem it solves**: Without metrics, the only way to know if scraping is healthy is to manually check if prices are updating. Metrics provide continuous quantitative visibility: "amazon.com scrape success rate dropped from 95% to 40% over the last 30 minutes" triggers an alert before users notice stale prices. Metrics also enable capacity planning: "we process 3 scrapes/second; peak requires 10; we need 4x more workers."
+
+**How it works in this project**: The `prom-client` library (`backend/src/shared/metrics.ts`) registers 20+ custom metrics. Examples: `price_tracker_scrapes_total` (counter by domain and status -- success/failure/circuit_open), `price_tracker_scrape_duration_seconds` (histogram by domain, showing p50/p95/p99 scrape latency), `price_tracker_scrape_queue_size` (gauge showing backlog), `price_tracker_alerts_triggered_total` (counter by alert type), `price_tracker_cache_operations_total` (counter by operation and result -- hit/miss). HTTP metrics use path normalization (UUIDs replaced with `:id`) to prevent unbounded label cardinality.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make within a time window. The system tracks request counts per client (by IP, user ID, or API key) and rejects excess requests with HTTP 429 (Too Many Requests).
+
+**What problem it solves**: This project has two rate-limiting concerns: API rate limiting (preventing abuse of the web API) and domain rate limiting (preventing excessive scraping of target e-commerce sites). API rate limiting protects the server from being overwhelmed by a single client. Domain rate limiting prevents getting blocked by target sites and ensures fair distribution of scrape capacity across domains.
+
+**How it works in this project**: API rate limiting uses `express-rate-limit` middleware configured at 100 requests/minute per IP. Domain scrape rate limiting uses Redis counters with key pattern `ratelimit:{domain}:{minute}` and 60-second TTL. Before each scrape, the worker checks if the domain's request count exceeds its configured limit (from `scraper_configs.rate_limit`). If exceeded, the scrape job is delayed until the next minute. This per-domain approach prevents a high-volume domain (Amazon with 100K tracked products) from starving low-volume domains.
+
+### Idempotency
+
+**What it is**: An idempotent operation produces the same result whether executed once or multiple times. In the context of web APIs, idempotency means that if a client sends the same request twice (due to network retry, user double-click, or app crash), the server processes it only once and returns the same response both times.
+
+**What problem it solves**: In this project, idempotency serves two purposes. First, scrape job deduplication: if the job scheduler fires while a product's scrape is already queued (because the previous scrape took longer than expected), the system should not queue a duplicate job. Second, alert deduplication: if a product's price drops and the alert check runs twice before the alert is marked as sent, the user should not receive two identical notifications.
+
+**How it works in this project**: Scrape job deduplication uses Redis SETNX with key `scrape:pending:{productId}` and a 1-hour TTL. Before enqueueing a scrape job, the scheduler checks if this key exists. If it does, the product's scrape is already in progress and a new job is not queued. The key is deleted when the scrape completes. Alert deduplication checks `last_triggered_at` on the alert record -- if an alert was triggered within a cooldown window (configurable, default 1 hour), it is not triggered again for the same price drop.
+
+### Health Checks
+
+**What it is**: Health check endpoints are HTTP routes that report whether the application is functioning correctly. They are consumed by infrastructure components (load balancers, container orchestrators, monitoring systems) to make automated decisions about traffic routing and process lifecycle.
+
+**What problem it solves**: An API server might be running but unable to serve requests because its database connection was lost or Redis is unreachable. Without health checks, the load balancer continues sending traffic to the broken instance, causing cascading errors for users. Health checks enable automatic traffic rerouting and container restarts.
+
+**How it works in this project**: The backend exposes four endpoints. `GET /health` returns 200 with basic process info (uptime, memory). `GET /health/detailed` checks PostgreSQL connectivity (via `SELECT 1`), Redis connectivity (via `PING`), and TimescaleDB status, reporting per-component latency. `GET /ready` returns 200 only if all dependencies are connected (used by load balancers to decide if this instance should receive traffic). `GET /live` always returns 200 if the process is running (used by container orchestrators to detect deadlocked processes). The separation between liveness and readiness is important: a process that lost its database connection is alive (should not be killed) but not ready (should not receive traffic).

@@ -687,3 +687,182 @@ This section maps the production architecture above to the actual local implemen
 - Distributed tracing (OpenTelemetry)
 - Training load and fitness/fatigue tracking
 - Heat maps and aggregate route visualization
+
+## Frontend Architecture
+
+This section describes the React frontend implementation: component hierarchy, state management, routing, data fetching patterns, and key UI behaviors.
+
+### Technology Stack
+
+| Technology | Purpose |
+|-----------|---------|
+| React 19 + TypeScript | UI framework with type safety |
+| TanStack Router | File-based routing with type-safe params |
+| Zustand | Lightweight global state management with localStorage persistence |
+| Leaflet + react-leaflet | Interactive map rendering with OpenStreetMap tiles |
+| polyline (library) | Decoding Google-encoded polylines to lat/lng arrays |
+| Tailwind CSS | Utility-first CSS with Strava-branded custom colors |
+| Vite | Development server and build tool |
+
+### Route Structure
+
+TanStack Router file-based routing in `frontend/src/routes/`:
+
+| File | Path | Description |
+|------|------|-------------|
+| `__root.tsx` | (layout) | Root layout with Navbar and auth check on mount |
+| `index.tsx` | `/` | Dashboard with activity feed (personalized if logged in, explore if not) |
+| `login.tsx` | `/login` | Login form |
+| `register.tsx` | `/register` | Registration form |
+| `upload.tsx` | `/upload` | GPX file upload and activity simulation |
+| `activity.$id.tsx` | `/activity/:id` | Activity detail with map, metrics, kudos, comments, segment efforts |
+| `explore.tsx` | `/explore` | Public activity discovery feed |
+| `segments.tsx` | `/segments` | Segment browser with search and filtering |
+| `segment.$id.tsx` | `/segment/:id` | Segment detail with leaderboard and map |
+| `profile.$id.tsx` | `/profile/:id` | Athlete profile with stats, activities, achievements |
+| `profile.$id.followers.tsx` | `/profile/:id/followers` | Followers list |
+| `profile.$id.following.tsx` | `/profile/:id/following` | Following list |
+| `stats.tsx` | `/stats` | Personal statistics dashboard with records and achievements |
+
+### Zustand Store
+
+The frontend uses a single Zustand store for authentication:
+
+**`authStore.ts`** -- Athlete authentication state with `persist` middleware. Stores the user object and `isAuthenticated` flag in localStorage (via `partialize`). On app load, `checkAuth()` validates the session by calling `GET /api/auth/me`. If the session is invalid, state is cleared. The store provides `login`, `register`, `logout`, and `checkAuth` actions. Unlike many projects that persist only the token, this store persists the full user object and auth flag, so the UI renders immediately on reload without waiting for the auth check to complete.
+
+This project does not use additional Zustand stores for activities, segments, or feed data. Instead, each route component manages its own data state via `useState` + `useEffect`, fetching data on mount. This approach is simpler for a content-consumption app where most pages load independent data that is not shared across routes.
+
+### API Service Layer
+
+The API client (`services/api.ts`) is organized as five domain-specific objects, each grouping related endpoints:
+
+| Object | Purpose | Key Methods |
+|--------|---------|-------------|
+| `auth` | Authentication | `login`, `register`, `logout`, `me` |
+| `activities` | Activity CRUD and social | `list`, `get`, `getGps`, `upload`, `simulate`, `kudos`, `removeKudos`, `addComment` |
+| `feed` | Activity feeds | `get` (personalized), `explore` (public) |
+| `users` | Profiles and social | `get`, `search`, `follow`, `unfollow`, `getFollowers`, `getFollowing`, `getAchievements` |
+| `segments` | Segments and leaderboards | `list`, `get`, `getLeaderboard`, `getEfforts`, `create`, `delete` |
+| `stats` | Personal and admin stats | `me`, `records`, `adminOverview` |
+
+All methods use a shared `request<T>()` wrapper that handles JSON parsing, credentials (`credentials: 'include'`), and error extraction. The `upload` method is special-cased to use `FormData` instead of JSON for GPX file uploads.
+
+### Component Hierarchy
+
+```
+__root (Navbar + Outlet)
+├── Dashboard (index)
+│   ├── Feed section (lg:col-span-2)
+│   │   ├── Action buttons (Simulate Activity, Upload Activity)
+│   │   └── ActivityCard[] (activity list with map thumbnails)
+│   └── Sidebar (lg:col-span-1)
+│       ├── User profile mini-card (avatar initial, username, link to stats)
+│       └── Quick links (Explore Segments, Discover Activities)
+├── Upload
+│   ├── GPX file input (drag-and-drop styled, .gpx filter)
+│   ├── Activity type selector (run, ride, hike, walk, swim)
+│   ├── Name/description inputs
+│   └── Submit (Upload) + Simulate button
+├── ActivityDetail
+│   ├── ActivityMap (Leaflet map with route polyline)
+│   ├── Metrics grid (distance, time, elevation, speed, heart rate)
+│   ├── Kudos button (toggle)
+│   ├── Comments section
+│   └── Segment efforts list (matched segments with times and PR rank)
+├── Segments browser
+│   ├── Search input + activity type filter
+│   └── SegmentCard[] (name, distance, elevation, athlete count)
+├── SegmentDetail
+│   ├── Segment map (Leaflet polyline)
+│   ├── LeaderboardTable (rank, athlete, time, date)
+│   └── Effort history
+├── Profile
+│   ├── Profile header (avatar, bio, location, follow/unfollow button)
+│   ├── Stats summary (activities, distance, followers, following)
+│   ├── Recent activities
+│   └── Achievements list
+└── Stats dashboard
+    ├── Activity totals by type
+    ├── Personal records (longest, fastest, biggest climb)
+    └── Achievement progress
+```
+
+### Key UI Patterns
+
+**Map visualization with Leaflet**: The `ActivityMap` component is central to the Strava experience. It accepts either a pre-encoded polyline string (for performance -- 10x smaller than raw points) or an array of GPS points (for detailed views). The `polyline` library decodes the encoded string into lat/lng arrays. The component uses `useMemo` to avoid re-decoding on every render. A `FitBounds` sub-component calls `map.fitBounds()` on mount to auto-zoom to the route extent with 20px padding. Start and end markers use custom `L.divIcon` elements (green circle for start, red for finish) with CSS-styled borders and shadows. Map interactivity (scroll zoom, dragging, zoom controls) is configurable -- disabled in card thumbnails and enabled on detail pages.
+
+**Activity simulation**: Since real GPX files are hard to come by during development, the upload page includes a "Simulate" button that calls `POST /api/activities/simulate`. This generates a random GPS track with configurable point count and activity type. The simulation result redirects to the new activity's detail page, making it easy to populate the system with test data for segment matching and feed generation.
+
+**Conditional feed behavior**: The dashboard (index route) serves two purposes. For authenticated users, it fetches the personalized feed (`feed.get()`) showing activities from followed athletes. For unauthenticated users, it fetches the explore feed (`feed.explore()`) showing public activities. The heading changes ("Your Feed" vs "Explore Activities") and action buttons (Simulate, Upload) are conditionally rendered based on auth state.
+
+**Strava-branded theming**: The frontend uses custom Tailwind colors (`strava-orange`, `strava-orange-dark`, `strava-gray-*`) to match Strava's visual identity. These are defined in the Tailwind config and used throughout for buttons, headers, and accent colors.
+
+**Activity-type color coding**: The `getActivityColor()` utility function (`utils/format.ts`) maps activity types to colors (e.g., run = orange, ride = blue) used for polyline rendering on maps and UI accents.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before. Each explanation covers what the pattern is, what problem it solves, and how it works in this project.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of checking per-user permissions, the system checks if a user's role includes the required permission.
+
+**What problem it solves**: Without RBAC, determining who can do what requires scattered conditional checks throughout the code. For a fitness platform, you need to distinguish between regular athletes (who can upload activities, follow others, and give kudos) and admins (who can view platform-wide statistics, manage all users, and moderate content). RBAC provides a clean boundary: user-facing endpoints check for the `user` role, admin endpoints check for the `admin` role.
+
+**How it works in this project**: The `users` table has a `role` column (default `'user'`). The auth middleware loads the session from Redis and attaches the user object (including role) to each request. Admin endpoints (`/api/stats/admin/*`) check the role in middleware before allowing access. Regular athletes can only modify their own data (ownership checks for activities, kudos, comments). The social graph (follow/unfollow) and activity privacy settings (`privacy` column: `'public'`, `'followers'`, `'private'`) add a second layer of access control beyond simple role checks.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside is a caching strategy where the application checks the cache before querying the database. On a cache miss, the database is queried, the result is stored in the cache with a TTL, and then returned. On a cache hit, the cached value is returned directly.
+
+**What problem it solves**: In a fitness platform, certain data is read far more often than it is written. A popular segment's leaderboard might be viewed 1,000 times per hour but only updated when someone rides that segment. Activity feeds are read on every page load but only updated when followed athletes upload activities. Without caching, every feed view requires a `ZREVRANGE` on Redis plus database lookups for activity details -- the Redis part is fast, but the database lookups add up under load.
+
+**How it works in this project**: Redis sorted sets serve as the primary cache for two hot data paths. Leaderboards use sorted sets (`leaderboard:{segment_id}`) with elapsed time as the score, providing O(log N) insertions and O(k) for top-k queries. Activity feeds use sorted sets (`feed:{user_id}`) with timestamps as scores, providing chronological feed reads via `ZREVRANGE`. Personal records are cached as simple string keys (`pr:{user_id}:{segment_id}`) for O(1) lookups. Idempotency results are cached with 24-hour TTL to prevent duplicate activity uploads. All cached data is reconstructible from PostgreSQL -- if Redis crashes, leaderboards and feeds are rebuilt from `segment_efforts` and `activities` tables.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker wraps calls to external or potentially failing services and monitors their success rate. When failures exceed a threshold, it stops sending requests (circuit "opens"), waits for a recovery period, then allows test requests (circuit "half-open"). If tests succeed, normal operation resumes.
+
+**What problem it solves**: In this project, the circuit breaker concept applies to segment matching. Segment matching runs synchronously during activity upload and involves expensive database queries (bounding box intersection + GPS point comparison). If the database is under heavy load, segment matching could time out, causing the entire activity upload to fail. A circuit breaker around the matching service would allow the activity to be saved even if matching fails, with matching retried later.
+
+**How it works in this project**: While not using the Opossum library directly (segment matching runs in-process), the architecture design applies circuit breaker thinking to the segment matching flow. The system is designed so that segment matching failure does not prevent activity creation -- the activity and GPS points are committed to PostgreSQL first, and matching runs as a separate step. If matching times out or errors, the activity is still saved successfully. The production design would move matching to a background worker behind a Kafka topic, with a proper circuit breaker wrapping the matching service calls.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable JSON rather than free-form text. Each entry has defined fields (timestamp, level, message, contextual data) that can be searched, filtered, and aggregated by log management tools.
+
+**What problem it solves**: Debugging "why didn't segment matching find segment X for activity Y?" in a system processing thousands of activities per day requires precise log search. A free-form message like "No segments matched" is useless without context. A structured entry like `{"msg":"segment_match_complete","activity_id":"abc","candidates":15,"matches":0,"duration_ms":230}` can be found instantly and reveals that 15 candidates were evaluated but none matched.
+
+**How it works in this project**: Pino (`backend/src/shared/logger.ts`) outputs JSON logs with 8 component-specific child loggers: `activity`, `segment`, `leaderboard`, `feed`, `database`, `redis`, `auth`, `lifecycle`. Each child logger automatically includes a `component` field in every entry. Request-scoped loggers carry correlation IDs from `X-Request-Id` headers, enabling end-to-end tracing of a single activity upload through parsing, GPS storage, segment matching, leaderboard updates, feed fan-out, and achievement checking. Sensitive fields (password, session ID, cookies, authorization headers) are automatically redacted by Pino's redaction configuration.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system where the application exposes numerical measurements at a `/metrics` endpoint, scraped periodically by a Prometheus server. Grafana visualizes this data as dashboards and triggers alerts on thresholds.
+
+**What problem it solves**: A fitness platform needs visibility into several performance-critical pipelines. How long does activity upload take? How many GPS points are we ingesting per minute? Is segment matching keeping up, or is it creating a backlog? Are leaderboard updates fast enough? Without metrics, these questions require manual investigation -- with metrics, they are answered by a glance at a dashboard.
+
+**How it works in this project**: The `prom-client` library (`backend/src/shared/metrics.ts`) registers 20+ metrics organized by subsystem. Activity metrics: `strava_activity_uploads_total` (counter by type/status), `strava_activity_upload_duration_seconds` (histogram), `strava_activity_gps_points_total` (counter tracking data ingestion volume). Segment metrics: `strava_segment_match_duration_seconds` (histogram measuring the two-phase matching algorithm's latency), `strava_segment_matches_total` (counter tracking how often matching finds results). Leaderboard metrics: `strava_leaderboard_updates_total` (counter for PR and podium frequency), `strava_leaderboard_query_duration_seconds` (histogram for Redis query speed). Feed metrics: `strava_feed_fanout_duration_seconds` (histogram tracking how long it takes to fan out an activity to followers -- this grows with follower count). Infrastructure metrics: `strava_db_query_duration_seconds`, `strava_redis_connected` (gauge for connection health).
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make within a time window, rejecting excess requests with HTTP 429.
+
+**What problem it solves**: Activity uploads are expensive (GPX parsing, GPS point insertion, segment matching). Without rate limiting, a buggy fitness device could upload the same activity repeatedly, consuming database resources and creating duplicate segment efforts. The API also needs protection against bots scraping athlete profiles and leaderboard data.
+
+**How it works in this project**: Rate limiting is implemented at the API Gateway level in the production design (not as a separate middleware in the local implementation). The architecture specifies per-endpoint limits: activity uploads are rate-limited more aggressively (expensive operation) than feed reads (cheap Redis query). The idempotency system (see below) provides a complementary defense specifically for activity uploads.
+
+### Idempotency
+
+**What it is**: An idempotent operation produces the same result whether executed once or multiple times. For APIs, this means retrying a request due to network failure is always safe -- the server detects the duplicate and returns the original response without re-executing the operation.
+
+**What problem it solves**: GPS devices and fitness apps frequently retry activity uploads. A cyclist finishes a ride, the app uploads the GPX file, the network drops before the response arrives, and the app retries. Without idempotency, the second upload creates a duplicate activity with duplicate segment efforts, corrupting leaderboards (the athlete now appears twice) and inflating statistics (their monthly distance is doubled). This is especially problematic because the duplicate is difficult to detect after the fact -- two identical activities with slightly different upload timestamps look legitimate.
+
+**How it works in this project**: The idempotency service (`backend/src/shared/idempotency.ts`) uses a two-layer approach. Layer 1 is content-based hashing: a SHA-256 hash of `userId + GPX file content + start timestamp` creates a unique fingerprint. The same GPX file uploaded twice by the same user produces the same hash. Layer 2 is client-provided keys: the `X-Idempotency-Key` header allows mobile apps to generate their own upload IDs, enabling idempotency even before the GPX content is read. Keys are stored in Redis with 24-hour TTL in key pattern `idem:activity:{sha256_hash}` containing `{ activity_id, name, type, cached_at }`. On duplicate detection, the server returns 200 OK with the original activity data (not 409 Conflict), because the client's goal (activity uploaded) was achieved.
+
+### Health Checks
+
+**What it is**: Health check endpoints are HTTP routes that report whether the application is functioning correctly. They are consumed by load balancers, container orchestrators, and monitoring systems to make automated routing and lifecycle decisions.
+
+**What problem it solves**: An API server might be running but unable to process activity uploads because PostgreSQL is unreachable or unable to serve feeds because Redis is down. Without health checks, a load balancer keeps routing traffic to the broken instance, causing errors. Health checks enable automatic removal of unhealthy instances from the traffic pool.
+
+**How it works in this project**: The backend (`backend/src/shared/health.ts`) exposes a three-tier health check system. `GET /health` (liveness): returns 200 with uptime and memory usage -- confirms the process is running and not deadlocked. `GET /health/ready` (readiness): checks PostgreSQL connectivity (via `SELECT 1`) and Redis connectivity (via `PING`). Returns 200 only if both are connected, otherwise 503. This is used by load balancers to decide if this instance should receive traffic. `GET /health/detailed` (debugging): reports per-component status with measured latency for each dependency check, connection pool statistics, and memory breakdown. This is used by operators during incident investigation. The separation between liveness and readiness matters: an instance that lost its Redis connection is alive (do not kill it, Redis might come back) but not ready (do not send it traffic that requires leaderboard or feed reads).

@@ -619,3 +619,121 @@ Vote partitioning by month (`PARTITION BY RANGE (created_at)`) enables clean arc
 - Moderation tools (automod, ban, content removal)
 - A/B testing framework
 - Vote fuzzing for anti-brigade
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root (RootComponent)
+├── Header                          # Global nav bar with auth state, search, navigation
+├── Outlet (route-specific content)
+│   ├── / (HomePage)                # Global feed with sort tabs + sidebar
+│   │   ├── SortTabs                # Hot / New / Top / Controversial sort selector
+│   │   ├── PostCard[]              # Post summary cards in a vertical list
+│   │   │   └── VoteButtons         # Upvote/downvote with optimistic score update
+│   │   └── Sidebar                 # Subreddit list, community info
+│   ├── /r/$subreddit               # Subreddit page with header + post list
+│   │   ├── SortTabs
+│   │   └── PostCard[]
+│   ├── /r/$subreddit/comments/$postId  # Post detail with threaded comments
+│   │   ├── VoteButtons             # Post-level voting
+│   │   ├── CommentThread[]         # Recursive comment tree (self-referencing)
+│   │   │   ├── VoteButtons         # Comment-level voting (horizontal layout)
+│   │   │   └── CommentThread[]     # Nested replies (recursive rendering)
+│   │   └── Comment form            # Top-level comment submission
+│   ├── /submit                     # Post creation form
+│   ├── /subreddits/create          # Subreddit creation form
+│   ├── /u/$username                # User profile with post history
+│   ├── /search                     # Search results page
+│   ├── /login                      # Login form
+│   └── /register                   # Registration form
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`): Manages authentication state with `persist` middleware. Stores the current `User` object and provides `login`, `register`, `logout`, and `checkAuth` actions. The `persist` middleware serializes only the `user` field to localStorage under the key `reddit-auth`, enabling session restoration across page reloads without re-authenticating. On app startup, `checkAuth` validates the session cookie against the backend `/api/auth/me` endpoint; if the cookie has expired or been revoked server-side, the store clears the cached user.
+
+The project does not use a dedicated feed or post store. Post data, subreddit info, and comment trees are managed as local React state within each route component via `useState` + `useEffect`. This is a deliberate simplification: since Reddit's content is community-scoped (each subreddit has its own feed), there is no global feed state to share across routes.
+
+### Routing
+
+TanStack Router with file-based routing. Routes are organized to mirror Reddit's URL structure:
+
+| File | URL Pattern | Purpose |
+|------|-------------|---------|
+| `routes/index.tsx` | `/` | Global front page with sort tabs |
+| `routes/r.$subreddit.tsx` | `/r/:subreddit` | Subreddit feed |
+| `routes/r.$subreddit.comments.$postId.tsx` | `/r/:subreddit/comments/:postId` | Post detail + comment tree |
+| `routes/submit.tsx` | `/submit` | Post creation with optional subreddit pre-fill |
+| `routes/subreddits/create.tsx` | `/subreddits/create` | Subreddit creation |
+| `routes/u.$username.tsx` | `/u/:username` | User profile |
+| `routes/search.tsx` | `/search` | Search results |
+| `routes/login.tsx` / `routes/register.tsx` | `/login`, `/register` | Authentication |
+
+Search params are validated via `validateSearch` for sort type (`hot`, `new`, `top`, `controversial`) and comment sort type (`best`, `top`, `new`, `controversial`). This allows sharing URLs like `/r/programming?sort=top` with the sort state encoded in the URL.
+
+### Data Fetching
+
+All data fetching uses a centralized `api.ts` module that wraps the native `fetch` API with `credentials: 'include'` for cookie-based session auth. Each route component fetches its own data in a `useEffect` hook triggered by route params or search params. The subreddit page uses `Promise.all` to fetch subreddit metadata and posts in parallel, reducing load time.
+
+There is no client-side caching layer (no React Query or SWR). Every route navigation triggers a fresh fetch. This is acceptable for a learning project but means navigating back to a previously viewed page re-fetches all data.
+
+### Optimistic Updates
+
+The `VoteButtons` component implements a partial optimistic update pattern. When a user clicks upvote or downvote, the component immediately sends the API request and waits for the server response before updating the displayed score. The score shown comes from `result.score` (the server-computed value), not a client-side increment. This means there is a brief delay (the round-trip time) before the score visually changes, but the displayed value is always accurate. The `isVoting` flag prevents double-clicks during the round-trip.
+
+The comment submission flow uses an immediate local insert: after `api.createComment` resolves, the new comment is prepended to the local `comments` array via `setComments`. For replies, `handleReplyAdded` recursively walks the comment tree to insert the reply under the correct parent, preserving the nested structure without re-fetching the entire tree.
+
+### Key UI Patterns
+
+**Recursive comment rendering**: `CommentThread` is a self-referencing component. Each instance renders its own content, vote buttons, and reply form, then maps over `comment.replies` to render child `CommentThread` instances. Nesting depth is visualized with left margin (`marginLeft: comment.depth > 0 ? '16px' : 0`) and a vertical collapse line. Users can collapse a subtree by clicking the `[-]` button, which switches to a compact one-line summary showing username, score, and timestamp.
+
+**Sort tabs with URL state**: Sort selection is stored as a URL search parameter rather than component state. This means sort preferences survive page refreshes and can be shared via URL. `SortTabs` renders links that update the `?sort=` parameter, and the route's `validateSearch` function parses and validates the value.
+
+**Subreddit subscription toggle**: The subscribe/unsubscribe button uses local state (`isSubscribed`) initialized from the server response (`sub.subscribed`). Toggling calls the API and flips the local boolean. This is a simple optimistic pattern where the UI updates immediately and silently logs errors.
+
+---
+
+## Deep Pattern Explanations
+
+### Structured Logging
+
+Structured logging means emitting log messages as machine-parseable JSON objects instead of free-form text strings. A traditional log line like `"User 42 created post in r/programming"` is easy for humans to read but difficult for machines to search, filter, or aggregate. A structured log for the same event looks like `{"level":"info","msg":"post.created","userId":42,"subreddit":"programming","postId":1234,"timestamp":"2024-01-15T10:30:00Z"}`. Every field is a named key-value pair that log aggregation tools (Elasticsearch/Kibana, Datadog, Grafana Loki) can index and query.
+
+The implementation uses Pino (`src/shared/logger.ts`), which outputs JSON by default. Each HTTP request gets a child logger with request-scoped context (request ID, HTTP method, path, user ID). This means every log line emitted during that request's lifecycle carries the same correlation fields, making it possible to reconstruct the full request flow by filtering on request ID. Slow queries (>100ms) automatically trigger warning-level logs with the query text and duration, providing a built-in slow query detector without separate database monitoring.
+
+**Why it matters at scale**: When running multiple API server instances behind a load balancer, a single user request might be served by any instance. Without structured logging with request IDs, correlating log lines across instances requires manual timestamp matching, which is error-prone. With structured JSON logs, a query like `requestId="abc-123"` instantly returns every log line from that request regardless of which server emitted it.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements from your application at regular intervals (typically every 15 seconds). The application exposes a `/metrics` endpoint that Prometheus scrapes, returning metrics in a specific text format. There are four metric types:
+
+- **Counter**: A value that only goes up (e.g., total HTTP requests served). You calculate rates from counters: "requests per second" = change in counter / time interval.
+- **Histogram**: Records the distribution of values (e.g., request latency). A histogram automatically creates buckets (e.g., <10ms, <50ms, <100ms, <500ms) and counts how many observations fall into each. This lets you calculate percentiles like p95 and p99 without storing every individual value.
+- **Gauge**: A value that can go up or down (e.g., current number of database connections in the pool).
+- **Summary**: Similar to histogram but calculates percentiles on the client side (less common).
+
+The implementation (`src/shared/metrics.ts`) defines 15+ custom metrics. Route labels are normalized to prevent cardinality explosion: `/r/programming/hot` and `/r/funny/hot` both become `/r/:subreddit/:sort` in the metric label. Without this normalization, each unique subreddit name would create a new time series, eventually overwhelming Prometheus's memory.
+
+**Why it matters at scale**: Metrics answer operational questions that logs cannot efficiently answer. "What is the p99 latency of feed requests over the last hour?" requires aggregating millions of log entries but is a single PromQL query: `histogram_quantile(0.99, rate(reddit_http_request_duration_seconds_bucket{route="/r/:subreddit/:sort"}[1h]))`. Metrics are also the foundation for alerting: trigger a page when error rate exceeds 1% for 5 minutes.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the application is functioning correctly. They serve three distinct purposes, which is why there are three separate endpoints:
+
+- **`GET /health`** (detailed): Returns a JSON object with the status of every dependency (PostgreSQL connectivity + latency, Valkey connectivity + latency, memory usage). Operations teams use this for debugging: if the database is slow, this endpoint reveals it immediately.
+- **`GET /health/live`** (liveness): Returns 200 if the process is running. Kubernetes uses this to detect hung processes. If liveness fails, Kubernetes kills and restarts the container. This endpoint should never check external dependencies because a database outage should not cause all API servers to restart in a cascading failure.
+- **`GET /health/ready`** (readiness): Returns 200 if the application is ready to serve traffic. This checks that database connections are established and Redis is reachable. Kubernetes uses this to decide whether to route traffic to this instance. A newly started instance that has not yet connected to the database will fail readiness, so the load balancer skips it until it is ready.
+
+**Why three endpoints instead of one**: Conflating liveness and readiness causes cascading failures. If `/health` checks the database and the database is overloaded, all instances report unhealthy simultaneously. The orchestrator restarts all of them, which sends a surge of new connection requests to the already-overloaded database, making the situation worse.
+
+### Idempotency
+
+An idempotent operation produces the same result regardless of how many times it is executed. This is critical in distributed systems because network failures make it impossible to distinguish "the request failed before the server processed it" from "the request succeeded but the response was lost." In both cases, the client retries, and without idempotency, the second attempt creates a duplicate.
+
+In the Reddit implementation, vote idempotency uses `INSERT ... ON CONFLICT (user_id, post_id) DO UPDATE SET direction = $3`. If a user sends the same upvote twice (due to a network retry or double-click), the second insert hits the unique constraint conflict and simply updates the direction to the same value it already has. The operation is a no-op. The background vote aggregator reads the full state of the votes table, so even if duplicate inserts somehow occurred, the aggregated score would be computed from the deduplicated vote records.
+
+The broader principle: idempotency is achieved either through unique constraints (database rejects duplicates), upsert semantics (insert-or-update), or client-generated idempotency keys (stored server-side to detect retries). Reddit votes use the first approach because the `(user_id, post_id)` pair is a natural unique key.

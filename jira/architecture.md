@@ -546,6 +546,169 @@ Pino JSON logger with request context (method, path, status, duration, user_id).
 
 ---
 
+## Frontend Architecture
+
+This section describes the actual frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (TanStack Router)
+├── / (index.tsx)                           (login or redirect to projects)
+├── /projects                               (project list)
+├── /projects/$projectKey                   (project shell)
+│   └── Layout                              (Header + Sidebar + main content)
+│       ├── Header                          (search bar, create button, user menu)
+│       ├── Sidebar                         (project selector, nav links)
+│       └── Outlet (nested routes)
+│           ├── /board                      (Kanban board)
+│           │   └── KanbanBoard
+│           │       └── BoardColumn (per status)
+│           │           └── BoardCard (per issue)
+│           ├── /backlog                    (sprint + backlog views)
+│           │   └── Backlog
+│           │       ├── BacklogItem (sprint issues)
+│           │       └── BacklogItem (backlog issues)
+│           ├── /issues                     (issue list table)
+│           └── /settings                   (project configuration)
+├── IssueDetail (modal overlay)             (issue view/edit)
+│   ├── IssueDetailHeader                   (key, type icon, actions)
+│   ├── IssueSummaryEditor                  (inline title editing)
+│   ├── IssueDetailTabs                     (comments / history tab bar)
+│   │   ├── CommentsTab                     (threaded comments)
+│   │   └── HistoryTab                      (field change audit trail)
+│   └── IssueDetailSidebar                  (status, assignee, priority, sprint, story points)
+└── CreateIssueModal                        (issue creation form)
+```
+
+The `IssueDetail` component uses a decomposition pattern: the container component (`IssueDetail.tsx`) manages data fetching and state, while sub-components in the `issue-detail/` directory handle rendering. This keeps the main component under 150 lines while the full detail view spans 6 files.
+
+### Zustand Stores
+
+The frontend uses four Zustand stores that separate concerns by domain.
+
+**`useAuthStore` -- Authentication**
+
+Manages the user session lifecycle. On app initialization, `checkAuth()` calls the `/api/auth/me` endpoint to restore session state from the server-side cookie. Unlike the Google Docs project, this store does not persist a token to `localStorage` -- it relies entirely on HTTP-only session cookies, which are sent automatically with every request.
+
+**`useProjectStore` -- Project Context**
+
+Manages the project list and the currently active project's full context. When a user navigates to a project route, `fetchProjectDetails(projectId)` loads four resources in parallel using `Promise.all`: the project metadata, its workflow (statuses and transitions), sprints, and boards. This parallel loading pattern reduces the initial project load time from ~400ms (sequential) to ~150ms (parallel, bound by the slowest query).
+
+**`useIssueStore` -- Issues and Backlog**
+
+Manages three issue lists: `issues` (current sprint or filtered view), `backlog` (issues not in any sprint), and `currentIssue` (selected for the detail modal). The `updateIssueInList` method performs cross-list optimistic updates -- when an issue's status changes, it is updated in both the `issues` and `backlog` arrays, as well as `currentIssue` if it is the currently selected issue. `removeIssueFromList` handles deletion cleanup across all three.
+
+**`useUIStore` -- UI State**
+
+Manages global UI state: sidebar visibility, and three modal states (issue detail, create issue, search). This store keeps UI concerns out of domain stores, preventing unnecessary re-renders when only visual state changes.
+
+### Routing
+
+The application uses TanStack Router with file-based routing and nested route layouts:
+
+| Route | File | Purpose |
+|-------|------|---------|
+| `/` | `routes/index.tsx` | Login page or redirect to projects |
+| `/projects` | `routes/projects/index.tsx` | Project list |
+| `/projects/$projectKey` | `routes/projects/$projectKey.tsx` | Project shell with Layout |
+| `/projects/$projectKey/board` | `routes/projects/$projectKey/board.tsx` | Kanban board |
+| `/projects/$projectKey/backlog` | `routes/projects/$projectKey/backlog.tsx` | Sprint planning |
+| `/projects/$projectKey/issues` | `routes/projects/$projectKey/issues.tsx` | Issue list table |
+| `/projects/$projectKey/settings` | `routes/projects/$projectKey/settings.tsx` | Project configuration |
+
+The `$projectKey` route acts as a layout route: it renders the `Layout` component (Header + Sidebar) and uses `Outlet` for child routes. This ensures the sidebar and header persist across board/backlog/issues navigation without re-mounting.
+
+### Data Fetching
+
+All API calls go through `services/api.ts`, which provides typed functions for every endpoint. The module exports individual functions (not a class), each wrapping `fetch()` with credentials mode `include` (to send session cookies). Functions are organized by resource: `login/logout/register/getCurrentUser` for auth, `getProjects/getProject/getProjectWorkflow/getProjectSprints/getProjectBoards` for projects, `getProjectIssues/getBacklogIssues/getSprintIssues/createIssue/updateIssue/deleteIssue` for issues, `getIssueTransitions/executeTransition` for workflow operations, and `getIssueComments/addComment` for comments.
+
+### Key UI Patterns
+
+- **Kanban board with drag-and-drop**: The `KanbanBoard` component groups issues by workflow status into `BoardColumn` components. Issues are draggable using the HTML5 Drag and Drop API. On drop, the component finds the appropriate workflow transition to the target status, executes it via the API (`executeTransition`), and updates the issue in the store. The drop target column highlights with a blue ring (`ring-2 ring-blue-400`) during drag-over.
+
+- **Workflow-aware transitions**: Dropping an issue on a status column is not a simple field update -- it must go through the workflow engine. The frontend fetches available transitions for the issue, finds one matching the target status, and executes it. If no valid transition exists (e.g., "Done" to "To Do" is not configured), the drop is silently rejected.
+
+- **Backlog with sprint planning**: The `Backlog` component shows two sections: the active sprint's issues and the backlog (unassigned issues). Issues can be moved between sections via action buttons that appear on hover. Moving to sprint updates the issue's `sprint_id`.
+
+- **Issue detail modal**: Clicking an issue anywhere (board card, backlog item, issue list) opens a modal with the full issue detail. The modal has two tabs (Comments and History) and a sidebar showing status, assignee, priority, sprint, and story points. Status changes in the modal sidebar trigger workflow transitions. The `useIssueDetail` custom hook manages the detail view's data fetching and mutation logic.
+
+- **Keyboard shortcuts**: The root component registers global keyboard shortcuts: `Ctrl+K` for search (placeholder), and potential `C` key for create issue (when no input is focused).
+
+- **Status category colors**: Board columns use color coding based on the workflow status category: gray for `todo`, blue for `in_progress`, green for `done`. This provides visual consistency regardless of custom status names.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers encountering these patterns for the first time.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC assigns permissions to roles rather than individual users. Users are granted roles within a specific context (e.g., a project), and the role determines what actions they can perform. This creates a layered permission system: system-level roles (user, admin), project-level roles (project lead, developer, viewer), and scheme-based permission grants.
+
+**Why it matters**: In an issue tracker used by multiple teams, permission requirements vary wildly. The security team needs "only the assignee can close security bugs." The design team wants "anyone can create issues." Without RBAC, these rules are hard-coded per project, making changes require code deployments. With scheme-based RBAC, an administrator configures permission schemes in the UI and assigns them to projects.
+
+**How it works in this project**: The permission system has three layers. `project_roles` defines reusable roles (e.g., Administrator, Developer, Viewer). `permission_schemes` groups permission grants into reusable configurations. `permission_grants` maps specific permissions (e.g., `create_issue`, `edit_issue`, `transition`) to grantees by type (`anyone`, `user`, `role`, `group`). Each project references a permission scheme via `permission_scheme_id`. When a user attempts an action, the system loads the project's scheme, evaluates all grants, and checks if any match the user's roles, groups, or direct user ID. This scheme-based approach means changing permissions for 50 projects that share the same scheme requires updating one scheme, not 50 project configurations.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside is a caching pattern where the application checks the cache before querying the database. On a cache miss, the data is loaded from the database and stored in the cache for future requests. On a cache hit, the database query is skipped entirely.
+
+**Why it matters**: Issue trackers have a highly skewed read/write ratio. A board view showing 30 issues across 5 status columns requires fetching the project metadata, workflow definition, and all issues -- multiple queries that take 20-50ms total. With cache-aside, subsequent board loads complete in ~2ms. Workflow definitions and permission schemes are read thousands of times per change, making them ideal caching candidates.
+
+**How it works in this project**: The project service (`backend/src/services/projectService.ts`) implements cache-aside for projects, workflows, and permission schemes. Cache keys use descriptive patterns: `project:{id}` (15-min TTL), `workflow:{id}` (30-min TTL), `perm-scheme:{id}` (30-min TTL), `issue:{id}` (5-min TTL), `board:{id}:issues` (1-min TTL). Workflows and permission schemes have longer TTLs because they change rarely. Board issue caches have short TTLs because issues change frequently. On issue update, both `issue:{id}` and `issue:key:{key}` caches are explicitly deleted, and a search reindexing event is published.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker wraps calls to external dependencies and monitors their success/failure rate. When failures cross a threshold, the circuit "opens" and calls fail immediately (without contacting the dependency) for a cooldown period. This prevents a slow or failing dependency from cascading failures throughout the system.
+
+**Why it matters**: Jira depends on PostgreSQL, Redis, Elasticsearch, and RabbitMQ. If Elasticsearch becomes slow (e.g., due to a garbage collection pause), every search request blocks for 30 seconds waiting for a timeout. Without a circuit breaker, the server's event loop fills with blocked requests, and even non-search endpoints (creating issues, viewing boards) become unresponsive. With a circuit breaker, after a few Elasticsearch failures, search requests immediately return a "search unavailable" error while issue CRUD continues working normally.
+
+**How it works in this project**: The graceful degradation strategy is dependency-aware. Elasticsearch is treated as optional: if it is down, the server starts and serves all issue CRUD operations; search is degraded but the rest of the application works. RabbitMQ initialization retries in the background, so issue operations work without it (notifications and search indexing are delayed). PostgreSQL is critical: if it fails, the server enters a read-only mode serving cached data. Each dependency failure results in specific, predictable degradation rather than total system failure.
+
+### Structured Logging
+
+**What it is**: Structured logging outputs log entries as machine-parseable JSON rather than human-readable text. Each log entry is a JSON object with consistent fields: level, message, timestamp, and contextual metadata (user ID, request path, duration, issue key).
+
+**Why it matters**: When investigating a bug report -- "issue PROJ-123 was moved to Done but the assignee was not notified" -- you need to find the specific transition event, check if the post-function fired, and see if the notification was published to RabbitMQ. With structured logs, this is a simple query: `jq 'select(.issueKey == "PROJ-123" and .action == "transition")'`. Without structured logs, you search through thousands of text lines with regex patterns that break whenever someone changes a log message format.
+
+**How it works in this project**: Pino is used (`backend/src/config/logger.ts`) with environment-aware output: pretty-printed with colors in development for readability, raw JSON in production for log aggregation. Each HTTP request gets a child logger with `method`, `path`, `status`, `duration`, and `user_id`. Workflow transitions log the issue key, from/to status, and executing user. Queue operations log the queue name, message ID, and processing status. This context makes it possible to reconstruct the full lifecycle of any operation.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus metrics are numeric measurements exposed at an HTTP endpoint (`/metrics`) that a Prometheus server periodically scrapes. Applications define counters (totals), histograms (latency distributions), and gauges (current values) with labels for dimensional analysis.
+
+**Why it matters**: Issue trackers need to answer questions like: "How many issues were created per project this week?" "What is the p95 latency for JQL searches?" "How deep is the search indexing queue?" Metrics provide these answers in real-time through dashboards and can trigger alerts when thresholds are breached.
+
+**How it works in this project**: The metrics module (`backend/src/config/metrics.ts`) exposes domain-specific metrics alongside standard HTTP metrics. `jira_issues_created_total{project_key, issue_type}` tracks issue creation rates by project and type. `jira_transitions_total{project_key, from_status, to_status}` reveals workflow patterns (e.g., which statuses are most commonly transitioned to). `jira_search_queries_total{query_type}` and `jira_search_latency_seconds{query_type}` track search performance by type (JQL, text, quick). `jira_cache_hits_total` and `jira_cache_misses_total` with `{cache_type}` labels measure cache effectiveness. `jira_idempotent_replays_total` tracks how often duplicate requests are caught.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects backend services from overload and ensures fair resource sharing.
+
+**Why it matters**: A JQL search query can be expensive -- it is parsed, translated to an Elasticsearch query, executed, and results are fetched. A user repeatedly pressing "Search" or a misbehaving integration hitting the search endpoint 100 times per second could saturate Elasticsearch and degrade search for all users. Rate limiting caps search requests at a sustainable rate while allowing normal usage.
+
+**How it works in this project**: While the full rate limiting middleware is listed as omitted from the local build, the architecture design specifies rate limits per endpoint category. Authentication endpoints have strict limits to prevent credential stuffing. Search endpoints are limited to prevent Elasticsearch overload. Issue mutation endpoints are limited per user to prevent bulk operations from overwhelming the database. The implementation would use a sliding window counter in Redis, keyed by user ID or IP address.
+
+### Idempotency
+
+**What it is**: An operation is idempotent if executing it multiple times produces the same result as executing it once. In an API, this means that retrying a request that may or may not have been processed will not cause duplicate side effects.
+
+**Why it matters**: Creating an issue is not naturally idempotent. If a user clicks "Create" and the network drops before the response arrives, the client retries. Without idempotency protection, the system creates two identical issues -- both with the key "PROJ-124," both assigned to the same sprint. The user now has to find and delete the duplicate, and the issue counter is off.
+
+**How it works in this project**: All mutating API endpoints accept an `X-Idempotency-Key` header. The idempotency middleware (`backend/src/middleware/idempotency.ts`) checks Redis for a cached response under the key `idempotency:{userId}:{key}`. If found, it returns the cached response (status code + body) without executing the handler. If not found, it processes the request, caches the response with a 24-hour TTL, and returns it. The `idempotency_keys` table in PostgreSQL serves as a backup store, with a background job purging expired entries hourly (keyed by `expires_at`). This dual-layer approach ensures idempotency survives Redis restarts.
+
+### Health Checks
+
+**What it is**: Health checks are lightweight HTTP endpoints that report the operational status of an application instance and its dependencies. Load balancers and orchestrators use them to make routing and restart decisions.
+
+**Why it matters**: In a system with four dependencies (PostgreSQL, Redis, Elasticsearch, RabbitMQ), any one can fail independently. Health checks enable the infrastructure to detect which dependency is down and whether the instance can still serve useful traffic. An instance with a failed Elasticsearch connection can still serve issue CRUD and board views -- it should remain in the load balancer pool. An instance with a failed PostgreSQL connection is useless and should be removed.
+
+**How it works in this project**: Two endpoints exist. `GET /health` performs checks against PostgreSQL (`SELECT 1`), Redis (`PING`), and Elasticsearch (cluster health). Each check reports individual status and latency. The response returns `200` if all are healthy, `503` if any are degraded, with a JSON body listing per-dependency results. `GET /ready` is a simpler readiness probe that checks only PostgreSQL and Redis -- the minimum required for the application to process requests. Kubernetes uses `/ready` for initial pod readiness gates and `/health` for ongoing liveness probes.
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local setup and maps production concepts to the Docker + Node.js + React implementation.

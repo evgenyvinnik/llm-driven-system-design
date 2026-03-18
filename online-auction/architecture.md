@@ -610,3 +610,149 @@ This section maps the production architecture above to the local Docker + Node.j
 - Elasticsearch for search
 - OAuth/JWT authentication
 - Fraud detection / ML-based bid pattern analysis
+
+## Frontend Architecture
+
+This section describes the React frontend implementation: component hierarchy, state management, routing, data fetching patterns, and key UI behaviors.
+
+### Technology Stack
+
+| Technology | Purpose |
+|-----------|---------|
+| React 19 + TypeScript | UI framework with type safety |
+| TanStack Router | File-based routing with type-safe params |
+| Zustand | Lightweight global state management |
+| Tailwind CSS | Utility-first CSS styling |
+| Vite | Development server and build tool |
+
+### Route Structure
+
+TanStack Router file-based routing in `frontend/src/routes/`:
+
+| File | Path | Description |
+|------|------|-------------|
+| `__root.tsx` | (layout) | Root layout with sticky Header, main content Outlet, and footer |
+| `index.tsx` | `/` | Home page with auction browsing, search, filters, and pagination |
+| `login.tsx` | `/login` | Login form |
+| `register.tsx` | `/register` | Registration form |
+| `auction.$auctionId.tsx` | `/auction/:auctionId` | Auction detail with real-time bid updates via WebSocket |
+| `create.tsx` | `/create` | Create new auction form with image upload (FormData) |
+| `my-auctions.tsx` | `/my-auctions` | User's auctions as seller, bid history, selling history |
+| `watchlist.tsx` | `/watchlist` | User's watched auctions list |
+| `notifications.tsx` | `/notifications` | Notification center with read/unread management |
+| `admin.tsx` | `/admin` | Admin dashboard with platform stats, user management, force-close |
+
+### Zustand Stores
+
+The frontend uses two Zustand stores to manage global state:
+
+**`authStore.ts`** -- Authentication state with localStorage persistence. Stores the current user and session token. The `persist` middleware saves only the token to localStorage via `partialize`, so session survives browser refresh. On app load, `checkAuth()` validates the stored token against `GET /api/auth/me`. If valid, the user object is populated; if not, the token is cleared and the user is treated as unauthenticated. Actions: `login`, `register`, `logout`, `checkAuth`.
+
+**`websocketStore.ts`** -- WebSocket connection state for real-time auction updates. Manages a single WebSocket connection to the server, a set of subscribed auction IDs, and a listener registry. When connected, the store sends `{ type: 'subscribe', auction_id }` messages for each auction the user is viewing. On disconnect, it automatically reconnects after 3 seconds and re-subscribes to all previously tracked auctions. External components register message callbacks via `addMessageListener()`, which returns a cleanup function. The listener pattern (a `Set<callback>` stored outside the Zustand state to avoid serialization issues) allows multiple components to independently react to the same WebSocket messages without coupling.
+
+### Component Hierarchy
+
+```
+__root (Header + Outlet + Footer)
+├── HomePage
+│   ├── Search bar + Status filter + Sort dropdown
+│   ├── AuctionCard[] (grid layout, responsive 1-4 columns)
+│   │   └── CountdownTimer (uses useCountdown hook)
+│   └── Pagination controls
+├── AuctionPage (detail)
+│   ├── Image display (or placeholder SVG)
+│   ├── Auction metadata (seller, starting price, increment, reserve)
+│   ├── CountdownTimer (large, with snipe protection notice)
+│   ├── BidForm (manual bid + auto-bid toggle)
+│   │   ├── Manual bid input with minimum enforcement
+│   │   └── Auto-bid configuration panel
+│   ├── BidHistory (chronological bid list, highlights current user)
+│   └── Watch/Unwatch toggle
+├── CreateAuction (FormData submission with image upload)
+├── MyAuctions (tabs for selling/bidding history)
+├── Watchlist (list of watched auctions)
+├── Notifications (with mark-read, mark-all-read)
+└── Admin (stats dashboard, user list, role management, force-close)
+```
+
+### Data Fetching Pattern
+
+The frontend uses plain `fetch()` calls wrapped in an `api` service object (`services/api.ts`). All requests include `credentials: 'include'` for session cookie handling. A shared `handleResponse<T>()` helper parses JSON responses and throws errors with the server's error message. There is no React Query or SWR -- data fetching is done via `useEffect` with local `useState` for loading, error, and data states. When filters change (status, sort, search, page), the `useEffect` dependency array triggers a refetch.
+
+### Key UI Patterns
+
+**Real-time bid updates via WebSocket**: The `useAuctionSubscription` hook manages the full WebSocket lifecycle for a specific auction. It subscribes on mount, unsubscribes on unmount, and filters incoming messages by `auction_id`. When a `new_bid` message arrives, the auction detail page optimistically updates the displayed price from the WebSocket payload, then does a full refetch to get the updated bid history. When an `auction_ended` message arrives, the page refetches to show final state.
+
+**Countdown timer**: The `useCountdown` hook recalculates time remaining every second via `setInterval`. It returns individual time components (days, hours, minutes, seconds) and a `totalSeconds` value used for urgency detection. When `totalSeconds < 300` (5 minutes), the `CountdownTimer` component switches to red pulsing text with an "Ending Soon!" label. When the countdown reaches zero, it shows "Auction Ended" in gray.
+
+**Minimum bid enforcement**: The `BidForm` component calculates `minBid = current_price + bid_increment` and enforces it client-side before submission. The auto-bid toggle reveals a separate form for setting a maximum proxy bid amount. When an active auto-bid exists, it displays the max amount with a cancel button instead of the setup form.
+
+**Conditional rendering by auth state and ownership**: The auction detail page checks `isAuthenticated` to show/hide the bid form (showing "Sign in to place a bid" for guests), checks `isOwner` to display "This is your auction" instead of the bid form, and checks `isWinner` to show a "You Won!" badge.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before. Each explanation covers what the pattern is, what problem it solves, and how it works in this project.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of checking "can user X do action Y?" for every user individually, the system checks "does user X have a role that permits action Y?" This decouples permission logic from individual user identities.
+
+**What problem it solves**: Without RBAC, authorization logic scatters throughout the codebase as ad-hoc checks ("if user.id === auction.seller_id"). When new features or admin capabilities are added, every endpoint must be audited. RBAC centralizes permission decisions: a middleware checks the user's role against the route's required role before the handler executes. If the role does not match, the request is rejected with 403 Forbidden before any business logic runs.
+
+**How it works in this project**: The `users` table has a `role` column constrained to `('user', 'admin')`. When a request arrives, the auth middleware loads the session from Redis, retrieves the user record, and attaches it to the request object. Admin endpoints (`/api/v1/admin/*`) check `req.user.role === 'admin'` via a role-checking middleware. Sellers can only edit/cancel their own auctions (ownership check + role check). Guests (no session) can only view auctions and search. This four-tier model (guest, user, seller, admin) maps directly to the RBAC boundaries table in the Security section.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns it. On a cache hit, the cached value is returned directly, skipping the database entirely. The cache is "aside" from the main data flow -- it is not in the write path, and the database is the source of truth.
+
+**What problem it solves**: Database queries are expensive (network round-trip, query parsing, disk I/O). For read-heavy workloads like auction browsing (where the same auction page may be viewed thousands of times per minute during a hot auction), querying the database for every request wastes resources and increases latency. Cache-aside reduces database load by serving repeated reads from memory (Redis responds in <1ms vs 5-50ms for PostgreSQL).
+
+**How it works in this project**: Auction data is cached in Redis with keys like `auction:{id}` (60-second TTL) and `auction:{id}:bids` (30-second TTL). When a user views an auction, the server checks Redis first. If the key exists, the cached JSON is returned immediately. If not, the server queries PostgreSQL, stores the result in Redis with `SETEX`, and returns it. When a new bid is placed, the bid worker invalidates the cache by deleting the relevant keys, so the next read fetches fresh data from the database. This is "write-through invalidation" -- writes go to the database first, then the cache is cleared (not updated) to avoid stale data.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker is a stability pattern borrowed from electrical engineering. It wraps calls to an external service (payment gateway, third-party API) and monitors failure rates. When failures exceed a threshold, the circuit "opens" and immediately rejects subsequent calls without attempting them, giving the failing service time to recover. After a timeout, the circuit enters a "half-open" state where it allows a limited number of test requests. If those succeed, the circuit closes and normal operation resumes. If they fail, the circuit reopens.
+
+**What problem it solves**: When a downstream service is failing (overloaded, crashed, network issue), continuing to send requests creates a cascade: your application's threads/connections pool exhausts while waiting for timeouts, your response times spike, and your users see errors. The circuit breaker prevents this cascade by failing fast -- returning an error immediately (or executing a fallback) instead of waiting for a timeout that will inevitably fail. This preserves your application's resources for requests that can actually succeed.
+
+**How it works in this project**: The Opossum library wraps payment/escrow service calls in `backend/src/shared/circuitBreaker.ts`. Configuration: 5-second timeout per request, circuit opens when 50% of requests fail, stays open for 30-60 seconds before testing. When the circuit is open, the fallback handler queues the payment operation for later retry instead of blocking the bid process. The circuit breaker state is exposed as a Prometheus gauge metric (`circuit_breaker_state`) so operators can see when a downstream service is degraded. The auction end worker uses this to handle payment processing gracefully -- if payment fails, the auction is still marked as SOLD and the payment is retried later.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable data (typically JSON) rather than free-form text strings. Each log entry has well-defined fields: timestamp, log level (info/warn/error), message, and arbitrary contextual key-value pairs (user ID, auction ID, bid amount, latency). This contrasts with traditional `console.log("User 123 placed bid $50 on auction 456")` which is human-readable but impossible to reliably parse, filter, or aggregate programmatically.
+
+**What problem it solves**: In a distributed system with multiple server instances, debugging a single user's request requires finding the relevant log entries among millions. Free-form text logs require regex-based searching and break whenever the message format changes. Structured logs enable precise queries: "show me all log entries where `auction_id = X` and `level = error` in the last hour." Log aggregation tools (Elasticsearch, Datadog, CloudWatch) can index JSON fields for sub-second search across terabytes of logs.
+
+**How it works in this project**: The Pino library (`backend/src/shared/logger.ts`) outputs JSON logs with fields including `level`, `time`, `msg`, and contextual data. Each log line looks like `{"level":30,"time":1234567890,"msg":"bid_placed","auction_id":"abc","amount":50.00,"bidder_id":"xyz"}`. A correlation ID (from the `X-Request-Id` header) is attached to every log entry within a request, allowing all log entries for a single user action to be traced across multiple function calls. In development mode, `pino-pretty` reformats the JSON into colored, human-readable output. Key logged events: `bid_placed`, `bid_duplicate`, `auction_ended`, `circuit_breaker_open`.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system. The application exposes a `/metrics` HTTP endpoint that returns numerical measurements in a specific text format. A Prometheus server periodically scrapes this endpoint (typically every 15 seconds) and stores the values in a time-series database. Grafana or similar tools query this database to create dashboards and trigger alerts. The three main metric types are: counters (monotonically increasing values like "total requests"), histograms (distribution of values like "request duration in buckets"), and gauges (point-in-time values like "active WebSocket connections").
+
+**What problem it solves**: Without metrics, the only way to know if the system is healthy is to wait for users to complain or for a total failure. Metrics provide continuous, quantitative visibility: "bid placement latency p95 increased from 100ms to 400ms over the last 10 minutes" is actionable before users notice degradation. Metrics also enable capacity planning ("we serve 5,000 bids/second; our database handles 8,000; we have 60% headroom") and incident investigation ("the spike in 500 errors correlates with the cache hit rate dropping from 95% to 20%").
+
+**How it works in this project**: The `prom-client` library (`backend/src/shared/metrics.ts`) registers 15+ custom metrics. Examples: `bids_placed_total` (counter with labels for auction_id, is_auto_bid, status), `bid_placement_duration_seconds` (histogram measuring how long bid processing takes), `websocket_connections_active` (gauge tracking concurrent connections), `cache_hits_total` / `cache_misses_total` (counters for monitoring cache effectiveness). A metrics middleware records `http_request_duration_seconds` for every API request, with labels for method, path, and status code. Path labels are normalized (UUIDs replaced with `:id`) to prevent unbounded label cardinality, which would cause Prometheus to consume excessive memory.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make within a time window. The system tracks request counts per client (identified by user ID, IP address, or API key) and rejects requests that exceed the configured threshold with HTTP 429 (Too Many Requests). The response includes a `Retry-After` header indicating when the client can try again.
+
+**What problem it solves**: Without rate limiting, a single malicious or buggy client can monopolize server resources, making the system unresponsive for everyone. In an auction system specifically, rate limiting prevents bid bombing (a script placing hundreds of bids per second to disrupt competitors), credential stuffing attacks on the login endpoint, and scraping of auction data. It also protects downstream services (database, Redis) from being overwhelmed by a traffic spike from a single source.
+
+**How it works in this project**: Redis-based sliding window counters track requests per user per action type. The key pattern is `user:{userId}:rate_limit` with a 60-second TTL. When a user places a bid, the server increments the counter and checks if it exceeds 10. If so, the bid is rejected with 429. Different actions have different limits: 10 bids per minute, 5 auction creations per hour, 30 searches per minute. The sliding window approach (using Redis `INCR` + `EXPIRE`) is preferred over fixed windows because it prevents the "boundary burst" problem where a client sends 10 requests at 0:59 and 10 more at 1:00, effectively getting 20 requests in 2 seconds.
+
+### Idempotency
+
+**What it is**: An idempotent operation produces the same result whether it is executed once or multiple times. In the context of APIs, idempotency means that if a client sends the same request twice (due to a network retry, user double-click, or mobile app timeout), the server processes it only once and returns the same response both times. The client attaches a unique key (typically a UUID) to each logical operation via a header like `X-Idempotency-Key`.
+
+**What problem it solves**: Network failures are inevitable. When a client sends a bid request and the network drops before the response arrives, the client does not know if the bid was placed or not. Without idempotency, retrying the request could place a second bid at a higher amount (because the first bid raised the price). In financial systems, this can cause monetary loss. Idempotency guarantees that retrying a request is always safe -- the worst case is a slightly delayed response, never a duplicate side effect.
+
+**How it works in this project**: When a bid arrives with an `X-Idempotency-Key` header, the server first checks Redis for the key. If found with a cached result, it returns that result immediately (200 OK, not 409 Conflict, because the client's intent was achieved). If not found, the server sets the key to "in-progress" in Redis (preventing concurrent duplicates from parallel retries), processes the bid, stores the result with a 24-hour TTL, and returns it. A unique partial index on `bids(idempotency_key)` in PostgreSQL provides a database-level safety net in case Redis is unavailable. Keys expire after 24 hours because a retry after that long is almost certainly a new user intent, not a network retry.
+
+### Health Checks
+
+**What it is**: Health check endpoints are HTTP routes that report whether the application is functioning correctly. They are consumed by infrastructure components (load balancers, Kubernetes, monitoring systems) to make automated decisions about traffic routing and container lifecycle. There are typically three types: liveness (is the process running and not deadlocked?), readiness (can the application serve traffic, i.e., are all dependencies connected?), and detailed (a debugging-oriented view of all component statuses with latency measurements).
+
+**What problem it solves**: In a multi-instance deployment behind a load balancer, an instance might be running but unable to serve requests (database connection lost, Redis unreachable, thread pool exhausted). Without health checks, the load balancer continues sending traffic to the broken instance, causing errors for users. Health checks enable automatic traffic rerouting: if `/health/ready` returns non-200, the load balancer stops sending new requests to that instance. Kubernetes uses liveness checks to restart stuck containers and readiness checks to remove pods from service endpoints.
+
+**How it works in this project**: The backend exposes four endpoints: `GET /api/health` (basic liveness -- returns 200 with uptime and memory usage), `GET /api/health/detailed` (checks PostgreSQL connectivity via `SELECT 1`, checks Redis connectivity via `PING`, reports connection pool stats and per-component latency), `GET /api/ready` (returns 200 only if both PostgreSQL and Redis are connected, otherwise 503), and `GET /api/live` (always returns 200 if the process is running). The detailed endpoint measures the time each dependency check takes, so operators can see if database queries are slow even before they start failing.

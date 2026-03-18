@@ -532,6 +532,186 @@ Exponential backoff with jitter for all retryable operations. Queue consumers us
 
 ---
 
+## Frontend Architecture
+
+This section describes the actual frontend implementation: component hierarchy, state management, routing, data fetching, real-time collaboration integration, block editing, and key UI patterns.
+
+### Component Hierarchy
+
+```
+__root.tsx (TanStack Router)
+├── /login                                    (login form)
+├── /register                                 (registration form)
+├── / (index.tsx)                             (workspace home / page list)
+│   └── Sidebar                               (workspace switcher, page tree, user menu)
+│       └── PageTreeItem (recursive)           (expandable nested pages)
+└── /page/$pageId                             (page editor)
+    ├── Sidebar                                (always visible)
+    └── BlockEditor                            (block content editor)
+        ├── BlockComponent (orchestrator)       (delegates to type-specific renderer)
+        │   ├── TextBlock                       (paragraph text)
+        │   ├── HeadingBlock                    (h1, h2, h3)
+        │   ├── ListBlock                       (bulleted, numbered)
+        │   ├── ToggleBlock                     (collapsible content)
+        │   ├── CodeBlock                       (code with syntax)
+        │   ├── QuoteBlock                      (blockquote)
+        │   ├── CalloutBlock                    (callout with icon)
+        │   └── DividerBlock                    (horizontal rule)
+        └── BlockTypeMenu                       (slash command popup)
+    DatabaseView                               (for database pages)
+        ├── TableView                           (spreadsheet layout)
+        ├── BoardView                           (Kanban columns)
+        ├── ListView                            (compact list)
+        └── PropertyCell                        (per-cell renderer)
+```
+
+The application uses a delegation pattern for block rendering: `BlockComponent` is the orchestrator that receives a block and dispatches rendering to the appropriate type-specific component (`TextBlock`, `HeadingBlock`, etc.). Each type-specific component handles its own editing UX, content rendering, and keyboard behavior. Child blocks are rendered recursively -- `ToggleBlock` renders its children as nested `BlockComponent` instances.
+
+### Zustand Stores
+
+The frontend uses four Zustand stores, each managing a distinct domain of application state.
+
+**`stores/index.ts` -- Auth, Workspace, and Page Stores**
+
+Three stores are defined in a single file to minimize import overhead:
+
+- **`useAuthStore`**: Manages user session with `user`, `token`, `isAuthenticated`, and `isLoading`. On login/register, it stores the token in `localStorage` and calls `wsService.connect(token)` to establish the WebSocket connection. On logout, it removes the token and calls `wsService.disconnect()`.
+
+- **`useWorkspaceStore`**: Manages the list of workspaces and the currently selected workspace. Auto-selects the first workspace if none is selected. Actions: `fetchWorkspaces`, `setCurrentWorkspace`, `createWorkspace`.
+
+- **`usePageStore`**: Manages the hierarchical page tree, the currently selected page, and which pages are expanded in the sidebar. Uses a `Set<string>` for `expandedPages` to track expand/collapse state. When a child page is created, its parent is automatically expanded. Actions: `fetchPages`, `createPage`, `updatePage`, `deletePage`, `toggleExpanded`.
+
+**`stores/editor.ts` -- Editor State with Optimistic Updates**
+
+The editor store is the most complex store, managing blocks, selection, focus, presence, and real-time operations. Key design decisions:
+
+- **Optimistic updates with rollback**: Every mutating operation (add, update, delete, move) immediately updates the local state, then sends the API request. If the request fails, the store rolls back to the previous state. For `addBlock`, a temporary block with a generated UUID is inserted locally; on API success, the temp block is replaced with the server response.
+
+- **Remote operation application**: The `applyRemoteOperation` method handles incoming operations from other users. It processes four operation types (insert, update, delete, move) and applies them to the local block array. Inserted blocks are sorted by `position` (fractional index) to maintain correct ordering.
+
+- **Presence tracking**: The store maintains a `presence` array of active users with their cursor positions. `addPresence`, `removePresence`, and `updatePresencePosition` methods are called from the WebSocket message handler.
+
+- **Focus management**: `setFocusedBlock` tracks which block has keyboard focus and sends a presence update via WebSocket so other users can see where you are editing.
+
+### Routing
+
+The application uses TanStack Router with file-based routing:
+
+| Route | File | Auth | Purpose |
+|-------|------|------|---------|
+| `/` | `routes/index.tsx` | Protected | Workspace home, page list |
+| `/login` | `routes/login.tsx` | Public only | Login form |
+| `/register` | `routes/register.tsx` | Public only | Registration form |
+| `/page/$pageId` | `routes/page.$pageId.tsx` | Protected | Page editor with blocks |
+
+The root route (`__root.tsx`) calls `checkAuth()` on mount and shows a loading state until auth is verified. All routes render inside the `Outlet` provided by the root component.
+
+### Data Fetching
+
+API calls are centralized in `services/api.ts`, which provides typed functions organized by domain: `authApi` (login, register, logout, me), `workspacesApi` (list, create), `pagesApi` (list, get, create, update, delete), and `blocksApi` (create, update, delete, move). Each function uses `fetch()` with the auth token from `localStorage` and returns typed response objects. The Zustand stores orchestrate data fetching in their async actions.
+
+### Real-Time Collaboration (CRDT) and WebSocket Integration
+
+The WebSocket service (`services/websocket.ts`) is a singleton class managing real-time collaboration:
+
+1. **Connection**: On login, the auth store calls `wsService.connect(token)`, which opens a WebSocket to `ws://host/ws?token=<token>`. The server responds with a `connected` message containing the assigned `clientId`.
+
+2. **Page subscription**: When navigating to `/page/$pageId`, the page component calls `wsService.subscribePage(pageId)`. The server responds with the current presence list. On navigation away, `wsService.unsubscribePage()` removes the user from the page.
+
+3. **Operation broadcasting**: When a block is created, updated, deleted, or moved, the editor store sends the operation via `wsService.sendOperation(op)`. Operations include the block data, operation type, and are timestamped by the server using a Hybrid Logical Clock (HLC) for causal ordering.
+
+4. **Remote operation handling**: The page component registers a message handler that listens for `operation` messages. When received, it calls `useEditorStore.applyRemoteOperation(op)`, which applies the change to the local block array based on operation type (insert, update, delete, move).
+
+5. **Presence**: `wsService.updatePresence({ block_id, offset })` sends the user's current cursor position. Incoming presence messages update the store's presence array, enabling display of which blocks other users are editing.
+
+6. **Reconnection**: On disconnect, the service uses exponential backoff (base 1s, capped at 30s, up to 5 attempts). Pending messages are queued and sent when the connection reopens.
+
+7. **Sync-on-reconnect**: `wsService.requestSync(since)` requests all operations since a given timestamp, allowing the client to catch up after a disconnection.
+
+### Key UI Patterns
+
+- **Slash commands**: Typing `/` in an empty text block triggers the `BlockTypeMenu`, a dropdown listing all available block types. Selecting an option converts the current block to the chosen type. The menu supports 10 commands: `/h1`, `/h2`, `/h3`, `/bullet`, `/number`, `/toggle`, `/code`, `/quote`, `/callout`, `/divider`.
+
+- **Keyboard navigation**: Arrow keys move focus between blocks. Enter creates a new text block below the current one. Backspace on an empty non-text block converts it back to text; on an empty text block, it deletes the block and focuses the previous one.
+
+- **Recursive sidebar tree**: The `Sidebar` component renders the page hierarchy as an expandable tree. Each page item shows an icon, title, and expand/collapse chevron. Right-click context menus offer create child page, create database, and delete options.
+
+- **Database views**: Pages marked as databases (`is_database = TRUE`) render using `DatabaseView`, which provides a tab bar to switch between Table, Board (Kanban), and List views. All views share the same underlying data but apply different layouts, filters, and sort configurations. `PropertyCell` renders type-appropriate editors (text input, date picker, select dropdown, checkbox) for each property.
+
+- **Notion-style block hover**: Blocks show a drag handle and plus button on hover, providing affordances for reordering and inserting new blocks.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers encountering these patterns for the first time.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache first for requested data. On a cache miss, the application reads from the database, stores the result in the cache with a time-to-live (TTL), and returns it. On a cache hit, the database is skipped entirely.
+
+**Why it matters**: Block-based pages are read far more often than written. A popular team wiki page might have 100 views per edit. Without caching, every page load queries PostgreSQL for the page, its blocks, and workspace metadata -- three queries at ~5-20ms each. With cache-aside, most reads complete in ~1ms from Redis. At 500K concurrent users, this is the difference between needing 50 PostgreSQL read replicas and needing 5.
+
+**How it works in this project**: The cache layer (`backend/src/shared/cache.ts`) wraps Redis `GET`/`SET` with configurable TTL per data type. Page metadata has a 5-minute TTL, block content has a 10-minute TTL, workspace members have a 15-minute TTL, and presence data uses write-through with a 30-second TTL. Cache invalidation is event-driven: when a block is updated via the API, the page cache key is deleted. When a page title changes, the parent page's child list cache is also invalidated. This approach accepts brief staleness (a user might see a 5-minute-old page title in the sidebar) in exchange for dramatically reduced database load.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Instead of `"User alice updated block abc123 in page xyz"`, a structured log entry is `{"level":"info","userId":"alice","action":"block_update","blockId":"abc123","pageId":"xyz","duration_ms":12}`.
+
+**Why it matters**: When debugging a CRDT conflict across multiple clients and servers, you need to correlate events: "What operations did server 1 receive from client A in the last 30 seconds?" Free-form text logs require fragile regex parsing. Structured logs can be queried precisely: `jq 'select(.userId == "alice" and .action == "operation" and .timestamp > 1705320000)'`. Log aggregation systems (Elasticsearch, Datadog) can build dashboards and alerts from structured fields.
+
+**How it works in this project**: The project uses Pino (`backend/src/shared/logger.ts`), which outputs JSON in production and pretty-printed text in development. Each log entry includes base context (service name, environment, PID). Request handlers create child loggers that add `requestId`, `method`, `path`, and `userId` to every log within that request scope. Log levels follow severity: `info` for completed requests and applied operations, `warn` for CRDT conflicts and queue backpressure, `error` for database failures.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a pull-based monitoring system where applications expose numeric measurements at an HTTP endpoint (`/metrics`). A Prometheus server periodically scrapes this endpoint and stores the time-series data. Metrics come in three types: **Counter** (only goes up -- total requests served), **Histogram** (distribution of values in buckets -- request latencies), and **Gauge** (goes up and down -- active WebSocket connections).
+
+**Why it matters**: Metrics answer operational questions that logs cannot efficiently answer. "What percentage of API requests took longer than 200ms in the last hour?" requires scanning millions of log lines but is a single PromQL query: `histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[1h]))`. Metrics enable SLI/SLO tracking, capacity planning, and automated alerting.
+
+**How it works in this project**: The `/metrics` endpoint (`backend/src/shared/metrics.ts`) exposes: `http_request_duration_seconds` (histogram, with method/route/status labels), `websocket_connections_total` (gauge per server), `crdt_operations_total` (counter by type and status), `rabbitmq_queue_depth` (gauge per queue name), `cache_hits_total` and `cache_misses_total` (counters by cache type). These metrics are scraped by Prometheus and visualized in Grafana. Alerts fire when SLIs breach thresholds -- for example, if API p95 latency exceeds 500ms for 5 minutes, or if the dead letter queue accumulates more than 100 messages over 30 minutes.
+
+### Health Checks
+
+**What it is**: Health check endpoints report whether an application instance and its dependencies are functioning correctly. Load balancers, container orchestrators (Kubernetes), and monitoring systems poll these endpoints to determine if an instance should receive traffic.
+
+**Why it matters**: Without health checks, a load balancer continues sending traffic to a server whose PostgreSQL connection pool is exhausted or whose Redis connection has dropped. Users see errors. With health checks, the load balancer detects the problem within seconds and stops routing traffic to the unhealthy instance.
+
+**How it works in this project**: Two health endpoints exist. `GET /health` performs full dependency checks: `SELECT 1` against PostgreSQL, `PING` against Redis, and connectivity check against RabbitMQ. Each check has a timeout and reports individual status and latency. The overall response is `200` if all dependencies are healthy, `503` if any are degraded. `GET /ready` is a simpler readiness probe that checks only PostgreSQL and Redis -- the minimum required for the application to serve requests. Kubernetes uses `/ready` to decide when a new pod can start receiving traffic after startup, and `/health` for ongoing liveness monitoring.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make within a specified time window. It protects against abuse (accidental or intentional), ensures fair resource sharing among users, and prevents a single misbehaving client from degrading service quality for everyone else.
+
+**Why it matters**: A single user with a malfunctioning browser extension could send thousands of API requests per second, overwhelming the server. In a collaborative workspace, rate limiting also prevents a compromised account from rapidly exfiltrating data by iterating through all pages and blocks.
+
+**How it works in this project**: Although the full rate limiting middleware is not yet implemented in the local build, the architecture design specifies limits at key endpoints. Login attempts are limited to prevent credential stuffing (brute-force password attacks). API requests are limited per authenticated user using a sliding window counter in Redis. WebSocket operations are throttled per page to prevent flooding -- the server drops operations that exceed the threshold and sends an error message to the client.
+
+### Idempotency
+
+**What it is**: An operation is idempotent if performing it multiple times produces the same result as performing it once. In a distributed system, idempotency guarantees that retrying a failed request does not create duplicate side effects.
+
+**Why it matters**: CRDT operations in Notion are designed to be idempotent by nature -- applying the same operation twice produces the same state as applying it once. But HTTP API calls are not inherently idempotent. If a user creates a page and the response is lost, retrying the request without idempotency protection creates a duplicate page. RabbitMQ message delivery is "at-least-once," meaning consumers may receive the same message twice if the acknowledgment is lost.
+
+**How it works in this project**: For RabbitMQ consumers, each message includes an `event_id` (UUID). Consumers track processed event IDs in Redis with a 24-hour TTL. When a duplicate message arrives, it is recognized by its `event_id`, logged, and skipped. The `notion.export` queue achieves exactly-once semantics by combining at-least-once delivery with idempotency keys stored in Redis -- even if the same export job is delivered twice, only the first execution produces output. For CRDT operations, idempotency is inherent: the same operation applied twice converges to the same state because operations are commutative and carry unique IDs.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC assigns permissions to roles rather than individual users. Users are assigned roles, and roles determine what actions they can perform. This creates a manageable, auditable permission system that scales to large organizations.
+
+**Why it matters**: Notion has three levels of access control: workspace membership (admin, member, guest), page-level permissions (view, edit, full_access), and block-level operations. Without RBAC, managing permissions for 100 team members across 1,000 pages would require 100,000 individual permission entries. With RBAC, you assign a workspace role once and override at the page level only when needed.
+
+**How it works in this project**: The `workspace_members` table assigns roles (admin, member, guest) at the workspace level. The `page_permissions` table provides page-level overrides. Permission evaluation follows a hierarchy: first check page-level permission for the user, then fall back to workspace role. Admins have full access to all workspace resources. Members can edit pages they create and view all pages. Guests can only access pages explicitly shared with them. The audit log records all permission changes for compliance.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker monitors calls to an external dependency and tracks failure rates. When failures exceed a threshold, the circuit "opens" and calls fail immediately without contacting the dependency. After a cooldown period, the circuit allows a test request through ("half-open"). If it succeeds, normal operation resumes ("closed"). If it fails, the circuit stays open.
+
+**Why it matters**: When RabbitMQ becomes unresponsive, every API request that publishes to a queue blocks until the connection timeout (typically 10-30 seconds). This makes the entire API unresponsive, even though RabbitMQ is only used for async jobs like search indexing and notifications. A circuit breaker detects RabbitMQ's failure within seconds and stops attempting connections, allowing the API to continue serving page loads and block operations.
+
+**How it works in this project**: The graceful degradation table in the architecture shows how each circuit breaker failure is handled. When Redis is down, sessions fall back to PostgreSQL and presence features are disabled. When RabbitMQ is down, async jobs are skipped and logged for retry later. When PostgreSQL becomes read-only, the application disables writes and shows a banner to users. Each failure mode degrades specific features rather than bringing down the entire application.
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local implementation: what was built, what was simplified, and what was omitted.

@@ -623,6 +623,203 @@ On SIGTERM/SIGINT: close WebSocket connections with close frame, drain in-flight
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App
+├── RouterProvider (TanStack Router)
+│   ├── RootLayout
+│   │   ├── Header (nav: Drive, Photos, Admin + user info + logout)
+│   │   └── Outlet
+│   │       ├── LoginPage
+│   │       ├── RegisterPage
+│   │       ├── DrivePage
+│   │       │   └── FileBrowser
+│   │       │       ├── FileToolbar (upload, new folder, view controls)
+│   │       │       ├── FileStatusBanners (upload progress, conflict alerts)
+│   │       │       ├── SelectionBar (batch actions for selected files)
+│   │       │       ├── FileList
+│   │       │       │   └── FileItemComponent (icon, name, size, modified date)
+│   │       │       ├── DragOverlay (visual feedback during drag-and-drop)
+│   │       │       └── NewFolderModal
+│   │       ├── PhotosPage
+│   │       │   └── PhotoGallery
+│   │       │       ├── PhotoToolbar (upload, albums, favorites filter, view mode)
+│   │       │       ├── PhotoGrid (@tanstack/react-virtual row-based virtualization)
+│   │       │       │   └── PhotoItem (thumbnail, favorite badge, selection checkbox)
+│   │       │       ├── PhotoViewer (lightbox with prev/next, zoom, favorite toggle)
+│   │       │       └── CreateAlbumModal
+│   │       └── AdminPage
+│   │           └── AdminDashboard
+│   │               ├── OverviewTab (StatCards: users, files, storage, sync ops)
+│   │               ├── UsersTab (user list with storage quotas)
+│   │               ├── OperationsTab (recent sync operations log)
+│   │               └── ConflictsTab (unresolved conflicts with resolution actions)
+│   └── common/
+│       ├── StatCard (metric value + label + icon)
+│       ├── LoadingSpinner
+│       └── Modal (reusable dialog wrapper)
+```
+
+### Zustand Stores
+
+Three domain-separated stores manage global state:
+
+**`authStore`** -- Manages authentication lifecycle. Holds the current `user` object, `deviceId`, and session `token`. On login/register, it calls the API, stores the result, and connects the WebSocket service for real-time sync. On logout, it disconnects WebSocket and clears all state. `checkAuth()` restores session from existing httpOnly cookie on page load.
+
+**`fileStore`** -- Manages the iCloud Drive experience. Tracks `files` (current directory listing), `currentPath` (navigation state), `selectedFiles` (Set for multi-select batch operations), `conflicts` (unresolved version conflicts), and `uploadProgress` (Map of filename to percentage). Key behaviors: navigating to a path triggers an automatic file reload; file operations (create, rename, delete) perform API calls then update local state optimistically; `subscribeToChanges()` listens to WebSocket events and reloads files when another device modifies the same directory.
+
+**`photoStore`** -- Manages iCloud Photos. Tracks `photos` (paginated array), `albums`, `selectedPhotos` (Set), `hasMore` (for infinite scroll), `viewMode` (grid/list), and `filter` (all/favorites). Supports cursor-based pagination: `loadMore()` appends the next page of 50 photos without resetting the existing list. Photo uploads prepend new photos to the array. Like the file store, it subscribes to WebSocket events for cross-device sync.
+
+### Routing
+
+Uses TanStack Router with programmatic route definitions (not file-based). The route tree:
+
+| Path | Guard | Component | Purpose |
+|------|-------|-----------|---------|
+| `/` | None | Redirect | Sends authenticated users to `/drive`, others to `/login` |
+| `/login` | None | LoginPage | Email/password authentication |
+| `/register` | None | RegisterPage | New account creation |
+| `/drive` | `protectedBeforeLoad` | DrivePage | File browser (requires auth) |
+| `/photos` | `protectedBeforeLoad` | PhotosPage | Photo gallery (requires auth) |
+| `/admin` | Auth + role check | AdminPage | Admin dashboard (requires `role === 'admin'`) |
+
+Route guards use `useAuthStore.getState()` in `beforeLoad` to check authentication synchronously. Non-admin users attempting to access `/admin` are redirected to `/drive`.
+
+### Data Fetching
+
+All API communication is centralized in `services/api.ts`, which wraps `fetch` calls with `credentials: 'include'` for cookie-based session auth. The API module provides typed methods for every backend endpoint (auth, files, sync, photos, devices, admin). Stores call API methods and update their own state on success. There is no separate data-fetching library (no React Query or SWR) -- stores handle loading states and error tracking directly.
+
+### Real-Time Updates
+
+`services/websocket.ts` provides a WebSocket client that connects after login. Both `fileStore` and `photoStore` subscribe to WebSocket events via `subscribeToChanges()`. When a file or photo operation occurs on another device, the server broadcasts a change event, and the relevant store reloads its data from the API. The WebSocket carries only event types and file IDs -- not file content.
+
+### Key UI Patterns
+
+**Virtualized photo grid**: `PhotoGrid` uses `@tanstack/react-virtual` with row-based virtualization. Photos are arranged in rows (based on viewport width), and only rows visible in the viewport are rendered. This maintains 60fps scrolling with 1000+ photos by avoiding DOM nodes for off-screen content.
+
+**Drag-and-drop file upload**: The `FileBrowser` component listens for `dragenter`, `dragover`, and `drop` events on the file list area. When files are dropped, they are passed to `fileStore.uploadFiles()`, which uploads them sequentially with progress tracking. A `DragOverlay` component provides visual feedback during the drag.
+
+**Multi-select with batch operations**: Both `fileStore` and `photoStore` maintain a `Set<string>` of selected IDs. The `SelectionBar` (files) and `PhotoToolbar` (photos) appear when selections exist, offering batch delete, move-to-album, and other operations.
+
+**Conflict resolution UI**: The `ConflictsTab` in the admin dashboard and `FileStatusBanners` in the drive view display unresolved sync conflicts. Each conflict shows the local and server versions with their version vectors, and offers resolution options: use local, use server, or keep both (creates a conflict copy).
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and why it matters for a system operating at scale.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method for restricting system access based on the roles assigned to individual users, rather than assigning permissions directly to each user. In this project, users have a `role` column in the `users` table (values: `'user'` or `'admin'`). When a request arrives at a protected endpoint, the auth middleware checks the session to identify the user, and route-specific guards check the role.
+
+The purpose of RBAC is to separate "who can do what" from "who is who." Instead of maintaining a per-user permission list (which becomes unmanageable at thousands of users), you define a small set of roles and assign permissions to roles. A user inherits all permissions of their role. In this project, regular users can manage their own files and photos, while admins can view system statistics, manage all users, and inspect sync conflicts across the system.
+
+On the frontend, the TanStack Router `beforeLoad` guard checks `user.role !== 'admin'` and redirects non-admins away from the `/admin` route. On the backend, the admin routes middleware verifies the role server-side, so even direct API calls from non-admin users are rejected with 403 Forbidden.
+
+At production scale, RBAC prevents unauthorized access to sensitive operations (viewing all users' data, modifying system configuration) without requiring complex per-resource permission checks on every request.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database, and populates the cache on a miss. The cache does not communicate with the database directly -- the application code sits between them and manages both.
+
+The flow works as follows: (1) The application receives a request for data. (2) It checks Redis for a cached value using a deterministic key (e.g., `file:metadata:{fileId}`). (3) If the key exists (cache hit), the cached value is returned immediately, avoiding a database query. (4) If the key does not exist (cache miss), the application queries PostgreSQL, stores the result in Redis with a TTL (time-to-live), and returns the result.
+
+On writes, the application explicitly invalidates (deletes) the relevant cache keys so that subsequent reads fetch fresh data from the database. This project uses cache-aside for file metadata (1-hour TTL), user storage quota (5-minute TTL), chunk existence checks (1-hour TTL), and device lists (15-minute TTL).
+
+The pattern matters at scale because database queries are orders of magnitude slower than Redis lookups. A file listing that takes 5ms from PostgreSQL takes 0.1ms from Redis. At 100K concurrent users browsing their files, cache-aside reduces database load by 80-90% for read-heavy workloads, keeping p99 latency low and preventing database connection exhaustion.
+
+The trade-off is eventual consistency: after a write, there is a brief window (until the cache key is invalidated) where stale data could be served. For file metadata, this is acceptable -- seeing a file's old modification date for a fraction of a second is harmless. For sync state (where accuracy is critical), this project uses write-through caching instead, updating both cache and database atomically.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service, which would waste resources and increase latency. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and subsequent calls fail immediately without attempting the operation.
+
+The circuit breaker has three states:
+
+1. **Closed** (normal operation): Requests flow through to the external service. The breaker monitors the error rate. If failures exceed a threshold (e.g., 50% of recent requests fail), the breaker transitions to Open.
+
+2. **Open** (failing fast): All requests are immediately rejected with a predefined error (e.g., 503 Service Unavailable) without contacting the external service. This protects the system from wasting time on a service that is down. After a reset timeout (e.g., 30 seconds), the breaker transitions to Half-Open.
+
+3. **Half-Open** (probing): A limited number of requests are allowed through to test whether the service has recovered. If they succeed, the breaker closes (back to normal). If they fail, it reopens.
+
+This project uses three separate Opossum-based circuit breakers for MinIO/S3 storage operations: `storage_put` (30s timeout, for large uploads), `storage_get` (15s timeout, for downloads), and `storage_stat` (5s timeout, for existence checks). Each has a 50% error threshold.
+
+The reason for separate breakers per operation type is that they fail independently. A network issue might prevent large uploads (PUT) while small existence checks (HEAD) still work. With a single breaker, a PUT failure would block all storage operations, including reads. With separate breakers, file downloads continue working even when uploads are broken.
+
+At scale, circuit breakers prevent cascade failures. If MinIO becomes slow (e.g., disk saturation), without a breaker, every request would wait 30 seconds for a timeout, consuming a server thread/connection the entire time. With 1000 concurrent requests, that is 1000 threads blocked on a dead service, leaving no capacity for healthy operations like file listing (which only needs PostgreSQL). The breaker short-circuits these calls, returning an error in microseconds instead of seconds.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Each log entry contains a set of named fields (timestamp, level, message, request ID, user ID, component name, etc.) that can be indexed, searched, and aggregated by log management systems.
+
+This project uses Pino, a high-performance Node.js JSON logger. In development, `pino-pretty` formats the output for human readability. In production, raw JSON is emitted for consumption by log aggregation systems (ELK stack, Grafana Loki, Datadog).
+
+Key features of the logging setup:
+- **Request correlation IDs**: Each HTTP request is assigned a UUID that propagates through all log entries generated during that request. This allows tracing a single sync operation across multiple log lines (e.g., "chunk upload started" -> "chunk deduplicated" -> "file metadata updated" -> "WebSocket notification sent").
+- **Component child loggers**: Pino child loggers are created for each service component (`syncService`, `chunkService`, `photoService`). Each child logger automatically includes the component name in every log entry, making it trivial to filter logs by component.
+- **Audit logger**: A separate Pino instance for security-sensitive events (file sharing, device registration, admin actions). This log stream can be routed to a separate, tamper-evident storage for compliance.
+
+At scale, structured logging is essential because text-based logging is unsearchable across thousands of server instances. When a user reports "my file sync failed," you need to search across all servers for that user's request ID. With structured logs, this is a simple JSON field query (`requestId == "abc123"`). With text logs, you would need regex matching across terabytes of log files.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements from applications at regular intervals (scraping). Applications expose an HTTP endpoint (`/metrics`) in a specific text format, and the Prometheus server periodically fetches this endpoint to collect data points.
+
+This project exposes metrics via the `prom-client` library. Each metric has a type:
+
+- **Counter**: A value that only goes up (e.g., `icloud_conflicts_total` -- the total number of sync conflicts detected since the server started). Useful for computing rates: "how many conflicts per minute?"
+- **Histogram**: Records the distribution of values (e.g., `icloud_http_request_duration_seconds` -- how long each API request took). Prometheus computes percentiles (p50, p95, p99) from histograms. This answers "what is the latency that 99% of requests are below?"
+- **Gauge**: A value that goes up and down (e.g., `icloud_websocket_connections` -- how many WebSocket connections are currently active). Useful for capacity monitoring.
+
+The metrics exposed by this project cover HTTP latency by endpoint, sync operation duration, conflict frequency, chunk operation timing (MinIO/S3 latency), deduplication effectiveness (how often chunks are reused), cache hit rates, circuit breaker state, and active WebSocket connections.
+
+At scale, metrics enable alerting and capacity planning. Without metrics, you discover that sync latency is high only when users complain. With metrics, you set an alert: "if sync p95 latency exceeds 5 seconds for 5 minutes, page the on-call engineer." Metrics also reveal trends: "chunk upload latency has been increasing 10% per week" -- which signals an impending storage capacity issue before it becomes a user-facing outage.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make to the API within a time window. Its purpose is to prevent abuse (intentional or accidental) from overwhelming the server and degrading service for all users.
+
+This project implements rate limiting at 1000 requests per 15-minute window per IP address. The implementation uses Redis to track request counts: each incoming request increments a counter keyed by the client's IP address. If the counter exceeds the limit, the server returns 429 Too Many Requests with a `Retry-After` header indicating when the client can try again.
+
+Rate limiting matters at scale for several reasons: (1) A single misbehaving client (buggy sync engine retrying in a tight loop) could generate thousands of requests per second, consuming database connections and CPU that should serve other users. (2) Malicious actors could attempt brute-force login attacks without rate limiting. (3) Burst traffic from a popular shared album being viewed by hundreds of users simultaneously could overwhelm the photo service.
+
+The trade-off is that legitimate high-volume operations (bulk file upload, initial sync of a large library) may hit the limit. This is mitigated by setting the limit high enough for normal usage patterns and by designing the sync protocol to batch operations efficiently.
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a distributed system with unreliable networks, clients frequently retry requests when they do not receive a response (timeout, connection drop). Without idempotency, a retry could create duplicate files, double-count storage quota, or corrupt version vectors.
+
+This project implements idempotency for sync push operations using a Redis-backed idempotency key system. The flow works as follows:
+
+1. The client generates a deterministic key: `SHA-256(userId + operation + changes_hash)` and sends it as the `Idempotency-Key` header.
+2. The server checks Redis for this key. If found, it returns the cached response from the original execution -- the retry is handled without re-executing the operation.
+3. If not found, the server acquires a processing lock (5-minute TTL) in Redis, executes the handler, stores the result in Redis (24-hour TTL), and returns the response.
+4. If another request with the same key arrives while the first is still processing (lock exists), the server waits up to 30 seconds or returns 409 Conflict with `Retry-After`.
+
+File chunk uploads are inherently idempotent because chunks are content-addressed (keyed by SHA-256 hash). Uploading the same chunk twice is a no-op since the storage key is the hash itself. This is a form of "natural idempotency" that requires no additional mechanism.
+
+At scale, idempotency prevents data corruption during network partitions. Consider a mobile device uploading on a flaky cellular connection: the upload completes on the server, but the response is lost. The client retries. Without idempotency, the server would create a duplicate file and increment the version vector incorrectly. With idempotency, the retry returns the original response.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the application is functioning correctly. They are designed for automated systems (load balancers, container orchestrators like Kubernetes) to determine whether to route traffic to an instance.
+
+This project implements a three-tier health check system:
+
+1. **`/health/live`** (liveness probe): Returns 200 if the process is running. This is the simplest check -- if the HTTP server can respond at all, the process is alive. Kubernetes uses this to decide whether to restart a container.
+
+2. **`/health/ready`** (readiness probe): Tests connectivity to all critical dependencies (PostgreSQL, Redis/Valkey, MinIO). If any dependency is unreachable, the endpoint returns 503 Service Unavailable. Kubernetes uses this to decide whether to route traffic -- a server that is alive but cannot reach the database should not receive requests.
+
+3. **`/health`** (full health check): Returns detailed status including dependency latencies, circuit breaker states (open/closed/half-open for each storage breaker), memory usage, and uptime. This is used by monitoring dashboards and human operators, not by automated routing.
+
+The distinction between liveness and readiness is critical at scale. A server stuck in an infinite loop is not live (needs restart). A server that just started and has not yet established database connections is live but not ready (should not receive traffic yet). Conflating these checks leads to either premature restarts (restarting a server that is still initializing) or routing traffic to broken instances (sending requests to a server that cannot reach the database).
+
+---
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.

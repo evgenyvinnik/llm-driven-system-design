@@ -769,3 +769,189 @@ This section maps the production architecture above to the actual local implemen
 - Grafana dashboards (metrics exposed at `/metrics` but no visualization)
 - Distributed tracing (OpenTelemetry)
 - Map visualization in the frontend (coordinates only, no map tiles)
+
+## Frontend Architecture
+
+This section describes the React frontend implementation: component hierarchy, state management, routing, data fetching patterns, and key UI behaviors.
+
+### Technology Stack
+
+| Technology | Purpose |
+|-----------|---------|
+| React 19 + TypeScript | UI framework with type safety |
+| TanStack Router | File-based routing with type-safe params |
+| Zustand | Lightweight global state management with localStorage persistence |
+| WebSocket (native) | Real-time order tracking and driver offer notifications |
+| Tailwind CSS | Utility-first CSS styling |
+| Vite | Development server and build tool with path aliases (`@/`) |
+
+### Route Structure
+
+TanStack Router file-based routing in `frontend/src/routes/`:
+
+| File | Path | Description |
+|------|------|-------------|
+| `__root.tsx` | (layout) | Root layout with Navbar, auth load on mount |
+| `index.tsx` | `/` | Customer home: merchant discovery with geo-based search and category filters |
+| `login.tsx` | `/login` | Login form with role-aware registration |
+| `register.tsx` | `/register` | Registration with role selection (customer/driver/merchant) and vehicle fields |
+| `merchants.$merchantId.tsx` | `/merchants/:merchantId` | Merchant menu with add-to-cart functionality |
+| `cart.tsx` | `/cart` | Shopping cart with delivery address, instructions, tip, and checkout |
+| `orders.index.tsx` | `/orders` | Customer order history list |
+| `orders.$orderId.tsx` | `/orders/:orderId` | Order detail with real-time status tracking via WebSocket |
+| `driver.tsx` | `/driver` | Driver dashboard with online/offline toggle, offers, active deliveries |
+| `admin.tsx` | `/admin` | Admin dashboard with platform stats, orders, drivers, merchants |
+
+### Zustand Stores
+
+The frontend uses three Zustand stores for orthogonal state domains:
+
+**`authStore.ts`** -- Authentication state with `persist` middleware. Stores user object and session token, persisting only the token to localStorage via `partialize`. On app load, `loadUser()` reads the token from localStorage and validates it via `GET /api/v1/auth/me`. The store supports role-aware registration (customer, driver, merchant) with vehicle type and license plate fields for driver accounts. Actions: `login`, `register`, `logout`, `loadUser`, `clearError`. Error state is tracked within the store for display in the login/register forms.
+
+**`cartStore.ts`** -- Shopping cart state (not persisted -- resets on page reload). Enforces a single-merchant constraint: adding an item from a different merchant clears the existing cart. This mirrors real delivery platforms where an order can only come from one restaurant. Key behaviors: `addItem()` checks if the new item's `merchant_id` differs from the current cart's merchant and clears the cart if so, then either increments quantity for existing items or appends new items. `getSubtotal()` and `getItemCount()` are computed methods that reduce over the items array. `updateInstructions()` allows per-item special instructions (e.g., "no onions"). The cart stores full `MenuItem` objects (not just IDs) so the UI can display names and prices without additional API calls.
+
+**`locationStore.ts`** -- Geolocation state for browser-based location tracking. Used by both customers (for finding nearby merchants) and drivers (for sharing real-time location). `getCurrentLocation()` wraps the browser Geolocation API with a fallback to San Francisco coordinates (37.7749, -122.4194) when geolocation is unavailable or denied. `watchLocation()` starts continuous tracking via `navigator.geolocation.watchPosition()`, calling a callback on each update -- the driver dashboard uses this to send location updates to the server via both HTTP API and WebSocket simultaneously. `stopWatching()` clears the watcher ID. Configuration: high accuracy enabled, 10-second timeout, 5-second maximum age for watched positions (60-second for one-shot).
+
+### API Service Layer
+
+The API client (`services/api.ts`) uses a generic `request<T>()` wrapper that attaches the Bearer token from localStorage and parses JSON responses with typed `ApiResponse<T>` structure. Methods are organized by domain: auth (register with role, login, logout, getMe), merchants (nearby search with lat/lng/radius, categories, text search), orders (create, list, detail, cancel, rate driver, rate merchant), driver (profile, go online/offline, location update, orders, offers, status transitions), and admin (stats, orders, drivers, merchants, customers, analytics).
+
+### WebSocket Service
+
+The `WebSocketService` class (`services/websocket.ts`) manages a persistent WebSocket connection with automatic reconnection using exponential backoff. It provides typed message handling for four message types: `connected` (initial handshake), `location_update` (driver position changes), `status_update` (order status transitions), and `new_offer` (delivery offer for drivers). The service is instantiated as a singleton (`wsService`).
+
+Key capabilities:
+- `subscribeToOrder(orderId)` -- customer subscribes to real-time tracking for a specific order
+- `subscribeToDriverOffers()` -- driver subscribes to receive delivery offer notifications
+- `updateLocation(lat, lng)` -- driver sends location via WebSocket (supplement to HTTP API)
+- Automatic reconnection with exponential backoff (1s, 2s, 4s, 8s, 16s), max 5 attempts
+- Clean disconnect on logout or navigation away
+
+### Component Hierarchy
+
+```
+__root (Navbar + Outlet)
+├── HomePage (Customer)
+│   ├── Hero section (title, tagline)
+│   ├── Search bar (text input + button)
+│   ├── Category filter (horizontal scroll pills: All, Fast Food, Pizza, etc.)
+│   └── MerchantCard[] (3-column grid: name, category, rating, prep time)
+├── MerchantMenu
+│   ├── Merchant header (name, description, address, hours)
+│   └── MenuItemCard[] (name, description, price, add-to-cart button)
+├── Cart
+│   ├── Cart items (quantity controls, special instructions, remove)
+│   ├── Delivery address input
+│   ├── Delivery instructions input
+│   ├── Tip selector
+│   ├── Price summary (subtotal, delivery fee, tip, total)
+│   └── Place order button
+├── OrderHistory (OrderCard[] with status badges)
+├── OrderDetail
+│   ├── Status timeline
+│   ├── Order items list
+│   ├── Driver info (when assigned)
+│   └── Rating form (when delivered)
+├── DriverDashboard
+│   ├── DeliveryOfferModal (popup with order details, countdown timer, accept/decline)
+│   ├── DriverStatusHeader (online/offline toggle, status indicator, driver name)
+│   ├── DriverStatsGrid (rating, total deliveries, acceptance rate)
+│   └── ActiveDeliveryCard[] (order details with status transition buttons)
+│       ├── Mark picked up button
+│       ├── Mark in transit button
+│       └── Mark delivered button
+└── AdminDashboard
+    ├── Platform stats (orders, drivers, merchants, customers)
+    ├── Recent orders table
+    ├── Driver list with status
+    └── Analytics charts
+```
+
+### Custom Hook: `useDriverDashboard`
+
+The `useDriverDashboard` hook (`hooks/useDriverDashboard.ts`) encapsulates all driver dashboard logic, keeping the route component purely presentational. It manages:
+
+1. **Data loading**: Fetches driver profile and active orders in parallel via `Promise.all`
+2. **WebSocket connection**: Connects when the driver is online and subscribes to delivery offers
+3. **Offer countdown**: Runs a 1-second interval timer that decrements `expiresIn` on pending offers, auto-dismissing when expired
+4. **Online/offline toggle**: `handleGoOnline()` gets the current location (or requests it), sends it to the API, and starts continuous location watching. `handleGoOffline()` checks for active orders first and prevents going offline if any exist.
+5. **Location tracking**: When online, uses `locationStore.watchLocation()` to continuously send position updates via both HTTP API (`api.updateLocation`) and WebSocket (`wsService.updateLocation`) -- dual-channel ensures updates get through even if one transport fails
+6. **Order lifecycle**: Handlers for `handlePickedUp`, `handleInTransit`, and `handleDelivered` call the API and then refresh all driver data
+
+### Key UI Patterns
+
+**Three-sided marketplace UI**: The frontend serves three distinct user personas (customer, driver, admin) from a single React application. The Navbar conditionally renders different navigation links based on `user.role`. The home page (`/`) is customer-focused (merchant discovery), the `/driver` route is role-guarded (redirects non-drivers to login), and `/admin` shows platform-wide data.
+
+**Single-merchant cart enforcement**: When a customer adds an item from Merchant B while the cart contains items from Merchant A, the cart is silently cleared and the new item is added. This prevents impossible orders (a driver cannot pick up from two restaurants simultaneously). The `cartStore.addItem()` method checks `merchant.id !== menuItem.merchant_id` to detect cross-merchant additions.
+
+**Real-time delivery offer modal**: When the driver is online and a new order matches them, the server sends a `new_offer` WebSocket message. The `useDriverDashboard` hook sets `pendingOffer` state, which triggers a `DeliveryOfferModal` overlay showing order details (merchant, items, delivery address) and a countdown timer. The countdown uses `setInterval` at 1-second granularity. If the timer reaches zero, the offer auto-dismisses. Accept/decline buttons call the API and clear the modal.
+
+**Geo-based merchant discovery**: The home page uses `locationStore.getCurrentLocation()` on mount to detect the user's position (falling back to San Francisco if unavailable). Merchants are then loaded via `api.getMerchants(lat, lng, radius, category)`, which returns results sorted by distance. Category filter pills at the top allow narrowing results without a full page reload.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before. Each explanation covers what the pattern is, what problem it solves, and how it works in this project.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of per-user permission checks, the system checks if a user's role grants the required access.
+
+**What problem it solves**: A delivery platform has four user types (customer, driver, merchant, admin), each with fundamentally different capabilities. Customers place orders and track deliveries. Drivers accept offers and update delivery status. Merchants manage menus. Admins view platform-wide data. Without RBAC, every endpoint would need complex conditional logic to determine what the current user can do. With RBAC, a single middleware check (`requireRole('driver')`) protects all driver endpoints.
+
+**How it works in this project**: The `users` table has a `role` column constrained to `('customer', 'driver', 'merchant', 'admin')`. The auth middleware loads the session from Redis, retrieves the user with their role, and attaches it to the request. Endpoint groups are protected: `/api/v1/driver/*` requires the `driver` role, `/api/v1/admin/*` requires `admin`. Customer endpoints use ownership checks in addition to role checks -- a customer can only view their own orders. Driver endpoints additionally verify that the driver is the one assigned to an order before allowing status transitions (prevents a different driver from marking someone else's delivery as complete).
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside is a caching strategy where the application checks the cache before querying the database. On a cache miss, the database is queried, the result is cached with a TTL, and returned. On a cache hit, the cached value is returned directly.
+
+**What problem it solves**: In a delivery platform, the hottest data path is "find nearby available drivers." With 30,000 concurrent drivers sending location updates every 3 seconds, querying a traditional database for nearby drivers would require expensive spatial queries on a rapidly changing dataset. Redis's in-memory GEOADD/GEORADIUS operations provide sub-millisecond geo queries that can handle 10,000 updates per second.
+
+**How it works in this project**: Redis serves as both a cache and a real-time data store. Driver locations use `GEOADD` on the `drivers:locations` key with longitude, latitude, and driver_id. When a new order needs a driver, `GEORADIUS` returns all available drivers within a configurable radius, sorted by distance. Driver metadata (status, lat, lng, updated_at) is stored in a Redis hash (`driver:{id}`) for fast lookups without hitting PostgreSQL. Session tokens are cached in Redis with 24-hour TTL. The PostgreSQL `drivers` table stores `current_lat`/`current_lng` as a persistent fallback -- if Redis crashes, the last known position is still available for rebuilding the geo-index.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker wraps calls to potentially failing services and monitors their success rate. When failures exceed a threshold, it opens and fails fast. After a recovery period, it allows test requests. If tests succeed, normal operation resumes.
+
+**What problem it solves**: The driver matching service calls Redis (for geo-queries) and PostgreSQL (for driver details and order updates). If either dependency is degraded, the matching service would hang waiting for timeouts, blocking the order assignment pipeline. Without a circuit breaker, orders would pile up in `pending` state while workers wait for responses that will never arrive. The circuit breaker detects the degradation and fails fast, allowing the system to queue orders for later processing instead of blocking.
+
+**How it works in this project**: The Opossum library (`backend/src/shared/circuitBreaker.ts`) wraps the driver matching service. Configuration: 5-second timeout per matching attempt, circuit opens at 50% failure rate (over at least 5 requests), stays open for 10 seconds before allowing one test request in half-open state. When the circuit is open, the matching service returns a "no drivers available" response and the order remains in `pending` state. An admin notification is sent so operators can investigate. The circuit breaker state is exposed as a Prometheus gauge (`delivery_circuit_breaker_state`). This prevents a Redis outage from cascading into an API outage -- orders can still be created and queued, they just cannot be matched to drivers until the circuit closes.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable JSON rather than free-form text. Each entry has defined fields that can be searched, filtered, and aggregated.
+
+**What problem it solves**: When investigating "why was order X never assigned a driver?", operators need to trace the order through the matching pipeline: was a match attempted? Were drivers found nearby? Did the circuit breaker prevent matching? Was an offer sent? Did the offer expire? Free-form logs like "Matching failed for order" are useless without context. Structured entries like `{"msg":"matching_attempt","order_id":"abc","nearby_drivers":5,"top_score":0.82,"circuit_state":"closed"}` answer these questions immediately.
+
+**How it works in this project**: Pino (`backend/src/shared/logger.ts`) outputs JSON logs with module-specific child loggers (orders, drivers, matching, auth). Each child logger automatically tags entries with a `module` field. Request correlation IDs enable tracing a single order through creation, matching, offer sending, acceptance, and delivery. Key logged events: `order_created`, `matching_started`, `driver_scored` (with score breakdown), `offer_sent`, `offer_accepted`/`offer_rejected`/`offer_expired`, `order_picked_up`, `order_delivered`. In development, `pino-pretty` reformats JSON for human readability.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system where the application exposes numerical measurements at a `/metrics` endpoint, scraped periodically. Dashboards and alerts are built on top of this data.
+
+**What problem it solves**: A delivery platform needs real-time visibility into several critical flows. How long does driver matching take? What percentage of offers are accepted vs rejected vs expired? Is the average delivery time increasing? Without metrics, degradation is only noticed when customers complain. With metrics, "driver acceptance rate dropped from 85% to 40% in the last hour" triggers an investigation before customers are affected.
+
+**How it works in this project**: The `prom-client` library (`backend/src/shared/metrics.ts`) registers 25+ custom metrics. Order metrics: `delivery_orders_created_total` (counter by merchant category), `delivery_orders_completed_total` (counter by final status -- delivered/cancelled), `delivery_order_duration_seconds` (histogram of end-to-end order time). Matching metrics: `delivery_driver_matching_duration_seconds` (histogram measuring how long the scoring algorithm takes), `delivery_driver_assignments_total` (counter by result -- accepted/rejected/expired, key for monitoring driver engagement). Infrastructure metrics: `delivery_http_request_duration_seconds` (histogram by method, route, status), `delivery_circuit_breaker_state` (gauge -- 0=closed, 1=open, 0.5=half-open), `delivery_db_query_duration_seconds` (histogram by operation and table), `delivery_redis_operation_duration_seconds` (histogram by operation type).
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make within a time window, rejecting excess requests with HTTP 429.
+
+**What problem it solves**: A delivery platform faces abuse vectors from multiple directions. Customers could spam the order creation endpoint (accidentally or maliciously), drivers could flood the location update endpoint (buggy GPS tracker sending updates 100 times per second), and bots could scrape merchant menus. Rate limiting prevents any single client from monopolizing server resources.
+
+**How it works in this project**: Rate limiting operates at two levels. Per-IP limits on the API protect against unauthenticated abuse (login attempts, registration). Per-user limits on sensitive operations protect against authenticated abuse (order creation is limited to prevent accidental double-orders). Driver location updates are not rate-limited in the traditional sense -- instead, the system accepts only the latest position and discards intermediate updates if they arrive faster than the 3-second processing interval. The `session:{token}` pattern in Redis enables per-user tracking without additional lookups.
+
+### Idempotency
+
+**What it is**: An idempotent operation produces the same result whether executed once or multiple times. For APIs, retrying a request due to network failure is safe because the server detects the duplicate and returns the original response.
+
+**What problem it solves**: Order creation is the most critical write operation in a delivery platform. A customer taps "Place Order" and the network drops before the response. The app retries. Without idempotency, the customer gets two identical orders, two charges, and two drivers dispatched. This is both a terrible user experience and a financial liability.
+
+**How it works in this project**: The client sends an `X-Idempotency-Key` header (UUID v4) with every order creation request. The server flow: (1) Check `idempotency_keys` table for the key. (2) If found with `status='completed'`, return the cached JSONB response (200 OK). (3) If found with `status='pending'`, reject as concurrent duplicate (409 Conflict). (4) If not found, insert a pending record, process the order, update the record to `completed` with the cached response, and return it. Keys expire after 24 hours via a cleanup job (`npm run db:cleanup`). The idempotency table is in PostgreSQL (not Redis) for durability -- if Redis crashes during order processing, the idempotency record survives. Order status transitions use optimistic locking (`UPDATE orders SET status = 'picked_up' WHERE id = $1 AND status = 'preparing' RETURNING *`) as an additional idempotency mechanism: if `affected_rows = 0`, the transition was already applied.
+
+### Health Checks
+
+**What it is**: Health check endpoints are HTTP routes that report whether the application is functioning correctly. They are consumed by load balancers and monitoring systems to make automated traffic routing decisions.
+
+**What problem it solves**: A delivery platform API server might be running but unable to process orders because PostgreSQL is unreachable, or unable to match drivers because Redis (with the geo-index) is down. Without health checks, the load balancer keeps routing traffic to the broken instance, and orders fail silently until someone notices.
+
+**How it works in this project**: `GET /health` checks both PostgreSQL (via a simple query) and Redis (via `PING`), returning a JSON response with per-component status and overall latency. The response includes `{ status: 'healthy'|'degraded', postgres: 'connected'|'error', redis: 'connected'|'error', latency_ms: number }`. A load balancer can route traffic based on the overall status: `healthy` means all dependencies are connected, `degraded` means at least one is down. The health check is designed to be fast (no expensive queries) so it can be called frequently (every 5-10 seconds) without impacting application performance. For this project, the single health endpoint serves both liveness and readiness purposes since the backend is a monolithic Express process.

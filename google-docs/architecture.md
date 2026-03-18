@@ -569,6 +569,177 @@ At 100K concurrent editors, Redis pub/sub becomes the bottleneck -- each operati
 
 ---
 
+## Frontend Architecture
+
+This section describes the actual frontend implementation: component hierarchy, state management, routing, data fetching, real-time collaboration integration, rich text editing, and key UI patterns.
+
+### Component Hierarchy
+
+```
+App.tsx (BrowserRouter)
+├── LoginPage / RegisterPage              (public routes)
+├── HomePage                              (document list)
+│   ├── Header                            (app bar, user info)
+│   └── DocumentList                      (grid of document cards)
+└── DocumentPage                          (collaborative editor)
+    ├── DocumentHeader                    (title, presence dots, panel toggles)
+    ├── Editor                            (TipTap rich text editor)
+    │   ├── EditorToolbar                 (bold, italic, headings, lists, etc.)
+    │   └── EditorContent (TipTap)        (ProseMirror-rendered document)
+    ├── CommentsPanel                     (threaded comments sidebar)
+    ├── VersionHistoryPanel               (version list, restore, create)
+    └── ShareModal                        (permission management)
+```
+
+The top-level `App.tsx` uses React Router (`BrowserRouter`) with `ProtectedRoute` and `PublicRoute` wrappers that check `useAuthStore` for authentication state. Unauthenticated users are redirected to `/login`; authenticated users are redirected away from auth pages to `/`.
+
+### Zustand Stores
+
+The frontend uses two Zustand stores that separate concerns between authentication and document-level state.
+
+**`authStore.ts` -- Authentication State**
+
+Manages user session, token persistence, and WebSocket token synchronization. Uses Zustand's `persist` middleware to save the session token to `localStorage`, enabling session restoration across page reloads. On login or registration, the store calls `wsService.setToken(token)` to prepare the WebSocket service for authenticated connections. On logout, it calls `wsService.disconnect()` to tear down real-time connections.
+
+Key state: `user`, `token`, `isLoading`, `error`. Actions: `login`, `register`, `logout`, `checkAuth`.
+
+**`documentStore.ts` -- Document, Presence, Comments, and Versions**
+
+A single store managing all document-related state: the document list, the currently open document, presence (active collaborators), comments with threading, and version history. All async actions handle loading and error states internally, and operations that modify lists (create, delete, update) perform optimistic in-memory updates.
+
+Key state: `documents` (list view), `currentDocument` (editor view), `presence` (collaborator cursors), `comments`, `versions`. Actions include CRUD for documents, presence management (`setPresence`, `updatePresence`, `removePresence`), comment operations (create, reply, resolve, delete), and version operations (create, restore).
+
+### Routing
+
+The application uses React Router v6 with four routes:
+
+| Route | Component | Auth | Purpose |
+|-------|-----------|------|---------|
+| `/login` | `LoginPage` | Public only | Email/password login form |
+| `/register` | `RegisterPage` | Public only | Account creation form |
+| `/` | `HomePage` | Protected | Document list with create button |
+| `/document/:id` | `DocumentPage` | Protected | Collaborative editor |
+
+### Data Fetching
+
+All API calls go through a centralized `services/api.ts` module that provides typed functions for each endpoint (`authApi`, `documentsApi`, `commentsApi`, `versionsApi`). Each function wraps `fetch()` with the auth token header and returns a typed response object with `{ success, data, error }`. The Zustand stores call these functions in their async actions, updating store state on success and setting error messages on failure.
+
+### Real-Time Collaboration and WebSocket Integration
+
+The WebSocket service (`services/websocket.ts`) is a singleton class (`WebSocketService`) that manages the entire real-time lifecycle:
+
+1. **Connection**: Connects to `ws://host/ws?token=<sessionToken>` when the user opens a document. The token is passed as a query parameter for authentication during the upgrade handshake.
+
+2. **Document subscription**: `DocumentPage` calls `wsService.subscribe(docId)` on mount and `wsService.unsubscribe()` on unmount. The server responds with a `SYNC` message containing the current presence list.
+
+3. **Operation sending**: When the TipTap editor detects a document change (`onUpdate`), the client would calculate OT operations from ProseMirror transaction steps and send them via `wsService.sendOperation(operations, version)`. Operations are queued in `pendingOperations` until the server sends an `ACK` with the confirmed version number.
+
+4. **Cursor sync**: On `onSelectionUpdate`, the editor sends cursor position (`sendCursor`) or selection range (`sendSelection`) to other collaborators. These arrive as `CURSOR` messages and are stored in the document store's `presence` array.
+
+5. **Reconnection**: On WebSocket close, the service automatically reconnects with exponential backoff (base 1s, up to 5 attempts). On reconnect, it re-subscribes to the current document.
+
+6. **Message handling**: `DocumentPage` registers a message handler via `wsService.addMessageHandler()` that processes `SYNC`, `PRESENCE`, `CURSOR`, and `ERROR` messages, updating the document store accordingly.
+
+### Rich Text Editing
+
+The editor uses TipTap (a wrapper around ProseMirror) with the following extensions:
+
+| Extension | Purpose |
+|-----------|---------|
+| `StarterKit` | Bold, italic, strike, headings (1-6), bullet/ordered lists, blockquotes, code blocks, horizontal rules, undo/redo (depth=100) |
+| `Underline` | Underline formatting |
+| `Highlight` | Multi-color text highlighting |
+| `TextStyle` + `Color` | Text color changes |
+| `Placeholder` | "Start typing..." placeholder in empty documents |
+
+The `EditorToolbar` component provides formatting buttons that call TipTap commands (e.g., `editor.chain().focus().toggleBold().run()`). The toolbar renders above the editor and shows active formatting states.
+
+Document content is stored as ProseMirror JSON in the database. When the document loads, `editor.commands.setContent(document.content)` hydrates the editor. Content changes are detected via the `onUpdate` callback, which checks `transaction.docChanged`.
+
+### Key UI Patterns
+
+- **Permission-based read-only mode**: The `Editor` component accepts a `readOnly` prop derived from `currentDocument.permission_level === 'view'`. When read-only, the toolbar is hidden and a "View only" banner appears at the bottom.
+- **Presence indicators**: Active collaborators appear as colored dots with names in the top-right corner of the editor. Each user has a unique `avatar_color` stored in the database.
+- **Side panels**: Comments and version history render as slide-in panels to the right of the editor, toggled by header buttons. Both panels fetch their data independently via the document store.
+- **Google Docs-style document page**: The editor is rendered inside a fixed-width container (816px, matching US Letter width) with a white background and shadow, centered on a gray background, mimicking the appearance of a printed page.
+- **Loading states**: Spinner components appear during async operations (auth check, document load). Error states show a message with a "Go back to home" link.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers encountering these patterns for the first time.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC is a method of restricting system access based on the roles assigned to individual users, rather than granting permissions directly to each user. Instead of saying "Alice can edit document X," you say "Alice has the Editor role on document X, and Editors can edit."
+
+**Why it matters**: Without RBAC, permission checks become a tangled web of per-user, per-resource rules that are impossible to audit or modify at scale. When a team lead leaves and a new person takes over, you change one role assignment instead of updating hundreds of individual permissions.
+
+**How it works in this project**: The system defines five roles -- Owner, Editor, Commenter, Viewer, and Admin -- each with a specific set of capabilities. The `document_permissions` table maps a user to a document with a permission level (`view`, `comment`, `edit`). Ownership is tracked via `documents.owner_id`. The RBAC middleware (`backend/src/shared/rbac.ts`) intercepts every REST request and WebSocket operation, looks up the user's role for the target document, and rejects the request if the role lacks the required capability. For example, a Viewer can call `GET /api/docs/:id` but receives a 403 if they attempt `PUT /api/docs/:id`. WebSocket connections store the permission level in connection state, so operation messages are validated without a database query on every keystroke.
+
+**The enforcement layers**: Permissions are checked at three points: (1) REST middleware before route handlers, (2) WebSocket operation handlers before processing, and (3) database queries that include permission joins as a safety net.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache first for requested data. On a cache miss, the application reads from the database, stores the result in the cache, and returns it. On a cache hit, the database is skipped entirely.
+
+**Why it matters**: Database queries are expensive -- they require network round-trips, disk I/O, and query planning. For data that is read far more often than written (like user profiles, document metadata, and permissions), caching eliminates most database load. In a collaborative editor, the same document metadata might be requested hundreds of times per minute by different collaborators.
+
+**How it works in this project**: When a request needs document content, the server first checks Redis for a cached copy under the key pattern (e.g., `doc:{id}:content`). If found, it returns the cached data immediately (~1ms). If not found, it queries PostgreSQL (~5-20ms), stores the result in Redis with a TTL (5 minutes for content, 1 hour for user profiles, 10 minutes for permissions), and returns the data. When a document is edited, the cache entry is explicitly deleted (invalidated) so the next read fetches fresh data from the database.
+
+**Cache invalidation**: This is the hard part. The project uses explicit invalidation: when a write operation occurs, the corresponding cache key is deleted. Session data uses a different strategy -- write-through -- where both Redis and PostgreSQL are updated simultaneously, because session validity is critical and cannot tolerate staleness.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker is a stability pattern borrowed from electrical engineering. It wraps calls to external dependencies (databases, caches, APIs) and monitors their failure rate. When failures exceed a threshold, the circuit "opens" and subsequent calls fail immediately without attempting the operation, preventing cascading failures. After a timeout, the circuit enters "half-open" state and allows a test request through. If it succeeds, the circuit closes and normal operation resumes.
+
+**Why it matters**: Without a circuit breaker, when PostgreSQL becomes slow or unresponsive, every API request blocks waiting for a database timeout (typically 10-30 seconds). This exhausts the server's connection pool and thread/event loop capacity, causing the entire application to become unresponsive -- even for operations that do not need the database. The circuit breaker detects the failure pattern and fails fast, allowing the server to serve degraded responses (e.g., cached data from Redis) rather than hanging.
+
+**How it works in this project**: The implementation uses the Opossum library (`backend/src/shared/circuitBreaker.ts`). Two circuit breakers are configured: one for PostgreSQL (opens after 5 consecutive failures, tries again after 30 seconds) and one for Redis (opens after 10 failures, tries again after 10 seconds). When the PostgreSQL circuit opens, the server serves documents from Redis cache and queues writes for later. When the Redis circuit opens, session validation falls back to PostgreSQL. Circuit breaker state transitions are logged and tracked via a Prometheus gauge metric (`circuit_breaker_state`), enabling alerts when a dependency is unhealthy.
+
+### Structured Logging
+
+**What it is**: Structured logging means emitting log entries as machine-parseable data (typically JSON) rather than free-form text strings. Instead of `"User alice loaded document 123 in 45ms"`, a structured log entry is `{"level":"info","userId":"alice","action":"document_load","documentId":"123","duration_ms":45,"timestamp":"2024-01-15T10:30:00Z"}`.
+
+**Why it matters**: Free-form text logs are easy to read in a terminal but impossible to query at scale. When you have 10 servers producing thousands of log lines per second, finding all requests from a specific user that took longer than 200ms requires parsing every log line with regex. Structured logs can be ingested into log aggregation systems (Elasticsearch, Datadog, CloudWatch Logs) and queried like a database: `SELECT * WHERE userId = 'alice' AND duration_ms > 200`.
+
+**How it works in this project**: The project uses Pino (`backend/src/shared/logger.ts`), a high-performance JSON logger for Node.js. Every log entry includes a base context: service name, environment, and timestamp. Request-scoped context is added via child loggers that attach `requestId`, `userId`, `method`, and `path` to every log entry within that request. Trace IDs are propagated through HTTP headers, WebSocket messages, and Redis pub/sub messages, enabling end-to-end tracing of a single operation across all components. Log levels follow standard severity: `info` for normal operations, `warn` for degraded states (cache misses, circuit breaker transitions), `error` for failures, and `fatal` for unrecoverable errors that trigger shutdown.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a time-series monitoring system where applications expose numeric metrics at an HTTP endpoint (`/metrics`), and a Prometheus server periodically scrapes (fetches) these metrics. Each metric has a name, a type, and optional labels. The three core metric types are: **Counter** (monotonically increasing value, like total requests), **Histogram** (distribution of values, like request latency buckets), and **Gauge** (point-in-time value that can go up or down, like active connections).
+
+**Why it matters**: Without metrics, you cannot answer basic operational questions: "What is the p95 API latency?" "How many cache misses are we seeing?" "Is the WebSocket connection count growing?" Metrics enable dashboards (Grafana), alerting (PagerDuty), and capacity planning. They are the foundation of SLI/SLO-based reliability management.
+
+**How it works in this project**: The implementation uses prom-client (`backend/src/shared/metrics.ts`). Key metrics include: `http_request_duration_seconds` (histogram, tracks API latency by method/path), `websocket_connections_active` (gauge, tracks concurrent connections per server), `ot_operations_total` (counter, tracks insert/delete operations), `ot_operation_latency_ms` (histogram, tracks time from operation receipt to broadcast), `cache_requests_total` (counter with `hit`/`miss` labels, tracks cache effectiveness), and `circuit_breaker_state` (gauge, 0=closed/1=open/2=half-open). These metrics are scraped by Prometheus and visualized in Grafana dashboards, with alerts configured for SLI violations (e.g., p95 latency > 500ms for 5 minutes).
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts how many requests a client can make within a time window. It protects the server from abuse (intentional or accidental), ensures fair resource sharing among users, and prevents a single misbehaving client from degrading service for everyone.
+
+**Why it matters**: Without rate limiting, a single user running a script that polls the API every 10ms could generate 6,000 requests per minute -- enough to saturate a database connection pool and slow down the entire application. In a collaborative editor, a buggy client extension could flood the WebSocket with operations, overwhelming the OT engine.
+
+**How it works in this project**: Rate limits are enforced per-user (identified by session) and per-IP (for unauthenticated endpoints). The limits vary by endpoint sensitivity: login attempts are limited to 5 per 15 minutes to prevent brute-force attacks, registration is limited to 3 accounts per hour per IP to prevent spam, WebSocket operations are limited to 100 per second per user per document (far above human typing speed but catches runaway scripts), and general API requests are limited to 100 per minute per user. Limits are tracked in Redis using a sliding window counter pattern: each request increments a counter key with a TTL matching the window duration.
+
+### Idempotency
+
+**What it is**: An operation is idempotent if performing it multiple times has the same effect as performing it once. In the context of an API, idempotency means that retrying a failed request (because the client did not receive a response) will not create duplicate side effects -- no double-creating a document, no double-applying an edit.
+
+**Why it matters**: Network failures are common. A client sends a POST request to create a document, the server processes it successfully, but the response is lost due to a network hiccup. The client retries. Without idempotency, the server creates a second document. In a collaborative editor, this problem is amplified: if a user types "hello" and the ACK is lost, retrying without idempotency inserts "hellohello."
+
+**How it works in this project**: The project implements idempotency at two levels. For HTTP requests (`backend/src/middleware/idempotency.ts`), clients include an `Idempotency-Key` header on POST/PUT/PATCH/DELETE requests. The server checks Redis for a cached response under that key. If found, it returns the cached response without re-processing. If not found, it processes the request, caches the response with a 1-hour TTL, and returns it. For WebSocket operations (`backend/src/services/collaboration/sync.ts`), each operation includes a unique `operationId`. The server checks Redis (`SET NX` with 1-hour TTL, key pattern `op:{userId}:{documentId}:{operationId}`) before applying the operation. If the key already exists, the operation is a duplicate and the server returns the cached ACK.
+
+### Health Checks
+
+**What it is**: Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are used by load balancers to route traffic away from unhealthy instances and by orchestration systems (Kubernetes) to restart failed containers.
+
+**Why it matters**: Without health checks, a load balancer continues sending traffic to a server whose database connection pool is exhausted, causing errors for users. With health checks, the load balancer detects the unhealthy instance within seconds and stops routing traffic to it, while the remaining instances absorb the load.
+
+**How it works in this project**: The `/health` endpoint (`backend/src/index.ts`) performs a lightweight check on each dependency: `SELECT 1` for PostgreSQL and `PING` for Redis. Each check has a timeout (e.g., 5 seconds) and reports per-dependency status and latency. The response includes an overall status (`healthy` or `degraded`), the uptime of the process, and the state of each circuit breaker. The load balancer polls this endpoint every 10 seconds and removes instances that return non-200 responses. A degraded response (one dependency down but others working) may keep the instance in rotation for read-only traffic while alerting operators.
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local implementation: what was built, what was simplified, and what was omitted.

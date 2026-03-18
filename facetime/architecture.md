@@ -470,6 +470,174 @@ TURN is the hardest to scale because it handles actual media traffic:
 | Idempotency | Redis with TTL | Database unique constraint | Catches duplicates before DB, 5-min window |
 | NAT traversal | ICE (STUN+TURN) | Always relay | 85% P2P success rate saves TURN bandwidth |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App (conditional rendering based on login + call state)
+├── [Not logged in]
+│   └── LoginScreen (user list with click-to-login -- no passwords)
+├── [Logged in, idle]
+│   ├── Header (FaceTime logo, user info, logout button)
+│   ├── ContactList
+│   │   └── Contact rows (avatar, name, username, audio/video call buttons)
+│   └── Connection status indicator (bottom-left, green/yellow dot)
+├── [Incoming call ringing]
+│   └── IncomingCall (caller info, accept/decline buttons, ring animation)
+└── [Active call -- any non-idle state]
+    └── ActiveCall
+        ├── VideoPlayer (local + remote video streams)
+        └── CallControls (mute, video toggle, end call)
+```
+
+### Zustand Store
+
+A single unified store (`useStore`) manages all application state across four domains:
+
+**Auth**: `currentUser` (User object or null), `isLoggedIn` (boolean). The `setCurrentUser` action updates both fields atomically. There is no session persistence -- the "login" flow is simplified to clicking a username from a pre-seeded list (no passwords), suitable for demonstrating WebRTC without auth complexity.
+
+**Contacts**: `contacts` (array of all users). Set once on app mount by fetching from the REST API. Used to display the contact list and to resolve user IDs to display names during calls.
+
+**Call state**: `callState` (object with `callId`, `caller`, `callees`, `callType`, `state`, `direction`, `startTime`, `isGroup`). The `state` field drives all rendering logic: `idle` shows contacts, `ringing` with `direction: incoming` shows IncomingCall, any other non-idle state shows ActiveCall. `setCallState` does a partial merge (spread). `resetCallState` cleans up media streams (stopping all tracks) and resets all call-related state to defaults.
+
+**WebRTC streams**: `localStream` and `remoteStream` (MediaStream objects or null). Set by the `useWebRTC` hook during call setup. The store also manages UI toggles (`isMuted`, `isVideoOff`) that directly manipulate the local stream's track `enabled` property -- toggling `isMuted` disables/enables all audio tracks on the local stream.
+
+### Routing
+
+The FaceTime frontend does not use a router library. The entire application is a single-page experience with conditional rendering based on two state variables: `isLoggedIn` (from the store) and `callState.state` (from the store). The rendering logic in `App.tsx` follows a priority chain:
+
+1. If not logged in: render `LoginScreen`
+2. If call state is `ringing` and direction is `incoming`: render `IncomingCall`
+3. If call state is any non-idle value: render `ActiveCall`
+4. Otherwise: render the main contacts screen
+
+This approach is appropriate because FaceTime has no navigable pages -- it is a real-time communication tool where the UI is entirely driven by the current call state.
+
+### Data Fetching
+
+API communication uses two separate modules:
+
+**`services/api.ts`**: REST API calls for user listing (`fetchUsers`), login (`login`), and TURN credential fetching (`fetchTurnCredentials`). These are simple `fetch` wrappers called during initialization and call setup.
+
+**`services/signaling.ts`**: A singleton `SignalingService` class managing the WebSocket connection to the signaling server. This is the primary communication channel for the application. It handles:
+- Connection lifecycle with automatic reconnection (exponential backoff: 1s, 2s, 4s, 8s, 16s, up to 5 attempts)
+- 30-second heartbeat pings to maintain presence
+- Device registration on connect (auto-detects device type from user agent)
+- Persistent device ID stored in `localStorage`
+- Call control methods: `initiateCall`, `answerCall`, `declineCall`, `endCall`
+- WebRTC signaling relay: `sendOffer`, `sendAnswer`, `sendIceCandidate`
+- Message fan-out to registered handlers via `onMessage` subscription pattern
+
+### Key UI Patterns
+
+**WebRTC hook (`useWebRTC`)**: A custom React hook that encapsulates all WebRTC peer connection management. It handles media stream acquisition (with configurable video resolution and audio processing), RTCPeerConnection setup with ICE server configuration, ICE candidate exchange through the signaling service, and SDP offer/answer negotiation. The hook subscribes to signaling messages via `useEffect` and processes the WebRTC handshake state machine: `call_initiate` -> `call_ring` -> `call_answer` -> `offer` -> `answer` -> `ice_candidate` -> connected. It manages an ICE candidate queue for candidates that arrive before the remote description is set.
+
+**State-driven rendering**: The entire UI is driven by the `callState.state` field in the store. There are no imperative show/hide calls. When the signaling service receives an `incoming-call` message, it updates `callState` in the store, and React re-renders the appropriate screen automatically. This makes the UI predictable and easy to reason about.
+
+**Media stream lifecycle**: The store's `resetCallState` function handles cleanup: it iterates all tracks on both local and remote streams and calls `track.stop()` to release camera and microphone access. This prevents the common bug where ending a call leaves the camera indicator light on because tracks were not properly stopped.
+
+**Connection status indicator**: A fixed-position indicator in the bottom-left corner shows whether the WebSocket signaling connection is active (green dot + "Connected") or attempting to reconnect (yellow pulsing dot + "Connecting..."). This gives the user immediate feedback about their ability to make or receive calls.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade backend pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and why it matters for a system operating at scale.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a method for restricting system access based on the roles assigned to individual users. In this project, users have a `role` column in the `users` table (default value `'user'`). The FaceTime implementation uses a simplified auth model (no passwords, click-to-login) focused on demonstrating WebRTC rather than access control, but the role column exists in the schema for admin endpoint protection.
+
+The purpose of RBAC is to separate "who can do what" from "who is who." Rather than checking individual user permissions on every request, the system checks the user's role against the required role for the endpoint. Admin-only endpoints (like active call listing) verify the role server-side. This pattern scales to millions of users because the permission check is a simple string comparison rather than a database lookup of per-user permissions.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database, and populates the cache on a miss.
+
+This project implements cache-aside with three distinct strategies:
+
+**User profiles** (1-hour TTL): User profile data (display name, avatar) changes infrequently. Caching it avoids repeated database lookups during contact list rendering and call history display. The 1-hour TTL balances freshness against database load.
+
+**Device presence** (60-second TTL with heartbeat refresh): Device online status is cached in Redis hash maps (`HSET`/`HGETALL`) keyed by user ID. Each device's presence entry includes device type, last heartbeat timestamp, and connection metadata. The 30-second heartbeat from the frontend refreshes the TTL, so a device that stops heartbeating is automatically removed from presence after 60 seconds.
+
+**Call state** (2-hour TTL): Active call metadata (participants, state, timestamps) is cached in Redis for sub-millisecond access during the call setup critical path. Call setup involves 10-20 state reads and writes within 3 seconds -- PostgreSQL's row-level locking overhead would add approximately 5ms per operation, totaling 100ms of unnecessary latency. Redis handles these as in-memory operations in approximately 0.1ms each.
+
+The presence caching pattern uses write-through rather than cache-aside: every heartbeat and registration event writes directly to Redis (not just the database), ensuring that presence data is always current. This is critical because stale presence data would cause calls to ring devices that are offline.
+
+### Circuit Breaker
+
+A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service. This project uses Opossum-based circuit breakers wrapping database and Redis operations.
+
+The circuit breaker has three states:
+
+1. **Closed** (normal): Requests pass through. The breaker monitors the error rate. If 50% of recent requests fail, it transitions to Open.
+2. **Open** (failing fast): All requests are immediately rejected without contacting the service. After a 10-second reset timeout, it transitions to Half-Open.
+3. **Half-Open** (probing): A limited number of requests test whether the service recovered. Success closes the breaker; failure reopens it.
+
+Configuration: 50% error threshold, 3-second timeout per operation, 10-second reset timeout, minimum 5 requests before the circuit can trip.
+
+The factory pattern (`createCircuitBreaker`) with a singleton registry ensures that only one breaker exists per operation name. A convenience wrapper `withCircuitBreaker` handles breaker creation, fallback registration, and execution in a single call, reducing boilerplate.
+
+State changes emit Prometheus metrics (`facetime_circuit_breaker_state` gauge) and structured log entries, enabling automated alerting when a breaker opens. This is critical in a real-time system because an open circuit breaker means calls cannot be initiated or history cannot be retrieved, and the on-call engineer needs to know immediately.
+
+### Structured Logging
+
+Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. This project uses Pino with several specialized logger configurations:
+
+- **Service metadata**: Every log entry includes the service name (`facetime-signaling`), version, and process ID. This is essential when running multiple instances behind a load balancer.
+- **Request correlation**: Each HTTP request gets a UUID (`requestId`) propagated from the `X-Request-Id` header or generated server-side. All log entries for that request share the ID.
+- **WebSocket logger**: A dedicated child logger with `clientId`, `userId`, and `deviceId` context. When debugging "why did user X not receive the incoming call ring?", filtering by `userId` across all log entries instantly reveals the answer.
+- **Call event logger**: Logs every call lifecycle event (initiated, answered, declined, ended) with `callId` and event type. This produces a complete, searchable timeline for any call.
+- **Audit logger**: A separate Pino instance for security-sensitive operations (TURN credential generation, authentication events). This can be routed to tamper-evident storage for compliance.
+- **Signaling event logger**: Logs every WebRTC signaling message (offer, answer, ICE candidate) for debugging connectivity issues. These logs are verbose and can be filtered out in production via log level configuration.
+
+At production scale with millions of concurrent calls, structured logging is the only practical way to debug issues. When a user reports "my call dropped after 30 seconds," the engineer filters by `callId`, sees the complete signaling sequence, identifies that ICE negotiation failed (no relay candidate gathered), and determines the root cause (TURN server was at capacity).
+
+### Prometheus Metrics
+
+This project exposes 16 custom Prometheus metrics covering the full call lifecycle:
+
+**Call volume metrics** (Counters): `facetime_calls_initiated_total`, `facetime_calls_answered_total`, `facetime_calls_ended_total` -- segmented by call type (video/audio/group) and end reason (normal/timeout/error). Computing the answer rate (answered/initiated) reveals the percentage of calls that connect successfully.
+
+**Latency metrics** (Histograms): `facetime_call_setup_latency_seconds` measures time from initiation to ICE connection -- this is the primary SLI (Service Level Indicator) for the product. `facetime_signaling_latency_seconds` measures per-message processing time in the signaling server. `facetime_ice_candidate_latency_seconds` measures ICE gathering duration.
+
+**Connection health** (Gauges): `facetime_active_calls` and `facetime_active_websocket_connections` show current system load. Combined with call duration histograms, these enable capacity planning: "at peak, we have 5000 active calls averaging 8 minutes each, so we need TURN capacity for 750 concurrent relayed calls."
+
+**Infrastructure insights** (Counters): `facetime_ice_connection_type_total` tracks how calls connect (host/srflx/relay). If the relay percentage increases from 15% to 30%, it indicates network environment changes requiring more TURN server capacity. `facetime_idempotency_hits_total` tracks duplicate call initiations prevented.
+
+Default Node.js metrics (CPU, memory, event loop lag, GC pause time) are collected automatically with the `facetime_` prefix, enabling correlation between application metrics and system resource consumption.
+
+### Rate Limiting
+
+This project does not implement explicit rate limiting middleware in the backend because the primary communication channel is WebSocket (not HTTP), and WebSocket connections are inherently limited by the connection count per client. However, the signaling server does implement implicit rate control through call state validation: a client cannot initiate a new call while already in a call, preventing call-initiation spam.
+
+At production scale, rate limiting would be applied at the API Gateway level: (1) TURN credential requests limited to 10/minute per user (prevents credential harvesting), (2) WebSocket message rate limited to 100/second per connection (prevents signaling flooding), (3) Call initiation limited to 5/minute per user (prevents ring spam).
+
+### Idempotency
+
+Idempotency means that performing the same operation multiple times produces the same result as performing it once. This project implements two forms of idempotency:
+
+**Call initiation idempotency**: The client sends an `X-Idempotency-Key` header (client-generated UUID) stored in Redis with a 5-minute TTL. If the client retries due to network timeout, the server returns the existing call ID instead of creating a duplicate call. Without this, a mobile client on a flaky network might retry 3 times, creating 3 separate calls. The callee would see 3 incoming call notifications stacked on each other, and accepting one would leave 2 orphaned "ringing" calls.
+
+**ICE candidate deduplication**: ICE candidates are deduplicated using `SHA-256(callId:deviceId:candidateString)` stored in Redis with `SETNX` (set-if-not-exists) and a 1-hour TTL. This prevents duplicate candidates from network retries or redundant gathering from flooding the peer. Each duplicate is silently dropped rather than forwarded.
+
+Idempotency metrics track hit/miss rates, revealing how frequently clients are retrying and whether the network conditions are degrading.
+
+### Health Checks
+
+This project implements a three-tier health check system:
+
+1. **`/health/live`** (liveness probe): Returns 200 if the process is running. Kubernetes uses this to decide whether to restart a container.
+
+2. **`/health/ready`** (readiness probe): Tests connectivity to PostgreSQL and Redis by executing lightweight operations. A server that is alive but cannot reach the database should not receive WebSocket connections.
+
+3. **`/health`** (full health check): Returns detailed status including database and Redis latency measurements, circuit breaker states (open/closed/half-open), memory usage, and active connection counts. This is used by monitoring dashboards.
+
+The health check is particularly important for this project because WebSocket connections are sticky (a client stays on the same server for the duration of the connection). If a server becomes unhealthy, existing connections may continue working (P2P media flows independently of signaling), but new connections should be routed elsewhere. The readiness probe enables this routing without disrupting active calls.
+
+---
+
 ## Implementation Notes
 
 ### Local Architecture

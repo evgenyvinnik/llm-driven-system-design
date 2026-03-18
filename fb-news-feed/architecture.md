@@ -560,3 +560,171 @@ This section maps the production architecture to the actual local implementation
 - Load balancer (nginx/HAProxy) -- though multi-instance is supported via `npm run dev:server1/2/3`
 - Content moderation / spam detection
 - Image upload and storage (MinIO/S3) -- posts accept image URLs only
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root (Root)
+├── Header                          # Top navigation with logo, search, profile menu
+├── Outlet (route-specific content)
+│   ├── / (HomePage)                # Virtualized feed with post composer
+│   │   ├── PostComposer            # Create post with text, image URL, privacy
+│   │   ├── Virtualized feed        # @tanstack/react-virtual with dynamic heights
+│   │   │   └── PostCard[]          # Individual post with likes, comments, sharing
+│   │   │       ├── Avatar          # Reusable avatar with fallback initial
+│   │   │       ├── Button          # Styled button with loading state
+│   │   │       └── Comments        # Expandable, lazy-loaded comment section
+│   │   └── Loading / Empty / End   # Feed state indicators
+│   ├── /profile/$username          # User profile with posts + follower lists
+│   ├── /login                      # Login form
+│   └── /register                   # Registration form
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`): Manages authentication state with `persist` middleware. Unlike the other projects in this repository that use cookie-based sessions, this project uses token-based auth: the `token` field is stored in localStorage and attached to every API request as a `Bearer` token in the `Authorization` header. The `persist` middleware serializes only the `token` (not the user object) to localStorage under the key `auth-storage`. On app startup, `checkAuth` reads the token from localStorage and validates it against `/api/v1/auth/me`. If valid, the full user object is populated. If invalid or expired, the token is cleared. The `setUser` action allows profile updates to sync to the header immediately.
+
+**`useFeedStore`** (`stores/feedStore.ts`): Manages the home feed with cursor-based pagination and optimistic updates. Stores `posts` (accumulated array), `cursor` (opaque timestamp for next page), `hasMore` (pagination flag), `isLoading`, and `error`. The store provides six actions:
+
+- `fetchFeed(reset?)`: Loads posts from the API, appending to existing posts unless `reset=true`. Guards against concurrent loads and stops when `hasMore` is false.
+- `addPost(post)`: Prepends a newly created post to the array (used by PostComposer).
+- `removePost(postId)`: Removes a deleted post from the array.
+- `updatePost(postId, updates)`: Merges partial updates into a post (generic update).
+- `likePost(postId)`: Optimistic like with rollback on failure.
+- `unlikePost(postId)`: Optimistic unlike with rollback on failure.
+
+The like/unlike actions are the most architecturally interesting. They immediately update the local state (setting `is_liked` and incrementing/decrementing `like_count`), then fire the API call asynchronously. If the API call fails, the store rolls back to the previous state. This creates a zero-latency UI where the like button responds instantly regardless of network speed.
+
+### Routing
+
+TanStack Router with file-based routing. The home route uses a `beforeLoad` guard that checks for a token in localStorage and redirects to `/login` if absent. This is a declarative guard (using `throw redirect(...)`) rather than the imperative `useEffect` + `useNavigate` pattern used in the other projects.
+
+| File | URL Pattern | Purpose |
+|------|-------------|---------|
+| `routes/index.tsx` | `/` | Home feed with post composer (auth required) |
+| `routes/profile.$username.tsx` | `/profile/:username` | User profile with posts + followers |
+| `routes/login.tsx` | `/login` | Login form |
+| `routes/register.tsx` | `/register` | Registration form |
+
+### Data Fetching
+
+The API client (`services/api.ts`) is organized into four namespaces: `authApi`, `usersApi`, `postsApi`, and `feedApi`. It includes a custom `ApiError` class that carries the HTTP status code, enabling callers to distinguish between 401 (unauthorized), 404 (not found), and 500 (server error) responses.
+
+Authentication is handled differently from other projects: instead of `credentials: 'include'` for cookie-based sessions, this project uses `Authorization: Bearer {token}` headers. The `request` helper reads the token from localStorage and attaches it to every request. This approach works with stateless API servers (no server-side session storage needed for auth) but requires explicit token management on the client.
+
+Feed data flows through the `useFeedStore`, which handles pagination state. The home page triggers `fetchFeed(true)` on mount to load the initial feed, then relies on infinite scroll to load subsequent pages.
+
+### Virtualization
+
+The home feed uses `@tanstack/react-virtual` for efficient DOM rendering of large post lists. The virtualizer is configured with:
+
+- `estimateSize: () => 400`: Initial height estimate per post (header + content + actions).
+- `overscan: 3`: Renders 3 extra posts above and below the viewport for smoother scrolling.
+- `measureElement`: Uses `getBoundingClientRect().height` for dynamic height measurement. This is necessary because posts have variable heights (text length, images, expanded comments).
+
+Each virtualized item is positioned with `position: absolute` and `transform: translateY(...)`, which triggers GPU-accelerated compositing rather than CPU layout. The `ref={virtualizer.measureElement}` callback on each item tells the virtualizer the actual height after rendering, allowing it to correct its position estimates.
+
+**Infinite scroll**: A scroll event listener checks if the user is within 500px of the bottom of the scrollable area. If so, it calls `fetchFeed()` to load the next page. Guards prevent concurrent loads and stop loading when `hasMore` is false.
+
+### Optimistic Updates
+
+The FB News Feed frontend has the most sophisticated optimistic update pattern of the four projects:
+
+**Like/unlike with rollback**: When a user clicks "Like," the `useFeedStore.likePost` action immediately sets `is_liked: true` and increments `like_count` in the local state. The API call fires asynchronously. If the API call fails, the store reverses the change (sets `is_liked: false` and decrements `like_count`). This means the UI responds in <1ms regardless of network latency. The rollback ensures consistency: if the server rejects the like (e.g., the post was deleted), the UI self-corrects.
+
+**Post creation insert**: After `postsApi.createPost` resolves, the `PostComposer` calls `addPost(post)` to prepend the new post to the feed. The post appears at the top immediately because it is added to the front of the array. No full feed refresh is needed.
+
+**Post deletion**: After confirming and deleting via `postsApi.deletePost`, the `removePost(postId)` action filters the post from the array. The virtualizer automatically adjusts positions for the remaining posts.
+
+### Key UI Patterns
+
+**Celebrity badge**: The `PostCard` component renders a blue verified checkmark next to celebrity authors (users with `is_celebrity: true`). This surfaces the hybrid fan-out distinction in the UI: celebrity posts are pulled at read time rather than pushed.
+
+**Privacy indicator**: Posts display a globe icon for public posts and a people icon for friends-only posts, reflecting the `privacy` field. This gives users visual feedback about their post's visibility.
+
+**Expandable textarea**: The `PostComposer` textarea starts as a single-line pill-shaped input. On focus, it expands to 3 rows with rounded corners. On blur (if empty), it collapses back. This mimics Facebook's behavior where the composer is compact until actively used.
+
+**Lazy comment loading**: Comments are not loaded until the user clicks "Comment" or the comment count. The `PostCard` maintains local state for `comments`, `loadingComments`, and `showComments`. This avoids loading comments for posts the user scrolls past, which would waste bandwidth on a feed where most posts are not engaged with.
+
+---
+
+## Deep Pattern Explanations
+
+### Circuit Breaker
+
+A circuit breaker is a fault-tolerance pattern that prevents an application from repeatedly calling a failing service. When a downstream service (e.g., the database) becomes slow or unresponsive, continuing to send requests makes the problem worse: each request ties up a connection and a thread, eventually exhausting the caller's resources and causing a cascading failure.
+
+The implementation (`backend/src/shared/circuit-breaker.ts`) uses the Opossum library and wraps the feed generation function. The circuit breaker tracks the success/failure ratio of recent calls. When failures exceed the configured threshold, the circuit "opens" and immediately rejects all subsequent calls without attempting them (failing in <1ms instead of waiting 3-5 seconds for a timeout). After a cooldown period, the circuit enters "half-open" state and allows one test request. If it succeeds, normal operation resumes. If it fails, the circuit reopens.
+
+When the feed circuit breaker is open, the system degrades gracefully by showing popular/trending posts as a fallback instead of an error page. This ensures users still see content even when the personalized feed pipeline is failing.
+
+**Why not just set shorter timeouts?** Timeouts limit how long a single request waits, but they do not reduce load on the failing service. With a 3-second timeout and 100 concurrent users, the failing service still receives 100 requests. The circuit breaker eliminates all requests after the threshold is reached, giving the downstream service time to recover. The circuit breaker and timeout work together: the timeout detects individual failures, and the circuit breaker aggregates them into a system-level response.
+
+The circuit breaker state is exposed as a Prometheus gauge (`circuit_breaker_state`), enabling alerting when circuits open.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading" or "read-aside") is a caching strategy where the application manages the cache explicitly. On a read request, the application first checks the cache. If the data is present (cache hit), it is returned immediately without touching the database. If absent (cache miss), the application queries the database, writes the result to the cache with a TTL, and returns it.
+
+The implementation (`backend/src/shared/cache.ts`) uses Redis sorted sets for feed caching. When a user's feed is generated, the post IDs and their ranking scores are stored in a Redis sorted set (`feed:{userId}`) with a 24-hour TTL. Subsequent feed requests read from the sorted set using `ZREVRANGEBYSCORE` (retrieve by score range in descending order), which returns results in O(log N + M) time where M is the number of returned items.
+
+**Write-through for fan-out**: When a regular user creates a post, the fan-out process writes to both the database (`feed_items` table) and the Redis cache (`ZADD` to each follower's sorted set) simultaneously. This is write-through: the cache is updated at write time rather than lazily. Write-through is chosen for fan-out because the fan-out process already iterates over all followers, making the additional Redis writes a negligible cost.
+
+**Cache invalidation**: When a user follows or unfollows someone, their feed cache is invalidated (deleted), forcing a rebuild on the next request. This is simpler than surgically adding or removing posts from the cache, and the follow/unfollow frequency is low enough that rebuilds are inexpensive.
+
+### Structured Logging
+
+Structured logging means emitting log messages as JSON objects with named fields rather than concatenated text strings. Instead of `"2024-01-15 User 42 liked post abc-123"`, the log becomes `{"level":"info","msg":"post.liked","userId":"42","postId":"abc-123","component":"posts","requestId":"req-789","timestamp":"2024-01-15T10:30:00Z"}`.
+
+The implementation (`backend/src/shared/logger.ts`) uses Pino, which outputs JSON by default. Pino creates child loggers per component (e.g., `logger.child({ component: 'fanout' })`), so every log line from the fan-out service automatically carries the `component: "fanout"` field. In development, `pino-pretty` formats the JSON into colorized, human-readable output.
+
+**Why structured logging matters for fan-out debugging**: When a celebrity post fails to propagate to some followers, the operations team needs to trace the fan-out process. With structured logs, the query `component="fanout" AND postId="abc-123"` returns every step of that specific fan-out, including how many followers were processed, which batch failed, and what the error was. With text logs, this requires regex parsing across potentially millions of log lines.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that scrapes numerical measurements from your application at fixed intervals (typically every 15 seconds). The application exposes a `/metrics` endpoint that returns measurements in Prometheus text format. Prometheus stores these timestamped values, enabling temporal queries ("what was the p95 latency over the last hour") and alerting ("notify me when the error rate exceeds 1%").
+
+The four metric types:
+- **Counter**: Values that only increase (e.g., `fanout_operations_total`). Rates are derived: `rate(fanout_operations_total[5m])`.
+- **Histogram**: Value distributions in buckets (e.g., `feed_generation_duration_seconds`). Enables percentile queries.
+- **Gauge**: Values that can increase or decrease (e.g., `websocket_active_connections`). Represents current state.
+
+The implementation (`backend/src/shared/metrics.ts`) defines 15+ metrics. The fan-out metrics are unique to this project: `fanout_operations_total` is labeled by `author_type` (regular vs celebrity), showing the balance between push and pull. `fanout_followers_count` is a histogram showing the distribution of fan-out breadth, which helps tune the celebrity threshold (currently 10,000 followers).
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the application can serve traffic. They are consumed by two audiences: orchestration systems (Kubernetes, load balancers) and operations teams.
+
+The implementation (`backend/src/shared/health.ts`) provides three endpoints:
+- **`GET /health`**: Returns detailed component health (database latency, Redis latency) as JSON. Operations teams use this for debugging.
+- **`GET /health/live`**: Returns 200 if the process is running. Kubernetes uses this to detect hung processes. Does not check external dependencies.
+- **`GET /health/ready`**: Returns 200 if the application can handle requests. Checks database and Redis connectivity. Kubernetes uses this to control traffic routing.
+
+**Why separate liveness from readiness**: If liveness checked the database and the database went down temporarily, the orchestrator would restart all API instances simultaneously. The restart surge would send connection storms to the recovering database, potentially prolonging the outage. Liveness should only detect process-level failures (deadlocks, infinite loops), while readiness reflects dependency health.
+
+### Idempotency
+
+An idempotent operation produces the same result regardless of how many times it is executed. Network failures are inevitable in distributed systems: a client sends a POST request, the server processes it, but the response is lost. The client retries, and without idempotency, the server processes the request again, creating a duplicate.
+
+The implementation (`backend/src/shared/idempotency.ts`) uses Redis-backed idempotency keys. When a client sends a POST request with an `X-Idempotency-Key` header, the middleware constructs a composite key from `userId:path:clientKey`. Before processing, it checks Redis for this key. If found, the cached response is returned immediately (no database writes, no fan-out). If not found, the request is processed normally, and the response is stored in Redis with a 24-hour TTL.
+
+Only successful responses (2xx status) are cached. This prevents a scenario where a transient error (database timeout) is cached, causing all retries to receive the same error. Failed requests return normally, allowing the client to retry and potentially succeed.
+
+**Fail-open on cache errors**: If Redis is unavailable, the idempotency middleware allows the request through without deduplication. This trades potential duplicates for availability, which is the correct trade-off: a duplicate post is annoying but recoverable, while blocking all post creation during a Redis outage is not.
+
+### RBAC (Role-Based Access Control)
+
+RBAC assigns permissions to roles rather than individual users. The FB News Feed has two roles: `user` and `admin`. Instead of maintaining a permissions table listing what each user can do, the system checks the user's role and maps it to a predefined set of allowed operations.
+
+| Role | Permissions |
+|------|-------------|
+| `user` | Create/delete own posts, comment, like, follow/unfollow, view public content |
+| `admin` | All user permissions + view all users, delete any post, view system stats |
+
+The auth middleware extracts the user's role from the session (Redis lookup) and attaches it to the request context. Route handlers check `req.user.role === 'admin'` for admin-only operations. This is simpler than a full permission system (no permission tables, no role-permission mapping tables) and sufficient for a system with two roles.
+
+**Why not per-user permissions?** For 500M users, storing individual permissions would require a massive lookup table. With RBAC, role assignment is a single column on the users table. Adding a new role (e.g., `moderator`) means adding one row to the role definitions, not updating millions of user records. The trade-off: RBAC cannot express fine-grained permissions like "user 42 can edit posts in group X but not group Y." For that, you would need attribute-based access control (ABAC), which is significantly more complex.

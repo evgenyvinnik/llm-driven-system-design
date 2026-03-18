@@ -646,3 +646,161 @@ Pino logger with JSON output. Trace IDs (`X-Trace-Id`) propagated through reques
 - Content moderation and spam detection
 - A/B testing framework
 - Skills assessment and certification
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root (RootComponent)
+├── Navbar                          # Top navigation with search, nav links, profile
+├── Outlet (route-specific content)
+│   ├── / (HomePage)                # 3-column layout: profile card | feed | PYMK
+│   │   ├── Profile Card (sidebar)  # Mini profile with avatar, headline, connections link
+│   │   ├── Post Composer           # Inline post creation with action buttons
+│   │   ├── PostCard[]              # Feed posts with like/comment/share actions
+│   │   │   └── Comments section    # Expandable, lazy-loaded on demand
+│   │   └── PYMK sidebar           # People You May Know suggestions
+│   ├── /network                    # Connection management with 3 tabs
+│   │   ├── Connections tab         # Grid of ConnectionCard components
+│   │   ├── Requests tab            # Pending requests with accept/reject
+│   │   └── PYMK tab               # Grid of ConnectionCard with match reasons
+│   ├── /profile/$userId            # Full professional profile
+│   │   ├── ProfileHeader           # Banner, avatar, name, connection actions
+│   │   ├── EditProfileModal        # Modal form for editing profile fields
+│   │   ├── ProfileAbout            # Summary/about section
+│   │   ├── ExperienceSection       # Work history with company info
+│   │   ├── EducationSection        # Education history
+│   │   ├── SkillsSection           # Skills with endorsement counts
+│   │   └── ActivitySection         # Recent posts
+│   ├── /jobs                       # 2-column: sidebar nav | job listings
+│   │   ├── Search form + filters   # Keyword, location, remote, type, level
+│   │   ├── JobCard[]               # Job listings with match scores
+│   │   └── Recommended tab         # Jobs matched to user profile
+│   ├── /jobs/$jobId                # Job detail page
+│   ├── /search                     # User search results
+│   ├── /login                      # Login form
+│   └── /register                   # Registration form
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`): Manages authentication state with the `persist` middleware. Stores `user` (the full `User` object) and `isAuthenticated` (boolean) in localStorage under the key `linkedin-auth`. Provides `login`, `register`, `logout`, `checkAuth`, and `updateUser` actions. The `checkAuth` action is called from the root route's `useEffect` on every app mount, validating the session cookie against `/api/auth/me`. If validation fails (expired session, server restart), the store clears both `user` and `isAuthenticated`, redirecting to login.
+
+The `updateUser` action is notable: it allows the profile edit flow to update the cached auth user without re-fetching from the server, keeping the navbar display name and headline in sync immediately after a profile edit.
+
+The project does not use separate stores for feed, connections, or jobs. All data is fetched and managed as local component state within each route. This keeps the architecture simple but means navigating away from a page discards all fetched data.
+
+### Routing
+
+TanStack Router with file-based routing. The root layout renders `Navbar` globally and uses `Outlet` for route-specific content. Authentication guards are implemented imperatively: each protected route checks `isAuthenticated` in its `useEffect` and redirects to `/login` via `useNavigate` if not authenticated.
+
+| File | URL Pattern | Purpose |
+|------|-------------|---------|
+| `routes/index.tsx` | `/` | Home feed with post composer + PYMK sidebar |
+| `routes/network.tsx` | `/network` | Connection management (connections, requests, PYMK) |
+| `routes/profile.$userId.tsx` | `/profile/:userId` | Full professional profile |
+| `routes/jobs.tsx` | `/jobs` | Job search and recommendations |
+| `routes/jobs.$jobId.tsx` | `/jobs/:jobId` | Job detail and application |
+| `routes/search.tsx` | `/search` | User search |
+| `routes/login.tsx` / `routes/register.tsx` | `/login`, `/register` | Authentication |
+
+### Data Fetching
+
+The API client (`services/api.ts`) is organized into domain-specific namespaces: `authApi`, `usersApi`, `connectionsApi`, `feedApi`, and `jobsApi`. Each namespace groups related endpoints with typed request/response signatures. All requests use `credentials: 'include'` for cookie-based session forwarding.
+
+Routes use `Promise.all` for parallel data loading. The home page loads feed posts and PYMK suggestions simultaneously. The network page loads connections, pending requests, and PYMK in a single parallel batch. The profile page loads profile data and user posts in parallel, then conditionally loads connection degree and mutual connections for non-own profiles.
+
+The jobs page loads all jobs and recommended jobs in parallel on mount, then uses a dedicated search handler for filtering. Search triggers a fresh API call with query parameters (keyword, location, remote flag, employment type, experience level) rather than client-side filtering.
+
+### Optimistic Updates
+
+The LinkedIn frontend uses a mixed approach to UI updates:
+
+**Immediate local state updates**: When accepting a connection request, the handler calls `connectionsApi.acceptRequest`, then immediately moves the user from `pendingRequests` to `connections` in local state. The UI updates before the API call completes. If the API call fails, the error is logged but the UI is not rolled back, which is acceptable for a learning project.
+
+**Post-creation insert**: After creating a post via `feedApi.createPost`, the returned post object is prepended to the local `posts` array with the current user as the author: `setPosts([{ ...post, author: user! }, ...posts])`. This ensures the new post appears at the top of the feed immediately.
+
+**Endorsement increment**: When endorsing a skill, the handler calls the API and then locally increments the `endorsement_count` for that skill in the skills array via `setSkills(skills.map(...))`. This avoids re-fetching the entire skills list.
+
+### Key UI Patterns
+
+**Tabbed interfaces**: Both the network page and jobs page use tab-based navigation implemented with local state (`activeTab`). Tabs switch between different data views (connections/requests/PYMK, search/recommended) without changing the URL. All tab data is loaded in parallel on mount, so switching tabs is instant.
+
+**Lazy-loaded comments**: The `PostCard` component does not load comments until the user clicks "Comment" or the comment count. This prevents unnecessary API calls for posts the user scrolls past. Once loaded, comments are cached in local component state.
+
+**Connection degree display**: The profile page displays connection degree (1st, 2nd, 3rd) and mutual connections for non-own profiles. This data is fetched in a second parallel batch after profile data loads, since it requires a separate graph query.
+
+**Modal-based editing**: Profile editing uses a modal (`EditProfileModal`) that pre-fills form fields from the current profile. On save, the updated user is set in both the local profile state and the global auth store (via `updateUser`), keeping the navbar in sync.
+
+---
+
+## Deep Pattern Explanations
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. Without it, a single user (or bot) can overwhelm the server by sending thousands of requests per second, degrading performance for everyone. Rate limiting protects both against malicious abuse (credential stuffing, scraping) and accidental abuse (buggy client code in an infinite retry loop).
+
+The implementation (`src/utils/rateLimiter.ts`) uses a Redis-backed token bucket algorithm. Each user starts with a "bucket" of tokens (e.g., 100 tokens for read operations). Every request consumes one token. Tokens refill at a steady rate (100 per minute). When the bucket is empty, subsequent requests receive a `429 Too Many Requests` response with `X-RateLimit-Remaining: 0` and `X-RateLimit-Reset: <unix-timestamp>` headers telling the client when to retry.
+
+The system uses different rate limits for different endpoint categories because different operations have different costs and abuse risks:
+
+| Category | Limit | Rationale |
+|----------|-------|-----------|
+| Public (login/register) | 10/min | Prevents credential stuffing attacks |
+| Read (GET) | 100/min | Generous for normal browsing, blocks scraping |
+| Write (POST/PUT) | 30/min | Prevents spam posting |
+| Connection requests | 20/min | Prevents mass-connect spam |
+| Search | 20/min | Search is expensive (Elasticsearch query per request) |
+
+The token bucket is implemented as a Lua script executed atomically in Redis. Lua scripting is necessary because the "check remaining tokens and decrement" operation must be atomic. If implemented as separate Redis GET and SET commands, a race condition between two concurrent requests could allow both to pass when only one token remains.
+
+**Fail-open design**: If Redis is down, the rate limiter allows all requests instead of blocking them. This trades abuse protection for availability. The rationale: a Redis outage is temporary, and blocking all users during that window causes more harm than temporarily allowing unlimited requests.
+
+### Structured Logging
+
+Structured logging means emitting log messages as machine-parseable JSON objects rather than free-form text strings. Instead of `"2024-01-15 10:30:00 INFO User 42 sent connection request to user 87"`, a structured log produces `{"level":"info","msg":"connection.request.sent","fromUserId":42,"toUserId":87,"traceId":"abc-123","timestamp":"2024-01-15T10:30:00Z"}`.
+
+The implementation uses Pino (`src/utils/logger.ts`), which outputs JSON by default. Every request receives a unique trace ID via the `X-Trace-Id` header, which propagates through the entire request lifecycle. This means every log line emitted during a request carries the same trace ID, making it possible to reconstruct the full request flow across all middleware, route handlers, and service functions.
+
+**Why JSON over text**: Log aggregation systems (Elasticsearch, Datadog, Grafana Loki) can index JSON fields for fast querying. A query like `traceId="abc-123" AND level="error"` returns all errors from a specific request in milliseconds. With text logs, this requires regex parsing, which is slower by orders of magnitude and brittle when log formats change.
+
+### Prometheus Metrics
+
+Prometheus is a time-series database that scrapes numerical measurements from your application at regular intervals (typically every 15 seconds). The application exposes a `/metrics` endpoint that returns metrics in Prometheus text format. Prometheus stores these measurements with timestamps, enabling queries like "what was the p95 latency over the last hour" or "how many requests returned 500 errors in the last 5 minutes."
+
+The four metric types are:
+- **Counter**: Monotonically increasing value (e.g., `connections_created_total`). You calculate rates using PromQL: `rate(connections_created_total[5m])` gives connections per second.
+- **Histogram**: Distribution of values in configurable buckets (e.g., `http_request_duration_seconds`). Enables percentile calculations: `histogram_quantile(0.95, ...)` gives the p95 latency.
+- **Gauge**: Value that can increase or decrease (e.g., `queue_depth`, `active_sessions`). Represents current state.
+- **Summary**: Client-side percentile calculation (less common than histograms).
+
+The implementation (`src/utils/metrics.ts`) defines 20+ custom metrics covering HTTP traffic, business events (connections, posts, likes), algorithm performance (PYMK computation time, feed generation time), infrastructure health (queue depth, cache hits/misses), and security events (rate limit violations, login attempts). Default Node.js metrics (CPU, memory, event loop lag, GC duration) are included automatically via `collectDefaultMetrics()`.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the application can serve requests. They exist for two audiences: orchestration systems (Kubernetes) and operations teams.
+
+- **`GET /health`**: Returns detailed status of every dependency (PostgreSQL, Valkey, RabbitMQ) with individual latency measurements. An operations engineer uses this to diagnose which component is degraded.
+- **`GET /health/live`**: Returns 200 if the process is alive. Kubernetes uses this to detect hung processes. This must never check external dependencies, because a database outage should not cause the orchestrator to restart all API instances simultaneously (cascading failure).
+- **`GET /health/ready`**: Returns 200 if the application can serve traffic. Checks that the database connection pool is active and Redis is reachable. Kubernetes uses this to decide whether to route traffic to this instance. A newly started instance that has not yet established database connections will fail readiness, so the load balancer skips it until it is ready.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of checking "does user 42 have permission to delete this post," the system checks "does user 42 have the admin role, and does the admin role include the delete-any-post permission."
+
+In the LinkedIn implementation, users have a `role` column with values `user`, `recruiter`, or `admin`. The auth middleware extracts the user's role from the session. Route-level authorization checks whether the role has sufficient privileges for the requested operation. For example, only users with the `admin` role can view all users' audit logs, while any authenticated user can view their own connections.
+
+**Why roles instead of per-user permissions**: With 900M users, storing individual permissions per user is infeasible. Roles group permissions into a small set (3 roles), and assigning a role to a user is a single column update. Adding a new permission (e.g., "can pin posts") means updating the role definition in code, not modifying millions of user records.
+
+### Redis Cache-Aside
+
+Cache-aside (also called "lazy loading") is a caching pattern where the application checks the cache before querying the database. If the cache has the data (cache hit), return it immediately. If not (cache miss), query the database, store the result in the cache with a TTL, and return it.
+
+The implementation uses this pattern for PYMK results and feed data. When a user requests their PYMK suggestions, the service first checks Valkey for `pymk:{userId}`. If found, the cached result is returned in <1ms. If not, the PYMK algorithm runs (50-200ms), the result is stored in Valkey with a 24-hour TTL, and subsequent requests hit the cache.
+
+**Why not write-through?** Write-through updates the cache on every database write. For PYMK, the inputs (connections, experience, skills) change infrequently but the computation is expensive. Write-through would recompute PYMK every time a user updates their profile, wasting computation. Cache-aside with a long TTL (24 hours) amortizes the computation cost.
+
+**Cache invalidation**: The hardest problem in computer science. Feed caches are explicitly deleted when a user creates a post (`cacheDel('feed:${connId}')` for the first 50 connections). This ensures high-priority connections see fresh content immediately, while others see it within the TTL window.

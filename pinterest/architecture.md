@@ -648,3 +648,144 @@ Pino logger with JSON output (`pino-http` for request logging), including servic
 - Image moderation / NSFW detection
 - Pinterest Lens (visual search from camera)
 - Rich pins (recipe, product, article metadata)
+
+---
+
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root (RootLayout)
+├── Header                          # Fixed top bar with logo, search, auth controls
+├── Outlet (route-specific content)
+│   ├── / (HomePage)                # Masonry grid feed with search overlay
+│   │   ├── MasonryGrid             # Virtualized masonry layout container
+│   │   │   └── PinCard[]           # Individual pin with dominant color placeholder
+│   │   └── SaveToBoard (modal)     # Board selection modal for saving pins
+│   ├── /pin/$pinId                 # Pin detail with full image + comments
+│   ├── /create                     # Pin creation with file upload
+│   ├── /profile/$username          # User profile with Created/Saved tabs
+│   │   ├── MasonryGrid             # User's pins in masonry layout
+│   │   └── BoardGrid               # User's boards in a standard grid
+│   │       └── BoardCard[]         # Board thumbnail with pin count
+│   ├── /board/$boardId             # Board detail with pins in masonry
+│   ├── /login                      # Login form
+│   └── /register                   # Registration form
+```
+
+### Zustand Stores
+
+**`useAuthStore`** (`stores/authStore.ts`): Manages authentication state without persistence middleware. Stores `user`, `isLoading`, and `error`. The `checkAuth` action is called on app mount to validate the session cookie. Unlike other projects in this repository that use `persist`, this store does not cache the user in localStorage. Every page load validates against the server, which is simpler but means a brief loading spinner on every cold start.
+
+**`usePinStore`** (`stores/pinStore.ts`): Manages the feed state with cursor-based pagination. Stores `feedPins` (array of loaded pins), `feedCursor` (opaque cursor string for the next page), `feedLoading`, and `feedError`. Provides two loading actions: `loadFeed` (personalized, from followed users) and `loadDiscoverFeed` (popular pins, for unauthenticated users). Both actions append to the existing `feedPins` array unless `reset=true` is passed. A guard prevents concurrent loads (`if (state.feedLoading) return`) and stops loading when the cursor is exhausted. The `clearFeed` action resets the store when the user logs in/out or when switching between search and feed modes.
+
+This two-store architecture (auth + feed) is the minimum needed: auth state is global, and feed state must persist across the MasonryGrid's re-renders during scroll.
+
+### Routing
+
+TanStack Router with file-based routing. The root layout renders a fixed `Header` with `pt-[64px]` padding on the main content area to prevent overlap.
+
+| File | URL Pattern | Purpose |
+|------|-------------|---------|
+| `routes/index.tsx` | `/` | Home feed (masonry grid) or search results via `?q=` |
+| `routes/pin.$pinId.tsx` | `/pin/:pinId` | Pin detail with comments |
+| `routes/create.tsx` | `/create` | Pin creation with file upload |
+| `routes/profile.$username.tsx` | `/profile/:username` | User profile (pins + boards) |
+| `routes/board.$boardId.tsx` | `/board/:boardId` | Board detail with pins |
+| `routes/login.tsx` / `routes/register.tsx` | `/login`, `/register` | Authentication |
+
+Search is handled inline on the home page via the `?q=` search parameter. When `q` is present and at least 2 characters, the home page switches from feed mode to search mode, displaying search results in the same MasonryGrid.
+
+### Data Fetching
+
+The API client (`services/api.ts`) exports individual async functions (not a namespace object) for each endpoint. Each function is fully typed with request and response types. The client handles FormData for image uploads by conditionally omitting the `Content-Type` header (letting the browser set the multipart boundary). All requests include `credentials: 'include'` for session cookies.
+
+Feed data flows through the `usePinStore` rather than being managed locally in the route. This is necessary because the masonry grid performs infinite scroll, and the accumulated pin array must persist across scroll-triggered re-renders. The store's `loadFeed` action appends new pins to the existing array rather than replacing it.
+
+Pin detail, board detail, and profile data are fetched locally within their respective route components using `useEffect` + `useState`, since these pages do not need cross-component state sharing.
+
+### Virtualization
+
+The `MasonryGrid` component combines two techniques: the custom `useMasonryLayout` hook for column assignment and `@tanstack/react-virtual` for scroll-based DOM management.
+
+**`useMasonryLayout` hook** (`hooks/useMasonryLayout.ts`): Takes an array of pins, a column count, and a column width. For each pin, it finds the shortest column, calculates the pin's pixel height from `columnWidth * pin.aspectRatio`, and records the pin's column index and absolute `top` position. The output is an array of `MasonryItem` objects with pre-calculated positions and a `totalHeight` for the container. The hook is memoized with `useMemo` on `[pins, columnCount, columnWidth]` to avoid recalculation on unrelated re-renders.
+
+**Responsive columns**: A `ResizeObserver` watches the container width and recalculates the column count based on a minimum column width of 236px. This produces 2 columns on phones, scaling up to 6 columns on wide screens. The column width is computed dynamically: `(containerWidth - GAP * (columnCount - 1)) / columnCount`.
+
+**Infinite scroll**: A scroll event listener on the parent element checks if the user is within 500px of the bottom. If so, it calls `onLoadMore` to trigger the next page fetch from the `usePinStore`.
+
+**Absolute positioning over CSS columns**: Items are placed using `position: absolute` with computed `left` and `top` values. This gives the layout algorithm full control over item placement order. CSS `column-count` would reflow items top-to-bottom within columns (reading order mismatches relevance order), and CSS Grid cannot produce variable-height masonry without JavaScript assistance.
+
+### Key UI Patterns
+
+**Dominant color placeholders**: The `PinCard` component sets the image container's `backgroundColor` to `pin.dominantColor || '#e8e8e8'`. The image loads with `opacity: 0` and transitions to `opacity: 1` via a CSS transition once the `onLoad` event fires. This creates a smooth fade-in effect where the colored placeholder is visible until the actual image downloads, eliminating layout shift and the jarring grey-to-image flash.
+
+**Aspect ratio preservation**: Each pin card uses `paddingBottom: ${aspectRatio * 100}%` on a relative container, with the image positioned `absolute inset-0`. This CSS technique ensures the container has the correct height before the image loads, preventing layout reflow. The `aspectRatio` value (height/width) is computed server-side during image processing and stored in the database.
+
+**Save-to-board modal**: The `SaveToBoard` component is a modal overlay that lazy-loads the user's boards on open. Users select an existing board or create a new one inline. Board creation auto-saves the pin to the newly created board, reducing the interaction to a single flow. The modal uses `onClick: e.stopPropagation()` on the dialog content to prevent closing when clicking inside the form.
+
+**Feed mode switching**: The home page supports three modes: personalized feed (logged-in), discover feed (logged-out), and search results (when `?q=` is present). The `usePinStore` provides separate actions for each feed type, and the route component switches between them based on auth state and URL parameters.
+
+---
+
+## Deep Pattern Explanations
+
+### Circuit Breaker
+
+A circuit breaker is a fault-tolerance pattern that prevents an application from repeatedly calling a failing external service. The concept is borrowed from electrical engineering: when current exceeds a threshold, the circuit breaker trips, stopping the flow to prevent damage. In software, when an external service (MinIO, RabbitMQ) starts returning errors, the circuit breaker "opens" and immediately rejects subsequent calls without attempting them. This prevents cascading failures where one slow or failing service causes all threads/connections in the calling service to block.
+
+The implementation (`src/services/circuitBreaker.ts`) uses the Opossum library. A circuit breaker wraps a function call (e.g., uploading to MinIO). It tracks the success/failure ratio of recent calls. When failures exceed 50% across the last 5 attempts, the circuit opens. In the open state, all calls fail immediately (in <1ms) without contacting the external service. After a reset timeout (30 seconds), the circuit enters a "half-open" state where it allows a single test request through. If that request succeeds, the circuit closes and normal operation resumes. If it fails, the circuit reopens for another 30 seconds.
+
+**Why not just retry?** Retrying a failing service adds load to an already-overloaded system. If MinIO is responding slowly due to disk I/O saturation, sending more requests makes the problem worse. The circuit breaker removes load from the failing service, giving it time to recover. Without a circuit breaker, the image upload endpoint would hang for the connection timeout (30 seconds) on every request, exhausting the Express connection pool and making the entire API unresponsive.
+
+State transitions are logged via Pino so operations teams can see when circuits open and close. In a production environment, circuit breaker state would also be exposed as a Prometheus gauge for alerting.
+
+### Structured Logging
+
+Structured logging means emitting log messages as machine-parseable JSON objects rather than free-form text. A traditional log line like `"Image processing failed for pin abc-123"` is readable by humans but difficult for machines to filter, aggregate, or alert on. A structured log for the same event: `{"level":"error","msg":"image.processing.failed","pinId":"abc-123","error":"ENOENT: file not found","duration":1234,"service":"image-worker","timestamp":"2024-01-15T10:30:00Z"}`.
+
+The implementation uses Pino (`src/services/logger.ts`) with `pino-http` for automatic request logging. Pino is chosen over alternatives (Winston, Bunyan) because it is the fastest Node.js logger, achieving performance through deferred serialization and direct stream writing.
+
+Both the API server and the image worker use the same logger configuration, ensuring consistent structured fields across processes. This is important because the image processing pipeline spans two processes: the API server enqueues the job, and the worker processes it. Without consistent structured logging, correlating a failed image upload across both processes requires manual timestamp matching.
+
+### Prometheus Metrics
+
+Prometheus is a time-series monitoring system that collects numerical measurements from your application at regular intervals. Your application exposes a `/metrics` endpoint that Prometheus periodically scrapes (typically every 15 seconds). Prometheus stores these timestamped values, enabling queries over time windows.
+
+The four metric types serve different purposes:
+- **Counter** (e.g., `pins_created_total`): Only goes up. Rates are calculated by Prometheus: `rate(pins_created_total[5m])` gives pins created per second.
+- **Histogram** (e.g., `image_processing_duration_seconds`): Records value distributions in pre-defined buckets. Enables percentile queries: `histogram_quantile(0.99, ...)`.
+- **Gauge** (e.g., current queue depth): Can go up or down, representing instantaneous state.
+
+The implementation (`src/services/metrics.ts`) tracks HTTP request latency/count, business events (pins created, saves), and image processing performance (duration, errors). The image processing duration histogram is particularly valuable: it reveals whether the Sharp image processing step, MinIO upload, or database update is the bottleneck.
+
+### Rate Limiting
+
+Rate limiting restricts how many requests a client can make within a time window. The implementation uses `express-rate-limit` with a Redis backend (`rate-limit-redis`) for distributed rate limiting across multiple API server instances.
+
+Different endpoints have different limits because they have different costs:
+- Pin creation (10/min): Each creation triggers a file upload to MinIO and a RabbitMQ message, both of which consume infrastructure resources.
+- Login attempts (5/min): Prevents credential stuffing (automated password guessing).
+- Follow actions (30/min): Prevents follow/unfollow spam.
+
+The Redis backend is essential for distributed rate limiting. If rate limits were stored in-memory (the default), each API server instance would have its own counter. A user could hit 10 requests on server A, then 10 more on server B, effectively doubling their allowed rate. With Redis, all instances share the same counter.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report whether the application can serve requests. The implementation provides two endpoints:
+
+- **`GET /api/health`**: Returns overall health status with a timestamp. Checks PostgreSQL and Valkey connectivity.
+- **`GET /api/health/live`**: Lightweight liveness probe that returns 200 if the process is running.
+
+In a production deployment, Kubernetes uses the liveness probe to detect hung processes (the event loop is blocked, the process has deadlocked). If liveness fails, Kubernetes kills and restarts the container. The liveness probe intentionally does not check external dependencies because a MinIO outage should not trigger a restart of all API servers.
+
+### Idempotency
+
+An idempotent operation produces the same result no matter how many times it is executed. This is critical because network failures make it impossible to distinguish "the request never reached the server" from "the request succeeded but the response was lost." In both cases, the client retries.
+
+The Pinterest implementation uses three idempotency mechanisms:
+
+1. **Database constraints**: `pin_saves` has `UNIQUE(pin_id, user_id, board_id)`. Save operations use `INSERT ... ON CONFLICT DO NOTHING`. A duplicate save is silently ignored.
+2. **Client-generated idempotency keys**: Pin creation accepts an `X-Idempotency-Key` header (UUID). The server stores this key in Valkey with a 24-hour TTL. If a duplicate request arrives with the same key, the server returns the original response without creating a second pin. This prevents duplicate uploads from network retries or double-clicks.
+3. **Worker idempotency**: Each step in the image processing worker is idempotent. Uploading a thumbnail to MinIO overwrites the same object key. Updating the database sets absolute values (`status='published'`, `aspect_ratio=0.75`), not increments. If a worker crashes and RabbitMQ redelivers the message to another worker, the second processing produces identical results.

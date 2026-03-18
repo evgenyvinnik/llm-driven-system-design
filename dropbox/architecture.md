@@ -594,6 +594,147 @@ On SIGTERM/SIGINT: stop accepting new HTTP connections, close WebSocket connecti
 | Session storage | Redis + cookie | JWT | Immediate revocation, quota tracking |
 | Queue technology | RabbitMQ | Kafka | Simpler operations; sufficient for background jobs |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+__root.tsx (bare Outlet, no shared layout)
+├── / (FileBrowser) [auth required]
+│   ├── Sidebar (navigation: files, shared with me, storage quota)
+│   ├── Breadcrumbs (folder path navigation)
+│   ├── UploadZone (drag-and-drop + upload button + progress overlay)
+│   ├── FileListItem (per-file row with actions)
+│   ├── CreateFolderModal
+│   ├── ShareModal (create share links, folder sharing)
+│   ├── VersionHistoryModal (version list + restore)
+│   └── MoveModal (move file/folder to different parent)
+├── /login (LoginPage)
+├── /register (RegisterPage)
+├── /admin (AdminPage) [admin role required]
+├── /settings (SettingsPage)
+└── /shared (SharedFilePage) [public, token-based access]
+```
+
+The root route (`__root.tsx`) is minimal -- it renders only an `<Outlet />` with no shared header or footer. Each route manages its own full-page layout. The main file browser at `/` uses a sidebar + main content layout with the sidebar providing navigation between "My Files" and "Shared with me" views.
+
+### TanStack Router Structure
+
+The project uses TanStack Router's file-based routing. The root route at `/` accepts an optional `folder` search parameter (`?folder={folderId}`) for navigating into subfolders without changing the URL path. This means all folder navigation stays on the `/` route and updates only the query string.
+
+| Route File | Path | Purpose |
+|------------|------|---------|
+| `__root.tsx` | N/A | Bare Outlet wrapper |
+| `index.tsx` | `/` | Main file browser with `?folder=` search param |
+| `login.tsx` | `/login` | Login form |
+| `register.tsx` | `/register` | Registration form |
+| `admin.tsx` | `/admin` | Admin dashboard (system stats, user management) |
+| `settings.tsx` | `/settings` | User settings |
+| `shared.tsx` | `/shared` | Public shared file access (token-based) |
+
+Route validation is implemented in the index route using `validateSearch` to extract and type the `folder` search parameter. Auth checks use `useEffect` to redirect unauthenticated users to `/login`.
+
+### Zustand Stores
+
+**`authStore`** -- Manages user authentication state with `persist` middleware. Unlike the other projects, this store persists the session `token` (not the user object) to localStorage, allowing session restoration on page reload. Provides `login`, `register`, `logout`, and `checkAuth` actions. `checkAuth` calls `GET /api/auth/me` to refresh the user object from the server.
+
+**`fileStore`** -- The most complex store in any of the four projects. Manages the current folder view, upload queue, and file selection state. Key fields:
+- `currentFolder`: Contains the folder metadata, breadcrumbs array, and items list for the currently displayed folder.
+- `uploadingFiles`: An array of upload tracking objects with per-file progress (0-100%), status (`pending`/`uploading`/`completed`/`error`), and error messages.
+- `selectedItems`: A `Set<string>` of selected file/folder IDs for future bulk operations.
+
+The store provides `loadFolder(folderId?)` for navigation, `uploadFile(file)` which manages the full upload lifecycle including progress tracking, and CRUD operations (`createFolder`, `deleteItem`, `renameItem`, `moveItem`) that automatically refresh the current folder view after completion.
+
+### Data Fetching Pattern
+
+API calls are organized by resource across four exported objects in `frontend/src/services/api.ts`: `authApi`, `filesApi`, `sharingApi`, and `adminApi`. Each uses a shared `request<T>()` helper that wraps `fetch` with credentials, JSON headers, and error handling.
+
+File uploads use `XMLHttpRequest` instead of `fetch` because XHR supports `upload.onprogress` events for tracking upload progress -- the `fetch` API does not provide upload progress callbacks. The `filesApi.uploadFile` method returns a Promise that resolves when the upload completes, while calling an `onProgress` callback with percentage values during transfer.
+
+File downloads use raw `fetch` (bypassing the JSON wrapper) and return the Response object directly, allowing the caller to stream the binary response or create a download link.
+
+### Real-Time Updates
+
+The Dropbox frontend connects to the backend via WebSocket (`/ws?token={sessionToken}`) for real-time sync notifications. When another device or browser tab uploads, deletes, or moves a file, the server publishes a sync event via Redis pub/sub, and all connected WebSocket clients for that user receive a notification. The client then calls `loadFolder()` to refresh the current folder view. This is a notification-driven refresh pattern -- the WebSocket message triggers a full API call rather than carrying the updated data inline.
+
+### Key UI Patterns
+
+**Drag-and-drop upload zone**: The `UploadZone` component uses `react-dropzone` to detect files dragged over the browser window. When files are dropped, each file is passed to `fileStore.uploadFile()`, which tracks upload progress in the `uploadingFiles` array. A floating progress panel in the bottom-right corner shows per-file upload status with animated progress bars. Completed uploads auto-dismiss after 3 seconds.
+
+**Breadcrumb navigation**: The `Breadcrumbs` component renders the folder hierarchy as clickable path segments. Clicking a breadcrumb navigates to that folder by updating the `?folder=` search parameter. The breadcrumb data comes from the API response (`currentFolder.breadcrumbs`), which includes the full path from root to the current folder.
+
+**Modal-driven file operations**: Sharing, version history, moving, and folder creation each use dedicated modal components. The parent `FileBrowser` manages modal visibility via state variables (`shareItem`, `versionItem`, `moveModalItem`, `showCreateFolder`). Each modal receives the relevant file/folder item and a callback for the operation.
+
+**Folder navigation via query string**: Instead of using nested routes (`/folder/abc/folder/def`), the file browser uses a single route with `?folder={id}`. This simplifies routing but means the browser's back/forward buttons navigate between folder views correctly via the query string history.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, why it matters for a cloud storage service, and how it works in practice.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is a method of restricting system access based on roles assigned to users rather than checking individual permissions for each action. Instead of maintaining a list of "user X can do Y on resource Z" for every possible combination, the system assigns each user a role and defines what each role can do.
+
+**Why Dropbox needs it:** A cloud storage service has a layered permission model. At the system level, there are two roles: regular users (who manage their own files) and admins (who manage all users, view system stats, and run maintenance). At the file/folder level, there are three access levels: Owner (full control), Editor (read + write), and Viewer (read only). Without RBAC, there would be no way to distinguish between a user viewing their own files, a collaborator editing a shared folder, and an admin managing storage quotas. The folder hierarchy adds complexity because permissions inherit downward -- sharing a folder grants access to all files and subfolders within it.
+
+**How it works here:** The `users` table has a `role` column (`user` or `admin`). The `folder_shares` table maps folder-to-user relationships with an `access_level` column (`view`, `edit`, `owner`). The auth middleware in `backend/src/middleware/auth.ts` validates the session and attaches the user object (including role) to the request. File operation endpoints check both the system role (for admin access) and the per-file ownership/sharing permissions (for collaborator access). The authorization check walks up the folder hierarchy to find inherited shares.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called lazy-loading) is a caching strategy where the application checks the cache first for each read request. On a cache hit, the cached value is returned immediately. On a cache miss, the application queries the database, stores the result in the cache, and returns it. The application explicitly manages cache population and invalidation.
+
+**Why Dropbox needs it:** Folder listing is the most frequently called operation in a file storage service -- every time a user navigates to a folder, opens the app, or refreshes the page, the server must query all files and subfolders. Without caching, each folder navigation queries PostgreSQL with joins across the `files` table, potentially scanning thousands of rows for users with many files. With cache-aside, repeated views of the same folder (which is the common case -- users spend most time in a few folders) return instantly from Redis.
+
+**How it works here:** The Redis key pattern `cache:folder:{folderId}:listing` stores the serialized JSON of a folder's contents with a 5-minute TTL. On folder navigation, the server checks this key first. On any write operation that affects a folder (file upload, delete, rename, move, folder creation), the cache for the affected folder is invalidated via `redis.del()`. The root folder has a separate key pattern (`cache:folder:root:{userId}:listing`) because root folders are user-specific. File metadata is cached separately at `cache:file:{fileId}` with a 10-minute TTL for individual file lookups.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker is a stability pattern that monitors calls to an external dependency and stops sending requests when the dependency is failing. It has three states: Closed (normal operation, requests pass through), Open (dependency is failing, requests are rejected immediately without attempting the call), and Half-Open (a test request is allowed through after a cooldown period to check if the dependency has recovered).
+
+**Why Dropbox needs it:** The API server depends on PostgreSQL, Redis, and MinIO (S3-compatible object storage). MinIO is particularly critical because file uploads and downloads directly interact with it. If MinIO becomes unresponsive (disk full, network partition), continuing to send upload requests would cause all upload handlers to hang waiting for timeouts, exhausting the Node.js event loop and making the entire API unresponsive -- even for operations that do not need MinIO (like folder listing from cache, authentication). The circuit breaker detects MinIO failures and immediately rejects upload attempts with 503, keeping the rest of the API responsive.
+
+**How it works here:** The circuit breaker in `backend/src/shared/circuitBreaker.ts` uses the `cockatiel` library (rather than Opossum used in other projects). It wraps MinIO operations (chunk upload, chunk download, chunk existence check) with a circuit that opens after 5 consecutive failures and resets after 30 seconds. Retry logic is built into the same module: 3 retries with exponential backoff and jitter for transient storage failures. The circuit breaker state is exposed as a Prometheus gauge (`circuit_breaker_state`) and reported in the health check response, allowing the load balancer to route traffic away from instances with open circuits.
+
+### Structured Logging
+
+**What it is:** Structured logging emits log entries as machine-parseable JSON objects with consistent, typed fields rather than free-form text strings. Each log entry has a fixed schema (timestamp, level, service, message) plus context-specific fields that allow log aggregation tools to filter, search, and correlate events across distributed services.
+
+**Why Dropbox needs it:** A cloud storage service generates diverse log events: file uploads (with chunk index, hash, dedup status), downloads (with file ID, byte range), sync notifications (with user ID, event type), share link access (with token, password validation result), and version operations (with file ID, version number). Without structured logging, searching for "all operations on file X" requires parsing unstructured text. With structured fields like `{ "fileId": "abc", "operation": "upload", "chunkIndex": 3, "dedup": true }`, operators can query `fileId = "abc"` to see the complete lifecycle of a file across all operations.
+
+**How it works here:** The logger in `backend/src/shared/logger.ts` uses Pino configured with JSON output in production and pretty-printed output in development. Each log entry includes: `timestamp`, `level`, `service` (identifying the API instance), `traceId` (propagated via `X-Trace-Id` header for cross-service correlation), `userId`, and `message`. Child loggers created per-request inherit the trace ID and user ID, ensuring all log entries within a single request are automatically correlated. Upload operations add `chunkIndex`, `chunkHash`, and `dedup` fields. Download operations add `fileId` and byte range fields.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a pull-based monitoring system that periodically scrapes metric values from application HTTP endpoints. Applications expose a `/metrics` endpoint with time-series data in Prometheus text format. Metrics are categorized as counters (values that only increase, like total requests), gauges (values that go up and down, like active connections), and histograms (distributions of values, like request latency).
+
+**Why Dropbox needs it:** A cloud storage service must monitor several critical dimensions that are invisible without instrumentation. Upload success rate tells operators if MinIO is healthy. Deduplication ratio reveals how much storage is being saved. WebSocket connection count indicates sync load. Upload session duration shows if large uploads are completing or timing out. Queue depth reveals if background jobs (garbage collection, sync notifications) are keeping up. Without metrics, operators discover storage failures only when users report "upload failed" -- by which point many users may be affected.
+
+**How it works here:** The `backend/src/shared/metrics.ts` file registers metrics using `prom-client`. Key metrics: `http_requests_total` and `http_request_duration_seconds` (standard request monitoring), `upload_chunks_total` (counter labeled by status: success/duplicate/failed -- the "duplicate" label tracks deduplication effectiveness), `upload_sessions_active` (gauge for concurrent uploads), `file_downloads_total` (counter), `deduplication_ratio` (gauge), `websocket_connections_active` (gauge for sync clients), `sync_events_total` (counter by event type), and `circuit_breaker_state` (gauge per dependency). Path normalization replaces UUIDs in metric labels with placeholders to prevent high cardinality (e.g., `/files/file/{id}/download` instead of `/files/file/abc-123/download`).
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make within a time window. When the limit is exceeded, the server returns HTTP 429 (Too Many Requests). Limits are typically per-IP for anonymous endpoints and per-user for authenticated endpoints, tracked using atomic counters in Redis with TTL-based expiration.
+
+**Why Dropbox needs it:** File upload is the most resource-intensive operation in a storage service -- each upload consumes network bandwidth, object storage I/O, database connections, and disk space. Without rate limiting, a single user running an automated upload script could saturate the server's upload bandwidth, fill storage quotas of shared infrastructure, or exhaust database connections. Rate limiting also protects against brute-force attacks on share link passwords (which use bcrypt, an intentionally slow operation) and prevents abuse of the auth endpoints.
+
+**How it works here:** Rate limiting is implemented in `backend/src/index.ts` using `express-rate-limit`. Two tiers: general API requests (1,000 requests per 15 minutes per IP) and auth endpoints (20 requests per minute per IP, protecting against brute-force login attempts). Upload-specific rate limiting uses Redis counters at `ratelimit:{userId}:upload` with a 1-minute TTL to prevent individual users from monopolizing upload capacity. The Redis key pattern `ratelimit:{ip}:api` tracks per-IP API usage.
+
+### Idempotency
+
+**What it is:** Idempotency guarantees that performing the same operation multiple times produces the same result as performing it once. For file uploads, this means that if a chunk upload request is retried (due to network timeout or client retry logic), the chunk is not stored twice, the reference count is not incremented twice, and the upload session progress is not double-counted.
+
+**Why Dropbox needs it:** Chunked file uploads are inherently retry-prone. A 1GB file split into 4MB chunks requires 256 separate HTTP requests, any of which can fail due to network issues. If a chunk upload succeeds on the server but the response is lost in transit, the client will retry the same chunk. Without idempotency, the retry would increment the chunk's `reference_count` from 1 to 2, causing the chunk to persist even after the file is deleted (because the garbage collector sees `reference_count > 0`). Content-addressed storage provides natural data idempotency (same hash = same storage key, so re-uploading is a no-op at the storage layer), but metadata operations require explicit protection.
+
+**How it works here:** The idempotency middleware in `backend/src/shared/idempotency.ts` uses the composite key `{uploadSessionId}-chunk-{index}` as the idempotency key. Redis tracks the processing state for each chunk: `pending` (being processed), `completed` (successfully stored). If a retry arrives for a chunk marked `completed`, the middleware returns the cached successful response without re-executing the upload logic. The reference count increment is wrapped in the same idempotency boundary, ensuring it is incremented exactly once regardless of retries.
+
+### Health Checks
+
+**What it is:** Health check endpoints report whether an application instance is functioning correctly and can serve traffic. They are consumed by load balancers, container orchestrators, and monitoring systems. A typical health check system provides three tiers: liveness (is the process running?), readiness (can it handle requests?), and deep (are all dependencies responsive and within latency thresholds?).
+
+**Why Dropbox needs it:** A cloud storage service depends on three critical external services: PostgreSQL (metadata), Redis (sessions and cache), and MinIO (file chunks). If MinIO is down, the instance cannot serve uploads or downloads but can still serve folder listings from cache and handle authentication. A readiness check that requires all three services would unnecessarily remove the instance from rotation. The three-tier health check model allows the load balancer to make nuanced decisions: route metadata-only requests to instances with PostgreSQL + Redis, but skip instances with MinIO failures for upload/download traffic.
+
+**How it works here:** Three endpoints are implemented in `backend/src/routes/health.ts`: `/health/live` returns 200 if the process is alive (Kubernetes liveness probe -- if this fails, the container should be restarted). `/health/ready` checks PostgreSQL and Redis connectivity and returns 200 only if both are reachable (load balancer health check -- if this fails, stop sending traffic). `/health/deep` performs dependency-by-dependency health checks with latency measurements, returning a JSON report like `{ "postgres": { "status": "up", "latency_ms": 3 }, "redis": { "status": "up", "latency_ms": 1 }, "minio": { "status": "down", "error": "connection refused" } }`. The deep check is used by monitoring dashboards and alerting, not by load balancers (it is too expensive to run on every health check interval).
+
 ## Implementation Notes
 
 This section documents the actual local development setup and maps production design decisions to the working implementation.

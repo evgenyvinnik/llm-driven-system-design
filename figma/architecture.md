@@ -464,6 +464,221 @@ Scheduled cleanup tasks (node-cron) manage storage:
 
 ---
 
+## Frontend Architecture
+
+This section describes the actual frontend implementation: component hierarchy, state management, routing, data fetching, real-time collaboration, canvas rendering, and key UI patterns.
+
+### Component Hierarchy
+
+```
+App.tsx (conditional routing)
+├── FileBrowser                               (file list grid)
+│   └── File cards                            (thumbnail, name, date)
+└── Editor                                    (full design workspace)
+    ├── Toolbar                               (shape tools: select, rectangle, ellipse, text, frame)
+    ├── LayersPanel                           (object list with visibility/lock toggles)
+    ├── Canvas                                (PixiJS WebGL canvas + mouse/keyboard handlers)
+    │   └── PixiRenderer                      (WebGL rendering engine)
+    │       ├── ShapeFactory                  (creates PixiJS graphics per shape type)
+    │       └── SelectionOverlay              (selection bounds, resize handles)
+    ├── PropertiesPanel                       (position, size, fill, stroke, opacity editors)
+    └── VersionHistory (modal)                (save/restore version snapshots)
+```
+
+The application uses a simple two-state navigation pattern: `App.tsx` holds a `selectedFileId` state variable. When null, it renders `FileBrowser`; when set, it renders `Editor` with the file ID. There is no router library -- navigation is handled by React state, with the `Editor` providing an `onBack` callback that resets `selectedFileId` to null.
+
+### Zustand Store
+
+The frontend uses a single Zustand store (`stores/editorStore.ts`) that manages all editor state -- a deliberate design choice for a design tool where all state is deeply interconnected.
+
+**`useEditorStore` -- Full Editor State**
+
+The store manages six state domains:
+
+1. **File state**: `fileId`, `fileName`, `canvasData` (the complete design document as a JSON structure containing `objects` and `pages` arrays).
+
+2. **Selection and tool**: `selectedIds` (array of selected object UUIDs) and `activeTool` (current drawing tool: select, rectangle, ellipse, text, frame).
+
+3. **Viewport**: `x`, `y`, `zoom` -- the pan and zoom transform applied to the canvas. All objects are rendered relative to these viewport coordinates.
+
+4. **Presence**: `collaborators` (array of `PresenceState` objects with userId, userName, cursor position, selection, and color), plus the local user's `userId`, `userName`, and `userColor`.
+
+5. **History**: `history` (array of up to 50 `CanvasData` snapshots) and `historyIndex` (current position in the history stack). Undo/redo navigate this stack.
+
+6. **Object operations**: `addObject`, `updateObject`, `deleteObject`, `duplicateObject`, `moveObjectInLayer`. Each operation follows a three-step pattern:
+   - Push the current state to the history stack (for undo)
+   - Create an `Operation` object and send it via WebSocket (for multi-user sync)
+   - Apply the change locally as an optimistic update
+
+**WebSocket integration via function reference**: The store uses a module-level `operationSender` variable set by the WebSocket hook via `setOperationSender()`. This avoids circular dependency between the store and the WebSocket hook -- the store creates operations and calls `sendOperation()`, but does not import the WebSocket module directly.
+
+### Rendering Pipeline (PixiJS / WebGL)
+
+The rendering system is the most architecturally significant part of the frontend. It uses PixiJS for hardware-accelerated WebGL rendering, which provides dramatically better performance than Canvas 2D for design tools with many objects.
+
+**`PixiRenderer.ts` (365 lines)** -- The main renderer class that manages the PixiJS application lifecycle:
+
+1. **Initialization**: Creates a PixiJS `Application`, attaches it to a DOM container, and sets up the rendering hierarchy: viewport container (applies pan/zoom) > objects container (holds shape graphics) > grid graphics (background grid) > cursor container (remote user cursors).
+
+2. **Viewport transforms**: Pan and zoom are applied at the `viewportContainer` level via `position` and `scale` properties. Individual objects do not need to know about the viewport -- they are rendered in world coordinates and the container transform handles the rest.
+
+3. **Object rendering**: `renderObjects()` takes an array of `DesignObject` and synchronizes the PixiJS scene graph. It uses a `Map<string, PIXI.Container>` to track existing graphics objects. New objects are created via `ShapeFactory`; removed objects are destroyed; updated objects have their properties synced (position, size, fill, stroke, opacity).
+
+4. **Frustum culling**: Only objects whose bounding boxes intersect the visible viewport are rendered, preventing performance degradation with large designs containing hundreds of off-screen objects.
+
+**`ShapeFactory.ts` (199 lines)** -- Creates PixiJS `Graphics` objects for each shape type:
+- **Rectangle**: `drawRoundedRect()` with configurable corner radius, fill color, and stroke
+- **Ellipse**: `drawEllipse()` with fill and stroke
+- **Text**: `PIXI.Text` with configurable font, size, color, and alignment
+- **Frame**: Container rectangle with a label, used for grouping objects
+
+**`SelectionOverlay.ts` (143 lines)** -- Draws selection indicators:
+- Blue bounding box around selected objects
+- Resize handles at corners and edge midpoints
+- Multi-select bounding box when multiple objects are selected
+
+### WebSocket Integration and Real-Time Collaboration
+
+The `useWebSocket` hook (`hooks/useWebSocket.ts`) manages the full real-time collaboration lifecycle:
+
+1. **Connection**: When `fileId` is provided, the hook opens a WebSocket to `ws://host/ws` and sends a `subscribe` message with `fileId`, `userId`, and `userName`.
+
+2. **Initial sync**: The server responds with a `sync` message containing the file's `canvas_data`, current presence list, and the assigned cursor color for this user. The hook updates the store with `setCanvasData()`, `setCollaborators()`, and `setUserInfo()`.
+
+3. **Operation handling**: When the store sends an operation (via the `operationSender` function reference), the hook sends it as an `operation` WebSocket message. Incoming operations from other users are filtered (`op.userId !== state.userId`) to skip self-operations (already applied optimistically). Remote operations are applied using the `operationApplier` service.
+
+4. **Operation applier** (`services/operationApplier.ts`): A pure function that takes `CanvasData` and an `Operation` and returns new immutable `CanvasData`. Supports four operation types:
+   - `create`: Appends a new `DesignObject` to the objects array (with deduplication check)
+   - `update`: Merges property updates into an existing object, supporting both full-object merge and dot-notation path updates (e.g., `style.fill`)
+   - `delete`: Removes an object from the array by ID
+   - `move`: Changes an object's z-order position (layer reordering)
+
+5. **Presence**: The `sendPresence(cursor, selection)` function sends cursor position (x, y in canvas coordinates) and current selection (array of object IDs) to other collaborators. Incoming presence updates are stored in the editor store and rendered as colored cursors on the canvas.
+
+6. **Reconnection**: On WebSocket close, the hook schedules a reconnect after 3 seconds. On reconnect, it re-subscribes to the file and receives a fresh `sync` message with current state.
+
+### Canvas Rendering
+
+The `Canvas` component (`components/Canvas.tsx`, 296 lines) is the central interaction surface. It handles:
+
+- **Mouse events**: Click to select, drag to move selected objects, click+drag with a shape tool to create new objects. Mouse move updates presence cursor position via `sendPresence()`.
+- **Keyboard events**: Delete/Backspace to remove selected objects, Ctrl+Z/Ctrl+Y for undo/redo, Ctrl+D for duplicate, arrow keys for nudge movement.
+- **Pan**: Middle mouse button or Space+drag for viewport panning.
+- **Zoom**: Mouse wheel adjusts viewport zoom, centered on the cursor position.
+- **Selection**: Click on empty canvas deselects. Click on an object selects it. The selection state drives both the `PropertiesPanel` content and the `SelectionOverlay` rendering.
+
+The Canvas component initializes a `PixiRenderer` instance on mount, attaches it to a `div` ref, and calls `renderer.renderObjects()` whenever `canvasData.objects` changes. It also calls `renderer.renderPresence()` when collaborator cursor positions update.
+
+### Key UI Patterns
+
+- **Three-panel layout**: The editor uses a fixed three-panel layout similar to Figma: layers panel (left, ~240px), canvas (center, flexible), properties panel (right, ~280px). All panels share the same dark theme (`bg-figma-bg`).
+
+- **Optimistic updates with operation sync**: Every local change (create shape, move object, change color) applies immediately to the store and simultaneously sends a WebSocket operation. Remote operations are received and applied to the store, which triggers a re-render of the PixiJS canvas. This ensures sub-50ms local response time while keeping all clients synchronized.
+
+- **Undo/redo via history stack**: The store maintains a stack of up to 50 `CanvasData` snapshots. Every mutation pushes the current state onto the stack before applying the change. Undo/redo navigates this stack with full `CanvasData` copies (deep clone via `JSON.parse(JSON.stringify(...))`). Remote operations do not push to the history stack -- only local operations do.
+
+- **Layer management**: The `LayersPanel` shows all objects in reverse z-order (top-most first). Each layer item has visibility and lock toggle buttons. The `moveObjectInLayer` store action changes an object's position in the `objects` array, which determines its z-order in the PixiJS rendering pipeline.
+
+- **Property editing**: The `PropertiesPanel` shows editable fields for the selected object: x, y, width, height, rotation, fill color, stroke color, stroke width, opacity. Changes call `updateObject(id, updates)` on the store, which optimistically applies the update and broadcasts it via WebSocket.
+
+- **Version history modal**: The `VersionHistory` component provides a modal for saving named versions (snapshots of the current `canvas_data`) and restoring previous versions. Auto-save versions are distinguished from named versions. Restoring a version replaces the current `canvas_data` and broadcasts the change to all collaborators.
+
+- **File browser**: The `FileBrowser` component shows a card grid of design files with names and timestamps. Users can create new files, soft-delete files, and click to open the editor. There is no folder/project hierarchy in the current implementation -- files are listed flat.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, written for readers encountering these patterns for the first time.
+
+### Circuit Breaker
+
+**What it is**: A circuit breaker monitors calls to an external dependency (database, cache, API) and tracks failure rates. When failures exceed a configurable threshold, the circuit "opens" -- subsequent calls fail immediately without attempting the operation. After a timeout, the circuit enters "half-open" state and allows one test request. If it succeeds, the circuit closes and normal operation resumes. If it fails, the circuit stays open for another timeout period.
+
+**Why it matters**: In a collaborative design tool, every operation involves two external systems: PostgreSQL (persist the operation and update canvas data) and Redis (check idempotency key, update presence). If PostgreSQL becomes slow (e.g., under heavy query load from a large file), every WebSocket operation handler blocks waiting for the database. The server's event loop fills up, and even Redis-only operations (presence updates, cursor movements) stop working. The circuit breaker detects PostgreSQL's degradation and stops sending requests to it, allowing presence and cursor operations to continue normally while file save operations are queued.
+
+**How it works in this project**: The implementation uses the Opossum library (`backend/src/shared/circuitBreaker.ts`) with three independent circuits:
+
+| Circuit | Timeout | Error Threshold | Reset Timeout | Volume Threshold |
+|---------|---------|-----------------|---------------|-----------------|
+| PostgreSQL | 10s | 50% | 15s | 3 requests |
+| Redis | 2s | 50% | 5s | 5 requests |
+| WebSocket Sync | 3s | 60% | 5s | 10 requests |
+
+"Error threshold 50% with volume threshold 3" means: after at least 3 requests, if 50% or more fail, the circuit opens. The volume threshold prevents the circuit from opening on a single transient failure. State transitions (closed to open, open to half-open, half-open to closed) are logged via Pino and tracked via Prometheus metrics (`figma_circuit_breaker_state{circuit}` gauge, `figma_circuit_breaker_transitions_total{circuit, state}` counter). The `/health` endpoint reports all circuit breaker states, so operators can see at a glance which dependencies are healthy.
+
+### Prometheus Metrics
+
+**What it is**: Prometheus is a monitoring system where applications expose numeric measurements at an `/metrics` HTTP endpoint. A Prometheus server periodically scrapes these endpoints and stores the data as time series. Applications define three types of metrics: **Counters** (monotonically increasing values, like total operations processed), **Histograms** (distributions of values in buckets, like operation latency), and **Gauges** (point-in-time values that go up and down, like active collaborators).
+
+**Why it matters**: A design tool has unique monitoring needs. You need to know: "How many collaborators are on this file?" (capacity planning), "What is the operation broadcast latency?" (user experience), "How many operations are being deduplicated?" (network reliability indicator), "How many auto-save versions are accumulating?" (storage planning).
+
+**How it works in this project**: The metrics module (`backend/src/shared/metrics.ts`) exposes 12+ custom metrics:
+
+- `figma_active_collaborators{file_id}` (gauge) -- collaborators per file, for hot-spot detection
+- `figma_websocket_connections_total` (gauge) -- total active connections, for capacity planning
+- `figma_operations_total{operation_type, status}` (counter) -- throughput by type (create/update/delete/move) and status (success/failed)
+- `figma_operation_latency_seconds{operation_type}` (histogram) -- processing time from receipt to persistence
+- `figma_sync_latency_seconds{message_type}` (histogram) -- broadcast latency from persistence to delivery
+- `figma_idempotency_checks_total{result}` (counter) -- ratio of new vs. deduplicated operations (high dedup rate suggests network issues)
+- `figma_db_query_latency_seconds{query_type}` (histogram) -- database performance by query type
+- `figma_retry_attempts_total{operation, attempt}` (counter) -- retry behavior visibility
+- `figma_cleanup_jobs_total{job_type, status}` (counter) -- retention job tracking
+
+### Structured Logging
+
+**What it is**: Structured logging outputs log entries as JSON objects with consistent, queryable fields instead of free-form text. Each entry includes level, timestamp, message, and contextual metadata specific to the operation being logged.
+
+**Why it matters**: When a user reports "I drew a rectangle but my collaborator did not see it," debugging requires tracing the operation through the entire system: client WebSocket send, server receive, idempotency check, database insert, Redis pub/sub broadcast, collaborator WebSocket delivery. With structured logs, you can filter by `operationId` across all log entries to reconstruct the full path. With text logs, this correlation is manual and error-prone.
+
+**How it works in this project**: Pino (`backend/src/shared/logger.ts`) is configured with the service context `figma-backend`. In development, logs are pretty-printed with colors for readability. In production, they output raw JSON for ingestion by log aggregation systems. Child loggers are created for request-specific context, adding fields like `fileId`, `operationId`, `userId`, and `operationType`. WebSocket message handling logs include the message type and payload size. Circuit breaker state transitions are logged at `warn` level with the circuit name and new state.
+
+### Idempotency
+
+**What it is**: An idempotent operation produces the same result regardless of how many times it is executed. In a real-time collaborative system, idempotency is critical because network conditions guarantee that some operations will be delivered more than once.
+
+**Why it matters**: Consider this scenario: User A draws a rectangle. The operation is sent via WebSocket. The server persists it and broadcasts it. But the ACK is lost due to a network blip. User A's client retries the operation. Without idempotency, the server creates a second rectangle at the same position -- the collaborator sees two overlapping rectangles. With idempotency, the server recognizes the retry by its unique key and returns the original ACK without processing the operation again.
+
+**How it works in this project**: Idempotency is enforced at two layers. First, Redis: every operation includes a client-generated `idempotency_key`. The server executes `SET key NX EX 300` (set if not exists, 5-minute TTL). If the key already exists, the operation is a duplicate and is skipped. Second, PostgreSQL: the operations table has a partial unique index on `idempotency_key WHERE idempotency_key IS NOT NULL`. This provides a database-level safety net in case of Redis failure. The dual-layer approach (`backend/src/shared/idempotency.ts`) ensures that even if Redis is temporarily unavailable, duplicate operations are still caught at the database level.
+
+### Health Checks
+
+**What it is**: Health check endpoints are lightweight HTTP routes that report whether an application instance can serve traffic. They are consumed by load balancers (to route traffic), container orchestrators (to restart failed instances), and monitoring systems (to alert operators).
+
+**Why it matters**: A Figma-like design tool server manages both HTTP REST endpoints and WebSocket connections. An instance might have a working REST API but a broken WebSocket subsystem (e.g., Redis pub/sub connection lost). Without granular health checks, the load balancer continues routing WebSocket connections to this instance, where they silently fail to receive collaboration updates.
+
+**How it works in this project**: Three health endpoints exist, each serving a different consumer:
+
+- `GET /health` -- comprehensive check: tests PostgreSQL connectivity (`SELECT 1`), Redis connectivity (`PING`), reports active WebSocket connection count, lists all circuit breaker states, and includes process uptime. Returns `200` with full status or `503` with per-dependency failure details.
+- `GET /health/live` -- minimal liveness probe: returns `200` if the process is running. Used by orchestrators to detect crashed instances. Does not check dependencies (a live but degraded instance should not be killed and restarted in a loop).
+- `GET /health/ready` -- readiness probe: checks PostgreSQL and Redis. Returns `200` only when both are reachable. Used by load balancers to determine when an instance can start receiving traffic after startup, and by orchestrators to remove instances from the pool during dependency outages.
+
+### Rate Limiting
+
+**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects servers from overload and ensures fair resource sharing among users.
+
+**Why it matters**: In a collaborative design tool, a single user moving an object generates a stream of `update` operations -- potentially dozens per second during a drag operation. A buggy client or automated script could generate thousands of operations per second, overwhelming the database and WebSocket broadcast system. Rate limiting caps the operation rate at a sustainable level while allowing normal interactive editing.
+
+**How it works in this project**: Rate limiting is listed as omitted from the local build, but the architecture specifies the design. Operation rate would be limited per-user per-file using a sliding window counter in Redis. The limit would be set high enough for interactive editing (e.g., 100 operations per second) but low enough to catch runaway clients. REST API endpoints would have standard per-user rate limits. Login endpoints would have strict limits to prevent credential stuffing.
+
+### Redis Cache-Aside
+
+**What it is**: Cache-aside (lazy loading) is a caching strategy where the application checks the cache first. On a miss, it reads from the database, populates the cache, and returns the data. On a hit, the database is bypassed entirely.
+
+**Why it matters**: Loading a design file involves reading the `files` row (including the `canvas_data` JSONB blob, which can be hundreds of KB for complex designs) and joining with permissions and team membership. This is a heavy query. When 50 users are collaborating on the same file, each WebSocket reconnection triggers a full file load. Caching the file data in Redis reduces this from a ~50ms database query to a ~2ms cache read.
+
+**How it works in this project**: While the project does not implement a general-purpose cache-aside layer, it uses Redis for specific caching patterns: session data is stored in Redis for fast validation on every WebSocket message, presence data (cursor positions, selections) is stored exclusively in Redis (never hitting PostgreSQL), and idempotency keys are cached in Redis with 5-minute TTLs. The architecture notes indicate that a full cache-aside layer for file metadata and canvas data would be the next scaling step, with invalidation triggered by any write operation.
+
+### RBAC (Role-Based Access Control)
+
+**What it is**: RBAC assigns permissions to roles rather than individual users. Users are granted roles, and the role determines what actions they can perform on a resource. This creates a manageable permission system that scales with the number of users and resources.
+
+**Why it matters**: A design tool has three natural permission levels: viewers (can see the design but not edit), editors (can modify objects and properties), and admins (can manage sharing and delete the file). Without RBAC, every permission check requires looking up the specific user-file-permission combination. With RBAC, roles are defined once and assigned per user per file.
+
+**How it works in this project**: The `file_permissions` table maps users to files with a permission level (`view`, `edit`, `admin`). Team membership provides a baseline: team members get `view` access to all team files, with per-file overrides for `edit` or `admin`. The `team_members` table assigns team roles (`owner`, `admin`, `member`). While the permission enforcement middleware is listed as not yet implemented in the local build, the database schema and API design support the full RBAC model. File operations would check: (1) is the user a file permission holder? (2) if not, is the user a team member? (3) what is the effective permission level?
+
+---
+
 ## Implementation Notes
 
 This section documents the actual local setup and maps production concepts to the Docker + Node.js + React implementation.

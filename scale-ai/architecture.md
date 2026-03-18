@@ -561,6 +561,151 @@ At 10,000 inference QPS:
 | Inference placeholder | Heuristic analysis | Full ML model | Proves API contract; swap for real model later |
 | Model activation | Single-active with DB constraint | Feature flags | Simpler; unique index enforces invariant |
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App.tsx (hash-based router + game state manager)
+├── #draw (Drawing Game - default view)
+│   ├── Global Nav (Draw | Admin | Test Model)
+│   ├── Stats Header (total drawings, today, streak, level)
+│   ├── PostItCanvas (skeuomorphic drawing canvas)
+│   │   └── <canvas> (400x400, multi-pass marker rendering)
+│   ├── Progress Bar (shape cycle dots)
+│   └── Success/Milestone Toasts
+├── #admin (Admin Dashboard)
+│   ├── AdminLogin (email/password form)
+│   └── AdminDashboard (tabbed interface)
+│       ├── OverviewTab (StatCard grid, recent jobs)
+│       ├── DrawingsTab (paginated gallery, flag/delete/restore)
+│       │   └── StrokeThumbnail (canvas-rendered thumbnail)
+│       ├── QualityTab (batch analysis, quality stats)
+│       └── TrainingTab (start training, model list, activate)
+└── #implement (Implementor Portal)
+    ├── Classify Mode
+    │   ├── PostItCanvas (freeform drawing)
+    │   └── Results Panel (prediction, confidence bars, probabilities)
+    └── Generate Mode
+        └── GenerateMode (shape selector + AI-generated stroke display)
+```
+
+The app uses a single `App.tsx` component as both the router and top-level state manager. There are no nested routes or lazy-loaded components -- the entire application renders from one component tree with conditional rendering based on the `view` state variable.
+
+### Routing (Hash-Based, No TanStack Router)
+
+Unlike the other projects in this repository, Scale AI does **not** use TanStack Router. It uses a simple hash-based routing scheme implemented directly in `App.tsx`:
+
+| Hash | View | Component |
+|------|------|-----------|
+| (none) | `draw` | Drawing game (default) |
+| `#admin` | `admin` | Admin dashboard |
+| `#implement` | `implement` | Model tester portal |
+
+Navigation uses `window.location.hash` directly, and the app listens for `hashchange` events via `useEffect`. This was chosen because the three views are completely independent portals with no shared state, and the admin/implementor views are secondary to the drawing game. The simplicity of hash routing avoids the overhead of a routing library for what is essentially a three-tab application.
+
+### State Management (No Zustand)
+
+This project does not use Zustand. All state is managed via React's `useState` and `useCallback` hooks within the components that need it:
+
+**Drawing game state** (in `App.tsx`): `currentShapeIndex` (which shape to draw next), `totalDrawings` / `todayDrawings` / `streakDays` / `level` (gamification stats), `showSuccess` / `showMilestone` (toast animations), `submitting` (loading guard), `error` (error banner), `soundOn` (sound effects toggle). Stats are loaded from the backend on mount and updated locally after each submission.
+
+**Admin dashboard state** (in `AdminDashboard.tsx`): `user` (admin auth), `stats` / `drawings` / `models` (data), `activeTab` (tab navigation), `trainingInProgress` (loading guard). All data is loaded via `Promise.all` on login and refreshed after mutations.
+
+**Implementor portal state** (in `ImplementorPortal.tsx`): `modelInfo` (active model metadata), `result` (classification output), `activeMode` (classify vs generate tab).
+
+**Anonymous session management** (in `services/api.ts`): A UUID session ID is generated via `crypto.randomUUID()` and stored in localStorage. This ID is sent with every drawing submission to track per-user statistics without requiring login.
+
+### API Service Architecture
+
+The API layer in `frontend/src/services/api.ts` is organized by backend service rather than by resource, reflecting the microservice architecture:
+
+- **Collection API** (port 3001): `getShapes()`, `submitDrawing()`, `getUserStats()` -- used by the drawing game. Anonymous; uses `sessionId` from localStorage.
+- **Admin API** (port 3002): `adminLogin()`, `adminLogout()`, `getAdminStats()`, `getDrawings()`, `flagDrawing()`, `deleteDrawing()`, `startTraining()`, `getModels()`, `activateModel()`, `analyzeBatchQuality()` -- used by the admin dashboard. Uses httpOnly session cookies via `credentials: 'include'`.
+- **Inference API** (port 3003): `getModelInfo()`, `classifyDrawing()`, `generateShape()` -- used by the implementor portal. No authentication required.
+
+The `adminFetch` helper wraps all admin API calls with consistent credentials and content-type headers. Each API function returns typed results using TypeScript interfaces defined in the same file.
+
+### Key UI Patterns
+
+**Skeuomorphic canvas (PostItCanvas)**: The most distinctive UI component across all four projects. The canvas is styled as a yellow post-it note pinned to a cork board background, with a decorative Sharpie marker and realistic paper texture. Drawing uses a multi-pass rendering technique: three canvas passes with decreasing opacity (0.8, 0.4, 0.2) and increasing line width simulate marker ink bleeding. Random ink dots are added at stroke points for texture. The canvas captures pressure data from touch devices and timestamps for each point, producing the stroke data format required for ML training.
+
+**Gamification loop**: The drawing game cycles through 5 shapes (line, heart, circle, square, triangle) sequentially. After each submission, the shape advances to the next in the cycle. Milestone thresholds (5, 10, 25, 50, 100, 250, 500, 1000 drawings) trigger celebration animations and sound effects. The level system (1 level per 10 drawings) and streak tracking (consecutive days of drawing) provide long-term engagement.
+
+**Optimistic updates in admin**: The `AdminDashboard` performs optimistic local state updates for flag, delete, and restore operations. When an admin flags a drawing, `setDrawings` immediately updates the local array without waiting for the API response. If the API call fails, an error message is shown but the optimistic update is not rolled back -- the admin can retry or refresh.
+
+**Sound effects**: The `utils/sounds.ts` module provides audio feedback for drawing submission (`success`), milestone achievement (`levelUp`), errors (`error`), and UI interactions (`click`). Sounds can be toggled on/off and the preference persists in localStorage.
+
+**Reusable PostItCanvas for two contexts**: The same `PostItCanvas` component serves both the drawing game (with a specific shape prompt like "Draw a circle") and the implementor classify mode (with a generic "Draw any shape" prompt). The `shape` prop controls the prompt text, and the `freeform` value disables shape-specific guidance.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in the backend, why it matters for a data labeling platform, and how it works in practice.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is a method of restricting system access based on roles assigned to users rather than checking individual permissions for each action. Each user has a role, and each API endpoint checks the caller's role before allowing the operation.
+
+**Why Scale AI needs it:** A data labeling platform has three completely separate user personas with no overlapping permissions. Anonymous contributors draw shapes and should not be able to view other users' data, trigger training, or manage the dataset. Admins need to browse all drawings, flag low-quality data, trigger and monitor training jobs, and activate models. Inference users need to classify drawings and generate shapes. Without RBAC, either contributors could corrupt the training dataset by deleting drawings, or admins would have no way to curate data quality.
+
+**How it works here:** The platform uses two separate authentication mechanisms reflecting its two auth models. Anonymous drawing contributors get an auto-generated session ID stored in localStorage -- they have no database user record with a role column. Admin users authenticate via email/password (bcrypt, cost 12) stored in the `admin_users` table, with sessions managed in Redis via httpOnly cookies. The auth middleware in `backend/src/shared/auth.ts` validates the session cookie and rejects requests without a valid admin session. The inference API has no authentication at all -- it is public by design. This three-tier approach (anonymous, admin-authenticated, public) is simpler than a unified RBAC system because the three portals have zero permission overlap.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside is a caching strategy where the application checks the cache before querying the database for each read. On a cache hit, the cached value is returned immediately. On a cache miss, the application queries the database, stores the result in the cache with a TTL, and returns it.
+
+**Why Scale AI needs it:** The admin dashboard's overview page queries aggregated statistics across all drawings: total count, per-shape breakdown, flagged count, today's count, and active model info. These statistics require multiple `COUNT(*)` and `GROUP BY` queries against the drawings table, which grows continuously as users submit drawings. Without caching, every time an admin loads the dashboard, the database runs expensive aggregation queries. At 20M drawings per day at production scale, these queries would take seconds and add unnecessary load. Caching the aggregated stats with a short TTL (5 minutes) means the database runs these queries at most once every 5 minutes, regardless of how many admins are viewing the dashboard simultaneously.
+
+**How it works here:** The `backend/src/shared/cache.ts` module provides a Redis client with `cacheGet` and `cacheSet` helpers. Dashboard statistics are cached at a key like `admin:stats` with a 5-minute TTL. Session data is cached at `session:{sessionId}` with a configurable TTL (7 days default, 30 days for "remember me"). Idempotency keys for drawing submissions are stored at `idempotency:{key}` with a 1-hour TTL. When an admin triggers actions that would invalidate cached stats (flagging, deleting, restoring drawings), the stats cache is not explicitly invalidated -- the 5-minute TTL provides eventual consistency, which is acceptable for dashboard statistics.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker monitors calls to an external dependency and automatically stops sending requests when the dependency is failing. In its "closed" state, requests pass through normally. When failures exceed a threshold, it enters the "open" state and immediately rejects all requests without attempting the call. After a cooldown period, it enters "half-open" state and allows a single test request. If the test succeeds, the circuit closes; if it fails, it reopens.
+
+**Why Scale AI needs it:** The platform depends on three external services: PostgreSQL, MinIO, and RabbitMQ. Each has different failure modes and recovery characteristics. If MinIO goes down, drawing submissions will fail (stroke data cannot be stored), but the admin dashboard can still display cached stats and the inference service can still classify drawings. If RabbitMQ goes down, training jobs cannot be queued, but drawing collection and inference continue. Without circuit breakers, a MinIO outage would cause every drawing submission to hang for the full timeout period (30+ seconds), exhausting the connection pool and making the entire collection service unresponsive -- even for health checks and metrics endpoints that do not use MinIO.
+
+**How it works here:** Circuit breakers are implemented in `backend/src/shared/circuitBreaker.ts` with per-dependency configurations. PostgreSQL: opens after 3 consecutive failures, resets after 15 seconds, returns 503 with `Retry-After` header when open. MinIO: opens after 5 consecutive failures, resets after 30 seconds, rejects drawing submissions with 503. RabbitMQ: opens after 5 consecutive failures, resets after 60 seconds, falls back to writing the training job to a dead-letter table in PostgreSQL (to be replayed when RabbitMQ recovers). Circuit breaker state is exposed as a Prometheus gauge (`circuit_breaker_state`: 0=closed, 1=half-open, 2=open) and included in the health check response.
+
+### Structured Logging
+
+**What it is:** Structured logging emits log entries as JSON objects with consistent, typed fields instead of free-form text strings. Each entry has standard fields (timestamp, level, service, message) plus context-specific fields that vary by event type.
+
+**Why Scale AI needs it:** A microservice architecture with three separate services (collection, admin, inference) plus a Python training worker generates logs in four different processes. Without structured logging, correlating events across services (e.g., "drawing submitted in collection service -> training job started in admin service -> model trained in Python worker -> model loaded in inference service") requires manually matching timestamps and free-text patterns. With structured fields like `{ "service": "collection", "requestId": "abc", "drawingId": "xyz", "shape": "circle" }`, operators can query by drawing ID to trace its lifecycle from submission through training to inference.
+
+**How it works here:** The logger in `backend/src/shared/logger.ts` uses Pino with JSON output. Each service instance includes a `service` field (`collection`, `admin`, or `inference`) in every log entry. Request middleware generates a unique `requestId` and creates a child logger that inherits it. Drawing submissions log `drawingId`, `shape`, and `processingTimeMs`. Training job operations log `jobId`, `status`, and `config`. Inference requests log `modelVersion`, `predictedShape`, and `inferenceTimeMs`. The Python training worker uses Python's `logging` module with JSON formatting to maintain the same structured approach.
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a pull-based monitoring system that scrapes metric values from HTTP endpoints at regular intervals. Applications expose a `/metrics` endpoint with time-series data. Metrics are counters (monotonically increasing), gauges (point-in-time values), or histograms (value distributions).
+
+**Why Scale AI needs it:** A data labeling platform has unique monitoring needs beyond standard web application metrics. Collection throughput (drawings per second per shape) determines whether the dataset is growing fast enough for training. Inference latency (p99 < 100ms) directly affects the implementor experience. Training job success rate reveals infrastructure problems. Circuit breaker state across three dependencies (PostgreSQL, MinIO, RabbitMQ) indicates which services need attention. Without metrics, operators would not know if the collection service is quietly dropping drawings, if inference latency has doubled due to a model update, or if the RabbitMQ circuit breaker has been open for an hour.
+
+**How it works here:** Each microservice exposes its own `/metrics` endpoint. The `backend/src/shared/metrics.ts` module registers shared metrics: `http_requests_total` and `http_request_duration_seconds` (standard request monitoring), plus service-specific metrics. Collection service: `drawings_total` (counter by shape and status). Inference service: `inference_requests_total` (counter by model version and predicted shape), `inference_latency_seconds` (histogram by model version), `generation_requests_total` (counter by shape). All services: `external_service_calls_total` (counter by service/operation/status for dependency monitoring), `circuit_breaker_state` (gauge per dependency).
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make within a time window. When exceeded, the server returns HTTP 429 (Too Many Requests). Limits are tracked per IP or per user using atomic counters with TTL-based expiration.
+
+**Why Scale AI needs it:** The drawing collection endpoint is public and accepts anonymous submissions. Without rate limiting, a bot could submit millions of junk drawings, polluting the training dataset and consuming MinIO storage. Even well-intentioned users could accidentally submit duplicates by double-clicking the "Done!" button or by a script with a retry loop. The inference endpoint is also public, and without rate limiting, it could be used as a free ML inference API by third parties. Rate limiting on drawing submissions also ensures that the quality of the dataset remains high -- genuine human drawings take 3-10 seconds each, so a rate of more than 1 drawing per second from a single IP is almost certainly automated.
+
+**How it works here:** Rate limiting is configurable per service. The collection service limits drawing submissions per IP. The admin API limits requests to authenticated admin sessions only. The inference API limits requests per IP. All rate limits use Redis-backed counters. Drawing submissions have an additional idempotency layer that prevents the same drawing (identified by `sessionId:shapeId:timestamp`) from being stored twice, even if rate limiting allows the retry through.
+
+### Idempotency
+
+**What it is:** Idempotency ensures that performing the same operation multiple times produces the same result as performing it once. For APIs, this means that retried requests do not create duplicate resources, increment counters twice, or trigger side effects multiple times.
+
+**Why Scale AI needs it:** Drawing submissions involve two non-transactional writes: storing stroke data in MinIO (object storage) and creating a metadata row in PostgreSQL. If the MinIO write succeeds but the PostgreSQL write fails (or vice versa), a retry would create a duplicate in one system. Additionally, the "Done!" button on the canvas could be double-clicked, or the browser could automatically retry a failed POST. Each duplicate drawing pollutes the training dataset and wastes storage. At production scale with 20M drawings per day, even a 0.1% duplication rate means 20,000 junk entries daily.
+
+**How it works here:** The idempotency middleware in `backend/src/shared/idempotency.ts` generates a key from `sessionId:shapeId:timestamp`. Before processing a drawing submission, it checks Redis for this key. If found (within the 1-hour TTL window), it returns the cached response immediately. If not found, it processes the submission and caches the response. The timestamp granularity is seconds, so two legitimate drawings of the same shape within the same second from the same user are treated as duplicates -- this is acceptable because genuine drawings take 3-10 seconds minimum.
+
+### Health Checks
+
+**What it is:** Health check endpoints report whether an application instance can serve traffic. Load balancers use them to route traffic away from unhealthy instances. Container orchestrators use them to restart failed containers. Monitoring systems use them to trigger alerts.
+
+**Why Scale AI needs it:** With three separate microservices (collection on 3001, admin on 3002, inference on 3003), health checks serve double duty. First, they enable individual service monitoring -- if the collection service loses its MinIO connection, it should report unhealthy independently of the admin service. Second, they enable dependency-aware routing -- if PostgreSQL is down, both collection and admin services should report unhealthy, but the inference service (which loads model info from the database only on startup and caches it) might remain healthy. The three-tier model (live/ready/deep) allows different consumers to check appropriate depth.
+
+**How it works here:** The health check module in `backend/src/shared/healthCheck.ts` provides three endpoints per service: `/health` (basic liveness -- returns 200 if the process is running), `/health/live` (same as `/health`, used as Kubernetes liveness probe), and `/health/ready` (checks PostgreSQL, Redis, and MinIO connectivity; includes circuit breaker state in the response). Each service registers these endpoints. The readiness check returns 503 with a JSON body listing which dependencies are down, enabling operators to quickly identify the root cause of service degradation.
+
 ## Implementation Notes
 
 This section documents the actual local development setup and maps production design decisions to the working implementation.
