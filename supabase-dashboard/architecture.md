@@ -32,52 +32,63 @@ A Backend-as-a-Service (BaaS) management dashboard inspired by Supabase Studio. 
 ## High-Level Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         Client Browser                           │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐            │
-│  │  Table    │ │   SQL    │ │   Auth   │ │ Settings │            │
-│  │  Editor   │ │  Editor  │ │  Users   │ │          │            │
-│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘            │
-│       └─────────────┴────────────┴─────────────┘                 │
-└──────────────────────────┬───────────────────────────────────────┘
-                           │ HTTPS
-                    ┌──────┴──────┐
-                    │  API Gateway │
-                    │  / Nginx LB  │
-                    └──────┬──────┘
-                           │
-              ┌────────────┼────────────┐
-              │            │            │
-        ┌─────┴─────┐ ┌───┴───┐ ┌─────┴─────┐
-        │  API       │ │  API  │ │  API       │
-        │  Server 1  │ │  S 2  │ │  Server 3  │
-        └─────┬─────┘ └───┬───┘ └─────┬─────┘
-              │            │            │
-    ┌─────────┼────────────┼────────────┼─────────┐
-    │         │            │            │         │
-    │    ┌────┴────┐  ┌────┴────┐  ┌────┴────┐   │
-    │    │ Schema  │  │  Query  │  │  DDL    │   │
-    │    │ Intro-  │  │  Exe-   │  │  Gene-  │   │
-    │    │ spector │  │  cutor  │  │  rator  │   │
-    │    └────┬────┘  └────┬────┘  └────┬────┘   │
-    │         │            │            │         │
-    │    ┌────┴────────────┴────────────┴────┐   │
-    │    │     Dynamic Pool Manager          │   │
-    │    │   (per-project connection pools)   │   │
-    │    └────┬───────────────────────┬──────┘   │
-    │         │                       │          │
-    │   ┌─────┴─────┐          ┌─────┴──────┐   │
-    │   │ Metadata  │          │  Target    │   │
-    │   │ Database  │          │  Database  │   │
-    │   │ (PG 5432) │          │  (PG 5433) │   │
-    │   └───────────┘          └────────────┘   │
-    │                                            │
-    │   ┌───────────┐                            │
-    │   │  Valkey   │                            │
-    │   │  (Redis)  │                            │
-    │   │  Sessions │                            │
-    │   └───────────┘                            │
-    └────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           Client Browser                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
+│  │  Table    │  │   SQL    │  │   Auth   │  │ Settings │             │
+│  │  Editor   │  │  Editor  │  │  Users   │  │          │             │
+│  └─────┬────┘  └─────┬────┘  └────┬─────┘  └────┬─────┘             │
+│        └──────────────┴────────────┴──────────────┘                  │
+└───────────────────────────┬──────────────────────────────────────────┘
+                            │ HTTPS
+                     ┌──────┴──────┐
+                     │   CDN /     │
+                     │   CloudFront│
+                     └──────┬──────┘
+                            │
+                     ┌──────┴──────┐
+                     │  API Gateway│
+                     │  / Nginx LB │
+                     └──────┬──────┘
+                            │
+               ┌────────────┼────────────┐
+               │            │            │
+         ┌─────┴─────┐ ┌───┴───┐ ┌─────┴─────┐
+         │  API       │ │  API  │ │  API       │
+         │  Server 1  │ │  S 2  │ │  Server 3  │
+         └─────┬─────┘ └───┬───┘ └─────┬─────┘
+               │            │            │
+     ┌─────────┴────────────┴────────────┴──────────┐
+     │                                               │
+     │  ┌────────────┐  ┌────────────┐  ┌──────────┐│
+     │  │  Schema    │  │   Query    │  │   DDL    ││
+     │  │  Intro-    │  │   Executor │  │   Gene-  ││
+     │  │  spector   │  │            │  │   rator  ││
+     │  └─────┬──────┘  └─────┬──────┘  └────┬─────┘│
+     │        │               │               │      │
+     │  ┌─────┴───────────────┴───────────────┴────┐ │
+     │  │      Dynamic Connection Pool Manager     │ │
+     │  │   (per-project pools, LRU eviction)      │ │
+     │  └─────┬────────────────────────────┬───────┘ │
+     │        │                            │         │
+     │  ┌─────┴────────┐   ┌──────────────┴───────┐ │
+     │  │  PgBouncer   │   │     PgBouncer        │ │
+     │  │  (Metadata)  │   │   (Target DBs)       │ │
+     │  └─────┬────────┘   └──────────────┬───────┘ │
+     │        │                            │         │
+     │  ┌─────┴────────┐   ┌──────────────┴───────┐ │
+     │  │  Metadata DB │   │   Target Databases   │ │
+     │  │  (PG Primary │   │   (User-managed,     │ │
+     │  │   + Replica) │   │    per-project)      │ │
+     │  └──────────────┘   └──────────────────────┘ │
+     │                                               │
+     │  ┌──────────────┐   ┌──────────────────────┐ │
+     │  │   Redis      │   │   Prometheus +       │ │
+     │  │   Cluster    │   │   Grafana            │ │
+     │  │   (Sessions, │   └──────────────────────┘ │
+     │  │    Cache)    │                             │
+     │  └──────────────┘                             │
+     └───────────────────────────────────────────────┘
 ```
 
 ## Core Components
@@ -91,7 +102,7 @@ Queries `information_schema` views on the target database to discover:
 - **Foreign Keys**: Join `table_constraints` (type = `FOREIGN KEY`) with `key_column_usage` and `constraint_column_usage`
 - **Row Estimates**: `pg_class.reltuples` for approximate row counts without `COUNT(*)`
 
-Each introspection opens a short-lived client connection rather than reusing the pool, ensuring schema changes are always reflected.
+Each introspection opens a short-lived client connection rather than reusing the pool, ensuring schema changes are always reflected. At production scale, introspection results would be cached in Redis with a 60-second TTL and invalidated on DDL operations.
 
 ### Query Executor (Dynamic Pool Manager)
 
@@ -101,6 +112,8 @@ Manages a `Map<projectId, pg.Pool>` of connection pools to target databases:
 2. Caches the pool for subsequent queries
 3. Evicts the pool when project connection settings change
 4. Cleans up all pools on graceful shutdown
+
+At production scale, this becomes a tiered system: hot projects (queried in last 5 minutes) get persistent pools, warm projects get on-demand connections through PgBouncer, and cold projects require a full connection setup. An LRU eviction strategy caps total pools at 200 per API server instance.
 
 ```typescript
 // Pool lifecycle (from src/services/queryExecutor.ts)
@@ -136,6 +149,8 @@ Manages simulated Supabase auth users in the metadata database (not the target d
 - Role (`authenticated`, `anon`, `service_role`)
 - Email confirmation status
 - JSONB metadata for arbitrary user attributes
+
+In production Supabase, this would be the GoTrue authentication service with JWT issuance, OAuth providers, and row-level security policy enforcement.
 
 ## Database Schema
 
@@ -311,7 +326,7 @@ CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INTEGER REFERENCES ord
 
 **Why:** Opening a new TCP connection per query adds 50-100ms of latency. With pools, subsequent queries reuse existing connections. The pool is capped at 5 connections per project to prevent a single project from exhausting server resources.
 
-**Trade-off:** Memory usage grows with active projects. At 1000 active projects with 5 connections each, the server holds 5000 database connections. Mitigation: idle timeout (60s) auto-closes unused connections, and the pool map evicts entries when connection settings change.
+**Trade-off:** Memory usage grows with active projects. At 1000 active projects with 5 connections each, the server holds 5000 database connections. Mitigation: idle timeout (60s) auto-closes unused connections, and the pool map evicts entries when connection settings change. At production scale, PgBouncer would sit between API servers and target databases, multiplexing connections and reducing the per-server pool count.
 
 ### information_schema vs. pg_catalog
 
@@ -328,6 +343,16 @@ CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INTEGER REFERENCES ord
 **Why:** Letting users type raw `CREATE TABLE` SQL is error-prone and hard to validate. Structured column definitions (name, type, nullable, default, PK) can be validated before SQL generation. The sanitizer strips dangerous characters from identifiers and quotes reserved words, preventing SQL injection through table/column names.
 
 **Trade-off:** The DDL generator only supports common column types and constraints. Complex PostgreSQL features (partial indexes, generated columns, CHECK constraints, custom types) require the SQL editor. This is an acceptable boundary -- the DDL generator handles 90% of table creation, and the SQL editor handles the rest.
+
+## Consistency and Idempotency
+
+### SQL Execution Safety
+
+All SQL queries against target databases are executed within statement-level timeouts. The query executor does not wrap user SQL in transactions -- each statement runs independently. This prevents a long-running `SELECT` from holding locks that block other operations, but means multi-statement DDL changes are not atomic. Users who need transactional DDL can wrap their SQL in explicit `BEGIN`/`COMMIT` blocks in the SQL editor.
+
+### Connection Pool Consistency
+
+When a project's connection settings change, the cached pool is evicted and a new one created on next use. In-flight queries on the old pool complete normally; only subsequent queries use the new settings. This avoids abruptly terminating active queries while ensuring configuration changes take effect promptly.
 
 ## Security
 
@@ -371,6 +396,7 @@ CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INTEGER REFERENCES ord
 - Wraps target database operations
 - Opens after 50% error rate, resets after 30 seconds
 - Prevents cascading failures when target databases are unreachable
+- When open, returns a clear "target database unavailable" error rather than timing out
 
 ### Connection Failures
 - Pool creation failures return clear error messages to the UI
@@ -386,9 +412,9 @@ CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INTEGER REFERENCES ord
 
 ### Connection Pool Limits
 At scale, a single API server cannot maintain pools to thousands of target databases. Solutions:
-1. **PgBouncer** - Connection pooler between API servers and target databases
-2. **Pool eviction** - LRU eviction when pool count exceeds threshold (e.g., 200)
-3. **Tiered pooling** - Hot projects get persistent pools, cold projects get on-demand connections
+1. **PgBouncer** - Connection pooler between API servers and target databases, multiplexing thousands of application connections into hundreds of database connections
+2. **Pool eviction** - LRU eviction when pool count exceeds threshold (e.g., 200 per instance)
+3. **Tiered pooling** - Hot projects get persistent pools, warm projects get on-demand connections, cold projects require full connection setup
 
 ### Horizontal Scaling
 - API servers are stateless (sessions in Redis) -- add instances behind load balancer
@@ -399,6 +425,7 @@ At scale, a single API server cannot maintain pools to thousands of target datab
 - Statement-level timeout prevents runaway queries
 - Per-user rate limiting prevents abuse
 - Query result pagination prevents memory exhaustion on large result sets
+- At high scale, a dedicated query execution service could isolate SQL workloads from metadata API traffic
 
 ## Trade-offs Summary
 
@@ -414,27 +441,65 @@ At scale, a single API server cannot maintain pools to thousands of target datab
 
 ## Implementation Notes
 
+### Local Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        Browser                                    │
+│   React + TanStack Router + Zustand + Tailwind                   │
+│   http://localhost:5173                                           │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │ fetch (proxied)
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                 Express API Server                                │
+│                 http://localhost:3000                              │
+│                                                                   │
+│  Routes: auth, projects, tables, tableData, sql, authUsers,      │
+│          settings, users                                          │
+│                                                                   │
+│  Services: schemaIntrospector, queryExecutor, ddlGenerator,      │
+│            authUserService, circuitBreaker, metrics, logger,     │
+│            rateLimiter                                            │
+└──────┬───────────────────────┬─────────────────┬─────────────────┘
+       │                       │                 │
+       ▼                       ▼                 ▼
+┌──────────────┐  ┌────────────────┐  ┌─────────────────┐
+│  Metadata DB │  │   Target DB    │  │   Valkey        │
+│  PostgreSQL  │  │   PostgreSQL   │  │   (Redis)       │
+│  :5432       │  │   :5433        │  │   :6379         │
+│              │  │                │  │                 │
+│ supabase_meta│  │   sample_db    │  │  Sessions       │
+│ (users,      │  │   (products,   │  │                 │
+│  projects,   │  │    customers,  │  │                 │
+│  saved_      │  │    orders)     │  │                 │
+│  queries,    │  │                │  │                 │
+│  auth_users) │  │                │  │                 │
+└──────────────┘  └────────────────┘  └─────────────────┘
+```
+
 ### Production-Grade Patterns Implemented
 
-1. **Circuit Breaker (Opossum)** - Wraps target database calls. Opens at 50% error rate, resets after 30s. Prevents the dashboard from hanging when a target database goes down. See `src/services/circuitBreaker.ts`.
+| Pattern | File | Why It Matters |
+|---------|------|----------------|
+| Circuit Breaker (Opossum) | `src/services/circuitBreaker.ts` | Opens at 50% error rate, resets after 30s. Prevents the dashboard from hanging when a target DB goes down. |
+| Prometheus Metrics (prom-client) | `src/services/metrics.ts` | Custom histograms for query execution duration, connection pool gauge, standard HTTP metrics. Enables alerting on slow queries. |
+| Structured Logging (Pino) | `src/services/logger.ts` | JSON logs with request context, error details, project IDs. Enables log aggregation and search. |
+| Rate Limiting (express-rate-limit) | `src/services/rateLimiter.ts` | 1000 req/15min API-wide, 50 req/15min auth, 100 req/min SQL. Prevents abuse without blocking normal usage. |
+| Dynamic Pool Management | `src/services/queryExecutor.ts` | Pools created on demand, cached by project ID, evicted on config change or idle timeout. |
+| Identifier Sanitization | `src/services/ddlGenerator.ts` | DDL generator strips special characters and quotes reserved words. Prevents SQL injection through DDL forms. |
+| Session Auth (express-session + connect-redis) | `src/middleware/auth.ts` | Valkey-backed sessions with httpOnly cookies. Immediate revocation on logout. |
 
-2. **Prometheus Metrics (prom-client)** - Custom histograms for query execution duration, connection pool gauge, standard HTTP metrics. Enables alerting on slow queries and connection pool exhaustion. See `src/services/metrics.ts`.
+### Simplifications
 
-3. **Structured Logging (Pino)** - JSON logs with request context, error details, and project IDs. Enables log aggregation and search in production. See `src/services/logger.ts`.
-
-4. **Rate Limiting (express-rate-limit)** - 1000 req/15min API-wide, 50 req/15min auth, 100 req/min SQL queries. Prevents abuse without blocking normal usage. See `src/services/rateLimiter.ts`.
-
-5. **Dynamic Pool Management** - Connection pools created on demand, cached by project ID, evicted on config change or idle timeout. Balances connection reuse with resource limits. See `src/services/queryExecutor.ts`.
-
-6. **Identifier Sanitization** - DDL generator strips special characters and quotes reserved words. Prevents SQL injection through structured table/column creation forms. See `src/services/ddlGenerator.ts`.
-
-### Simplified or Substituted
-
-- **Valkey** for Redis -- API-compatible, used for session storage
-- **Single target DB** for what would be per-project isolated databases in production
-- **Session auth** for what would be OAuth + row-level security in production Supabase
-- **Simulated auth users** stored in metadata DB instead of real Supabase GoTrue auth service
-- **Basic textarea** SQL editor instead of CodeMirror/Monaco with syntax highlighting
+| Production Design | Local Substitute | Why Acceptable |
+|-------------------|------------------|----------------|
+| Per-project isolated databases | Single target DB on port 5433 | Demonstrates the two-DB pattern; pool manager is keyed by project ID regardless |
+| PgBouncer connection pooling | Direct pg.Pool per project | Sufficient for < 10 concurrent projects in development |
+| OAuth + GoTrue auth service | Session-based auth in metadata DB | Simulates Supabase auth user management without JWT/OAuth complexity |
+| Redis Cluster for sessions | Single Valkey instance | No HA needed for local development |
+| CDN for static assets | Vite dev server on :5173 | Hot module replacement is more useful during development |
+| CodeMirror/Monaco SQL editor | Basic textarea | Functional for executing SQL; syntax highlighting is cosmetic |
 
 ### Omitted
 
