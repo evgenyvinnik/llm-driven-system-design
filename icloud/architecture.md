@@ -16,18 +16,21 @@ iCloud is a file and data synchronization service across Apple devices. Core cha
 
 ### Functional Requirements
 
-1. **Sync**: Synchronize files across devices
-2. **Photos**: Store and sync photo library
-3. **Conflict**: Detect and resolve conflicts
-4. **Offline**: Work offline, sync when connected
-5. **Share**: Share files and albums
+1. **Sync**: Bidirectional file synchronization across iPhone, iPad, Mac, and web
+2. **Photos**: Photo library sync with derivative generation (thumbnail, preview, full-res)
+3. **Conflict**: Detect and resolve concurrent edits using version vectors
+4. **Offline**: Work offline with local queue, sync when connectivity returns
+5. **Share**: Share files and photo albums with other users
 
 ### Non-Functional Requirements
 
-- **Consistency**: Eventual consistency with conflict detection
-- **Latency**: < 5 seconds for sync propagation
-- **Storage**: Petabytes of user data
-- **Privacy**: End-to-end encryption for sensitive data
+- **Consistency**: Eventual consistency with causal ordering via version vectors
+- **Latency**: < 5 seconds for sync propagation between online devices
+- **Storage**: Petabytes of user data across billions of files
+- **Privacy**: End-to-end encryption for sensitive categories
+- **Availability**: 99.99% for sync operations
+- **Durability**: 99.999999999% (11 nines) for stored data
+- **Throughput**: 100K+ file operations per second globally
 
 ---
 
@@ -35,32 +38,48 @@ iCloud is a file and data synchronization service across Apple devices. Core cha
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│          iPhone │ iPad │ Mac │ Apple Watch │ Web                │
+│                     Client Layer                                 │
+│          iPhone │ iPad │ Mac │ Apple Watch │ Web                 │
+│     Local file system + sync engine + offline queue             │
+└─────────────────────────────────────────────────────────────────┘
+                              │ HTTPS + WebSocket
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    CDN / Edge Network                            │
+│       Photo derivatives, shared album assets, static files      │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
-│              (Auth, Rate Limiting, Routing)                     │
+│                    API Gateway                                   │
+│         (Auth, Rate Limiting, Routing, Request Dedup)           │
 └─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Sync Service │    │ Photo Service │    │ CloudKit      │
-│               │    │               │    │               │
-│ - File sync   │    │ - Library     │    │ - App data    │
-│ - Conflict    │    │ - Analysis    │    │ - Key-value   │
-│ - Versions    │    │ - Sharing     │    │ - Database    │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
+        │              │              │              │
+        ▼              ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
+│   Sync     │ │  Storage   │ │   Photo    │ │   Share    │
+│  Service   │ │  Service   │ │  Service   │ │  Service   │
+│            │ │            │ │            │ │            │
+│ Version    │ │ Chunk mgmt │ │ Derivatives│ │ Albums     │
+│ vectors    │ │ Dedup      │ │ Thumbnails │ │ Permissions│
+│ Conflict   │ │ Upload/DL  │ │ EXIF parse │ │ Public URL │
+│ resolution │ │ Quota      │ │ Favorites  │ │            │
+└─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
+      │              │              │              │
+      ▼              ▼              ▼              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
+│                      Data Layer                                  │
 ├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │   Object Storage  │      Cassandra            │
-│   - Metadata    │   - File chunks   │      - Sync state         │
-│   - Users       │   - Photos        │      - Version vectors    │
+│  PostgreSQL     │  Redis/Valkey     │  Object Storage (S3)      │
+│  - File meta    │  - Sync state     │  - File chunks            │
+│  - Versions     │  - Cache (meta)   │  - Photo derivatives      │
+│  - Photos       │  - Idempotency    │  - Thumbnails             │
+│  - Albums       │  - Rate limits    │                           │
+│  - Sync ops     │  - WebSocket pub  │                           │
+├─────────────────┤                   │                           │
+│  WebSocket Hub  │                   │                           │
+│  - Device push  │                   │                           │
+│  - Change notify│                   │                           │
 └─────────────────┴───────────────────┴───────────────────────────┘
 ```
 
@@ -68,679 +87,401 @@ iCloud is a file and data synchronization service across Apple devices. Core cha
 
 ## Core Components
 
-### 1. Sync Protocol
-
-**Version Vectors for Conflict Detection:**
-```javascript
-class SyncEngine {
-  constructor(deviceId) {
-    this.deviceId = deviceId
-    this.localState = new Map() // fileId -> { version, hash, modTime }
-  }
-
-  async sync() {
-    // 1. Get local changes since last sync
-    const localChanges = await this.getLocalChanges()
-
-    // 2. Get server changes
-    const serverState = await this.fetchServerState()
-
-    // 3. Detect conflicts
-    const { toUpload, toDownload, conflicts } = this.reconcile(
-      localChanges,
-      serverState
-    )
-
-    // 4. Handle conflicts
-    for (const conflict of conflicts) {
-      await this.resolveConflict(conflict)
-    }
-
-    // 5. Upload local changes
-    for (const file of toUpload) {
-      await this.uploadFile(file)
-    }
-
-    // 6. Download server changes
-    for (const file of toDownload) {
-      await this.downloadFile(file)
-    }
-
-    // 7. Update sync state
-    await this.updateSyncState()
-  }
-
-  reconcile(localChanges, serverState) {
-    const toUpload = []
-    const toDownload = []
-    const conflicts = []
-
-    // Process all known files
-    const allFileIds = new Set([
-      ...localChanges.keys(),
-      ...serverState.keys()
-    ])
-
-    for (const fileId of allFileIds) {
-      const local = localChanges.get(fileId)
-      const server = serverState.get(fileId)
-
-      if (!server) {
-        // New local file, upload it
-        toUpload.push(local)
-      } else if (!local) {
-        // New server file, download it
-        toDownload.push(server)
-      } else {
-        // Both exist, check versions
-        const comparison = this.compareVersions(local.version, server.version)
-
-        if (comparison === 'local-newer') {
-          toUpload.push(local)
-        } else if (comparison === 'server-newer') {
-          toDownload.push(server)
-        } else if (comparison === 'conflict') {
-          conflicts.push({ fileId, local, server })
-        }
-        // If equal, no action needed
-      }
-    }
-
-    return { toUpload, toDownload, conflicts }
-  }
-
-  compareVersions(localVersion, serverVersion) {
-    // Version vectors: { deviceId: sequenceNumber }
-    let localNewer = false
-    let serverNewer = false
-
-    const allDevices = new Set([
-      ...Object.keys(localVersion),
-      ...Object.keys(serverVersion)
-    ])
-
-    for (const device of allDevices) {
-      const localSeq = localVersion[device] || 0
-      const serverSeq = serverVersion[device] || 0
-
-      if (localSeq > serverSeq) localNewer = true
-      if (serverSeq > localSeq) serverNewer = true
-    }
-
-    if (localNewer && serverNewer) return 'conflict'
-    if (localNewer) return 'local-newer'
-    if (serverNewer) return 'server-newer'
-    return 'equal'
-  }
-}
-```
-
-### 2. Chunk-Based File Transfer
-
-**Efficient Delta Sync:**
-```javascript
-class ChunkedUploader {
-  constructor(chunkSize = 4 * 1024 * 1024) { // 4MB chunks
-    this.chunkSize = chunkSize
-  }
-
-  async uploadFile(fileId, filePath) {
-    const fileSize = await fs.stat(filePath).size
-    const totalChunks = Math.ceil(fileSize / this.chunkSize)
-
-    // Get existing chunks on server
-    const existingChunks = await this.getServerChunks(fileId)
-    const existingHashes = new Set(existingChunks.map(c => c.hash))
-
-    const chunks = []
-    const stream = fs.createReadStream(filePath, {
-      highWaterMark: this.chunkSize
-    })
-
-    let chunkIndex = 0
-    for await (const data of stream) {
-      const hash = crypto.createHash('sha256').update(data).digest('hex')
-
-      chunks.push({
-        index: chunkIndex,
-        hash,
-        size: data.length
-      })
-
-      // Only upload if chunk doesn't exist (deduplication)
-      if (!existingHashes.has(hash)) {
-        await this.uploadChunk(hash, data)
-      }
-
-      chunkIndex++
-    }
-
-    // Update file manifest
-    await this.updateFileManifest(fileId, {
-      chunks,
-      totalSize: fileSize,
-      version: this.incrementVersion(fileId)
-    })
-
-    return chunks
-  }
-
-  async downloadFile(fileId, destPath) {
-    const manifest = await this.getFileManifest(fileId)
-
-    const writeStream = fs.createWriteStream(destPath)
-
-    for (const chunk of manifest.chunks) {
-      const data = await this.downloadChunk(chunk.hash)
-
-      // Verify chunk integrity
-      const actualHash = crypto.createHash('sha256').update(data).digest('hex')
-      if (actualHash !== chunk.hash) {
-        throw new Error(`Chunk integrity check failed for ${chunk.hash}`)
-      }
-
-      writeStream.write(data)
-    }
-
-    writeStream.end()
-  }
-
-  async uploadChunk(hash, data) {
-    // Encrypt chunk before upload
-    const encrypted = await this.encrypt(data)
-
-    await s3.upload({
-      Bucket: 'icloud-chunks',
-      Key: `chunks/${hash}`,
-      Body: encrypted,
-      ContentType: 'application/octet-stream'
-    }).promise()
-  }
-}
-```
-
-### 3. Conflict Resolution
-
-**Automatic and Manual Resolution:**
-```javascript
-class ConflictResolver {
-  async resolveConflict(conflict) {
-    const { fileId, local, server } = conflict
-
-    // Try automatic resolution based on file type
-    const fileType = this.getFileType(fileId)
-
-    switch (fileType) {
-      case 'text':
-        return this.mergeTextFiles(local, server)
-
-      case 'photo':
-        // Photos: keep both as separate files
-        return this.keepBoth(local, server)
-
-      case 'document':
-        // Documents: use last-modified wins, keep other as conflict copy
-        return this.lastWriteWins(local, server)
-
-      default:
-        // Unknown type: ask user
-        return this.promptUser(local, server)
-    }
-  }
-
-  async mergeTextFiles(local, server) {
-    // Three-way merge using common ancestor
-    const ancestor = await this.getCommonAncestor(local, server)
-
-    const localContent = await this.getContent(local)
-    const serverContent = await this.getContent(server)
-    const ancestorContent = await this.getContent(ancestor)
-
-    try {
-      const merged = diff3Merge(localContent, ancestorContent, serverContent)
-
-      if (!merged.hasConflicts) {
-        // Clean merge
-        return {
-          type: 'merged',
-          content: merged.result
-        }
-      } else {
-        // Has conflicts, create conflict file
-        return {
-          type: 'manual',
-          conflictFile: this.createConflictFile(local, server, merged)
-        }
-      }
-    } catch (e) {
-      return this.keepBoth(local, server)
-    }
-  }
-
-  async keepBoth(local, server) {
-    // Rename server version with conflict suffix
-    const conflictName = this.generateConflictName(server)
-
-    return {
-      type: 'kept-both',
-      localFile: local,
-      conflictCopy: {
-        ...server,
-        name: conflictName
-      }
-    }
-  }
-
-  generateConflictName(file) {
-    const ext = path.extname(file.name)
-    const base = path.basename(file.name, ext)
-    const timestamp = new Date().toISOString().split('T')[0]
-    const device = file.lastModifiedDevice
-
-    return `${base} (${device}'s conflicted copy ${timestamp})${ext}`
-  }
-}
-```
-
-### 4. Photo Library Sync
-
-**Optimized Photo Storage:**
-```javascript
-class PhotoLibrary {
-  async syncPhoto(photo) {
-    // Upload full resolution to cloud
-    const fullResHash = await this.uploadOriginal(photo)
-
-    // Generate derivatives
-    const derivatives = await this.generateDerivatives(photo)
-
-    // Store metadata
-    await db.query(`
-      INSERT INTO photos (id, user_id, hash, taken_at, location, metadata)
-      VALUES ($1, $2, $3, $4, $5, $6)
-    `, [photo.id, photo.userId, fullResHash, photo.takenAt,
-        photo.location, photo.exifData])
-
-    // Upload derivatives
-    for (const [size, derivative] of Object.entries(derivatives)) {
-      await this.uploadDerivative(photo.id, size, derivative)
-    }
-
-    return { photoId: photo.id, hash: fullResHash }
-  }
-
-  async generateDerivatives(photo) {
-    return {
-      thumbnail: await this.resize(photo, 200, 200),
-      preview: await this.resize(photo, 1024, 1024),
-      display: await this.resize(photo, 2048, 2048)
-    }
-  }
-
-  // Optimize device storage
-  async optimizeDeviceStorage(deviceId, targetFreeSpace) {
-    // Get photos on device sorted by last viewed
-    const photos = await db.query(`
-      SELECT p.*, dp.last_viewed
-      FROM photos p
-      JOIN device_photos dp ON p.id = dp.photo_id
-      WHERE dp.device_id = $1
-      AND dp.has_full_res = true
-      ORDER BY dp.last_viewed ASC
-    `, [deviceId])
-
-    let freedSpace = 0
-    const toOptimize = []
-
-    for (const photo of photos.rows) {
-      if (freedSpace >= targetFreeSpace) break
-
-      // Keep full-res in cloud, replace with preview on device
-      toOptimize.push(photo.id)
-      freedSpace += photo.full_res_size - photo.preview_size
-    }
-
-    return { photosToOptimize: toOptimize, estimatedFreedSpace: freedSpace }
-  }
-
-  async downloadFullResolution(photoId) {
-    const photo = await this.getPhotoMeta(photoId)
-    const originalData = await this.downloadOriginal(photo.hash)
-
-    // Mark that this device now has full-res
-    await db.query(`
-      UPDATE device_photos
-      SET has_full_res = true, last_viewed = NOW()
-      WHERE photo_id = $1 AND device_id = $2
-    `, [photoId, this.deviceId])
-
-    return originalData
-  }
-}
-```
-
-### 5. End-to-End Encryption
-
-**Secure Key Management:**
-```javascript
-class EncryptionService {
-  constructor() {
-    this.algorithm = 'aes-256-gcm'
-  }
-
-  async encryptFile(fileData, userId) {
-    // Get or create per-file key
-    const fileKey = crypto.randomBytes(32)
-
-    // Encrypt file data
-    const iv = crypto.randomBytes(16)
-    const cipher = crypto.createCipheriv(this.algorithm, fileKey, iv)
-
-    const encrypted = Buffer.concat([
-      cipher.update(fileData),
-      cipher.final()
-    ])
-
-    const authTag = cipher.getAuthTag()
-
-    // Wrap file key with user's master key
-    const masterKey = await this.getUserMasterKey(userId)
-    const wrappedKey = await this.wrapKey(fileKey, masterKey)
-
-    return {
-      encryptedData: encrypted,
-      iv,
-      authTag,
-      wrappedKey
-    }
-  }
-
-  async decryptFile(encryptedData, iv, authTag, wrappedKey, userId) {
-    // Unwrap file key
-    const masterKey = await this.getUserMasterKey(userId)
-    const fileKey = await this.unwrapKey(wrappedKey, masterKey)
-
-    // Decrypt file
-    const decipher = crypto.createDecipheriv(this.algorithm, fileKey, iv)
-    decipher.setAuthTag(authTag)
-
-    return Buffer.concat([
-      decipher.update(encryptedData),
-      decipher.final()
-    ])
-  }
-
-  async getUserMasterKey(userId) {
-    // Master key derived from user's password
-    // Stored in device's secure enclave/keychain
-    const keyData = await keychain.get(`icloud_master_${userId}`)
-    return Buffer.from(keyData, 'hex')
-  }
-
-  async wrapKey(key, wrapperKey) {
-    // AES-KW (Key Wrap)
-    const wrapped = crypto.createCipheriv('aes-256-wrap', wrapperKey, null)
-    return Buffer.concat([wrapped.update(key), wrapped.final()])
-  }
-}
-```
+### 1. Sync Engine (Version Vectors)
+
+The sync engine uses version vectors to detect causality and conflicts between devices editing the same file.
+
+**Version Vector**: A map of `{deviceId: sequenceNumber}` attached to each file. When device A edits a file, it increments its own entry: `{A: 3, B: 2}`. When device B independently edits, it has `{A: 2, B: 3}`. These vectors diverge, signaling a conflict.
+
+**Comparison Logic:**
+
+Given vectors V1 and V2, iterate all device entries:
+- If V1[d] > V2[d] for some devices AND V2[d] > V1[d] for others: **conflict** (concurrent edits)
+- If V1[d] >= V2[d] for all devices: **V1 is newer** (V1 causally dominates)
+- If V2[d] >= V1[d] for all devices: **V2 is newer**
+- If equal: **same version**
+
+**Conflict Resolution Strategy:**
+1. **Auto-merge** if possible (e.g., both added different photos to an album)
+2. **Last-write-wins** with user notification for binary conflicts
+3. **Conflict copy** for irreconcilable edits: keep both versions, name the conflict copy `filename (conflict from DeviceName).ext`
+
+**Sync Protocol (Push/Pull):**
+1. Device connects and sends its sync cursor (last known server sequence number)
+2. Server returns all changes since that cursor
+3. Device applies remote changes, detects conflicts with local pending changes
+4. Device pushes local changes with version vectors
+5. Server validates version vectors, detects conflicts, stores new versions
+6. Server broadcasts change notifications to all other connected devices via WebSocket
+
+### 2. Chunk-Based File Storage
+
+Files are split into content-addressed chunks for efficient storage and transfer.
+
+**Chunking Strategy:**
+- Fixed-size 4MB chunks (simple, predictable)
+- Each chunk is SHA-256 hashed for content addressing
+- Chunks are stored once globally with reference counting for deduplication
+- Upload only chunks that don't already exist in the global chunk store
+
+**Deduplication Flow:**
+1. Client computes chunk hashes for a file
+2. Client queries server: "which of these chunks do you already have?"
+3. Server checks `chunk_store` table by hash
+4. Client uploads only missing chunks
+5. Server creates `file_chunks` records linking file to its chunks
+6. Global `chunk_store.reference_count` is incremented
+
+**Dedup savings** are significant: similar documents share most chunks (a 10MB file with a 1-line edit uploads only 4MB instead of 10MB). Across users, common files (OS updates, popular documents) are stored once.
+
+**Delta Sync**: When a file is modified, only changed chunks are uploaded. The client computes the new chunk list and diffs against the old chunk list stored on the server.
+
+### 3. Photo Service
+
+Photos require special handling due to size (10-50MB per RAW) and the need for multiple derivatives.
+
+**Derivative Pipeline:**
+1. Original uploaded to object storage (full resolution)
+2. Server generates three derivatives using Sharp:
+   - Thumbnail: 200px wide, JPEG quality 80 (~10KB)
+   - Preview: 1024px wide, JPEG quality 85 (~100KB)
+   - Full resolution: original file
+3. EXIF metadata extracted: camera make/model, GPS coordinates, capture time
+4. All three derivatives stored in separate object storage buckets
+
+**Optimized Storage Mode**: Devices track which photos have full-res locally (`device_photos` junction table). When device storage is low, full-res copies are evicted, keeping only thumbnails. Full-res is always in the cloud and downloaded on demand.
+
+**Photo Organization**: Albums are user-created collections with a junction table (`album_photos`). Albums can be shared with other users via `album_shares` with optional contribute permissions. Shared albums generate a unique `share_token` for public URL access.
+
+### 4. Real-Time Sync (WebSocket)
+
+WebSocket connections provide instant change notification to online devices.
+
+When a file operation completes on one device, the server broadcasts a lightweight change event to all other devices owned by the same user. The event contains the file ID and operation type -- not the file content. Receiving devices then pull the updated metadata and content as needed.
+
+This avoids pushing large payloads over WebSocket while ensuring sub-second notification latency for online devices.
 
 ---
 
 ## Database Schema
 
+### Entity-Relationship Overview
+
+```
+┌──────────────┐     1:N      ┌──────────────┐     1:N      ┌──────────────┐
+│    users     │◄─────────────│   devices    │◄─────────────│device_photos │
+│──────────────│              │──────────────│              │──────────────│
+│ id (UUID PK) │              │ id (UUID PK) │              │ device_id FK │
+│ email        │              │ user_id FK   │              │ photo_id FK  │
+│ password_hash│              │ name         │              │ has_full_res │
+│ storage_quota│              │ device_type  │              └──────────────┘
+│ storage_used │              │ sync_cursor  │
+│ role         │              └──────┬───────┘
+└──────┬───────┘                     │
+       │                             │ last_modified_by
+       │ 1:N                         │
+       ▼                             ▼
+┌──────────────┐     1:N      ┌──────────────┐     1:N      ┌──────────────┐
+│    files     │◄─────────────│ file_versions│              │ file_chunks  │
+│──────────────│              │──────────────│              │──────────────│
+│ id (UUID PK) │              │ id (UUID PK) │              │ id (UUID PK) │
+│ user_id FK   │              │ file_id FK   │              │ file_id FK   │
+│ parent_id FK │◄─── self-ref │ version_num  │              │ chunk_index  │
+│ name, path   │              │ content_hash │              │ chunk_hash   │
+│ version_vector│             │ version_vec  │              │ storage_key  │
+│ is_folder    │              │ is_conflict  │              └──────────────┘
+│ is_deleted   │              └──────────────┘
+└──────┬───────┘                                            ┌──────────────┐
+       │                                                    │ chunk_store  │
+       │ 1:1                                                │──────────────│
+       ▼                                                    │chunk_hash PK │
+┌──────────────┐     N:M (albums)     ┌──────────────┐     │ storage_key  │
+│   photos     │◄─────────────────────│album_photos  │     │ ref_count    │
+│──────────────│                      │──────────────│     └──────────────┘
+│ id (UUID PK) │                      │ album_id FK  │
+│ user_id FK   │                      │ photo_id FK  │
+│ file_id FK   │                      └──────────────┘
+│ original_hash│                             ▲
+│ thumb/prev/  │                             │
+│ full_res keys│              ┌──────────────┤
+│ EXIF metadata│              │   albums     │     1:N      ┌──────────────┐
+│ is_favorite  │              │──────────────│◄─────────────│album_shares  │
+└──────────────┘              │ id (UUID PK) │              │──────────────│
+                              │ user_id FK   │              │ album_id FK  │
+                              │ name         │              │ user_id FK   │
+                              │ is_shared    │              │can_contribute│
+                              │ share_token  │              └──────────────┘
+                              └──────────────┘
+```
+
+### Table Definitions
+
 ```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 -- Users
 CREATE TABLE users (
-  id UUID PRIMARY KEY,
-  apple_id VARCHAR(200) UNIQUE NOT NULL,
-  storage_quota BIGINT DEFAULT 5368709120, -- 5GB
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email VARCHAR(200) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  storage_quota BIGINT DEFAULT 5368709120,  -- 5GB default
   storage_used BIGINT DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW()
+  role VARCHAR(20) DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Files
+-- Devices
+CREATE TABLE devices (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(100) NOT NULL,
+  device_type VARCHAR(50) NOT NULL,
+  last_sync_at TIMESTAMP,
+  sync_cursor JSONB DEFAULT '{}',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_devices_user ON devices(user_id);
+
+-- Files (self-referencing for folder hierarchy)
 CREATE TABLE files (
-  id UUID PRIMARY KEY,
-  user_id UUID REFERENCES users(id),
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  parent_id UUID REFERENCES files(id) ON DELETE CASCADE,
   name VARCHAR(500) NOT NULL,
   path VARCHAR(1000) NOT NULL,
-  size BIGINT NOT NULL,
+  mime_type VARCHAR(200),
+  size BIGINT DEFAULT 0,
   content_hash VARCHAR(64),
-  version JSONB, -- Version vector
+  version_vector JSONB DEFAULT '{}',
+  is_folder BOOLEAN DEFAULT FALSE,
   is_deleted BOOLEAN DEFAULT FALSE,
+  last_modified_by UUID REFERENCES devices(id),
   created_at TIMESTAMP DEFAULT NOW(),
   modified_at TIMESTAMP DEFAULT NOW()
 );
 
 CREATE INDEX idx_files_user_path ON files(user_id, path);
+CREATE INDEX idx_files_parent ON files(parent_id);
+CREATE INDEX idx_files_user_deleted ON files(user_id, is_deleted);
 
--- File Chunks
+-- File chunks (per-file chunk manifest)
 CREATE TABLE file_chunks (
-  file_id UUID REFERENCES files(id),
-  chunk_index INTEGER,
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  file_id UUID REFERENCES files(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
   chunk_hash VARCHAR(64) NOT NULL,
   chunk_size INTEGER NOT NULL,
-  PRIMARY KEY (file_id, chunk_index)
+  storage_key VARCHAR(200) NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(file_id, chunk_index)
 );
 
--- Sync State (per device)
-CREATE TABLE device_sync_state (
-  device_id UUID,
-  user_id UUID REFERENCES users(id),
-  last_sync_token VARCHAR(100),
-  sync_cursor JSONB,
-  last_sync_at TIMESTAMP,
-  PRIMARY KEY (device_id, user_id)
+CREATE INDEX idx_chunks_file ON file_chunks(file_id);
+CREATE INDEX idx_chunks_hash ON file_chunks(chunk_hash);
+
+-- Global chunk deduplication store
+CREATE TABLE chunk_store (
+  chunk_hash VARCHAR(64) PRIMARY KEY,
+  storage_key VARCHAR(200) NOT NULL,
+  chunk_size INTEGER NOT NULL,
+  reference_count INTEGER DEFAULT 1,
+  created_at TIMESTAMP DEFAULT NOW()
 );
+
+-- File version history (for conflict resolution)
+CREATE TABLE file_versions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  file_id UUID REFERENCES files(id) ON DELETE CASCADE,
+  version_number INTEGER NOT NULL,
+  content_hash VARCHAR(64) NOT NULL,
+  version_vector JSONB NOT NULL,
+  created_by UUID REFERENCES devices(id),
+  is_conflict BOOLEAN DEFAULT FALSE,
+  conflict_resolved BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(file_id, version_number)
+);
+
+CREATE INDEX idx_versions_file ON file_versions(file_id);
+
+-- Sync operations log
+CREATE TABLE sync_operations (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  device_id UUID REFERENCES devices(id) ON DELETE CASCADE,
+  file_id UUID REFERENCES files(id) ON DELETE SET NULL,
+  operation_type VARCHAR(20) NOT NULL,
+  operation_data JSONB,
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT NOW(),
+  completed_at TIMESTAMP
+);
+
+CREATE INDEX idx_sync_ops_user_device ON sync_operations(user_id, device_id);
+CREATE INDEX idx_sync_ops_status ON sync_operations(status);
 
 -- Photos
 CREATE TABLE photos (
-  id UUID PRIMARY KEY,
-  user_id UUID REFERENCES users(id),
-  hash VARCHAR(64) NOT NULL,
-  taken_at TIMESTAMP,
-  location GEOGRAPHY(Point),
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  file_id UUID REFERENCES files(id) ON DELETE SET NULL,
+  original_hash VARCHAR(64) NOT NULL,
+  thumbnail_key VARCHAR(200),
+  preview_key VARCHAR(200),
+  full_res_key VARCHAR(200),
   width INTEGER,
   height INTEGER,
-  full_res_size BIGINT,
-  metadata JSONB,
+  taken_at TIMESTAMP,
+  location_lat DECIMAL(10, 8),
+  location_lng DECIMAL(11, 8),
+  camera_make VARCHAR(100),
+  camera_model VARCHAR(100),
+  metadata JSONB DEFAULT '{}',
+  is_favorite BOOLEAN DEFAULT FALSE,
   is_deleted BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  modified_at TIMESTAMP DEFAULT NOW()
 );
 
+CREATE INDEX idx_photos_user ON photos(user_id);
 CREATE INDEX idx_photos_user_date ON photos(user_id, taken_at DESC);
+CREATE INDEX idx_photos_favorite ON photos(user_id, is_favorite) WHERE is_favorite = TRUE;
 
--- Shared Albums
-CREATE TABLE shared_albums (
-  id UUID PRIMARY KEY,
-  owner_id UUID REFERENCES users(id),
+-- Albums
+CREATE TABLE albums (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   name VARCHAR(200) NOT NULL,
-  is_public BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW()
+  cover_photo_id UUID REFERENCES photos(id) ON DELETE SET NULL,
+  is_shared BOOLEAN DEFAULT FALSE,
+  share_token VARCHAR(64),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
+CREATE INDEX idx_albums_user ON albums(user_id);
+CREATE UNIQUE INDEX idx_albums_share_token ON albums(share_token) WHERE share_token IS NOT NULL;
+
+-- Album-photo junction
 CREATE TABLE album_photos (
-  album_id UUID REFERENCES shared_albums(id),
-  photo_id UUID REFERENCES photos(id),
+  album_id UUID REFERENCES albums(id) ON DELETE CASCADE,
+  photo_id UUID REFERENCES photos(id) ON DELETE CASCADE,
   added_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (album_id, photo_id)
 );
 
-CREATE TABLE album_subscribers (
-  album_id UUID REFERENCES shared_albums(id),
-  user_id UUID REFERENCES users(id),
+-- Album sharing
+CREATE TABLE album_shares (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  album_id UUID REFERENCES albums(id) ON DELETE CASCADE,
+  shared_with_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   can_contribute BOOLEAN DEFAULT FALSE,
-  PRIMARY KEY (album_id, user_id)
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(album_id, shared_with_user_id)
 );
+
+-- Device photo sync state
+CREATE TABLE device_photos (
+  device_id UUID REFERENCES devices(id) ON DELETE CASCADE,
+  photo_id UUID REFERENCES photos(id) ON DELETE CASCADE,
+  has_full_res BOOLEAN DEFAULT FALSE,
+  last_viewed TIMESTAMP,
+  downloaded_at TIMESTAMP,
+  PRIMARY KEY (device_id, photo_id)
+);
+
+-- Sessions
+CREATE TABLE sessions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  device_id UUID REFERENCES devices(id) ON DELETE SET NULL,
+  token VARCHAR(255) UNIQUE NOT NULL,
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
 ```
+
+### Schema Design Rationale
+
+**Self-referencing files table**: `parent_id` references `files(id)` to form a tree hierarchy for folders. `path` stores the materialized path (e.g., `/Documents/Work/report.pdf`) for fast prefix queries (`WHERE path LIKE '/Documents/%'`). Both are maintained: `parent_id` for tree traversal, `path` for fast lookups.
+
+**Version vectors as JSONB**: `{deviceId: sequenceNumber}` maps naturally to JSONB. PostgreSQL JSONB supports efficient containment queries and indexing if needed. The vector is small (one entry per device, typically 2-5 devices per user).
+
+**chunk_store with reference counting**: Global deduplication table keyed by content hash. When multiple files share the same chunk, `reference_count` tracks how many references exist. Chunks with zero references are garbage-collected. This pattern saves 30-50% storage for typical document workloads.
+
+**Three photo derivative keys**: `thumbnail_key`, `preview_key`, `full_res_key` are separate object storage paths. This allows CDN caching of immutable content-addressed derivatives with infinite TTL. Devices download only the derivative they need (thumbnail for grid view, preview for lightbox, full-res for editing).
+
+**Partial index for favorites**: `WHERE is_favorite = TRUE` keeps the index tiny since only a small percentage of photos are favorited. The "Favorites" album query hits this small index instead of scanning all photos.
+
+**device_photos junction table**: Tracks which devices have full-resolution copies of which photos. Enables "Optimize Mac Storage" -- when device storage is low, evict full-res copies (set `has_full_res = FALSE`), keeping only cloud-backed thumbnails.
+
+**sync_operations log**: Append-only log of all sync operations for debugging, conflict analysis, and audit. `file_id` uses `SET NULL` on delete so the log preserves the operation record even after the file is removed.
+
+---
+
+## API Design
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/auth/register` | Create user account |
+| POST | `/api/v1/auth/login` | Authenticate, create session, register device |
+| POST | `/api/v1/auth/logout` | Destroy session |
+| GET | `/api/v1/files` | List files in a folder |
+| POST | `/api/v1/files` | Create file or folder |
+| PUT | `/api/v1/files/:id` | Update file metadata |
+| DELETE | `/api/v1/files/:id` | Soft-delete file |
+| POST | `/api/v1/files/:id/upload` | Upload file content (chunked) |
+| GET | `/api/v1/files/:id/download` | Download file content |
+| POST | `/api/v1/sync/push` | Push local changes to server (idempotent) |
+| GET | `/api/v1/sync/pull` | Pull remote changes since cursor |
+| GET | `/api/v1/sync/conflicts` | List unresolved conflicts |
+| POST | `/api/v1/sync/conflicts/:id/resolve` | Resolve a conflict |
+| GET | `/api/v1/photos` | List photos with pagination |
+| POST | `/api/v1/photos/upload` | Upload photo (generates derivatives) |
+| GET | `/api/v1/photos/:id/thumbnail` | Get thumbnail derivative |
+| GET | `/api/v1/photos/:id/preview` | Get preview derivative |
+| GET | `/api/v1/photos/:id/full` | Get full-resolution original |
+| POST | `/api/v1/photos/:id/favorite` | Toggle favorite status |
+| GET | `/api/v1/devices` | List user's devices |
+| GET | `/api/v1/admin/stats` | Admin system statistics |
+| GET | `/api/v1/admin/users` | Admin user management |
+| GET | `/health` | Full system health check |
+| GET | `/health/live` | Liveness probe |
+| GET | `/health/ready` | Readiness probe |
+| GET | `/metrics` | Prometheus metrics |
+| WS | `/ws` | WebSocket for real-time sync notifications |
 
 ---
 
 ## Key Design Decisions
 
-### 1. Version Vectors
+### 1. Version Vectors vs Timestamps
 
-**Decision**: Use version vectors for conflict detection
+Version vectors detect true causality: two devices editing independently produce diverging vectors that cannot be ordered by wall-clock time alone. Timestamps fail because device clocks drift (by seconds to minutes), leading to silent data loss when a "newer" timestamp overwrites a concurrent edit. Version vectors guarantee that concurrent edits are detected as conflicts, never silently lost. The trade-off is increased metadata size (one entry per device) and more complex merge logic, but for a sync service where data integrity is paramount, this is essential.
 
-**Rationale**:
-- Detects concurrent edits across devices
-- No central coordinator needed
-- Handles network partitions
+### 2. Chunk-Based Storage vs Whole-File
 
-### 2. Chunk-Based Storage
+Chunking files into 4MB content-addressed blocks enables three critical features: (1) deduplication across files and users (common documents stored once), (2) delta sync (only changed chunks uploaded on edit), and (3) resumable uploads (retry from the last successful chunk, not the beginning). The trade-off is increased complexity in the storage layer (chunk manifest tracking, reference counting, garbage collection) and small files being inefficient (a 10KB file still creates a chunk record). We mitigate the small-file overhead by storing files under 1MB inline without chunking.
 
-**Decision**: Split files into content-addressed chunks
+### 3. Optimized Storage Mode for Photos
 
-**Rationale**:
-- Enables deduplication
-- Efficient delta sync
-- Resumable uploads/downloads
-
-### 3. Optimized Storage Mode
-
-**Decision**: Replace full-res photos with previews on device
-
-**Rationale**:
-- Saves device storage
-- Full-res always in cloud
-- Download on demand
-
----
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Sync model | Version vectors | Timestamps | Conflict detection |
-| Storage | Chunked, content-addressed | Whole file | Deduplication, delta |
-| Encryption | Per-file keys | Single user key | Key rotation, sharing |
-| Photos | Optimized on-device | Full sync | Device storage limits |
+Rather than syncing all full-resolution photos to all devices (which would fill a 128GB iPhone in months), we sync only thumbnails by default and download full-res on demand. The `device_photos` table tracks what each device has locally. This reduces device storage by 95%+ while keeping the full library browsable. The trade-off is latency when opening a photo for the first time (must download from cloud), mitigated by predictive prefetching of recently viewed albums.
 
 ---
 
 ## Caching and Edge Strategy
 
-### CDN Layer (Static Assets and Photo Derivatives)
+### CDN Layer
 
-**Architecture:**
-```
-Client -> CloudFront/CDN -> Origin (MinIO/S3)
-                         -> API Gateway (cache miss)
-```
+Photo derivatives are the highest-bandwidth content. Thumbnails and previews are content-addressed (keyed by hash) and cached at CDN edge with `Cache-Control: public, max-age=31536000, immutable`. Since the content hash changes when the photo changes, no explicit cache invalidation is needed.
 
-**What to Cache at CDN:**
-- Photo derivatives (thumbnails, previews) - high read frequency
-- Public shared album assets
-- Static UI assets and app bundles
-
-**CDN Configuration:**
-```javascript
-const cdnConfig = {
-  // Photo derivatives - long cache, versioned by hash
-  photoDerivatives: {
-    ttl: 31536000,  // 1 year (immutable content-addressed)
-    cacheKey: 'derivative-hash',
-    headers: {
-      'Cache-Control': 'public, max-age=31536000, immutable'
-    }
-  },
-
-  // Shared album metadata - short cache
-  sharedAlbumMeta: {
-    ttl: 60,  // 1 minute
-    staleWhileRevalidate: 300,
-    headers: {
-      'Cache-Control': 'public, max-age=60, stale-while-revalidate=300'
-    }
-  }
-}
-```
-
-### Redis/Valkey Cache Layer
-
-**Cache-Aside Pattern (Read-Heavy Data):**
-
-Used for data that is read frequently but written infrequently.
-
-```javascript
-class CacheAside {
-  constructor(redis, db, defaultTTL = 3600) {
-    this.redis = redis
-    this.db = db
-    this.defaultTTL = defaultTTL
-  }
-
-  async getFileMetadata(fileId) {
-    const cacheKey = `file:meta:${fileId}`
-
-    // 1. Try cache first
-    const cached = await this.redis.get(cacheKey)
-    if (cached) {
-      return JSON.parse(cached)
-    }
-
-    // 2. Cache miss - fetch from database
-    const metadata = await this.db.query(
-      'SELECT * FROM files WHERE id = $1',
-      [fileId]
-    )
-
-    // 3. Populate cache
-    if (metadata.rows[0]) {
-      await this.redis.setex(
-        cacheKey,
-        this.defaultTTL,
-        JSON.stringify(metadata.rows[0])
-      )
-    }
-
-    return metadata.rows[0]
-  }
-
-  // Invalidate on write
-  async updateFileMetadata(fileId, updates) {
-    await this.db.query(
-      'UPDATE files SET name = $2, modified_at = NOW() WHERE id = $1',
-      [fileId, updates.name]
-    )
-
-    // Invalidate cache
-    await this.redis.del(`file:meta:${fileId}`)
-  }
-}
-```
-
-**Write-Through Pattern (Sync State):**
-
-Used for critical data where cache and DB must stay consistent.
-
-```javascript
-class WriteThrough {
-  async updateSyncState(deviceId, userId, syncToken) {
-    const cacheKey = `sync:state:${deviceId}:${userId}`
-    const data = {
-      lastSyncToken: syncToken,
-      lastSyncAt: new Date().toISOString()
-    }
-
-    // Write to both cache AND database atomically
-    await Promise.all([
-      this.redis.setex(cacheKey, 86400, JSON.stringify(data)),
-      this.db.query(`
-        INSERT INTO device_sync_state (device_id, user_id, last_sync_token, last_sync_at)
-        VALUES ($1, $2, $3, NOW())
-        ON CONFLICT (device_id, user_id)
-        DO UPDATE SET last_sync_token = $3, last_sync_at = NOW()
-      `, [deviceId, userId, syncToken])
-    ])
-
-    return data
-  }
-}
-```
-
-### TTL Strategy by Data Type
+### Redis/Valkey Cache
 
 | Data Type | TTL | Pattern | Invalidation |
 |-----------|-----|---------|--------------|
@@ -750,1327 +491,229 @@ class WriteThrough {
 | Photo derivatives | Forever | CDN + content-hash | Never (immutable) |
 | Chunk existence | 1 hour | Cache-aside | On chunk upload |
 | Device list | 15 minutes | Cache-aside | On device register/remove |
+| Idempotency keys | 24 hours | Write-on-submit | Natural expiry |
 
-### Cache Invalidation Rules
+**Write-Through** is used for sync state because losing the cursor would cause the device to re-sync everything. Both cache and database are written atomically.
 
-```javascript
-class CacheInvalidator {
-  constructor(redis, pubsub) {
-    this.redis = redis
-    this.pubsub = pubsub
-  }
+**Cache-Aside** is used for file metadata where occasional stale reads (up to TTL) are acceptable. On writes, relevant cache keys are explicitly invalidated.
 
-  // Explicit invalidation on write operations
-  async onFileUpdated(fileId, userId) {
-    const keys = [
-      `file:meta:${fileId}`,
-      `user:files:${userId}:list`,
-      `user:storage:${userId}`
-    ]
-    await this.redis.del(...keys)
+---
 
-    // Notify other cache instances via pub/sub
-    await this.pubsub.publish('cache:invalidate', {
-      keys,
-      timestamp: Date.now()
-    })
-  }
+## Consistency and Idempotency
 
-  // Bulk invalidation for folder operations
-  async onFolderDeleted(folderId, userId) {
-    // Use scan to find all matching keys (avoid KEYS in production)
-    const pattern = `file:meta:${folderId}:*`
-    let cursor = '0'
+### Write Consistency Model
 
-    do {
-      const [newCursor, keys] = await this.redis.scan(
-        cursor, 'MATCH', pattern, 'COUNT', 100
-      )
-      cursor = newCursor
+| Data Type | Consistency | Rationale |
+|-----------|-------------|-----------|
+| File metadata | Strong (transactions) | Must not lose edits |
+| Version vectors | Strong (compare-and-swap) | Conflict detection requires accuracy |
+| Chunk storage | Eventual (content-addressed) | Chunks are immutable; dedup is idempotent |
+| Photo derivatives | Eventual | Regenerated if missing |
+| Sync operations log | Strong (append-only) | Audit trail must be complete |
+| User storage quota | Eventually consistent | Updated after upload/delete, minor lag acceptable |
 
-      if (keys.length > 0) {
-        await this.redis.del(...keys)
-      }
-    } while (cursor !== '0')
-  }
-}
-```
+### Idempotency Implementation
 
-### Local Development Cache Setup
+**Sync Push**: The client sends an `Idempotency-Key` header derived from `SHA-256(userId + operation + changes_hash)`. The server checks Redis for an existing result:
+- **Found**: Return cached response (safe replay)
+- **Not found**: Acquire a processing lock (5-min TTL), execute the handler, store the result (24h TTL), release the lock
+- **In progress**: Wait up to 30 seconds for the result, or return 409 Conflict with `Retry-After`
 
-```yaml
-# docker-compose.yml addition
-services:
-  valkey:
-    image: valkey/valkey:7-alpine
-    ports:
-      - "6379:6379"
-    command: valkey-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-```
+This handles the common case where a client times out after 30 seconds, the server actually processed the request, and the client retries -- without the retry causing duplicate files or incorrect version vectors.
+
+**File Upload**: Content-addressed chunks are inherently idempotent. Uploading the same chunk (same hash) twice is a no-op since the chunk store uses the hash as the primary key.
 
 ---
 
 ## Observability
 
-### Metrics Collection
-
-**Key Metrics by Category:**
-
-```javascript
-const metrics = {
-  // Sync performance
-  'sync.duration_ms': 'histogram',      // Time to complete sync cycle
-  'sync.files_uploaded': 'counter',     // Files uploaded per sync
-  'sync.files_downloaded': 'counter',   // Files downloaded per sync
-  'sync.conflicts_detected': 'counter', // Conflicts found
-  'sync.conflicts_resolved': 'counter', // Auto-resolved conflicts
-
-  // Storage operations
-  'storage.chunk_upload_ms': 'histogram',   // Chunk upload latency
-  'storage.chunk_download_ms': 'histogram', // Chunk download latency
-  'storage.dedup_hits': 'counter',          // Chunks skipped (already exist)
-  'storage.bytes_uploaded': 'counter',      // Total bytes uploaded
-
-  // Cache performance
-  'cache.hit_rate': 'gauge',           // Cache hit ratio
-  'cache.miss_count': 'counter',       // Cache misses
-  'cache.eviction_count': 'counter',   // Keys evicted
-
-  // API health
-  'api.request_duration_ms': 'histogram', // Request latency by endpoint
-  'api.error_rate': 'gauge',              // 5xx error rate
-  'api.active_connections': 'gauge'       // WebSocket connections
-}
-```
-
-**Prometheus Instrumentation Example:**
-
-```javascript
-import { Registry, Histogram, Counter, Gauge } from 'prom-client'
-
-const registry = new Registry()
-
-const syncDuration = new Histogram({
-  name: 'icloud_sync_duration_seconds',
-  help: 'Duration of sync operations',
-  labelNames: ['device_type', 'result'],
-  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
-  registers: [registry]
-})
-
-const conflictsDetected = new Counter({
-  name: 'icloud_conflicts_total',
-  help: 'Total number of sync conflicts detected',
-  labelNames: ['file_type', 'resolution'],
-  registers: [registry]
-})
-
-// Usage in sync engine
-async function sync() {
-  const timer = syncDuration.startTimer({ device_type: 'mac' })
-  try {
-    await performSync()
-    timer({ result: 'success' })
-  } catch (err) {
-    timer({ result: 'error' })
-    throw err
-  }
-}
-```
-
-### Structured Logging
-
-**Log Format (JSON Lines):**
-
-```javascript
-const logger = {
-  info: (event, data) => console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    level: 'info',
-    event,
-    ...data,
-    service: 'sync-service',
-    version: process.env.APP_VERSION
-  })),
-
-  error: (event, error, data) => console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    level: 'error',
-    event,
-    error: {
-      message: error.message,
-      stack: error.stack,
-      code: error.code
-    },
-    ...data,
-    service: 'sync-service'
-  }))
-}
-
-// Example log entries
-logger.info('sync.started', {
-  userId: 'user-123',
-  deviceId: 'device-456',
-  filesChanged: 15
-})
-
-logger.info('chunk.uploaded', {
-  userId: 'user-123',
-  fileId: 'file-789',
-  chunkHash: 'abc123...',
-  sizeBytes: 4194304,
-  durationMs: 450,
-  deduplicated: false
-})
-
-logger.error('sync.failed', error, {
-  userId: 'user-123',
-  deviceId: 'device-456',
-  phase: 'upload'
-})
-```
-
-### Distributed Tracing
-
-**OpenTelemetry Integration:**
-
-```javascript
-import { trace, SpanKind } from '@opentelemetry/api'
-
-const tracer = trace.getTracer('icloud-sync')
-
-async function uploadFile(fileId, filePath) {
-  return tracer.startActiveSpan('file.upload', {
-    kind: SpanKind.CLIENT,
-    attributes: {
-      'file.id': fileId,
-      'file.path': filePath
-    }
-  }, async (span) => {
-    try {
-      // Chunking phase
-      const chunks = await tracer.startActiveSpan('file.chunk', async (chunkSpan) => {
-        const result = await splitIntoChunks(filePath)
-        chunkSpan.setAttribute('chunk.count', result.length)
-        chunkSpan.end()
-        return result
-      })
-
-      // Upload each chunk
-      for (const chunk of chunks) {
-        await tracer.startActiveSpan('chunk.upload', {
-          attributes: { 'chunk.hash': chunk.hash, 'chunk.size': chunk.size }
-        }, async (uploadSpan) => {
-          await uploadChunkToStorage(chunk)
-          uploadSpan.end()
-        })
-      }
-
-      span.setStatus({ code: 0 })
-    } catch (error) {
-      span.setStatus({ code: 2, message: error.message })
-      span.recordException(error)
-      throw error
-    } finally {
-      span.end()
-    }
-  })
-}
-```
-
-### SLI Dashboard Definitions
-
-**Grafana Dashboard Panels:**
-
-| Panel | Query | Purpose |
-|-------|-------|---------|
-| Sync Success Rate | `rate(icloud_sync_duration_seconds_count{result="success"}[5m]) / rate(icloud_sync_duration_seconds_count[5m])` | Track sync reliability |
-| P95 Sync Latency | `histogram_quantile(0.95, rate(icloud_sync_duration_seconds_bucket[5m]))` | Sync performance |
-| Conflict Rate | `rate(icloud_conflicts_total[1h])` | Data consistency health |
-| Cache Hit Rate | `rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m]))` | Cache effectiveness |
-| Storage Dedup Ratio | `rate(storage_dedup_hits_total[1h]) / rate(storage_chunks_processed_total[1h])` | Storage efficiency |
-| Active WebSocket Connections | `icloud_websocket_connections` | Real-time sync capacity |
-
-### Alert Thresholds
-
-```yaml
-# alerts.yml
-groups:
-  - name: icloud-slis
-    rules:
-      - alert: SyncLatencyHigh
-        expr: histogram_quantile(0.95, rate(icloud_sync_duration_seconds_bucket[5m])) > 10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Sync P95 latency exceeds 10 seconds"
-
-      - alert: SyncErrorRateHigh
-        expr: rate(icloud_sync_duration_seconds_count{result="error"}[5m]) / rate(icloud_sync_duration_seconds_count[5m]) > 0.05
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Sync error rate exceeds 5%"
-
-      - alert: CacheHitRateLow
-        expr: rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m])) < 0.8
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Cache hit rate below 80%"
-
-      - alert: ConflictRateSpike
-        expr: rate(icloud_conflicts_total[5m]) > 10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Unusual spike in sync conflicts"
-
-      - alert: StorageQuotaExceeded
-        expr: icloud_user_storage_used_bytes / icloud_user_storage_quota_bytes > 0.95
-        for: 1m
-        labels:
-          severity: info
-        annotations:
-          summary: "User approaching storage quota limit"
-```
-
-### Audit Logging
-
-**Security and Compliance Events:**
-
-```javascript
-class AuditLogger {
-  constructor(db) {
-    this.db = db
-  }
-
-  async log(event) {
-    await this.db.query(`
-      INSERT INTO audit_log (
-        event_type, user_id, device_id, resource_type, resource_id,
-        action, metadata, ip_address, user_agent, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-    `, [
-      event.type,
-      event.userId,
-      event.deviceId,
-      event.resourceType,
-      event.resourceId,
-      event.action,
-      JSON.stringify(event.metadata),
-      event.ipAddress,
-      event.userAgent
-    ])
-  }
-}
-
-// Audit events to capture
-const auditEvents = {
-  // Authentication
-  'auth.login': { retention: '2 years' },
-  'auth.logout': { retention: '2 years' },
-  'auth.device_registered': { retention: '2 years' },
-  'auth.device_removed': { retention: '2 years' },
-
-  // Data access
-  'file.shared': { retention: '1 year' },
-  'file.downloaded': { retention: '90 days' },
-  'album.shared': { retention: '1 year' },
-  'album.unshared': { retention: '1 year' },
-
-  // Administrative
-  'admin.user_suspended': { retention: '5 years' },
-  'admin.data_export': { retention: '5 years' },
-  'admin.data_deleted': { retention: '5 years' }
-}
-
-// Usage
-await auditLogger.log({
-  type: 'file.shared',
-  userId: 'user-123',
-  deviceId: 'device-456',
-  resourceType: 'file',
-  resourceId: 'file-789',
-  action: 'create_share_link',
-  metadata: {
-    shareType: 'public',
-    expiresAt: '2024-12-31'
-  },
-  ipAddress: req.ip,
-  userAgent: req.headers['user-agent']
-})
-```
-
-**Audit Log Schema:**
-
-```sql
-CREATE TABLE audit_log (
-  id BIGSERIAL PRIMARY KEY,
-  event_type VARCHAR(100) NOT NULL,
-  user_id UUID,
-  device_id UUID,
-  resource_type VARCHAR(50),
-  resource_id UUID,
-  action VARCHAR(100) NOT NULL,
-  metadata JSONB,
-  ip_address INET,
-  user_agent TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_audit_user_time ON audit_log(user_id, created_at DESC);
-CREATE INDEX idx_audit_event_type ON audit_log(event_type, created_at DESC);
-CREATE INDEX idx_audit_resource ON audit_log(resource_type, resource_id, created_at DESC);
-```
-
----
-
-## Failure Handling
-
-### Retry Strategy with Idempotency Keys
-
-**Idempotent Upload Operations:**
-
-```javascript
-class IdempotentUploader {
-  constructor(redis, storage, db) {
-    this.redis = redis
-    this.storage = storage
-    this.db = db
-  }
-
-  async uploadFile(idempotencyKey, fileId, fileData, userId) {
-    const lockKey = `upload:lock:${idempotencyKey}`
-    const resultKey = `upload:result:${idempotencyKey}`
-
-    // Check if this request was already processed
-    const existingResult = await this.redis.get(resultKey)
-    if (existingResult) {
-      return JSON.parse(existingResult)
-    }
-
-    // Acquire lock to prevent duplicate processing
-    const lockAcquired = await this.redis.set(
-      lockKey,
-      'locked',
-      'NX',
-      'EX',
-      300  // 5 minute lock
-    )
-
-    if (!lockAcquired) {
-      // Another request is processing this - wait and return result
-      await this.waitForResult(resultKey)
-      return JSON.parse(await this.redis.get(resultKey))
-    }
-
-    try {
-      // Perform the actual upload
-      const result = await this.performUpload(fileId, fileData, userId)
-
-      // Store result for 24 hours
-      await this.redis.setex(resultKey, 86400, JSON.stringify(result))
-
-      return result
-    } finally {
-      await this.redis.del(lockKey)
-    }
-  }
-
-  async waitForResult(resultKey, maxWaitMs = 30000) {
-    const startTime = Date.now()
-    while (Date.now() - startTime < maxWaitMs) {
-      const result = await this.redis.get(resultKey)
-      if (result) return
-      await new Promise(resolve => setTimeout(resolve, 100))
-    }
-    throw new Error('Timeout waiting for upload result')
-  }
-}
-```
-
-**Client-Side Retry with Exponential Backoff:**
-
-```javascript
-class RetryClient {
-  constructor(maxRetries = 3, baseDelayMs = 1000) {
-    this.maxRetries = maxRetries
-    this.baseDelayMs = baseDelayMs
-  }
-
-  async uploadWithRetry(fileId, fileData) {
-    // Generate idempotency key from file content hash
-    const idempotencyKey = crypto
-      .createHash('sha256')
-      .update(fileId + fileData.slice(0, 1024))
-      .digest('hex')
-
-    let lastError
-
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      try {
-        const response = await fetch('/api/v1/files/upload', {
-          method: 'POST',
-          headers: {
-            'Idempotency-Key': idempotencyKey,
-            'Content-Type': 'application/octet-stream'
-          },
-          body: fileData
-        })
-
-        if (response.ok) {
-          return await response.json()
-        }
-
-        // Don't retry 4xx errors (client error)
-        if (response.status >= 400 && response.status < 500) {
-          throw new Error(`Client error: ${response.status}`)
-        }
-
-        lastError = new Error(`Server error: ${response.status}`)
-      } catch (error) {
-        lastError = error
-      }
-
-      if (attempt < this.maxRetries) {
-        // Exponential backoff with jitter
-        const delay = this.baseDelayMs * Math.pow(2, attempt)
-        const jitter = delay * 0.2 * Math.random()
-        await new Promise(r => setTimeout(r, delay + jitter))
-      }
-    }
-
-    throw lastError
-  }
-}
-```
-
-### Circuit Breaker Pattern
-
-**Storage Service Circuit Breaker:**
-
-```javascript
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || 5
-    this.resetTimeoutMs = options.resetTimeoutMs || 30000
-    this.halfOpenMaxCalls = options.halfOpenMaxCalls || 3
-
-    this.state = 'closed'  // closed, open, half-open
-    this.failureCount = 0
-    this.successCount = 0
-    this.lastFailureTime = null
-    this.halfOpenCalls = 0
-  }
-
-  async execute(fn) {
-    if (this.state === 'open') {
-      if (Date.now() - this.lastFailureTime >= this.resetTimeoutMs) {
-        this.state = 'half-open'
-        this.halfOpenCalls = 0
-      } else {
-        throw new Error('Circuit breaker is open')
-      }
-    }
-
-    if (this.state === 'half-open' && this.halfOpenCalls >= this.halfOpenMaxCalls) {
-      throw new Error('Circuit breaker half-open limit reached')
-    }
-
-    try {
-      const result = await fn()
-      this.onSuccess()
-      return result
-    } catch (error) {
-      this.onFailure()
-      throw error
-    }
-  }
-
-  onSuccess() {
-    if (this.state === 'half-open') {
-      this.successCount++
-      if (this.successCount >= this.halfOpenMaxCalls) {
-        this.state = 'closed'
-        this.failureCount = 0
-        this.successCount = 0
-      }
-    } else {
-      this.failureCount = 0
-    }
-  }
-
-  onFailure() {
-    this.failureCount++
-    this.lastFailureTime = Date.now()
-
-    if (this.state === 'half-open') {
-      this.state = 'open'
-    } else if (this.failureCount >= this.failureThreshold) {
-      this.state = 'open'
-    }
-  }
-
-  getState() {
-    return {
-      state: this.state,
-      failureCount: this.failureCount,
-      lastFailureTime: this.lastFailureTime
-    }
-  }
-}
-
-// Usage
-const storageBreaker = new CircuitBreaker({
-  failureThreshold: 5,
-  resetTimeoutMs: 30000
-})
-
-async function uploadChunk(hash, data) {
-  return storageBreaker.execute(async () => {
-    return await minioClient.putObject('chunks', hash, data)
-  })
-}
-```
-
-**Circuit Breaker Middleware:**
-
-```javascript
-const circuitBreakers = {
-  storage: new CircuitBreaker({ failureThreshold: 5, resetTimeoutMs: 30000 }),
-  database: new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 60000 }),
-  externalApi: new CircuitBreaker({ failureThreshold: 10, resetTimeoutMs: 120000 })
-}
-
-// Health endpoint shows circuit breaker states
-app.get('/health/circuits', (req, res) => {
-  res.json({
-    storage: circuitBreakers.storage.getState(),
-    database: circuitBreakers.database.getState(),
-    externalApi: circuitBreakers.externalApi.getState()
-  })
-})
-```
-
-### Multi-Region Disaster Recovery (Conceptual)
-
-**For Local Development Learning:**
-
-While full multi-region DR is impractical locally, understand the patterns:
-
-```javascript
-// Simulated region failover for learning
-class RegionManager {
-  constructor() {
-    this.regions = [
-      { id: 'primary', endpoint: 'http://localhost:3001', healthy: true },
-      { id: 'secondary', endpoint: 'http://localhost:3002', healthy: true }
-    ]
-    this.activeRegion = this.regions[0]
-  }
-
-  async healthCheck() {
-    for (const region of this.regions) {
-      try {
-        const response = await fetch(`${region.endpoint}/health`, {
-          timeout: 5000
-        })
-        region.healthy = response.ok
-      } catch {
-        region.healthy = false
-      }
-    }
-  }
-
-  getActiveEndpoint() {
-    // Return first healthy region
-    const healthy = this.regions.find(r => r.healthy)
-    if (!healthy) {
-      throw new Error('No healthy regions available')
-    }
-    return healthy.endpoint
-  }
-
-  async failover() {
-    await this.healthCheck()
-    const newActive = this.regions.find(r => r.healthy && r.id !== this.activeRegion.id)
-
-    if (newActive) {
-      console.log(`Failing over from ${this.activeRegion.id} to ${newActive.id}`)
-      this.activeRegion = newActive
-      return true
-    }
-    return false
-  }
-}
-```
-
-**DR Checklist for Production:**
-
-| Component | Primary | Secondary | RPO | RTO |
-|-----------|---------|-----------|-----|-----|
-| PostgreSQL | us-east-1 | us-west-2 | 1 minute (async replication) | 15 minutes |
-| MinIO/S3 | us-east-1 | us-west-2 | 0 (cross-region replication) | 5 minutes |
-| Valkey/Redis | us-east-1 | us-west-2 | 5 minutes | 10 minutes |
-| Cassandra | Multi-DC | Multi-DC | 0 (multi-master) | 0 (automatic) |
-
-### Backup and Restore Testing
-
-**Automated Backup Verification:**
-
-```javascript
-class BackupValidator {
-  constructor(db, storage) {
-    this.db = db
-    this.storage = storage
-  }
-
-  // Run nightly in non-production environments
-  async validateBackups() {
-    const report = {
-      timestamp: new Date().toISOString(),
-      checks: []
-    }
-
-    // 1. Verify PostgreSQL backup exists and is recent
-    const pgBackup = await this.checkPostgresBackup()
-    report.checks.push({
-      name: 'postgresql_backup',
-      status: pgBackup.valid ? 'pass' : 'fail',
-      lastBackup: pgBackup.timestamp,
-      sizeBytes: pgBackup.size
-    })
-
-    // 2. Verify chunk storage backup/replication
-    const storageBackup = await this.checkStorageReplication()
-    report.checks.push({
-      name: 'storage_replication',
-      status: storageBackup.inSync ? 'pass' : 'fail',
-      lagBytes: storageBackup.replicationLag
-    })
-
-    // 3. Sample restore test (restore random file)
-    const restoreTest = await this.sampleRestoreTest()
-    report.checks.push({
-      name: 'sample_restore',
-      status: restoreTest.success ? 'pass' : 'fail',
-      durationMs: restoreTest.duration,
-      fileId: restoreTest.fileId
-    })
-
-    return report
-  }
-
-  async checkPostgresBackup() {
-    // Check backup exists in storage
-    const backups = await this.storage.listObjects('backups', 'pg/')
-    const latest = backups.sort((a, b) => b.lastModified - a.lastModified)[0]
-
-    const ageHours = (Date.now() - latest.lastModified.getTime()) / 3600000
-
-    return {
-      valid: ageHours < 24,  // Backup should be less than 24 hours old
-      timestamp: latest.lastModified,
-      size: latest.size
-    }
-  }
-
-  async sampleRestoreTest() {
-    const startTime = Date.now()
-
-    // Pick a random file from the database
-    const randomFile = await this.db.query(`
-      SELECT id, content_hash FROM files
-      WHERE is_deleted = false
-      ORDER BY RANDOM()
-      LIMIT 1
-    `)
-
-    if (!randomFile.rows[0]) {
-      return { success: true, duration: 0, fileId: null }
-    }
-
-    const fileId = randomFile.rows[0].id
-    const expectedHash = randomFile.rows[0].content_hash
-
-    try {
-      // Attempt to reconstruct file from chunks
-      const manifest = await this.getFileManifest(fileId)
-      const chunks = []
-
-      for (const chunk of manifest.chunks) {
-        const data = await this.storage.getObject('chunks', chunk.hash)
-        chunks.push(data)
-      }
-
-      // Verify reconstructed file hash
-      const reconstructed = Buffer.concat(chunks)
-      const actualHash = crypto
-        .createHash('sha256')
-        .update(reconstructed)
-        .digest('hex')
-
-      return {
-        success: actualHash === expectedHash,
-        duration: Date.now() - startTime,
-        fileId
-      }
-    } catch (error) {
-      return {
-        success: false,
-        duration: Date.now() - startTime,
-        fileId,
-        error: error.message
-      }
-    }
-  }
-}
-```
-
-**Backup Schedule:**
-
-```yaml
-# backup-schedule.yml
-backups:
-  postgresql:
-    type: pg_dump
-    frequency: daily
-    retention: 30 days
-    destination: s3://icloud-backups/pg/
-
-  postgresql_wal:
-    type: continuous
-    retention: 7 days
-    destination: s3://icloud-backups/pg-wal/
-
-  chunk_storage:
-    type: cross-region-replication
-    frequency: continuous
-    destination: s3://icloud-chunks-replica/
-
-restore_tests:
-  frequency: weekly
-  scope: sample  # full, sample, metadata-only
-  notification: ops-team@example.com
-```
-
-**Local Development Backup Commands:**
-
-```bash
-# Backup PostgreSQL
-pg_dump -h localhost -U icloud icloud_db > backup_$(date +%Y%m%d).sql
-
-# Restore PostgreSQL
-psql -h localhost -U icloud icloud_db < backup_20240115.sql
-
-# Backup MinIO bucket
-mc mirror minio/icloud-chunks ./backup-chunks/
-
-# Restore MinIO bucket
-mc mirror ./backup-chunks/ minio/icloud-chunks
-```
-
----
-
-## Frontend Architecture
-
-The frontend is built with React, TypeScript, and Tailwind CSS. Components are organized into logical modules with clear separation of concerns.
-
-### Component Directory Structure
-
-```
-frontend/src/components/
-├── admin/                    # Admin dashboard components
-│   ├── index.ts              # Barrel exports
-│   ├── OverviewTab.tsx       # System statistics display
-│   ├── OperationsTab.tsx     # Sync operations table
-│   ├── ConflictsTab.tsx      # Conflict management
-│   └── UsersTab.tsx          # User administration
-│
-├── common/                   # Shared UI components
-│   ├── index.ts              # Barrel exports
-│   ├── StatCard.tsx          # Colored statistic cards
-│   ├── LoadingSpinner.tsx    # Loading indicators
-│   └── Modal.tsx             # Modal dialog wrapper
-│
-├── files/                    # File browser components
-│   ├── index.ts              # Barrel exports
-│   ├── FileItemComponent.tsx # Single file/folder row
-│   ├── FileToolbar.tsx       # Breadcrumb and actions
-│   ├── FileList.tsx          # File listing container
-│   ├── FileStatusBanners.tsx # Error/conflict/upload banners
-│   ├── NewFolderModal.tsx    # New folder creation
-│   ├── SelectionBar.tsx      # Selection count and clear
-│   └── DragOverlay.tsx       # Drop zone indicator
-│
-├── photos/                   # Photo gallery components
-│   ├── index.ts              # Barrel exports
-│   ├── PhotoItem.tsx         # Single photo thumbnail
-│   ├── PhotoViewer.tsx       # Full-screen lightbox
-│   ├── PhotoToolbar.tsx      # Filter and upload controls
-│   ├── PhotoGrid.tsx         # Thumbnail grid container
-│   └── CreateAlbumModal.tsx  # Album creation dialog
-│
-├── Icons.tsx                 # Shared icon components
-├── AdminDashboard.tsx        # Main admin page (orchestrator)
-├── FileBrowser.tsx           # Main file browser (orchestrator)
-└── PhotoGallery.tsx          # Main photo gallery (orchestrator)
-```
-
-### Design Principles
-
-**1. Component Size Guidelines**
-
-Each component follows a ~150-200 line maximum. Larger components are split into:
-- **Orchestrator components** (e.g., `AdminDashboard.tsx`): Handle state, effects, and compose sub-components
-- **Presentation components** (e.g., `StatCard.tsx`): Pure UI rendering with props
-
-**2. Module Organization**
-
-Related components are grouped into feature directories with barrel exports:
-```typescript
-// Import from feature module
-import { PhotoItem, PhotoViewer, PhotoGrid } from './photos';
-
-// Not individual files
-import { PhotoItem } from './photos/PhotoItem';
-```
-
-**3. JSDoc Documentation**
-
-All exported components and significant functions include JSDoc comments:
-```typescript
-/**
- * Displays a single statistic in a colored card.
- *
- * @param props - Component props
- * @returns Styled statistic card element
- */
-export const StatCard: React.FC<StatCardProps> = ({ ... }) => { ... }
-```
-
-**4. Type Safety**
-
-Props interfaces are defined and exported alongside components:
-```typescript
-export interface StatCardProps {
-  title: string;
-  value: string | number;
-  subtitle?: string;
-  color?: StatCardColor;
-}
-```
-
-### State Management
-
-- **Zustand stores** for global application state (`fileStore`, `photoStore`)
-- **React state** for local UI state (modals, selections, form inputs)
-- **Store subscriptions** for WebSocket real-time updates
-
-### Component Communication Patterns
-
-| Pattern | Use Case | Example |
-|---------|----------|---------|
-| Props down | Parent to child data | `<PhotoGrid photos={photos} />` |
-| Callbacks up | Child to parent events | `onToggleSelection={(id) => ...}` |
-| Store | Cross-component state | `useFileStore()`, `usePhotoStore()` |
-| Context | Theme, auth (not yet used) | Future enhancement |
-
-### Photo Grid Virtualization
-
-The photo gallery uses `@tanstack/react-virtual` for efficient rendering of large photo collections.
-
-**Why Virtualization:**
-- Photo libraries can contain thousands of images
-- Each photo element includes thumbnail, selection state, and click handlers
-- Without virtualization, memory usage grows linearly with collection size
-
-**Row-Based Virtualization Approach:**
-
-Unlike single-item virtualization, the photo grid virtualizes rows containing multiple photos:
-
-```typescript
-// PhotoGrid.tsx
-import { useVirtualizer } from '@tanstack/react-virtual';
-
-const COLUMNS = 4;
-const ITEM_HEIGHT = 200; // Row height including gap
-
-const rowCount = Math.ceil(photos.length / COLUMNS);
-
-const virtualizer = useVirtualizer({
-  count: rowCount,
-  getScrollElement: () => parentRef.current,
-  estimateSize: () => ITEM_HEIGHT,
-  overscan: 2, // 2 extra rows above/below
-});
-```
-
-**Why Row-Based:**
-- Grid layout requires consistent column structure
-- Virtualizing rows maintains grid alignment
-- Simpler CSS layout (grid within each virtualized row)
-
-**Rendering Pattern:**
-```typescript
-{virtualRows.map((virtualRow) => {
-  const startIndex = virtualRow.index * COLUMNS;
-  const rowPhotos = photos.slice(startIndex, startIndex + COLUMNS);
-
-  return (
-    <div
-      key={virtualRow.key}
-      style={{
-        position: 'absolute',
-        top: 0,
-        transform: `translateY(${virtualRow.start}px)`,
-      }}
-      className="grid grid-cols-4 gap-2"
-    >
-      {rowPhotos.map((photo) => (
-        <PhotoItem key={photo.id} photo={photo} />
-      ))}
-    </div>
-  );
-})}
-```
-
-**Configuration:**
-
-| Setting | Value | Rationale |
-|---------|-------|-----------|
-| Columns | 4 | Standard photo grid layout |
-| Row height | 200px | Fixed for consistent virtualization |
-| `overscan` | 2 rows | 8 extra photos buffer |
-
-**Infinite Scroll Integration:**
-
-```typescript
-const handleScroll = useCallback(() => {
-  const { scrollTop, scrollHeight, clientHeight } = parentRef.current;
-  if (scrollHeight - scrollTop - clientHeight < 300) {
-    onLoadMore?.();
-  }
-}, [onLoadMore]);
-```
-
-**Performance Impact:**
-
-| Metric | Without Virtualization | With Virtualization |
-|--------|------------------------|---------------------|
-| DOM nodes (1000 photos) | 4000+ | ~80 |
-| Memory usage | 400MB+ | 80MB |
-| Initial render | 2+ seconds | <200ms |
-| Scroll FPS | Degrades with collection size | Constant 60fps |
-
-### Common Components
-
-The `common/` directory contains reusable UI primitives:
-
-| Component | Purpose |
-|-----------|---------|
-| `StatCard` | Colored metric card for dashboards |
-| `LoadingSpinner` | Animated loading indicator |
-| `CenteredSpinner` | Spinner centered in a container |
-| `Modal` | Dialog overlay with title and content |
-| `ModalActions` | Standard cancel/confirm button row |
-
----
-
-## Implementation Notes
-
-This section documents the actual implementation of the observability, caching, and failure handling patterns described above. Each implementation addresses specific production concerns.
-
-### Structured Logging with Pino
-
-**File:** `backend/src/shared/logger.js`
-
-**Why Pino:** Pino is the fastest JSON logger for Node.js, essential for high-throughput sync operations. Structured JSON logs enable:
-
-- **Log Aggregation:** Tools like ELK, Loki, or CloudWatch can parse and query logs efficiently
-- **Correlation IDs:** Each request gets a unique ID, making it easy to trace a sync operation across services
-- **Audit Trail:** Security-relevant events (file shares, device registrations) are logged separately for compliance
-
-**Key Features:**
-- Development mode uses `pino-pretty` for human-readable console output
-- Production mode outputs raw JSON for log aggregators
-- Request middleware attaches `req.log` with correlation ID for all routes
-- Separate audit logger for compliance events with longer retention
-
-**Example Log Output:**
-```json
-{
-  "level": "info",
-  "time": "2024-01-15T10:30:00.000Z",
-  "correlationId": "abc-123",
-  "event": "sync.push_completed",
-  "userId": "user-456",
-  "applied": 5,
-  "conflicts": 1,
-  "errors": 0
-}
-```
-
-### Prometheus Metrics
-
-**File:** `backend/src/shared/metrics.js`
-
-**Why Prometheus:** Industry-standard for cloud-native monitoring. RED method (Rate, Errors, Duration) metrics enable SLO tracking.
-
-**Metrics Categories:**
+### Metrics (Prometheus)
 
 | Category | Metric | Type | Purpose |
 |----------|--------|------|---------|
 | HTTP | `icloud_http_request_duration_seconds` | Histogram | API latency by endpoint |
 | Sync | `icloud_sync_duration_seconds` | Histogram | Sync operation timing |
-| Sync | `icloud_conflicts_total` | Counter | Track conflict frequency |
-| Storage | `icloud_chunk_operation_duration_seconds` | Histogram | MinIO latency |
+| Sync | `icloud_conflicts_total` | Counter | Conflict frequency |
+| Storage | `icloud_chunk_operation_duration_seconds` | Histogram | MinIO/S3 latency |
 | Storage | `icloud_dedup_hits_total` | Counter | Deduplication effectiveness |
 | Cache | `icloud_cache_hits_total` | Counter | Cache hit rate |
 | Circuit | `icloud_circuit_breaker_state` | Gauge | Breaker open/closed status |
+| WebSocket | `icloud_websocket_connections` | Gauge | Active real-time connections |
 
-**Grafana Queries for SLI Dashboard:**
-```promql
-# Sync Success Rate (SLO: 99.9%)
-sum(rate(icloud_sync_operations_total{result="success"}[5m])) /
-sum(rate(icloud_sync_operations_total[5m]))
+### Alert Thresholds
 
-# P95 Sync Latency (SLO: <5s)
-histogram_quantile(0.95, rate(icloud_sync_duration_seconds_bucket[5m]))
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| Sync p95 latency | > 5s | > 10s |
+| Sync error rate | > 1% | > 5% |
+| Conflict rate spike | > 10/min | > 50/min |
+| Cache hit rate | < 85% | < 70% |
+| Storage quota > 95% | per-user | per-user |
+| Circuit breaker open | any breaker | storage breaker |
 
-# Cache Hit Rate (Target: >85%)
-rate(icloud_cache_hits_total[5m]) /
-(rate(icloud_cache_hits_total[5m]) + rate(icloud_cache_misses_total[5m]))
-```
+### Structured Logging
 
-**Endpoint:** `GET /metrics` returns Prometheus-formatted metrics for scraping.
+Pino JSON logger with:
+- Request correlation IDs for tracing sync operations across services
+- Component child loggers (`syncService`, `chunkService`, `photoService`)
+- Audit logger for security events (file shares, device registrations, admin actions)
+- Development mode: `pino-pretty` for human-readable output
+- Production mode: raw JSON for log aggregators (ELK, Loki)
 
-### Redis Caching Strategy
+---
 
-**File:** `backend/src/shared/cache.js`
-
-**Why Two Patterns:**
-
-1. **Cache-Aside (Read-Heavy Data):** Used for file metadata and storage quotas. Tolerates stale reads for 1 hour. On cache miss, fetches from PostgreSQL and populates cache.
-
-2. **Write-Through (Critical Data):** Used for device sync state. Writes to both cache and database atomically. Ensures consistency for sync cursor (losing this could cause duplicate syncs).
-
-**TTL Configuration:**
-
-| Data Type | TTL | Pattern | Rationale |
-|-----------|-----|---------|-----------|
-| File Metadata | 1 hour | Cache-aside | Files change infrequently |
-| User Storage | 5 min | Cache-aside | Updates on upload/delete |
-| Sync State | 24 hours | Write-through | Critical, must be consistent |
-| Chunk Exists | 1 hour | Cache-aside | Dedup check optimization |
-| Idempotency Keys | 24 hours | Cache-aside | Retry window |
-
-**Cache Invalidation:** On file update, we invalidate:
-- `file:meta:{fileId}` - The specific file
-- `user:storage:{userId}` - Storage quota (may have changed)
+## Failure Handling
 
 ### Circuit Breaker for Storage
 
-**File:** `backend/src/shared/circuitBreaker.js`
+MinIO/S3 failures can cascade to the entire sync service. Three separate circuit breakers protect different operation types:
 
-**Why Circuit Breaker:** MinIO/S3 failures can cascade to the entire sync service. Without protection:
-- Requests pile up waiting for timeout
-- Thread pool exhaustion
-- User-visible latency spikes
+| Breaker | Timeout | Threshold | Reset | Purpose |
+|---------|---------|-----------|-------|---------|
+| `storage_put` | 30s | 50% error | 30s | Large uploads |
+| `storage_get` | 15s | 50% error | 30s | Downloads |
+| `storage_stat` | 5s | 50% error | 15s | Existence checks |
 
-**How It Works:**
+State machine: CLOSED --(threshold reached)--> OPEN --(reset timeout)--> HALF-OPEN --(3 successes)--> CLOSED.
+
+When a breaker opens, the sync service returns 503 for storage-dependent operations. File metadata operations (list, rename, delete) continue working since they only touch PostgreSQL.
+
+### Retry Strategy
+
+**Client-side**: Exponential backoff (1s base, 2x multiplier, 30s max) with jitter. Idempotency key ensures safe replay. Only 5xx errors are retried; 4xx errors (validation, auth) are not.
+
+**Server-side**: Sync push operations that partially fail (some chunks uploaded, metadata not committed) are rolled back within a database transaction. The client can retry the entire operation safely via idempotency key.
+
+### Graceful Shutdown
+
+On SIGTERM/SIGINT: close WebSocket connections with close frame, drain in-flight HTTP requests, close database pool and Redis connections, close MinIO client, exit.
+
+---
+
+## Scalability Considerations
+
+### What Breaks First
+
+1. **Object storage throughput** -- At scale, chunk uploads/downloads dominate bandwidth. Solution: CDN for reads, multi-region S3 with cross-region replication.
+2. **Sync state database** -- Every file operation writes to `files`, `file_versions`, and `sync_operations`. Solution: user-level sharding (all data for a user on the same shard), read replicas for listing queries.
+3. **WebSocket connections** -- Each online device maintains a persistent connection. At 1B devices, this requires a distributed WebSocket hub (e.g., Redis pub/sub for cross-instance fan-out).
+4. **Photo derivative generation** -- CPU-intensive Sharp operations. Solution: dedicated worker pool with auto-scaling based on queue depth.
+
+### Horizontal Scaling Path
+
+- **Sync service**: Stateless, horizontal scaling behind load balancer. WebSocket connections are sticky by user_id.
+- **Storage service**: Stateless, scales with S3/MinIO throughput. Chunk existence checks cached in Redis.
+- **Database**: User-level sharding. All tables for a user co-located on the same shard for transactional integrity.
+- **Photo workers**: Queue-based with auto-scaling. Derivative generation is embarrassingly parallel.
+
+---
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Sync model | Version vectors | Timestamps / CRDTs | Correct conflict detection without clock sync; CRDTs too complex for file sync |
+| Storage | Chunked, content-addressed | Whole file | 30-50% dedup savings, delta sync, resumable uploads |
+| Photo delivery | Optimized (thumbnail-first) | Full sync | 95% device storage savings |
+| Encryption | Per-file keys | Single user key | Granular sharing, independent key rotation |
+| Real-time sync | WebSocket | Polling / SSE | Bidirectional, sub-second latency, connection state tracking |
+| Chunk size | 4MB fixed | Content-defined (Rabin) | Simpler implementation; content-defined better for dedup at scale |
+| Conflict resolution | Version vectors + conflict copies | Last-write-wins | No silent data loss; user decides for irreconcilable conflicts |
+| Session storage | Cookie + token in DB | JWT | Immediate revocation, server-side session data |
+
+---
+
+## Implementation Notes
+
+This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.
+
+### Local Architecture
 
 ```
-         Requests
-             │
-             ▼
-      ┌─────────────┐
-      │   CLOSED    │ ─── Normal operation
-      └─────────────┘
-             │
-        5 failures
-             │
-             ▼
-      ┌─────────────┐
-      │    OPEN     │ ─── Fail fast (30s)
-      └─────────────┘
-             │
-        30s timeout
-             │
-             ▼
-      ┌─────────────┐
-      │  HALF-OPEN  │ ─── Test recovery
-      └─────────────┘
-             │
-        3 successes
-             │
-             ▼
-      ┌─────────────┐
-      │   CLOSED    │ ─── Resume normal
-      └─────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│               React Frontend (:5173)                         │
+│  FileBrowser + PhotoGallery + AdminDashboard                │
+│  Drag-and-drop upload, photo viewer, conflict resolution    │
+│  Virtualized photo grid (@tanstack/react-virtual)           │
+│  State: Zustand (fileStore, photoStore, authStore)           │
+└────────────────────────┬──────────────┬─────────────────────┘
+                         │ HTTP         │ WebSocket (:3000/ws)
+                         ▼              ▼
+┌─────────────────────────────────────────────────────────────┐
+│           Express Backend (:3000)                            │
+│  Routes: auth, files, sync, photos, devices, admin          │
+│  Middleware: auth (cookie+token), rate limiting, idempotency │
+│  Services: websocket, chunks, sync                          │
+│  Shared: logger, metrics, cache, circuitBreaker,            │
+│          idempotency, health                                 │
+└──────┬──────────────┬──────────────┬────────────────────────┘
+       │              │              │
+       ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐
+│ PostgreSQL │ │   Valkey   │ │   MinIO    │
+│  (:5432)   │ │  (:6379)   │ │(:9000/9001)│
+│ DB:        │ │  Cache,    │ │ Buckets:   │
+│ icloud_sync│ │  idempot., │ │ chunks,    │
+│ User:icloud│ │  rate limit│ │ photos,    │
+│            │ │            │ │ thumbnails │
+└────────────┘ └────────────┘ └────────────┘
 ```
 
-**Configuration:**
-- `errorThresholdPercentage: 50` - Open when 50% of requests fail
-- `resetTimeout: 30000` - Try again after 30 seconds
-- `timeout: 30000` - Individual request timeout for uploads
+### Production Patterns Actually Implemented
 
-**Separate Breakers:** We use different breakers for different operations:
-- `storage_put` - Longer timeout (30s) for large uploads
-- `storage_get` - Medium timeout (15s) for downloads
-- `storage_stat` - Short timeout (5s) for existence checks
+| Pattern | File | Why It Matters at Scale |
+|---------|------|------------------------|
+| Structured logging (Pino) | `backend/src/shared/logger.ts` | JSON logs with correlation IDs; audit logger for compliance events (file shares, admin actions) |
+| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP latency histograms, sync duration, conflict counters, chunk operation timing, WebSocket gauge, dedup hits |
+| Redis caching (dual pattern) | `backend/src/shared/cache.ts` | Cache-aside for file metadata (1h TTL), write-through for sync state (24h TTL); explicit invalidation on writes |
+| Circuit breakers (Opossum) | `backend/src/shared/circuitBreaker.ts` | Separate breakers for storage put (30s), get (15s), stat (5s); prevents MinIO failures from cascading |
+| Idempotency | `backend/src/shared/idempotency.ts` | Redis lock + result cache for sync push operations; prevents duplicate files on client retry |
+| Health checks | `backend/src/shared/health.ts` | Three tiers: `/health/live` (liveness), `/health/ready` (DB+Redis+MinIO), `/health` (full with breaker states) |
+| Version vector sync | `backend/src/services/sync.ts` | Compare-and-detect conflicts, auto-merge or conflict copies, cursor-based pull |
+| Chunk dedup | `backend/src/services/chunks.ts` | SHA-256 content addressing, reference counting, upload-only-missing optimization |
+| WebSocket real-time | `backend/src/services/websocket.ts` | Per-user device broadcast on file operations; excludes originating device |
+| Photo derivatives (Sharp) | `backend/src/routes/photos.ts` | Thumbnail (200px) + preview (1024px) + full-res; stored in separate MinIO buckets |
+| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT: close WebSocket, drain connections, close pools |
+| Photo grid virtualization | `frontend/src/components/photos/PhotoGrid.tsx` | @tanstack/react-virtual row-based virtualization; constant 60fps with 1000+ photos |
+| Rate limiting | `backend/src/index.ts` | 1000 requests per 15-minute window per IP |
 
-### Idempotency for Sync Operations
+### Frontend Component Architecture
 
-**File:** `backend/src/shared/idempotency.js`
+The frontend is organized into feature modules with barrel exports:
 
-**Why Idempotency:** Sync operations are particularly vulnerable to duplicate processing:
+| Module | Components | Purpose |
+|--------|-----------|---------|
+| `files/` | FileList, FileItem, FileToolbar, FileStatusBanners, DragOverlay, NewFolderModal, SelectionBar | iCloud Drive file browser with drag-and-drop |
+| `photos/` | PhotoGrid, PhotoItem, PhotoViewer, PhotoToolbar, CreateAlbumModal | Photo library with virtualized grid and lightbox |
+| `admin/` | OverviewTab, UsersTab, OperationsTab, ConflictsTab | Admin dashboard with system stats |
+| `common/` | StatCard, LoadingSpinner, Modal | Shared UI primitives |
 
-1. Client times out after 30 seconds
-2. Server actually processed the request
-3. Client retries with same changes
-4. Without idempotency: duplicate files or incorrect version vectors
+State management uses Zustand stores (`fileStore`, `photoStore`, `authStore`) for global state and React local state for UI concerns (modals, selections).
 
-**How It Works:**
+### Simplifications from Production Design
 
-```
-Client Request (with Idempotency-Key header)
-             │
-             ▼
-      ┌──────────────────┐
-      │ Check Redis for  │
-      │ existing result  │
-      └──────────────────┘
-             │
-     ┌───────┴───────┐
-     │               │
-   Found          Not Found
-     │               │
-     ▼               ▼
- Return          Acquire Lock
- Cached          (5 min TTL)
- Result              │
-                     ▼
-              Execute Handler
-                     │
-                     ▼
-              Save Result
-              (24 hour TTL)
-                     │
-                     ▼
-              Release Lock
-```
+| Production | Local Substitute | Why |
+|------------|-----------------|-----|
+| S3 with cross-region replication | MinIO (single instance) | S3-compatible API, same code path |
+| CDN for photo derivatives | Direct MinIO access via backend proxy | No edge network needed locally |
+| Distributed WebSocket hub (Redis pub/sub) | In-process WebSocket with per-instance user map | Single server instance, no cross-instance fan-out needed |
+| Content-defined chunking (Rabin fingerprint) | Fixed 4MB chunks | Simpler; Rabin better for dedup at scale |
+| End-to-end encryption (per-file keys) | No encryption | Encryption layer orthogonal to sync protocol |
+| Selective sync (per-folder, per-device) | Full sync to all devices | Feature complexity deferred |
+| Background photo derivative pipeline | Synchronous Sharp processing in upload handler | No worker queue needed at dev scale |
+| OAuth / Apple ID | Cookie + token session auth | Simpler; focused on sync, not identity |
+| Offline queue with IndexedDB | Online-only (no local persistence) | Offline sync requires service worker |
+| Read replicas for listing queries | Single PostgreSQL instance | One database sufficient for dev workload |
 
-**Key Design Decisions:**
+### What Was Omitted
 
-1. **Lock with TTL:** If server crashes, lock auto-expires after 5 minutes
-2. **Result Caching:** Store full response for 24 hours for exact replay
-3. **Conflict Handling:** If another request is processing, wait up to 30s or return 409
-4. **Opt-in:** Routes use `withIdempotency()` wrapper for operations that need it
-
-**Client Integration:**
-```javascript
-// Client generates key from content
-const idempotencyKey = sha256(userId + operation + JSON.stringify(changes));
-
-fetch('/api/v1/sync/push', {
-  method: 'POST',
-  headers: {
-    'Idempotency-Key': idempotencyKey,
-  },
-  body: JSON.stringify({ changes }),
-});
-```
-
-### Health Checks
-
-**File:** `backend/src/shared/health.js`
-
-**Three Endpoints for Different Purposes:**
-
-| Endpoint | Purpose | Checks | Use Case |
-|----------|---------|--------|----------|
-| `/health/live` | Liveness | None | Kubernetes restart probe |
-| `/health/ready` | Readiness | DB + Redis | Load balancer routing |
-| `/health` | Full status | All components | Debugging, dashboards |
-
-**Full Health Response:**
-```json
-{
-  "status": "healthy",
-  "timestamp": "2024-01-15T10:30:00.000Z",
-  "uptime": 3600,
-  "version": "1.0.0",
-  "components": {
-    "postgres": {
-      "status": "healthy",
-      "latencyMs": 2,
-      "poolInfo": {
-        "totalCount": 20,
-        "idleCount": 18,
-        "waitingCount": 0
-      }
-    },
-    "redis": {
-      "status": "healthy",
-      "latencyMs": 1,
-      "memoryUsedBytes": 1048576
-    },
-    "storage": {
-      "status": "healthy",
-      "latencyMs": 15,
-      "bucketsCount": 3
-    },
-    "circuitBreakers": {
-      "status": "healthy",
-      "breakers": {
-        "put": { "state": "closed", "stats": {...} },
-        "get": { "state": "closed", "stats": {...} }
-      }
-    }
-  }
-}
-```
-
-### Running the Implementation
-
-**Start Infrastructure:**
-```bash
-docker-compose up -d
-```
-
-**Start Backend with Observability:**
-```bash
-cd backend
-npm run dev
-```
-
-**Verify Health:**
-```bash
-curl http://localhost:3001/health
-```
-
-**View Metrics:**
-```bash
-curl http://localhost:3001/metrics
-```
-
-**Test Idempotency:**
-```bash
-# First request
-curl -X POST http://localhost:3001/api/v1/sync/push \
-  -H "Idempotency-Key: test-key-123" \
-  -H "Content-Type: application/json" \
-  -d '{"changes": []}'
-
-# Duplicate request returns same result without re-processing
-curl -X POST http://localhost:3001/api/v1/sync/push \
-  -H "Idempotency-Key: test-key-123" \
-  -H "Content-Type: application/json" \
-  -d '{"changes": []}'
-```
+- **CDN and edge caching** -- no multi-POP deployment
+- **Multi-region deployment** -- single local instance
+- **Kubernetes orchestration** -- Docker Compose only
+- **End-to-end encryption** -- no per-file key management
+- **Offline-first with IndexedDB** -- online-only
+- **Selective sync** -- all files sync to all devices
+- **User-level database sharding** -- single PostgreSQL
+- **Content-defined chunking** -- fixed 4MB chunks
+- **Compression before upload** -- gzip/zstd deferred
+- **Public sharing links** -- share_token column exists but UI not implemented

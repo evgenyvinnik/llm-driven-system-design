@@ -16,18 +16,20 @@ AirTag uses the Find My network to locate items using crowd-sourced Bluetooth de
 
 ### Functional Requirements
 
-1. **Track**: Locate items via Find My network
-2. **Precision**: UWB-based precise finding
-3. **Lost Mode**: Notify when item is found
-4. **Anti-Stalking**: Detect unknown trackers
-5. **Sound**: Play sound to locate nearby item
+1. **Track**: Locate items via the Find My network of billions of Apple devices
+2. **Precision**: UWB-based directional finding for nearby items
+3. **Lost Mode**: Notify owner when a lost item is found by the network
+4. **Anti-Stalking**: Detect and alert users to unknown trackers traveling with them
+5. **Sound**: Play sound to locate nearby items
 
 ### Non-Functional Requirements
 
-- **Privacy**: Apple cannot see locations
-- **Scale**: 1B+ Find My network devices
-- **Latency**: < 15 minutes for location update
-- **Battery**: Years of battery life
+- **Privacy**: Apple cannot decrypt or see item locations -- end-to-end encrypted
+- **Scale**: 1B+ Find My network devices submitting reports, 500M+ AirTags
+- **Latency**: < 15 minutes for location update (limited by key rotation period)
+- **Battery**: 1+ year battery life on CR2032 (requires ultra-low-power BLE)
+- **Availability**: 99.99% for report ingestion, 99.9% for location retrieval
+- **Throughput**: 10M+ encrypted location reports per minute globally
 
 ---
 
@@ -35,486 +37,199 @@ AirTag uses the Find My network to locate items using crowd-sourced Bluetooth de
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     AirTag Device                               │
-│         (BLE beacon, UWB, NFC, Speaker, Motion sensor)         │
+│                     AirTag Device                                │
+│         (BLE beacon, UWB, NFC, Speaker, Motion sensor)          │
+│         Broadcasts rotating BLE identifier every 2 seconds      │
 └─────────────────────────────────────────────────────────────────┘
-                              │ BLE
+                              │ BLE advertisement
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   Find My Network                               │
-│              (Billions of Apple devices)                        │
+│                   Find My Network                                │
+│              (1B+ iPhones, iPads, Macs)                         │
+│         Detect BLE beacons, encrypt location, report            │
 └─────────────────────────────────────────────────────────────────┘
-                              │ Encrypted reports
+                              │ Encrypted reports (HTTPS)
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Apple Servers                                │
-│         (Encrypted blob storage, no location access)           │
+│                    API Gateway                                   │
+│              (Auth, Rate Limiting, Geo-routing)                 │
 └─────────────────────────────────────────────────────────────────┘
-        │                                           │
-        ▼                                           ▼
-┌───────────────┐                          ┌───────────────┐
-│  Owner Device │                          │Anti-Stalk Svc │
-│               │                          │               │
-│ - Decrypts    │                          │ - Detection   │
-│ - Shows map   │                          │ - Alerts      │
-└───────────────┘                          └───────────────┘
+        │              │              │              │
+        ▼              ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
+│  Report    │ │  Query     │ │ Anti-Stalk │ │Notification│
+│  Ingestion │ │  Service   │ │  Service   │ │  Service   │
+│            │ │            │ │            │ │            │
+│ Store blobs│ │ Lookup by  │ │ Pattern    │ │ Push alerts│
+│ No decrypt │ │ id hash   │ │ detection  │ │ Lost mode  │
+└─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
+      │              │              │              │
+      ▼              ▼              ▼              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Data Layer                                  │
+├─────────────────┬───────────────────┬───────────────────────────┤
+│  PostgreSQL     │  Redis/Valkey     │  RabbitMQ                 │
+│  - Reports      │  - Cache          │  - Report ingestion       │
+│  - Devices      │  - Sessions       │  - Anti-stalk analysis    │
+│  - Sightings    │  - Rate limits    │  - Notification delivery  │
+│  - Notifications│  - Idempotency    │  - Report cleanup         │
+└─────────────────┴───────────────────┴───────────────────────────┘
 ```
+
+### Privacy Flow (Zero-Knowledge Design)
+
+```
+AirTag                          iPhone (finder)              Apple Server              Owner's iPhone
+  │                                  │                           │                          │
+  │─── BLE: {rotatingId, pubKey} ──▶│                           │                          │
+  │                                  │                           │                          │
+  │                        Encrypt(myLocation, pubKey)           │                          │
+  │                                  │                           │                          │
+  │                                  │──── {hash(id), blob} ───▶│                          │
+  │                                  │                           │── Store encrypted blob   │
+  │                                  │                           │                          │
+  │                                  │                           │◀── Query by hash(id) ────│
+  │                                  │                           │                          │
+  │                                  │                           │──── Return blob ────────▶│
+  │                                  │                           │                          │
+  │                                  │                      Decrypt(blob, privateKey)       │
+  │                                  │                           │           = location      │
+```
+
+Apple servers store only encrypted blobs and identifier hashes. They cannot correlate reports to devices or decrypt locations. Only the owner, who holds the master secret, can derive the identifier hashes for their device and decrypt the payloads.
 
 ---
 
 ## Core Components
 
-### 1. Key Rotation and Beacon
+### 1. Key Rotation and Beacon Protocol
 
-**Rotating Identity:**
-```javascript
-class AirTagKeyManager {
-  constructor(masterSecret) {
-    this.masterSecret = masterSecret // Shared with owner's iCloud
-    this.currentPeriod = this.getCurrentPeriod()
-  }
+The AirTag derives a new key pair every 15 minutes from a deterministic master secret shared with the owner's iCloud account.
 
-  getCurrentPeriod() {
-    // Rotate keys every 15 minutes
-    return Math.floor(Date.now() / (15 * 60 * 1000))
-  }
+**Key Derivation Chain:**
+1. Master secret (32 bytes) is generated at pairing time and synced to owner's iCloud Keychain
+2. Current period = `floor(timestamp / (15 * 60 * 1000))`
+3. Period key = `HMAC-SHA256(masterSecret, "airtag_key_" + period)`
+4. EC key pair: private key = period key (truncated to P-224 size), public key derived via ECDH
+5. BLE identifier = `SHA-256(publicKey)` truncated to 6 bytes
+6. BLE advertisement broadcasts: {identifier (6 bytes), publicKey (full)}
 
-  deriveCurrentKey() {
-    // Derive period-specific key from master secret
-    const period = this.getCurrentPeriod()
-    return crypto.createHmac('sha256', this.masterSecret)
-      .update(`airtag_key_${period}`)
-      .digest()
-  }
+**Why 15-minute rotation**: Balances privacy (shorter = harder to track) against battery life (longer = fewer key derivations) and location freshness (reports are only useful within the rotation window). A 15-minute window also aligns with typical urban transit times, preventing long-distance tracking by passive observers.
 
-  derivePublicKey() {
-    // Generate EC public key for this period
-    const privateKey = this.deriveCurrentKey()
-    const keyPair = crypto.createECDH('p224')
-    keyPair.setPrivateKey(privateKey.slice(0, 28)) // P-224 key size
+### 2. Location Reporting (Crowd-Sourced)
 
-    return keyPair.getPublicKey()
-  }
+When an iPhone detects an AirTag BLE advertisement, it encrypts its own GPS location using the AirTag's public key (ECIES: Elliptic Curve Integrated Encryption Scheme) and submits the encrypted blob to Apple's servers.
 
-  // BLE advertisement payload
-  getBLEPayload() {
-    const publicKey = this.derivePublicKey()
+**ECIES Encryption:**
+1. Generate ephemeral EC key pair (P-224)
+2. Compute shared secret via ECDH with AirTag's public key
+3. Derive AES-256-GCM key from shared secret using SHA-256
+4. Encrypt `{lat, lon, accuracy, timestamp}` with random IV
+5. Transmit: `{ephemeralPublicKey, iv, ciphertext, authTag}`
 
-    return {
-      // Advertised identifier (derived from public key)
-      identifier: crypto.createHash('sha256')
-        .update(publicKey)
-        .digest()
-        .slice(0, 6), // 6 bytes identifier
+Only the owner (who can derive the matching private key from the master secret) can decrypt. The finder iPhone never knows which AirTag it reported -- it just forwards the blob.
 
-      // Full public key (for encryption)
-      publicKey: publicKey
-    }
-  }
-}
-```
+### 3. Location Retrieval (Owner)
 
-### 2. Location Reporting
+When the owner opens Find My, the client derives all possible identifier hashes for a time range (one per 15-minute period), queries Apple's servers for matching encrypted reports, and decrypts each payload locally.
 
-**Privacy-Preserving Reports:**
-```javascript
-class FindMyReporter {
-  // Called when iPhone detects an AirTag
-  async reportSighting(airtag, myLocation) {
-    const { identifier, publicKey } = airtag
-
-    // Encrypt location with AirTag's public key
-    // Only owner (who knows master secret) can decrypt
-    const encryptedLocation = await this.encryptLocation(
-      myLocation,
-      publicKey
-    )
-
-    // Report to Apple servers
-    await fetch('https://findmy.apple.com/report', {
-      method: 'POST',
-      body: JSON.stringify({
-        // Hashed identifier (Apple can correlate reports)
-        identifierHash: crypto.createHash('sha256')
-          .update(identifier)
-          .digest('hex'),
-
-        // Encrypted location blob (Apple cannot decrypt)
-        encryptedPayload: encryptedLocation,
-
-        // Timestamp (for freshness)
-        timestamp: Date.now()
-      })
-    })
-  }
-
-  async encryptLocation(location, publicKey) {
-    // ECIES encryption
-    // Generate ephemeral key pair
-    const ephemeral = crypto.createECDH('p224')
-    ephemeral.generateKeys()
-
-    // Derive shared secret
-    const sharedSecret = ephemeral.computeSecret(publicKey)
-
-    // Derive encryption key from shared secret
-    const encryptionKey = crypto.createHash('sha256')
-      .update(sharedSecret)
-      .update('encryption')
-      .digest()
-
-    // Encrypt location
-    const iv = crypto.randomBytes(12)
-    const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey, iv)
-
-    const plaintext = JSON.stringify({
-      lat: location.latitude,
-      lon: location.longitude,
-      accuracy: location.accuracy,
-      timestamp: Date.now()
-    })
-
-    const encrypted = Buffer.concat([
-      cipher.update(plaintext, 'utf8'),
-      cipher.final()
-    ])
-
-    return {
-      ephemeralPublicKey: ephemeral.getPublicKey(),
-      iv: iv,
-      ciphertext: encrypted,
-      authTag: cipher.getAuthTag()
-    }
-  }
-}
-```
-
-### 3. Location Retrieval
-
-**Owner Decryption:**
-```javascript
-class FindMyClient {
-  constructor(masterSecret) {
-    this.masterSecret = masterSecret
-  }
-
-  async getLocations(timeRange) {
-    // Generate all possible identifiers for time range
-    const identifiers = []
-    const startPeriod = Math.floor(timeRange.start / (15 * 60 * 1000))
-    const endPeriod = Math.floor(timeRange.end / (15 * 60 * 1000))
-
-    for (let period = startPeriod; period <= endPeriod; period++) {
-      const key = this.deriveKeyForPeriod(period)
-      const publicKey = this.derivePublicKeyFromPrivate(key)
-      const identifier = crypto.createHash('sha256')
-        .update(publicKey)
-        .digest()
-        .slice(0, 6)
-
-      identifiers.push({
-        period,
-        identifierHash: crypto.createHash('sha256')
-          .update(identifier)
-          .digest('hex'),
-        privateKey: key
-      })
-    }
-
-    // Query Apple for encrypted reports
-    const reports = await this.queryReports(identifiers.map(i => i.identifierHash))
-
-    // Decrypt reports
-    const locations = []
-    for (const report of reports) {
-      const identifier = identifiers.find(i => i.identifierHash === report.identifierHash)
-      if (!identifier) continue
-
-      try {
-        const location = await this.decryptReport(report, identifier.privateKey)
-        locations.push(location)
-      } catch (e) {
-        // Decryption failed - not our AirTag
-        continue
-      }
-    }
-
-    return locations.sort((a, b) => b.timestamp - a.timestamp)
-  }
-
-  async decryptReport(report, privateKey) {
-    const { ephemeralPublicKey, iv, ciphertext, authTag } = report.encryptedPayload
-
-    // Derive shared secret
-    const keyPair = crypto.createECDH('p224')
-    keyPair.setPrivateKey(privateKey.slice(0, 28))
-    const sharedSecret = keyPair.computeSecret(ephemeralPublicKey)
-
-    // Derive decryption key
-    const decryptionKey = crypto.createHash('sha256')
-      .update(sharedSecret)
-      .update('encryption')
-      .digest()
-
-    // Decrypt
-    const decipher = crypto.createDecipheriv('aes-256-gcm', decryptionKey, iv)
-    decipher.setAuthTag(authTag)
-
-    const decrypted = Buffer.concat([
-      decipher.update(ciphertext),
-      decipher.final()
-    ])
-
-    return JSON.parse(decrypted.toString('utf8'))
-  }
-}
-```
+**Query Flow:**
+1. Derive period keys for the time range (typically last 24 hours = 96 periods)
+2. Compute identifier hash for each period: `SHA-256(SHA-256(publicKey)[:6])`
+3. Batch query: `SELECT * FROM location_reports WHERE identifier_hash = ANY($hashes) AND created_at BETWEEN $start AND $end`
+4. Decrypt each payload using the period's private key
+5. Cache decrypted locations in `decrypted_locations` table for map display
 
 ### 4. Anti-Stalking Detection
 
-**Unknown Tracker Alerts:**
-```javascript
-class AntiStalkingService {
-  constructor() {
-    this.seenTrackers = new Map() // identifier -> sightings
-    this.alertThreshold = 3 // sightings
-    this.timeWindow = 3 * 60 * 60 * 1000 // 3 hours
-  }
+Detects unknown trackers traveling with a user across multiple locations.
 
-  async onTrackerDetected(tracker, myLocation) {
-    const { identifier } = tracker
+**Detection Algorithm:**
+1. iPhone periodically scans for BLE advertisements
+2. Unknown identifiers (not belonging to the user's registered devices) are recorded as sightings
+3. Sightings are analyzed for stalking patterns within a 3-hour sliding window:
+   - **Threshold**: 3+ sightings of the same identifier
+   - **Distance**: User has traveled > 500 meters with the tracker
+   - **Duration**: Tracker has been present for > 1 hour
+4. If pattern detected, alert the user with notification: "Unknown AirTag Detected"
+5. Offer options: play sound, show map of sighting locations, instructions to disable
 
-    // Skip if it's one of my registered devices
-    if (await this.isMyDevice(identifier)) {
-      return
-    }
+**False Positive Mitigation**: Family members' AirTags, shared spaces (offices, transit), and AirTags on shared items are common false positives. The distance threshold (500m) and time window (1 hour) filter out most static encounters.
 
-    // Record sighting
-    const sightings = this.seenTrackers.get(identifier) || []
-    sightings.push({
-      location: myLocation,
-      timestamp: Date.now()
-    })
+### 5. Lost Mode
 
-    // Filter to recent sightings
-    const recentSightings = sightings.filter(
-      s => Date.now() - s.timestamp < this.timeWindow
-    )
-    this.seenTrackers.set(identifier, recentSightings)
-
-    // Check for stalking pattern
-    if (this.detectStalkingPattern(recentSightings)) {
-      await this.alertUser(identifier, recentSightings)
-    }
-  }
-
-  detectStalkingPattern(sightings) {
-    if (sightings.length < this.alertThreshold) {
-      return false
-    }
-
-    // Check if tracker has been with us across multiple locations
-    const locations = sightings.map(s => s.location)
-
-    // Calculate total distance traveled
-    let totalDistance = 0
-    for (let i = 1; i < locations.length; i++) {
-      totalDistance += this.haversineDistance(locations[i-1], locations[i])
-    }
-
-    // If we've traveled significant distance with this tracker
-    if (totalDistance > 0.5) { // > 500 meters
-      return true
-    }
-
-    // Check time span
-    const timeSpan = sightings[sightings.length - 1].timestamp - sightings[0].timestamp
-    if (timeSpan > 60 * 60 * 1000) { // > 1 hour
-      return true
-    }
-
-    return false
-  }
-
-  async alertUser(identifier, sightings) {
-    // Send local notification
-    await this.sendNotification({
-      title: 'Unknown AirTag Detected',
-      body: 'An AirTag has been traveling with you. Tap to learn more.',
-      data: {
-        type: 'unknown_tracker',
-        identifier,
-        firstSeen: sightings[0].timestamp,
-        sightingCount: sightings.length
-      }
-    })
-
-    // Show option to play sound
-    // Show map of where tracker has been seen
-    // Provide instructions for disabling
-  }
-}
-```
-
-### 5. Precision Finding
-
-**UWB Directional Finding:**
-```javascript
-class PrecisionFinder {
-  async startPrecisionFinding(airtag) {
-    // Establish UWB ranging session
-    const session = await this.initUWBSession(airtag.identifier)
-
-    // Continuous ranging loop
-    while (session.active) {
-      const ranging = await session.measureRange()
-
-      // Calculate distance from time-of-flight
-      const distance = this.calculateDistance(ranging.timeOfFlight)
-
-      // Calculate direction from angle-of-arrival
-      const direction = this.calculateDirection(ranging.angleOfArrival)
-
-      // Update UI
-      this.updateUI({
-        distance, // in meters
-        direction: {
-          azimuth: direction.azimuth, // horizontal angle
-          elevation: direction.elevation // vertical angle
-        },
-        signalStrength: ranging.rssi
-      })
-
-      await this.sleep(100) // 10 Hz update rate
-    }
-  }
-
-  calculateDistance(timeOfFlight) {
-    const speedOfLight = 299792458 // m/s
-    return (timeOfFlight * speedOfLight) / 2 // Round trip
-  }
-
-  calculateDirection(angleOfArrival) {
-    // UWB antenna array provides angle measurements
-    return {
-      azimuth: angleOfArrival.horizontal,
-      elevation: angleOfArrival.vertical
-    }
-  }
-}
-```
+When enabled, Lost Mode tags the device with contact information. When a network device detects a lost AirTag:
+1. The location report is submitted (standard flow)
+2. The server checks if the identifier hash matches any device in Lost Mode
+3. If matched, a push notification is queued for the owner
+4. NFC tap on the AirTag reveals the owner's contact message
 
 ---
 
 ## Database Schema
 
-This section documents the complete PostgreSQL database schema for the Find My Network clone, including all tables, relationships, indexes, and design rationale.
-
 ### Entity-Relationship Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    ENTITY RELATIONSHIPS                                   │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+                                ┌─────────────────┐
+                                │     session      │
+                                │─────────────────│
+                                │ sid (PK)         │
+                                │ sess (JSON)      │
+                                │ expire           │
+                                └─────────────────┘
 
-                                    ┌─────────────────┐
-                                    │     session     │
-                                    │─────────────────│
-                                    │ sid (PK)        │
-                                    │ sess            │
-                                    │ expire          │
-                                    └─────────────────┘
-                                           │
-                                           │ (no FK, uses user_id
-                                           │  stored in sess JSON)
-                                           ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                           │
-│  ┌─────────────────┐         1:N          ┌─────────────────────┐                        │
-│  │      users      │◄─────────────────────│  registered_devices │                        │
-│  │─────────────────│                      │─────────────────────│                        │
-│  │ id (PK)         │                      │ id (PK)             │                        │
-│  │ email (UNIQUE)  │                      │ user_id (FK)────────┼──┐                     │
-│  │ password_hash   │                      │ device_type         │  │                     │
-│  │ name            │                      │ name                │  │                     │
-│  │ role            │                      │ emoji               │  │ CASCADE             │
-│  │ created_at      │                      │ master_secret       │  │ DELETE              │
-│  │ updated_at      │                      │ current_period      │  │                     │
-│  └─────────────────┘                      │ is_active           │  │                     │
-│         │                                 │ created_at          │  │                     │
-│         │                                 │ updated_at          │◄─┘                     │
-│         │ 1:N                             └─────────────────────┘                        │
-│         │ CASCADE                                   │                                     │
-│         │ DELETE                                    │                                     │
-│         ▼                                           │ 1:1                                 │
-│  ┌─────────────────┐                               │ CASCADE DELETE                       │
-│  │  notifications  │                               ▼                                      │
-│  │─────────────────│                      ┌─────────────────────┐                        │
-│  │ id (PK)         │                      │     lost_mode       │                        │
-│  │ user_id (FK)────┼──► CASCADE           │─────────────────────│                        │
-│  │ device_id (FK)──┼──► SET NULL          │ device_id (PK, FK)──┼──► registered_devices  │
-│  │ type            │                      │ enabled             │                        │
-│  │ title           │                      │ contact_phone       │                        │
-│  │ message         │                      │ contact_email       │                        │
-│  │ is_read         │                      │ message             │                        │
-│  │ data            │                      │ notify_when_found   │                        │
-│  │ created_at      │                      │ enabled_at          │                        │
-│  └─────────────────┘                      │ created_at          │                        │
-│         │                                 │ updated_at          │                        │
-│         │ 1:N                             └─────────────────────┘                        │
-│         │ CASCADE                                   │                                     │
-│         │ DELETE                                    │                                     │
-│         ▼                                           │ 1:N                                 │
-│  ┌─────────────────┐                               │ CASCADE DELETE                       │
-│  │tracker_sightings│                               ▼                                      │
-│  │─────────────────│                      ┌─────────────────────┐                        │
-│  │ id (PK)         │                      │ decrypted_locations │                        │
-│  │ user_id (FK)────┼──► CASCADE           │─────────────────────│                        │
-│  │ identifier_hash │                      │ id (PK)             │                        │
-│  │ latitude        │                      │ device_id (FK)──────┼──► registered_devices  │
-│  │ longitude       │                      │ latitude            │                        │
-│  │ seen_at         │                      │ longitude           │                        │
-│  └─────────────────┘                      │ accuracy            │                        │
-│                                           │ address             │                        │
-│                                           │ timestamp           │                        │
-│                                           │ created_at          │                        │
-│                                           └─────────────────────┘                        │
-│                                                                                           │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────┐       1:N        ┌─────────────────────┐
+│      users      │◄─────────────────│  registered_devices  │
+│─────────────────│                  │─────────────────────│
+│ id (PK, UUID)   │                  │ id (PK, UUID)        │
+│ email (UNIQUE)  │                  │ user_id (FK) ────────┤ CASCADE
+│ password_hash   │                  │ device_type          │
+│ name            │                  │ name, emoji          │
+│ role            │                  │ master_secret        │
+└────────┬────────┘                  │ current_period       │
+         │                           │ is_active            │
+         │ 1:N CASCADE               └──────────┬──────────┘
+         │                                       │
+         ▼                                       │ 1:1 CASCADE
+┌─────────────────┐                              ▼
+│  notifications  │                    ┌─────────────────────┐
+│─────────────────│                    │     lost_mode        │
+│ id (PK, UUID)   │                    │─────────────────────│
+│ user_id (FK)    │                    │ device_id (PK, FK)  │
+│ device_id (FK)  │ SET NULL           │ enabled             │
+│ type            │                    │ contact_phone/email │
+│ title, message  │                    │ message             │
+│ is_read, data   │                    │ notify_when_found   │
+└─────────────────┘                    └─────────────────────┘
+         │
+         │ 1:N CASCADE                 1:N CASCADE
+         ▼                                       ▼
+┌─────────────────┐                    ┌─────────────────────┐
+│tracker_sightings│                    │ decrypted_locations  │
+│─────────────────│                    │─────────────────────│
+│ id (PK, BIGSER) │                    │ id (PK, BIGSERIAL)  │
+│ user_id (FK)    │                    │ device_id (FK)       │
+│ identifier_hash │                    │ latitude, longitude  │
+│ latitude, lng   │                    │ accuracy, address    │
+│ seen_at         │                    │ timestamp            │
+└─────────────────┘                    └─────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              STANDALONE TABLE (NO FKs)                                    │
-│                                                                                           │
-│  ┌─────────────────────┐                                                                 │
-│  │  location_reports   │  ◄── Crowd-sourced encrypted reports from Find My network       │
-│  │─────────────────────│                                                                 │
-│  │ id (PK)             │      No FK to registered_devices because:                       │
-│  │ identifier_hash     │      1. Reports come from anonymous network devices             │
-│  │ encrypted_payload   │      2. Identifier rotates every 15 minutes                     │
-│  │ reporter_region     │      3. Server cannot correlate hash to device (privacy)        │
-│  │ created_at          │                                                                 │
-│  └─────────────────────┘                                                                 │
-│                                                                                           │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────┐
+│  location_reports   │  ◄── Standalone (no FK to devices -- privacy by design)
+│─────────────────────│
+│ id (PK, BIGSERIAL)  │      Server cannot correlate reports to devices
+│ identifier_hash     │      Only owner can derive matching hashes
+│ encrypted_payload   │
+│ reporter_region     │
+│ created_at          │
+└─────────────────────┘
 ```
 
-### Complete Table Definitions
-
-#### 1. users
-
-The central user account table that all other user-owned data references.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Unique user identifier |
-| `email` | `VARCHAR(255)` | `UNIQUE NOT NULL` | Login email, used for authentication |
-| `password_hash` | `VARCHAR(255)` | `NOT NULL` | Bcrypt-hashed password |
-| `name` | `VARCHAR(100)` | `NOT NULL` | Display name shown in UI |
-| `role` | `VARCHAR(20)` | `DEFAULT 'user' CHECK (role IN ('user', 'admin'))` | Access control role |
-| `created_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | Account creation timestamp |
-| `updated_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | Last profile update |
+### Table Definitions
 
 ```sql
+-- Users table
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -524,28 +239,8 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-```
 
----
-
-#### 2. registered_devices
-
-Devices (AirTags, iPhones, MacBooks, etc.) registered to a user's account.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Unique device identifier |
-| `user_id` | `UUID` | `NOT NULL REFERENCES users(id) ON DELETE CASCADE` | Owner of the device |
-| `device_type` | `VARCHAR(50)` | `NOT NULL CHECK (...)` | Type: airtag, iphone, macbook, ipad, airpods |
-| `name` | `VARCHAR(100)` | `NOT NULL` | User-assigned name (e.g., "Keys", "Backpack") |
-| `emoji` | `VARCHAR(10)` | `DEFAULT '📍'` | Icon shown on map markers |
-| `master_secret` | `VARCHAR(64)` | `NOT NULL` | Shared secret for key derivation (encrypted in production) |
-| `current_period` | `INTEGER` | `DEFAULT 0` | Current key rotation period counter |
-| `is_active` | `BOOLEAN` | `DEFAULT TRUE` | Whether device is actively tracked |
-| `created_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | Device registration timestamp |
-| `updated_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | Last settings update |
-
-```sql
+-- Registered devices (AirTags, iPhones, etc.)
 CREATE TABLE IF NOT EXISTS registered_devices (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -561,27 +256,8 @@ CREATE TABLE IF NOT EXISTS registered_devices (
 
 CREATE INDEX idx_devices_user ON registered_devices(user_id);
 CREATE INDEX idx_devices_active ON registered_devices(is_active);
-```
 
-**Index Strategy:**
-- `idx_devices_user`: Optimizes "list all devices for user" query (O(log n) lookup)
-- `idx_devices_active`: Optimizes filtering active devices for location polling
-
----
-
-#### 3. location_reports
-
-Encrypted location blobs from the crowd-sourced Find My network. This is the core privacy-preserving table.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | `BIGSERIAL` | `PRIMARY KEY` | Auto-incrementing report ID (high volume) |
-| `identifier_hash` | `VARCHAR(64)` | `NOT NULL` | SHA-256 hash of device's rotating BLE identifier |
-| `encrypted_payload` | `JSONB` | `NOT NULL` | ECIES-encrypted location (ephemeralPubKey, iv, ciphertext, authTag) |
-| `reporter_region` | `VARCHAR(10)` | nullable | Coarse region (e.g., "US-CA") for routing/sharding |
-| `created_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | When report was received |
-
-```sql
+-- Location reports (encrypted blobs from crowd-sourced network)
 CREATE TABLE IF NOT EXISTS location_reports (
     id BIGSERIAL PRIMARY KEY,
     identifier_hash VARCHAR(64) NOT NULL,
@@ -593,39 +269,8 @@ CREATE TABLE IF NOT EXISTS location_reports (
 CREATE INDEX idx_reports_identifier ON location_reports(identifier_hash);
 CREATE INDEX idx_reports_time ON location_reports(created_at);
 CREATE INDEX idx_reports_identifier_time ON location_reports(identifier_hash, created_at DESC);
-```
 
-**Index Strategy:**
-- `idx_reports_identifier`: Fast lookup by identifier hash (primary query path)
-- `idx_reports_time`: Supports time-based cleanup (DELETE WHERE created_at < 7 days ago)
-- `idx_reports_identifier_time`: Compound index for "latest reports for identifier" query
-
-**Why No FK to registered_devices:**
-This table has NO foreign key to `registered_devices` by design:
-1. **Privacy**: Server cannot correlate identifier_hash to a specific device
-2. **Anonymity**: Reports come from random network devices, not the owner
-3. **Key Rotation**: Identifier changes every 15 minutes; no stable device reference exists
-4. **Decryption**: Only the owner (with master_secret) can derive which reports belong to their device
-
----
-
-#### 4. lost_mode
-
-Settings for lost mode, linked 1:1 with a registered device.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `device_id` | `UUID` | `PRIMARY KEY REFERENCES registered_devices(id) ON DELETE CASCADE` | The device in lost mode |
-| `enabled` | `BOOLEAN` | `DEFAULT FALSE` | Whether lost mode is active |
-| `contact_phone` | `VARCHAR(50)` | nullable | Phone number to display when found |
-| `contact_email` | `VARCHAR(200)` | nullable | Email to display when found |
-| `message` | `TEXT` | nullable | Custom message (e.g., "If found, call...") |
-| `notify_when_found` | `BOOLEAN` | `DEFAULT TRUE` | Send push notification when device is located |
-| `enabled_at` | `TIMESTAMP WITH TIME ZONE` | nullable | When lost mode was enabled |
-| `created_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | Record creation timestamp |
-| `updated_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | Last settings update |
-
-```sql
+-- Lost mode settings
 CREATE TABLE IF NOT EXISTS lost_mode (
     device_id UUID PRIMARY KEY REFERENCES registered_devices(id) ON DELETE CASCADE,
     enabled BOOLEAN DEFAULT FALSE,
@@ -637,32 +282,8 @@ CREATE TABLE IF NOT EXISTS lost_mode (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-```
 
-**Design Decision - 1:1 Relationship:**
-- `device_id` is both the PRIMARY KEY and FK, enforcing exactly one lost_mode record per device
-- Separate table (vs. columns on registered_devices) allows NULL-able lost mode settings without nullable columns on the device table
-- Cleaner separation of concerns: device metadata vs. lost mode state
-
----
-
-#### 5. notifications
-
-User notifications for device events (found, unknown tracker, low battery, system).
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Unique notification ID |
-| `user_id` | `UUID` | `NOT NULL REFERENCES users(id) ON DELETE CASCADE` | Notification recipient |
-| `device_id` | `UUID` | `REFERENCES registered_devices(id) ON DELETE SET NULL` | Related device (may be null) |
-| `type` | `VARCHAR(50)` | `NOT NULL CHECK (...)` | Type: device_found, unknown_tracker, low_battery, system |
-| `title` | `VARCHAR(200)` | `NOT NULL` | Notification title |
-| `message` | `TEXT` | nullable | Notification body |
-| `is_read` | `BOOLEAN` | `DEFAULT FALSE` | Whether user has seen it |
-| `data` | `JSONB` | nullable | Extra payload (e.g., location, sighting count) |
-| `created_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | When notification was created |
-
-```sql
+-- Notifications
 CREATE TABLE IF NOT EXISTS notifications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -677,33 +298,8 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 CREATE INDEX idx_notifications_user ON notifications(user_id);
 CREATE INDEX idx_notifications_unread ON notifications(user_id, is_read) WHERE is_read = FALSE;
-```
 
-**Index Strategy:**
-- `idx_notifications_user`: Fast lookup of all notifications for a user
-- `idx_notifications_unread`: Partial index for unread notifications only (smaller, faster)
-
-**Why SET NULL on device_id:**
-- Notifications should persist even if the device is deleted
-- Historical record: "Your AirTag was found at X" remains useful
-- User can still see past notifications in their history
-
----
-
-#### 6. tracker_sightings
-
-Anti-stalking data: unknown trackers seen traveling with the user.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | `BIGSERIAL` | `PRIMARY KEY` | Auto-incrementing sighting ID |
-| `user_id` | `UUID` | `NOT NULL REFERENCES users(id) ON DELETE CASCADE` | User who detected the tracker |
-| `identifier_hash` | `VARCHAR(64)` | `NOT NULL` | Hash of the unknown tracker's BLE identifier |
-| `latitude` | `DECIMAL(10, 8)` | `NOT NULL` | Sighting latitude (±90°, 8 decimal places = ~1mm precision) |
-| `longitude` | `DECIMAL(11, 8)` | `NOT NULL` | Sighting longitude (±180°, 8 decimal places) |
-| `seen_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | When the tracker was detected |
-
-```sql
+-- Anti-stalking tracker sightings
 CREATE TABLE IF NOT EXISTS tracker_sightings (
     id BIGSERIAL PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -715,30 +311,8 @@ CREATE TABLE IF NOT EXISTS tracker_sightings (
 
 CREATE INDEX idx_sightings_user_identifier ON tracker_sightings(user_id, identifier_hash);
 CREATE INDEX idx_sightings_time ON tracker_sightings(seen_at);
-```
 
-**Index Strategy:**
-- `idx_sightings_user_identifier`: Optimizes "all sightings of tracker X by user Y" for pattern detection
-- `idx_sightings_time`: Supports time-windowed queries (e.g., last 3 hours)
-
----
-
-#### 7. decrypted_locations
-
-Cache of decrypted locations for the owner's map view.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `id` | `BIGSERIAL` | `PRIMARY KEY` | Auto-incrementing location ID |
-| `device_id` | `UUID` | `NOT NULL REFERENCES registered_devices(id) ON DELETE CASCADE` | The tracked device |
-| `latitude` | `DECIMAL(10, 8)` | `NOT NULL` | Decrypted latitude |
-| `longitude` | `DECIMAL(11, 8)` | `NOT NULL` | Decrypted longitude |
-| `accuracy` | `DECIMAL(10, 2)` | nullable | Location accuracy in meters |
-| `address` | `TEXT` | nullable | Reverse-geocoded address |
-| `timestamp` | `TIMESTAMP WITH TIME ZONE` | `NOT NULL` | Original report timestamp |
-| `created_at` | `TIMESTAMP WITH TIME ZONE` | `DEFAULT NOW()` | When decrypted/cached |
-
-```sql
+-- Decrypted location cache
 CREATE TABLE IF NOT EXISTS decrypted_locations (
     id BIGSERIAL PRIMARY KEY,
     device_id UUID NOT NULL REFERENCES registered_devices(id) ON DELETE CASCADE,
@@ -752,30 +326,8 @@ CREATE TABLE IF NOT EXISTS decrypted_locations (
 
 CREATE INDEX idx_decrypted_device ON decrypted_locations(device_id);
 CREATE INDEX idx_decrypted_time ON decrypted_locations(device_id, timestamp DESC);
-```
 
-**Index Strategy:**
-- `idx_decrypted_device`: Fast lookup of all locations for a device
-- `idx_decrypted_time`: Compound index for "latest N locations for device" (ORDER BY timestamp DESC)
-
-**Why This Table Exists:**
-- **Performance**: Decryption is CPU-intensive; caching results avoids re-decryption
-- **Denormalization**: Stores reverse-geocoded address to avoid repeated geocoding API calls
-- **History**: Maintains location history even after location_reports are cleaned up (7-day TTL)
-
----
-
-#### 8. session
-
-Express session storage for authentication (connect-pg-simple).
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| `sid` | `VARCHAR` | `PRIMARY KEY COLLATE "default"` | Session ID |
-| `sess` | `JSON` | `NOT NULL` | Serialized session data (contains user_id) |
-| `expire` | `TIMESTAMP(6)` | `NOT NULL` | Session expiration time |
-
-```sql
+-- Session table for express-session
 CREATE TABLE IF NOT EXISTS session (
     sid VARCHAR NOT NULL COLLATE "default",
     sess JSON NOT NULL,
@@ -786,357 +338,73 @@ CREATE TABLE IF NOT EXISTS session (
 CREATE INDEX idx_session_expire ON session(expire);
 ```
 
-**Index Strategy:**
-- `idx_session_expire`: Supports periodic cleanup of expired sessions
+### Schema Design Rationale
+
+**location_reports has NO foreign key to registered_devices**: This is the most critical design decision. The server cannot correlate an identifier_hash to a specific device because: (1) identifiers rotate every 15 minutes, (2) only the owner can derive which hashes belong to their device, (3) reports come from anonymous network devices. This enforces the zero-knowledge privacy guarantee.
+
+**Separated encrypted and decrypted data**: `location_reports` stores what the server receives (encrypted blobs, anonymous). `decrypted_locations` stores what the owner sees (plaintext coordinates, linked to device). This separation enforces that the server cannot JOIN reports to devices without the master_secret.
+
+**Lost mode as 1:1 table**: `device_id` is both PK and FK, enforcing exactly one record per device. Separating from `registered_devices` avoids nullable contact columns and cleanly separates device identity from lost state.
+
+**BIGSERIAL for high-volume tables**: `location_reports` (billions of rows), `tracker_sightings`, and `decrypted_locations` use BIGSERIAL for compact storage (8 bytes vs 16 for UUID) and faster sequential inserts. User-facing entities use UUID for security (no enumeration) and distributed generation.
+
+**Partial index for unread notifications**: `WHERE is_read = FALSE` keeps the index small since most notifications are eventually read. The badge count query (`SELECT COUNT(*) WHERE user_id = $1 AND is_read = FALSE`) hits only the small partial index.
+
+### Foreign Key Strategy
+
+| Parent | Child | FK Column | On Delete | Rationale |
+|--------|-------|-----------|-----------|-----------|
+| `users` | `registered_devices` | `user_id` | CASCADE | Device meaningless without owner |
+| `users` | `notifications` | `user_id` | CASCADE | Notifications are user-specific |
+| `users` | `tracker_sightings` | `user_id` | CASCADE | Anti-stalking data is user-specific |
+| `registered_devices` | `lost_mode` | `device_id` | CASCADE | Lost mode settings meaningless without device |
+| `registered_devices` | `notifications` | `device_id` | SET NULL | Preserve notification history ("Your AirTag was found") even after device removal |
+| `registered_devices` | `decrypted_locations` | `device_id` | CASCADE | Cached locations useless without device |
 
 ---
 
-### Foreign Key Relationships
+## API Design
 
-| Parent Table | Child Table | FK Column | On Delete | Rationale |
-|--------------|-------------|-----------|-----------|-----------|
-| `users` | `registered_devices` | `user_id` | **CASCADE** | Device belongs to user; delete user = delete all their devices |
-| `users` | `notifications` | `user_id` | **CASCADE** | Notifications are user-specific; delete user = delete notifications |
-| `users` | `tracker_sightings` | `user_id` | **CASCADE** | Sightings are user-specific anti-stalking data |
-| `registered_devices` | `lost_mode` | `device_id` | **CASCADE** | Lost mode settings are device-specific; delete device = delete settings |
-| `registered_devices` | `notifications` | `device_id` | **SET NULL** | Preserve notification history even if device is removed |
-| `registered_devices` | `decrypted_locations` | `device_id` | **CASCADE** | Cached locations are useless without the device |
-
-**CASCADE vs SET NULL Decision Tree:**
-
-```
-Is the child record meaningful without the parent?
-    │
-    ├── NO → Use CASCADE (delete child when parent deleted)
-    │   Examples:
-    │   - registered_devices without user: meaningless
-    │   - lost_mode without device: meaningless
-    │   - decrypted_locations without device: meaningless
-    │
-    └── YES → Use SET NULL (preserve child, null the FK)
-        Examples:
-        - notifications without device: still useful as history
-          "Your AirTag 'Keys' was found" → device deleted →
-          notification still shows what happened
-```
-
----
-
-### Why Tables Are Structured This Way
-
-#### 1. Separation of Encrypted and Decrypted Data
-
-```
-┌─────────────────────┐         ┌─────────────────────┐
-│  location_reports   │         │ decrypted_locations │
-│  (encrypted blobs)  │   ──►   │   (plain lat/lon)   │
-│  No FK to devices   │ decrypt │  FK to device       │
-└─────────────────────┘         └─────────────────────┘
-```
-
-**Rationale:**
-- `location_reports` stores what the server receives from the network (encrypted, anonymous)
-- `decrypted_locations` stores what the owner sees (decrypted by client or server with owner's key)
-- This separation enforces privacy: server cannot JOIN reports to devices without the master_secret
-
-#### 2. Anti-Stalking as Separate Table
-
-`tracker_sightings` is separate from `location_reports` because:
-- It's per-user (which user detected the tracker), not per-device
-- It stores plaintext coordinates (user's location when detecting)
-- It's used for pattern detection, not location retrieval
-- Different retention policy (shorter for privacy)
-
-#### 3. Lost Mode as 1:1 Table
-
-Could have been columns on `registered_devices`, but:
-- Avoids nullable columns for contact info on the device table
-- Clearer domain separation (device identity vs. lost state)
-- Easier to add lost mode features without altering device schema
-- Allows future extension (e.g., lost mode history)
-
-#### 4. BIGSERIAL for High-Volume Tables
-
-Tables using `BIGSERIAL` instead of `UUID`:
-- `location_reports`: Billions of reports, auto-increment is faster
-- `tracker_sightings`: High volume per user
-- `decrypted_locations`: Many locations per device
-
-**Trade-off:**
-- UUID: Globally unique, no central coordination, larger (16 bytes)
-- BIGSERIAL: Compact (8 bytes), faster inserts, requires single-writer
-
-#### 5. JSONB for Flexible Payloads
-
-`encrypted_payload` and `data` columns use JSONB:
-- Encrypted payload structure may evolve (new encryption schemes)
-- Notification data varies by type (device_found has location, unknown_tracker has sighting count)
-- PostgreSQL JSONB is indexable if needed later
-
----
-
-### Data Flow for Key Operations
-
-#### Operation 1: Submit Location Report (Crowd-Sourced Device)
-
-When an iPhone detects an AirTag and reports its location:
-
-```sql
--- 1. Insert encrypted report (no FK, no device lookup)
-INSERT INTO location_reports (identifier_hash, encrypted_payload, reporter_region, created_at)
-VALUES (
-    'a1b2c3d4e5f6...',  -- SHA-256 of BLE identifier
-    '{"ephemeralPubKey": "...", "iv": "...", "ciphertext": "...", "authTag": "..."}',
-    'US-CA',
-    NOW()
-);
-
--- Note: Server cannot determine which device this belongs to
--- Only the owner (with master_secret) can derive the identifier_hash for their device
-```
-
-#### Operation 2: Retrieve Locations (Device Owner)
-
-When owner opens the Find My app:
-
-```sql
--- 1. Get device and master_secret
-SELECT id, master_secret, current_period FROM registered_devices
-WHERE user_id = $1 AND id = $2;
-
--- 2. Client derives all possible identifier_hashes for time range
--- (15-minute periods from start to end)
--- identifier_hash = SHA256(SHA256(publicKey derived from master_secret + period))
-
--- 3. Query for matching reports
-SELECT id, identifier_hash, encrypted_payload, created_at
-FROM location_reports
-WHERE identifier_hash = ANY($1)  -- Array of possible hashes
-  AND created_at BETWEEN $2 AND $3
-ORDER BY created_at DESC;
-
--- 4. Client decrypts each payload with derived private key
--- 5. Cache decrypted results
-INSERT INTO decrypted_locations (device_id, latitude, longitude, accuracy, timestamp)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT DO NOTHING;
-```
-
-#### Operation 3: Enable Lost Mode
-
-```sql
--- 1. Upsert lost mode settings
-INSERT INTO lost_mode (device_id, enabled, contact_phone, message, notify_when_found, enabled_at)
-VALUES ($1, TRUE, $2, $3, TRUE, NOW())
-ON CONFLICT (device_id) DO UPDATE SET
-    enabled = TRUE,
-    contact_phone = EXCLUDED.contact_phone,
-    message = EXCLUDED.message,
-    enabled_at = NOW(),
-    updated_at = NOW();
-
--- 2. Create notification for confirmation
-INSERT INTO notifications (user_id, device_id, type, title, message, data)
-VALUES (
-    $1, $2, 'system',
-    'Lost Mode Enabled',
-    'You will be notified when your device is found.',
-    '{"enabled_at": "2024-01-15T10:30:00Z"}'
-);
-```
-
-#### Operation 4: Detect Unknown Tracker (Anti-Stalking)
-
-```sql
--- 1. Record sighting
-INSERT INTO tracker_sightings (user_id, identifier_hash, latitude, longitude, seen_at)
-VALUES ($1, $2, $3, $4, NOW());
-
--- 2. Check for stalking pattern (3+ sightings in 3 hours)
-SELECT COUNT(*),
-       MIN(seen_at) as first_seen,
-       MAX(seen_at) as last_seen,
-       array_agg(ARRAY[latitude::text, longitude::text]) as locations
-FROM tracker_sightings
-WHERE user_id = $1
-  AND identifier_hash = $2
-  AND seen_at > NOW() - INTERVAL '3 hours';
-
--- 3. If pattern detected, create alert
-INSERT INTO notifications (user_id, type, title, message, data)
-VALUES (
-    $1,
-    'unknown_tracker',
-    'Unknown AirTag Detected',
-    'An AirTag has been traveling with you for over an hour.',
-    '{"identifier_hash": "...", "sighting_count": 5, "first_seen": "...", "last_seen": "..."}'
-);
-```
-
-#### Operation 5: Delete User Account (GDPR Compliance)
-
-```sql
--- Single DELETE cascades to all user data
-DELETE FROM users WHERE id = $1;
-
--- CASCADE automatically deletes:
--- - registered_devices (and their lost_mode, decrypted_locations)
--- - notifications
--- - tracker_sightings
--- - sessions (via application logic, not FK)
-
--- location_reports are NOT deleted (they have no FK to user)
--- This is by design: reports are anonymous and cannot be attributed to a user
-```
-
----
-
-### Index Summary
-
-| Table | Index | Columns | Type | Purpose |
-|-------|-------|---------|------|---------|
-| `registered_devices` | `idx_devices_user` | `user_id` | B-tree | List devices by user |
-| `registered_devices` | `idx_devices_active` | `is_active` | B-tree | Filter active devices |
-| `location_reports` | `idx_reports_identifier` | `identifier_hash` | B-tree | Primary lookup path |
-| `location_reports` | `idx_reports_time` | `created_at` | B-tree | Time-based cleanup |
-| `location_reports` | `idx_reports_identifier_time` | `(identifier_hash, created_at DESC)` | Compound | Latest reports by identifier |
-| `notifications` | `idx_notifications_user` | `user_id` | B-tree | User's notifications |
-| `notifications` | `idx_notifications_unread` | `(user_id, is_read)` | Partial (WHERE is_read = FALSE) | Unread count badge |
-| `tracker_sightings` | `idx_sightings_user_identifier` | `(user_id, identifier_hash)` | Compound | Pattern detection |
-| `tracker_sightings` | `idx_sightings_time` | `seen_at` | B-tree | Time-windowed queries |
-| `decrypted_locations` | `idx_decrypted_device` | `device_id` | B-tree | Device's locations |
-| `decrypted_locations` | `idx_decrypted_time` | `(device_id, timestamp DESC)` | Compound | Latest locations |
-| `session` | `idx_session_expire` | `expire` | B-tree | Session cleanup |
-
----
-
-### Normalization Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| `lost_mode` as separate table | Normalized (1:1) | Avoids nullable columns on device; cleaner domain separation |
-| `address` in `decrypted_locations` | Denormalized | Avoids repeated geocoding API calls; address is derived, not source data |
-| `encrypted_payload` as JSONB | Semi-structured | Payload format may evolve; JSONB allows schema flexibility |
-| `emoji` in `registered_devices` | Denormalized | Simple string, no need for separate emoji table |
-| `location_reports` standalone | Intentionally unlinked | Privacy requirement: server cannot correlate reports to devices |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/auth/register` | Create user account |
+| POST | `/api/auth/login` | Authenticate and create session |
+| POST | `/api/auth/logout` | Destroy session |
+| GET | `/api/devices` | List user's registered devices |
+| POST | `/api/devices` | Register a new device |
+| DELETE | `/api/devices/:id` | Remove a device |
+| POST | `/api/locations/report` | Submit encrypted location report (idempotent) |
+| GET | `/api/locations/:deviceId` | Get decrypted locations for a device |
+| POST | `/api/lost-mode/:deviceId` | Enable/disable lost mode |
+| GET | `/api/lost-mode/:deviceId` | Get lost mode status |
+| GET | `/api/notifications` | List user notifications |
+| PATCH | `/api/notifications/:id/read` | Mark notification as read |
+| GET | `/api/anti-stalking/check` | Check for unknown trackers |
+| POST | `/api/anti-stalking/sighting` | Report tracker sighting |
+| GET | `/api/admin/stats` | Admin dashboard statistics |
+| GET | `/health` | Shallow health check (liveness) |
+| GET | `/health/ready` | Deep health check (readiness) |
+| GET | `/metrics` | Prometheus metrics |
 
 ---
 
 ## Key Design Decisions
 
-### 1. End-to-End Encryption
+### 1. End-to-End Encryption (Zero-Knowledge)
 
-**Decision**: Apple cannot decrypt location reports
+Apple cannot decrypt location reports. The finder encrypts with the AirTag's rotating public key; only the owner (with the master secret) can derive the matching private key to decrypt. This means Apple is not a liability for location data, and a server breach exposes only encrypted blobs. The trade-off is that Apple cannot provide server-side features like geofencing or location-based alerts -- all location processing must happen on the owner's device after decryption.
 
-**Rationale**:
-- Maximum privacy protection
-- Apple isn't liability for location data
-- User maintains full control
+### 2. 15-Minute Key Rotation
 
-### 2. Rotating Identifiers
+Rotating BLE identifiers every 15 minutes prevents passive tracking by third parties who observe BLE advertisements. A shorter rotation (e.g., 1 minute) would improve privacy but dramatically increase battery consumption (more key derivations, more BLE advertisement changes) and reduce the window for network devices to submit reports. The 15-minute window provides a practical balance: long enough for nearby iPhones to detect and report, short enough to prevent sustained tracking across a city.
 
-**Decision**: Change BLE identifier every 15 minutes
+### 3. Anti-Stalking as a First-Class Feature
 
-**Rationale**:
-- Prevents tracking by third parties
-- Owner can still correlate
-- Balance privacy vs. battery
-
-### 3. Anti-Stalking by Default
-
-**Decision**: Alert users to unknown trackers
-
-**Rationale**:
-- Prevent misuse
-- Proactive safety
-- Balance utility vs. abuse potential
-
----
-
-## Consistency and Idempotency Semantics
-
-### Write Semantics by Operation
-
-| Operation | Consistency | Idempotency | Rationale |
-|-----------|-------------|-------------|-----------|
-| Location Report | Eventual | Idempotent (dedupe by hash) | High volume, duplicates harmless |
-| Device Registration | Strong | Idempotent (upsert by device_id) | Critical user data |
-| Lost Mode Toggle | Strong | Idempotent (last-write-wins) | User expects immediate effect |
-| Anti-Stalking Alert | Eventual | At-least-once | Missing alert is worse than duplicate |
-
-### Location Report Handling
-
-Location reports are the highest-volume write operation. We use **eventual consistency** with idempotent processing:
-
-```javascript
-// Location reports use composite key for deduplication
-async function submitLocationReport(report) {
-  // Generate idempotency key from content hash
-  const idempotencyKey = crypto.createHash('sha256')
-    .update(report.identifierHash)
-    .update(report.timestamp.toString())
-    .update(report.encryptedPayload)
-    .digest('hex')
-    .slice(0, 32)
-
-  // Upsert with conflict handling
-  await db.query(`
-    INSERT INTO location_reports (id, identifier_hash, encrypted_payload, created_at)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (id) DO NOTHING  -- Ignore duplicate submissions
-  `, [idempotencyKey, report.identifierHash, report.encryptedPayload, new Date(report.timestamp)])
-}
-```
-
-### Replay and Conflict Resolution
-
-**Replay Handling:**
-- Reports older than 7 days are rejected at API gateway (prevents replay attacks)
-- Timestamp tolerance of +/- 5 minutes for clock drift
-- Duplicate detection window: 24 hours (reports with same idempotency key ignored)
-
-**Conflict Resolution Strategy:**
-- **Location Reports**: No conflict - duplicates are discarded, all unique reports are stored
-- **Device Registration**: Last-write-wins with `updated_at` timestamp; frontend shows optimistic update
-- **Lost Mode**: Last-write-wins; toggle operations include client timestamp for ordering
-
-```javascript
-// Lost mode uses optimistic locking with version check
-async function toggleLostMode(deviceId, enabled, clientVersion) {
-  const result = await db.query(`
-    UPDATE lost_mode
-    SET enabled = $1, enabled_at = NOW(), version = version + 1
-    WHERE device_id = $2 AND version = $3
-    RETURNING version
-  `, [enabled, deviceId, clientVersion])
-
-  if (result.rowCount === 0) {
-    throw new ConflictError('Lost mode was modified by another session')
-  }
-  return result.rows[0].version
-}
-```
-
-### Local Development Setup
-
-For local testing, run PostgreSQL with synchronous commits enabled (default) to observe strong consistency:
-
-```bash
-# Verify synchronous commits in psql
-SHOW synchronous_commit;  -- Should be 'on'
-
-# Test idempotency by submitting same report twice
-curl -X POST http://localhost:3001/api/v1/reports \
-  -H "Content-Type: application/json" \
-  -d '{"identifierHash":"abc123","encryptedPayload":"...","timestamp":1700000000000}'
-# Second identical request should return 200 but not create duplicate
-```
+Rather than relying on users to manually check for trackers, the system proactively scans and alerts. The detection thresholds (3+ sightings, 500m distance, 1 hour duration) are calibrated to minimize false positives from family AirTags, shared spaces, and transit while catching genuine stalking attempts. The trade-off is alert fatigue -- in dense urban environments with many AirTags, the false positive rate can be noticeable. We mitigate this by requiring significant user movement (500m) alongside persistent tracker presence.
 
 ---
 
 ## Caching and Edge Strategy
-
-### Cache Architecture
 
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
@@ -1145,558 +413,214 @@ curl -X POST http://localhost:3001/api/v1/reports \
 └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
-### Cache Layers
-
 | Layer | What's Cached | TTL | Strategy |
 |-------|---------------|-----|----------|
-| CDN | Static assets, map tiles | 24 hours | Cache-Control headers |
-| Valkey L1 | User's device list | 5 minutes | Cache-aside |
-| Valkey L2 | Location report lookups | 15 minutes | Cache-aside with write-through hint |
-| Local (client) | Recent locations | 1 minute | Stale-while-revalidate |
+| CDN | Static assets, NFC landing pages | 24 hours | Cache-Control headers |
+| Valkey L1 | User's device list | 5 minutes | Cache-aside, invalidate on device change |
+| Valkey L2 | Location report lookups | 15 minutes | Cache-aside (aligns with key rotation) |
+| Valkey L3 | Idempotency keys | 24 hours | Write-on-submit, prevents replay |
+| Client | Recent decrypted locations | 1 minute | Stale-while-revalidate |
 
-### Cache-Aside Pattern (Primary)
-
-Used for device list and location queries where reads far exceed writes:
-
-```javascript
-class CacheAside {
-  constructor(redis, db) {
-    this.redis = redis
-    this.db = db
-  }
-
-  async getDeviceList(userId) {
-    const cacheKey = `devices:${userId}`
-
-    // 1. Check cache first
-    const cached = await this.redis.get(cacheKey)
-    if (cached) {
-      return JSON.parse(cached)
-    }
-
-    // 2. Cache miss - fetch from DB
-    const devices = await this.db.query(
-      'SELECT * FROM registered_devices WHERE user_id = $1',
-      [userId]
-    )
-
-    // 3. Populate cache with TTL
-    await this.redis.setex(cacheKey, 300, JSON.stringify(devices.rows)) // 5 min TTL
-
-    return devices.rows
-  }
-
-  // Invalidate on write
-  async registerDevice(userId, device) {
-    await this.db.query('INSERT INTO registered_devices ...', [userId, device])
-    await this.redis.del(`devices:${userId}`)  // Invalidate cache
-  }
-}
-```
-
-### Write-Through Pattern (Location Reports)
-
-For location reports, we use write-through to pre-warm the cache for owner queries:
-
-```javascript
-async function submitAndCacheReport(report) {
-  // 1. Write to database
-  await db.query('INSERT INTO location_reports ...', [report])
-
-  // 2. Append to cache (for owner's next query)
-  const cacheKey = `reports:${report.identifierHash}`
-  await redis.lpush(cacheKey, JSON.stringify(report))
-  await redis.ltrim(cacheKey, 0, 99)  // Keep last 100 reports
-  await redis.expire(cacheKey, 900)   // 15 min TTL (matches key rotation period)
-}
-```
-
-### Cache Invalidation Rules
-
-| Event | Invalidation Action |
-|-------|---------------------|
-| Device registered | Delete `devices:{userId}` |
-| Device removed | Delete `devices:{userId}` |
-| Lost mode toggled | Delete `lostmode:{deviceId}` |
-| Key rotation (15 min) | Reports cache expires naturally (TTL = 15 min) |
-| User logout | Delete all `*:{userId}` keys |
-
-### Local Development with Valkey
-
-```bash
-# Start Valkey via Docker
-docker run -d --name airtag-valkey -p 6379:6379 valkey/valkey:latest
-
-# Or via Homebrew
-brew install valkey && valkey-server
-
-# Monitor cache operations in real-time
-valkey-cli MONITOR
-
-# Check cache hit rates
-valkey-cli INFO stats | grep keyspace
-```
-
-### CDN Configuration (for Static Assets)
-
-In local development, simulate CDN behavior with Express static middleware:
-
-```javascript
-// Simulate CDN cache headers for static assets
-app.use('/static', express.static('public', {
-  maxAge: '1d',  // Cache-Control: max-age=86400
-  etag: true,
-  lastModified: true
-}))
-
-// Map tiles and images
-app.use('/tiles', express.static('tiles', {
-  maxAge: '7d',
-  immutable: true  // Cache-Control: immutable (content-addressed)
-}))
-```
+**Cache-Aside** is the primary pattern: check cache first, fetch from DB on miss, populate cache with TTL. On writes (device registered, lost mode toggled), the relevant cache keys are explicitly invalidated. The 15-minute TTL for reports aligns with key rotation -- cached data expires as new identifiers become active.
 
 ---
 
 ## Async Queue Architecture (RabbitMQ)
 
-### Queue Topology
-
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           RabbitMQ                                       │
-│                                                                          │
-│  ┌─────────────┐    ┌─────────────────────────────────────────────────┐ │
-│  │  Exchange   │───▶│  location.reports (fanout to workers)           │ │
-│  │  (topic)    │    └─────────────────────────────────────────────────┘ │
-│  │             │    ┌─────────────────────────────────────────────────┐ │
-│  │             │───▶│  antistalk.analyze (stalking pattern check)     │ │
-│  │             │    └─────────────────────────────────────────────────┘ │
-│  │             │    ┌─────────────────────────────────────────────────┐ │
-│  │             │───▶│  notifications.push (alert delivery)            │ │
-│  │             │    └─────────────────────────────────────────────────┘ │
-│  │             │    ┌─────────────────────────────────────────────────┐ │
-│  │             │───▶│  reports.cleanup (TTL expiration)               │ │
-│  └─────────────┘    └─────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                         RabbitMQ                               │
+│                                                                │
+│  Exchange: airtag.events (topic)                               │
+│                                                                │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │ location.reports ── Store encrypted blobs (at-least-1) │    │
+│  ├────────────────────────────────────────────────────────┤    │
+│  │ antistalk.analyze ── Pattern detection (at-least-1)    │    │
+│  ├────────────────────────────────────────────────────────┤    │
+│  │ notifications.push ── Alert delivery (at-least-1)      │    │
+│  ├────────────────────────────────────────────────────────┤    │
+│  │ reports.cleanup ── TTL expiration (at-most-1)          │    │
+│  └────────────────────────────────────────────────────────┘    │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-### Queue Definitions
+| Queue | Semantics | Prefetch | Backpressure |
+|-------|-----------|----------|--------------|
+| `location.reports` | At-least-once, idempotent writes | 100 | Max 1M messages, 7-day TTL |
+| `antistalk.analyze` | At-least-once, stateless check | 10 | Dead-letter after 2 retries |
+| `notifications.push` | At-least-once, dedup in push | 50 | Retry with backoff |
+| `reports.cleanup` | At-most-once, cron backup | 1000 | Acceptable to miss some |
 
-| Queue | Purpose | Delivery | Backpressure |
-|-------|---------|----------|--------------|
-| `location.reports` | Store encrypted location blobs | At-least-once | Prefetch = 100 |
-| `antistalk.analyze` | Detect stalking patterns | At-least-once | Prefetch = 10 |
-| `notifications.push` | Send alerts to users | At-least-once with retry | Prefetch = 50 |
-| `reports.cleanup` | Expire old reports (7 days) | At-most-once | Prefetch = 1000 |
+---
 
-### Producer: Location Report Ingestion
+## Consistency and Idempotency
 
-```javascript
-const amqp = require('amqplib')
+### Write Semantics
 
-class ReportProducer {
-  async connect() {
-    this.connection = await amqp.connect('amqp://guest:guest@localhost:5672')
-    this.channel = await this.connection.createChannel()
+| Operation | Consistency | Idempotency | Rationale |
+|-----------|-------------|-------------|-----------|
+| Location Report | Eventual | Idempotent (content-hash dedup) | High volume; duplicates are harmless |
+| Device Registration | Strong | Idempotent (upsert by device_id) | Critical user data |
+| Lost Mode Toggle | Strong | Idempotent (last-write-wins) | User expects immediate effect |
+| Anti-Stalking Alert | Eventual | At-least-once | Missing an alert is worse than a duplicate |
 
-    // Declare exchange and queues
-    await this.channel.assertExchange('airtag.events', 'topic', { durable: true })
-    await this.channel.assertQueue('location.reports', {
-      durable: true,
-      arguments: {
-        'x-message-ttl': 7 * 24 * 60 * 60 * 1000,  // 7 days
-        'x-max-length': 1000000  // Backpressure: max 1M messages
-      }
-    })
-    await this.channel.bindQueue('location.reports', 'airtag.events', 'report.location.*')
-  }
+**Location Report Idempotency**: The idempotency key is `SHA-256(identifierHash + timestamp_rounded_to_minute + payloadHash)`. Redis stores this key with 24-hour TTL. Duplicate submissions return 200 without re-inserting. This handles client retries on cellular networks.
 
-  async publishReport(report) {
-    const message = Buffer.from(JSON.stringify(report))
+**Lost Mode Optimistic Locking**: Toggle operations include a version number. The UPDATE checks `WHERE version = $expected`, returning a conflict error if another session modified the record. This prevents race conditions between multiple devices.
 
-    // Publish with persistence
-    this.channel.publish('airtag.events', 'report.location.new', message, {
-      persistent: true,
-      messageId: report.idempotencyKey,  // For deduplication
-      timestamp: Date.now()
-    })
-  }
-}
-```
+---
 
-### Consumer: Anti-Stalking Analysis (Background Job)
+## Observability
 
-```javascript
-class AntiStalkConsumer {
-  async start() {
-    const connection = await amqp.connect('amqp://guest:guest@localhost:5672')
-    const channel = await connection.createChannel()
+### Metrics (Prometheus)
 
-    // Backpressure: only process 10 messages at a time
-    await channel.prefetch(10)
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `http_request_duration_seconds` | Histogram | API latency by endpoint |
+| `location_reports_total` | Counter | Ingestion throughput, regional breakdown |
+| `cache_operations_total{result}` | Counter | Cache hit/miss ratio |
+| `db_query_duration_seconds` | Histogram | Slow query detection |
+| `rate_limit_hits_total` | Counter | Abuse detection, limit tuning |
 
-    await channel.assertQueue('antistalk.analyze', { durable: true })
-    await channel.bindQueue('antistalk.analyze', 'airtag.events', 'report.location.*')
+### Alert Thresholds
 
-    channel.consume('antistalk.analyze', async (msg) => {
-      try {
-        const report = JSON.parse(msg.content.toString())
-        await this.analyzeForStalking(report)
-        channel.ack(msg)  // Acknowledge success
-      } catch (err) {
-        console.error('Analysis failed:', err)
-        // Requeue with delay for retry (dead letter after 3 attempts)
-        if (msg.fields.redelivered) {
-          channel.nack(msg, false, false)  // Dead letter
-        } else {
-          channel.nack(msg, false, true)   // Requeue
-        }
-      }
-    })
-  }
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| Report ingestion p99 | > 200ms | > 500ms |
+| Report error rate | > 1% | > 5% |
+| Anti-stalking queue depth | > 10K | > 100K |
+| Redis memory | > 80% | > 95% |
 
-  async analyzeForStalking(report) {
-    // Fetch recent sightings for this identifier
-    const sightings = await db.query(`
-      SELECT * FROM location_reports
-      WHERE identifier_hash = $1
-      AND created_at > NOW() - INTERVAL '3 hours'
-      ORDER BY created_at
-    `, [report.identifierHash])
+### Structured Logging
 
-    // Run pattern detection (see AntiStalkingService above)
-    if (this.detectStalkingPattern(sightings.rows)) {
-      await this.publishAlert(report.identifierHash, sightings.rows)
-    }
-  }
+Pino JSON logs with request correlation IDs, component-level child loggers (e.g., `locationService`, `antiStalkingService`), and automatic redaction of sensitive fields. Development mode uses `pino-pretty` for readability.
 
-  async publishAlert(identifierHash, sightings) {
-    // Queue notification for delivery
-    this.channel.publish('airtag.events', 'alert.stalking', Buffer.from(JSON.stringify({
-      identifierHash,
-      sightingCount: sightings.length,
-      firstSeen: sightings[0].created_at,
-      lastSeen: sightings[sightings.length - 1].created_at
-    })), { persistent: true })
-  }
-}
-```
+---
 
-### Backpressure and Flow Control
+## Failure Handling
 
-```javascript
-// Monitor queue depth and apply backpressure at API layer
-async function checkBackpressure() {
-  const queueInfo = await channel.checkQueue('location.reports')
+### Graceful Degradation
 
-  if (queueInfo.messageCount > 500000) {
-    // Shed load: reject new reports temporarily
-    console.warn('Queue depth high, applying backpressure')
-    return { accept: false, retryAfter: 60 }
-  }
+- **Redis down**: Cache misses fall through to PostgreSQL; rate limiting degrades to in-memory counters; idempotency checks are bypassed (at-least-once is acceptable)
+- **RabbitMQ down**: Location reports are written directly to PostgreSQL (synchronous fallback); anti-stalking analysis is deferred until queue recovers
+- **PostgreSQL read replica down**: Queries fall back to primary; write performance may degrade
 
-  if (queueInfo.messageCount > 100000) {
-    // Slow down: add artificial delay
-    console.warn('Queue depth elevated, slowing intake')
-    return { accept: true, delay: 100 }
-  }
+### Retry Strategy
 
-  return { accept: true, delay: 0 }
-}
-```
+Queue consumers use exponential backoff with dead-letter queues after 3 attempts. HTTP clients retry with jitter on 5xx responses. All retryable operations use idempotency keys.
 
-### Delivery Semantics Summary
+---
 
-| Queue | Semantics | Handling |
-|-------|-----------|----------|
-| `location.reports` | At-least-once | Idempotent writes (ON CONFLICT DO NOTHING) |
-| `antistalk.analyze` | At-least-once | Idempotent analysis (stateless check) |
-| `notifications.push` | At-least-once | Dedupe in push service (1 hour window) |
-| `reports.cleanup` | At-most-once | Acceptable to miss some (cron backup) |
+## Scalability Considerations
 
-### Local Development Setup
+### What Breaks First
 
-```bash
-# Start RabbitMQ via Docker
-docker run -d --name airtag-rabbitmq \
-  -p 5672:5672 -p 15672:15672 \
-  rabbitmq:3-management
+1. **Location report ingestion** -- 10M+ reports/minute requires Kafka-level throughput. RabbitMQ works for moderate scale; at global scale, partition by region with Kafka.
+2. **Identifier hash lookups** -- Each owner query generates 96+ hashes (24h / 15min). PostgreSQL compound index handles this, but at 500M AirTags, consider Cassandra partitioned by identifier_hash prefix.
+3. **Anti-stalking analysis** -- Per-user pattern detection is CPU-bound. Horizontally scale workers, partition by user_id.
 
-# Or via Homebrew
-brew install rabbitmq && brew services start rabbitmq
+### Horizontal Scaling Path
 
-# Access management UI
-open http://localhost:15672  # guest/guest
-
-# Monitor queues from CLI
-rabbitmqctl list_queues name messages consumers
-```
-
-### docker-compose.yml Addition
-
-```yaml
-services:
-  rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-
-  valkey:
-    image: valkey/valkey:latest
-    ports:
-      - "6379:6379"
-    volumes:
-      - valkey_data:/data
-
-volumes:
-  rabbitmq_data:
-  valkey_data:
-```
+- **Report ingestion**: Partition by `reporter_region` across Kafka topics and consumer groups
+- **Query service**: Stateless, horizontal scaling behind load balancer
+- **Anti-stalking**: Worker pool consuming from RabbitMQ with configurable prefetch
+- **Database**: Read replicas for query service, time-based partitioning for `location_reports` (7-day retention), geographic sharding for global scale
 
 ---
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Encryption | End-to-end | Server-side | Privacy |
-| Key rotation | 15 minutes | Hourly | Privacy vs. battery |
-| Anti-stalking | Proactive alerts | Manual check | Safety |
-| Precision | UWB | BLE only | Accuracy |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Encryption | End-to-end (ECIES) | Server-side | Zero-knowledge privacy; Apple cannot see locations |
+| Key rotation | 15 minutes | Hourly / 1 minute | Balance privacy, battery life, and report window |
+| Anti-stalking | Proactive alerts | Manual check | Safety-first; false positives preferable to missed stalking |
+| Precision finding | UWB | BLE RSSI only | Centimeter-level accuracy vs meter-level |
+| Report storage | PostgreSQL + BIGSERIAL | Cassandra | Simpler operations; partition by time at scale |
+| Queue | RabbitMQ | Kafka | Easier setup, sufficient for learning scale |
+| Session storage | Redis + cookie | JWT | Immediate revocation, simpler session management |
+| Identifier hash index | Compound B-tree | Hash index | Supports range scans (time-ordered retrieval) |
 
 ---
 
 ## Implementation Notes
 
-This section documents the backend implementation improvements and explains **WHY** each change makes the system more reliable, observable, and scalable.
+This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.
 
-### 1. Structured Logging with Pino
+### Local Architecture
 
-**What**: Replaced `console.log` with Pino structured JSON logging.
-
-**Why This Improves the System**:
-
-1. **Log Aggregation**: JSON logs are machine-parseable, enabling ingestion into ELK Stack, Splunk, or CloudWatch Logs. This allows searching across all server instances with a single query like `component:locationService AND level:error`.
-
-2. **Request Correlation**: Each request gets a unique ID (`req.id`) that flows through all log entries. When investigating an issue, you can filter by request ID to see the complete request lifecycle across services.
-
-3. **Performance**: Pino is 5x faster than Winston/Bunyan because it uses asynchronous I/O and avoids expensive string interpolation. In a high-throughput system processing 100k+ location reports/minute, logging overhead matters.
-
-4. **Context Propagation**: Child loggers inherit parent context, so a log entry from `locationService` automatically includes `component: "locationService"` without manual annotation.
-
-**Files**: `src/shared/logger.ts`, `src/index.ts`
-
-```typescript
-// Before (hard to search, no context)
-console.error('Submit report error:', error);
-
-// After (structured, searchable, with context)
-log.error(
-  { error, identifierHash: data.identifier_hash },
-  'Failed to submit location report'
-);
+```
+┌─────────────────────────────────────────────────────────────┐
+│               React Frontend (:5173)                         │
+│  MapView (Leaflet) + DeviceCards + NotificationsPanel        │
+│  LoginForm + AddDeviceModal + AdminDashboard                 │
+│  State: Zustand (useStore)                                   │
+└────────────────────────┬────────────────────────────────────┘
+                         │ HTTP (fetch, credentials: include)
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│           Express Backend (:3000)                             │
+│  Routes: auth, devices, locations, lostMode,                │
+│          notifications, antiStalking, admin                  │
+│  Middleware: session (Redis), auth, rate limiting            │
+│  Shared: logger, metrics, cache, idempotency, health        │
+└──────┬──────────────┬──────────────┬────────────────────────┘
+       │              │              │
+       ▼              ▼              ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐
+│ PostgreSQL │ │   Valkey   │ │  RabbitMQ  │
+│  (:5432)   │ │  (:6379)   │ │(:5672/mgmt │
+│ DB: findmy │ │  Sessions, │ │  :15672)   │
+│ User:findmy│ │  cache,    │ │ Location   │
+│            │ │  rate limit│ │ workers    │
+└────────────┘ └────────────┘ └────────────┘
 ```
 
----
-
-### 2. Prometheus Metrics for Observability
-
-**What**: Added Prometheus metrics collection with a `/metrics` endpoint.
-
-**Why This Improves the System**:
-
-1. **SLO Monitoring**: Track the four golden signals (latency, traffic, errors, saturation). Example alert: "P99 latency > 200ms for 5 minutes" triggers before users notice degradation.
-
-2. **Capacity Planning**: `location_reports_total` counter shows ingestion rate over time. If reports increase 10x during a product launch, you know to scale before saturation.
-
-3. **Cache Efficiency**: `cache_operations_total{result="hit|miss"}` reveals cache hit rate. If hit rate drops below 80%, investigate TTL settings or cache invalidation bugs.
-
-4. **Rate Limit Tuning**: `rate_limit_hits_total` shows how often limits are hit per endpoint. If auth limits trigger frequently, either increase limits or investigate credential stuffing attacks.
-
-5. **Database Performance**: `db_query_duration_seconds` histogram with percentiles identifies slow queries. A query with P99 > 100ms is a candidate for indexing.
-
-**Files**: `src/shared/metrics.ts`, `src/index.ts`
-
-**Key Metrics**:
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_request_duration_seconds` | Histogram | Latency SLOs, percentile tracking |
-| `location_reports_total` | Counter | Ingestion throughput, regional breakdown |
-| `cache_operations_total` | Counter | Cache efficiency (hit/miss ratio) |
-| `db_query_duration_seconds` | Histogram | Slow query detection |
-| `rate_limit_hits_total` | Counter | Abuse detection, limit tuning |
-
----
-
-### 3. Redis Caching with Cache-Aside Pattern
-
-**What**: Added Redis caching for location queries and device lookups.
-
-**Why This Improves the System**:
-
-1. **Read Scalability**: Location queries involve: (1) device lookup, (2) identifier hash generation for time range, (3) report query, (4) decryption. Caching the final result eliminates all four steps for repeated queries.
-
-2. **Latency Reduction**: Cache hit: ~1ms. Database query + decryption: ~50-200ms. For a user refreshing the map every 30 seconds, caching provides 50x latency improvement.
-
-3. **Database Protection**: During "lost device" scenarios, users may refresh obsessively. Cache absorbs this traffic, protecting PostgreSQL from connection exhaustion.
-
-4. **TTL Alignment**: Cache TTL (15 minutes) matches key rotation period. This ensures cached data expires around the same time new reports become available, balancing freshness vs. efficiency.
-
-**Files**: `src/shared/cache.ts`, `src/services/locationService.ts`
-
-**Cache Strategy**:
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Location Query │────▶│   Redis Check   │────▶│  PostgreSQL     │
-│                 │     │   (1ms RTT)     │     │  (50-200ms)     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-         │                      │                       │
-         │     Cache HIT        │                       │
-         │◀─────────────────────│                       │
-         │                      │      Cache MISS       │
-         │◀─────────────────────┼───────────────────────│
-         │                      │                       │
-         │                      │  Populate cache       │
-         │                      │◀──────────────────────│
-```
-
----
-
-### 4. Idempotency for Location Report Submissions
-
-**What**: Added idempotency layer using Redis to prevent duplicate location reports.
-
-**Why This Improves the System**:
-
-1. **Network Reliability**: Mobile devices on cellular networks experience packet loss. Clients retry failed requests, potentially creating duplicate reports. Idempotency ensures retries are safe.
-
-2. **At-Least-Once Delivery**: When we add RabbitMQ for async processing, message redelivery is expected. Idempotent handlers ensure reports are processed exactly once.
-
-3. **Replay Attack Prevention**: An attacker capturing a location report cannot replay it after 7 days (timestamp validation) or within 24 hours (duplicate detection).
-
-4. **Consistent Responses**: Duplicate requests return the same response (same `report_id`), maintaining client-side invariants.
-
-**Files**: `src/shared/idempotency.ts`, `src/services/locationService.ts`
-
-**Idempotency Key Generation**:
-```typescript
-// Key = hash(identifier + timestamp_rounded + payload_hash)
-// - Timestamp rounded to minute: handles clock drift
-// - Payload hash: catches identical content
-const idempotencyKey = generateIdempotencyKey(
-  data.identifier_hash,
-  timestamp,
-  data.encrypted_payload
-);
-```
-
----
-
-### 5. Rate Limiting for API Protection
-
-**What**: Added Redis-backed rate limiting with different limits per endpoint.
-
-**Why This Improves the System**:
-
-1. **DoS Mitigation**: Without rate limits, a single client can exhaust database connections or CPU. Rate limits bound the damage from malicious or buggy clients.
-
-2. **Fair Usage**: In a crowd-sourced network, one device shouldn't consume all server capacity. Rate limits ensure all devices get fair access.
-
-3. **Brute Force Prevention**: Auth endpoint limit (10/min) makes password brute-forcing impractical. At 10 attempts/minute, testing 1000 passwords takes 100 minutes.
-
-4. **Cost Control**: Each API request has a cost (compute, database, bandwidth). Rate limits prevent runaway costs from misconfigured clients or scrapers.
-
-5. **Distributed Enforcement**: Redis-backed limits work across multiple server instances. A client can't bypass limits by hitting different servers.
-
-**Files**: `src/shared/rateLimit.ts`, `src/index.ts`
-
-**Rate Limit Tiers**:
-| Endpoint | Limit | Rationale |
-|----------|-------|-----------|
-| Location Reports | 100/min | High throughput for crowd-sourced ingestion |
-| Location Queries | 60/min | Normal user refresh rate (~1/min per device) |
-| Authentication | 10/min | Prevent brute force attacks |
-| Device Registration | 20/min | Setup-only, prevents device farming |
-| Admin | 20/min | Sensitive operations, should be infrequent |
-
----
-
-### 6. Comprehensive Health Checks
-
-**What**: Added `/health/ready` endpoint that checks PostgreSQL and Redis connectivity.
-
-**Why This Improves the System**:
-
-1. **Kubernetes Integration**: Readiness probes determine if a pod should receive traffic. If Redis is down, the pod is marked unhealthy and removed from the load balancer.
-
-2. **Rolling Deployments**: During deploys, new pods only receive traffic after dependencies are ready. This prevents 503 errors during startup.
-
-3. **Graceful Degradation**: The health check reports "degraded" status if some (but not all) checks fail. This allows traffic to continue while alerting operators.
-
-4. **Dependency Monitoring**: Health checks provide latency measurements for each dependency. Slow Redis response (>10ms) may indicate network issues or memory pressure.
-
-**Files**: `src/shared/health.ts`, `src/index.ts`
-
-**Health Check Endpoints**:
-| Endpoint | Type | Use Case |
-|----------|------|----------|
-| `/health` | Shallow | Kubernetes liveness probe |
-| `/health/live` | Shallow | Alias for liveness |
-| `/health/ready` | Deep | Kubernetes readiness probe |
-| `/metrics` | N/A | Prometheus scraping |
-
----
-
-### 7. Shared Module Architecture
-
-**What**: Organized infrastructure code into `src/shared/` with a barrel export.
-
-**Why This Improves the System**:
-
-1. **Separation of Concerns**: Business logic (services) is separate from infrastructure (logging, caching, metrics). Services import what they need from `shared/index.js`.
-
-2. **Testability**: Shared modules can be mocked in unit tests. Services don't need real Redis or Prometheus connections during testing.
-
-3. **Reusability**: When adding new services (e.g., anti-stalking worker), they import the same infrastructure. Consistent logging, metrics, and caching across all services.
-
-4. **Configuration Centralization**: Cache TTLs, rate limits, and log levels are defined in one place. Changing a TTL affects all consumers.
-
-**Directory Structure**:
-```
-src/shared/
-├── index.ts       # Barrel export for all shared modules
-├── logger.ts      # Pino structured logging
-├── metrics.ts     # Prometheus metrics
-├── cache.ts       # Redis caching with cache-aside
-├── idempotency.ts # Duplicate request prevention
-├── rateLimit.ts   # Rate limiting middleware
-└── health.ts      # Health check endpoints
-```
-
----
-
-### Summary: Before vs. After
-
-| Aspect | Before | After |
-|--------|--------|-------|
-| Logging | `console.log` (unstructured) | Pino JSON (structured, searchable) |
-| Metrics | None | Prometheus (latency, throughput, errors) |
-| Caching | None | Redis cache-aside (15-min TTL) |
-| Idempotency | None | Redis-based duplicate detection (24h window) |
-| Rate Limiting | None | Redis-backed, per-endpoint limits |
-| Health Checks | Basic `/health` | Dependency-aware `/health/ready` |
-| Error Handling | Generic 500 | Structured logging with context |
-
-These changes transform the backend from a simple CRUD server into a production-ready service that can:
-- Scale horizontally behind a load balancer
-- Survive dependency failures gracefully
-- Be monitored and alerted on via Grafana dashboards
-- Handle network retries and duplicate submissions safely
-- Protect itself from abuse and misconfigured clients
+**Workers** (separate processes):
+- `location-worker` (`src/workers/location-worker.ts`) -- consumes from RabbitMQ, stores encrypted reports, checks lost mode, triggers notifications
+- `notification-worker` (`src/workers/notification-worker.ts`) -- processes notification queue
+
+### Production Patterns Actually Implemented
+
+| Pattern | File | Why It Matters at Scale |
+|---------|------|------------------------|
+| Structured logging (Pino) | `backend/src/shared/logger.ts` | JSON logs with component-level child loggers, request IDs for correlation |
+| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP duration histograms, report counters, cache hit/miss, rate limit hits |
+| Redis caching (cache-aside) | `backend/src/shared/cache.ts` | 15-min TTL for location lookups, 5-min TTL for device lists; invalidate on write |
+| Idempotency | `backend/src/shared/idempotency.ts` | Content-hash dedup for location reports, 24h Redis TTL, safe retries |
+| Rate limiting (Redis-backed) | `backend/src/shared/rateLimit.ts` | Per-endpoint: auth 10/min, reports 100/min, queries 60/min, admin 20/min |
+| Health checks | `backend/src/shared/health.ts` | `/health` (liveness), `/health/ready` (PostgreSQL + Redis check) |
+| Session auth (Redis store) | `backend/src/index.ts` | connect-redis with 24h session TTL, httpOnly cookies |
+| AES-256-GCM encryption | `backend/src/utils/crypto.ts` | Simplified ECIES: HMAC-SHA256 key derivation, AES-256-GCM for payloads |
+| Key rotation | `backend/src/utils/crypto.ts` | 15-minute period derivation from master secret |
+| Anti-stalking detection | `backend/src/services/antiStalkingService.ts` | Sighting count, distance, time-span heuristics with 1h alert cooldown |
+| RabbitMQ workers | `backend/src/workers/location-worker.ts` | Background report processing with prefetch, ack/nack, lost mode notification trigger |
+| Notification service | `backend/src/services/notificationService.ts` | Database-backed notifications with unread count, type filtering |
+
+### Simplifications from Production Design
+
+| Production | Local Substitute | Why |
+|------------|-----------------|-----|
+| ECIES with P-224 elliptic curves | AES-256-GCM with HMAC-SHA256 key derivation | Full ECIES requires hardware key management; simplified crypto demonstrates the pattern |
+| Hardware BLE beacon | Simulated via map clicks in frontend | No physical AirTag hardware |
+| Billions of Find My network devices | Single user submitting reports manually | Demonstrates the protocol without crowd-sourcing |
+| Kafka for report ingestion | RabbitMQ with 2 worker instances | Sufficient for dev scale, same at-least-once semantics |
+| Hardware Security Module (HSM) | Master secret stored as plaintext in DB | HSM integration requires specialized hardware |
+| Push notifications (APNs) | Database notifications polled by frontend | No Apple Push Notification Service access |
+| UWB precision finding | Not implemented | Requires U1 chip hardware |
+| NFC identification | Not implemented | Requires NFC reader hardware |
+| OAuth / Apple ID | Session-based email/password auth | Simpler; focused on tracking, not identity |
+
+### What Was Omitted
+
+- **CDN and edge caching** -- no multi-POP deployment
+- **Multi-region deployment** -- single local instance
+- **Kubernetes orchestration** -- Docker Compose only
+- **Geographic sharding** -- single PostgreSQL instance
+- **Time-based table partitioning** -- single `location_reports` table
+- **UWB precision finding** -- hardware required
+- **NFC tap identification** -- hardware required
+- **Power management / BLE advertising** -- hardware required
+- **iCloud Keychain integration** -- Apple ecosystem only
+- **GDPR data export pipeline** -- CASCADE delete implemented, export not
