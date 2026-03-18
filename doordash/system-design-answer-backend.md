@@ -165,36 +165,11 @@
 
 ### Finding Nearby Available Drivers
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Nearby Driver Query Flow                              │
-│                                                                              │
-│   Input: Restaurant coordinates, radius (default 5km)                        │
-│                                                                              │
-│   ┌───────────────────────────────────────────────────────────────────────┐ │
-│   │  Step 1: GEOSEARCH driver_locations                                    │ │
-│   │                                                                        │ │
-│   │  - FROMMEMBER or FROMLONLAT                                           │ │
-│   │  - BYRADIUS {km} km                                                    │ │
-│   │  - WITHDIST (include distance in results)                              │ │
-│   │  - ASC (sort by distance, closest first)                               │ │
-│   │  - COUNT 20 (limit for performance)                                    │ │
-│   └────────────────────────────────────────────────────────────────────────┘ │
-│                                   │                                          │
-│                                   ▼                                          │
-│   ┌────────────────────────────────────────────────────────────────────────┐ │
-│   │  Step 2: Filter by availability                                        │ │
-│   │                                                                        │ │
-│   │  For each driver_id:                                                   │ │
-│   │    - HGETALL driver:{id}  (get metadata)                               │ │
-│   │    - GET driver:{id}:order_count  (current orders)                     │ │
-│   │    - Filter: status === 'active' AND order_count < 2                   │ │
-│   └────────────────────────────────────────────────────────────────────────┘ │
-│                                   │                                          │
-│                                   ▼                                          │
-│   Output: Array of { id, distance, lat, lon, activeOrders }                 │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Two-step query:**
+1. **GEOSEARCH** driver_locations FROMLONLAT, BYRADIUS 5km, WITHDIST, ASC, COUNT 20
+2. **Filter** by availability: HGETALL driver:{id} to check status=active AND order_count < 2
+
+Output: Array of { id, distance, lat, lon, activeOrders }
 
 ### Why Valkey Instead of PostgreSQL PostGIS?
 
@@ -214,59 +189,17 @@
 
 ### Multi-Factor Scoring
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Match Score Calculation                              │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 1: Distance to Restaurant (40% weight)                       │   │
-│   │                                                                      │   │
-│   │  Score = max(0, 100 - (distance_km * 10))                           │   │
-│   │  Closer drivers score higher                                         │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 2: Current Order Load (25% weight)                           │   │
-│   │                                                                      │   │
-│   │  Score = -15 per active order                                        │   │
-│   │  Prefer drivers with fewer current orders                            │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 3: Driver Rating (15% weight)                                │   │
-│   │                                                                      │   │
-│   │  Score = rating * 5  (5 stars = +25 points)                         │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 4: Experience Bonus (10% weight)                             │   │
-│   │                                                                      │   │
-│   │  Score = min(total_deliveries / 10, 20)                              │   │
-│   │  Capped at 20 points for experienced drivers                         │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 5: Earnings Goal Fairness (10% weight)                       │   │
-│   │                                                                      │   │
-│   │  +10 if daily_deliveries < earnings_goal                             │   │
-│   │  Prioritize drivers who need more deliveries                         │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 6: Route Efficiency for Batching                             │   │
-│   │                                                                      │   │
-│   │  If driver has current orders:                                       │   │
-│   │  Score += route_efficiency * 20                                      │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 7: Timing Alignment                                          │   │
-│   │                                                                      │   │
-│   │  -20 penalty if estimated_arrival > prep_time_remaining              │   │
-│   │  Avoid drivers who arrive before food is ready                       │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+"The matching algorithm scores each candidate driver by combining seven weighted factors. Distance dominates because minimizing pickup time directly reduces delivery ETA."
+
+| Factor | Weight | Scoring Logic |
+|--------|--------|---------------|
+| Distance to restaurant | 40% | max(0, 100 - distance_km * 10) — closer is better |
+| Current order load | 25% | -15 per active order — prefer idle drivers |
+| Driver rating | 15% | rating * 5 (5 stars = +25 pts) |
+| Experience bonus | 10% | min(total_deliveries / 10, 20) — capped at 20 |
+| Earnings fairness | 10% | +10 if below daily earnings goal |
+| Route efficiency | Bonus | +route_efficiency * 20 if driver has current orders |
+| Timing alignment | Penalty | -20 if driver arrives before food is ready |
 
 ### Assignment Flow with Circuit Breaker
 
@@ -322,68 +255,26 @@
 
 ### Order Batching Logic
 
-**Batch Eligibility Criteria:**
-- Driver must already have an active order
-- Max 2 orders per batch
-- Restaurant proximity: within 500m of current order's restaurant
-- Route efficiency: combined route must be >= 70% efficient
-- Additional delay: <= 5 minutes to first customer
-
-**Batch Validation Flow:**
-1. Check if driver has current orders (1, not 0, not 2+)
-2. Calculate restaurant distance using haversine formula
-3. If > 500m, reject batch opportunity
-4. Calculate combined route efficiency
-5. If < 70%, reject batch opportunity
-6. Calculate additional delay to first customer
-7. If > 5 minutes, reject batch opportunity
-8. Return batch details with savings calculation
+"Batching is only worthwhile when the efficiency gain outweighs the delay cost. We gate it with strict criteria: driver has exactly 1 active order, new restaurant within 500m, combined route >= 70% efficient, and additional delay <= 5 minutes to the first customer. Max 2 orders per batch."
 
 ---
 
 ## Step 6: Multi-Factor ETA Calculation (5 minutes)
 
+**Four factors combine into the ETA:**
+
+| Factor | Calculation |
+|--------|-------------|
+| Time to restaurant | Route time from driver location to restaurant |
+| Prep time remaining | totalPrepTime - elapsedSinceConfirmed (min 0) |
+| Delivery time | Route time from restaurant to customer |
+| Fixed buffers | 3 min pickup + 2 min dropoff |
+
+**Key insight:** Driver travel and food prep happen in PARALLEL.
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        ETA Calculation Components                            │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 1: Time to Restaurant                                        │   │
-│   │                                                                      │   │
-│   │  If driver assigned and not yet at restaurant:                       │   │
-│   │  getRouteTime(driver.location, restaurant.location)                  │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 2: Food Preparation Time Remaining                           │   │
-│   │                                                                      │   │
-│   │  If status is CONFIRMED or PREPARING:                                │   │
-│   │  remaining = totalPrepTime - elapsedSinceConfirmed                   │   │
-│   │  Minimum of 0 (food might already be ready)                          │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 3: Time from Restaurant to Customer                          │   │
-│   │                                                                      │   │
-│   │  getRouteTime(restaurant.location, order.deliveryAddress)            │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Factor 4: Fixed Buffers                                             │   │
-│   │                                                                      │   │
-│   │  Pickup buffer: 3 minutes (parking, entering, getting food)          │   │
-│   │  Dropoff buffer: 2 minutes (parking, handoff, confirmation)          │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Total Calculation:                                                  │   │
-│   │                                                                      │   │
-│   │  waitTime = max(timeToRestaurant, prepTimeRemaining)                 │   │
-│   │  totalMs = waitTime + deliveryTime + pickupBuffer + dropoffBuffer    │   │
-│   │                                                                      │   │
-│   │  Key insight: Driver travel and food prep happen in PARALLEL         │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
+waitTime = max(timeToRestaurant, prepTimeRemaining)
+totalETA = waitTime + deliveryTime + pickupBuffer + dropoffBuffer
 ```
 
 ### Route Time with Traffic Multipliers
@@ -474,20 +365,7 @@
 | Route calculations | Cache-aside | 5 min | Time-based expiry |
 | Nearby restaurants | Cache-aside (geo cell) | 2 min | Background refresh |
 
-### Cache-Aside Implementation
-
-**Read Pattern:**
-1. Try cache first with key `cache:restaurant_full:{id}`
-2. If cache hit, parse JSON and return
-3. If cache miss, query PostgreSQL for restaurant + menu items
-4. Combine into single object
-5. Store in cache with SETEX (5 min TTL)
-6. Return result
-
-**Invalidation Pattern:**
-- On any UPDATE to menu_items for a restaurant:
-- DEL `cache:restaurant_full:{restaurantId}`
-- Next read will repopulate cache
+"Cache-aside for restaurants: check `cache:restaurant_full:{id}` first, on miss query PostgreSQL and populate with 5-min TTL. Invalidate on any menu update by deleting the key — next read repopulates."
 
 ---
 
@@ -495,85 +373,30 @@
 
 ### Order Creation with Idempotency Key
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Idempotent Order Creation                               │
-│                                                                              │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │  1. Check X-Idempotency-Key header                                    │  │
-│   │     - If missing, return 400 error                                    │  │
-│   └───────────────────────────────────┬──────────────────────────────────┘  │
-│                                       │                                      │
-│                                       ▼                                      │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │  2. Check Redis for existing key: idempotency:order:{key}             │  │
-│   │     - If found, return cached response (statusCode + body)            │  │
-│   └───────────────────────────────────┬──────────────────────────────────┘  │
-│                                       │                                      │
-│                                       ▼                                      │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │  3. BEGIN PostgreSQL transaction                                      │  │
-│   │     - INSERT order                                                    │  │
-│   │     - INSERT all order_items                                          │  │
-│   │     - COMMIT                                                          │  │
-│   └───────────────────────────────────┬──────────────────────────────────┘  │
-│                                       │                                      │
-│                                       ▼                                      │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │  4. Cache response in Redis (24 hour TTL)                             │  │
-│   │     - Key: idempotency:order:{key}                                    │  │
-│   │     - Value: { statusCode: 201, body: order }                         │  │
-│   └───────────────────────────────────┬──────────────────────────────────┘  │
-│                                       │                                      │
-│                                       ▼                                      │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │  5. Return 201 with order                                             │  │
-│   └──────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│   On any error: ROLLBACK transaction, throw error                           │
-│   Client can safely retry with same idempotency key                         │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+"Every order creation requires an X-Idempotency-Key header. This prevents duplicate orders from network retries — critical for a payment-bearing operation."
+
+**Flow:**
+1. Require X-Idempotency-Key header (400 if missing)
+2. Check Redis for `idempotency:order:{key}` — if found, return cached response
+3. BEGIN transaction: INSERT order + order_items, COMMIT
+4. Cache response in Redis with 24h TTL: `{ statusCode: 201, body: order }`
+5. On error: ROLLBACK, throw — client safely retries with same key
 
 ---
 
 ## Step 10: Observability (2 minutes)
 
-### Prometheus Metrics
+**Key Prometheus Metrics:**
 
-**HTTP Request Latency (Histogram):**
-- Name: http_request_duration_seconds
-- Labels: method, route, status_code
-- Buckets: 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s
+| Metric | Type | Purpose |
+|--------|------|---------|
+| http_request_duration_seconds | Histogram | Request latency by route/method/status |
+| orders_total | Counter | Order creation and state transitions |
+| driver_match_duration_seconds | Histogram | Matching algorithm latency |
+| geo_query_duration_seconds | Histogram | Valkey GEOSEARCH latency |
+| drivers_active | Gauge | Real-time count of online drivers |
 
-**Order Counters:**
-- Name: orders_total
-- Labels: status
-- Tracks order creation and state transitions
-
-**Driver Matching Latency (Histogram):**
-- Name: driver_match_duration_seconds
-- Buckets: 100ms, 500ms, 1s, 2s, 5s, 10s, 30s
-
-**Geo Query Latency (Histogram):**
-- Name: geo_query_duration_seconds
-- Buckets: 1ms, 5ms, 10ms, 25ms, 50ms, 100ms
-
-**Active Drivers Gauge:**
-- Name: drivers_active
-- Real-time count of online drivers
-
-### Structured Logging with Pino
-
-**Logger Configuration:**
-- Level: from LOG_LEVEL env or 'info'
-- Base fields: service name, version
-- JSON format for log aggregation
-
-**Business Event Logging:**
-- Event type (order_placed, driver_matched, etc.)
-- Order ID, timestamps
-- Relevant details for debugging
+**Structured logging** via Pino in JSON format — every business event (order_placed, driver_matched) includes order ID, timestamps, and actor for debugging and audit.
 
 ---
 

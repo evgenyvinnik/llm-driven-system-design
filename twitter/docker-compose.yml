@@ -31,10 +31,6 @@ services:
       timeout: 5s
       retries: 5
 
-volumes:
-  postgres_data:
-  redis_data:
-
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: twitter-zookeeper
@@ -54,3 +50,7 @@ volumes:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     depends_on:
       - zookeeper
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -14,7 +14,7 @@
     "worker:review": "node dist/workers/reviewWorker.js",
     "build": "tsc",
     "start": "node dist/index.js",
-    "migrate": "tsx src/scripts/migrate.ts",
+    "db:migrate": "tsx src/scripts/migrate.ts",
     "seed": "tsx src/scripts/seed.ts",
     "lint": "eslint src",
     "type-check": "tsc --noEmit",

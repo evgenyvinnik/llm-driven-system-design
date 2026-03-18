@@ -112,129 +112,33 @@
 
 ---
 
-## 🔍 3. Shared Types and Validation (5-6 minutes)
+## 🔍 3. Shared Types and Validation (3-4 minutes)
 
-### Core Type Definitions
+"The key fullstack insight is sharing types, validation schemas, and constants across frontend and backend. We use a monorepo with a shared package."
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           VIDEO TYPES                                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Video                          VideoWithChannel                             │
-│  ┌─────────────────────────┐    ┌─────────────────────────┐                 │
-│  │ id: string (11-char)    │    │ ...Video fields         │                 │
-│  │ channelId: string       │    │ channel: {              │                 │
-│  │ title: string           │    │   id, name, handle,     │                 │
-│  │ description: string?    │    │   avatarUrl,            │                 │
-│  │ durationSeconds: number?│    │   subscriberCount       │                 │
-│  │ status: VideoStatus     │    │ }                       │                 │
-│  │ visibility: Visibility  │    └─────────────────────────┘                 │
-│  │ viewCount: number       │                                                │
-│  │ likeCount: number       │    VideoResolutionInfo                         │
-│  │ dislikeCount: number    │    ┌─────────────────────────┐                 │
-│  │ commentCount: number    │    │ videoId: string         │                 │
-│  │ categories: string[]    │    │ resolution: Resolution  │                 │
-│  │ tags: string[]          │    │ manifestUrl: string     │                 │
-│  │ thumbnailUrl: string?   │    │ bitrate: number         │                 │
-│  │ publishedAt: string?    │    │ width: number           │                 │
-│  │ createdAt: string       │    │ height: number          │                 │
-│  └─────────────────────────┘    └─────────────────────────┘                 │
-│                                                                              │
-│  VideoStatus: 'uploading' | 'processing' | 'ready' | 'failed' | 'blocked'   │
-│  Visibility: 'public' | 'unlisted' | 'private'                              │
-│  Resolution: '1080p' | '720p' | '480p' | '360p'                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+### Core Shared Types
 
-### Upload Types
+| Type | Key Fields | Purpose |
+|------|-----------|---------|
+| Video | id, channelId, title, status, visibility, viewCount, likeCount, thumbnailUrl | Core entity, status drives UI states |
+| VideoWithChannel | ...Video + channel { name, handle, avatarUrl, subscriberCount } | Denormalized for display |
+| VideoResolutionInfo | videoId, resolution, manifestUrl, bitrate, width, height | HLS quality selection |
+| UploadSession | id, filename, fileSize, totalChunks, uploadedChunks, status, expiresAt | Tracks chunked upload state |
+| ApiResponse\<T\> | data, error (code + message), meta (pagination) | Uniform API envelope |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           UPLOAD TYPES                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  UploadSession                  UploadInitRequest                            │
-│  ┌─────────────────────────┐    ┌─────────────────────────┐                 │
-│  │ id: string              │    │ filename: string        │                 │
-│  │ filename: string        │    │ fileSize: number        │                 │
-│  │ fileSize: number        │    │ mimeType: string        │                 │
-│  │ totalChunks: number     │    └─────────────────────────┘                 │
-│  │ uploadedChunks: number  │                                                │
-│  │ status: SessionStatus   │    UploadCompleteRequest                       │
-│  │ chunkSize: number       │    ┌─────────────────────────┐                 │
-│  │ expiresAt: string       │    │ title: string           │                 │
-│  └─────────────────────────┘    │ description?: string    │                 │
-│                                 │ tags?: string[]         │                 │
-│  SessionStatus:                 │ categories?: string[]   │                 │
-│  'active' | 'completed'         │ visibility?: Visibility │                 │
-│  | 'expired' | 'cancelled'      └─────────────────────────┘                 │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Status enums:** VideoStatus flows through `uploading → processing → ready | failed | blocked`. Visibility is `public | unlisted | private`. Resolutions: `1080p | 720p | 480p | 360p`.
 
-### API Response Types
+### Shared Validation (Zod)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           API TYPES                                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ApiResponse<T>                 SSE Events                                   │
-│  ┌─────────────────────────┐    ┌─────────────────────────┐                 │
-│  │ data: T | null          │    │ transcode.started       │                 │
-│  │ error: ApiError | null  │    │ transcode.progress      │                 │
-│  │ meta: ApiMeta | null    │    │   └─ videoId, resolution│                 │
-│  └─────────────────────────┘    │      progress (0-100)   │                 │
-│                                 │ transcode.completed     │                 │
-│  ApiError                       │   └─ resolutions[],     │                 │
-│  ┌─────────────────────────┐    │      thumbnailUrl,      │                 │
-│  │ code: string            │    │      durationSeconds    │                 │
-│  │ message: string         │    │ transcode.failed        │                 │
-│  │ details?: object        │    └─────────────────────────┘                 │
-│  └─────────────────────────┘                                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Zod schemas are defined once and used for both frontend form validation and backend API validation:
 
-### Zod Validation Schemas
+- **uploadInitSchema**: filename (1-255 chars), fileSize (max 5GB), mimeType (mp4, webm, quicktime, avi, mkv)
+- **uploadCompleteSchema**: title (1-100 chars), description (max 5000), tags (max 30), categories (max 5), visibility
+- **commentCreateSchema**: text (1-10000 chars), optional parentId (UUID for threading)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       ZOD VALIDATION SCHEMAS                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  uploadInitSchema               uploadCompleteSchema                         │
-│  ┌─────────────────────────┐    ┌─────────────────────────┐                 │
-│  │ filename: 1-255 chars   │    │ title: 1-100 chars      │                 │
-│  │ fileSize: 0 < x <= 5GB  │    │ description: <= 5000    │                 │
-│  │ mimeType: allowed types │    │ tags: max 30, each <=50 │                 │
-│  └─────────────────────────┘    │ categories: max 5       │                 │
-│                                 │ visibility: enum        │                 │
-│  commentCreateSchema            └─────────────────────────┘                 │
-│  ┌─────────────────────────┐                                                │
-│  │ text: 1-10000 chars     │    Allowed MIME Types:                         │
-│  │ parentId?: uuid         │    video/mp4, video/webm, video/quicktime,     │
-│  └─────────────────────────┘    video/x-msvideo, video/x-matroska           │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Key constants**: MAX_FILE_SIZE = 5GB, CHUNK_SIZE = 5MB, MAX_CONCURRENT_CHUNKS = 3, UPLOAD_EXPIRY = 24h. Resolution ladder: 1080p (5 Mbps) → 720p (2.5) → 480p (1) → 360p (0.5).
 
-### Shared Constants
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       SHARED CONSTANTS                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Upload Limits                  Video Resolutions                            │
-│  ┌─────────────────────────┐    ┌───────────────────────────────────────┐   │
-│  │ MAX_FILE_SIZE: 5GB      │    │ Resolution │ Width │ Height │ Bitrate │   │
-│  │ CHUNK_SIZE: 5MB         │    ├────────────┼───────┼────────┼─────────┤   │
-│  │ MAX_TITLE_LENGTH: 100   │    │ 1080p      │ 1920  │ 1080   │ 5 Mbps  │   │
-│  │ MAX_DESCRIPTION: 5000   │    │ 720p       │ 1280  │ 720    │ 2.5 Mbps│   │
-│  │ MAX_CONCURRENT: 3 chunks│    │ 480p       │ 854   │ 480    │ 1 Mbps  │   │
-│  │ UPLOAD_EXPIRY: 24 hours │    │ 360p       │ 640   │ 360    │ 500 Kbps│   │
-│  └─────────────────────────┘    └───────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**SSE event types** for transcoding: `transcode.started`, `transcode.progress` (per-resolution 0-100%), `transcode.completed`, `transcode.failed`.
 
 ---
 
@@ -279,234 +183,61 @@
 
 ### Backend Upload Service
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    UPLOAD SERVICE OPERATIONS                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  initializeUpload(userId, input)                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Validate input with uploadInitSchema.parse()                     │    │
-│  │ 2. Generate uploadId, calculate totalChunks                         │    │
-│  │ 3. S3 CreateMultipartUploadCommand → raw-videos bucket              │    │
-│  │ 4. INSERT INTO upload_sessions (PostgreSQL)                         │    │
-│  │ 5. HSET upload:{id} s3Key, s3UploadId, completedChunks (Redis)      │    │
-│  │ 6. Return UploadSession                                             │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  uploadChunk(uploadId, chunkNumber, data)                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Validate session exists and is active                            │    │
-│  │ 2. Get S3 info from Redis HGETALL                                   │    │
-│  │ 3. S3 UploadPartCommand (PartNumber = chunkNumber + 1)              │    │
-│  │ 4. Redis MULTI: HSET parts, HINCRBY completedChunks                 │    │
-│  │ 5. Return { etag }                                                  │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  completeUpload(userId, uploadId, input)                                     │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Validate with uploadCompleteSchema.parse()                       │    │
-│  │ 2. Verify all chunks uploaded (completedChunks == totalChunks)      │    │
-│  │ 3. Get ETags from Redis, sort by part number                        │    │
-│  │ 4. S3 CompleteMultipartUploadCommand                                │    │
-│  │ 5. Transaction: INSERT video, UPDATE session status                 │    │
-│  │ 6. Queue transcode job to RabbitMQ                                  │    │
-│  │ 7. Cleanup Redis keys                                               │    │
-│  │ 8. Return { videoId, status: 'processing' }                         │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The backend exposes three operations:
 
-### Frontend Upload Hook
+- **initializeUpload(userId, input)**: Validates via uploadInitSchema, generates uploadId, calculates totalChunks (fileSize / CHUNK_SIZE), creates S3 multipart upload in raw-videos bucket, persists session in PostgreSQL, and caches S3 keys + chunk tracking in Redis (HSET). Returns UploadSession.
+
+- **uploadChunk(uploadId, chunkNumber, data)**: Validates session is active, retrieves S3 info from Redis (HGETALL), uploads part to S3, and atomically updates Redis (MULTI: HSET etag, HINCRBY completedChunks). Returns { etag }.
+
+- **completeUpload(userId, uploadId, input)**: Validates with uploadCompleteSchema, verifies completedChunks == totalChunks, assembles ETags sorted by part number, completes S3 multipart upload, then in a PostgreSQL transaction: INSERTs video record and UPDATEs session status. Queues transcode job to RabbitMQ. Cleans up Redis. Returns { videoId, status: 'processing' }.
+
+"The key design choice is using Redis for chunk tracking rather than PostgreSQL. Each chunk upload would otherwise require a PostgreSQL write, and with 3 concurrent chunks for potentially thousands of simultaneous uploaders, that's significant write pressure. Redis handles these ephemeral counters much more efficiently."
+
+### Frontend Upload Hook (useChunkedUpload)
+
+The hook manages a state machine: `idle → initializing → uploading → completing → done | error`. It slices the file into 5MB chunks and uploads them in parallel with a concurrency pool of 3. Each chunk is PUT to `/chunks/:n` with binary data. An AbortController enables cancellation. On completion, it POSTs metadata (title, description, tags) and returns the videoId. The hook exposes `{ progress, uploadFile, cancel }`.
+
+### Upload API
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    useChunkedUpload HOOK                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  State: UploadProgress                                                       │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ status: 'idle' | 'initializing' | 'uploading' | 'completing' |      │    │
-│  │         'done' | 'error'                                            │    │
-│  │ uploadedChunks, totalChunks                                         │    │
-│  │ uploadedBytes, totalBytes, percentComplete                          │    │
-│  │ videoId?, error?                                                    │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  uploadFile(file, metadata) Flow:                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Create AbortController for cancellation                          │    │
-│  │ 2. POST /init → get session with totalChunks                        │    │
-│  │ 3. Slice file into chunks (5MB each)                                │    │
-│  │ 4. Parallel upload with concurrency pool (max 3)                    │    │
-│  │    ┌────────────────────────────────────────────────────────┐       │    │
-│  │    │ for each chunk:                                        │       │    │
-│  │    │   - Check abort signal                                 │       │    │
-│  │    │   - PUT /chunks/:n with binary data                    │       │    │
-│  │    │   - Update progress state                              │       │    │
-│  │    │   - If pool.length >= 3, await Promise.race(pool)      │       │    │
-│  │    └────────────────────────────────────────────────────────┘       │    │
-│  │ 5. await Promise.all(pool) for remaining                            │    │
-│  │ 6. POST /complete with metadata → get videoId                       │    │
-│  │ 7. Return videoId                                                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  Returns: { progress, uploadFile, cancel }                                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Upload API Routes
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    UPLOAD API ROUTES                                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  POST /api/v1/uploads/init                                                   │
-│  ├─ Middleware: requireAuth, rateLimit(5/min)                                │
-│  ├─ Body: { filename, fileSize, mimeType }                                   │
-│  └─ Response: { data: UploadSession, error: null, meta: null }               │
-│                                                                              │
-│  PUT /api/v1/uploads/:uploadId/chunks/:chunkNumber                           │
-│  ├─ Middleware: requireAuth, rateLimit(100/min)                              │
-│  ├─ Body: raw binary buffer                                                  │
-│  └─ Response: { data: { etag }, error: null, meta: null }                    │
-│                                                                              │
-│  POST /api/v1/uploads/:uploadId/complete                                     │
-│  ├─ Middleware: requireAuth                                                  │
-│  ├─ Body: { title, description?, tags?, categories?, visibility? }          │
-│  └─ Response: { data: { videoId, status }, error: null, meta: null }         │
-└─────────────────────────────────────────────────────────────────────────────┘
+POST /api/v1/uploads/init             → Creates session, returns totalChunks (rate: 5/min)
+PUT  /api/v1/uploads/:id/chunks/:n    → Uploads binary chunk, returns etag (rate: 100/min)
+POST /api/v1/uploads/:id/complete     → Finalizes upload with metadata, returns videoId
 ```
 
 ---
 
 ## 📊 5. Deep Dive: Video Playback Integration (8-10 minutes)
 
-### Streaming Service
+### Backend Streaming Service
+
+**getVideoForPlayback(videoId, userId?)** checks Redis cache first (5-min TTL), falls back to a JOIN query on videos + users. Resolution info is cached for 1 hour. If the user is authenticated, we also fetch their resume position from watch_history.
+
+**recordView** uses Redis INCR for fast view counting (flushed to PostgreSQL periodically). **updateWatchProgress** UPSERTs watch_history every 30 seconds and on page unload, tracking last position, total watch duration, and percentage.
+
+### Watch Page Layout
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    STREAMING SERVICE OPERATIONS                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  getVideoForPlayback(videoId, userId?)                                       │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Check Redis cache for video:{videoId}                            │    │
-│  │ 2. If miss: JOIN videos + users, cache 5 min                        │    │
-│  │ 3. Get resolutions from cache or DB (cache 1 hour)                  │    │
-│  │ 4. If userId: get resume position from watch_history                │    │
-│  │ 5. Return { video, resolutions, resumePosition? }                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  recordView(videoId, userId?)                                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Redis INCR views:pending:{videoId}                               │    │
-│  │ 2. If userId: INSERT INTO watch_history                             │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  updateWatchProgress(userId, videoId, position, duration)                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Calculate watch percentage                                       │    │
-│  │ 2. UPSERT watch_history with:                                       │    │
-│  │    - last_position_seconds = position                               │    │
-│  │    - watch_duration = GREATEST(current, position)                   │    │
-│  │    - watch_percentage = GREATEST(current, calculated)               │    │
-│  │    - watched_at = NOW()                                             │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                         WatchPage                                  │
+│  ┌────────────────────────────┐  ┌─────────────────────────────┐  │
+│  │       Main Content         │  │   Recommendations Sidebar   │  │
+│  │  ┌──────────────────────┐  │  │                             │  │
+│  │  │    VideoPlayer       │  │  │   Based on currentVideoId   │  │
+│  │  │    (HLS.js)          │  │  │   and categories            │  │
+│  │  └──────────────────────┘  │  │                             │  │
+│  │  ┌──────────────────────┐  │  │                             │  │
+│  │  │ VideoInfo + Comments │  │  │                             │  │
+│  │  └──────────────────────┘  │  │                             │  │
+│  └────────────────────────────┘  └─────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-### Watch Page Component
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    WATCH PAGE STRUCTURE                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                         WatchPage                                      │  │
-│  ├───────────────────────────────────────────────────────────────────────┤  │
-│  │                                                                        │  │
-│  │  Data Fetching:                                                        │  │
-│  │  - useQuery(['video', videoId]) → { video, resolutions, resumePos }    │  │
-│  │  - useMutation(recordView) → called on mount                           │  │
-│  │  - useMutation(updateProgress) → synced every 30s + on unmount         │  │
-│  │                                                                        │  │
-│  │  Layout (flex row):                                                    │  │
-│  │  ┌─────────────────────────────────┐  ┌────────────────────────────┐  │  │
-│  │  │        Main Content             │  │   Recommendations          │  │  │
-│  │  │  ┌───────────────────────────┐  │  │      Sidebar               │  │  │
-│  │  │  │     VideoPlayer           │  │  │                            │  │  │
-│  │  │  │  (aspect-video, HLS.js)   │  │  │   w-[400px]                │  │  │
-│  │  │  │  startPosition={resumePos}│  │  │   currentVideoId           │  │  │
-│  │  │  │  onProgress={...}         │  │  │   categories               │  │  │
-│  │  │  └───────────────────────────┘  │  │                            │  │  │
-│  │  │  ┌───────────────────────────┐  │  │                            │  │  │
-│  │  │  │     VideoInfo             │  │  │                            │  │  │
-│  │  │  └───────────────────────────┘  │  │                            │  │  │
-│  │  │  ┌───────────────────────────┐  │  │                            │  │  │
-│  │  │  │     CommentSection        │  │  │                            │  │  │
-│  │  │  └───────────────────────────┘  │  │                            │  │  │
-│  │  └─────────────────────────────────┘  └────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Data fetching: useQuery for video + resolutions + resumePosition, useMutation for recordView (on mount) and updateProgress (every 30s + unmount).
 
 ### HLS Player Integration
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    VIDEO PLAYER (HLS.js)                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Props: videoId, manifestUrl, thumbnailUrl, duration, startPosition,        │
-│         onProgress                                                           │
-│                                                                              │
-│  Initialization:                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ Safari (native HLS):                                                │    │
-│  │   video.src = manifestUrl                                           │    │
-│  │   video.currentTime = startPosition                                 │    │
-│  │                                                                     │    │
-│  │ Other browsers (HLS.js):                                            │    │
-│  │   const hls = new Hls({                                             │    │
-│  │     enableWorker: true,                                             │    │
-│  │     startLevel: -1,         // Auto quality selection               │    │
-│  │     capLevelToPlayerSize: true,                                     │    │
-│  │     startPosition           // Resume position                      │    │
-│  │   })                                                                │    │
-│  │   hls.attachMedia(video)                                            │    │
-│  │   hls.loadSource(manifestUrl)                                       │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  HLS.js Events:                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ MANIFEST_PARSED → Extract quality levels, build selector            │    │
-│  │   qualityLevels = [{ index: -1, label: 'Auto' }, ...levels]         │    │
-│  │                                                                     │    │
-│  │ ERROR (fatal) → Recovery strategies:                                │    │
-│  │   NETWORK_ERROR → hls.startLoad()                                   │    │
-│  │   MEDIA_ERROR → hls.recoverMediaError()                             │    │
-│  │   default → hls.destroy()                                           │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  Quality Selection:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ handleQualityChange(levelIndex) {                                   │    │
-│  │   hls.currentLevel = levelIndex  // -1 = auto                       │    │
-│  │ }                                                                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  Progress Tracking:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ video.addEventListener('timeupdate', () => {                        │    │
-│  │   setCurrentTime(video.currentTime)                                 │    │
-│  │   onProgress?.(video.currentTime)                                   │    │
-│  │ })                                                                  │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The VideoPlayer component detects Safari (native HLS support) vs other browsers (HLS.js polyfill). HLS.js is initialized with `enableWorker: true`, `startLevel: -1` (auto quality), and `capLevelToPlayerSize: true`. On MANIFEST_PARSED, we extract quality levels for a selector UI. Fatal errors trigger recovery: NETWORK_ERROR restarts loading, MEDIA_ERROR calls recoverMediaError, and unrecoverable errors destroy the instance. Quality changes set `hls.currentLevel` (-1 = auto). Progress is tracked via the `timeupdate` event and forwarded to the parent for watch history sync.
 
 ---
 
@@ -514,242 +245,110 @@
 
 ### Backend SSE Service
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    SSE SERVICE                                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Client Management:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ clients: Map<clientId, SSEClient>                                   │    │
-│  │                                                                     │    │
-│  │ SSEClient {                                                         │    │
-│  │   id: string                                                        │    │
-│  │   userId: string                                                    │    │
-│  │   res: Express.Response                                             │    │
-│  │   videoIds: Set<string>                                             │    │
-│  │ }                                                                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  addClient(clientId, userId, res)                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. Set SSE headers:                                                 │    │
-│  │    Content-Type: text/event-stream                                  │    │
-│  │    Cache-Control: no-cache                                          │    │
-│  │    Connection: keep-alive                                           │    │
-│  │ 2. res.flushHeaders()                                               │    │
-│  │ 3. Send initial: data: { type: 'connected', clientId }              │    │
-│  │ 4. Store client in Map                                              │    │
-│  │ 5. res.on('close') → delete from Map                                │    │
-│  │ 6. Keep-alive ping every 30s: ": ping\n\n"                          │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  subscribeToVideo(clientId, videoId)                                         │
-│  └─ client.videoIds.add(videoId)                                             │
-│                                                                              │
-│  sendToVideo(videoId, event)                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ for client of clients.values():                                     │    │
-│  │   if client.videoIds.has(videoId):                                  │    │
-│  │     res.write(`event: ${event.type}\n`)                             │    │
-│  │     res.write(`data: ${JSON.stringify(event)}\n\n`)                 │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The SSE service maintains a `Map<clientId, SSEClient>` where each client holds a userId, Express response, and a `Set<videoId>` for subscriptions. On connection, it sets SSE headers (text/event-stream, no-cache, keep-alive), flushes headers, sends a `connected` event, and starts a 30-second keep-alive ping. Clients subscribe to specific videos via POST, and `sendToVideo(videoId, event)` iterates all clients with that videoId in their set. Cleanup happens on connection close.
 
-### Transcode Worker Integration
+### Transcode Worker Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    TRANSCODE WORKER FLOW                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  processTranscodeJob(job: { videoId, sourceKey, resolutions })               │
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                                                                     │    │
-│  │  1. SSE → transcode.started { videoId, resolutions }                │    │
-│  │                                                                     │    │
-│  │  2. For each resolution (1080p, 720p, 480p, 360p):                  │    │
-│  │     ┌─────────────────────────────────────────────────────────┐     │    │
-│  │     │ a. transcodeResolution(sourceKey, resolution, progress => {│     │    │
-│  │     │      SSE → transcode.progress { videoId, resolution,    │     │    │
-│  │     │                                 progress: 0-100 }       │     │    │
-│  │     │    })                                                   │     │    │
-│  │     │ b. saveResolution(videoId, resolution) → resInfo        │     │    │
-│  │     │ c. On error: SSE → transcode.failed, throw              │     │    │
-│  │     └─────────────────────────────────────────────────────────┘     │    │
-│  │                                                                     │    │
-│  │  3. generateThumbnails(sourceKey, videoId) → thumbnailUrl           │    │
-│  │                                                                     │    │
-│  │  4. updateVideoComplete(videoId, resolutions, thumbnailUrl)         │    │
-│  │                                                                     │    │
-│  │  5. SSE → transcode.completed { videoId, resolutions,               │    │
-│  │                                 thumbnailUrl, durationSeconds }     │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                    TRANSCODE WORKER                                │
+│                                                                    │
+│  1. SSE → transcode.started { videoId, resolutions }               │
+│                                                                    │
+│  2. For each resolution (1080p → 720p → 480p → 360p):             │
+│     - Transcode with progress callback                             │
+│     - SSE → transcode.progress { videoId, resolution, 0-100% }     │
+│     - Save resolution info to DB                                   │
+│     - On error: SSE → transcode.failed, abort                      │
+│                                                                    │
+│  3. Generate thumbnails → thumbnailUrl                             │
+│  4. Update video status to 'ready'                                 │
+│  5. SSE → transcode.completed { resolutions, thumbnailUrl }        │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-### Frontend SSE Hook
+### Frontend SSE Hook (useTranscodeStatus)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    useTranscodeStatus HOOK                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Options: { videoId, onProgress?, onCompleted?, onFailed? }                  │
-│                                                                              │
-│  State:                                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ status: 'pending' | 'transcoding' | 'completed' | 'failed'          │    │
-│  │ progress: Record<resolution, percent>                               │    │
-│  │   e.g., { '1080p': 45, '720p': 100, '480p': 100, '360p': 100 }      │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  Connection Flow:                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. new EventSource('/api/v1/sse/events', { withCredentials })       │    │
-│  │                                                                     │    │
-│  │ 2. on 'connected':                                                  │    │
-│  │    - Store clientId                                                 │    │
-│  │    - POST /subscribe/{videoId} with { clientId }                    │    │
-│  │                                                                     │    │
-│  │ 3. Event handlers:                                                  │    │
-│  │    'transcode.started' → setStatus('transcoding')                   │    │
-│  │    'transcode.progress' → update progress[resolution]               │    │
-│  │    'transcode.completed' → setStatus('completed'), close            │    │
-│  │    'transcode.failed' → setStatus('failed'), close                  │    │
-│  │                                                                     │    │
-│  │ 4. onerror → reconnect after 5 seconds                              │    │
-│  │                                                                     │    │
-│  │ 5. Cleanup: eventSource.close() on unmount                          │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  Returns: { status, progress }                                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The hook opens an EventSource to `/api/v1/sse/events` with credentials. On `connected`, it stores the clientId and POSTs to subscribe to the target videoId. It tracks status (`pending → transcoding → completed | failed`) and per-resolution progress (e.g., `{ '1080p': 45, '720p': 100, '480p': 100, '360p': 100 }`). On error, it reconnects after 5 seconds. The EventSource is closed on unmount or completion. Returns `{ status, progress }`.
 
 ---
 
-## 📝 7. Error Handling Across Stack (4-5 minutes)
+## 📝 7. Error Handling Across Stack (3-4 minutes)
 
-### Shared Error Types
+"Error codes are shared between frontend and backend to ensure consistent handling. The key categories are: validation (VALIDATION_ERROR, INVALID_INPUT), auth (UNAUTHORIZED, FORBIDDEN, SESSION_EXPIRED), resources (NOT_FOUND, VIDEO_NOT_FOUND), upload-specific (UPLOAD_EXPIRED, FILE_TOO_LARGE, UNSUPPORTED_FORMAT), RATE_LIMITED, and INTERNAL_ERROR."
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    ERROR CODES (SHARED)                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Validation           Auth                  Resources                        │
-│  ┌───────────────┐    ┌───────────────┐    ┌───────────────────┐            │
-│  │VALIDATION_ERR │    │ UNAUTHORIZED  │    │ NOT_FOUND         │            │
-│  │INVALID_INPUT  │    │ FORBIDDEN     │    │ VIDEO_NOT_FOUND   │            │
-│  └───────────────┘    │ SESSION_EXPD  │    │ CHANNEL_NOT_FOUND │            │
-│                       └───────────────┘    └───────────────────┘            │
-│                                                                              │
-│  Upload               Rate Limiting         Server                           │
-│  ┌───────────────┐    ┌───────────────┐    ┌───────────────┐                │
-│  │ UPLOAD_EXPIRED│    │ RATE_LIMITED  │    │ INTERNAL_ERROR│                │
-│  │ UPLOAD_INCMPLT│    └───────────────┘    └───────────────┘                │
-│  │ FILE_TOO_LARGE│                                                          │
-│  │ UNSUPPORTED_FMT│                                                          │
-│  └───────────────┘                                                          │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Backend**: An ApiError base class carries code, message, statusCode, and details. The error middleware catches ZodErrors (→ 400 with field-level issues), ApiErrors (→ appropriate status), and unknown errors (→ 500 with generic message). This ensures the frontend always receives the uniform `{ data, error, meta }` envelope.
 
-### Backend Error Handler
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    ERROR HANDLING MIDDLEWARE                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Error Classes:                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ ApiError (base)     → code, message, statusCode, details            │    │
-│  │ NotFoundError       → extends ApiError, statusCode = 404            │    │
-│  │ ValidationError     → extends ApiError, statusCode = 400            │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  errorHandler Middleware:                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. ZodError → 400:                                                  │    │
-│  │    { error: { code: VALIDATION_ERROR,                               │    │
-│  │               details: { issues: [{ path, message }] } } }          │    │
-│  │                                                                     │    │
-│  │ 2. ApiError → err.statusCode:                                       │    │
-│  │    { error: { code, message, details } }                            │    │
-│  │                                                                     │    │
-│  │ 3. Unknown → 500:                                                   │    │
-│  │    { error: { code: INTERNAL_ERROR,                                 │    │
-│  │               message: 'An unexpected error occurred' } }           │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Frontend Error Handling
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    FRONTEND ERROR HANDLING                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  fetchApi<T>(endpoint, options) → Promise<T>                                 │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. fetch('/api/v1' + endpoint, { credentials: 'include', ... })     │    │
-│  │ 2. Parse response as ApiResponse<T>                                 │    │
-│  │ 3. If error:                                                        │    │
-│  │    - SESSION_EXPIRED → redirect to /login                           │    │
-│  │    - Otherwise → throw ApiError(code, message, details)             │    │
-│  │ 4. Return data                                                      │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  ErrorBoundary Component:                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ - Catches React render errors                                       │    │
-│  │ - Displays fallback UI: error icon, message, refresh button         │    │
-│  │ - getDerivedStateFromError → { hasError: true, error }              │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Frontend**: A `fetchApi<T>` wrapper parses every response as ApiResponse\<T\>. SESSION_EXPIRED triggers a redirect to /login; other errors throw for component-level handling. A React ErrorBoundary catches render errors and shows a fallback UI with a refresh button.
 
 ---
 
 ## ⚖️ 8. Trade-offs and Alternatives (3-4 minutes)
 
-### Shared Package Strategy
+### Chunked Upload vs Direct Upload
 
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| ✅ Monorepo with shared package | Single source of truth | Build complexity | **Chosen** |
-| ❌ Duplicate types | Simple setup | Drift risk | Never |
-| ❌ OpenAPI codegen | Auto-sync | Extra tooling | Good for larger teams |
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Chunked multipart upload | Resumable, progress tracking, handles large files | More complex frontend/backend coordination |
+| ❌ Single PUT upload | Simple implementation | No resume on failure, browser memory issues for large files, no progress granularity |
 
-"I'm choosing a monorepo with a shared package because it ensures type safety across the stack. Both frontend and backend import from the same source, eliminating drift. The build complexity is manageable with modern tooling like turborepo or nx."
+"I'm choosing chunked uploads because a 2GB video file on a flaky mobile connection would fail frequently with a single PUT. With 5MB chunks, a network interruption only loses the current chunk — the frontend can resume from where it left off. The concurrency pool of 3 maximizes throughput without overwhelming the browser's connection limit. The trade-off is coordination complexity: we need Redis to track chunk ETags and an expiry mechanism for abandoned uploads. But for a video platform where upload reliability directly impacts creator retention, this complexity is justified."
 
-### Real-time Updates
+### SSE vs WebSocket for Transcoding Status
 
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| ✅ SSE | Simple, auto-reconnect | Unidirectional | **Chosen for transcoding** |
-| ❌ WebSocket | Bidirectional | More complex | Overkill here |
-| ❌ Polling | Simplest | Wasteful, laggy | Fallback only |
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ SSE | Simple, auto-reconnect, HTTP/2 multiplexing | Unidirectional only |
+| ❌ WebSocket | Bidirectional, lower latency | Connection management complexity, no auto-reconnect |
+| ❌ Polling | Simplest to implement | Wasteful at scale, 500ms average latency |
 
-"I'm choosing SSE for transcoding status updates because it's simpler than WebSocket and provides built-in reconnection. We only need server-to-client communication for status updates. WebSocket would be overkill since the client doesn't need to send real-time data."
+"Transcoding status is a purely server-to-client flow — the worker emits progress, the frontend displays it. SSE is purpose-built for this: the EventSource API handles reconnection automatically, and SSE connections multiplex over HTTP/2 without the separate TCP connection WebSocket requires. The limitation is that SSE is unidirectional, but we don't need the client to send real-time data during transcoding. If we later add live chat or collaborative editing, WebSocket would be the right choice for those features."
+
+### Shared Type Package Strategy
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Monorepo with shared package | Single source of truth, compile-time safety | Build pipeline complexity |
+| ❌ Duplicate types | No build dependency | Drift between frontend and backend |
+| ❌ OpenAPI codegen | Auto-generated from spec | Extra tooling, spec maintenance burden |
+
+"The shared package approach catches integration bugs at compile time rather than runtime. When a backend developer adds a field to the Video type, the frontend immediately sees it. Duplicate types drift silently — we shipped a bug at a previous company where the backend renamed a field but the frontend kept using the old name, and it wasn't caught for two weeks. The build complexity is real but manageable with turborepo's caching."
 
 ### Validation Strategy
 
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| ✅ Zod (shared) | Runtime + types | Bundle size | **Chosen** |
-| ❌ io-ts | Functional | Steeper learning | Good alternative |
-| ❌ Manual validation | No dependencies | Error-prone | Never |
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Zod (shared schemas) | Runtime validation + TypeScript inference from one definition | ~13KB bundle size |
+| ❌ Manual validation | Zero dependencies | Error-prone, no type inference, rules diverge |
 
-"I'm choosing Zod for validation because it provides both TypeScript types and runtime validation from a single schema definition. The schemas can be shared between frontend (form validation) and backend (API validation), ensuring consistent rules across the stack."
+"Zod schemas serve double duty: frontend form validation (showing inline errors before submission) and backend API validation (rejecting malformed requests). A single schema like uploadCompleteSchema enforces title length limits identically in both places. The bundle cost is acceptable — Zod tree-shakes well and the alternative is duplicated validation logic that inevitably drifts."
+
+### View Counting Strategy
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Redis INCR + periodic flush | Fast writes, handles spikes | Slightly stale counts |
+| ❌ Direct PostgreSQL UPDATE | Always accurate | Row-level lock contention on viral videos |
+
+"A viral video might get 10,000 views per second. Direct PostgreSQL UPDATEs would serialize on the row lock, creating a bottleneck that slows down the entire watch experience. Redis INCR is O(1) and atomic — we buffer counts and flush to PostgreSQL every 30 seconds. The trade-off is that view counts lag by up to 30 seconds, but users don't notice a difference between '1,234,567' and '1,234,600' views."
 
 ---
 
-## 📋 9. Summary
+## 📈 9. Scaling Considerations (2-3 minutes)
+
+**What breaks first at scale:**
+
+1. **Upload throughput**: Each upload session holds an S3 multipart in progress. At 10K concurrent uploads, the API servers need enough memory for chunk buffering. Solution: stream chunks directly to S3 without buffering the full chunk in memory, and use a load balancer to distribute across upload service instances.
+
+2. **Transcoding bottleneck**: Transcoding is CPU-intensive. A single worker processes one video at a time across 4 resolutions. Solution: horizontal scaling of transcode workers consuming from RabbitMQ, with prefetch=1 so each worker pulls one job at a time. At YouTube scale, this becomes a distributed job scheduling problem with priority queues (paid creators get faster processing).
+
+3. **SSE connection limits**: Each connected browser holds an open HTTP connection. At 100K concurrent users watching transcoding progress, that's 100K persistent connections on the SSE service. Solution: separate SSE into its own service behind a load balancer with sticky sessions, or switch to Redis Pub/Sub to fan out events across SSE instances.
+
+4. **View count hotspots**: Viral videos concentrate writes on a single Redis key. Solution: sharded counters (INCR on views:{videoId}:{shard}, sum on read) to distribute write load across Redis nodes.
+
+---
+
+## 📋 10. Summary
 
 The YouTube fullstack architecture focuses on:
 

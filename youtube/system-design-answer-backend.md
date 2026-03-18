@@ -8,39 +8,15 @@
 
 ---
 
-## 1. Requirements Clarification (3-4 minutes)
+## 1. 📋 Requirements Clarification (3-4 minutes)
 
 ### Functional Requirements
 
-1. **Video Upload Pipeline**
-   - Chunked upload handling for large files (up to 5GB)
-   - Resumable uploads with S3 multipart
-   - Validation and malware scanning
-   - Queue-based transcoding workflow
-
-2. **Transcoding Service**
-   - Convert to multiple resolutions (1080p, 720p, 480p, 360p)
-   - Generate HLS segments and manifests
-   - Thumbnail generation at multiple timestamps
-   - Status tracking and notifications
-
-3. **Streaming Infrastructure**
-   - HLS manifest generation and delivery
-   - CDN integration for segment caching
-   - Adaptive bitrate support
-   - Resume playback position tracking
-
-4. **Engagement APIs**
-   - Comments with threading (parent/child relationships)
-   - Like/dislike reactions with counter updates
-   - Subscriptions with notification preferences
-   - Watch history for recommendations
-
-5. **Recommendation Engine**
-   - Collaborative filtering based on watch patterns
-   - Content-based filtering using categories/tags
-   - Trending algorithm with time decay
-   - Personalized home feed generation
+1. **Video Upload Pipeline** — Chunked/resumable uploads (up to 5GB) with S3 multipart, validation, and queue-based transcoding
+2. **Transcoding Service** — Multi-resolution encoding (1080p/720p/480p/360p), HLS segment generation, thumbnail extraction
+3. **Streaming Infrastructure** — HLS adaptive bitrate delivery via CDN, playback position tracking
+4. **Engagement APIs** — Threaded comments, like/dislike reactions, subscriptions, watch history
+5. **Recommendation Engine** — Collaborative + content-based filtering, trending with time decay, personalized feeds
 
 ### Non-Functional Requirements
 
@@ -51,56 +27,24 @@
 
 ---
 
-## 2. Scale Estimation (2-3 minutes)
-
-### Storage Requirements
+## 2. 📊 Scale Estimation (2-3 minutes)
 
 ```
-Daily video uploads: 500 hours/min x 60 min x 24 hours = 720,000 hours/day
-Average video duration: 10 minutes
-Daily uploads: 4.3 million videos
+Storage:
+  Daily uploads: 500 hrs/min × 1440 min = 720K hours → 4.3M videos/day
+  Processed per video (all resolutions): ~674 MB → ~2.9 PB/day, ~1 EB/year
 
-Raw storage per video: 1GB average
-Daily raw storage: 4.3 PB
+Bandwidth:
+  1B views/day × 5 min avg × 5 Mbps = 17.4 Tbps continuous
+  CDN cache hit 95% → Origin handles ~870 Gbps
 
-After transcoding (10% compression + multi-resolution):
-- 1080p: 500k bitrate x 10 min = 375 MB
-- 720p: 250k bitrate x 10 min = 187 MB
-- 480p: 100k bitrate x 10 min = 75 MB
-- 360p: 50k bitrate x 10 min = 37 MB
-Total processed per video: ~674 MB average
-
-Daily processed storage: ~2.9 PB
-Annual storage growth: ~1 EB
-```
-
-### Bandwidth Calculations
-
-```
-Daily views: 1 billion
-Average watch duration: 5 minutes
-Average bitrate: 5 Mbps (720p)
-
-Total daily bandwidth: 1B x 5 min x 60s x 5 Mbps
-                     = 1.5 Exabits/day
-                     = 17.4 Tbps continuous
-
-CDN cache hit rate: 95% (popular content)
-Origin bandwidth: 17.4 Tbps x 5% = 870 Gbps
-```
-
-### Database Scale
-
-```
-Video metadata: 1B videos x 10KB = 10 TB
-User accounts: 2B users x 5KB = 10 TB
-Comments: 100B comments x 500 bytes = 50 TB
-Watch history: 500B entries x 100 bytes = 50 TB
+Database:
+  Video metadata: 10 TB | Users: 10 TB | Comments: 50 TB | Watch history: 50 TB
 ```
 
 ---
 
-## 3. High-Level Backend Architecture (8-10 minutes)
+## 3. 🏗️ High-Level Backend Architecture (8-10 minutes)
 
 ```
                                     ┌──────────────────────────────────────────┐
@@ -153,590 +97,260 @@ Watch history: 500B entries x 100 bytes = 50 TB
             └─────────────────┘               └─────────────────┘               └──────────────────┘
 ```
 
-### Service Responsibilities
+### API Design
 
-| Service | Technology | Key Responsibilities |
-|---------|------------|---------------------|
-| Upload Service | Express + Multer | Chunked upload, S3 multipart, validation |
-| Metadata Service | Express | Video/channel CRUD, subscriptions |
-| Streaming Service | Express/Nginx | HLS manifests, segment routing |
-| Comment Service | Express | Threading, reactions, moderation |
-| Recommendation Service | Express + ML | Personalization, trending |
-| Transcode Workers | Node/Python + FFmpeg | Video processing, HLS packaging |
+```
+Upload:
+  POST   /api/v1/upload/init           → Initialize multipart upload session
+  POST   /api/v1/upload/:id/chunk      → Upload a single chunk
+  POST   /api/v1/upload/:id/complete   → Finalize upload, trigger transcoding
+
+Videos:
+  GET    /api/v1/videos/:id            → Video metadata + resolution list
+  GET    /api/v1/videos/:id/stream     → Redirect to master.m3u8 via CDN
+  POST   /api/v1/videos/:id/view       → Record view event
+  GET    /api/v1/videos/trending       → Trending videos (from Redis ZSET)
+
+Engagement:
+  GET    /api/v1/videos/:id/comments   → Paginated comments (cursor-based)
+  POST   /api/v1/videos/:id/comments   → Create comment (or reply with parent_id)
+  POST   /api/v1/videos/:id/reactions  → Like or dislike
+
+Channels:
+  GET    /api/v1/channels/:id          → Channel profile + stats
+  GET    /api/v1/channels/:id/videos   → Channel videos (paginated)
+  POST   /api/v1/channels/:id/subscribe → Toggle subscription
+
+Feed:
+  GET    /api/v1/feed                  → Personalized home feed
+  GET    /api/v1/feed/subscriptions    → Latest from subscribed channels
+```
 
 ---
 
-## 4. Deep Dive: Chunked Upload and Transcoding Pipeline (10-12 minutes)
+## 4. 🔧 Deep Dive: Upload and Transcoding Pipeline (10-12 minutes)
 
 ### Chunked Upload with S3 Multipart
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Upload Flow                                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────┐     ┌─────────────────┐     ┌───────────────────────────┐ │
-│  │   Client    │────▶│ Upload Service  │────▶│ S3 Multipart Upload Init  │ │
-│  └─────────────┘     └─────────────────┘     └───────────────────────────┘ │
-│        │                     │                           │                  │
-│        │                     ▼                           │                  │
-│        │           ┌─────────────────────┐               │                  │
-│        │           │ Create Upload       │               │                  │
-│        │           │ Session in DB       │◀──────────────┘                  │
-│        │           └─────────────────────┘                                  │
-│        │                                                                    │
-│        └─────────────── For each 5MB chunk ──────────────────────────┐     │
-│                              │                                        │     │
-│                              ▼                                        │     │
-│                    ┌─────────────────────┐                            │     │
-│                    │   S3.uploadPart()   │                            │     │
-│                    │   + Store ETag      │                            │     │
-│                    │   in Redis          │                            │     │
-│                    └─────────────────────┘                            │     │
-│                                                                       │     │
-│        ┌──────────────────────────────────────────────────────────────┘     │
-│        │                                                                    │
-│        ▼  On completion:                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  1. Verify all chunks received (compare Redis count to expected)    │   │
-│  │  2. Call S3.completeMultipartUpload() with sorted ETags             │   │
-│  │  3. Create video record with status='processing'                    │   │
-│  │  4. Publish transcode job to message queue                          │   │
-│  │  5. Cleanup Redis keys and update session status                    │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────┐     ┌────────────────┐     ┌──────────────┐
+│  Client  │────▶│ Upload Service │────▶│ S3 Multipart │
+└──────────┘     └────────────────┘     │ Upload Init  │
+     │                  │               └──────┬───────┘
+     │                  ▼                      │
+     │           ┌──────────────┐              │
+     │           │ Create upload│◀─────────────┘
+     │           │ session in DB│
+     │           └──────────────┘
+     │
+     └──── For each 5MB chunk ────▶ S3.uploadPart() + store ETag in Redis
+                                           │
+                                           ▼ On completion:
+                                    1. Verify all chunks (Redis count vs expected)
+                                    2. S3.completeMultipartUpload() with sorted ETags
+                                    3. Create video record (status='processing')
+                                    4. Publish transcode job to message queue
 ```
 
-**Key Upload Implementation Details:**
+> "We use 5MB chunks for optimal parallelism, track ETags in Redis HSET with HINCRBY for the completion counter, and enforce a 5GB limit with MIME type validation. Upload sessions expire after 24 hours. Video IDs are YouTube-style 11-character alphanumeric strings."
 
-- **Chunk size**: 5MB per chunk for optimal parallelism
-- **File validation**: Check MIME type against allowed types, enforce 5GB limit
-- **Session management**: Store upload session in DB with 24-hour expiry
-- **Parallel tracking**: Use Redis HSET for chunk ETags, HINCRBY for completion counter
-- **Atomic completion**: S3 multipart requires sorted parts with ETags for final assembly
-- **Video ID generation**: YouTube-style 11-character alphanumeric ID
+**Why chunked over single-file upload?** A 2GB video upload over a mobile connection takes ~45 minutes. If it fails at 95%, single-file upload means starting over. Chunked upload with S3 multipart lets us resume from the last successful chunk. Each chunk is independently verified (ETag), so we can retry individual failures without re-uploading the entire file. The trade-off is implementation complexity -- we need upload session management, chunk ordering, and completion verification -- but for video files this is non-negotiable.
 
 ### Transcoding Worker Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Transcoding Pipeline                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────────┐                                                       │
-│  │  Message Queue   │ consume job                                           │
-│  │  (Kafka/RMQ)     │────────────────────┐                                  │
-│  └──────────────────┘                    │                                  │
-│                                          ▼                                  │
-│                           ┌──────────────────────────────┐                  │
-│                           │  1. Download raw video from  │                  │
-│                           │     S3 to local temp         │                  │
-│                           └──────────────┬───────────────┘                  │
-│                                          │                                  │
-│                                          ▼                                  │
-│                           ┌──────────────────────────────┐                  │
-│                           │  2. FFprobe: Extract source  │                  │
-│                           │     resolution + duration    │                  │
-│                           └──────────────┬───────────────┘                  │
-│                                          │                                  │
-│                                          ▼                                  │
-│                           ┌──────────────────────────────┐                  │
-│                           │  3. Generate thumbnails at   │                  │
-│                           │     multiple timestamps      │                  │
-│                           └──────────────┬───────────────┘                  │
-│                                          │                                  │
-│                        ┌─────────────────┼─────────────────┐                │
-│                        ▼                 ▼                 ▼                │
-│              ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│              │ Transcode    │  │ Transcode    │  │ Transcode    │           │
-│              │ 1080p        │  │ 720p         │  │ 480p, 360p   │           │
-│              │ (if source   │  │              │  │              │           │
-│              │  supports)   │  │              │  │              │           │
-│              └──────┬───────┘  └──────┬───────┘  └──────┬───────┘           │
-│                     │                 │                 │                   │
-│                     └─────────────────┼─────────────────┘                   │
-│                                       │                                     │
-│                                       ▼                                     │
-│                           ┌──────────────────────────────┐                  │
-│                           │  4. For each resolution:     │                  │
-│                           │     - Segment into HLS .ts   │                  │
-│                           │     - Generate playlist.m3u8 │                  │
-│                           │     - Upload to S3           │                  │
-│                           └──────────────┬───────────────┘                  │
-│                                          │                                  │
-│                                          ▼                                  │
-│                           ┌──────────────────────────────┐                  │
-│                           │  5. Generate master.m3u8     │                  │
-│                           │     (links all qualities)    │                  │
-│                           └──────────────┬───────────────┘                  │
-│                                          │                                  │
-│                                          ▼                                  │
-│                           ┌──────────────────────────────┐                  │
-│                           │  6. Update DB: status=ready  │                  │
-│                           │     Publish video.published  │                  │
-│                           │     event for notifications  │                  │
-│                           └──────────────────────────────┘                  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+Message Queue ──▶ Worker consumes job
+                    │
+                    ▼
+              1. Download raw video from S3 to local temp
+              2. FFprobe: extract source resolution + duration
+              3. Generate thumbnails at multiple timestamps
+                    │
+          ┌─────────┼─────────┐
+          ▼         ▼         ▼
+     Transcode   Transcode  Transcode
+      1080p*      720p     480p/360p
+          │         │         │
+          └─────────┼─────────┘
+                    ▼
+              4. Segment each resolution into 4-second HLS .ts files
+              5. Generate per-resolution playlist.m3u8 + master.m3u8
+              6. Upload all to S3
+              7. Update DB: status='ready', publish video.published event
+
+     * Only if source resolution supports it
 ```
 
-**Resolution Configurations:**
+> "We use libx264 with medium preset, VBR rate control (bufsize = 2x bitrate), AAC audio, and +faststart for progressive download. Each resolution gets its own HLS playlist; the master playlist links them all for adaptive bitrate switching."
 
-| Resolution | Width | Height | Video Bitrate | Audio Bitrate |
-|------------|-------|--------|---------------|---------------|
-| 1080p | 1920 | 1080 | 5000k | 192k |
-| 720p | 1280 | 720 | 2500k | 128k |
-| 480p | 854 | 480 | 1000k | 96k |
-| 360p | 640 | 360 | 500k | 64k |
-
-**FFmpeg Transcoding Parameters:**
-- Codec: libx264 with medium preset
-- Rate control: VBR with maxrate = bitrate, bufsize = 2x bitrate
-- Audio: AAC codec
-- Flags: +faststart for progressive download
-
-**HLS Segment Generation:**
-- Segment duration: 4 seconds
-- Playlist type: VOD (includes all segments)
-- File pattern: segment_0000.ts, segment_0001.ts, etc.
-
-### HLS Manifest Structure
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        HLS Manifest Hierarchy                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  master.m3u8 (Master Playlist)                                      │   │
-│  │  ──────────────────────────────                                     │   │
-│  │  #EXTM3U                                                            │   │
-│  │  #EXT-X-VERSION:3                                                   │   │
-│  │                                                                     │   │
-│  │  #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080           │   │
-│  │  1080p/playlist.m3u8                                                │   │
-│  │                                                                     │   │
-│  │  #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720            │   │
-│  │  720p/playlist.m3u8                                                 │   │
-│  │                                                                     │   │
-│  │  #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=854x480             │   │
-│  │  480p/playlist.m3u8                                                 │   │
-│  │                                                                     │   │
-│  │  #EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360              │   │
-│  │  360p/playlist.m3u8                                                 │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                              │                                              │
-│              ┌───────────────┼───────────────┐                             │
-│              ▼               ▼               ▼                             │
-│  ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐        │
-│  │ 720p/playlist.m3u8│ │ 480p/playlist.m3u8│ │ ...               │        │
-│  │ ──────────────────│ │                   │ │                   │        │
-│  │ #EXTM3U           │ │                   │ │                   │        │
-│  │ #EXT-X-VERSION:3  │ │                   │ │                   │        │
-│  │ #TARGETDURATION:4 │ │                   │ │                   │        │
-│  │ #PLAYLIST-TYPE:VOD│ │                   │ │                   │        │
-│  │                   │ │                   │ │                   │        │
-│  │ #EXTINF:4.000,    │ │                   │ │                   │        │
-│  │ segment_0000.ts   │ │                   │ │                   │        │
-│  │ #EXTINF:4.000,    │ │                   │ │                   │        │
-│  │ segment_0001.ts   │ │                   │ │                   │        │
-│  │ ...               │ │                   │ │                   │        │
-│  │ #EXT-X-ENDLIST    │ │                   │ │                   │        │
-│  └───────────────────┘ └───────────────────┘ └───────────────────┘        │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| Resolution | Dimensions | Video Bitrate | Audio Bitrate |
+|------------|-----------|---------------|---------------|
+| 1080p | 1920x1080 | 5000k | 192k |
+| 720p | 1280x720 | 2500k | 128k |
+| 480p | 854x480 | 1000k | 96k |
+| 360p | 640x360 | 500k | 64k |
 
 ---
 
-## 5. Deep Dive: View Counting and CDN Caching (6-8 minutes)
+## 5. 🔧 Deep Dive: View Counting and CDN Caching (6-8 minutes)
 
 ### Batched View Count Updates
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     View Count Batching Flow                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  User watches video                                                         │
-│        │                                                                    │
-│        ▼                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Redis INCR views:pending:{videoId}                                 │   │
-│  │  (Atomic increment, no DB hit)                                      │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│        │                                                                    │
-│        ├───▶ Optionally store view metadata for analytics                   │
-│        │     (userId, timestamp, quality) in Redis list                     │
-│        │                                                                    │
-│        ▼                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Background Job (every 60 seconds)                                  │   │
-│  │  ─────────────────────────────────                                  │   │
-│  │                                                                     │   │
-│  │  1. SCAN for all views:pending:* keys                               │   │
-│  │  2. For each key:                                                   │   │
-│  │     - GETSET key to 0 (atomically get current and reset)           │   │
-│  │     - If count > 0:                                                 │   │
-│  │       - UPDATE videos SET view_count = view_count + count           │   │
-│  │       - Invalidate video cache                                      │   │
-│  │       - Update trending score                                       │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Trending Score Calculation                                         │   │
-│  │  ─────────────────────────────                                      │   │
-│  │                                                                     │   │
-│  │  Score = viewDelta * decayFactor                                    │   │
-│  │                                                                     │   │
-│  │  decayFactor = 0.5^(ageHours/24)                                    │   │
-│  │  (Score halves every 24 hours)                                      │   │
-│  │                                                                     │   │
-│  │  Store in Redis sorted sets:                                        │   │
-│  │  - ZINCRBY trending:global score videoId                            │   │
-│  │  - ZINCRBY trending:{category} score videoId                        │   │
-│  │  - ZREMRANGEBYRANK trending:global 0 -1001 (keep top 1000)          │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+> "Direct DB writes per view would kill PostgreSQL at 1B views/day. Instead, we buffer in Redis and flush periodically. The trade-off is eventual consistency -- view counts may lag by up to 60 seconds -- but for a vanity metric this is perfectly acceptable."
+
+**Flow:** User watches video --> Redis INCR `views:pending:{videoId}` (atomic, no DB hit) --> optionally store view metadata (userId, timestamp, quality) in a Redis list for analytics.
+
+**Background job (every 60 seconds):** SCAN for all `views:pending:*` keys, GETSET each to 0 (atomically read and reset), batch UPDATE to PostgreSQL, invalidate video cache, and update trending score.
+
+**Trending score:** `score = viewDelta * 0.5^(ageHours/24)` -- score halves every 24 hours. Stored in Redis sorted sets (`ZINCRBY trending:global`, `ZINCRBY trending:{category}`), trimmed to top 1000 with ZREMRANGEBYRANK.
 
 ### Multi-Tier CDN Caching Strategy
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     CDN Caching Architecture                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Edge Tier (Closest to users)                                       │   │
-│  │  ────────────────────────────                                       │   │
-│  │  TTL: 1 hour                                                        │   │
-│  │  Stale-while-revalidate: 5 minutes                                  │   │
-│  │  Cacheable responses: 200, 206 (partial content)                    │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                              │                                              │
-│                              ▼ Cache miss                                   │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Regional Tier (POPs)                                               │   │
-│  │  ────────────────────                                               │   │
-│  │  TTL: 24 hours                                                      │   │
-│  │  Min freshness: 1 hour                                              │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                              │                                              │
-│                              ▼ Cache miss                                   │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Origin Shield (Single cache layer facing origin)                   │   │
-│  │  ─────────────────────────────────────────────────                  │   │
-│  │  Aggregates requests from all regional POPs                         │   │
-│  │  Reduces origin load by 95%                                         │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                              │                                              │
-│                              ▼                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Origin (MinIO/S3)                                                  │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────┐
+│  Edge Tier (closest to user) │  TTL: 1hr, stale-while-revalidate: 5min
+└──────────────┬───────────────┘
+               ▼ cache miss
+┌──────────────────────────────┐
+│  Regional Tier (POPs)        │  TTL: 24hr
+└──────────────┬───────────────┘
+               ▼ cache miss
+┌──────────────────────────────┐
+│  Origin Shield               │  Aggregates requests, reduces origin load 95%
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  Origin (MinIO/S3)           │
+└──────────────────────────────┘
 ```
 
-**Nginx HLS Caching Configuration:**
+| Content Type | Cache Duration | Notes |
+|--------------|----------------|-------|
+| HLS Segments (.ts) | 7 days | Immutable content, long cache |
+| Manifests (.m3u8) | 5 minutes | Short cache, can regenerate |
 
-| Content Type | Cache Path | Cache Duration | Notes |
-|--------------|------------|----------------|-------|
-| HLS Segments (.ts) | /var/cache/nginx/hls | 7 days | Immutable, long cache |
-| Manifests (.m3u8) | /var/cache/nginx/hls | 5 minutes | Short cache, can regenerate |
-
-**Key Caching Features:**
-- Range request support for video seeking
-- Stale-while-revalidate for graceful degradation
-- Cache status header (X-Cache-Status) for debugging
-- Cache key includes URI and query args
-
-**Pre-warming Popular Content:**
-1. Get list of edge POP locations
-2. Prefetch master.m3u8 and quality playlists
-3. Prefetch first 10 segments of each quality (~40 seconds of video)
-4. Issue prefetch requests to all edge locations
+> "We pre-warm popular content by prefetching the master playlist and first 10 segments (~40s of video) to all edge POPs. Range request support enables efficient seeking without downloading the whole segment."
 
 ---
 
-## 6. Deep Dive: Recommendation System (5-6 minutes)
-
-### Hybrid Recommendation Architecture
+## 6. 🔧 Deep Dive: Recommendation System (5-6 minutes)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Recommendation Flow                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  User requests home feed                                                    │
-│        │                                                                    │
-│        ▼                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Parallel Candidate Generation                                      │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│        │                                                                    │
-│        ├──────────────┬──────────────┬──────────────┐                      │
-│        ▼              ▼              ▼              ▼                      │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
-│  │Collabor- │  │Content-  │  │Subscrib- │  │Trending  │                   │
-│  │ative     │  │Based     │  │tion Feed │  │          │                   │
-│  │Filter    │  │Filter    │  │          │  │          │                   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘                   │
-│       │             │             │             │                          │
-│       └─────────────┴─────────────┴─────────────┘                          │
-│                          │                                                  │
-│                          ▼                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Merge & Deduplicate                                                │   │
-│  │  - Build candidate map by videoId                                   │   │
-│  │  - Track which sources contributed each video                       │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                          │                                                  │
-│                          ▼                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Score & Rank                                                       │   │
-│  │  - Apply source weights                                             │   │
-│  │  - Calculate engagement quality                                     │   │
-│  │  - Apply freshness decay                                            │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                          │                                                  │
-│                          ▼                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Return top N videos                                                │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+User requests home feed
+        │
+        ├───────────────┬───────────────┬──────────────┐
+        ▼               ▼               ▼              ▼
+ ┌────────────┐  ┌────────────┐  ┌───────────┐  ┌──────────┐
+ │Collaborative│  │Content-   │  │Subscription│  │Trending  │
+ │  Filter    │  │Based      │  │  Feed     │  │          │
+ └─────┬──────┘  └─────┬──────┘  └─────┬─────┘  └────┬─────┘
+       └────────────────┴──────────────┴──────────────┘
+                        │
+                        ▼
+              Merge & Deduplicate ──▶ Score & Rank ──▶ Return top N
 ```
 
-### Collaborative Filtering
+**Collaborative filtering:** Get user's last 100 watched videos (>50% completion), find similar users with at least 5 overlapping videos, surface videos those users watched that current user hasn't. Score = sum(overlap * watch_percentage).
 
-**Goal:** Find videos watched by users with similar taste
+**Content-based filtering:** Extract category preferences from 30-day watch history weighted by completion. Find unseen videos in preferred categories. Score = category_weight * engagement_ratio (likes/views).
 
-**Algorithm:**
-1. Get current user's last 100 watched videos (with >50% completion)
-2. Find similar users who watched the same videos with high completion
-3. Require at least 5 overlapping videos
-4. Rank by overlap count and average completion
-5. Get videos those similar users watched that current user hasn't
-6. Score by: sum(overlap * watch_percentage) across similar users
+> "We run all four candidate generators in parallel and merge results. This is critical for latency -- collaborative filtering requires joining watch_history across users (expensive), but running it concurrently with the cheaper subscription and trending lookups means total latency equals the slowest generator, not the sum. We cache collaborative filter results per user for 1 hour since taste doesn't change minute-to-minute."
 
-### Content-Based Filtering
+**Final scoring weights:**
 
-**Goal:** Find videos in categories the user prefers
-
-**Algorithm:**
-1. Extract category preferences from last 30 days of watch history
-2. Weight categories by total watch percentage
-3. Find videos in preferred categories user hasn't seen
-4. Score by: category weight match * engagement ratio (likes/views)
-
-### Final Scoring Formula
-
-| Source | Weight |
-|--------|--------|
-| Subscribed channel | +100 |
-| Collaborative filter | +50 |
-| Content-based filter | +30 |
-| Trending | +20 |
-
-**Additional Factors:**
-- Engagement quality: likeCount / (likeCount + dislikeCount + 1) * 40
-- Freshness decay: score *= e^(-ageHours/48) (half-life of 48 hours)
+| Source | Weight | Additional Factors |
+|--------|--------|--------------------|
+| Subscribed channel | +100 | Engagement quality: likes/(likes+dislikes+1) * 40 |
+| Collaborative filter | +50 | Freshness decay: score *= e^(-ageHours/48) |
+| Content-based filter | +30 | (half-life of 48 hours) |
+| Trending | +20 | |
 
 ---
 
-## 7. Database Schema and Indexes (4-5 minutes)
+## 7. 💾 Data Model (4-5 minutes)
 
-### Core Tables
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         PostgreSQL Schema                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  videos                                                              │   │
-│  │  ──────                                                              │   │
-│  │  id VARCHAR(11) PRIMARY KEY       -- YouTube-style 11-char ID       │   │
-│  │  channel_id UUID FK → users                                          │   │
-│  │  title VARCHAR(100)                                                  │   │
-│  │  description TEXT                                                    │   │
-│  │  duration_seconds INTEGER                                            │   │
-│  │  status VARCHAR(20) DEFAULT 'processing'                             │   │
-│  │  visibility VARCHAR(20) DEFAULT 'public'                             │   │
-│  │  view_count BIGINT DEFAULT 0                                         │   │
-│  │  like_count, dislike_count, comment_count BIGINT                     │   │
-│  │  categories TEXT[]                                                   │   │
-│  │  tags TEXT[]                                                         │   │
-│  │  thumbnail_url TEXT                                                  │   │
-│  │  published_at TIMESTAMP                                              │   │
-│  │                                                                     │   │
-│  │  Indexes:                                                           │   │
-│  │  - (channel_id, published_at DESC)          -- Channel videos       │   │
-│  │  - (published_at DESC) WHERE status='ready' -- Public feed          │   │
-│  │  - GIN(categories)                          -- Category search      │   │
-│  │  - GIN(tags)                                -- Tag search           │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  video_resolutions                                                  │   │
-│  │  ─────────────────                                                  │   │
-│  │  video_id VARCHAR(11) FK                                            │   │
-│  │  resolution VARCHAR(10)                                             │   │
-│  │  manifest_url TEXT                                                  │   │
-│  │  bitrate INTEGER                                                    │   │
-│  │  width, height INTEGER                                              │   │
-│  │  PRIMARY KEY (video_id, resolution)                                 │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  comments                                                            │   │
-│  │  ────────                                                            │   │
-│  │  id UUID PRIMARY KEY                                                 │   │
-│  │  video_id VARCHAR(11) FK                                             │   │
-│  │  user_id UUID FK                                                     │   │
-│  │  parent_id UUID FK → comments (nullable, for threading)              │   │
-│  │  text TEXT                                                           │   │
-│  │  like_count INTEGER DEFAULT 0                                        │   │
-│  │  is_edited BOOLEAN DEFAULT FALSE                                     │   │
-│  │                                                                     │   │
-│  │  Indexes:                                                           │   │
-│  │  - (video_id, created_at DESC)              -- Video comments       │   │
-│  │  - (parent_id) WHERE parent_id IS NOT NULL  -- Replies              │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  watch_history                                                      │   │
-│  │  ─────────────                                                      │   │
-│  │  id UUID PRIMARY KEY                                                 │   │
-│  │  user_id UUID FK                                                     │   │
-│  │  video_id VARCHAR(11) FK                                             │   │
-│  │  watch_duration_seconds INTEGER DEFAULT 0                            │   │
-│  │  watch_percentage DECIMAL(5,2)                                       │   │
-│  │  last_position_seconds INTEGER DEFAULT 0                             │   │
-│  │  watched_at TIMESTAMP                                                │   │
-│  │                                                                     │   │
-│  │  Indexes:                                                           │   │
-│  │  - (user_id, watched_at DESC)               -- User history         │   │
-│  │  - (video_id, watch_percentage)             -- Recommendation query │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| Table | Key Columns | Indexes | Notes |
+|-------|-------------|---------|-------|
+| videos | id (VARCHAR 11, PK), channel_id (FK), title, description, duration_seconds, status, visibility, view/like/dislike/comment counts, categories[], tags[], thumbnail_url, published_at | (channel_id, published_at DESC), (published_at DESC) WHERE status='ready', GIN(categories), GIN(tags) | YouTube-style 11-char alphanumeric ID. Denormalized counters for read performance |
+| video_resolutions | video_id (FK), resolution, manifest_url, bitrate, width, height | PK(video_id, resolution) | One row per quality level per video |
+| comments | id (UUID PK), video_id (FK), user_id (FK), parent_id (FK, nullable), text, like_count, is_edited | (video_id, created_at DESC), (parent_id) WHERE NOT NULL | Self-referential FK enables threading |
+| watch_history | id (UUID PK), user_id (FK), video_id (FK), watch_duration_seconds, watch_percentage, last_position_seconds, watched_at | (user_id, watched_at DESC), (video_id, watch_percentage) | Powers recommendations and resume playback |
+| users | id (UUID PK), username (unique), email (unique), display_name, avatar_url, subscriber_count, created_at | (username), (email) | subscriber_count denormalized for channel pages |
+| subscriptions | subscriber_id (FK), channel_id (FK), notify (boolean), created_at | PK(subscriber_id, channel_id), (channel_id) | Drives subscription feed and notification preferences |
+| reactions | id (UUID PK), user_id (FK), video_id (FK), type (like/dislike) | UNIQUE(user_id, video_id) | Upsert pattern for toggle behavior |
 
 ### Redis Data Structures
 
 | Key Pattern | Type | Purpose |
 |-------------|------|---------|
 | views:pending:{videoId} | STRING | Buffered view count (flushed every minute) |
-| trending:global | ZSET | Global trending videos (score = views * decay) |
-| trending:{category} | ZSET | Category-specific trending |
-| session:{sessionId} | HASH | User session (userId, username, role, expiresAt) |
+| trending:global / trending:{category} | ZSET | Trending videos with decay scores |
+| session:{sessionId} | HASH | User session data |
 | video:{videoId} | JSON | Cached video metadata |
-| upload:{uploadId} | HASH | Upload progress (completedChunks, status) |
-| upload:{uploadId}:parts | HASH | Chunk ETags (partNumber: etag) |
+| upload:{uploadId} | HASH | Upload progress tracking |
 | ratelimit:{ip}:{endpoint} | STRING | Rate limit counter with TTL |
 
----
+### Consistency and Idempotency
 
-## 8. Trade-offs and Alternatives (4-5 minutes)
+**Upload idempotency:** Each upload session gets a unique ID. If the client retries a chunk upload, S3 multipart handles deduplication by part number -- re-uploading part 5 simply overwrites the previous part 5. The completion step is idempotent because we check if the video record already exists before creating it.
 
-### Storage Architecture
+**View counting deduplication:** We use a Redis SET `views:seen:{videoId}:{timeWindow}` to track which users have already been counted in the current window. This prevents refresh-spam from inflating counts. The set auto-expires every 5 minutes to bound memory usage.
 
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| S3/MinIO | Scalable, cheap per GB, durable | Latency, needs CDN | **Chosen** - CDN solves latency |
-| Custom distributed FS | Low latency, control | Complex ops, expensive | Avoid unless massive scale |
-| Block storage + NFS | Simple | Not scalable | Local dev only |
+**Comment creation:** Each comment POST includes a client-generated idempotency key stored in Redis with a 5-minute TTL. Duplicate requests return the original comment instead of creating a new one.
 
-### Video Format Strategy
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| HLS only | Wide support, Apple native | Older standard | **Chosen** - best compatibility |
-| DASH only | Open standard, modern | Less iOS support | Good alternative |
-| Both HLS + DASH | Maximum reach | 2x storage | Justified at scale |
-
-### Transcoding Architecture
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| Sync transcoding | Simple | Blocks upload, slow | Never for video |
-| Async with RabbitMQ | Reliable, retries | Single queue bottleneck | **Chosen** for learning |
-| Kafka + workers | Parallel, scalable | More complex | Production at scale |
-| Serverless (Lambda) | Auto-scale | Cold start, duration limits | Good for burst |
-
-### View Count Consistency
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| Sync DB update | Accurate | DB bottleneck at scale | Never |
-| Redis buffer + batch | Fast, scalable | Eventual consistency | **Chosen** |
-| HyperLogLog | Very low memory | Approximate only | For unique views |
+**Reaction toggling:** Likes and dislikes use an upsert pattern -- the reactions table has a unique constraint on (user_id, video_id), so repeated likes are no-ops and toggling between like/dislike is a single UPDATE.
 
 ---
 
-## 9. Monitoring and Observability (3-4 minutes)
+## 8. ⚖️ Trade-offs and Alternatives (4-5 minutes)
 
-### Key Backend Metrics
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Object storage | ✅ S3/MinIO | Custom distributed FS | Scalable, cheap per GB, durable. CDN solves latency. Custom FS only justified at extreme scale |
+| Video format | ✅ HLS only | DASH or both | Best compatibility (Apple native + wide support). Both = 2x storage, justified only at YouTube scale |
+| Transcoding arch | ✅ Async RabbitMQ | Kafka + workers, Serverless | RabbitMQ gives reliable retries. Kafka better at production scale. Lambda has cold start + duration limits |
+| View counting | ✅ Redis buffer + batch | Sync DB update, HyperLogLog | Sync = DB bottleneck at 1B views/day. HLL only approximate. Redis buffer gives speed with eventual consistency |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Prometheus Metrics                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Upload Metrics                                                             │
-│  ──────────────                                                             │
-│  video_uploads_total{status}          Counter    initiated/completed/failed │
-│  video_upload_size_bytes              Histogram  1MB to 5GB buckets         │
-│                                                                             │
-│  Transcoding Metrics                                                        │
-│  ───────────────────                                                        │
-│  transcode_queue_depth                Gauge      Pending jobs               │
-│  transcode_duration_seconds{res,stat} Histogram  1min to 1hour buckets      │
-│                                                                             │
-│  Streaming Metrics                                                          │
-│  ─────────────────                                                          │
-│  video_views_total{quality}           Counter    Views by quality           │
-│  video_watch_duration_seconds         Histogram  Watch time per session     │
-│                                                                             │
-│  Cache Metrics                                                              │
-│  ─────────────                                                              │
-│  cache_hit_ratio{cache_type}          Gauge      Redis cache effectiveness  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+> "The view count trade-off is the most interesting. Synchronous DB updates would mean 11,500 writes/second to a single row during a viral video -- that's a guaranteed hotspot. Redis INCR handles millions of ops/second with O(1) complexity. The 60-second flush delay is invisible to users but reduces DB write pressure by 99%. HyperLogLog was tempting for unique view counts (12KB per counter!) but we need exact counts for creator monetization, so we use it only as a secondary dedup check."
 
-### Alerting Rules
+> "For transcoding, the RabbitMQ vs Kafka decision is nuanced. RabbitMQ gives us per-message acknowledgment and dead-letter queues out of the box -- if a worker crashes mid-transcode, the message returns to the queue automatically. Kafka's consumer groups would let us scale to thousands of workers with partition-based parallelism, but the operational overhead of managing offsets, rebalancing, and exactly-once semantics isn't justified until we're processing millions of videos per day. At our current scale, RabbitMQ with prefetch=1 ensures no worker takes more than it can handle."
+
+---
+
+## 9. 📈 Scalability Path (3-4 minutes)
+
+**What breaks first and how to fix it:**
+
+| Bottleneck | Symptom | Solution |
+|------------|---------|----------|
+| Transcoding queue depth | Upload-to-ready time > 30 min | Add workers horizontally; split into priority queues (partner vs regular) |
+| PostgreSQL write load | View count flush latency spikes | Shard videos table by video_id hash; read replicas for metadata reads |
+| Single Redis instance | Memory > 80%, latency spikes | Redis Cluster with hash slots; separate clusters for cache vs counters vs sessions |
+| CDN cache miss storms | Origin bandwidth spikes on viral content | Pre-warm trending content; origin shield absorbs thundering herd |
+| Comment reads on viral videos | p95 > 500ms for popular videos | Cache top 100 comments per video in Redis; paginate with cursor-based approach |
+
+> "The scaling strategy is to keep services stateless so we can add instances behind the load balancer. The hardest part to scale is the transcoding pipeline because each job is CPU-intensive and takes minutes. We handle this with auto-scaling worker pools keyed to queue depth -- when pending jobs exceed 50, we spin up additional workers. At extreme scale, we'd move to Kubernetes with pod autoscaling based on custom Prometheus metrics."
+
+---
+
+## 10. 📈 Monitoring and Observability (2-3 minutes)
+
+**Key Prometheus metrics:** `video_uploads_total{status}` (counter), `transcode_queue_depth` (gauge), `transcode_duration_seconds{resolution}` (histogram), `video_views_total{quality}` (counter), `cache_hit_ratio{cache_type}` (gauge).
+
+**Critical alerts:**
 
 | Metric | Warning | Critical |
 |--------|---------|----------|
 | Transcode queue depth | > 50 jobs | > 200 jobs |
 | Transcode failure rate | > 5% | > 15% |
 | API p95 latency | > 500ms | > 2s |
-| Upload failure rate | > 2% | > 10% |
 | CDN cache hit ratio | < 90% | < 70% |
-| DB connection pool | > 80% used | > 95% used |
+| DB connection pool usage | > 80% | > 95% |
+
+**Structured logging:** Every request gets a correlation ID propagated through all downstream services. Transcode jobs log each pipeline stage (download, probe, encode, segment, upload) with duration, enabling bottleneck identification.
 
 ---
 
-## 10. Summary
+## 11. 🎯 Summary
 
-The backend architecture for YouTube focuses on:
-
-1. **Chunked Upload Pipeline**: S3 multipart uploads with resumable chunks handle large files reliably while tracking progress in Redis
-
-2. **Async Transcoding**: Kafka/RabbitMQ job queue with FFmpeg workers generates HLS segments for adaptive streaming across multiple resolutions
-
-3. **View Count Batching**: Redis buffers view increments with periodic flushes to PostgreSQL, preventing database bottleneck while maintaining eventual consistency
-
-4. **Multi-Tier CDN**: Edge caching with HLS segment-level granularity, regional POPs, and origin shield reduce origin load to 5% of total bandwidth
-
-5. **Hybrid Recommendations**: Collaborative filtering (similar users), content-based filtering (categories/tags), and trending algorithms combine for personalized feeds
-
-6. **Denormalized Counters**: View, like, and subscriber counts are denormalized for read performance with trigger-based updates maintaining consistency
-
-The system handles 500 hours of video per minute through horizontal scaling of stateless services, massive object storage capacity, and global CDN distribution.
+The architecture handles 500 hours/minute of video upload through: **chunked S3 multipart uploads** with Redis progress tracking, **async FFmpeg transcoding** via message queue workers producing multi-resolution HLS segments, **Redis-buffered view counting** with periodic PostgreSQL flushes, **multi-tier CDN** reducing origin load to 5%, and **hybrid recommendations** combining collaborative filtering, content-based filtering, and trending algorithms. All services are stateless and horizontally scalable.

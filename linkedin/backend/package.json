@@ -12,7 +12,7 @@
     "start": "node dist/index.js",
     "lint": "eslint src",
     "seed": "tsx src/seed.ts",
-    "migrate": "tsx src/migrate.ts",
+    "db:migrate": "tsx src/migrate.ts",
     "format": "prettier --write src/**/*.ts"
   },
   "dependencies": {

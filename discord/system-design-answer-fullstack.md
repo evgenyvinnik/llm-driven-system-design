@@ -337,25 +337,12 @@ Message flow test:
 
 ### Monorepo Structure
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│ discord/                                                                       │
-├───────────────────────────────────────────────────────────────────────────────┤
-│ packages/shared/           # Shared types and validation                       │
-│   types/domain.ts, websocket.ts                                               │
-│   validation/schemas.ts                                                        │
-│   package.json             # @discord-clone/shared                            │
-├───────────────────────────────────────────────────────────────────────────────┤
-│ backend/                   # depends on @discord-clone/shared                  │
-│   src/gateway/, services/, routes/                                            │
-├───────────────────────────────────────────────────────────────────────────────┤
-│ frontend/                  # depends on @discord-clone/shared                  │
-│   src/components/, stores/, hooks/                                            │
-├───────────────────────────────────────────────────────────────────────────────┤
-│ package.json               # workspace root                                    │
-│ turbo.json                 # build orchestration                              │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+| Package | Purpose | Key Contents |
+|---------|---------|-------------|
+| packages/shared (@discord-clone/shared) | Shared types and validation | types/domain, types/websocket, validation/schemas |
+| backend (depends on @discord-clone/shared) | API and WebSocket gateway | gateway, services, routes |
+| frontend (depends on @discord-clone/shared) | React client application | components, stores, hooks |
+| Root workspace | Build orchestration | package.json (workspace config), turbo.json (build pipelines) |
 
 ---
 

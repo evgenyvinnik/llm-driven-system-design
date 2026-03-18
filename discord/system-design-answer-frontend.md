@@ -57,26 +57,13 @@
 
 ### Component Organization
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ routes/                                                                      │
-│   __root.tsx, index.tsx, login.tsx, channels.tsx                            │
-│   channels/@me.tsx, channels/$serverId.$channelId.tsx                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ components/layout/                                                           │
-│   ServerList.tsx, ChannelSidebar.tsx, UserPanel.tsx, MemberList.tsx         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ components/chat/                                                             │
-│   ChannelHeader.tsx, MessageList.tsx, Message.tsx, MessageInput.tsx         │
-│   MessageReactions.tsx, TypingIndicator.tsx                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ stores/                                                                      │
-│   authStore.ts, channelStore.ts, messageStore.ts, presenceStore.ts          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ hooks/                                                                       │
-│   useWebSocket.ts, useMessages.ts, usePresence.ts                           │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| Module | Purpose | Key Files |
+|--------|---------|-----------|
+| routes | Page-level route components (TanStack Router) | __root, index, login, channels, channels/@me, channels/$serverId.$channelId |
+| components/layout | App shell and navigation chrome | ServerList, ChannelSidebar, UserPanel, MemberList |
+| components/chat | Message display and input | ChannelHeader, MessageList, Message, MessageInput, MessageReactions, TypingIndicator |
+| stores | Zustand state slices | authStore, channelStore, messageStore, presenceStore |
+| hooks | Reusable logic for real-time features | useWebSocket, useMessages, usePresence |
 
 ---
 

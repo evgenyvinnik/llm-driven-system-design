@@ -14,7 +14,7 @@
     "dev:worker2": "WORKER_ID=2 tsx watch src/workers/transcode-worker.ts",
     "start": "tsx src/index.ts",
     "start:worker": "tsx src/workers/transcode-worker.ts",
-    "migrate": "tsx migrations/run.ts",
+    "db:migrate": "tsx migrations/run.ts",
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "format": "prettier --write src/**/*.ts",

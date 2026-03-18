@@ -15,7 +15,7 @@
     "start": "NODE_ENV=production tsx src/index.ts",
     "start:worker": "NODE_ENV=production tsx src/workers/analytics-worker.ts",
     "seed": "tsx src/seed.ts",
-    "migrate": "tsx src/migrate.ts",
+    "db:migrate": "tsx src/migrate.ts",
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "format": "prettier --write src/**/*.ts",

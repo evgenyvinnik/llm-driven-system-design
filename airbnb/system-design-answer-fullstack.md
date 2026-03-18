@@ -6,28 +6,22 @@
 
 ## 📋 Problem Statement
 
-Design a property rental marketplace like Airbnb with fullstack integration challenges:
-- End-to-end booking flow from search to confirmation
-- Availability calendar with complex UI interactions and backend consistency
-- Geographic search with map-based UI and PostGIS backend
-- Two-sided review system with hidden-until-both-submit logic
-- Real-time messaging between hosts and guests
+Design a property rental marketplace like Airbnb: end-to-end booking flow, availability calendar with complex UI and backend consistency, geographic search with map + PostGIS, and a two-sided review system.
 
 ---
 
 ## 🎯 Requirements Clarification
 
 ### Functional Requirements
-1. **List** - Hosts create property listings with photos, amenities, pricing
-2. **Search** - Guests find properties by location, dates, and filters
-3. **Book** - Reserve properties with payment processing
-4. **Review** - Two-way rating system after stays
+1. **List** - Hosts create listings with photos, amenities, pricing
+2. **Search** - Find properties by location, dates, filters
+3. **Book** - Reserve with payment; prevent double-booking
+4. **Review** - Two-way hidden-until-both rating system
 5. **Message** - Host-guest communication
 
 ### Non-Functional Requirements
-- **Availability**: 99.9% for search functionality
-- **Consistency**: Strong consistency for bookings (no double-booking)
-- **Latency**: < 200ms for search results
+- **Consistency**: Strong for bookings (no double-booking)
+- **Latency**: < 200ms search, 99.9% availability
 - **Scale**: 10M listings, 1M bookings/day
 
 ---
@@ -76,63 +70,32 @@ The booking flow demonstrates fullstack integration across all layers.
 
 ### Frontend: Booking Widget State Machine
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    BOOKING WIDGET                         │
-├──────────────────────────────────────────────────────────┤
-│  $149 / night                                             │
-│                                                          │
-│  ┌─────────────────────┬─────────────────────┐          │
-│  │  CHECK-IN           │  CHECK-OUT          │          │
-│  │  [Dec 15, 2024]     │  [Dec 20, 2024]     │          │
-│  └─────────────────────┴─────────────────────┘          │
-│                                                          │
-│  GUESTS: [2 guests]                                      │
-│                                                          │
-│  $149 x 5 nights         $745                           │
-│  Cleaning fee            $85                            │
-│  Service fee             $74                            │
-│  ─────────────────────────────                          │
-│  Total                   $904                           │
-│                                                          │
-│  [ Reserve ] or [ Request to Book ]                      │
-└──────────────────────────────────────────────────────────┘
-```
-
-### Widget State Flow
+The widget walks through: INITIAL (no dates) → PRICING (fetch availability) → READY (show breakdown, enable Reserve) → SUBMITTING (POST /api/bookings) → CONFIRMED (redirect to /trips) or ERROR (dates unavailable, re-fetch).
 
 ```
          ┌─────────────┐
          │   INITIAL   │
-         │  (no dates) │
          └──────┬──────┘
-                │ User selects dates
+                │ Select dates
                 ▼
          ┌─────────────┐
-         │   PRICING   │◄─────── Fetch availability
-         │ (calculating)│        from backend
+         │   PRICING   │◄── GET /availability
          └──────┬──────┘
-                │ Dates available
+                │ Available
                 ▼
          ┌─────────────┐
-         │    READY    │  Show price breakdown
-         │ (can book)  │  Enable Reserve button
+         │    READY    │  Price breakdown + Reserve btn
          └──────┬──────┘
                 │ Click Reserve
                 ▼
          ┌─────────────┐
-         │  SUBMITTING │  Show loading spinner
-         │             │  POST /api/bookings
+         │  SUBMITTING │  POST /api/bookings
          └──────┬──────┘
-                │
         ┌───────┴───────┐
-        │               │
-   Success           Conflict
-        │               │
+   Success           Conflict (409)
         ▼               ▼
   ┌──────────┐   ┌──────────┐
-  │ CONFIRMED│   │  ERROR   │ "Dates no longer available"
-  │ Redirect │   │ Refresh  │ Re-fetch availability
+  │ CONFIRMED│   │  ERROR   │ Re-fetch availability
   └──────────┘   └──────────┘
 ```
 
@@ -145,61 +108,24 @@ POST /api/v1/bookings
 ┌─────────────────────┐
 │   BEGIN TRANSACTION │
 └──────────┬──────────┘
-           │
            ▼
 ┌─────────────────────┐
-│ SELECT listing      │  Lock the row to prevent
-│ FOR UPDATE          │  concurrent modifications
+│ SELECT listing      │  Row lock (FOR UPDATE)
+│ Check OVERLAPS      │  Conflict? → ROLLBACK + 409
 └──────────┬──────────┘
-           │
            ▼
 ┌─────────────────────┐
-│ Check for conflicts │  WHERE (start, end)
-│ OVERLAPS query      │  OVERLAPS ($checkIn, $checkOut)
-└──────────┬──────────┘
-           │
-    ┌──────┴──────┐
-    │             │
- No conflicts  Conflicts found
-    │             │
-    ▼             ▼
-┌─────────┐  ┌─────────────┐
-│ Continue│  │ ROLLBACK    │
-└────┬────┘  │ Return 409  │
-     │       └─────────────┘
-     ▼
-┌─────────────────────┐
-│ Calculate pricing   │
-│ nights x rate +     │
-│ cleaning + service  │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ INSERT booking      │
+│ INSERT booking      │  Calculate pricing
 │ INSERT avail_block  │  Mark dates as "booked"
-│ INSERT conversation │  Create messaging thread
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│      COMMIT         │
+│ COMMIT              │
 └──────────┬──────────┘
            │
     ┌──────┴──────┬──────────────┐
-    │             │              │
     ▼             ▼              ▼
 ┌─────────┐ ┌──────────┐ ┌──────────────┐
-│ Publish │ │ Delete   │ │ Return 201   │
-│ event   │ │ cache    │ │ with booking │
-│ RabbitMQ│ │ Redis    │ │ JSON         │
+│ Publish │ │ Invalidate│ │ Return 201   │
+│ RabbitMQ│ │ Redis     │ │ with booking │
 └─────────┘ └──────────┘ └──────────────┘
-     │
-     ▼
-┌─────────────────────┐
-│ Worker sends email  │
-│ and push notif      │
-└─────────────────────┘
 ```
 
 ### Frontend-Backend Integration Points
@@ -243,125 +169,28 @@ POST /api/v1/bookings
 
 ### Search State Flow
 
-```
-                ┌─────────────────┐
-                │  URL Parameters │  Source of truth
-                │  ?lat=34.05     │  for search state
-                │  &lon=-118.24   │
-                │  &checkIn=...   │
-                └────────┬────────┘
-                         │
-         ┌───────────────┼───────────────┐
-         │               │               │
-         ▼               ▼               ▼
-   ┌──────────┐   ┌──────────┐   ┌──────────┐
-   │ SearchBar│   │ Filters  │   │  Map     │
-   │ updates  │   │ update   │   │ bounds   │
-   │ URL      │   │ URL      │   │ update   │
-   └────┬─────┘   └────┬─────┘   └────┬─────┘
-        │              │              │
-        └──────────────┴──────────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │  useEffect on   │
-              │  URL change     │
-              │  triggers fetch │
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │  GET /search    │
-              │  with all params│
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │  Update results │
-              │  and map markers│
-              └─────────────────┘
-```
+URL parameters are the single source of truth (`?lat=34.05&lon=-118.24&checkIn=...`). SearchBar, Filters, and Map all update URL params. A `useEffect` on URL change triggers `GET /search`, which updates both the results list and map markers. This gives us shareable URLs and working browser navigation for free.
 
-### Backend: PostGIS Search Query
+### Backend: PostGIS Search Pipeline
 
 ```
 GET /api/v1/search?lat=34.05&lon=-118.24&radius=25000&checkIn=...
 
-         │
-         ▼
 ┌─────────────────────────────────────────────┐
-│  Step 1: Geographic Filter                  │
-│  ST_DWithin(location, point, radius)        │
-│  Uses GIST spatial index                    │
-│                                             │
-│  Returns: listings within 25km circle       │
-└─────────────────────┬───────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│  Step 2: Basic Filters                      │
-│  - is_active = true                         │
-│  - max_guests >= requested                  │
-│  - price BETWEEN min AND max                │
-│  - property_type IN (selected types)        │
-│  - amenities && (selected amenities)        │
-└─────────────────────┬───────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│  Step 3: Availability Check (if dates)      │
-│  Exclude listings WHERE EXISTS              │
-│    availability_block with status != avail  │
-│    that OVERLAPS with requested dates       │
-└─────────────────────┬───────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│  Step 4: Ranking                            │
-│                                             │
-│  relevance = rating x 0.4 +                 │
-│              log(reviews + 1) x 0.3 +       │
-│              (1 - distance/radius) x 0.3    │
-│                                             │
-│  OR sort by: price, distance, rating        │
-└─────────────────────┬───────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│  Step 5: Pagination + Photos                │
-│  LIMIT 20 OFFSET (page-1)*20                │
-│  Join primary photos for each listing       │
-│  Return with distance in meters             │
+│  1. Geographic: ST_DWithin (GIST index)     │
+│  2. Filters: active, guests, price, type    │
+│  3. Availability: exclude OVERLAPS blocks   │
+│  4. Rank: rating×0.4 + log(reviews)×0.3     │
+│           + (1 - dist/radius)×0.3           │
+│  5. Paginate: LIMIT 20, join primary photos │
 └─────────────────────────────────────────────┘
 ```
 
+The query runs as a single PostgreSQL statement combining all five steps. The GIST spatial index on `listings.location` makes Step 1 fast even at 10M listings. Step 3 uses a `NOT EXISTS` subquery against `availability_blocks` with the OVERLAPS operator to exclude unavailable listings.
+
 ### Map-List Synchronization
 
-```
-User hovers on Result Card
-         │
-         ▼
-┌─────────────────────┐      ┌─────────────────────┐
-│ setHighlighted(id)  │─────▶│ Map: Highlight      │
-│ in search store     │      │ marker with pulse   │
-└─────────────────────┘      └─────────────────────┘
-
-User hovers on Map Marker
-         │
-         ▼
-┌─────────────────────┐      ┌─────────────────────┐
-│ setHighlighted(id)  │─────▶│ Results: Scroll to  │
-│ in search store     │      │ and highlight card  │
-└─────────────────────┘      └─────────────────────┘
-
-User drags map
-         │
-         ▼
-┌─────────────────────┐      ┌─────────────────────┐
-│ Update URL with     │─────▶│ Re-fetch listings   │
-│ new bounds/center   │      │ for new area        │
-└─────────────────────┘      └─────────────────────┘
-```
+Hovering a result card highlights the corresponding map marker (and vice versa) via a shared `highlightedId` in the search store. Dragging the map updates URL bounds, which triggers a re-fetch for the new area.
 
 ---
 
@@ -369,113 +198,47 @@ User drags map
 
 ### Frontend: Guest Calendar Component
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│   <  December 2024  >                                           │
-├─────────────────────────────────────────────────────────────────┤
-│  Sun    Mon    Tue    Wed    Thu    Fri    Sat                  │
-├─────────────────────────────────────────────────────────────────┤
-│   1      2      3      4      5      6      7                   │
-│  gray   gray   gray   gray  [---]  [---]  [---]  <-- past days  │
-├─────────────────────────────────────────────────────────────────┤
-│   8      9     10     11     12     13     14                   │
-│  avail  avail  [===CHECK-IN===]   -----   -----  <-- selected   │
-├─────────────────────────────────────────────────────────────────┤
-│  15     16     17     18     19     20     21                   │
-│ -----  -----  -----  -----  [CHECK-OUT]   XXXX  <-- blocked     │
-├─────────────────────────────────────────────────────────────────┤
-│  22     23     24     25     26     27     28                   │
-│  XXXX   XXXX  avail  avail  avail  avail  avail                 │
-├─────────────────────────────────────────────────────────────────┤
-│  29     30     31                                               │
-│ avail  avail  avail                                             │
-└─────────────────────────────────────────────────────────────────┘
-
-Legend:
-  gray   = Past date (not selectable)
-  avail  = Available (selectable)
-  XXXX   = Blocked/Booked (not selectable, strikethrough)
-  -----  = In selected range (highlighted background)
-  [===]  = Selected start/end (bold, filled)
-```
+Each day cell renders in one of four states: past (gray, disabled), available (selectable), blocked/booked (strikethrough, disabled), or selected range (highlighted). The calendar fetches availability blocks from the backend and maps ranges to individual day states.
 
 ### Calendar Selection State Machine
 
 ```
-                    ┌───────────────────┐
-                    │     IDLE          │
-                    │  No dates selected│
-                    └─────────┬─────────┘
-                              │ Click available date
-                              ▼
-                    ┌───────────────────┐
-                    │  START_SELECTED   │
-                    │  Waiting for end  │
-                    │  date selection   │
-                    └─────────┬─────────┘
-                              │
-            ┌─────────────────┼─────────────────┐
-            │                 │                 │
-      Click before      Click after       Click same
-      start date        start date        date
-            │                 │                 │
-            ▼                 ▼                 ▼
-    ┌───────────┐      ┌────────────┐   ┌───────────┐
-    │ Swap dates│      │ Validate:  │   │ Clear all │
-    │ new start │      │ - Min stay │   │ back to   │
-    │ = clicked │      │ - No blocks│   │ IDLE      │
-    └─────┬─────┘      └──────┬─────┘   └───────────┘
-          │                   │
-          │           ┌───────┴───────┐
-          │           │               │
-          │      Valid range     Invalid
-          │           │               │
-          ▼           ▼               ▼
-    ┌─────────────────────┐    ┌─────────────┐
-    │   RANGE_SELECTED    │    │ Show toast  │
-    │   Both dates set    │    │ error msg   │
-    │   Calculate price   │    │ Stay in     │
-    └─────────────────────┘    │ START state │
-                               └─────────────┘
+         ┌───────────────────┐
+         │       IDLE        │ No dates selected
+         └─────────┬─────────┘
+                   │ Click available date
+                   ▼
+         ┌───────────────────┐
+         │  START_SELECTED   │ Waiting for end date
+         └─────────┬─────────┘
+                   │
+     ┌─────────────┼──────────────┐
+     ▼             ▼              ▼
+ Click before  Click after   Click same
+ start → swap  start → validate  → IDLE
+                   │
+            ┌──────┴──────┐
+         Valid          Invalid
+            ▼              ▼
+   ┌────────────────┐  ┌──────────┐
+   │ RANGE_SELECTED │  │ Toast    │
+   │ Calculate price│  │ error    │
+   └────────────────┘  └──────────┘
 ```
 
 ### Backend: Calendar Update with Split/Merge
 
-When host updates availability, overlapping blocks must be split:
+When a host blocks dates, overlapping availability blocks must be split. Example: host blocks Dec 15-20 within an existing [Dec 1-31, available] block.
 
 ```
-BEFORE: Host has availability block [Dec 1 - Dec 31]
+BEFORE: |============ available =============|
+        Dec 1                            Dec 31
 
-Host blocks [Dec 15 - Dec 20]
-         │
-         ▼
-┌─────────────────────────────────────────────────────────┐
-│  Step 1: Find overlapping blocks                        │
-│  WHERE (start, end) OVERLAPS (Dec 15, Dec 20)           │
-│  Found: [Dec 1 - Dec 31, status=available]              │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Step 2: Split the existing block                       │
-│                                                         │
-│  BEFORE: |=========== available ============|           │
-│          Dec 1                          Dec 31          │
-│                                                         │
-│  INSERT: |=== avail ===|                                │
-│          Dec 1      Dec 14                              │
-│                                                         │
-│  INSERT:                 |==== blocked ====|            │
-│                         Dec 15          Dec 20          │
-│                                                         │
-│  INSERT:                                  |== avail ==| │
-│                                          Dec 21    Dec 31│
-│                                                         │
-│  DELETE: Original [Dec 1 - Dec 31] block                │
-└─────────────────────────────────────────────────────────┘
-
-AFTER: Three separate blocks with correct statuses
+AFTER:  |== avail ==|== blocked ==|== avail ==|
+        Dec 1    Dec 14  Dec 15  Dec 20  Dec 21  Dec 31
 ```
+
+The backend finds overlapping blocks via OVERLAPS, deletes the original, and inserts up to three replacement blocks within a transaction. Redis availability cache is invalidated on commit.
 
 ### Availability Storage Model
 
@@ -493,88 +256,40 @@ AFTER: Three separate blocks with correct statuses
 ### Review Visibility Timeline
 
 ```
-Booking completed (checkout date passes)
+Checkout date passes → 14-day review window opens
          │
+    ┌────┴────┐
+    ▼         ▼
+  Guest     Host
+  submits   submits
+  (hidden)  (hidden)
+    │         │
+    └────┬────┘
          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  14-DAY REVIEW WINDOW OPENS                                     │
-│                                                                 │
-│  ┌───────────────────────┐    ┌───────────────────────┐        │
-│  │  GUEST VIEW           │    │  HOST VIEW            │        │
-│  │  "How was your stay?" │    │  "How was your guest?"│        │
-│  │                       │    │                       │        │
-│  │  [*****] Overall     │    │  [*****] Overall     │        │
-│  │  [*****] Cleanliness │    │                       │        │
-│  │  [*****] Location    │    │  [Write review...]    │        │
-│  │  [*****] Value       │    │                       │        │
-│  │                       │    │                       │        │
-│  │  [Write review...]    │    │                       │        │
-│  │                       │    │                       │        │
-│  │  [Submit Review]      │    │  [Submit Review]      │        │
-│  └───────────────────────┘    └───────────────────────┘        │
-└─────────────────────────────────────────────────────────────────┘
-         │                               │
-         ▼                               ▼
-    Guest submits                   Host submits
-    (is_public=false)               (is_public=false)
-         │                               │
-         └───────────────┬───────────────┘
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │  TRIGGER FIRES      │
-              │  Check if both      │
-              │  reviews exist      │
-              └──────────┬──────────┘
-                         │
-              ┌──────────┴──────────┐
-              │                     │
-         Both exist            Only one
-              │                     │
-              ▼                     ▼
-    ┌─────────────────┐    ┌─────────────────┐
-    │ UPDATE both to  │    │ Wait for other  │
-    │ is_public=true  │    │ party to submit │
-    └─────────────────┘    └─────────────────┘
-              │
-              ▼
-    ┌─────────────────┐
-    │ TRIGGER: Update │
-    │ listing rating  │
-    │ and review_count│
-    └─────────────────┘
+┌─────────────────┐
+│  Both exist?    │
+└────────┬────────┘
+    ┌────┴────┐
+    ▼         ▼
+  Yes        No
+    │         │
+    ▼         ▼
+ Both →    Wait for
+ is_public  other party
+ = true
+    │
+    ▼
+ Update listing
+ rating + count
 ```
 
 ### Database Trigger Logic
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  ON INSERT INTO reviews:                                        │
-│                                                                 │
-│  1. Find other review for same booking                          │
-│     SELECT * FROM reviews                                       │
-│     WHERE booking_id = NEW.booking_id                           │
-│       AND author_type != NEW.author_type                        │
-│                                                                 │
-│  2. If found AND not public yet:                                │
-│     UPDATE reviews SET is_public = true                         │
-│     WHERE booking_id = NEW.booking_id                           │
-│                                                                 │
-│  3. Triggers listing rating update                              │
-└─────────────────────────────────────────────────────────────────┘
+Two PostgreSQL triggers handle this automatically. **ON INSERT into reviews**: check if the other party's review exists for the same booking; if so, set both to `is_public = true`. **ON UPDATE is_public**: if it's a guest review becoming public, recalculate the listing's average rating and review count. Host reviews don't affect listing rating.
 
-┌─────────────────────────────────────────────────────────────────┐
-│  ON UPDATE is_public ON reviews (when becomes true):            │
-│                                                                 │
-│  1. If author_type = 'guest':                                   │
-│     UPDATE listings SET                                         │
-│       rating = (SELECT AVG(rating) FROM guest reviews),         │
-│       review_count = (SELECT COUNT(*) FROM guest reviews)       │
-│     WHERE id = booking.listing_id                               │
-│                                                                 │
-│  (Host reviews don't affect listing rating)                     │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Frontend Review States
+
+The review UI shows different states per booking: "Write Review" (window open, not submitted), "Waiting for other party" (submitted but hidden), "Published" (both submitted). The 14-day window countdown is displayed to create urgency. Guest reviews include sub-ratings (cleanliness, location, value) while host reviews are overall-only.
 
 ### Why Hidden-Until-Both?
 
@@ -587,173 +302,27 @@ Booking completed (checkout date passes)
 
 ---
 
-## 🏠 Deep Dive 5: Host Dashboard Calendar
+## 🗄️ State Management & API Layer
 
-### Host Calendar Interface
+| Store | Purpose |
+|-------|---------|
+| Auth (Zustand) | User session, login/logout |
+| Search (URL params) | Location, dates, guests, filters — URL is source of truth |
+| Booking (local state) | Selected dates, guests, availability, submission state |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Manage Availability - Beach House                               │
-├─────────────────────────────────────────────────────────────────┤
-│  [3 dates selected]  Action: [Block]  Price: [$ ___]  [Apply]   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   <  December 2024  >                                           │
-│                                                                 │
-│  Sun    Mon    Tue    Wed    Thu    Fri    Sat                  │
-│                                                                 │
-│   1      2      3      4      5      6      7                   │
-│ [$89]  [$89]  [$89]  [$89]  [$89]  [$119] [$119]  <-- weekend   │
-│ [x]    [x]    [x]    [ ]    [ ]    [ ]    [ ]      pricing     │
-│                                                                 │
-│   8      9     10     11     12     13     14                   │
-│ [===]  [===]  [===]  [===]  [===]  [$89]  [$89]   <-- booked    │
-│ "John" ─────────────────────────                  (cannot edit) │
-│                                                                 │
-│  15     16     17     18     19     20     21                   │
-│ XXXX   XXXX   XXXX   [$89]  [$89]  [$89]  [$149]  <-- blocked   │
-│ (host blocked)                                     (custom $)   │
-│                                                                 │
-│  22     23     24     25     26     27     28                   │
-│ [$149] [$149] [$199] [$199] [$199] [$149] [$149]  <-- holiday   │
-│                 Christmas pricing                               │
-└─────────────────────────────────────────────────────────────────┘
-
-Legend:
-  [$XX]  = Available at price (selectable for bulk edit)
-  [===]  = Booked (shows guest name, not selectable)
-  XXXX   = Blocked by host (selectable to unblock)
-  [x]    = Selected for bulk action
-```
-
-### Bulk Action Flow
-
-```
-Host selects multiple dates
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│  Group consecutive dates into ranges    │
-│                                         │
-│  Selected: [1, 2, 3, 5, 6]              │
-│  Grouped:  [1-3], [5-6]                 │
-└──────────────────┬──────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────┐
-│  For each range:                        │
-│  PUT /listings/:id/calendar             │
-│  {                                      │
-│    startDate: range.start,              │
-│    endDate: range.end,                  │
-│    status: "blocked" | "available",     │
-│    pricePerNight: customPrice           │
-│  }                                      │
-└──────────────────┬──────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────┐
-│  Backend: Split/merge logic             │
-│  Redis: Invalidate availability cache   │
-│  Response: Success                      │
-└──────────────────┬──────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────┐
-│  Frontend: Re-fetch availability        │
-│  Clear selection                        │
-│  Show success toast                     │
-└─────────────────────────────────────────┘
-```
-
----
-
-## 🗄️ State Management Architecture
-
-### Store Structure
-
-| Store | State | Actions |
-|-------|-------|---------|
-| Auth | user, isLoading | login(), logout(), checkAuth() |
-| Search | location, coords, dateRange, guests, filters | setLocation(), setDateRange(), setFilters(), clear() |
-| Booking (local) | selectedDates, guests, availability, isSubmitting | - |
-
-### Data Flow: URL as Source of Truth
-
-```
-User types ──▶ Debounce 300ms ──▶ Geocode ──▶ setSearchParams()
-                                                    │
-                                                    ▼
-Update UI (Results + Map) ◀── Fetch listings ◀── useEffect on URL
-
-Benefits: Shareable URLs, browser navigation works, single source of truth
-```
-
----
-
-## 🔌 API Client Architecture
-
-### Request/Response Pattern
-
-```
-api.createBooking(data)
-        │
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│  fetch(BASE_URL + '/bookings', {                        │
-│    method: 'POST',                                      │
-│    credentials: 'include',  ◀── Sends session cookie    │
-│    headers: { 'Content-Type': 'application/json' },     │
-│    body: JSON.stringify(data)                           │
-│  })                                                     │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-          ┌─────────────────┴────────────────┐
-          │                                  │
-     response.ok                       !response.ok
-          │                                  │
-          ▼                                  ▼
-    return json()                     throw ApiError
-    Promise<T>                        { status, code, message }
-```
-
-### Error Handling by Code
-
-| Error Code | Frontend Action |
-|------------|-----------------|
-| DATES_UNAVAILABLE | Re-fetch availability, show toast, keep user on page |
-| UNAUTHORIZED | Redirect to /login with return URL |
-| Other errors | Show generic toast, log to error tracking |
+All API calls use `fetch` with `credentials: 'include'` (session cookies). Errors return typed codes: `DATES_UNAVAILABLE` triggers re-fetch + toast, `UNAUTHORIZED` redirects to `/login` with return URL.
 
 ---
 
 ## 💾 Caching Strategy
 
-### Multi-Layer Cache
+Three-layer cache: React Query (browser, staleTime-based) → Redis/Valkey (server, TTL-based) → PostgreSQL (source of truth).
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 1: React Query (Browser)                              │
-│  - queryKey: ['listing', id]  staleTime: 15 min             │
-│  - On mutation: invalidateQueries(['availability'])          │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 2: Redis/Valkey                                       │
-│  - listing:123 (15 min), availability:123 (1 min)           │
-│  - On booking: DEL availability:listingId                    │
-├──────────────────────────────────────────────────────────────┤
-│  Layer 3: PostgreSQL                                         │
-│  - Source of truth, populates caches on read                │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### TTL Strategy by Data Type
-
-| Data Type | Redis TTL | React Query staleTime | Invalidation Events |
-|-----------|-----------|----------------------|---------------------|
+| Data Type | Redis TTL | React Query staleTime | Invalidation |
+|-----------|-----------|----------------------|--------------|
 | Listing details | 15 min | 15 min | Review published, listing updated |
-| Availability | 1 min | 30 sec | Booking created, host calendar update |
+| Availability | 1 min | 30 sec | Booking created, calendar update |
 | Search results | 5 min | 5 min | None (acceptable staleness) |
-| User session | 24 hours | - | Logout |
 
 ---
 
@@ -772,13 +341,19 @@ api.createBooking(data)
 
 ---
 
-## 🚀 Future Fullstack Enhancements
+## 📈 Scalability Path
+
+**What breaks first**: Search queries at scale. PostGIS works well up to ~50M listings, but beyond that we'd add Elasticsearch as a read-optimized search index synced from PostgreSQL via CDC. The booking path scales well because it's a single-row lock per listing — contention only occurs on extremely popular listings.
+
+**Read replicas**: Route all search and listing detail reads to replicas. Bookings stay on primary for strong consistency. Session reads go to Redis (already separated).
+
+**Sharding strategy**: Shard listings by geographic region (continent/country). Most searches are geographically bounded, so cross-shard queries are rare. Bookings reference listing IDs and stay co-located with the listing shard.
+
+---
+
+## 🚀 Future Enhancements
 
 1. **Real-time updates** - WebSocket for booking confirmations and messages
-2. **Optimistic UI** - Show booking success immediately, handle conflicts gracefully
-3. **Map clustering** - Frontend clustering for dense listing areas
-4. **Smart pricing** - ML-based suggestions with host override UI
-5. **Image optimization** - CDN with responsive srcset
-6. **Offline support** - Service worker for cached listings
-7. **A/B testing** - Feature flags for search ranking experiments
-8. **Analytics dashboard** - Host metrics with charts
+2. **Map clustering** - Frontend clustering for dense listing areas
+3. **Smart pricing** - ML-based suggestions with host override UI
+4. **Image optimization** - CDN with responsive srcset

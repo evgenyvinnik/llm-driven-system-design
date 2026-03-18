@@ -13,7 +13,7 @@
     "dev:worker:webhook": "tsx watch src/workers/webhook-worker.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "migrate": "tsx src/db/migrate.ts",
+    "db:migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",
     "lint": "eslint src",
     "type-check": "tsc --noEmit",

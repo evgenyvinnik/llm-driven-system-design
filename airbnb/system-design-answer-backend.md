@@ -203,16 +203,7 @@ Step 4: Rank and Paginate
         └───────────────────────────────────────┘
 ```
 
-### Search Ranking Factors
-
-| Factor | Weight | Rationale |
-|--------|--------|-----------|
-| Distance to search center | High | Relevance to location |
-| Rating (average stars) | Medium | Quality signal |
-| Review count | Medium | Social proof |
-| Price match to budget | Medium | Affordability |
-| Host response rate | Low | Service quality |
-| Instant book enabled | Bonus | Conversion optimization |
+Results are ranked by a weighted score combining distance to search center (highest weight), rating and review count (quality signal), price match to budget, and instant-book availability (conversion bonus).
 
 ### Geo Search Alternatives
 
@@ -260,32 +251,7 @@ User B ─┼─▶ BEGIN TRANSACTION
         │   ROLLBACK with "Dates no longer available" error
 ```
 
-### Booking Creation Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Booking Service                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. BEGIN TRANSACTION                                            │
-│     │                                                            │
-│  2. SELECT * FROM listings WHERE id = ? FOR UPDATE               │
-│     │  (Acquire exclusive row lock)                              │
-│     │                                                            │
-│  3. Check availability_blocks for conflicts                      │
-│     │  WHERE status = 'booked'                                   │
-│     │  AND (start_date, end_date) OVERLAPS (check_in, check_out) │
-│     │                                                            │
-│  4. IF conflicts exist → ROLLBACK with error                     │
-│     │                                                            │
-│  5. INSERT INTO bookings (listing_id, guest_id, dates, status)   │
-│     │                                                            │
-│  6. INSERT INTO availability_blocks (listing_id, dates, 'booked')│
-│     │                                                            │
-│  7. COMMIT                                                       │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Within the transaction: (1) BEGIN, (2) SELECT listing FOR UPDATE to acquire the row lock, (3) check availability_blocks for overlapping booked ranges, (4) ROLLBACK if conflicts exist, (5) INSERT booking, (6) INSERT availability_block as 'booked', (7) COMMIT.
 
 ### Instant Book vs Request to Book
 
@@ -367,232 +333,36 @@ Day 8: Host submits review (rating: 5 stars)
            - Update listing.rating and listing.review_count
 ```
 
-### Database Triggers
-
-```
-Trigger 1: check_and_publish_reviews
-├── Fires: AFTER INSERT on reviews
-├── Logic: IF COUNT(DISTINCT author_type) = 2 for booking
-│          THEN SET is_public = TRUE for both reviews
-└── Purpose: Atomically reveal both reviews together
-
-Trigger 2: update_listing_rating
-├── Fires: AFTER UPDATE of is_public on reviews
-├── Logic: IF is_public = TRUE AND author_type = 'guest'
-│          THEN recalculate listing.rating as AVG(all public guest ratings)
-│          AND update listing.review_count
-└── Purpose: Keep denormalized rating accurate
-```
-
-### Review Window Rules
-
-| Rule | Duration | Action |
-|------|----------|--------|
-| Review window opens | Checkout date | Both can submit |
-| Review window closes | 14 days after checkout | No more reviews allowed |
-| Public visibility | When both submit OR window closes | Whichever comes first |
-| Rating counts | Only public guest reviews | Host rating separate |
+Two database triggers handle atomicity: (1) after each review insert, check if both author types exist for the booking — if so, set `is_public = TRUE` for both; (2) after a review becomes public, recalculate the listing's denormalized average rating and review count. The review window opens at checkout and closes after 14 days. Reviews become public when both parties submit or the window closes, whichever comes first.
 
 ---
 
-## 💾 Deep Dive: Caching Strategy
+## 📦 Caching and Async Processing
 
-### Cache Architecture
+### Caching Strategy
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CDN (CloudFront)                         │
-│     Static assets, listing images, search result pages          │
-│     TTL: 1 hour for images, 5 min for search pages              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       Valkey/Redis Cluster                       │
-│     Session cache, listing details, availability snapshots      │
-│     TTL: 15 min listing, 1 min availability, 24h sessions       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   PostgreSQL + PostGIS                           │
-│                 Source of truth for all data                     │
-└─────────────────────────────────────────────────────────────────┘
-```
+Three-tier cache: CDN (images, static assets), Valkey/Redis (listing details, availability, sessions), PostgreSQL as source of truth. We use cache-aside: check Valkey first, fall back to DB, populate cache on miss.
 
-### Cache-Aside Pattern
-
-```
-Get Listing Details:
-
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│   Client    │────▶│ Listing API  │────▶│   Valkey    │
-└─────────────┘     └──────────────┘     └─────────────┘
-                           │                    │
-                           │  Cache hit? ◀──────┤
-                           │      │             │
-                    Yes ◀──┤      │ No          │
-                           │      │             │
-                           │      ▼             │
-                           │ ┌─────────────┐    │
-                           │ │ PostgreSQL  │    │
-                           │ └─────────────┘    │
-                           │      │             │
-                           │      │ Set cache ──▶
-                           │      │ (TTL: 15min)│
-                           │      │             │
-                           ▼      ▼             │
-                    Return listing data         │
-```
-
-### Cache Invalidation Strategy
-
-```
-On Listing Update:
-├── Delete listing:{id} from cache
-├── Compute geohash of listing location (4-char precision)
-└── Delete search:{geohash}:* keys (invalidate nearby search results)
-
-On Booking Created:
-├── Delete availability:{listing_id} from cache
-└── Publish booking:created event (notify other services)
-```
-
-### TTL Strategy by Data Type
+**Cache invalidation:** On listing update, delete `listing:{id}` and nearby search result keys (keyed by geohash). On booking, delete `availability:{listing_id}` and publish event.
 
 | Data Type | TTL | Rationale |
 |-----------|-----|-----------|
-| Listing details | 15 min | Property details change infrequently |
+| Listing details | 15 min | Changes infrequently |
 | Availability | 1 min | Must be fresh to prevent conflicts |
-| Search results | 5 min | Slightly stale is acceptable |
+| Search results | 5 min | Slightly stale acceptable |
 | User sessions | 24 hours | Long-lived authentication |
-| Rate limit counters | 1 min | Fraud detection windows |
 
----
+### Async Events via RabbitMQ
 
-## 📨 Deep Dive: Async Processing with RabbitMQ
+Non-critical work (notifications, search reindexing, analytics) is handled asynchronously through a topic exchange with routing keys like `booking.created`, `listing.updated`, `review.submitted`. Dedicated workers consume each queue.
 
-### Queue Architecture
+Each message carries a unique `eventId`. Workers implement idempotent consumption: check Redis for `processed:{eventId}` before processing, set it with 7-day TTL after success. Failed messages retry up to 3 times before routing to a dead-letter queue for manual investigation.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       API Services                               │
-│            Listing / Booking / Search / Review                   │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     RabbitMQ Exchange                            │
-│                    (Topic Exchange)                              │
-├─────────────────┬─────────────────┬─────────────────────────────┤
-│ booking.created │ listing.updated │ notification.send            │
-│ booking.cancel  │ review.submitted│ search.reindex               │
-└─────────────────┴─────────────────┴─────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Notification  │    │ Search Index  │    │  Analytics    │
-│   Worker      │    │   Worker      │    │   Worker      │
-└───────────────┘    └───────────────┘    └───────────────┘
-```
+## 📊 Observability
 
-### Event Message Structure
+Key SLIs: search availability (99.9% target), search p95 latency (<200ms), booking p95 confirmation (<1s), and double-booking rate (must be 0%). We track `http_request_duration_seconds`, `bookings_total`, `search_latency_seconds`, and `cache_hit_ratio` via Prometheus histograms and counters.
 
-```
-{
-  eventId: "uuid-12345",
-  eventType: "booking.created",
-  timestamp: "2025-06-15T10:30:00Z",
-  data: {
-    bookingId: 789,
-    listingId: 42,
-    guestId: 101,
-    checkIn: "2025-07-01",
-    checkOut: "2025-07-05"
-  }
-}
-```
-
-### Idempotent Consumer Pattern
-
-```
-Worker receives message:
-
-1. Extract eventId from message
-        │
-2. Check Redis: processed:{eventId} exists?
-        │
-   ┌────┴────┐
-   │         │
-  Yes       No
-   │         │
-   ▼         ▼
- ACK msg   Process message
-(skip)          │
-                ▼
-           Set Redis key: processed:{eventId} = 1
-           (TTL: 7 days)
-                │
-                ▼
-           ACK message
-```
-
-### Retry and Dead Letter Queue
-
-```
-Message Processing:
-
-Attempt 1 → Fails → Increment retry count in header
-                    │
-Attempt 2 → Fails → Increment retry count
-                    │
-Attempt 3 → Fails → Retry count = 3 (max reached)
-                    │
-                    ▼
-           Route to Dead Letter Queue (DLQ)
-           For manual investigation
-```
-
----
-
-## 📊 Deep Dive: Observability
-
-### Key Metrics
-
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| http_request_duration_seconds | Histogram | method, route, status | Latency SLI |
-| bookings_total | Counter | status, instant_book | Business metric |
-| search_latency_seconds | Histogram | has_dates, has_guests | Search SLI |
-| cache_hit_ratio | Gauge | cache_type | Cache efficiency |
-
-### SLI/SLO Definitions
-
-| SLI | Definition | SLO Target | Alert Threshold |
-|-----|------------|------------|-----------------|
-| Availability | Successful requests / Total | 99.9% | < 99.5% for 5 min |
-| Search Latency | p95 response time | < 200ms | > 500ms for 5 min |
-| Booking Latency | p95 confirmation time | < 1s | > 2s for 5 min |
-| Double-Booking Rate | Conflicting bookings / Total | 0% | > 0 in 1 hour |
-| Cache Hit Rate | Cache hits / Total requests | > 80% | < 60% for 15 min |
-
-### Distributed Tracing Flow
-
-```
-Create Booking Request:
-
-[API Gateway] ──span──▶ [Booking Service] ──span──▶ [PostgreSQL]
-      │                        │
-      │                        └──span──▶ [Valkey Cache]
-      │
-      └──span──▶ [Notification Worker] ──span──▶ [Email Service]
-
-Each span captures:
-- Operation name (createBooking, db.query, cache.set)
-- Duration
-- Attributes (booking_id, listing_id, guest_id)
-- Status (success/error)
-```
+Distributed tracing (OpenTelemetry) spans each booking request from API Gateway through Booking Service to PostgreSQL and Valkey, with async spans into notification workers. Each span captures operation name, duration, entity IDs, and status.
 
 ---
 
@@ -612,11 +382,4 @@ Each span captures:
 
 ## 🚀 Future Enhancements
 
-| Enhancement | Benefit |
-|-------------|---------|
-| Elasticsearch integration | Full-text search on descriptions |
-| Dynamic pricing | ML-based demand-responsive pricing |
-| Multi-region deployment | Read replicas with geo-routing |
-| Kafka for events | Higher throughput event streaming |
-| Payment integration | Stripe/Adyen with PCI compliance |
-| Fraud detection | ML model for suspicious patterns |
+Key next steps: Elasticsearch for full-text search on listing descriptions, ML-based dynamic pricing, multi-region deployment with read replicas and geo-routing, Kafka migration for higher-throughput event streaming, and Stripe/Adyen payment integration with PCI compliance.

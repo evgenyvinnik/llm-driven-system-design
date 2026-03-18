@@ -10,7 +10,7 @@
     "dev:server2": "PORT=3002 npm run dev",
     "dev:server3": "PORT=3003 npm run dev",
     "start": "NODE_ENV=production tsx src/index.ts",
-    "db:init": "tsx src/db/migrate.ts",
+    "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "format": "prettier --write src/**/*.ts",
     "lint": "eslint src/**/*.ts"

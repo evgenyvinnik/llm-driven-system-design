@@ -13,7 +13,7 @@
     "db:rollback": "tsx src/db/migrate.ts rollback",
     "db:status": "tsx src/db/migrate.ts status",
     "db:create-migration": "tsx src/db/migrate.ts create",
-    "migrate": "tsx src/migrate.ts",
+    "db:migrate": "tsx src/migrate.ts",
     "seed": "tsx src/seed.ts",
     "type-check": "tsc --noEmit",
     "format": "prettier --write src/**/*.ts",
