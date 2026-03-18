@@ -541,6 +541,173 @@ The circuit breaker (cockatiel library) protects against cascading failures when
 | Input validation | Zod schemas | Manual validation | Type-safe, composable, auto-documentation |
 | Circuit breaker | Cockatiel | Opossum | Composable policies (retry + timeout + breaker) |
 
+## Frontend Architecture
+
+### Routing (TanStack Router, File-Based)
+
+```
+frontend/src/routes/
+├── __root.tsx      → Root layout (Header + auth check on mount)
+├── index.tsx       → / (search page with SearchBar, SearchFilters, SearchResults)
+├── login.tsx       → /login (username + password form)
+├── register.tsx    → /register (registration form)
+└── admin.tsx       → /admin (admin dashboard with tabs, role-gated)
+```
+
+The root component checks authentication on mount via `checkAuth()` and renders a loading spinner until the session is validated. The `Header` component is always visible and includes navigation links and a logout button. No route guards are implemented at the router level -- the admin page checks `user.role === 'admin'` and redirects to login if unauthorized.
+
+### Component Hierarchy
+
+```
+RootComponent (__root.tsx)
+├── Header                     (nav bar with logo, links, user menu)
+└── Outlet
+    ├── IndexPage (/)
+    │   ├── SearchBar           (input with typeahead suggestions dropdown)
+    │   ├── SearchFilters       (date range, post type, visibility dropdowns)
+    │   └── SearchResults       (result list with pagination)
+    │       └── SearchResultCard (single result with highlights, hashtags, metadata)
+    │
+    ├── LoginPage (/login)
+    ├── RegisterPage (/register)
+    │
+    └── AdminPage (/admin)
+        ├── HealthStatusBar     (PostgreSQL/ES/Redis status + reindex button)
+        ├── AdminTabs           (overview, users, posts, searches tab navigation)
+        ├── OverviewTab         (stat cards: users, posts, index size)
+        │   └── StatCard        (single metric with label and value)
+        ├── UsersTable          (paginated user list)
+        ├── PostsTable          (paginated post list)
+        └── SearchHistoryTable  (search query log with user and timestamp)
+```
+
+### Zustand Stores
+
+**`authStore`** -- Manages authentication state:
+
+| State | Purpose |
+|-------|---------|
+| `user` | Currently authenticated user object (or null) |
+| `isLoading` | True during auth checks (blocks UI rendering) |
+| `isAuthenticated` | Derived from user presence |
+| `error` | Last authentication error message |
+
+Actions: `login()`, `register()`, `logout()`, `checkAuth()`, `clearError()`. The auth token is persisted to `localStorage` by the API client and sent as a `Bearer` token in the `Authorization` header on all requests.
+
+**`searchStore`** -- Manages search state and interactions:
+
+| State | Purpose |
+|-------|---------|
+| `query` | Current search query text |
+| `filters` | Active filter criteria (date range, post type, visibility) |
+| `results` | Array of search result objects |
+| `suggestions` | Typeahead suggestions from Elasticsearch |
+| `trending` | Popular search queries from Redis sorted set |
+| `recentSearches` | User's personal search history |
+| `totalResults` | Estimated total match count |
+| `nextCursor` | Pagination cursor for "load more" |
+| `searchTime` | Server-reported query duration in ms |
+
+Actions: `search()`, `loadMore()`, `fetchSuggestions()`, `fetchTrending()`, `fetchRecentSearches()`, `clearResults()`, `clearSuggestions()`. Search and loadMore call the API client and merge results. Suggestions are fetched on every keystroke (debounced by the component, not the store).
+
+### Data Fetching
+
+**API Client (`services/api.ts`):** A singleton `ApiClient` class encapsulates all HTTP communication. It manages the auth token lifecycle (set on login/register, stored in localStorage, cleared on logout) and automatically injects the `Authorization` header into every request. All methods return typed promises. The class groups endpoints into categories: auth (login, register, logout, getCurrentUser), search (search, getSuggestions, getTrending, getRecentSearches), posts (createPost, getFeed, likePost, deletePost), and admin (getAdminStats, getAdminUsers, getAdminPosts, getAdminSearchHistory, reindexPosts, getAdminHealth).
+
+**Search flow:** When the user types in `SearchBar`, each keystroke triggers `fetchSuggestions()` via the search store, which calls `api.getSuggestions()`. On Enter or suggestion click, `search()` calls `api.search()` with the query, filters, and pagination cursor. Results are stored in the search store and rendered by `SearchResults`. The "load more" button calls `loadMore()`, which appends new results to the existing array.
+
+**Admin lazy loading:** The admin page loads stats and health on mount via `Promise.all`. Tab-specific data (users, posts, search history) is loaded lazily on first tab selection and cached in local state.
+
+### Key UI Patterns
+
+- **Typeahead suggestions:** `SearchBar` renders a dropdown that shows three types of content depending on context. When the user has typed 2+ characters, it shows API-sourced suggestions (hashtags, users, queries). When the input is empty or has fewer than 2 characters, it shows recent searches (personal history) and trending searches (platform-wide). Each suggestion type gets a distinct icon (Hash, User, Search, Clock, TrendingUp from lucide-react). Click-outside detection closes the dropdown.
+
+- **Cursor-based pagination:** Search results use cursor-based pagination rather than page numbers. The server returns a `next_cursor` value with each response. The `loadMore` action passes this cursor to the next API call, appending results to the existing array. This approach handles new posts being indexed between page loads without causing duplicate or missing results.
+
+- **Admin role gating:** The admin page checks `user.role === 'admin'` on mount and redirects to login if the check fails. This is a UI-level guard only; the backend enforces authorization independently via RBAC middleware.
+
+- **Health status visualization:** The `HealthStatusBar` component shows colored indicators for PostgreSQL, Elasticsearch, and Redis connectivity. The reindex button triggers a full re-indexing of all posts to Elasticsearch and displays the count of indexed documents on completion.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation describes what the pattern is, why it exists, and how it works -- assuming no prior knowledge.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is an authorization model where permissions are assigned to roles rather than to individual users. Each user is assigned a role, and the role determines what actions they can perform. This simplifies permission management: instead of configuring permissions for each of millions of users, you define permissions for a small number of roles and assign users to roles.
+
+**Why it matters:** A search system needs different access levels. Regular users can search and create posts. Admins need to view all users, inspect search history for abuse detection, trigger reindexing when the search index drifts, and view system health. Without RBAC, permission checks become scattered conditional statements that are error-prone and difficult to audit.
+
+**How it works here:** Two roles are defined: `user` (search, create/edit/delete own posts, manage friendships) and `admin` (all user permissions plus view all users/posts, system stats, trigger reindex, view search history). The role is stored in the `users.role` column with a CHECK constraint. The backend checks the role in route-level middleware before executing admin operations. The frontend additionally checks `user.role` to show or hide the admin navigation link.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache before querying the primary data store. On a cache miss, the application queries the database, stores the result in the cache, and returns it. On a cache hit, the database is skipped entirely.
+
+**Why it matters:** The most expensive operation in this system is computing a user's visibility set -- the list of all fingerprints they are authorized to see. This requires querying the friendships table for all accepted friends, then constructing strings like `"FRIENDS:{friendId}"` for each friend. For a user with 500 friends, this means a database query returning 500 rows, followed by string construction. At 350K searches per second, recomputing this for every search would overwhelm the friendships table. Caching the result in Redis for 15 minutes reduces database load by 99%+ for active users.
+
+**How it works here:** When a user searches, the visibility service checks Redis for key `visibility:{userId}`. If present (cache hit), the cached JSON array of fingerprints is used directly. If absent (cache miss), the service queries the friendships table, constructs the fingerprint set, stores it in Redis with a 15-minute TTL, and returns it. When a friendship changes (accepted or removed), both users' visibility cache keys are explicitly deleted (`DEL visibility:{userA}`, `DEL visibility:{userB}`), forcing recomputation on the next search.
+
+**File:** `backend/src/services/visibilityService.ts`
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing dependency. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the actual operation. After a cooldown period, the circuit enters a "half-open" state where it allows one probe request through. If the probe succeeds, the circuit closes and normal operation resumes.
+
+**Why it matters:** Elasticsearch is the most critical dependency for search. If Elasticsearch becomes slow or unresponsive (JVM garbage collection pause, cluster rebalancing, network partition), every search request would block for the full timeout (5 seconds). With thousands of concurrent searches, this blocks all Express request handlers, and the entire API becomes unresponsive -- including health checks, auth endpoints, and post creation that do not require Elasticsearch. The circuit breaker prevents this cascade by failing search requests instantly when Elasticsearch is known to be unhealthy.
+
+**How it works here:** The Cockatiel library wraps all Elasticsearch calls with a composed policy: timeout (5 seconds per request), retry (2 attempts with exponential backoff from 100ms to 2s), and consecutive breaker (opens after 5 consecutive failures, half-opens after 30 seconds). When the circuit is open: search returns a "service temporarily unavailable" error, suggestions fall back to trending searches from Redis (no Elasticsearch needed), health check shows degraded status, and post creation still succeeds (PostgreSQL insert works, Elasticsearch indexing is queued for retry).
+
+**File:** `backend/src/shared/circuitBreaker.ts`
+
+### Structured Logging
+
+**What it is:** Structured logging writes log entries as machine-parseable JSON objects rather than free-form text strings. Each log entry includes standardized fields (timestamp, level, message) plus context-specific metadata (user ID, query text, result count, duration).
+
+**Why it matters:** When debugging why search is slow for a specific user, you need to find their search logs, see what query they ran, how many results were returned, how long it took, and whether the circuit breaker was involved. With free-form text logs, this requires fragile regex parsing. With structured JSON logs, it is a simple query: `level=info AND event=search AND userId=abc123 | sort by durationMs DESC`.
+
+**How it works here:** Pino is configured with domain-specific log functions. `logSearch()` records query, userId, filters, resultsCount, and durationMs. `logIndexing()` records postId, operation (create/update/delete), durationMs, and lagMs (time from post creation to searchable). `logCircuitBreakerStateChange()` records the service name and new state (closed/open/half-open). In development, pino-pretty formats JSON as colored human-readable output. The `LOG_LEVEL` environment variable controls verbosity.
+
+**File:** `backend/src/shared/logger.ts`
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics on an HTTP endpoint in a specific text format. Prometheus scrapes this endpoint periodically and stores time-series data for visualization and alerting.
+
+**Why it matters:** Metrics answer operational questions that logs cannot efficiently answer: "What is the p95 search latency right now?" "What is the cache hit rate for visibility lookups?" "How many posts were indexed in the last hour?" "Is the Elasticsearch circuit breaker flapping?" Without metrics, operators must manually aggregate log entries -- a process that takes minutes instead of the seconds a dashboard provides.
+
+**How it works here:** The `prom-client` library exposes 15+ custom metrics. Key examples: `search_latency_seconds` (Histogram) records search query duration for SLA monitoring. `cache_hits_total` and `cache_misses_total` (Counters) track visibility cache effectiveness. `circuit_breaker_state` (Gauge) reports the Elasticsearch circuit breaker state. `indexing_lag_seconds` (Histogram) measures the time from post creation to searchability. `elasticsearch_docs_count` and `elasticsearch_index_size_bytes` (Gauges) track index growth. Default Node.js metrics (CPU, memory, event loop lag, GC) are collected automatically via `collectDefaultMetrics()`.
+
+**File:** `backend/src/shared/metrics.ts`
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse (automated scraping, brute-force attacks) and ensures fair resource allocation across users.
+
+**Why it matters:** Search is computationally expensive -- each query hits Elasticsearch with multi-field matching, visibility filtering, and relevance scoring. A bot scraping all public posts could issue thousands of searches per second, consuming Elasticsearch CPU that should serve real users. Rate limiting caps the damage any single source can cause.
+
+**How it works here:** IP-based rate limiting is implemented via `express-rate-limit` middleware. The global limit is 1000 requests per 15 minutes per IP address. This is a simple sliding window counter. When the limit is exceeded, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. The limit applies to all API endpoints uniformly. In production, per-user rate limiting (separate from IP-based) and tiered limits (lower for search, higher for reads) would be added.
+
+**File:** `backend/src/index.ts`
+
+### Idempotency
+
+**What it is:** Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a search system, idempotency is primarily relevant for write operations (post creation, friendship changes) where network retries could cause duplicates.
+
+**Why it matters:** If a user creates a post, the server inserts it into PostgreSQL and indexes it in Elasticsearch. If the response is lost and the client retries, the post could be created twice. This creates duplicate search results and corrupts engagement metrics.
+
+**How it works here:** Post creation uses PostgreSQL's UUID primary key as a natural idempotency mechanism -- duplicate UUIDs cause a constraint violation rather than a duplicate insert. For indexing, each post is indexed by its UUID as the Elasticsearch document ID. Re-indexing the same post with the same ID overwrites the existing document rather than creating a duplicate. The admin reindex operation is fully idempotent: it deletes and recreates the index, then bulk-indexes all posts from PostgreSQL. Running it multiple times always produces the same result.
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators, and monitoring systems to detect and route around failures.
+
+**Why it matters:** This system depends on three external services: PostgreSQL (source of truth), Elasticsearch (search index), and Redis (cache and sessions). If any one fails, different parts of the application degrade differently. Health checks enable automated systems to detect exactly what is failing and respond appropriately.
+
+**How it works here:** Three endpoints serve different consumers. `/health` performs a comprehensive check of all three dependencies (PostgreSQL query, Elasticsearch ping, Redis ping) and returns a JSON object with the status of each. `/livez` confirms the process is alive (Kubernetes liveness probe). `/readyz` checks that all dependencies are reachable (Kubernetes readiness probe -- if Elasticsearch is down, the instance is removed from the load balancer but not restarted, allowing it to serve cached results or non-search endpoints). The admin dashboard's `HealthStatusBar` component polls the health endpoint to display colored indicators for each service.
+
+**File:** `backend/src/shared/healthCheck.ts`
+
 ## Implementation Notes
 
 This section maps the production architecture to the actual local implementation.

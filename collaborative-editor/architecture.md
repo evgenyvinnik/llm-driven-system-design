@@ -483,6 +483,169 @@ Each sync server handles a subset of documents. RabbitMQ enables cross-server op
 
 ---
 
+## Frontend Architecture
+
+### Component Hierarchy
+
+```
+App
+├── Header                    (document title display)
+├── UserSelector              (dropdown to pick demo user identity)
+├── DocumentList              (list of documents with create button)
+│                              shown when no document is selected
+├── TextEditor                (textarea for collaborative editing)
+│                              shown when a document is selected
+└── UserList                  (sidebar showing connected collaborators
+                               with colored cursor indicators)
+```
+
+The application uses a simple two-state layout managed in `App` rather than a router. If no document is selected, `App` renders the `DocumentList` view where users can browse, create, and select documents. Once a document is selected, `App` renders the editor view with the `TextEditor`, `Header`, `UserList`, and a "Back to Documents" button. This is intentional -- there is no TanStack Router because the editor experience is a single view with no URL-based navigation between pages.
+
+### Zustand Store (`editorStore`)
+
+A single Zustand store manages all collaborative editing state, implementing the OT client state machine:
+
+| Slice | State | Purpose |
+|-------|-------|---------|
+| **Connection** | `connected`, `ws`, `clientId` | WebSocket connection state and unique client session ID assigned by server |
+| **Document** | `documentId`, `content`, `serverVersion` | Current document being edited, its text content, and the last acknowledged server version |
+| **OT State Machine** | `inflightOp`, `pendingOps` | The operation sent to server awaiting ack, and operations applied locally but not yet sent |
+| **Presence** | `clients` (Map<string, ClientInfo>) | Map of connected collaborators with cursor position, selection, display name, and assigned color |
+| **User** | `userId` | Current user's ID (set during demo user selection) |
+
+**OT state machine flow within the store:**
+
+1. **Local edit:** `applyLocalChange(op)` applies the operation to content optimistically and adds it to `pendingOps`. If no operation is in-flight, `flushPending()` composes all pending ops into one and sends it to the server, moving it to `inflightOp`.
+
+2. **Server ack:** `handleAck()` clears `inflightOp`, updates `serverVersion`, and calls `flushPending()` to send the next batch of pending operations.
+
+3. **Remote operation:** `handleRemoteOperation()` transforms the incoming operation against `inflightOp` (if present) and then against each operation in `pendingOps`, updating both the remote op and the local ops. The transformed remote operation is then applied to content. This ensures convergence: all clients reach the same document state regardless of operation arrival order.
+
+4. **Resync:** If the OT algorithm produces an invalid operation (baseLength mismatch), the server sends a `resync` message with the full document content and version. The client replaces its entire state, discarding inflight and pending ops.
+
+### Client-Side OT Engine
+
+Two service files implement the OT algorithm on the client side:
+
+**`TextOperation.ts`** -- The core data structure representing a document change as a sequence of retain, insert, and delete components. Provides `apply(doc)` to apply the operation to a string, `toJSON()` / `fromJSON()` for serialization over WebSocket, and `isNoop()` to check if the operation makes no changes.
+
+**`OTTransformer.ts`** -- Contains the `transform(op1, op2)` function that takes two operations created against the same document state and returns transformed versions `[op1', op2']` such that applying op1 then op2' gives the same result as applying op2 then op1'. Also contains `compose(op1, op2)` which combines two sequential operations into a single operation, used by `flushPending()` to batch multiple local edits into one network message.
+
+### Data Fetching
+
+**REST API (`services/api.ts`):** Used for document management operations that happen before editing starts. Provides `getDocuments()` (list all), `getDocument(id)`, `createDocument(title, ownerId)`, `updateDocumentTitle(id, title)`, `getUsers()`, and `getUser(id)`. All calls use `fetch()` against the `/api` base URL. These are only used by `DocumentList` and `UserSelector`.
+
+**WebSocket (managed in `editorStore`):** All real-time editing communication flows through a single WebSocket connection per editing session. The connection URL includes `documentId` and `userId` as query parameters. The store's `connect()` action opens the connection and registers an `onmessage` handler that routes messages by type to specialized handler functions.
+
+### Real-Time Update Patterns
+
+**Message handling in the store:** Incoming WebSocket messages are routed to handler functions that update the Zustand store:
+
+| Server Message | Handler | Store Updates |
+|----------------|---------|---------------|
+| `init` | `handleInit()` | Sets `clientId`, `serverVersion`, `content`, `clients` map, clears pending ops |
+| `ack` | `handleAck()` | Updates `serverVersion`, clears `inflightOp`, flushes more pending |
+| `operation` | `handleRemoteOperation()` | Transforms against local ops, applies to `content`, updates `serverVersion` |
+| `cursor` | `handleCursor()` | Updates cursor position in `clients` map for the sending client |
+| `selection` | `handleSelection()` | Updates text selection in `clients` map |
+| `client_join` | `handleClientJoin()` | Adds new client to `clients` map with color and display name |
+| `client_leave` | `handleClientLeave()` | Removes client from `clients` map |
+| `resync` | `handleResync()` | Replaces `content`, `serverVersion`, clears all pending/inflight ops |
+
+**Operation deduplication:** When the store receives a remote operation, it checks `message.clientId === clientId`. If the operation is from the local client (echoed back by the server), it is skipped because the local content already includes that change. Only the `serverVersion` is updated.
+
+**Textarea synchronization:** The `TextEditor` component uses a `ref` to the textarea element and tracks the last known content in a `lastContentRef`. When the store's `content` changes (due to a remote operation), the `useEffect` updates the textarea's `value` property directly and restores the cursor position and scroll position. This avoids re-rendering the entire component on every remote keystroke.
+
+**Diff-based operation creation:** When the user types in the textarea, the `handleInput` callback computes a diff between the old and new text values. It finds the common prefix length, the common suffix length, and builds a TextOperation from the difference (retain prefix, delete removed characters, insert new characters, retain suffix). This approach handles all edit types (single character insert, paste, backspace, cut) uniformly.
+
+### Key UI Patterns
+
+- **IME composition handling:** The `TextEditor` tracks whether an IME (Input Method Editor) composition is in progress via `isComposingRef`. During composition (used for CJK language input), input events are suppressed to prevent partial characters from generating operations. The operation is created only when `compositionend` fires.
+
+- **Presence indicators:** The `UserList` sidebar shows each connected collaborator with their assigned color, display name, and cursor position. Colors are assigned server-side to ensure uniqueness and consistency across clients.
+
+- **Optimistic local edits:** All local changes are applied to the document immediately before being sent to the server. The user never waits for a server round-trip to see their own keystrokes. If the server rejects the operation or the OT transform produces an error, a resync replaces the local state.
+
+- **Connection status feedback:** The textarea is disabled and shows "Connecting..." as placeholder text when the WebSocket is not connected. The background color changes from white (connected) to gray (disconnected) to provide visual feedback.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation describes what the pattern is, why it exists, and how it works -- assuming no prior knowledge.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing dependency. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately (fast-fail) without attempting the actual operation. After a cooldown period, the circuit enters a "half-open" state where it allows one probe request through. If the probe succeeds, the circuit closes and normal operation resumes.
+
+**Why it matters:** The collaborative editor depends on three external services: PostgreSQL (operation persistence and document loading), Redis (presence and idempotency), and RabbitMQ (cross-server operation broadcast). If PostgreSQL becomes unresponsive, every operation submission would block for 5 seconds (the default timeout), stalling the event loop. With 50 concurrent editors, the server would have 50 blocked requests, exhausting the connection pool and causing all other operations -- including WebSocket pings, cursor updates, and Redis presence -- to queue up and timeout. The circuit breaker stops this cascade by failing database calls instantly when PostgreSQL is known to be unhealthy.
+
+**How it works here:** Three separate circuit breakers protect each dependency with tuned configurations. PostgreSQL: 5-second timeout, 50% error threshold at 5+ requests, 30-second reset. Redis: 1-second timeout, 50% at 10+ requests, 10-second reset (shorter because Redis failures are usually transient). RabbitMQ: 2-second timeout, 50% at 5+ requests, 15-second reset. When the RabbitMQ circuit opens, the server buffers publishes in memory (up to 1000 messages) and continues broadcasting locally. When the PostgreSQL circuit opens, operations fail and the server requests the client to resync.
+
+**File:** `backend/src/shared/circuitBreaker.ts`
+
+### Idempotency
+
+**What it is:** Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a collaborative editor, this is critical because network issues cause clients to retry operations. If a retry is processed as a new operation, the same text is inserted twice, corrupting the document for all collaborators.
+
+**Why it matters:** Consider a user typing "hello" -- the client sends an insert operation, the server processes it and increments the version, but the acknowledgment is lost due to a network blip. The client retries the same insert. Without idempotency, the document now contains "hellohello", and all other collaborators see the duplicate. Because OT relies on version numbers for transform correctness, a duplicate operation at the wrong version can cascade into further corruption.
+
+**How it works here:** Each operation carries a client-generated `operationId` formatted as `{clientId}-{timestamp}-{contentHash}`. Before processing an operation, the server checks Redis for this ID (key: `idemp:{operationId}`, TTL: 1 hour). If the key exists, the server returns the cached result (version number and transformed operation) without re-applying the operation to the document. If the key does not exist, the server processes the operation normally and stores the result in Redis. The 1-hour TTL is long enough for all retries to complete but short enough to avoid unbounded cache growth.
+
+**File:** `backend/src/shared/idempotency.ts`
+
+### Structured Logging
+
+**What it is:** Structured logging writes log entries as machine-parseable JSON objects rather than free-form text strings. Each log entry includes standardized fields (timestamp, level, message) plus context-specific metadata (document ID, client ID, operation version, latency).
+
+**Why it matters:** Debugging OT issues requires correlating events across multiple clients editing the same document. When a conflict resolution produces an unexpected result, you need to find all operations for that document, see their versions, examine the transform inputs and outputs, and determine which client's operation arrived first. With free-form text logs, this is a manual process of grep and mental correlation. With structured JSON logs, it is a query: `documentId=abc AND event=ot_conflict_resolved | sort by timestamp`.
+
+**How it works here:** Pino is configured with child loggers that include `server_id`, `document_id`, and `client_id` as context fields. Key logged events: `operation_applied` (every successful operation, with latency), `ot_conflict_resolved` (concurrent operations transformed, with version gap and concurrent op count), `operation_apply_failed` (transform produced an invalid operation -- a bug indicator), `ws_connect` / `ws_disconnect` (connection stability), `document_loaded` (load time and content size), `snapshot_saved` (backup frequency tracking). `pino-http` adds request-level logging with correlation IDs for REST API calls.
+
+**File:** `backend/src/shared/logger.ts`
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics on an HTTP endpoint (`/metrics`) in a text format. Prometheus scrapes this endpoint periodically and stores the time-series data for visualization in dashboards and alerting when thresholds are crossed.
+
+**Why it matters:** The collaborative editor has specific SLIs (Service Level Indicators) that require continuous measurement: operation latency (p95 < 50ms), OT transform latency (must be negligible compared to total operation time), WebSocket connection count (for capacity planning), and queue depth (for detecting RabbitMQ backpressure). Logs can answer "what happened to this one operation" but cannot answer "what is the p95 operation latency over the last hour" without expensive aggregation.
+
+**How it works here:** The `prom-client` library exposes 8 custom metrics. `collab_ws_connections_total` (Gauge) tracks active WebSocket connections per server instance. `collab_active_documents` (Gauge) counts documents with at least one active editor. `collab_operations_total` (Counter with status label) counts operations processed, split by success/error. `collab_operation_latency_ms` (Histogram) records time from operation received to ack sent. `collab_transform_latency_ms` (Histogram) isolates the OT transform step. `collab_queue_depth` (Gauge) monitors RabbitMQ queue depth per queue. `collab_circuit_breaker_state` (Gauge) reports circuit breaker state (0=closed, 0.5=half-open, 1=open). `collab_duplicate_operations_total` (Counter) counts idempotency cache hits, indicating retry frequency.
+
+**File:** `backend/src/shared/metrics.ts`
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers (to route traffic away from unhealthy instances), orchestrators like Kubernetes (to restart crashed containers), and monitoring dashboards.
+
+**Why it matters:** The collaborative editor depends on three external services, and each can fail independently. If PostgreSQL is down, documents cannot be loaded or operations persisted, but active editing sessions can continue briefly using in-memory state. If Redis is down, presence updates and idempotency checks fail, but editing still works. If RabbitMQ is down, cross-server broadcast fails, but single-server editing works normally. Health checks enable automated systems to detect exactly what is failing and respond appropriately rather than treating all failures identically.
+
+**How it works here:** Four endpoints serve different consumers. `/health` performs a comprehensive check of all three dependencies (PostgreSQL query latency, Redis ping, RabbitMQ channel check) and returns a JSON object with the status and latency of each. `/ready` is the Kubernetes readiness probe -- if any dependency is unhealthy, the instance is removed from the load balancer but not restarted, allowing it to continue serving active editing sessions. `/live` is the Kubernetes liveness probe -- only fails if the Node.js process itself is unresponsive. `/metrics` is the Prometheus scrape endpoint.
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many actions a client can perform within a time window. It protects the system from abuse by ensuring no single client can consume disproportionate resources.
+
+**Why it matters:** A collaborative editor is uniquely vulnerable to operation flooding. A malicious script could open a WebSocket connection and send thousands of insert operations per second, overwhelming the OT transform engine (which has quadratic complexity with concurrent operations), filling the operations table, and triggering rapid snapshot generation. Rate limiting caps the operation rate per client to prevent this.
+
+**How it works here:** Operations are rate-limited per client via the WebSocket connection. The server tracks operations per second per client and rejects operations that exceed the threshold. On the REST API side, standard express-rate-limit middleware protects document CRUD endpoints. The rate limits are intentionally lenient for normal editing (a fast typist produces 5-10 operations per second) but restrictive enough to prevent automated flooding.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is an authorization model where permissions are assigned to roles rather than to individual users. Each user is assigned a role, and the role determines what actions they can perform.
+
+**Why it matters:** A collaborative editor needs fine-grained access control per document. Some users should only read a document (viewers), others should be able to edit (editors), and the document owner needs to manage sharing and delete the document (admin). Without RBAC, permission checks would require per-user, per-document configuration that does not scale.
+
+**How it works here:** The `document_access` table stores `(document_id, user_id, permission)` where permission is one of `view`, `edit`, or `admin`. The document owner automatically gets `admin` permission. Permissions are hierarchical: `admin` implies `edit`, which implies `view`. The schema is implemented and populated, but the enforcement middleware is not yet wired into the WebSocket handler -- this is noted in the "What Was Omitted" section. The design is ready for activation without schema changes.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside is a caching strategy where the application checks a fast in-memory cache before querying a slower persistent store. On a cache miss, the primary store is queried and the result is stored in the cache for future requests.
+
+**Why it matters:** In the collaborative editor, two data types benefit from caching. First, presence data (cursor positions, online status) changes rapidly and is read by all connected clients. Storing it in Redis instead of PostgreSQL avoids per-keystroke database writes. Second, idempotency keys must be checked on every operation submission. Redis provides sub-millisecond lookups compared to PostgreSQL's multi-millisecond query time. At 500,000 operations per second globally, this difference is the difference between operational and overloaded.
+
+**How it works here:** Presence data is stored directly in Redis (not a cache of database data, but Redis as the primary store) with automatic expiration. When a client disconnects, their presence keys expire after the TTL, automatically removing stale cursor indicators. Idempotency keys use Redis as a write-through cache: the key is written on first operation processing and read on subsequent retries. Both patterns use Redis's built-in TTL for automatic cleanup without requiring garbage collection.
+
+**File:** `backend/src/services/redis.ts`
+
 ## Implementation Notes
 
 This section maps the production architecture above to the actual local implementation running on Docker + Node.js + React.

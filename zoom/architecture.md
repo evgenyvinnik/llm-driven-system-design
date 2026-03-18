@@ -494,6 +494,217 @@ Server handles SIGTERM/SIGINT:
 | Chat delivery | WebSocket (shared) | Separate chat service | Already connected for signaling, minimal overhead |
 | Meeting code | 3-4-3 alpha | UUID / numeric | Human-readable, typeable, memorable |
 
+## Frontend Architecture
+
+### Routing (TanStack Router, File-Based)
+
+```
+frontend/src/routes/
+├── __root.tsx           → Root layout (Header + auth check + redirect to /login)
+├── index.tsx            → / (dashboard with meeting list, join by code, create meeting)
+├── login.tsx            → /login (username + password form)
+├── register.tsx         → /register (registration form)
+├── schedule.tsx         → /schedule (meeting scheduling form)
+├── history.tsx          → /history (past meetings list)
+└── meeting.$code.tsx    → /meeting/:code (lobby → in-meeting view)
+```
+
+The root component checks authentication on mount via `checkAuth()`. If the user is not authenticated and is not on `/login` or `/register`, they are redirected to `/login`. The `Header` component is always visible with the app logo, navigation links, and user menu.
+
+The meeting route (`meeting.$code.tsx`) is the most complex -- it implements a two-phase flow within a single route: the meeting lobby (camera/mic preview, display name entry, join button) transitions to the in-meeting view (video grid, control bar, side panels) once the WebSocket join handshake completes.
+
+### Component Hierarchy
+
+```
+RootComponent (__root.tsx)
+├── Header                      (logo, nav links, user avatar, logout)
+└── Outlet
+    ├── Dashboard (/)
+    │   ├── JoinByCode          (text input + join button for meeting code)
+    │   └── MeetingCard[]       (cards showing upcoming/active meetings)
+    │
+    ├── LoginPage (/login)
+    ├── RegisterPage (/register)
+    ├── ScheduleForm (/schedule)
+    ├── HistoryPage (/history)
+    │
+    └── MeetingPage (/meeting/:code)
+        ├── MeetingLobby        (pre-join: camera preview, device selection, display name)
+        │   └── useMediaDevices (hook for enumerating cameras/mics)
+        │
+        └── [in-meeting view]
+            ├── VideoGrid        (responsive grid of participant tiles)
+            │   ├── VideoTile[]  (individual participant: video/avatar, name, status icons)
+            │   └── ScreenShareView  (full-width placeholder when someone shares screen)
+            ├── ChatPanel        (in-meeting text chat with broadcast/DM support)
+            ├── ParticipantList  (sidebar list with mute/video/hand status indicators)
+            ├── BreakoutRooms    (host-only: create, assign, activate, close breakout rooms)
+            ├── ControlBar       (bottom bar: mute, camera, screen share, hand raise, chat, leave)
+            └── HandRaiseIndicator (animated hand icon overlay)
+```
+
+### Zustand Stores
+
+Three stores separate concerns for auth, media devices, and meeting state:
+
+**`authStore`** -- Authentication state:
+
+| State | Purpose |
+|-------|---------|
+| `user` | Authenticated user object (id, username, email, displayName) |
+| `loading` | True during initial auth check (blocks rendering) |
+| `error` | Last auth error message |
+
+Actions: `login()`, `register()`, `logout()`, `checkAuth()`, `clearError()`. Session-based auth with cookies; no token in localStorage.
+
+**`mediaStore`** -- Local media device state:
+
+| State | Purpose |
+|-------|---------|
+| `localStream` | MediaStream from getUserMedia (camera + microphone) |
+| `isMuted`, `isVideoOn` | Current audio/video toggle states |
+| `isScreenSharing` | Whether local user is sharing screen |
+| `isHandRaised` | Whether local user has raised hand |
+| `selectedCamera`, `selectedMic` | Device IDs for selected camera and microphone |
+
+Actions: Setters for each field, plus `reset()` which stops all media tracks and returns to initial state. The `reset()` is called on meeting leave to release camera/mic permissions.
+
+**`meetingStore`** -- Meeting room state:
+
+| State | Purpose |
+|-------|---------|
+| `meeting` | Current meeting metadata (id, code, title, host, settings, status) |
+| `participants` | Array of participants with media states (muted, video, screen share, hand raise) |
+| `chatMessages` | Array of in-meeting chat messages |
+| `breakoutRooms` | Array of breakout room definitions and assignments |
+| `isInMeeting` | True after WebSocket join handshake completes |
+| `isChatOpen`, `isParticipantListOpen`, `isBreakoutOpen` | Side panel toggle states (mutually exclusive) |
+| `screenSharingUserId` | User ID of the participant currently sharing screen (null if none) |
+
+Actions: `setParticipants()`, `addParticipant()`, `removeParticipant()`, `updateParticipant()` (for media state changes), `addChatMessage()`, panel toggles (opening one closes the others), `reset()`. Participant updates automatically track screen sharing state -- when `isScreenSharing` is set to true, the store records that user's ID as `screenSharingUserId`.
+
+### WebSocket Client (`services/websocket.ts`)
+
+A singleton `WebSocketClient` class manages the real-time connection for meeting signaling and chat. Key design choices:
+
+- **Event-based dispatch:** The client uses a `Map<string, MessageHandler[]>` to register handlers by message type. Components register handlers via `wsClient.on('joined', handler)` and unregister via `wsClient.off()`. A wildcard handler (`'*'`) catches all messages for debugging.
+
+- **Reconnection with exponential backoff:** On unexpected close (code !== 4001), the client attempts up to 5 reconnections with delays of 1s, 2s, 4s, 8s, 16s. On intentional disconnect, reconnection is suppressed by setting `reconnectAttempts = maxReconnectAttempts`.
+
+- **Signaling methods:** The client exposes typed methods for the WebRTC signaling protocol: `joinMeeting()`, `leaveMeeting()`, `produce()`, `consume()`, `closeProducer()`, `toggleMute()`, `toggleVideo()`, `startScreenShare()`, `stopScreenShare()`, `raiseHand()`, `sendChatMessage()`. Each method wraps `ws.send(JSON.stringify({...}))` with the appropriate message type.
+
+- **Auth via query parameters:** The connection URL includes `userId` and `username` as query parameters. This is a development simplification -- production would validate the session cookie during the WebSocket upgrade handshake.
+
+### Data Fetching
+
+**REST API (`services/api.ts`):** Used for operations that happen before or after a meeting. Provides auth endpoints (login, register, logout, getMe), meeting CRUD (createMeeting, getMeetings, getMeetingByCode, startMeeting, endMeeting), breakout room management (createBreakoutRooms, activateBreakoutRooms, closeBreakoutRooms), and chat history (getChatMessages). All calls use `fetch()` with `credentials: 'include'` to send session cookies.
+
+**Meeting page data flow:** The `/meeting/:code` route loads meeting metadata via REST on mount (`api.getMeetingByCode(code)`), then establishes the WebSocket connection on join. After the WebSocket `joined` message arrives, the participant list is populated from the message payload, and the UI transitions from lobby to in-meeting view.
+
+### Real-Time Update Patterns
+
+**WebSocket message handling in MeetingPage:** The `setupWsHandlers()` callback registers handlers for all meeting events:
+
+| Server Message | Store Action | Effect |
+|----------------|-------------|--------|
+| `joined` | `setParticipants()`, `setIsInMeeting(true)` | Transitions from lobby to meeting view |
+| `participant-joined` | `addParticipant()` | New tile appears in video grid |
+| `participant-left` | `removeParticipant()` | Tile removed, screen share cleared if they were sharing |
+| `participant-update` | `updateParticipant()` | Mute/video/screen share/hand raise icons update |
+| `chat-message` | `addChatMessage()` | New message appears in chat panel |
+| `new-producer` | (no-op in simulation) | Would create a consumer to receive media in production |
+| `producer-closed` | (no-op in simulation) | Would clean up consumer in production |
+| `left` | `setIsInMeeting(false)` | Returns to lobby state |
+| `error` | Console error | Logged for debugging |
+
+### Key UI Patterns
+
+- **Adaptive video grid:** `VideoGrid` computes CSS grid classes dynamically based on participant count: 1 participant = 1x1, 2 = 2x1, up to 4 = 2x2, up to 9 = 3x3, up to 16 = 4x4, beyond 16 = 5-column auto-rows with scroll. When someone is screen sharing, the layout switches to a presenter view: the screen share fills the main area, and participants appear as small tiles in a vertical strip on the right.
+
+- **Mutually exclusive side panels:** Opening Chat closes Participants and Breakout Rooms, and vice versa. The toggle functions in `meetingStore` enforce this by setting the opened panel to true and all others to false.
+
+- **Meeting lobby with device preview:** Before joining, users see their camera preview and can select audio/video devices via the `useMediaDevices` hook (which calls `navigator.mediaDevices.enumerateDevices()`). The display name field is pre-populated from the auth store.
+
+- **Dark theme (Zoom-inspired):** The UI uses a custom Tailwind color palette with `zoom-bg` (dark background), `zoom-card`, `zoom-surface`, `zoom-primary` (#2D8CFF blue accent), `zoom-text`, and `zoom-secondary`. This matches the recognizable Zoom dark aesthetic.
+
+- **Meeting code format:** Meeting codes use the human-readable `abc-defg-hij` pattern (3-4-3 lowercase letters). Users can join by typing this code in the `JoinByCode` component on the dashboard, or by navigating directly to `/meeting/abc-defg-hij`.
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern implemented in this project. Each explanation describes what the pattern is, why it exists, and how it works -- assuming no prior knowledge.
+
+### Circuit Breaker
+
+**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing dependency. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately (fast-fail) without attempting the actual operation. After a cooldown period, the circuit enters a "half-open" state where it allows one probe request through. If the probe succeeds, the circuit closes and normal operation resumes.
+
+**Why it matters:** The Zoom backend depends on PostgreSQL for meeting creation, participant tracking, and chat persistence. If PostgreSQL becomes unresponsive (connection pool exhausted, disk full, network partition), every API request would block for the full database timeout (5 seconds). With 100 participants in a meeting, each toggling mute or sending chat messages, the Express request handler pool fills up. More critically, the WebSocket signaling server shares the Node.js event loop with the Express server. Blocked database calls would stall WebSocket message processing, causing all participants to experience frozen video grids and unresponsive controls. The circuit breaker prevents this cascade by failing database calls instantly when PostgreSQL is known to be unhealthy, preserving WebSocket signaling (which uses Redis for state) even during database outages.
+
+**How it works here:** Opossum wraps database queries with a 50% error threshold, 5-second timeout per query, and 30-second reset before half-open probe. When the circuit opens, meeting creation and history queries fail fast with a 503 status code. Active meetings continue functioning because participant state is managed in memory and via Redis -- only meeting persistence is affected. The `circuit_breaker_state` Prometheus metric tracks state transitions for alerting.
+
+**File:** `backend/src/services/circuitBreaker.ts`
+
+### Rate Limiting
+
+**What it is:** Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse by ensuring no single client can consume disproportionate resources.
+
+**Why it matters:** Video conferencing endpoints are attractive targets for abuse. A brute-force attack against the login endpoint could try thousands of passwords per minute. A bot could create hundreds of meetings, consuming meeting codes and database resources. Rate limiting caps the damage any single source can cause and provides time for detection and response.
+
+**How it works here:** Two tiers of rate limiting are implemented. Auth endpoints (login, register) have a strict limit of 20 requests per 15 minutes per IP address -- aggressive enough to prevent brute-force attacks while lenient enough for users who mistype their password a few times. General API endpoints have a broader limit of 100 requests per 15 minutes per IP. Both use `express-rate-limit` with `rate-limit-redis` as the store, which ensures rate limits are enforced consistently across multiple server instances (all instances share the same Redis counter). When the limit is exceeded, the server returns HTTP 429 (Too Many Requests).
+
+**File:** `backend/src/services/rateLimiter.ts`
+
+### Structured Logging
+
+**What it is:** Structured logging writes log entries as machine-parseable JSON objects rather than free-form text strings. Each log entry includes standardized fields (timestamp, level, message) plus context-specific metadata (meeting code, participant count, SFU operation type).
+
+**Why it matters:** Debugging video conferencing issues requires correlating events across multiple participants in the same meeting. When a user reports "I can't see anyone's video," you need to find their join event, check whether their producers were created, see if consumers were created for other participants, and determine whether the SFU router was healthy. With free-form text logs, this requires manual grep and mental correlation across hundreds of log lines. With structured JSON logs, it is a query: `meetingCode=abc-defg-hij AND event=produce | sort by timestamp`.
+
+**How it works here:** Pino is configured with `pino-http` for request-level logging with correlation IDs. Meeting lifecycle events (created, started, ended) are logged with meeting code and host user. SFU operations (router created, transport created, producer/consumer lifecycle) are logged with participant context. Participant join/leave events include timestamps and media state (muted, video on, screen sharing). In development, Pino outputs human-readable colored text; in production, it outputs JSON for ingestion by log aggregation systems.
+
+**File:** `backend/src/services/logger.ts`
+
+### Prometheus Metrics
+
+**What it is:** Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose an HTTP endpoint (`/metrics`) with metric values in a text format. Prometheus scrapes this endpoint and stores the time-series data for visualization and alerting.
+
+**Why it matters:** Video conferencing has specific operational metrics that are critical for capacity planning and incident response. "How many meetings are active right now?" determines whether to scale up SFU workers. "How many participants are connected?" determines WebSocket server load. "What is the API latency by route?" identifies slow endpoints before users complain. Without metrics, these questions require manual investigation during incidents, when response time is most critical.
+
+**How it works here:** Four custom metrics are defined. `active_meetings_total` (Gauge) tracks the number of meetings in "active" status -- used for SFU worker capacity planning. `active_participants_total` (Gauge) tracks the total connected participant count. `websocket_connections_total` (Gauge) tracks active WebSocket connections for load balancer tuning. `http_request_duration_seconds` (Histogram with method, route, and status labels) records API latency for SLI dashboards. Default Node.js metrics (CPU, memory, event loop lag, GC pause duration) are collected automatically via `collectDefaultMetrics()`.
+
+**File:** `backend/src/services/metrics.ts`
+
+### Health Checks
+
+**What it is:** Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators, and monitoring dashboards to detect and respond to failures.
+
+**Why it matters:** A video conferencing server depends on PostgreSQL (meeting persistence) and Redis (sessions, participant state). If PostgreSQL fails, the server cannot create new meetings but active meetings continue. If Redis fails, sessions are lost but in-memory meeting state is preserved. Health checks enable automated systems to make nuanced decisions: remove an instance from the load balancer when PostgreSQL is down (cannot serve new meeting requests) but do not restart it (active meetings are still functional).
+
+**How it works here:** A single comprehensive endpoint `GET /api/health` returns server status, current timestamp, PostgreSQL pool health (active, idle, and waiting connection counts), and Redis connectivity (ping response). This endpoint is used both by external monitoring and by the frontend to display server status.
+
+### Idempotency
+
+**What it is:** Idempotency means that performing the same operation multiple times produces the same result as performing it once. In distributed systems, network failures cause retries: a client sends a request, the server processes it, but the response is lost. The client retries, and without idempotency, the operation executes twice.
+
+**Why it matters:** Meeting creation is the most important idempotent operation. If a user clicks "New Meeting" and the network drops the response, their client retries. Without idempotency, two meetings are created with different codes, and the user sees a confusing duplicate in their meeting list. Similarly, the meeting code UNIQUE constraint in PostgreSQL provides a secondary safeguard -- but relying on database errors for flow control is fragile and produces poor error messages.
+
+**How it works here:** Meeting creation requests include an `Idempotency-Key` header (a client-generated UUID). The server stores the completed request outcome in Redis keyed by this value with a 24-hour TTL. If a duplicate request arrives, the server returns the previously created meeting without executing any database operations. The meeting code itself provides a secondary deduplication layer via the UNIQUE database constraint. For WebSocket signaling, participant state updates (mute, video toggle, hand raise) use last-writer-wins semantics and are inherently idempotent -- receiving "user X is muted" twice produces the same state as receiving it once. Chat messages use client-generated message IDs checked against a Redis set to prevent duplicate insertion.
+
+### RBAC (Role-Based Access Control)
+
+**What it is:** RBAC is an authorization model where permissions are assigned to roles rather than to individual users. Each user is assigned a role, and the role determines what actions they can perform.
+
+**Why it matters:** In a video conferencing system, different participants have different capabilities within the same meeting. The host can end the meeting, mute other participants, create breakout rooms, and manage settings. Co-hosts share some of these capabilities. Regular participants can only control their own media state. Without RBAC, these permission checks would be ad-hoc conditional statements throughout the WebSocket handler, making them difficult to audit and easy to bypass.
+
+**How it works here:** Three meeting roles are defined: `host` (full control: end meeting, mute all, create/manage breakout rooms, change settings), `co-host` (can mute others and manage breakout rooms but cannot end the meeting), and `participant` (can only control own audio, video, screen share, hand raise, and send chat messages). The role is stored in the `meeting_participants.role` column and checked in the WebSocket message handler before executing privileged operations. The meeting creator is automatically assigned the `host` role. Role checks also gate the breakout room UI in the frontend -- only hosts see the breakout room management panel.
+
+### Redis Cache-Aside
+
+**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a fast in-memory cache before querying a slower persistent store. On a cache miss, the application queries the database, stores the result in the cache, and returns it. On a cache hit, the database is skipped entirely.
+
+**Why it matters:** In a video conferencing system, session validation happens on every HTTP request and every WebSocket connection upgrade. With 800,000 concurrent participants, each making signaling requests, validating sessions against PostgreSQL would require hundreds of thousands of queries per second. Redis serves session lookups in sub-millisecond time from memory, reducing database load by orders of magnitude.
+
+**How it works here:** Redis is used as both the session store (via `connect-redis` with `ioredis`) and the primary store for transient meeting state. Sessions are stored in Redis with automatic expiration, and PostgreSQL is not involved in session validation at all. For the WebSocket reconnection buffer, the server stores the last 60 seconds of state changes per meeting in Redis. When a participant reconnects, the server replays missed events from this buffer rather than recomputing state from PostgreSQL.
+
 ## Implementation Notes
 
 ### Local Architecture
