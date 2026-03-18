@@ -867,34 +867,161 @@ Signal handlers for `SIGTERM` and `SIGINT` that cleanly disconnect Kafka, Redis,
 - **A/B testing framework** - No experiment assignment or metric comparison
 - **Audio fingerprinting** - No content identification or duplicate detection
 
-### Frontend Implementation
+### Frontend Architecture
 
-The React frontend (`frontend/src/`) provides a Spotify-like UI with:
+This section describes how the React frontend is structured and why each architectural decision was made.
 
-| Route | Component | Purpose |
-|-------|-----------|---------|
-| `/` | Home page | New releases, featured, popular tracks, personalized "For You" |
-| `/search` | Search | Multi-entity search across artists, albums, tracks |
-| `/artist/:id` | Artist page | Artist details with albums |
-| `/album/:id` | Album page | Album details with track listing |
-| `/playlist/:id` | Playlist page | Playlist with track listing and management |
-| `/library` | Library | Saved albums, followed artists |
-| `/library/liked` | Liked Songs | Liked tracks collection |
-| `/login` | Login | Email/password authentication |
-| `/register` | Register | Account creation |
+#### Component Hierarchy
 
-**Player Architecture** (`frontend/src/stores/playerStore.ts`):
+```
+RootLayout (__root.tsx)
+├── AudioProvider (hidden <audio> element, event listeners)
+├── Sidebar (nav links, playlist listing)
+├── Header (auth status, navigation controls)
+├── <Outlet /> (route-specific content)
+│   ├── HomePage (/) -- greeting, quick-play cards, "For You", popular, new releases
+│   │   ├── TrackCard[] (album art, play overlay, now-playing indicator)
+│   │   └── AlbumCard[] (cover art, release year, artist name)
+│   ├── SearchPage (/search) -- multi-entity search results
+│   ├── ArtistPage (/artist/$artistId) -- artist bio, albums, top tracks
+│   ├── AlbumPage (/album/$albumId) -- album detail with TrackList
+│   ├── PlaylistPage (/playlist/$playlistId) -- playlist header, TrackList
+│   ├── LibraryPage (/library) -- saved albums, followed artists
+│   ├── LikedSongsPage (/library/liked) -- liked tracks collection
+│   ├── LoginPage (/login) -- email/password auth
+│   └── RegisterPage (/register) -- account creation
+└── Player (persistent bottom bar: track info, controls, progress, volume)
+```
 
-A Zustand store manages all playback state:
-- Queue management with original queue preserved for shuffle restore
-- Shuffle (Fisher-Yates) and repeat modes (off, all, one)
-- 30-second stream count detection via `setCurrentTime` callback
-- Playback event reporting (play, pause, resume, skip, seek, complete) sent to the backend
-- HTML5 Audio element controlled via ref
+The root layout follows Spotify's three-panel design: a fixed-width sidebar (256px) on the left for navigation and playlists, a scrollable main content area in the center, and a persistent player bar anchored to the bottom. This layout is defined in `__root.tsx` and wraps all routes via the `<Outlet />` component. The player bar persists across route changes so music continues uninterrupted during navigation -- this is the defining UX characteristic of a music streaming app.
 
-**Key UI Components:**
-- `AudioProvider` - Manages the shared `<audio>` element and event listeners
-- `Player` - Bottom-bar player with progress, volume, queue controls
-- `Sidebar` - Navigation with playlist listing
-- `Header` - Auth status and navigation
-- `TrackList` - Reusable track listing with play/like actions
+#### Zustand Stores
+
+**`authStore`** manages user authentication: current user, loading state, error messages, and auth actions (login, register, logout, checkAuth). On app load, `checkAuth` calls the backend's `/auth/me` endpoint to restore the session from the HTTP-only cookie. Zustand was chosen over React Context because the auth store is read by many components (Sidebar, Header, HomePage, Player) and Context would cause all of them to re-render on any auth state change, while Zustand's selector-based subscriptions let each component subscribe only to the slice it needs.
+
+**`playerStore`** is the most complex store, managing the entire audio playback lifecycle:
+
+- **Track state**: `currentTrack`, `isPlaying`, `currentTime`, `duration` -- the current playback position and what is playing.
+- **Queue management**: `queue` (current play order), `originalQueue` (preserved for unshuffle), `queueIndex` (position in queue). When shuffle is toggled on, the store creates a new shuffled array using Fisher-Yates algorithm while keeping the current track at index 0. When shuffle is toggled off, the store restores `originalQueue` and finds the current track's original position.
+- **Playback modes**: `shuffleEnabled` (boolean), `repeatMode` (off/all/one). Repeat mode "one" restarts the current track on end; "all" wraps the queue index to 0 when reaching the end; "off" stops playback.
+- **Volume**: `volume` (0-1), `isMuted`. The audio element's volume is set directly via the stored ref.
+- **Stream counting**: `streamCountRecorded` flag tracks whether the 30-second threshold has been reached for the current track. When `setCurrentTime` is called by the `AudioProvider`'s `timeupdate` event and `currentTime >= 30`, a `stream_counted` event is sent to the backend and the flag is set to prevent duplicate counting. This follows the industry standard for royalty-accurate stream counting.
+- **Playback analytics**: Every significant user action (play, pause, resume, skip, seek, complete) generates a playback event sent to the backend via `playbackApi.recordEvent`. These events include the track ID, event type, and current position in milliseconds.
+- **Audio element ref**: The store holds a reference to the HTML5 Audio element (set by `AudioProvider`), enabling direct control from anywhere in the component tree without prop drilling.
+
+The `previous` action implements standard music player behavior: if the current track is more than 3 seconds in, restart it from the beginning instead of going to the previous track. This matches user expectations from physical media players.
+
+#### TanStack Router Structure
+
+Spotify uses **file-based routing** via TanStack Router's Vite plugin. Route files in `routes/` are automatically discovered and compiled into `routeTree.gen.ts`.
+
+| File | Path | Purpose |
+|------|------|---------|
+| `__root.tsx` | (layout) | Three-panel layout with Sidebar, Header, Player |
+| `index.tsx` | `/` | Home: greeting, quick-play, popular, new releases, "For You" |
+| `search.tsx` | `/search` | Multi-entity search (artists, albums, tracks) |
+| `artist.$artistId.tsx` | `/artist/:id` | Artist details with discography |
+| `album.$albumId.tsx` | `/album/:id` | Album with track listing |
+| `playlist.$playlistId.tsx` | `/playlist/:id` | Playlist management and playback |
+| `library.tsx` | `/library` | Saved albums, followed artists |
+| `library.liked.tsx` | `/library/liked` | Liked songs collection |
+| `login.tsx` | `/login` | Authentication |
+| `register.tsx` | `/register` | Account creation |
+
+Dynamic route segments use TanStack Router's `$param` convention (e.g., `artist.$artistId.tsx`), which provides type-safe `useParams()` access without runtime parsing.
+
+#### Data Fetching Pattern
+
+The frontend fetches data directly from the API service layer (`services/api.ts`) using `fetch` with cookie credentials. Data fetching happens in `useEffect` hooks within route components. The homepage uses `Promise.all` to parallelize three independent API calls (new releases, featured tracks, popular tracks), then conditionally fetches personalized "For You" tracks if the user is authenticated. This avoids waterfall loading where each request waits for the previous one to complete.
+
+There is no React Query or SWR; state is managed directly in component state (`useState`) for route-specific data and Zustand stores for cross-component shared state (auth, player). This is a deliberate simplification -- the app's navigation pattern (linear browsing, not rapid switching) makes aggressive caching less critical than in a data-heavy dashboard.
+
+#### Key UI Patterns
+
+**Audio Player Architecture** -- Spotify's player uses a two-component architecture. The `AudioProvider` component creates a hidden `<audio>` element and registers event listeners (`timeupdate`, `loadedmetadata`, `ended`) that feed into the player store. The `Player` component reads from the store to render the UI. This separation means the audio element exists in the DOM exactly once (in the root layout) and persists across all route changes. When a user navigates from an album page to a playlist page, the music continues without interruption because the audio element is never unmounted. The `AudioProvider` sets the initial volume from the store and syncs volume/mute changes bidirectionally.
+
+**Persistent Bottom Player Bar** -- The player bar occupies a fixed 80px at the bottom of the viewport and is divided into three sections: track info (30%, left), playback controls (center, max 722px), and volume (30%, right). The center section contains shuffle, previous, play/pause, next, and repeat buttons, with a progress bar below. The progress bar uses an HTML range input styled with a linear gradient background that visually fills as the track progresses. When no track is playing, the player shows a placeholder "Select a song to play" message.
+
+**TrackList Component** -- A reusable table component used across album, playlist, and liked songs pages. It renders a CSS Grid layout with columns for track number, title/artist, album, and duration. The component supports variant display: `showAlbum`, `showNumber`, `showArtist` props allow each context to show the relevant columns. The currently playing track is highlighted with Spotify green text and an animated playing indicator (three bouncing bars). On hover, the track number is replaced with a play button icon. Artist and album names are clickable links that navigate to their respective pages while stopping event propagation to prevent triggering track playback.
+
+**Sidebar with Dynamic Playlists** -- The sidebar loads user playlists on mount when authenticated, showing them below the "Your Library" section. Each playlist shows a cover image (or placeholder icon), name, and type. The "Liked Songs" entry uses a distinct purple-to-blue gradient background, matching Spotify's visual language. When unauthenticated, the sidebar shows a call-to-action card prompting login.
+
+---
+
+### Deep Pattern Explanations
+
+This section explains the production-grade patterns implemented in this project. Each pattern is described from first principles.
+
+#### RBAC (Role-Based Access Control)
+
+RBAC maps users to roles, and roles to permissions. Without RBAC, authorization logic would be scattered across every route handler, checking user IDs or arbitrary flags. RBAC centralizes this into a hierarchy where each role inherits the capabilities of lower roles.
+
+Spotify defines four roles: `user` (regular listener, 160kbps streaming limit), `premium` (high quality streaming at 320kbps, offline downloads, no ads), `artist` (own artist page management, analytics dashboard), and `admin` (full platform access, user management, audit logs). The middleware chain works in three steps: (1) extract session from cookie and look up in Redis, (2) attach the user object (with role) to the request, (3) check the role against the endpoint's minimum requirement. Playlist endpoints add a fourth check: ownership verification, where the handler confirms the requesting user owns or has collaborator access to the playlist before allowing modifications.
+
+The role hierarchy is important because it avoids maintaining an explicit permission matrix. Instead of listing every action each role can perform, the system defines a total order: `user < premium < artist < admin`. An endpoint requiring `premium` will accept `premium`, `artist`, and `admin` users. This keeps the authorization logic to a single comparison rather than a table lookup.
+
+#### Redis Cache-Aside Pattern
+
+The cache-aside pattern reduces database load by checking Redis before querying PostgreSQL. PostgreSQL queries typically take 2-10ms (query parsing, planning, index traversal, network round-trip), while Redis `GET` operations complete in 0.05-0.2ms. At Spotify's scale of 200M monthly active users, this 20-100x speedup prevents the need for dozens of database read replicas.
+
+The pattern works in four steps: (1) check Redis for the key (e.g., `artist:${id}`), (2) on cache hit, parse JSON and return immediately, (3) on cache miss, query PostgreSQL, serialize result to JSON, store in Redis with a TTL (e.g., 5 minutes for track metadata, 1 hour for artist profiles), (4) when data is modified, delete the cache key so the next read fetches fresh data.
+
+Why Redis and not an in-memory Map or LRU cache in the Node.js process? Because Spotify runs multiple API server instances behind a load balancer. An in-memory cache is per-process: instance A might cache an artist's profile while instance B has stale data. When the artist updates their bio on instance A, instance B's cache is never invalidated. Redis provides a single shared cache visible to all instances, with atomic operations that prevent race conditions during concurrent reads and writes.
+
+#### Circuit Breaker Pattern
+
+A circuit breaker wraps calls to external services and monitors their health. The fundamental problem: when a service you depend on becomes slow or unresponsive, your service's threads accumulate waiting for timeouts. If your API server has 50 request processing slots and 40 are blocked waiting on a dead storage service, only 10 remain for all other traffic. Soon every request slot is consumed, and your entire API appears down -- even for endpoints that don't use storage. This chain reaction is called a cascading failure.
+
+The circuit breaker has three states. **CLOSED** (normal): requests pass through, the breaker counts failures in a rolling window. **OPEN** (tripped): when failures exceed a threshold (e.g., 50% in the last 10 requests), the breaker trips and immediately rejects all requests without calling the downstream service. Failing in 1ms is better than waiting 10 seconds for a timeout. **HALF-OPEN** (probing): after a reset timeout (e.g., 30 seconds), the breaker allows one test request through. If it succeeds, the breaker closes. If it fails, the breaker reopens.
+
+Spotify wraps storage operations, recommendation queries, and external API calls with Opossum circuit breakers. When the CDN/origin fails, the circuit opens and the player shows a "Playback unavailable" message after 3 retries, rather than hanging indefinitely. The Prometheus gauge `circuit_breaker_state` exposes the current state for alerting.
+
+#### Structured Logging with Pino
+
+When running multiple API server instances producing thousands of log lines per second, `console.log("User played track")` is useless. You cannot search, filter, aggregate, or alert on unstructured text. Structured logging outputs each log entry as a JSON object with consistent fields, enabling machine processing at scale.
+
+Every Spotify log entry includes: `level` (fatal/error/warn/info/debug), `time` (Unix timestamp), `msg` (event name like `stream_counted` or `playlist_created`), `requestId` (UUID propagated across all entries for a single request), and `userId` (attached via child loggers). This enables queries like "find all errors for user X in the last hour" or "count stream_counted events per minute for alerting."
+
+Pino was chosen because it is the fastest JSON logger in Node.js -- it writes JSON directly to stdout with zero synchronous processing, deferring formatting to a transport process. Spotify adds audit-tagged logs (`audit: true`) for sensitive operations like playlist deletion or account changes, which can be filtered into a separate audit trail.
+
+#### Prometheus Metrics and the RED Method
+
+Prometheus collects numerical time-series data that answers "how is the system performing?" Logs tell you what happened; metrics tell you how much and how fast. Spotify tracks three metric types:
+
+**Counters** increase monotonically. `http_requests_total` counts every request; `stream_counts_total` counts royalty-qualifying streams. You compute the rate by measuring change over time: `rate(http_requests_total[5m])` gives requests per second.
+
+**Histograms** record the distribution of values in buckets. `http_request_duration_seconds` records latency, enabling percentile calculations. The p95 latency tells you "95% of requests complete within X seconds" -- far more useful than the average, which can hide a tail of very slow requests.
+
+**Gauges** represent values that go up and down. `active_streams` shows current load; `db_pool_connections` shows connection pool usage.
+
+Spotify uses the RED method (Rate, Errors, Duration) as the primary monitoring framework: request rate tells you throughput, error rate tells you reliability, and duration tells you performance. Alert thresholds are configured: 5xx rate > 1% for 5 minutes triggers a page; p95 playback start > 500ms triggers a warning.
+
+#### Rate Limiting with Sliding Window
+
+Rate limiting controls how many requests a client can make within a time window. Without it, a single misbehaving client can monopolize server resources, degrading performance for everyone.
+
+Spotify uses Redis sliding window rate limiting. Each request adds a timestamp to a Redis sorted set keyed by user ID and endpoint category. On each new request, the algorithm removes entries older than the window, counts the remaining entries, and rejects the request if the count exceeds the limit. This provides smooth, accurate enforcement: a user limited to 60 requests per minute can make at most 60 in any rolling 60-second window, regardless of when they started.
+
+The project explicitly chose sliding window over token bucket. Token bucket accumulates tokens during inactivity -- a user idle for 10 minutes at a 60/minute limit would accumulate 600 tokens and could fire them all at once, overwhelming downstream services. Sliding window prevents this burst behavior. The trade-off is slightly higher Redis overhead (sorted set operations vs. simple counter), but accuracy justifies the cost for protecting search and recommendation services.
+
+Rate limits are tiered by endpoint: 5/15min for auth (brute-force protection), 60/min for search (prevent scraping), 300/min for playback URLs (allow normal listening), 100/min for library writes. Auth endpoints use IP-based limiting; other endpoints use user-based limiting. When Redis is unavailable, rate limiting fails open (allows the request) to prevent a cache outage from blocking all API traffic.
+
+#### Idempotency
+
+Idempotency ensures that retrying a failed operation does not produce unintended side effects. The problem: when a client sends a request to add a track to a playlist and receives a network timeout, it does not know whether the server processed the request. Without idempotency, retrying creates a duplicate track in the playlist.
+
+Spotify implements idempotency at two levels:
+
+**Database level**: The `playlist_tracks` table has a `UNIQUE(playlist_id, track_id)` constraint with `ON CONFLICT DO NOTHING`. Inserting the same track twice silently succeeds without creating a duplicate. Deleting a non-existent track is a no-op.
+
+**Application level**: The middleware supports `X-Idempotency-Key` headers. On the first request with a given key, the middleware executes the handler and caches the response in Redis with a 5-minute TTL. On subsequent requests with the same key, the cached response is returned without re-executing the handler. This is critical for playback events where the `stream_counted` event must fire exactly once per listening session -- network retries must not double-count streams that affect royalty payments.
+
+#### Health Checks: Liveness vs. Readiness
+
+Health check endpoints report service status to orchestrators and load balancers. Spotify implements three tiers:
+
+**Liveness** (`/health/live`): Answers "is the process running?" Returns 200 if the Express server can respond. Must be fast and must not call external dependencies -- a slow database should not cause the process to be killed and restarted. Kubernetes uses liveness probes to detect hung processes.
+
+**Readiness** (`/health/ready`): Answers "can this instance serve traffic?" Checks that PostgreSQL and Redis are reachable. If either is down, the instance reports not ready, and the load balancer stops routing traffic to it. The instance remains alive (not restarted) and resumes serving once the dependency recovers. This prevents users from being routed to an instance that would fail every request.
+
+**Full health** (`/health`): Returns comprehensive status with per-dependency health, circuit breaker states, and latency measurements. Used by operators for debugging, not by automated routing.

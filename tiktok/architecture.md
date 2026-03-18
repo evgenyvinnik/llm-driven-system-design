@@ -597,3 +597,184 @@ cd frontend && npm run dev    # Frontend on :5173
 - **Kubernetes orchestration**: No container scheduling
 - **A/B testing framework**: No experimentation infrastructure for algorithm tuning
 - **Audio/sound matching**: Hashtag-based only, no audio fingerprinting
+
+---
+
+## Frontend Architecture
+
+This section describes how the React frontend is structured and why each architectural decision was made.
+
+### Component Hierarchy
+
+```
+RootComponent (__root.tsx, checks auth on mount)
+├── <Outlet /> (route content, fills screen above bottom nav)
+│   ├── HomePage (/) -- full-screen vertical FYP with feed type tabs
+│   │   ├── Feed Type Tabs (Following | For You, floating over video)
+│   │   └── Virtualized Video List (@tanstack/react-virtual)
+│   │       └── Video Item (full-screen height)
+│   │           ├── VideoPlayer (video element with play/pause, progress bar)
+│   │           ├── VideoActions (vertical right sidebar: avatar, like, comment, share)
+│   │           └── VideoInfo (bottom overlay: username, description, hashtags)
+│   ├── DiscoverPage (/discover) -- hashtag/trending browsing
+│   ├── UploadPage (/upload) -- video upload form
+│   ├── InboxPage (/inbox) -- notifications placeholder
+│   ├── ProfilePage (/profile/$username) -- user profile with video grid
+│   ├── SettingsPage (/settings) -- user settings
+│   ├── LoginPage (/login) -- authentication
+│   └── RegisterPage (/register) -- account creation
+└── BottomNav (fixed bottom bar: Home, Discover, Upload, Inbox, Me/Login)
+```
+
+The root layout is minimal: a full-height flex column with `<Outlet />` filling the available space and a fixed `BottomNav` at the bottom. Unlike Netflix or Spotify which use sidebar-based navigation, TikTok uses a mobile-style bottom navigation bar matching the real TikTok app's mobile-first design. The upload button has a distinctive gradient background (blue-to-red), visually distinguished from other nav items.
+
+### Zustand Stores
+
+**`authStore`** manages authentication state: current user, loading state, and auth actions (login, register, logout, checkAuth, updateUser). The `updateUser` action allows optimistic local profile updates without a full re-fetch. On app load, `checkAuth` restores the session from the HTTP-only cookie by calling `/api/auth/me`. Zustand was chosen over React Context for the same reason as other projects in this repository: Context re-renders all consumers on any value change, while Zustand's selectors enable per-field subscriptions. This matters because the feed store updates `currentIndex` on every scroll event, and only the currently active video needs to re-render.
+
+**`feedStore`** manages the For You Page feed lifecycle: the video list, current video index, loading state, pagination (`hasMore` flag), and feed type (fyp/following/trending). This store is the core of the TikTok experience because the FYP feed is the primary product surface. Key behaviors:
+
+- **Feed type switching**: `setFeedType` clears the video list, resets the index, and immediately loads the first page of the new feed type. This ensures a clean transition between "Following" and "For You" tabs.
+- **Pagination**: `loadMore` fetches 10 videos at a time with offset-based pagination. It guards against concurrent loads (`isLoading` flag) and stops when the server indicates no more content (`hasMore: false`).
+- **Scroll-triggered loading**: `setCurrentIndex` checks if the user is within 3 videos of the end and triggers `loadMore` if needed. This preloading ensures smooth infinite scroll without visible loading states.
+- **Optimistic like/unlike**: `likeVideo` and `unlikeVideo` update the local video's `isLiked` flag and `likeCount` immediately, then send the API request in the background. If the API call fails, the optimistic update remains until the next feed load. This provides instant UI feedback for the most common user interaction.
+- **View tracking**: `recordView` sends watch duration and completion rate to the backend. This data feeds the recommendation engine's ranking phase -- completion rate is the primary signal for content quality.
+
+### TanStack Router Structure
+
+TikTok uses **file-based routing** via TanStack Router's Vite plugin. Route files in `routes/` are automatically discovered.
+
+| File | Path | Purpose |
+|------|------|---------|
+| `__root.tsx` | (layout) | Full-screen layout with bottom nav |
+| `index.tsx` | `/` | FYP feed with virtualized video scroll |
+| `discover.tsx` | `/discover` | Hashtag and trending browsing |
+| `upload.tsx` | `/upload` | Video upload form |
+| `inbox.tsx` | `/inbox` | Notifications |
+| `profile.$username.tsx` | `/profile/:username` | User profile with video grid |
+| `settings.tsx` | `/settings` | User settings |
+| `login.tsx` | `/login` | Authentication |
+| `register.tsx` | `/register` | Registration |
+
+### Data Fetching Pattern
+
+The frontend uses a service layer (`services/api.ts`) with separate API modules: `authApi` (login/register/logout/me), `feedApi` (FYP/following/trending feeds), `videosApi` (upload/like/unlike/view/comments), and `usersApi` (profiles/follow/unfollow). Each module wraps `fetch` with credentials, error handling, and JSON parsing. Feed data flows through the `feedStore` Zustand store; other data is fetched directly in route components.
+
+### Virtualization (Why It Matters)
+
+The FYP homepage is the most performance-critical page. Each video item occupies the full viewport height, and the user scrolls through an unlimited feed of videos. Without virtualization, rendering 50+ full-screen video elements would mean 50+ `<video>` tags in the DOM, each consuming memory for decoded video frames, audio buffers, and GPU textures. On mobile devices, this would exhaust available memory within minutes and cause the browser to crash.
+
+**How virtualization works:** The `useVirtualizer` hook from `@tanstack/react-virtual` calculates which items are currently visible in the scroll container and renders only those items (plus a small `overscan` buffer). For TikTok's full-screen feed, `overscan: 1` means only 3 items exist in the DOM at any time: the current video, one above, and one below. The virtualizer creates a container element with `height = totalSize` (total items x item height) to maintain correct scrollbar behavior, then absolutely positions only the visible items within this container using `transform: translateY()`.
+
+**Key implementation details:**
+- `estimateSize: () => containerHeight` -- each item is exactly the viewport height
+- Container height is measured on mount and on window resize to handle dynamic viewport sizes
+- `handleScroll` calculates the current video index from `scrollTop / containerHeight` and updates the feed store
+- The `VideoPlayer` component receives an `isActive` prop based on whether its index matches `currentIndex`. Only the active video autoplays; inactive videos are paused and reset to the beginning. This prevents multiple videos from playing simultaneously and saves bandwidth.
+- Scroll-triggered preloading: when `currentIndex >= videos.length - 3`, the feed store loads the next page in the background
+
+### Key UI Patterns
+
+**Full-Screen Video Player** -- Each video in the feed occupies the full viewport height. The player uses a simple tap-to-toggle-play/pause interaction. Videos loop automatically (`loop` attribute), start muted (required for autoplay on mobile browsers), and display a thin progress bar at the bottom showing current position. The play/pause overlay (a large play icon in a semi-transparent circle) only appears when the video is paused and active, providing a clear visual cue without cluttering the full-screen video during playback. View tracking is implemented by recording the start time when a video becomes active and computing watch duration and completion rate when the user scrolls away.
+
+**Vertical Action Bar** -- The right-side action bar (creator avatar, like, comment, share) is positioned absolutely at `right-2 bottom-32`, floating over the video. The like button changes color to TikTok red when liked and shows the count in a compact format (K/M suffixes). The creator avatar includes a small red "+" button for quick follow. Tapping the comment button opens a bottom-sheet modal that slides up to cover 2/3 of the screen, matching TikTok's mobile interaction pattern.
+
+**Video Info Overlay** -- Creator username, description, and hashtags are displayed at the bottom of each video over a gradient background (`from-black/60 to-transparent`) for readability. Hashtags are limited to 5 and displayed with `#` prefix. The overlay is positioned to avoid overlap with the action bar (`right-16` padding).
+
+**Bottom Navigation** -- Fixed at the bottom with five items: Home, Discover, Upload (gradient button), Inbox, and Profile/Login. The upload button uses a TikTok-signature gradient (`from-tiktok-blue to-tiktok-red`) to visually distinguish it as the primary creation action. Navigation items use `activeProps` and `inactiveProps` for consistent active state styling.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns implemented in this project from first principles.
+
+### RBAC (Role-Based Access Control)
+
+TikTok implements a four-tier role hierarchy: `user` (browse, watch, like, comment), `creator` (upload videos, manage own content), `moderator` (delete any content, review reports), and `admin` (full access including user management). The `ensureRole` middleware in `backend/src/middleware/auth.ts` checks the user's role on every protected request.
+
+The middleware chain works in three steps: (1) the session middleware extracts the session from the HTTP-only cookie and attaches user data from Redis, (2) the auth middleware verifies that a user is authenticated (returns 401 otherwise), (3) the `ensureRole` middleware compares the user's role against the minimum required role for the endpoint.
+
+Why RBAC instead of per-user permissions? RBAC scales with the number of roles (4), not the number of users (1B). Adding a new protected endpoint means adding one middleware call. Changing what moderators can do means updating one role definition, not millions of user records. The role hierarchy means higher roles inherit all lower role capabilities: an admin can do everything a moderator, creator, and user can do.
+
+### Redis Cache-Aside Pattern
+
+The cache-aside pattern checks Redis before querying PostgreSQL. Redis operations complete in ~0.1ms; PostgreSQL queries take 2-10ms. At TikTok's production scale of 58K FYP requests per second, this 20-100x speedup is the difference between needing 10 database servers and needing 100.
+
+TikTok applies this pattern primarily for recommendation results. The FYP endpoint is the most expensive call in the system (candidate generation + ranking involves multiple database queries and embedding similarity searches). Caching the ranked feed results per user in Redis with a short TTL (1-5 minutes) means subsequent scrolls within the same session hit cache instead of re-running the full recommendation pipeline.
+
+The pattern works in four steps: (1) check Redis for `feed:${userId}:${feedType}`, (2) on hit, return cached results immediately, (3) on miss, run the two-phase recommendation pipeline, store results in Redis with TTL, (4) when engagement events occur (like, watch completion), invalidate the cache to trigger fresh recommendations on the next request.
+
+Why Redis instead of a process-local cache? TikTok runs multiple API server instances. A process-local cache would mean each instance computes and caches recommendations independently, wasting resources on duplicate computation. Redis provides a shared cache: once one instance computes a user's feed, all other instances can serve it.
+
+### Circuit Breaker Pattern
+
+The recommendation service is TikTok's most critical path. If it slows down, every FYP request hangs, consuming request processing slots. When all slots are consumed, even simple endpoints (like, follow, profile view) become unresponsive. This cascading failure takes down the entire API.
+
+TikTok's circuit breaker wraps the recommendation service with aggressive settings:
+- **Timeout**: 5 seconds (users abandon after 3 seconds of loading)
+- **Error threshold**: 50% (aggressive enough to protect, not so sensitive to flap on single failures)
+- **Reset timeout**: 15 seconds (enough for database connection recovery)
+- **Volume threshold**: 20 requests (prevents a single slow query from tripping the breaker)
+
+**Fallback behavior**: When the circuit opens, the FYP endpoint serves trending videos instead of personalized content. Users still see engaging content (trending videos are popular by definition), just not personalized. This degradation is invisible to most users and far better than showing an error page.
+
+The three states: **CLOSED** (normal operation, tracking error rate), **OPEN** (all requests fail immediately in ~1ms, returning trending fallback), **HALF-OPEN** (after 15 seconds, one probe request tests if the recommendation service recovered). The Prometheus gauge `circuit_breaker_state` enables alerting when the circuit opens.
+
+### Structured Logging with Pino
+
+At production scale (580K events/sec), `console.log("User liked video")` is useless. You cannot search, filter, or alert on unstructured text across 100+ server instances.
+
+TikTok logs JSON objects with consistent fields: `level`, `time`, `msg`, `requestId`, and context-specific fields. Event-based logging names (`video_uploaded`, `recommendation_served`, `circuit_breaker_opened`) enable queries like "count recommendation_served events per minute" or "find all circuit_breaker_opened events in the last hour."
+
+Request ID propagation is critical: when a FYP request triggers candidate generation, ranking, and embedding similarity queries, all log entries share the same `requestId`. An operator investigating a slow FYP response can filter by that ID and see the full processing timeline across all stages.
+
+Pino is the fastest JSON logger in Node.js because it writes JSON to stdout with zero synchronous formatting. At TikTok's event volume, the difference between Pino and Winston (which formats synchronously) is measurable: Pino adds ~0.01ms per log call vs. Winston's ~0.1ms, which at 10K log entries/second saves 900ms/second of CPU time.
+
+### Prometheus Metrics
+
+TikTok tracks recommendation-specific metrics beyond standard HTTP metrics:
+- **FYP latency histogram** (authenticated vs. anonymous): Measures the full recommendation pipeline time. Authenticated FYP is more expensive because it runs personalization; anonymous FYP serves trending content.
+- **Recommendation phase timing**: Separate histograms for candidate generation and ranking, enabling identification of which phase is slow.
+- **Circuit breaker state gauge**: 0=closed, 1=half-open, 2=open. Alerts on state changes.
+- **Rate limit hit counter**: By endpoint and user type. Spikes indicate abuse or overly tight limits.
+- **Video engagement counters**: Views, likes, uploads by source (fyp, following, hashtag, search). Reveals which discovery surface drives the most engagement.
+
+The RED method (Rate, Errors, Duration) is the primary monitoring framework: if the FYP request rate drops, users may be unable to reach the service. If errors spike, the recommendation pipeline is failing. If duration increases, the database or embedding search is degrading.
+
+### Rate Limiting
+
+TikTok applies rate limits tuned to each endpoint's cost and abuse potential:
+
+| Endpoint | Limit | Window | Why |
+|----------|-------|--------|-----|
+| Login | 5 | 15 min | Brute-force protection |
+| Register | 3 | 1 hour | Prevent account farming |
+| Upload | 10 | 1 hour | Protect transcoding infrastructure |
+| Comments | 30 | 1 min | Prevent comment spam |
+| Likes | 100 | 1 min | Prevent engagement manipulation |
+| Feed | 60 | 1 min | Allow scrolling, prevent scraping |
+| Search | 30 | 1 min | Prevent data harvesting |
+
+The sliding window implementation uses Redis sorted sets. Each request adds a timestamp; on each new request, old entries are pruned, and the count is checked against the limit. This prevents burst abuse that token bucket would allow (accumulated tokens from inactivity).
+
+Rate limiting is scoped per-user for authenticated endpoints and per-IP for auth endpoints. This means a brute-force attack from one IP cannot try more than 5 login attempts per 15 minutes, regardless of how many accounts it targets.
+
+### Idempotency
+
+TikTok achieves idempotency through database constraints:
+
+- **Likes**: `UNIQUE(user_id, video_id)` constraint. Repeated likes are rejected at the database level. The API returns 200 (not 409), treating the duplicate as a success. This is important because the optimistic UI in the frontend will retry if a network error occurs.
+- **Follows**: `UNIQUE(follower_id, following_id)` prevents duplicate follows.
+- **View deduplication**: View events are rate-limited per user per video in Redis (30-second cooldown). This prevents inflated view counts from rapid scrolling through the feed, where a user might scroll past and back to the same video multiple times.
+- **Comment creation**: Currently not idempotent -- duplicate POST requests create duplicate comments. In production, this would be solved with `X-Idempotency-Key` headers checked via Redis.
+
+### Health Checks
+
+TikTok implements three health check endpoints:
+
+**`/health`**: Comprehensive check that verifies database connectivity, Redis connectivity, and circuit breaker status. Returns a detailed JSON response with per-dependency status. Used by monitoring systems.
+
+**`/health/live`**: Liveness probe. Returns 200 if the Express server is accepting connections. Does not check external dependencies. Used by Kubernetes to detect hung processes -- if liveness fails, the container is restarted.
+
+**`/health/ready`**: Readiness probe. Checks that PostgreSQL and Redis are reachable. If either is down, returns non-200 status. The load balancer stops routing traffic to this instance until the dependency recovers. This prevents users from hitting an instance that would fail every request, while keeping the instance alive so it can resume serving when dependencies recover.

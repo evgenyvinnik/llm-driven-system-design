@@ -482,6 +482,189 @@ WS     /ws                                     → WebSocket (subscribe/unsubscr
 
 ---
 
+## Frontend Architecture
+
+The frontend is a React + TypeScript application built with Vite, using TanStack Router for file-based routing and Zustand for global state management. The application serves three distinct personas (customer, restaurant owner, driver) within a single codebase, with role-based dashboards and real-time order tracking via WebSocket.
+
+### Component Hierarchy
+
+```
+__root.tsx (Header with role-based nav + Outlet)
+├── index.tsx               → Customer home: restaurant discovery with cuisine filters
+├── restaurant.$restaurantId.tsx → Restaurant detail with categorized menu
+├── cart.tsx                 → Shopping cart with delivery address, tip, and checkout
+├── orders.index.tsx         → Customer order history with status filters
+├── orders.$orderId.tsx      → Order detail with real-time tracking and ETA
+├── login.tsx / register.tsx → Authentication with role selection
+├── restaurant-dashboard.tsx → Restaurant owner: order management, menu CRUD
+├── driver-dashboard.tsx     → Driver: availability toggle, active deliveries, stats
+```
+
+Reusable components include `RestaurantCard` (grid display), `MenuItemCard` (add-to-cart interaction), `OrderCard` (status display with action buttons), and `Header` (role-adaptive navigation showing different links for customers, owners, and drivers).
+
+### Routing with TanStack Router
+
+File-based routing maps files to URL paths. Dynamic segments use the `$` prefix: `restaurant.$restaurantId.tsx` handles `/restaurant/123` and `orders.$orderId.tsx` handles `/orders/456`. The router provides type-safe access to these parameters within the component.
+
+The root layout (`__root.tsx`) provides the `Header` component and an `Outlet` for child routes. There are no explicit route guards -- each page checks `useAuthStore().user` and conditionally renders or redirects. The `fetchUser` method on the auth store is called on mount to restore the session.
+
+### State Management (Zustand Stores)
+
+Two Zustand stores manage global state, both using the `persist` middleware to survive page refreshes:
+
+**`authStore`** -- Manages user session with localStorage persistence. Provides `login`, `register`, `logout`, and `fetchUser` actions. The store persists only the `user` object to localStorage, so the app can show cached user info immediately while verifying the session with the server in the background.
+
+**`cartStore`** -- Manages the shopping cart with full localStorage persistence. The cart is tied to a single restaurant -- if the customer switches restaurants, the cart is cleared to prevent mixed-restaurant orders (DoorDash does not support multi-restaurant orders in a single delivery). The store tracks the restaurant, cart items (with quantities and special instructions), delivery address, and tip amount. Derived values (`subtotal()` and `itemCount()`) are computed on demand using `get()` rather than stored as state, ensuring they never become stale.
+
+The cart uses immutable update patterns throughout: `addItem` creates a new array via spread/map rather than mutating the existing one. This ensures React detects the state change and re-renders components that subscribe to the store.
+
+### Data Fetching Pattern
+
+Data flows through: **Component -> API Service -> Backend -> Component state update**.
+
+The API service layer (`services/api.ts`) is organized into four domain modules: `authAPI`, `restaurantAPI`, `orderAPI`, and `driverAPI`. Each module exposes typed methods that call the generic `fetchAPI<T>()` wrapper. The wrapper attaches `credentials: 'include'` for session cookie authentication, serializes request bodies as JSON, and extracts error messages from non-200 responses.
+
+Components fetch data in `useEffect` hooks on mount and store results in local `useState`. For example, the restaurant page fetches the restaurant and its categorized menu on mount, storing both in component state. There is no frontend caching layer -- cache-aside happens on the backend in Redis.
+
+**Idempotent order creation**: The `orderAPI.create` method attaches an `X-Idempotency-Key` header with `crypto.randomUUID()` to every order creation request. This prevents double-ordering if the customer taps "Place Order" and the network is slow -- the server recognizes the duplicate key and returns the original order instead of creating a new one. This is the only frontend API call that uses idempotency keys, because order creation involves financial transactions.
+
+### Real-Time Updates via WebSocket
+
+The `useWebSocket` hook (`hooks/useWebSocket.ts`) manages WebSocket connections for real-time order tracking. Unlike Uber's singleton service pattern, DoorDash uses a React hook pattern where each component that needs real-time updates creates its own connection scoped to specific channels.
+
+**Channel-based subscriptions**: On connection open, the hook subscribes to specified channels by sending `{type: "subscribe", channel: "order:123"}` messages. This allows targeted updates -- the order tracking page subscribes to `order:{orderId}`, the driver dashboard subscribes to `driver:{driverId}:orders`, and the restaurant dashboard subscribes to `restaurant:{restaurantId}:orders`.
+
+**Reconnection**: When the WebSocket disconnects, the hook automatically reconnects after a fixed 3-second delay. This is simpler than exponential backoff but sufficient for a food delivery use case where a few seconds of delay is acceptable.
+
+**Message handling**: Incoming messages are JSON-parsed and passed to a callback function provided by the consuming component. The component handles different message types (e.g., `order_status_update`, `driver_location_update`) and updates its local state accordingly.
+
+### Driver Location Tracking
+
+The `useDriverLocation` hook (`hooks/useDriverLocation.ts`) manages GPS location tracking for drivers. It uses the browser's Geolocation API with high-accuracy mode and periodically sends location updates to the server via the HTTP API.
+
+**Tracking lifecycle**: The hook provides `startTracking()` and `stopTracking()` controls. When tracking is active, it reads the current position every 10 seconds (configurable via `intervalMs`) and sends it to the server via `driverAPI.updateLocation()`. The hook uses `enableHighAccuracy: true` for GPS precision (important for delivery ETA calculations), with a 5-second timeout and no caching (`maximumAge: 0`).
+
+**Error handling**: Geolocation errors (permission denied, position unavailable) are captured and exposed via the hook's `error` state. Location update API failures are logged but do not block subsequent updates -- a missed update is recovered on the next interval.
+
+### Key UI Patterns
+
+**Restaurant discovery with cuisine filters**: The home page fetches all restaurants and available cuisine types on mount. Clicking a cuisine filter re-fetches with the `cuisine` query parameter. A search input filters by restaurant name.
+
+**Categorized menu display**: The restaurant detail page receives the menu organized by category (e.g., "Appetizers", "Entrees", "Drinks") from the API. Each category renders as a section with its items. The `MenuItemCard` component has an "Add to Cart" button that calls `cartStore.addItem()`, incrementing the quantity if the item already exists.
+
+**Order state machine visualization**: The `OrderCard` component renders different action buttons based on the order status and the user's role. For restaurant owners: "Confirm" and "Reject" on PLACED orders, "Mark Ready" on PREPARING orders. For drivers: "Pick Up" on READY_FOR_PICKUP orders, "Deliver" on PICKED_UP orders. For customers: "Cancel" on PLACED orders, and real-time status display for all other states.
+
+**Cart with restaurant lock**: When the customer adds an item from a different restaurant, the cart store detects the restaurant ID mismatch and clears the existing cart before adding the new item. This prevents confusion from mixed-restaurant carts.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern used in the architecture, what problem it solves, and how it works in this system.
+
+### Redis Geospatial Indexing for Driver Locations
+
+**The problem**: When an order is confirmed, the system needs to find the nearest available driver. Drivers are constantly moving, sending location updates every 10 seconds. Storing these ephemeral locations in PostgreSQL would mean constant UPDATE queries on the drivers table, creating write contention and slow reads for proximity searches.
+
+**How it works**: Redis provides native geospatial commands. `GEOADD driver_locations longitude latitude driverId` stores a driver's location in a geo-indexed sorted set. `GEOSEARCH driver_locations FROMLONLAT lng lat BYRADIUS 10 km COUNT 20 ASC WITHDIST` finds the 20 nearest drivers within 10km, sorted by distance. Redis encodes coordinates as 52-bit geohash scores in the sorted set, enabling efficient range queries in sub-millisecond time.
+
+**Why Redis over PostGIS**: Driver locations are hot, ephemeral data -- overwritten every 10 seconds and only relevant while the driver is active. Redis operates entirely in memory with no disk I/O overhead. PostGIS is better for static spatial data (restaurant locations, delivery zones) that changes infrequently and benefits from ACID guarantees.
+
+### Idempotency Keys for Order Creation
+
+**The problem**: A customer taps "Place Order" on a slow mobile connection. The request is sent but no response arrives within 5 seconds. The app times out and shows an error. The customer taps again. Without protection, the system creates two identical orders and charges the customer twice.
+
+**How it works** (`backend/src/shared/idempotency.ts`): The frontend generates a UUID via `crypto.randomUUID()` and attaches it as the `X-Idempotency-Key` header. The backend middleware follows this flow:
+
+1. Check Redis for `idempotency:order:create:{key}`
+2. If found with a completed response: return the cached response (the order was already created)
+3. If found as "in_progress": return 409 Conflict (the first request is still processing)
+4. If not found: set an "in_progress" marker with NX (only-set-if-not-exists) and 60s TTL
+5. Process the order creation
+6. Cache the completed response with a 24-hour TTL
+
+The NX flag on the Redis SET prevents a race condition where two identical requests arrive simultaneously -- only the first succeeds in setting the marker. If the request fails, `clearIdempotencyKey` removes the marker so the client can retry.
+
+**Why the frontend generates the key**: The server cannot detect duplicates without a client-provided identifier, because two identical request bodies could be intentional (the customer genuinely wants to order the same meal twice) or accidental (a network retry). The UUID ties the idempotency to the user's intent, not the request content.
+
+### Circuit Breaker Pattern
+
+**The problem**: If Redis becomes slow, every driver matching request waits for the timeout (e.g., 3 seconds). At 50 requests/second, 150 requests pile up waiting for Redis. These blocked requests consume connection pool slots and memory, causing the entire API to become unresponsive -- even for endpoints that do not use Redis (like restaurant browsing).
+
+**How it works** (`backend/src/shared/circuit-breaker.ts`): The circuit breaker wraps calls to external dependencies and tracks failure rates:
+
+- **CLOSED**: Normal operation. Requests pass through. Failures are counted over a rolling window.
+- **OPEN**: When failures exceed the threshold (e.g., 50% of 5+ requests), the circuit opens. All requests fail immediately with a fallback response instead of waiting for a timeout. For driver search, the fallback returns an empty list. The order proceeds without driver assignment -- matching is retried when the circuit recovers.
+- **HALF-OPEN**: After a reset timeout, one probe request is allowed through. Success closes the circuit; failure reopens it.
+
+Each state transition emits a Prometheus metric, enabling dashboards and alerts when dependencies degrade.
+
+### Structured Logging (Pino)
+
+**The problem**: When debugging why an order was assigned to the wrong driver at 2 AM, you need to trace the matching decision through millions of log lines. `console.log("Order assigned")` provides no searchable context -- which order? which driver? what was the matching score?
+
+**How it works** (`backend/src/shared/logger.ts`): Pino outputs JSON-formatted log lines where every piece of context is a structured field: `{"level":"info","service":"matching","orderId":456,"driverId":"abc","score":87.3,"msg":"Driver assigned to order"}`. Log aggregation systems (ELK, Datadog) can index these fields for fast searching: "show all orders where driverId = abc" or "show all matching decisions with score < 50."
+
+Log levels (trace, debug, info, warn, error, fatal) allow filtering by severity. Production runs at `info` level, omitting verbose debug logs. When investigating an issue, you can temporarily lower the level to `debug` for more detail.
+
+### Prometheus Metrics
+
+**The problem**: You need real-time visibility into system health. How many orders are being placed per minute? What is the average matching latency? How many drivers are online? Logs answer "what happened to this specific request" but not "what is the system doing right now."
+
+**How it works** (`backend/src/shared/metrics.ts`): Three metric types:
+- **Counter**: `doordash_orders_total{status}` -- counts orders by status. The rate of change gives orders/second.
+- **Histogram**: `doordash_matching_duration_seconds` -- tracks matching latency distribution. Prometheus derives percentiles (p50, p95, p99) from buckets.
+- **Gauge**: `doordash_active_drivers` -- current number of online drivers. Useful for supply monitoring.
+
+The `/metrics` endpoint serves all metrics in Prometheus text format. Grafana dashboards visualize these metrics, and alerting rules fire when values deviate from baselines (e.g., matching latency p99 > 5 seconds).
+
+### Session-Based Authentication
+
+**The problem**: The server needs to identify who is making each request. Two approaches exist: session tokens (server stores state in Redis) and JWTs (client carries a self-contained token).
+
+**How it works**: When a user logs in, the server creates a session in Redis (random token -> user ID + role), sets an HTTP-only cookie with the token, and returns the user profile. On subsequent requests, the browser sends the cookie automatically, and the auth middleware (`backend/src/middleware/auth.ts`) looks up the session in Redis.
+
+**Why sessions over JWTs**: In a three-sided marketplace, a restaurant owner might need to be immediately deactivated (food safety violation). With session auth, deleting the Redis key instantly invalidates their access. With JWTs, the token remains valid until expiration -- even a short 15-minute JWT means the owner could continue accepting orders for 15 minutes after deactivation. For food delivery, this is unacceptable.
+
+### Role-Based Access Control (RBAC)
+
+**The problem**: DoorDash has three user roles (customer, restaurant_owner, driver) with different permissions. A customer should not be able to confirm an order. A driver should not be able to modify a restaurant's menu. Without access control, any authenticated user could perform any action.
+
+**How it works**: Each user has a `role` column in the database. The auth middleware attaches the user object (including role) to the request. Route-level middleware checks the role before allowing access:
+- Customer routes (`/api/orders` POST): require `role = 'customer'`
+- Restaurant routes (`/api/restaurants/:id/menu` POST): require `role = 'restaurant_owner'` AND ownership of the restaurant
+- Driver routes (`/api/drivers/orders/:id/pickup` POST): require `role = 'driver'` AND assignment to the order
+
+This is a simple flat RBAC model (users have one role, each role has fixed permissions). A more complex system would use role-permission mapping tables, but for three well-defined roles, a role column check is sufficient and easier to reason about.
+
+### Multi-Factor ETA Calculation
+
+**The problem**: A customer wants to know when their food will arrive, but the answer depends on many independent factors: how far is the driver from the restaurant? how long will the restaurant take to prepare the food? how far is the restaurant from the delivery address? what is traffic like right now?
+
+**How it works**: The ETA combines four components:
+1. **Driver to restaurant**: Distance from driver's current location to restaurant, divided by average speed, adjusted for traffic conditions (rush hour multiplier: 1.5x for 7-9 AM and 5-7 PM, 1.3x for lunch rush)
+2. **Preparation time**: The restaurant's estimated prep time for this order (restaurants set this per-order or use a default)
+3. **Restaurant to customer**: Distance from restaurant to delivery address, adjusted for traffic
+4. **Buffer**: Fixed 5-minute buffer for parking, walking to door, and finding the customer
+
+The ETA updates dynamically as conditions change: when the driver's location changes, when the restaurant marks the order as ready (prep time becomes 0), or when traffic conditions change.
+
+### Order State Machine
+
+**The problem**: An order progresses through multiple states (PLACED -> CONFIRMED -> PREPARING -> READY_FOR_PICKUP -> PICKED_UP -> DELIVERED) with different actors triggering transitions. Without strict state management, race conditions could lead to invalid states (e.g., marking an order as DELIVERED before it is PICKED_UP).
+
+**How it works**: State transitions use optimistic locking with a WHERE clause on the expected current status:
+
+```sql
+UPDATE orders SET status = 'CONFIRMED' WHERE id = $1 AND status = 'PLACED' RETURNING *;
+```
+
+If zero rows are updated, the transition is rejected -- someone else already changed the status. Each transition is validated: only the restaurant can CONFIRM, only the driver can PICKED_UP, and you can only transition to the next state in sequence.
+
+The state machine also triggers side effects: CONFIRMED triggers driver matching, PICKED_UP starts the delivery timer, DELIVERED calculates the final payment breakdown.
+
+---
+
 ## Key Design Decisions
 
 ### 1. Redis GEOSEARCH for Driver Locations vs PostGIS

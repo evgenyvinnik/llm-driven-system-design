@@ -524,6 +524,185 @@ Server ──▶ Both:
   { type: "pong", timestamp }
 ```
 
+## Frontend Architecture
+
+The frontend is a React 19 + TypeScript application built with Vite, using TanStack Router for file-based routing and Zustand for global state management. The application serves two distinct personas (rider and driver) within a single codebase, with role-based routing and a WebSocket service that provides real-time updates for both.
+
+### Component Hierarchy
+
+```
+__root.tsx (role-based navigation + Outlet)
+├── index.tsx           → Landing page / role-based redirect
+├── login.tsx           → Unified login for riders and drivers
+├── register.tsx        → Registration with rider/driver selection
+├── rider.tsx           → Rider dashboard (pickup/dropoff, estimates, ride status)
+│   └── rider/history.tsx → Ride history with pagination
+├── driver.tsx          → Driver dashboard (online/offline, ride offers, trip lifecycle)
+│   ├── driver/earnings.tsx → Earnings by period (today/week/month)
+│   └── driver/history.tsx  → Completed trip history
+```
+
+The root layout provides role-based navigation -- after login, the root route detects the user type (`rider` or `driver`) from the auth store and renders the appropriate navigation links.
+
+### Routing with TanStack Router
+
+TanStack Router's file-based routing maps each file to a URL path. Nested routes like `driver/earnings.tsx` create nested URL segments (`/driver/earnings`). The `$` prefix creates dynamic segments (not used here since rides are accessed via store state rather than URL parameters).
+
+There are no route guards enforcing authentication at the router level. Instead, each page component checks `useAuthStore().user` and redirects to `/login` if null. The `checkAuth` method is called on app startup to restore the session from a persisted localStorage token.
+
+### State Management (Zustand Stores)
+
+Three Zustand stores manage global state, each handling a distinct concern:
+
+**`authStore`** -- Manages user session with persistence middleware. The store persists only the JWT token to `localStorage` (not the full user object) via Zustand's `persist` middleware with `partialize`. On app startup, `checkAuth` reads the token from localStorage, validates it with the backend (`GET /api/auth/me`), and reconnects the WebSocket. On login/register, the store saves the token and immediately connects the WebSocket for real-time updates. On logout, it clears the token, disconnects the WebSocket, and resets user state.
+
+**`rideStore`** -- Manages the complete rider-side ride lifecycle. Tracks pickup/dropoff locations, fare estimates for all vehicle types, the selected vehicle type, the current active ride, ride status, and nearby driver positions. The store registers WebSocket event handlers at initialization time (outside the store creation function) to react to server-pushed events: `ride_matched` updates the ride with driver info, `driver_arrived`/`ride_started`/`ride_completed` transition the ride status, `ride_cancelled` clears the ride and shows an error, and `no_drivers_available` notifies the user. This event-driven pattern means the rider UI updates instantly when the driver accepts, arrives, or completes -- no polling required.
+
+**`driverStore`** -- Manages driver availability and trip progression. Tracks online/offline status, current location, active ride assignment, pending ride offers with expiration timestamps, and earnings data. The store sends location updates through both WebSocket (for real-time tracking with low latency) and HTTP API (for reliable persistence). Ride offers arrive via WebSocket with an `expiresIn` countdown -- the UI shows a timer based on `offerExpiresAt`, and declining fires an API call but does not wait for a response (fire-and-forget pattern for responsiveness).
+
+### WebSocket Service
+
+The WebSocket service (`services/websocket.ts`) is implemented as a singleton class that provides bidirectional real-time communication between the frontend and backend.
+
+**Connection lifecycle**: The service connects when the user logs in, authenticates by sending the JWT token as the first message, and automatically reconnects on disconnection with linear backoff (delay increases by 1 second per attempt, up to 5 attempts). The connection URL derives from `window.location` to work seamlessly with the Vite development proxy.
+
+**Message routing**: Incoming messages are JSON-parsed and routed to handlers registered via the `on(type, handler)` method. Stores subscribe to specific event types (`ride_offer`, `ride_matched`, etc.) during initialization. A wildcard `'*'` handler can be registered for debugging/logging all messages. The `off(type, handler)` method allows cleanup when components unmount.
+
+**Outbound messages**: The service provides typed methods for common operations: `sendLocationUpdate(lat, lng)` for driver position updates and `ping()` for keepalive.
+
+### Data Fetching Pattern
+
+Data flows through: **Component -> Store action -> API Service -> Backend -> Store update -> Component re-render**.
+
+The API service (`services/api.ts`) is organized by domain (`auth`, `rides`, `driver`) and attaches the JWT token from localStorage to every request via an `Authorization: Bearer` header. The generic `request<T>()` helper handles JSON serialization, error extraction, and type casting.
+
+For the rider flow: the component calls a store action (e.g., `requestRide()`), which calls the API service (`api.rides.request()`), receives the response, and updates the store state. The component re-renders reactively because it subscribes to the store via Zustand's hook.
+
+For real-time updates: the WebSocket pushes events directly to store handlers, which update state, triggering component re-renders without any component involvement.
+
+**Dual-channel location updates**: The driver store sends location updates through both WebSocket and HTTP API simultaneously. WebSocket provides low-latency delivery for real-time tracking, while the HTTP API provides reliable persistence even if the WebSocket connection is momentarily interrupted. The HTTP call fails silently -- location updates are not critical enough to show errors to the driver.
+
+### Key UI Patterns
+
+**Ride offer countdown**: When a driver receives a ride offer via WebSocket, the store records `offerExpiresAt = Date.now() + expiresIn * 1000`. The driver UI component uses this timestamp to render a countdown timer. When the timer reaches zero, the offer is automatically declined. This creates urgency for drivers to respond while ensuring the system can offer the ride to the next driver.
+
+**Fare estimate display**: When the rider enters pickup and dropoff locations, `fetchEstimates()` calls the backend which returns estimates for all vehicle types (economy, comfort, premium, XL) with surge multipliers. The rider selects a vehicle type, and the selected estimate updates in the store. This avoids separate API calls per vehicle type.
+
+**Trip lifecycle state machine on the driver side**: The driver UI renders different action buttons based on the current ride status: "Accept" when a ride offer is pending, "Arrived" when matched (driving to pickup), "Start Ride" when at pickup, and "Complete" when rider is picked up. Each transition calls a store action that hits the API and optimistically updates the local ride status.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern used in the architecture, what problem it solves, and how it works in this system.
+
+### Redis Geospatial Indexing
+
+**The problem**: When a rider requests a ride, the system needs to find nearby available drivers within seconds. With 5M drivers updating their locations every 3 seconds, a traditional database query (`SELECT * FROM drivers WHERE distance(lat, lng, ?, ?) < 5`) would require computing the Haversine formula for every row. Even with a spatial index, PostgreSQL/PostGIS adds 10-50x latency compared to an in-memory solution.
+
+**How it works**: Redis provides native geospatial commands built on sorted sets. `GEOADD drivers:available longitude latitude driverId` stores a driver's location. `GEOSEARCH drivers:available FROMLONLAT lng lat BYRADIUS 5 km COUNT 20 ASC WITHDIST` returns the 20 nearest drivers within 5km, sorted by distance, with the distance included. Under the hood, Redis encodes lat/lng into a 52-bit geohash stored as the sorted set score, enabling efficient range queries.
+
+**Why Redis over PostGIS for this use case**: Driver locations are ephemeral hot data -- they change every 3 seconds and only matter while the driver is online. Redis keeps everything in memory with sub-millisecond query times. PostGIS would require disk I/O and connection pool management for data that is overwritten seconds later. The trade-off is that Redis stores all data in memory (~200MB for 5M drivers), but this is well within a single instance's capacity.
+
+### WebSocket Bidirectional Communication
+
+**The problem**: Ride-hailing requires both server-to-client push (ride offers to drivers, status updates to riders) and client-to-server push (driver location updates every 3 seconds). With HTTP polling at 1-second intervals, 3M concurrent users would generate 3M requests/second just for status checks -- overwhelming the API servers with requests that return "no change" 99% of the time.
+
+**How it works**: A WebSocket connection is a persistent, full-duplex TCP connection established via an HTTP upgrade handshake. Once connected, both client and server can send messages at any time without the overhead of HTTP headers on each message. In this project, after the WebSocket connection opens, the client sends an `auth` message with the JWT token. The server validates the token and associates the connection with a user ID, enabling targeted message delivery.
+
+**Connection management at scale**: WebSocket connections are stateful -- each server instance holds a subset of active connections. To send a message to a specific user, the system needs to know which server holds their connection. In production, this is solved with Redis Pub/Sub: each server subscribes to a channel, and when a message needs to reach a user, it is published to the channel where the correct server receives it. The local implementation runs a single server instance, avoiding this complexity.
+
+**Reconnection with exponential backoff**: When the connection drops (network change, server restart), the client attempts to reconnect with increasing delays (1s, 2s, 3s, 4s, 5s) up to 5 attempts. This prevents thundering herd -- if a server restarts and 50K clients all reconnect simultaneously, staggered delays spread the reconnection load over several seconds.
+
+### Idempotency Keys
+
+**The problem**: A rider taps "Request Ride" on a mobile app. The request is sent, but the network is slow and no response comes back. The app shows a spinner for 5 seconds and times out. Did the ride get created or not? The user taps again. Without idempotency protection, the system creates two rides and potentially charges the rider twice.
+
+**How it works**: The client generates a unique UUID for each logical operation and sends it as the `X-Idempotency-Key` header. The server middleware (`backend/src/middleware/idempotency.ts`) follows this flow:
+
+1. Check Redis for `idempotency:{operation}:{userId}:{key}`
+2. If key exists with a completed response: return the cached response (the ride was already created)
+3. If key exists as "pending": return 409 Conflict (the first request is still processing)
+4. If key does not exist: set a "pending" marker with NX (only-set-if-not-exists) and 60s TTL, then process the request
+5. After processing: cache the response with a 24-hour TTL
+6. If Redis is unavailable: proceed without idempotency protection (fail-open for availability)
+
+The NX flag on the Redis SET command prevents a race condition where two identical requests arrive simultaneously -- only the first one succeeds in setting the pending marker.
+
+### Circuit Breaker Pattern
+
+**The problem**: If Redis becomes slow (network issues, memory pressure), every matching request waits for the timeout. These waiting requests consume server resources, causing the API to become unresponsive even for endpoints that do not need Redis (like login or ride history). One failing dependency takes down the entire system.
+
+**How it works**: The circuit breaker (`backend/src/utils/circuitBreaker.ts`) uses the Opossum library and operates in three states:
+
+- **CLOSED**: Requests flow normally. The breaker tracks the failure rate over a rolling window (e.g., 10 seconds with 50% threshold over 5+ requests).
+- **OPEN**: When failures exceed the threshold, the circuit opens. All subsequent requests fail immediately (< 1ms) with a fallback response. For Redis geo operations, the fallback returns an empty driver list. The user sees "No drivers available" -- a degraded but honest response rather than a hanging spinner.
+- **HALF-OPEN**: After a reset timeout (15 seconds), the breaker allows one probe request through. If it succeeds, the circuit closes. If it fails, the circuit opens again for another reset period.
+
+Circuit breaker state transitions are emitted as Prometheus metrics, enabling alerts when circuits open (indicating a dependency failure).
+
+### Surge Pricing with Geohash Partitioning
+
+**The problem**: Dynamic pricing needs to balance supply (available drivers) and demand (ride requests) in real-time, but the supply/demand ratio varies by location. A concert venue might have surge while a neighborhood 2km away has normal pricing.
+
+**How it works**: The map is divided into geohash cells (~5km precision). A geohash encodes a geographic coordinate into a string (e.g., "9q8yy") where each character narrows the area. Ride requests increment a Redis counter keyed by geohash (`demand:9q8yy`) with a 5-minute TTL, creating a rolling demand window. Supply is counted by running `GEORADIUS` within the same geohash area. The supply/demand ratio maps to a surge multiplier table (ratio > 2.0 = 1.0x, ratio < 0.25 = 2.5x cap).
+
+**Why geohash over H3 hexagons**: Geohash is implementable with pure string operations (30 lines of code). H3 hexagons provide more uniform area coverage and avoid edge effects at cell boundaries, but require a native C library and more complex neighbor calculations. For surge pricing granularity, the imprecision of geohash boundaries is acceptable.
+
+### Optimistic Locking for State Transitions
+
+**The problem**: The ride state machine has strict transitions (requested -> matched -> driver_arrived -> picked_up -> completed). When a rider cancels while the matching engine simultaneously assigns a driver, both operations try to update the same ride. Without protection, the ride could end up in an inconsistent state -- cancelled but with a driver assigned.
+
+**How it works**: Every state transition includes a WHERE clause on the expected current status:
+
+```sql
+UPDATE rides SET status = 'matched', driver_id = $1
+WHERE id = $2 AND status = 'requested'
+RETURNING *;
+```
+
+If zero rows are returned, the transition is rejected -- someone else already changed the status. The caller can then check the current status and respond appropriately (e.g., the matching engine re-enqueues the ride request to find another driver).
+
+This is "optimistic" because it allows parallel reads (no locks held during the read phase) and only detects conflicts at write time. The alternative, pessimistic locking (`SELECT ... FOR UPDATE`), would serialize all operations on the same ride, creating a bottleneck under high concurrency.
+
+### Structured Logging (Pino)
+
+**The problem**: `console.log("Ride created")` is useless in production. When debugging why a ride matching failed at 3 AM, you need to search millions of log lines by ride ID, user ID, or error type. Plain text logs cannot be searched by field, have no severity levels, and cannot be ingested by log aggregation systems (ELK, Datadog).
+
+**How it works**: Pino outputs JSON-formatted log lines with structured fields: `{"level":"info","time":1710000000,"service":"matching","rideId":"abc","msg":"Driver matched"}`. Each field is searchable. Service-specific loggers (`createModuleLogger('matching')`) tag all logs from a module, enabling filtering by component. Request logging middleware captures HTTP method, path, status code, and duration for every request.
+
+### Prometheus Metrics (RED Method)
+
+**The problem**: You need to answer "how is the system performing right now?" in real-time. Logs tell you what happened to individual requests; metrics give aggregate views. Without metrics, you discover problems when users complain, not when they start.
+
+**How it works**: The backend exposes 20+ custom metrics on `/metrics` in Prometheus exposition format. Three metric types are used:
+- **Counter** (monotonically increasing): `uber_ride_requests_total` -- counts total ride requests, partitioned by vehicle type and status. Rate of change tells you requests/second.
+- **Histogram** (distribution of values): `uber_ride_matching_duration_seconds` -- tracks how long matching takes. Prometheus computes percentiles (p50, p95, p99) from histogram buckets.
+- **Gauge** (current value): `uber_drivers_online_total` -- how many drivers are online right now.
+
+The **RED method** monitors three signals per service: Rate (requests/second), Errors (error rate), and Duration (latency percentiles). Alerting rules fire when these deviate from baseline.
+
+### Health Checks (Liveness vs Readiness)
+
+**The problem**: Load balancers need to know which server instances can handle traffic. A process might be running but unable to serve requests because Redis is down. Sending traffic to this instance would result in errors for every matching request.
+
+**How it works**: Three endpoints serve different purposes:
+- **`/health/live`**: Returns 200 if the process is running. Used by Kubernetes as a liveness probe -- if this fails, the container is restarted. Does NOT check external dependencies, because a Redis outage should not trigger mass container restarts.
+- **`/health/ready`**: Checks that PostgreSQL and Redis are responsive. Used as a readiness probe -- if this fails, the load balancer stops sending traffic but does not restart the instance. When dependencies recover, the instance automatically becomes ready again.
+- **`/health`**: Detailed status with latency measurements for each dependency, circuit breaker states, and memory usage. Used for dashboards and debugging, not for automated decisions.
+
+### Async Queue Processing (RabbitMQ)
+
+**The problem**: When a rider requests a ride, the system needs to find a driver, send notifications, and record analytics. If all of this happens synchronously in the API request handler, the rider waits 2-5 seconds for a response. If the notification service is slow, the entire ride request is delayed.
+
+**How it works**: The ride request API immediately creates the ride in PostgreSQL, publishes a matching request to the `matching.requests` queue, and returns a response to the rider in < 200ms. A separate matching worker consumes from the queue, finds nearby drivers, scores them, and sends a ride offer via WebSocket. The worker operates independently -- if it crashes, the message stays in the queue and is reprocessed.
+
+A fanout exchange (`ride.events.fanout`) broadcasts ride lifecycle events to multiple queues: notifications (to alert drivers/riders), analytics (to record metrics), and potentially billing (future). Each consumer reads independently at its own pace.
+
+**Dead letter queue**: Messages that fail after 3 retries (with exponential backoff delays of 2s, 4s, 8s) are routed to the `dead.letter.queue` for manual review. This prevents poison messages from blocking the queue while preserving them for debugging.
+
+---
+
 ## Key Design Decisions
 
 ### Redis Geo vs PostGIS vs Tile38

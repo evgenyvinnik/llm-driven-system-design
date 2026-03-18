@@ -873,3 +873,200 @@ All three infrastructure services run via `docker-compose up -d`. The backend ru
 - **Billing / subscription management** -- subscription_tier column exists but not enforced
 - **Chaos engineering** -- no Chaos Monkey or fault injection
 - **Analytics pipeline** -- no Kafka, Spark, or Druid for event processing
+
+---
+
+## Frontend Architecture
+
+This section describes how the React frontend is structured and why each architectural decision was made.
+
+### Component Hierarchy
+
+```
+App (TanStack Router + auth init)
+├── LoginPage
+├── ProfilesPage (profile selection grid)
+├── BrowsePage
+│   ├── Navbar (global nav: search, profiles, notifications)
+│   ├── HeroBanner (featured content with backdrop, metadata, Play/Info buttons)
+│   ├── ContinueWatchingRow (progress bars, episode info, resume links)
+│   └── VideoRow[] (horizontal scrollable rows per genre/category)
+│       └── VideoCard[] (poster, hover preview, My List toggle)
+├── VideoDetailPage (title details, episodes, similar titles)
+├── WatchPage
+│   └── VideoPlayer (full-screen playback)
+│       ├── TopBar (title + back navigation)
+│       ├── CenterPlayButton (large play/pause overlay)
+│       └── ControlBar
+│           ├── ProgressBar (seek, buffered indicator)
+│           ├── VolumeControl (slider + mute toggle)
+│           └── QualitySelector (resolution picker)
+├── SearchPage (query-driven results grid)
+└── MyListPage (saved titles grid)
+```
+
+### Zustand Stores
+
+Netflix uses three domain-separated Zustand stores, each responsible for a distinct concern. Zustand was chosen over React Context because Context triggers re-renders on every consumer when any value changes, while Zustand uses selector-based subscriptions so components only re-render when the specific slice of state they use changes. This matters when a video player updates `currentTime` 30 times per second -- without selector isolation, every component in the tree would re-render.
+
+**`authStore`** manages authentication state: the current account, selected profile, profile list, and loading/error states. Netflix supports multiple viewing profiles per account, so this store handles both account-level auth (login/logout/register) and profile-level selection (selectProfile/clearProfile). The `checkAuth` action restores session state on page load by calling the backend's `/auth/me` endpoint, enabling seamless page refreshes without re-login. Profile selection is stored server-side in the session, so switching devices preserves the active profile.
+
+**`browseStore`** manages content discovery: personalized homepage rows, continue watching items, My List, search results, and available genres. This store is the data layer for the browse experience. Homepage rows come from the backend's personalization service, which generates rows like "Because you watched X" and "Trending Now." The store separates homepage loading from My List loading because they have different lifecycles -- the homepage refreshes on profile switch, while My List updates optimistically when the user adds/removes a title. The `addToMyList` and `removeFromMyList` actions immediately update local state for responsive UI, then sync with the server. If the server request fails, the local state is stale until the next load.
+
+**`playerStore`** manages playback state: play/pause, current quality, volume/mute, current time, duration, buffered amount, fullscreen, and controls visibility. This store also handles streaming manifest loading and progress saving. The manifest contains available quality levels with URLs; the player defaults to 720p and allows manual quality switching. Progress is saved to the server every 10 seconds during playback and on component unmount, enabling the "Continue Watching" feature. The store tracks both `videoId` and `episodeId` to support series playback with episode-level resume. A `reset` action cleans up all state when navigating away from the player.
+
+### TanStack Router Structure
+
+Netflix uses a programmatic (code-defined) router rather than file-based routing. The route tree is defined in `App.tsx` with explicit `createRoute` calls.
+
+| Path | Component | Purpose |
+|------|-----------|---------|
+| `/` | Redirect | Checks auth, redirects to `/login`, `/profiles`, or `/browse` |
+| `/login` | LoginPage | Email/password authentication |
+| `/register` | LoginPage | Account creation (reuses login UI) |
+| `/profiles` | ProfilesPage | Profile selection (Netflix-style avatar grid) |
+| `/browse` | BrowsePage | Homepage with personalized rows |
+| `/browse/series` | BrowsePage | Series-filtered browse |
+| `/browse/movies` | BrowsePage | Movie-filtered browse |
+| `/video/$videoId` | VideoDetailPage | Title details, episodes, similar |
+| `/watch/$videoId` | WatchPage | Full-screen player with `?episodeId=` search param |
+| `/search?q=` | SearchPage | Query-driven search results |
+| `/my-list` | MyListPage | User's saved titles |
+
+The index route (`/`) uses `beforeLoad` to check auth state from the Zustand store and redirect appropriately. This avoids rendering any page content before determining where the user belongs. The watch route uses `validateSearch` to type-check the `episodeId` search parameter, enabling direct deep links to specific episodes.
+
+### Data Fetching Pattern
+
+The frontend uses a service layer (`services/`) that wraps `fetch` calls with consistent error handling, cookie credentials, and JSON parsing. Each service module corresponds to a backend domain: `auth.ts` (login/logout/register/profiles), `videos.ts` (homepage, search, My List, genres), and `streaming.ts` (manifests, progress updates). Zustand store actions call service methods and update state. Components call store actions in `useEffect` hooks on mount. There is no React Query or SWR -- the stores act as a simple cache that components populate on mount. This is adequate for Netflix's navigation pattern where pages are visited sequentially (browse -> detail -> watch) rather than rapidly switched between.
+
+### Key UI Patterns
+
+**Video Player** -- The player is decomposed into a main `VideoPlayer` component that orchestrates sub-components (`TopBar`, `CenterPlayButton`, `ControlBar`) and a custom `useVideoPlayerControls` hook. The hook handles keyboard shortcuts (Space for play/pause, arrow keys for skip/volume, M for mute, F for fullscreen, Escape to exit), mouse-based auto-hiding of controls (3-second idle timeout), and fullscreen toggle via the Fullscreen API. This separation keeps the main component focused on video element management and progress tracking, while the hook encapsulates input handling logic that would otherwise clutter the render function.
+
+**Horizontal Scroll Rows** -- Each `VideoRow` implements Netflix's signature horizontal carousel with arrow navigation. Arrow buttons appear on hover and scroll by 80% of the visible width with smooth scrolling. Scroll position is tracked to conditionally show/hide left and right arrows, avoiding dead-end visual cues. The rows use native CSS `overflow-x: auto` rather than a virtualized list because each row contains at most 20-30 cards, making DOM performance a non-issue.
+
+**Continue Watching Row** -- A specialized row variant that shows progress bars (percentage complete), time remaining, and episode information for series. Each card links directly to the watch page with the correct `episodeId` search parameter, enabling one-click resume.
+
+**Hero Banner** -- The featured content banner uses CSS gradients (`from-black/80 via-black/40 to-transparent` horizontal and `from-netflix-black via-transparent to-transparent` vertical) to ensure text readability over dynamic backdrop images. The banner occupies 80vh to create the immersive "above-the-fold" experience.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains the production-grade patterns implemented in this project. Each pattern is described from first principles -- what problem it solves, how it works mechanically, and why it was chosen over alternatives.
+
+### RBAC (Role-Based Access Control)
+
+RBAC is a security model where access to system resources is determined by a user's assigned role, rather than attaching permissions directly to individual users. The problem it solves: without RBAC, you would need to check individual user IDs against every protected resource, making authorization logic scattered, error-prone, and impossible to audit. When a new admin joins the team, you would have to update hundreds of permission entries instead of assigning one role.
+
+**How it works in this project:** Netflix defines six roles organized in a hierarchy: `viewer`, `kids_viewer`, `account_owner`, `admin`, `content_admin`, and `experiment_admin`. Each role implies a set of permissions. The middleware chain processes each request through three stages:
+
+1. **Authentication** -- The `authenticate` middleware extracts the session token from the HTTP-only cookie, looks up the session in Redis, and attaches the user object (including their role) to the request. If no valid session exists, the request is rejected with 401.
+
+2. **Role check** -- The `ensureRole` middleware compares the user's role against the minimum required role for the endpoint. For example, uploading content requires `content_admin`, while browsing requires only `viewer`. This check is a single string comparison against a role hierarchy.
+
+3. **Resource-level authorization** -- Some operations require additional checks beyond role. For example, a profile can only be modified by the account that owns it. This is checked in the route handler after the role check passes.
+
+The role hierarchy means higher roles inherit lower role permissions. An `admin` can do everything an `account_owner` can, plus admin-specific operations. This avoids maintaining explicit permission matrices. The `kids_viewer` role is enforced at the database query level -- content queries automatically filter by maturity rating when the active profile is a kids profile.
+
+### Redis Cache-Aside Pattern
+
+The cache-aside pattern (also called "lazy loading") solves a fundamental performance problem: database queries are slow compared to in-memory lookups. A typical PostgreSQL query takes 2-10ms (parsing, planning, disk I/O, network round-trip), while a Redis `GET` takes 0.05-0.2ms -- a 20-100x improvement. At Netflix's scale of 500K API requests per second, this difference is the difference between needing 50 database servers and needing 5.
+
+**How it works mechanically:**
+
+1. **Check cache first** -- When a request arrives for video metadata, the service calls `cache.get('video:${videoId}')`. Redis responds in ~0.1ms with either the cached JSON or null.
+
+2. **Cache miss** -- If Redis returns null (the data isn't cached), the service queries PostgreSQL: `SELECT * FROM videos WHERE id = $1`. This takes ~5ms. The service then stores the result in Redis with a TTL: `cache.set('video:${videoId}', JSON.stringify(video), 300)` (5-minute TTL for video metadata, 10-minute for channel info).
+
+3. **Cache hit** -- If Redis returns data, the service parses the JSON and returns it immediately, skipping the database entirely.
+
+4. **Invalidation** -- When data changes (video metadata updated, subscriber count changed), the service deletes the cache key: `cache.del('video:${videoId}')`. The next read will miss the cache and re-fetch from the database, populating a fresh cache entry.
+
+**Why Redis instead of in-memory caching (a JavaScript Map or LRU cache):** In-memory caches are per-process. When running multiple API server instances behind a load balancer, each instance would have its own cache with different data. A user's request might hit server A (cached) then server B (not cached), causing inconsistent latency. Worse, invalidation becomes impossible -- when server A updates data, server B's cache still holds stale data. Redis provides a shared cache visible to all server instances, with atomic operations for safe concurrent access. The trade-off is network latency (~0.1ms per Redis call), but this is negligible compared to the database query it replaces.
+
+### Circuit Breaker Pattern
+
+A circuit breaker prevents cascading failures across services. The problem: when a downstream service (e.g., MinIO storage, Redis cache) becomes slow or unresponsive, every request that depends on it will hang for the full timeout period (typically 10-30 seconds). If your API server has 100 concurrent request slots and 50 of them are waiting on a dead storage service, only 50 slots remain for healthy requests. Eventually, all slots are consumed waiting on the dead service, and the entire API becomes unresponsive -- even for requests that don't need storage at all. This is a cascading failure.
+
+**How the circuit breaker works (three states):**
+
+1. **CLOSED** (normal) -- Requests flow through to the downstream service normally. The breaker tracks the recent error rate (typically using a rolling window of the last N requests).
+
+2. **OPEN** (tripped) -- When the error rate exceeds a threshold (e.g., 50% of the last 10 requests failed), the breaker "opens." All subsequent requests fail immediately with a predefined error (no network call to the downstream service). This is the key insight: failing fast in 1ms is better than waiting 30 seconds for a timeout. The open state lasts for a configurable reset timeout (e.g., 30 seconds for storage, 15 seconds for Redis).
+
+3. **HALF-OPEN** (testing) -- After the reset timeout expires, the breaker enters half-open state and allows a single probe request through. If the probe succeeds, the breaker closes (service recovered). If it fails, the breaker opens again for another reset period.
+
+**Netflix's circuit breaker configuration:**
+
+| Service | Timeout | Error Threshold | Reset Timeout |
+|---------|---------|-----------------|---------------|
+| Storage (MinIO/S3) | 8s | 50% | 30s |
+| Redis | 2s | 50% | 15s |
+| Cassandra/DB | 5s | 50% | 30s |
+| CDN | 10s | 40% | 60s |
+
+The implementation uses Opossum (a Node.js circuit breaker library) which wraps async functions and monitors their success/failure rates. When a circuit opens, the Prometheus gauge `circuit_breaker_state` changes value, enabling alerting.
+
+### Structured Logging
+
+Structured logging replaces `console.log` with machine-parseable JSON log entries. The problem with `console.log` at scale: when running 50 API server instances, each producing thousands of log lines per second, unstructured text logs like `"User 123 viewed video 456"` become unsearchable. You cannot filter, aggregate, or alert on them. Finding a specific user's request across thousands of concurrent requests requires manual text search through millions of lines.
+
+**How structured logging works:** Instead of `console.log("User login failed")`, the application logs:
+
+```json
+{"level":"error","time":1710500000,"msg":"login_failed","email":"user@example.com","reason":"invalid_password","requestId":"abc-123","ip":"192.168.1.1"}
+```
+
+Every log entry is a JSON object with consistent fields: `level` (error/warn/info/debug), `time` (Unix timestamp), `msg` (event name), and arbitrary context fields. This enables:
+
+- **Filtering**: Find all errors in the last hour: `level == "error" AND time > now() - 3600`
+- **Correlation**: Trace a single request across all log entries: `requestId == "abc-123"`
+- **Aggregation**: Count login failures per IP address to detect brute-force attacks
+- **Alerting**: Trigger alerts when `msg == "circuit_breaker_opened"` or error rate exceeds threshold
+
+Netflix uses Pino for structured logging because it is the fastest JSON logger in Node.js (benchmarked at 5-10x faster than Winston). Pino achieves this by writing JSON directly to stdout with zero synchronous processing, deferring log formatting to a separate transport process. Child loggers (auth, streaming, circuit breaker) inherit the parent's configuration while adding domain-specific context fields.
+
+### Prometheus Metrics
+
+Prometheus is a metrics collection system that enables monitoring, alerting, and capacity planning. The core problem: without metrics, you cannot answer "how is the system performing right now?" or "what changed before the outage started?" Logs tell you what happened; metrics tell you how much and how fast.
+
+**Three metric types used:**
+
+1. **Counter** -- A monotonically increasing number. Example: `http_requests_total` counts every HTTP request, labeled by method, route, and status code. You cannot know the current request rate from a single counter value, but you can compute it by measuring the rate of change: `rate(http_requests_total[5m])` gives requests per second over 5 minutes.
+
+2. **Histogram** -- Records the distribution of values. Example: `http_request_duration_seconds` records how long each request takes, bucketed by duration (0.01s, 0.05s, 0.1s, 0.5s, 1s, 5s). From a histogram, you can compute percentiles: p50 (median latency), p95 (95th percentile), p99. This is critical because averages hide problems -- an average latency of 50ms could mean 95% of requests take 10ms while 5% take 850ms.
+
+3. **Gauge** -- A value that goes up and down. Example: `circuit_breaker_state` (0=closed, 1=half-open, 2=open) or `db_pool_connections` (current active connections).
+
+**RED method:** Netflix tracks Rate (requests/sec), Errors (5xx responses/sec), and Duration (latency percentiles) for every service endpoint. This gives a complete picture of service health with just three metrics. If the rate drops, users may be unable to reach the service. If errors spike, something is failing. If duration increases, the service is degrading.
+
+### Rate Limiting
+
+Rate limiting controls how many requests a client can make within a time window. Without rate limiting, a single misbehaving client (buggy app, malicious actor, or bot) can overwhelm the API server, causing slow responses or outages for all other users.
+
+**Sliding window algorithm (used in this project):** The implementation uses Redis sorted sets. Each request adds a timestamp entry to the user's sorted set. On each new request, the algorithm: (1) removes entries older than the window, (2) counts remaining entries, (3) rejects the request if the count exceeds the limit. This provides smooth, accurate rate enforcement without burst abuse.
+
+**Why sliding window over token bucket:** Token bucket allows accumulated tokens -- a user inactive for 10 minutes could accumulate 1000 tokens and fire them all at once, creating a spike that overwhelms downstream services. Sliding window prevents this by counting requests within a rolling time window, regardless of when they occurred. The trade-off is slightly higher Redis overhead (sorted set operations vs. simple INCR), which is negligible.
+
+Netflix uses tiered rate limits by endpoint: strict limits on auth endpoints (5/5min to prevent brute-force), moderate on content browsing (100/min), and relaxed on progress updates (60/min since these are automated). Auth endpoints use both IP-based and account-based rate limiting to catch both distributed and single-source attacks. When Redis is unavailable, rate limiting fails open -- meaning requests are allowed through -- because blocking all API traffic due to a cache outage is worse than briefly allowing unlimited requests.
+
+### Idempotency
+
+Idempotency ensures that performing the same operation multiple times produces the same result as performing it once. The problem: network communication is unreliable. When a client sends a request to save viewing progress and receives a timeout, it doesn't know whether the server processed the request or not. Without idempotency, retrying the request could create duplicate records, double-count views, or corrupt data.
+
+Netflix achieves idempotency through several mechanisms:
+
+- **Viewing progress** uses upsert semantics (`ON CONFLICT (profile_id, content_id) DO UPDATE`). Whether the client sends the same progress update once or five times, the database row ends up with the same value.
+- **Experiment allocation** uses deterministic hashing (murmurhash of profileId + experimentId). The same input always produces the same variant, making allocation inherently idempotent and consistent across devices.
+- **My List operations** use `ON CONFLICT DO NOTHING` for additions -- adding a title that's already in the list is silently ignored. Deletions are naturally idempotent because deleting a non-existent row is a no-op.
+
+### Health Checks
+
+Health checks are HTTP endpoints that report the operational status of a service. They serve two distinct purposes in production:
+
+**Liveness probes** (`/health`) answer "is the process running and able to handle requests?" If a liveness probe fails, the orchestrator (Kubernetes, ECS, or a load balancer) restarts the process. Liveness probes must be cheap and fast -- they should not call external dependencies, because a slow database should not cause the process to be restarted. Netflix's liveness probe simply returns 200 if the Express server is accepting connections.
+
+**Readiness probes** (`/health/ready`) answer "is the service ready to serve traffic?" A service can be alive but not ready -- for example, it's still establishing database connections or loading configuration. If a readiness probe fails, the load balancer stops routing traffic to that instance (but does not restart it). Netflix's readiness probe checks PostgreSQL connectivity and Redis connectivity. If either is unreachable, the instance reports not ready and stops receiving traffic until the dependency recovers.
+
+Netflix adds a third level (`/health/details`) that returns comprehensive diagnostics: circuit breaker states for each downstream service, connection pool statistics, process memory usage, and uptime. This endpoint is used by operators for debugging, not by automated routing.

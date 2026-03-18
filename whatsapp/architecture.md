@@ -416,6 +416,221 @@ All real-time communication uses a JSON WebSocket protocol at `/ws`:
 
 ---
 
+## Frontend Architecture
+
+The frontend is a React 19 + TypeScript single-page application built with Vite, using TanStack Router for routing and Zustand for global state management. The application implements a full messaging client with real-time WebSocket communication, optimistic message sending, offline support via IndexedDB (Dexie), message virtualization, typing indicators, presence tracking, and message reactions.
+
+### Component Hierarchy
+
+```
+__root.tsx (Auth check + Outlet + OfflineIndicator)
+└── index.tsx → ChatLayout (authenticated) or LoginForm/RegisterForm (guest)
+    └── ChatLayout
+        ├── ConversationList        → Sidebar with conversation list, unread counts
+        │   └── NewChatDialog       → User search + group creation
+        └── ChatView                → Active conversation
+            ├── MessageList         → Virtualized message rendering
+            │   ├── MessageBubble   → Individual message with status indicators
+            │   │   └── MessageReactions → Emoji reaction display
+            │   └── DateSeparator   → Day boundaries between messages
+            ├── ReactionPicker      → Emoji selection overlay
+            └── Input bar           → Message input with typing indicator
+```
+
+The `ChatLayout` component splits the screen into a sidebar (`ConversationList`) and a main content area (`ChatView`). On mobile-width screens, the conversation list and chat view switch via state toggle (showing one at a time), mimicking WhatsApp's mobile navigation.
+
+### Routing with TanStack Router
+
+The routing is minimal -- the entire app lives on a single route (`/`). The `__root.tsx` layout renders the `OfflineIndicator` banner (for connectivity status) and an `Outlet`. The index route checks `useAuthStore().user`: if authenticated, it renders `ChatLayout`; if not, it shows login/register forms with a toggle between them.
+
+This single-route architecture is appropriate for a messaging app where navigation happens within the UI (selecting conversations) rather than between pages. The URL does not encode the current conversation -- that state lives in the Zustand chat store.
+
+### State Management (Zustand Stores)
+
+Two Zustand stores manage global state:
+
+**`authStore`** -- Manages user authentication (login, register, logout, session validation). The `checkAuth` method is called on mount to verify the session cookie with the backend. Unlike the Uber project, this store does not use persistence middleware -- the session cookie handles persistence, and the auth state is revalidated from the server on each page load.
+
+**`chatStore`** -- The central messaging store managing all conversation and message state. This is the most complex store in any of the four projects, with the following responsibilities:
+
+- **Conversation list** (`conversations`): Array of all user conversations, sorted by `updated_at` (most recent first). Loaded on mount via `loadConversations()`.
+- **Current conversation** (`currentConversationId`): Which conversation the user is viewing. Set when clicking a conversation, cleared when navigating back.
+- **Message history** (`messages`): A `Record<string, Message[]>` mapping conversation IDs to their message arrays. Messages are loaded on demand when a conversation is opened, not eagerly for all conversations.
+- **Pagination** (`hasMoreMessages`, `oldestMessageId`): Tracks whether more historical messages exist and the cursor for loading them. `loadMoreMessages()` fetches older messages and prepends them to the array.
+- **Typing indicators** (`typingUsers`): A `Record<string, string[]>` mapping conversation IDs to arrays of user IDs currently typing. Updated by WebSocket `typing`/`stop_typing` events.
+- **User presence** (`userPresence`): A `Record<string, PresenceInfo>` tracking online/offline status and last-seen timestamps for other users. Updated by WebSocket `presence` events.
+- **Pending messages** (`pendingMessages`): A `Map<string, Message>` tracking messages sent but not yet acknowledged by the server. Used for optimistic update reconciliation.
+- **Message reactions** (`messageReactions`): A `Record<string, ReactionSummary[]>` tracking emoji reactions per message. Updated both by API calls (when the user reacts) and WebSocket events (when others react).
+
+**Duplicate message prevention**: The `addMessage` method checks for duplicates by both `id` and `clientMessageId` before adding a message. This prevents the same message from appearing twice when the server broadcasts a message that the sender already added optimistically.
+
+### WebSocket Integration
+
+The `useWebSocket` hook (`hooks/useWebSocket.ts`) manages the WebSocket connection with several notable design choices:
+
+**Singleton connection**: A module-level `wsInstance` variable ensures only one WebSocket connection exists regardless of how many components mount the hook. This prevents connection proliferation and the associated server resource waste.
+
+**Automatic connection/disconnection**: The hook connects when `user` is non-null and disconnects when `user` becomes null (logout). The connection persists across component unmounts -- the cleanup function intentionally does NOT disconnect if the user is still authenticated, allowing the connection to survive route changes.
+
+**Exponential backoff reconnection**: On disconnect, the hook retries with exponential backoff: delay = 1000ms * 2^attempt, up to 10 attempts. This means the delays are 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s. This prevents thundering herd when the server restarts -- thousands of clients do not all reconnect simultaneously.
+
+**Message routing**: The hook routes incoming WebSocket messages to the appropriate chat store methods based on message type:
+- `message` -> `addMessage()` + `updateConversationLastMessage()` + auto-send read receipt if viewing that conversation
+- `message_ack` -> `updateMessageId()` (replaces client-generated ID with server ID)
+- `delivery_receipt` -> `updateMessageStatus()` to 'delivered'
+- `read_receipt` -> `updateMessageStatus()` to 'read' for all specified message IDs
+- `typing`/`stop_typing` -> `setTyping()` to add/remove user from typing list
+- `presence` -> `updatePresence()` to update online/offline status
+- `reaction_update` -> `updateMessageReactions()` to sync reaction changes
+
+**Exported send functions**: `sendMessage`, `sendTyping`, and `sendReadReceipt` are exported as standalone functions (not hook return values) so they can be called from the chat store or any component without needing the hook instance.
+
+### Optimistic Updates and Reconciliation
+
+When the user sends a message, the flow is:
+
+1. Generate a `clientMessageId` via `crypto.randomUUID()`
+2. Create an optimistic `Message` object with `status: 'sending'` and add it to the store immediately
+3. Send the message via WebSocket with the `clientMessageId`
+4. When the server acknowledges with `message_ack`, update the message's `id` (replacing the client UUID with the server-generated UUID), `created_at` (server timestamp), and `status` (to 'sent')
+5. When the recipient's server delivers the message, a `delivery_receipt` updates status to 'delivered'
+6. When the recipient reads the message, a `read_receipt` updates status to 'read'
+
+This four-stage status progression (sending -> sent -> delivered -> read) is displayed to the user with checkmark icons in the `MessageBubble` component, matching WhatsApp's familiar UI pattern.
+
+**Why optimistic updates matter**: Without them, the user would see a blank space or spinner for 100-500ms while the message round-trips to the server. In a messaging app where users expect instant feedback, this latency is unacceptable. The optimistic approach shows the message immediately and updates the status indicators asynchronously.
+
+### Message Virtualization
+
+The `MessageList` component (`components/MessageList.tsx`) uses `@tanstack/react-virtual` to render only the messages visible in the viewport plus a small overscan buffer.
+
+**Why virtualization is necessary**: A group chat can accumulate thousands of messages. Rendering all of them as DOM elements would consume hundreds of megabytes of memory and cause severe jank during scrolling. Virtualization renders only ~15-20 visible messages plus 5 overscan items above and below the viewport, keeping DOM node count constant regardless of message history size.
+
+**Implementation details**: The virtualizer receives a list of `ListItem` objects that are either messages or a loading indicator. Each item has an estimated height (100px for messages with date separators, 60px for regular messages, 40px for the loading indicator). The `measureElement` ref callback measures actual rendered heights for accurate positioning. The virtualizer handles both initial scroll-to-bottom (newest messages visible on open) and auto-scroll when new messages arrive (only if the user was already at the bottom -- if they scrolled up to read history, new messages do not force-scroll).
+
+**Infinite scroll for older messages**: When the user scrolls near the top (scrollTop < 100px), `onLoadMore()` is called, which fetches 50 older messages via the API and prepends them to the message array. The `hasMore` flag prevents unnecessary API calls when all messages have been loaded.
+
+### Offline Support (IndexedDB via Dexie)
+
+The frontend implements offline-first capabilities using IndexedDB through the Dexie library (`db/database.ts`, `services/offlineSync.ts`).
+
+**Offline message queue**: When the WebSocket is disconnected, messages are queued in the `pendingMessages` IndexedDB table with status 'pending'. Each pending message includes a retry count. When connectivity is restored, the `resetFailedMessages()` function moves failed messages (retry count < 3) back to 'pending' for re-sending. Messages that fail 3 times remain as 'failed' for the user to review.
+
+**Conversation and message caching**: Conversations and messages are cached in IndexedDB tables for offline reading. `cacheConversations()` stores the conversation list with unread counts. `cacheMessages()` stores messages with a compound index on `[conversationId+createdAt]` for efficient range queries. `pruneOldCaches()` deletes cached messages older than 7 days to manage storage.
+
+**Connectivity detection**: The `useOnlineStatus` hook tracks browser connectivity using `navigator.onLine` and `online`/`offline` events. It also provides a `checkConnectivity()` method that actively probes the server (`HEAD /api/health`) for cases where `navigator.onLine` is unreliable (connected to WiFi but no internet). The `OfflineIndicator` component renders a red banner when offline ("You're offline. Messages will be sent when you reconnect.") and a green "Back online!" banner that auto-dismisses after 3 seconds.
+
+### Key UI Patterns
+
+**Typing indicators**: When the user types in the message input, the `handleTyping` callback sends a `typing` event via WebSocket. A 2-second debounce timeout sends `stop_typing` if the user pauses. On the receiving end, other users' typing events are stored in `chatStore.typingUsers` and displayed below the chat header as "[Name] is typing...".
+
+**Presence indicators**: The chat header shows the other participant's online status ("Online" or "Last seen [timestamp]"). For group chats, presence is not shown in the header. Presence updates arrive via WebSocket `presence` events and are stored in `chatStore.userPresence`.
+
+**Message reactions**: Users can react to messages with emoji. Clicking a message opens the `ReactionPicker` overlay. Selecting an emoji calls `chatStore.toggleReaction()`, which hits the API to add or remove the reaction (toggling). Reaction updates from other users arrive via WebSocket `reaction_update` events and are stored in `chatStore.messageReactions`. The `MessageReactions` component displays reaction summaries (emoji + count) below each message bubble.
+
+**Read receipts**: When the user opens a conversation, `messagesApi.markRead(conversationId)` is called via the API, and `sendReadReceipt(conversationId, [])` is sent via WebSocket. When individual messages arrive while the conversation is open, their IDs are immediately sent as read receipts. This two-pronged approach handles both "opening a conversation with unread messages" and "receiving new messages while the conversation is open."
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern used in the architecture, what problem it solves, and how it works in this system.
+
+### Redis Pub/Sub for Cross-Server Message Routing
+
+**The problem**: When running multiple server instances behind a load balancer, WebSocket connections are distributed across servers. If User A is connected to Server 1 and User B is connected to Server 2, Server 1 cannot directly deliver User A's message to User B because B's WebSocket connection lives on a different process.
+
+**How it works**: Each server subscribes to a Redis Pub/Sub channel (e.g., `server:{serverId}`). When a server receives a message for a user, it looks up which server holds that user's WebSocket connection (stored in Redis as `user:connections:{userId} -> serverId`). If the target is the same server, it delivers directly. If different, it publishes the message to the target server's channel. The target server receives the publish event and delivers the message through the local WebSocket connection.
+
+**Why Redis Pub/Sub over Kafka**: Pub/Sub is fire-and-forget with no persistence, which is perfect for real-time message delivery where latency matters more than durability. Messages are already persisted in PostgreSQL before routing. Kafka's persistence and consumer groups add overhead without benefit for this use case. If a server misses a Pub/Sub message (because it was down), the recipient will receive the message from the offline queue when they reconnect.
+
+### Rate Limiting (Sliding Window Algorithm)
+
+**The problem**: A malicious or buggy client could flood the messaging system with thousands of messages per second, overwhelming the database, WebSocket connections, and other users' clients. Without rate limiting, a single user could degrade the service for everyone.
+
+**How it works** (`backend/src/shared/rateLimiter.ts`): The implementation uses a Redis sorted set-based sliding window algorithm:
+
+1. Each request adds an entry to a sorted set with the current timestamp as the score: `ZADD rl:message_send:{userId} {timestamp} {unique_id}`
+2. Entries older than the window are removed: `ZREMRANGEBYSCORE ... 0 {windowStart}`
+3. The count of remaining entries gives the number of requests in the current window: `ZCARD`
+4. If the count exceeds the limit, the request is rejected with HTTP 429
+
+**Why sliding window over fixed window**: A fixed window (e.g., 60 requests per minute) has a burst problem at window boundaries. A user could send 60 requests at minute 0:59 and another 60 at minute 1:00, effectively sending 120 requests in 2 seconds. The sliding window counts requests over a continuously moving time range, ensuring the rate limit is always enforced.
+
+**Per-endpoint limits in this project**: Message sending: 60/minute, Login attempts: 5/15 minutes per IP (prevents brute force), Registration: 3/hour per IP (prevents account spam), WebSocket messages: 30/10 seconds burst. Rate limit hits are tracked as Prometheus metrics for monitoring.
+
+### Delivery Receipt State Machine
+
+**The problem**: Both sender and recipient need to know the status of each message. The sender needs confirmation that their message was delivered and read. The recipient needs the server to know they received the message (so offline queue can be cleared).
+
+**How it works** (`backend/src/shared/deliveryTracker.ts`): Each message progresses through four states:
+1. **sending** (client-only): Message is being transmitted to the server
+2. **sent**: Server received and persisted the message. Server sends `message_ack` back to sender.
+3. **delivered**: Recipient's server received the message and pushed it to the recipient's WebSocket. Server sends `delivery_receipt` to sender.
+4. **read**: Recipient opened the conversation containing the message. Recipient's client sends `read_receipt`, server forwards to sender.
+
+Status transitions are one-directional and monotonic (sent -> delivered -> read, never backward). If a `read_receipt` arrives before a `delivery_receipt` (possible due to network reordering), the message status jumps directly to 'read'.
+
+### Circuit Breaker Pattern
+
+**The problem**: If Redis becomes unresponsive (used for sessions, presence tracking, Pub/Sub routing), every incoming message and API request that touches Redis will wait for the timeout period. At high message throughput, this quickly exhausts server resources and makes the entire application unresponsive.
+
+**How it works** (`backend/src/shared/circuitBreaker.ts`): The circuit breaker wraps calls to Redis and external services:
+
+- **CLOSED**: Requests pass through normally. The breaker tracks success/failure rates.
+- **OPEN**: When failures exceed the threshold, all requests fail immediately with a fallback. For presence tracking, the fallback returns "unknown" status. For message routing, the fallback queues messages for database-backed delivery.
+- **HALF-OPEN**: After a timeout, one probe request is allowed. Success restores normal operation; failure reopens the circuit.
+
+This ensures that a Redis outage degrades features (no typing indicators, delayed presence updates) rather than taking down the entire messaging system.
+
+### Structured Logging (Pino)
+
+**The problem**: When debugging why a message was not delivered to a user, you need to trace the message through multiple systems: was it received by the server? was it persisted? was the recipient online? which server had their connection? Plain text logs like `console.log("message sent")` cannot answer these questions.
+
+**How it works** (`backend/src/shared/logger.ts`): Pino outputs JSON-formatted log lines with structured fields: `{"level":"info","event":"MESSAGE_DELIVERED","messageId":"abc","conversationId":"xyz","recipientId":"user123","msg":"Message delivered via WebSocket"}`. Each field is searchable in log aggregation systems. Event constants (`LogEvents.MESSAGE_DELIVERED`, `LogEvents.MESSAGE_STORED`, `LogEvents.RATE_LIMITED`) ensure consistent event naming across the codebase.
+
+### Prometheus Metrics
+
+**The problem**: You need real-time answers to operational questions: How many messages per second? What is the WebSocket connection count? How many messages are in the offline queue? How many rate limit violations occurred today?
+
+**How it works** (`backend/src/shared/metrics.ts`): The backend exposes metrics on `/metrics` in Prometheus format:
+- **Counter**: `whatsapp_messages_total{type}` -- total messages by type (text, image, etc.)
+- **Histogram**: `whatsapp_message_delivery_duration_seconds` -- time from send to delivery
+- **Gauge**: `whatsapp_websocket_connections` -- current active connections
+- **Counter**: `whatsapp_rate_limit_hits{endpoint}` -- rate limit violations by endpoint
+
+These metrics feed into Grafana dashboards for real-time monitoring and into alerting rules that page on-call engineers when thresholds are exceeded.
+
+### Health Checks (Liveness vs Readiness)
+
+**The problem**: When running behind a load balancer, the balancer needs to know which instances can handle WebSocket connections and message delivery. An instance might be running but unable to connect to Redis (which means it cannot route messages across servers).
+
+**How it works**: Two health check types:
+- **Liveness** (`/health/live`): "Is the process alive?" Returns 200 if the Node.js process is running. If this fails, the orchestrator restarts the container. Does not check Redis or PostgreSQL -- a database outage should not trigger mass restarts.
+- **Readiness** (`/health/ready`): "Can this instance handle traffic?" Checks PostgreSQL connectivity (for message persistence) and Redis connectivity (for sessions and message routing). If this fails, the load balancer stops routing new WebSocket connections to this instance but does not kill it.
+
+### Session-Based Authentication with Redis
+
+**The problem**: The server needs to identify which user owns each WebSocket connection and HTTP request. For a messaging app, immediate session revocation is critical -- if a user's phone is stolen, their sessions must be invalidated instantly.
+
+**How it works**: On login, the server creates a session record in Redis with a random token and sets an HTTP-only cookie. Subsequent HTTP requests include the cookie automatically. For WebSocket connections, the session is validated during the initial HTTP upgrade handshake.
+
+**Why sessions over JWTs for messaging**: JWTs are self-contained tokens valid until expiration. If a user reports their phone stolen, you cannot invalidate their JWT without maintaining a revocation list (which defeats the statelessness benefit). With Redis sessions, deleting the session key immediately blocks all access -- the stolen phone's next request fails authentication. For a messaging app with sensitive conversations, this instant revocation capability is a hard requirement.
+
+### Retry with Exponential Backoff
+
+**The problem**: When a transient failure occurs (network blip, database momentarily overloaded), immediately retrying often fails again because the underlying issue has not resolved. Retrying in a tight loop also amplifies the load on an already-struggling system.
+
+**How it works** (`backend/src/shared/retry.ts`): The retry function wraps async operations with configurable retry logic:
+1. Execute the function
+2. If it fails, wait for `baseDelay * 2^attempt` milliseconds (exponential increase)
+3. Add random jitter (randomize the delay by +/- 25%) to prevent thundering herd -- without jitter, all retries from different clients would fire at exactly the same time
+4. Retry up to `maxRetries` times, then propagate the error
+
+This is used for database connections, Redis connections, and message persistence. For user-facing operations, retry attempts are limited (2-3) to avoid keeping the user waiting.
+
+---
+
 ## Key Design Decisions
 
 ### Message Storage: Cassandra vs PostgreSQL

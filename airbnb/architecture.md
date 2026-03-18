@@ -646,6 +646,156 @@ CREATE TABLE audit_logs (
 
 ---
 
+## Frontend Architecture
+
+The frontend is a React 19 + TypeScript single-page application built with Vite, using TanStack Router for file-based routing and Zustand for global state management. The architecture separates concerns into routes (pages), components (reusable UI), stores (global state), and services (API communication).
+
+### Component Hierarchy
+
+```
+__root.tsx (Header + Outlet + Footer)
+├── index.tsx           → Home page with featured listings and SearchBar
+├── search.tsx          → Search results with filter panel and ListingCard grid
+├── listing.$id.tsx     → Listing detail with BookingWidget, Calendar, reviews
+├── booking.$id.tsx     → Booking confirmation and details
+├── login.tsx / register.tsx → Authentication forms
+├── become-host.tsx     → Host onboarding flow
+├── messages.tsx        → Host-guest messaging interface
+├── trips.tsx           → Guest trip management (upcoming, past)
+├── host/
+│   ├── listings.tsx    → Host's listing management dashboard
+│   ├── listings.new.tsx → Multi-step listing creation form
+│   └── reservations.tsx → Host reservation management
+```
+
+The root layout (`__root.tsx`) renders the `Header` component (with navigation, auth state, and unread message count) above every page via TanStack Router's `Outlet` component, plus a global footer. This guarantees consistent navigation across all routes without re-mounting the header on navigation.
+
+### Routing with TanStack Router
+
+TanStack Router uses file-based routing where each file in `routes/` automatically becomes a route. The file name maps to the URL path: `listing.$id.tsx` handles `/listing/:id` with the `$id` segment becoming a dynamic parameter. This approach eliminates manual route configuration and ensures type-safe route parameters.
+
+Route files export a `Route` object created by `createFileRoute()` that specifies the path and the component to render. The router generates a `routeTree.gen.ts` file at build time that wires all routes together. There are no explicit route guards -- instead, components check `useAuthStore().isAuthenticated` and redirect to `/login` when needed (as seen in `BookingWidget` redirecting unauthenticated users who try to book).
+
+### State Management (Zustand Stores)
+
+Two Zustand stores manage global state that needs to persist across route changes:
+
+**`authStore`** -- Manages user session state (current user, loading flag, authentication status). Provides `login`, `register`, `logout`, `checkAuth`, and `becomeHost` actions. Each action calls the corresponding API service method and updates the store atomically. The `checkAuth` method is called on app startup to validate the session cookie with the backend -- if the cookie is expired or invalid, the user is silently logged out.
+
+**`searchStore`** -- Manages search parameters that persist across the home page and search page (location, coordinates, check-in/check-out dates, guest count, and filter criteria). The `getSearchParams()` method merges all parameters into a single object for the search API call. This store exists because search state needs to survive navigation between the home page (where the user enters search criteria in the `SearchBar`) and the search results page (where results are displayed and filters are applied).
+
+Local component state (via `useState`) is used for everything else: listing data fetched on page load, filter panel visibility, calendar date selection, booking form inputs, and loading/error states. This follows the principle of keeping state as close to where it is used as possible -- only state that genuinely needs to cross route boundaries lives in Zustand.
+
+### Data Fetching Pattern
+
+Data flows through a consistent chain: **Component -> API Service -> Backend -> Component state update**.
+
+The API service layer (`services/api.ts`) provides a typed wrapper around `fetch()` organized by domain: `authAPI`, `listingsAPI`, `searchAPI`, `bookingsAPI`, `reviewsAPI`, and `messagesAPI`. Every request includes `credentials: 'include'` to attach the session cookie for authentication. The generic `fetchAPI<T>()` helper handles JSON serialization, error extraction from response bodies, and type casting.
+
+Components call API methods directly in `useEffect` hooks (for data loading on mount) or in event handlers (for mutations like booking creation). There is no intermediate caching layer on the frontend -- each page load fetches fresh data from the backend, which applies Redis cache-aside on the server side to avoid repeated database queries.
+
+**Photo uploads** use a separate code path that bypasses the JSON `fetchAPI` wrapper. The `listingsAPI.uploadPhotos` method creates a `FormData` object and sends it with `multipart/form-data` content type, which is required for file uploads to the backend's Multer middleware.
+
+### Key UI Patterns
+
+**Multi-step listing creation form** (`components/listing-form/`): The host listing creation flow uses a step-based wizard pattern with a custom `useListingForm` hook managing form state across four steps (BasicInfo, Details, Location, Pricing). A `ProgressIndicator` component shows the current step. Each step component receives form state and change handlers, with validation at each step before allowing progression. This pattern keeps each step focused on a subset of fields while maintaining a single source of truth for the entire form.
+
+**Calendar component** (`components/Calendar.tsx`): A custom date-range picker that fetches availability blocks from the backend and visually distinguishes available, blocked, and selected dates. The calendar handles check-in/check-out selection with minimum-night enforcement -- clicking a check-in date then a check-out date that violates the minimum stay shows an error. Availability is fetched for a 365-day window on mount to avoid repeated API calls.
+
+**Booking widget** (`components/BookingWidget.tsx`): A sticky sidebar widget that reacts to date selection by checking availability in real-time via the API. When dates are valid and available, it displays a pricing breakdown (nightly rate times nights, cleaning fee, service fee, total). The widget adapts its CTA button text based on context: "Check availability" when no dates are selected, "Reserve" for instant-book listings, and "Request to book" for request-based listings.
+
+**Skeleton loading states**: Both the home page and search page render placeholder "pulse" animations (gray rectangles matching the listing card layout) while data is loading. This prevents layout shift when content arrives and provides immediate visual feedback.
+
+---
+
+## Deep Pattern Explanations
+
+This section explains each production-grade pattern used in the architecture, what problem it solves, and how it works in this system.
+
+### Redis Cache-Aside Pattern
+
+**The problem**: Every search query, listing detail view, and availability check hits PostgreSQL. A database query typically takes 2-10ms, but Redis responds in 0.1-0.5ms -- a 10-50x improvement. More importantly, under load (50M searches/day), the database connection pool becomes the bottleneck. Without caching, the system would need many more PostgreSQL replicas to handle read traffic.
+
+**How it works**: The cache-aside (also called "lazy loading") pattern follows this flow:
+
+1. **Check cache**: Before querying the database, check Redis for a cached result using a deterministic key (e.g., `listing:42` for listing ID 42)
+2. **Cache hit**: If found, return the cached JSON immediately -- the database is never touched
+3. **Cache miss**: If not found, query PostgreSQL, store the result in Redis with a TTL (time-to-live), then return the result
+4. **Invalidation on write**: When data changes (listing updated, booking created), delete the cache key rather than updating it. Deleting avoids a race condition where a stale read could overwrite a fresh write. The next read will miss the cache and re-populate it from the database.
+
+**Why not an in-memory Map?** A JavaScript `Map` lives in a single process. When running multiple server instances behind a load balancer, each instance would have its own cache with different data, leading to inconsistencies. Redis is shared across all instances, so a cache invalidation from one server is immediately visible to all others. Redis also survives process restarts, while an in-memory cache is lost.
+
+**TTL strategy in this project** (`backend/src/shared/cache.ts`): Different data types get different TTLs based on how frequently they change: listings get 15 minutes (details change rarely), availability gets 1 minute (changes with every booking), search results get 5 minutes (acceptable staleness), and reviews get 30 minutes.
+
+### Circuit Breaker Pattern
+
+**The problem**: When an external dependency (database, Redis, payment gateway) becomes slow or unresponsive, every request that calls it will wait for the timeout period. If the timeout is 10 seconds and you receive 100 requests/second, you quickly exhaust all available connections or threads. The entire application becomes unresponsive -- not just the endpoints that depend on the failing service. This is called a **cascading failure**.
+
+**How it works**: A circuit breaker wraps calls to external services and operates in three states:
+
+1. **CLOSED (normal operation)**: Requests pass through to the service. The breaker tracks success/failure rates over a rolling window.
+2. **OPEN (fail fast)**: When failures exceed a threshold (e.g., 50% of the last 5+ requests), the circuit "opens." All subsequent requests fail immediately (< 1ms) with a fallback response instead of waiting for a timeout. This protects the rest of the system.
+3. **HALF-OPEN (probe)**: After a reset timeout (e.g., 30 seconds), the breaker allows one test request through. If it succeeds, the circuit closes and normal operation resumes. If it fails, the circuit opens again.
+
+**In this project** (`backend/src/shared/circuitBreaker.ts`): The implementation uses the Opossum library and creates specialized breakers for different services. The search circuit breaker returns empty results as a fallback (degraded but usable). The availability circuit breaker assumes "unavailable" as a safe default (prevents overbooking). Database operations have no fallback -- they fail and the error propagates to the user.
+
+Each circuit breaker emits events (success, failure, open, close, halfOpen) that are recorded as Prometheus metrics, enabling alerting when circuits open.
+
+### Structured Logging (Pino)
+
+**The problem**: `console.log("Booking created for user " + userId)` fails at scale for multiple reasons: (1) you cannot search logs by field (which user? which listing?), (2) there are no severity levels (is this informational or an error?), (3) there is no correlation across services (which logs belong to the same request?), and (4) the output is plain text that log aggregation tools (ELK, Datadog, Splunk) cannot parse.
+
+**How it works**: Pino outputs JSON-formatted log lines like `{"level":"info","time":1710000000000,"service":"booking","userId":"abc","listingId":42,"msg":"Booking created"}`. Each field is searchable and filterable. Log levels (trace, debug, info, warn, error, fatal) allow you to filter noise in production while keeping verbose logs in development.
+
+**In this project** (`backend/src/shared/logger.ts`): Module-specific loggers are created with `createModuleLogger('booking')` to tag all logs from that module. Request logging middleware captures HTTP method, path, status code, and response time for every request.
+
+### Prometheus Metrics
+
+**The problem**: Logs tell you what happened to individual requests. Metrics tell you what is happening to the system right now. You need both. Without metrics, you cannot answer questions like "what is the p99 search latency?" or "how many bookings are failing?" until a user complains.
+
+**How it works**: Prometheus uses three main metric types:
+- **Counter**: Monotonically increasing value. Example: `airbnb_bookings_total{status="confirmed"}` counts all confirmed bookings. You cannot decrease a counter -- you derive rates from the change over time.
+- **Histogram**: Tracks the distribution of values (like response times). Records observations into buckets, enabling percentile calculations. Example: `airbnb_search_duration_seconds` lets you compute p50, p95, p99 search latency.
+- **Gauge**: A value that can go up and down. Example: `airbnb_active_listings` tracks the current number of active listings.
+
+The **RED method** (Rate, Errors, Duration) is used for alerting: monitor request rate (is traffic normal?), error rate (are requests failing?), and duration (are requests slow?). Threshold-based alerts page on-call engineers when these deviate from normal.
+
+**In this project** (`backend/src/shared/metrics.ts`): The `/metrics` endpoint exposes all metrics in Prometheus exposition format for scraping. Cache hit/miss ratios, circuit breaker states, and booking counts are all tracked.
+
+### Health Checks (Liveness and Readiness)
+
+**The problem**: When running multiple server instances behind a load balancer, the load balancer needs to know which instances are healthy enough to receive traffic. A server might be running (process alive) but unable to serve requests because its database connection is broken. Without health checks, the load balancer would keep sending traffic to broken instances.
+
+**How it works**: Two types of health checks serve different purposes:
+- **Liveness** (`/health/live`): "Is the process running?" A simple 200 response. If this fails, the orchestrator (Kubernetes) restarts the container. It should not check external dependencies -- a database outage should not cause mass restarts.
+- **Readiness** (`/health/ready`): "Can this instance handle traffic?" Checks that critical dependencies (PostgreSQL, Redis) are responsive. If this fails, the load balancer stops routing traffic to this instance but does not restart it -- the instance stays alive and may recover when the dependency comes back.
+
+The detailed health endpoint (`/health`) returns latency measurements for each dependency, circuit breaker states, and memory usage -- useful for dashboards and debugging.
+
+### Session-Based Authentication with Redis
+
+**The problem**: The server needs to know who is making each request. Two main approaches exist: session tokens (server stores state) and JWTs (client carries state).
+
+**How it works in this project**: When a user logs in, the server creates a session record in Redis (keyed by a random token) and sets an HTTP-only cookie containing that token. On subsequent requests, the browser automatically sends the cookie, and the server looks up the session in Redis to identify the user.
+
+**Why sessions over JWT**: Session tokens can be immediately revoked (delete the Redis key). JWTs are self-contained tokens that remain valid until they expire -- if a user's account is compromised, you cannot invalidate an existing JWT without maintaining a blacklist, which defeats the purpose of being stateless. For a marketplace where hosts might need to be deactivated instantly, immediate revocation is a hard requirement.
+
+### PostGIS Geographic Search
+
+**The problem**: "Find all listings within 25km of downtown San Francisco" requires calculating the distance between a search point and every listing's coordinates. A naive approach (compute Haversine distance for all 10M listings) is O(n) and far too slow.
+
+**How it works**: PostGIS extends PostgreSQL with geospatial types and spatial indexing. Listing locations are stored as `POINT` geometry with a GIST index. The `ST_DWithin` function uses the spatial index to efficiently find all points within a given radius, reducing the search from full-table scan to an index lookup. This brings geographic queries from seconds to milliseconds.
+
+**Why PostGIS over Elasticsearch**: PostGIS keeps all data in a single database, avoiding the complexity of synchronizing listing data between PostgreSQL and a separate search index. For the current access patterns (radius search with filters), PostGIS is sufficient. Elasticsearch would be added if full-text search on listing descriptions became a requirement.
+
+### Two-Sided Review Mutual-Reveal System
+
+**The problem**: In a two-sided marketplace, if the host can see the guest's review before writing their own, they might retaliate with a negative review. This creates a chilling effect where both parties write dishonestly positive reviews.
+
+**How it works**: Both the host and guest can submit reviews for a completed booking. Reviews are stored immediately but marked as not visible. A database trigger checks after each review insertion whether both parties have submitted -- when both exist, it sets `is_visible = true` on both reviews simultaneously. This mutual-reveal mechanism ensures honest reviews because neither party knows what the other wrote.
+
+---
+
 ## Key Design Decisions
 
 ### 1. Date Ranges vs Day-by-Day Availability
