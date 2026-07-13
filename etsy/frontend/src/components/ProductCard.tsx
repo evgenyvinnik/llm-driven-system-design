@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router';
 import type { Product } from '../types';
+import { formatPrice, isFree } from '../utils/format';
 
 interface ProductCardProps {
   product: Product;
@@ -7,7 +8,7 @@ interface ProductCardProps {
 
 /** Renders a product card with image, title, price, shop name, and shipping info. */
 export function ProductCard({ product }: ProductCardProps) {
-  const imageUrl = product.images?.[0] || 'https://via.placeholder.com/400x400?text=No+Image';
+  const imageUrl = product.images?.[0] || 'https://placehold.co/400x400?text=No+Image';
 
   return (
     <Link to="/product/$productId" params={{ productId: String(product.id) }} className="group">
@@ -29,9 +30,9 @@ export function ProductCard({ product }: ProductCardProps) {
           <div className="flex items-center justify-between">
             <div>
               <span className="text-lg font-semibold text-gray-900">
-                ${product.price.toFixed(2)}
+                ${formatPrice(product.price)}
               </span>
-              {product.shipping_price === 0 && (
+              {isFree(product.shipping_price) && (
                 <span className="ml-2 text-xs text-green-600">
                   Free shipping
                 </span>

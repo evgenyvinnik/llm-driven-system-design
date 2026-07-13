@@ -30,7 +30,7 @@ export function BusinessCard({ business, rank }: BusinessCardProps) {
           <div className="text-lg font-bold text-gray-500 mb-2">{rank}.</div>
         )}
         <img
-          src={business.photo_url || 'https://via.placeholder.com/120x120?text=No+Image'}
+          src={business.photo_url || 'https://placehold.co/120x120?text=No+Image'}
           alt={business.name}
           className="w-32 h-32 object-cover rounded-md"
         />
@@ -115,7 +115,7 @@ export function BusinessGridCard({ business }: BusinessGridCardProps) {
       className="card hover:shadow-lg transition-shadow"
     >
       <img
-        src={business.photo_url || 'https://via.placeholder.com/300x200?text=No+Image'}
+        src={business.photo_url || 'https://placehold.co/300x200?text=No+Image'}
         alt={business.name}
         className="w-full h-40 object-cover"
       />

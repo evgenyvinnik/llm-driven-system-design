@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useCartStore } from '../stores/cartStore';
 import { useAuthStore } from '../stores/authStore';
+import { formatPrice, isFree } from '../utils/format';
 
 export const Route = createFileRoute('/cart')({
   component: CartPage,
@@ -30,7 +31,7 @@ function CartPage() {
     );
   }
 
-  if (!cart || cart.shops.length === 0) {
+  if (!cart || isFree(cart.shops.length)) {
     return (
       <div className="max-w-7xl mx-auto px-4 py-12 text-center">
         <h1 className="text-2xl font-bold text-gray-900 mb-4">Your cart is empty</h1>
@@ -66,7 +67,7 @@ function CartPage() {
                   <div key={item.id} className="flex gap-4 py-4 border-b border-gray-100 last:border-0">
                     <Link to="/product/$productId" params={{ productId: String(item.productId) }}>
                       <img
-                        src={item.images?.[0] || 'https://via.placeholder.com/100x100?text=No+Image'}
+                        src={item.images?.[0] || 'https://placehold.co/100x100?text=No+Image'}
                         alt={item.title}
                         className="w-24 h-24 object-cover rounded-md"
                       />
@@ -105,10 +106,10 @@ function CartPage() {
 
                     <div className="text-right">
                       <p className="font-semibold text-gray-900">
-                        ${item.itemTotal.toFixed(2)}
+                        ${formatPrice(item.itemTotal)}
                       </p>
                       <p className="text-sm text-gray-500">
-                        ${item.price.toFixed(2)} each
+                        ${formatPrice(item.price)} each
                       </p>
                     </div>
                   </div>
@@ -117,12 +118,12 @@ function CartPage() {
 
               <div className="mt-4 pt-4 border-t border-gray-100 flex justify-between text-sm">
                 <span className="text-gray-600">Subtotal</span>
-                <span className="font-medium">${shop.subtotal.toFixed(2)}</span>
+                <span className="font-medium">${formatPrice(shop.subtotal)}</span>
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-gray-600">Shipping</span>
                 <span className="font-medium">
-                  {shop.shippingTotal === 0 ? 'Free' : `$${shop.shippingTotal.toFixed(2)}`}
+                  {isFree(shop.shippingTotal) ? 'Free' : `$${formatPrice(shop.shippingTotal)}`}
                 </span>
               </div>
             </div>
@@ -137,14 +138,14 @@ function CartPage() {
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
                 <span className="text-gray-600">Items ({cart.summary.itemCount})</span>
-                <span>${cart.summary.itemTotal.toFixed(2)}</span>
+                <span>${formatPrice(cart.summary.itemTotal)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-600">Shipping</span>
                 <span>
-                  {cart.summary.shippingTotal === 0
+                  {isFree(cart.summary.shippingTotal)
                     ? 'Free'
-                    : `$${cart.summary.shippingTotal.toFixed(2)}`}
+                    : `$${formatPrice(cart.summary.shippingTotal)}`}
                 </span>
               </div>
             </div>
@@ -152,7 +153,7 @@ function CartPage() {
             <div className="border-t border-gray-200 mt-4 pt-4">
               <div className="flex justify-between text-lg font-semibold">
                 <span>Total</span>
-                <span>${cart.summary.grandTotal.toFixed(2)}</span>
+                <span>${formatPrice(cart.summary.grandTotal)}</span>
               </div>
             </div>
 

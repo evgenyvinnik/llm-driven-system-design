@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import api from '../services/api';
 import type { Product } from '../types';
 import { ProductCard } from '../components/ProductCard';
+import { isFree } from '../utils/format';
 
 interface SearchParams {
   q?: string;
@@ -182,7 +183,7 @@ function SearchPage() {
             <div className="flex justify-center items-center min-h-96">
               <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div>
             </div>
-          ) : products.length === 0 ? (
+          ) : isFree(products.length) ? (
             <div className="text-center py-12">
               <p className="text-gray-600 mb-4">No products found</p>
               <Link to="/" className="btn btn-secondary">

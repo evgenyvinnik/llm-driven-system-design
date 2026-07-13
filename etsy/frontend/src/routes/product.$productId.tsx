@@ -5,6 +5,7 @@ import type { Product } from '../types';
 import { ProductCard } from '../components/ProductCard';
 import { useAuthStore } from '../stores/authStore';
 import { useCartStore } from '../stores/cartStore';
+import { formatPrice, isFree } from '../utils/format';
 
 export const Route = createFileRoute('/product/$productId')({
   component: ProductPage,
@@ -105,7 +106,7 @@ function ProductPage() {
 
   const images = product.images?.length > 0
     ? product.images
-    : ['https://via.placeholder.com/600x600?text=No+Image'];
+    : ['https://placehold.co/600x600?text=No+Image'];
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -152,11 +153,11 @@ function ProductPage() {
 
           <div className="flex items-center gap-4 mb-6">
             <span className="text-3xl font-bold text-gray-900">
-              ${product.price.toFixed(2)}
+              ${formatPrice(product.price)}
             </span>
             {product.compare_at_price && product.compare_at_price > product.price && (
               <span className="text-lg text-gray-500 line-through">
-                ${product.compare_at_price.toFixed(2)}
+                ${formatPrice(product.compare_at_price)}
               </span>
             )}
           </div>
@@ -173,7 +174,7 @@ function ProductPage() {
                 Vintage
               </span>
             )}
-            {product.shipping_price === 0 && (
+            {isFree(product.shipping_price) && (
               <span className="bg-green-50 text-green-700 px-3 py-1 rounded-full text-sm">
                 Free Shipping
               </span>
@@ -239,9 +240,9 @@ function ProductPage() {
           <div className="border-t border-gray-200 pt-6 mb-6">
             <h3 className="font-medium text-gray-900 mb-2">Shipping</h3>
             <p className="text-gray-600">
-              {product.shipping_price === 0
+              {isFree(product.shipping_price)
                 ? 'Free shipping'
-                : `Shipping: $${product.shipping_price.toFixed(2)}`}
+                : `Shipping: $${formatPrice(product.shipping_price)}`}
             </p>
             {product.processing_time && (
               <p className="text-gray-600">

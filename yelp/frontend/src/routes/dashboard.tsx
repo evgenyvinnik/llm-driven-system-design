@@ -123,7 +123,7 @@ function DashboardPage() {
                   className="bg-white rounded-lg shadow p-6 flex items-center gap-6"
                 >
                   <img
-                    src={business.photo_url || 'https://via.placeholder.com/100'}
+                    src={business.photo_url || 'https://placehold.co/100x100'}
                     alt={business.name}
                     className="w-24 h-24 object-cover rounded-lg"
                   />

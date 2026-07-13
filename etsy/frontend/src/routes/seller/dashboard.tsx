@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { useAuthStore } from '../../stores/authStore';
 import api from '../../services/api';
 import type { Order, Product } from '../../types';
+import { formatPrice, isFree } from '../../utils/format';
 
 interface ShopStats {
   sales_count: number;
@@ -154,7 +155,7 @@ function SellerDashboard() {
             <div className="card p-6">
               <p className="text-sm text-gray-600">Revenue</p>
               <p className="text-3xl font-bold text-gray-900">
-                ${parseFloat(stats.total_revenue).toFixed(2)}
+                ${formatPrice(stats.total_revenue)}
               </p>
             </div>
             <div className="card p-6">
@@ -193,7 +194,7 @@ function SellerDashboard() {
           {/* Recent Orders */}
           <div>
             <h2 className="text-lg font-semibold text-gray-900 mb-4">Recent Orders</h2>
-            {orders.length === 0 ? (
+            {isFree(orders.length) ? (
               <p className="text-gray-600">No orders yet</p>
             ) : (
               <div className="card overflow-hidden">
@@ -224,7 +225,7 @@ function SellerDashboard() {
                           {(order as Order & { buyer_email?: string }).buyer_email}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                          ${order.total.toFixed(2)}
+                          ${formatPrice(order.total)}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm">
                           <span
@@ -252,7 +253,7 @@ function SellerDashboard() {
       {/* Orders Tab */}
       {activeTab === 'orders' && (
         <div className="space-y-4">
-          {orders.length === 0 ? (
+          {isFree(orders.length) ? (
             <p className="text-gray-600 text-center py-12">No orders yet</p>
           ) : (
             orders.map((order) => (
@@ -284,14 +285,14 @@ function SellerDashboard() {
                     {order.items.map((item) => (
                       <div key={item.id} className="flex items-center gap-4 py-2">
                         <img
-                          src={item.image_url || 'https://via.placeholder.com/60x60'}
+                          src={item.image_url || 'https://placehold.co/60x60'}
                           alt={item.title}
                           className="w-12 h-12 object-cover rounded"
                         />
                         <div className="flex-1">
                           <p className="text-sm font-medium">{item.title}</p>
                           <p className="text-xs text-gray-500">
-                            Qty: {item.quantity} x ${item.price.toFixed(2)}
+                            Qty: {item.quantity} x ${formatPrice(item.price)}
                           </p>
                         </div>
                       </div>
@@ -303,7 +304,7 @@ function SellerDashboard() {
                   <p className="text-sm text-gray-600">
                     Ship to: {JSON.stringify(order.shipping_address)}
                   </p>
-                  <p className="font-semibold">${order.total.toFixed(2)}</p>
+                  <p className="font-semibold">${formatPrice(order.total)}</p>
                 </div>
               </div>
             ))
@@ -320,7 +321,7 @@ function SellerDashboard() {
             </Link>
           </div>
 
-          {products.length === 0 ? (
+          {isFree(products.length) ? (
             <div className="text-center py-12">
               <p className="text-gray-600 mb-4">No products yet</p>
               <Link to="/seller/products/new" className="btn btn-primary">
@@ -355,7 +356,7 @@ function SellerDashboard() {
                       <td className="px-6 py-4">
                         <div className="flex items-center gap-3">
                           <img
-                            src={product.images?.[0] || 'https://via.placeholder.com/50x50'}
+                            src={product.images?.[0] || 'https://placehold.co/50x50'}
                             alt={product.title}
                             className="w-12 h-12 object-cover rounded"
                           />
@@ -366,7 +367,7 @@ function SellerDashboard() {
                         </div>
                       </td>
                       <td className="px-6 py-4 text-sm text-gray-900">
-                        ${product.price.toFixed(2)}
+                        ${formatPrice(product.price)}
                       </td>
                       <td className="px-6 py-4 text-sm">
                         <span

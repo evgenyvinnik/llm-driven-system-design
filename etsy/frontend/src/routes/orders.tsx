@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import api from '../services/api';
 import type { Order } from '../types';
 import { useAuthStore } from '../stores/authStore';
+import { formatPrice, isFree } from '../utils/format';
 
 export const Route = createFileRoute('/orders')({
   component: OrdersPage,
@@ -73,7 +74,7 @@ function OrdersPage() {
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       <h1 className="text-3xl font-display font-bold text-gray-900 mb-8">My Orders</h1>
 
-      {orders.length === 0 ? (
+      {isFree(orders.length) ? (
         <div className="text-center py-12">
           <p className="text-gray-600 mb-4">You haven't placed any orders yet</p>
           <Link to="/" className="btn btn-primary">
@@ -108,14 +109,14 @@ function OrdersPage() {
                   {order.items.map((item) => (
                     <div key={item.id} className="flex items-center gap-4 py-2">
                       <img
-                        src={item.image_url || 'https://via.placeholder.com/60x60?text=No+Image'}
+                        src={item.image_url || 'https://placehold.co/60x60?text=No+Image'}
                         alt={item.title}
                         className="w-16 h-16 object-cover rounded-md"
                       />
                       <div className="flex-1">
                         <p className="font-medium text-gray-900">{item.title}</p>
                         <p className="text-sm text-gray-600">
-                          Qty: {item.quantity} x ${item.price.toFixed(2)}
+                          Qty: {item.quantity} x ${formatPrice(item.price)}
                         </p>
                       </div>
                     </div>
@@ -130,7 +131,7 @@ function OrdersPage() {
                   )}
                 </div>
                 <p className="font-semibold text-gray-900">
-                  Total: ${order.total.toFixed(2)}
+                  Total: ${formatPrice(order.total)}
                 </p>
               </div>
             </div>

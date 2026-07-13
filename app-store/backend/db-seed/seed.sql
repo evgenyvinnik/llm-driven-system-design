@@ -56,7 +56,7 @@ INSERT INTO apps (
         ARRAY['photo', 'editing', 'ai', 'filters', 'enhance'],
         '2.1.0', 125000000, '4+',
         false, 4.99, 45678, 205052.50, 45000, 4.56,
-        'https://via.placeholder.com/512/FF6B6B/FFFFFF?text=PM',
+        'https://placehold.co/512x512/FF6B6B/FFFFFF?text=PM',
         'published', NOW() - INTERVAL '90 days'
     ),
     -- TaskMaster
@@ -71,7 +71,7 @@ INSERT INTO apps (
         ARRAY['tasks', 'productivity', 'todo', 'reminders', 'organize'],
         '3.0.5', 45000000, '4+',
         true, 0, 234567, 1079409.00, 234000, 4.61,
-        'https://via.placeholder.com/512/4ECDC4/FFFFFF?text=TM',
+        'https://placehold.co/512x512/4ECDC4/FFFFFF?text=TM',
         'published', NOW() - INTERVAL '180 days'
     ),
     -- Space Quest Adventures
@@ -86,7 +86,7 @@ INSERT INTO apps (
         ARRAY['game', 'space', 'adventure', 'action', 'aliens'],
         '1.5.2', 350000000, '9+',
         true, 0, 567890, 2636929.50, 567000, 4.65,
-        'https://via.placeholder.com/512/9B59B6/FFFFFF?text=SQ',
+        'https://placehold.co/512x512/9B59B6/FFFFFF?text=SQ',
         'published', NOW() - INTERVAL '60 days'
     ),
     -- FitTrack Pro
@@ -101,7 +101,7 @@ INSERT INTO apps (
         ARRAY['fitness', 'workout', 'health', 'exercise', 'calories'],
         '4.2.1', 85000000, '4+',
         false, 9.99, 89012, 391652.80, 89000, 4.40,
-        'https://via.placeholder.com/512/E74C3C/FFFFFF?text=FT',
+        'https://placehold.co/512x512/E74C3C/FFFFFF?text=FT',
         'published', NOW() - INTERVAL '120 days'
     ),
     -- SocialStream
@@ -116,7 +116,7 @@ INSERT INTO apps (
         ARRAY['social', 'networking', 'friends', 'chat', 'share'],
         '5.1.0', 110000000, '12+',
         true, 0, 890123, 3827528.90, 890000, 4.30,
-        'https://via.placeholder.com/512/3498DB/FFFFFF?text=SS',
+        'https://placehold.co/512x512/3498DB/FFFFFF?text=SS',
         'published', NOW() - INTERVAL '200 days'
     ),
     -- WeatherNow
@@ -131,7 +131,7 @@ INSERT INTO apps (
         ARRAY['weather', 'forecast', 'radar', 'alerts', 'temperature'],
         '2.8.3', 35000000, '4+',
         true, 0, 456789, 2101233.40, 456000, 4.61,
-        'https://via.placeholder.com/512/F39C12/FFFFFF?text=WN',
+        'https://placehold.co/512x512/F39C12/FFFFFF?text=WN',
         'published', NOW() - INTERVAL '300 days'
     ),
     -- LearnLingo
@@ -146,7 +146,7 @@ INSERT INTO apps (
         ARRAY['language', 'learning', 'education', 'spanish', 'french'],
         '3.5.0', 200000000, '4+',
         false, 14.99, 123456, 580365.70, 123000, 4.72,
-        'https://via.placeholder.com/512/2ECC71/FFFFFF?text=LL',
+        'https://placehold.co/512x512/2ECC71/FFFFFF?text=LL',
         'published', NOW() - INTERVAL '150 days'
     ),
     -- BudgetWise
@@ -161,7 +161,7 @@ INSERT INTO apps (
         ARRAY['budget', 'finance', 'money', 'expenses', 'savings'],
         '2.3.1', 55000000, '4+',
         true, 0, 345678, 1537664.70, 345000, 4.46,
-        'https://via.placeholder.com/512/1ABC9C/FFFFFF?text=BW',
+        'https://placehold.co/512x512/1ABC9C/FFFFFF?text=BW',
         'published', NOW() - INTERVAL '100 days'
     ),
     -- Puzzle Mania
@@ -176,7 +176,7 @@ INSERT INTO apps (
         ARRAY['puzzle', 'game', 'brain', 'logic', 'challenge'],
         '1.9.8', 150000000, '4+',
         true, 0, 678901, 3054545.50, 678000, 4.50,
-        'https://via.placeholder.com/512/8E44AD/FFFFFF?text=PZ',
+        'https://placehold.co/512x512/8E44AD/FFFFFF?text=PZ',
         'published', NOW() - INTERVAL '80 days'
     ),
     -- StreamMax
@@ -191,7 +191,7 @@ INSERT INTO apps (
         ARRAY['streaming', 'movies', 'shows', 'entertainment', 'video'],
         '4.0.2', 95000000, '12+',
         false, 6.99, 234567, 1073298.70, 234000, 4.59,
-        'https://via.placeholder.com/512/E91E63/FFFFFF?text=SX',
+        'https://placehold.co/512x512/E91E63/FFFFFF?text=SX',
         'published', NOW() - INTERVAL '250 days'
     )
 ON CONFLICT (bundle_id) DO NOTHING;
@@ -199,22 +199,22 @@ ON CONFLICT (bundle_id) DO NOTHING;
 -- Add screenshots for apps
 INSERT INTO app_screenshots (app_id, url, device_type, sort_order) VALUES
     -- PhotoMagic Pro screenshots
-    ('a1111111-1111-1111-1111-111111111111', 'https://via.placeholder.com/390x844/FF6B6B/FFFFFF?text=PhotoMagic+1', 'iphone', 0),
-    ('a1111111-1111-1111-1111-111111111111', 'https://via.placeholder.com/390x844/FF6B6B/FFFFFF?text=PhotoMagic+2', 'iphone', 1),
-    ('a1111111-1111-1111-1111-111111111111', 'https://via.placeholder.com/390x844/FF6B6B/FFFFFF?text=PhotoMagic+3', 'iphone', 2),
+    ('a1111111-1111-1111-1111-111111111111', 'https://placehold.co/390x844/FF6B6B/FFFFFF?text=PhotoMagic+1', 'iphone', 0),
+    ('a1111111-1111-1111-1111-111111111111', 'https://placehold.co/390x844/FF6B6B/FFFFFF?text=PhotoMagic+2', 'iphone', 1),
+    ('a1111111-1111-1111-1111-111111111111', 'https://placehold.co/390x844/FF6B6B/FFFFFF?text=PhotoMagic+3', 'iphone', 2),
     -- TaskMaster screenshots
-    ('a2222222-2222-2222-2222-222222222222', 'https://via.placeholder.com/390x844/4ECDC4/FFFFFF?text=TaskMaster+1', 'iphone', 0),
-    ('a2222222-2222-2222-2222-222222222222', 'https://via.placeholder.com/390x844/4ECDC4/FFFFFF?text=TaskMaster+2', 'iphone', 1),
+    ('a2222222-2222-2222-2222-222222222222', 'https://placehold.co/390x844/4ECDC4/FFFFFF?text=TaskMaster+1', 'iphone', 0),
+    ('a2222222-2222-2222-2222-222222222222', 'https://placehold.co/390x844/4ECDC4/FFFFFF?text=TaskMaster+2', 'iphone', 1),
     -- Space Quest screenshots
-    ('a3333333-3333-3333-3333-333333333333', 'https://via.placeholder.com/390x844/9B59B6/FFFFFF?text=SpaceQuest+1', 'iphone', 0),
-    ('a3333333-3333-3333-3333-333333333333', 'https://via.placeholder.com/390x844/9B59B6/FFFFFF?text=SpaceQuest+2', 'iphone', 1),
-    ('a3333333-3333-3333-3333-333333333333', 'https://via.placeholder.com/390x844/9B59B6/FFFFFF?text=SpaceQuest+3', 'iphone', 2),
+    ('a3333333-3333-3333-3333-333333333333', 'https://placehold.co/390x844/9B59B6/FFFFFF?text=SpaceQuest+1', 'iphone', 0),
+    ('a3333333-3333-3333-3333-333333333333', 'https://placehold.co/390x844/9B59B6/FFFFFF?text=SpaceQuest+2', 'iphone', 1),
+    ('a3333333-3333-3333-3333-333333333333', 'https://placehold.co/390x844/9B59B6/FFFFFF?text=SpaceQuest+3', 'iphone', 2),
     -- FitTrack Pro screenshots
-    ('a4444444-4444-4444-4444-444444444444', 'https://via.placeholder.com/390x844/E74C3C/FFFFFF?text=FitTrack+1', 'iphone', 0),
-    ('a4444444-4444-4444-4444-444444444444', 'https://via.placeholder.com/390x844/E74C3C/FFFFFF?text=FitTrack+2', 'iphone', 1),
+    ('a4444444-4444-4444-4444-444444444444', 'https://placehold.co/390x844/E74C3C/FFFFFF?text=FitTrack+1', 'iphone', 0),
+    ('a4444444-4444-4444-4444-444444444444', 'https://placehold.co/390x844/E74C3C/FFFFFF?text=FitTrack+2', 'iphone', 1),
     -- WeatherNow screenshots
-    ('a6666666-6666-6666-6666-666666666666', 'https://via.placeholder.com/390x844/F39C12/FFFFFF?text=WeatherNow+1', 'iphone', 0),
-    ('a6666666-6666-6666-6666-666666666666', 'https://via.placeholder.com/390x844/F39C12/FFFFFF?text=WeatherNow+2', 'iphone', 1)
+    ('a6666666-6666-6666-6666-666666666666', 'https://placehold.co/390x844/F39C12/FFFFFF?text=WeatherNow+1', 'iphone', 0),
+    ('a6666666-6666-6666-6666-666666666666', 'https://placehold.co/390x844/F39C12/FFFFFF?text=WeatherNow+2', 'iphone', 1)
 ON CONFLICT DO NOTHING;
 
 -- Add sample reviews

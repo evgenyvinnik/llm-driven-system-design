@@ -1,17 +1,7 @@
--- Drop existing tables (for development reset)
-DROP TABLE IF EXISTS order_items CASCADE;
-DROP TABLE IF EXISTS orders CASCADE;
-DROP TABLE IF EXISTS cart_items CASCADE;
-DROP TABLE IF EXISTS reviews CASCADE;
-DROP TABLE IF EXISTS favorites CASCADE;
-DROP TABLE IF EXISTS view_history CASCADE;
-DROP TABLE IF EXISTS products CASCADE;
-DROP TABLE IF EXISTS categories CASCADE;
-DROP TABLE IF EXISTS shops CASCADE;
-DROP TABLE IF EXISTS users CASCADE;
+-- Etsy schema. Idempotent: safe to re-run (npm run db:migrate) without destroying data.
 
 -- Users table
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
   email VARCHAR(255) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
@@ -24,7 +14,7 @@ CREATE TABLE users (
 );
 
 -- Categories table
-CREATE TABLE categories (
+CREATE TABLE IF NOT EXISTS categories (
   id SERIAL PRIMARY KEY,
   name VARCHAR(100) NOT NULL,
   slug VARCHAR(100) UNIQUE NOT NULL,
@@ -34,7 +24,7 @@ CREATE TABLE categories (
 );
 
 -- Shops (sellers)
-CREATE TABLE shops (
+CREATE TABLE IF NOT EXISTS shops (
   id SERIAL PRIMARY KEY,
   owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   name VARCHAR(100) UNIQUE NOT NULL,
@@ -54,7 +44,7 @@ CREATE TABLE shops (
 );
 
 -- Products
-CREATE TABLE products (
+CREATE TABLE IF NOT EXISTS products (
   id SERIAL PRIMARY KEY,
   shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE,
   title VARCHAR(200) NOT NULL,
@@ -77,7 +67,7 @@ CREATE TABLE products (
 );
 
 -- Favorites (items and shops)
-CREATE TABLE favorites (
+CREATE TABLE IF NOT EXISTS favorites (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   favoritable_type VARCHAR(20) NOT NULL,
@@ -87,7 +77,7 @@ CREATE TABLE favorites (
 );
 
 -- View history for personalization
-CREATE TABLE view_history (
+CREATE TABLE IF NOT EXISTS view_history (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
@@ -95,7 +85,7 @@ CREATE TABLE view_history (
 );
 
 -- Shopping cart items
-CREATE TABLE cart_items (
+CREATE TABLE IF NOT EXISTS cart_items (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
@@ -107,7 +97,7 @@ CREATE TABLE cart_items (
 );
 
 -- Orders (one per shop per checkout)
-CREATE TABLE orders (
+CREATE TABLE IF NOT EXISTS orders (
   id SERIAL PRIMARY KEY,
   buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL,
@@ -124,7 +114,7 @@ CREATE TABLE orders (
 );
 
 -- Order items
-CREATE TABLE order_items (
+CREATE TABLE IF NOT EXISTS order_items (
   id SERIAL PRIMARY KEY,
   order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
   product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
@@ -136,7 +126,7 @@ CREATE TABLE order_items (
 );
 
 -- Reviews
-CREATE TABLE reviews (
+CREATE TABLE IF NOT EXISTS reviews (
   id SERIAL PRIMARY KEY,
   order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
   product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
@@ -150,14 +140,14 @@ CREATE TABLE reviews (
 );
 
 -- Indexes for performance
-CREATE INDEX idx_products_shop_id ON products(shop_id);
-CREATE INDEX idx_products_category_id ON products(category_id);
-CREATE INDEX idx_products_is_active ON products(is_active);
-CREATE INDEX idx_products_created_at ON products(created_at DESC);
-CREATE INDEX idx_cart_items_user_id ON cart_items(user_id);
-CREATE INDEX idx_orders_buyer_id ON orders(buyer_id);
-CREATE INDEX idx_orders_shop_id ON orders(shop_id);
-CREATE INDEX idx_favorites_user_id ON favorites(user_id);
-CREATE INDEX idx_view_history_user_id ON view_history(user_id);
-CREATE INDEX idx_reviews_product_id ON reviews(product_id);
-CREATE INDEX idx_reviews_shop_id ON reviews(shop_id);
+CREATE INDEX IF NOT EXISTS idx_products_shop_id ON products(shop_id);
+CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id);
+CREATE INDEX IF NOT EXISTS idx_products_is_active ON products(is_active);
+CREATE INDEX IF NOT EXISTS idx_products_created_at ON products(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cart_items_user_id ON cart_items(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_buyer_id ON orders(buyer_id);
+CREATE INDEX IF NOT EXISTS idx_orders_shop_id ON orders(shop_id);
+CREATE INDEX IF NOT EXISTS idx_favorites_user_id ON favorites(user_id);
+CREATE INDEX IF NOT EXISTS idx_view_history_user_id ON view_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON reviews(product_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_shop_id ON reviews(shop_id);

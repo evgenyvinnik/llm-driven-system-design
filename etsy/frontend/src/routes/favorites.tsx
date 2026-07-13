@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import api from '../services/api';
 import type { Favorite } from '../types';
 import { useAuthStore } from '../stores/authStore';
+import { formatPrice, isFree } from '../utils/format';
 
 export const Route = createFileRoute('/favorites')({
   component: FavoritesPage,
@@ -87,7 +88,7 @@ function FavoritesPage() {
         <div className="flex justify-center items-center min-h-96">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div>
         </div>
-      ) : favorites.length === 0 ? (
+      ) : isFree(favorites.length) ? (
         <div className="text-center py-12">
           <p className="text-gray-600 mb-4">
             No favorite {activeTab === 'product' ? 'products' : 'shops'} yet
@@ -106,7 +107,7 @@ function FavoritesPage() {
               >
                 <div className="aspect-square overflow-hidden">
                   <img
-                    src={favorite.image || 'https://via.placeholder.com/400x400?text=No+Image'}
+                    src={favorite.image || 'https://placehold.co/400x400?text=No+Image'}
                     alt={favorite.name || ''}
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                   />
@@ -123,7 +124,7 @@ function FavoritesPage() {
                 </Link>
                 {favorite.price && (
                   <p className="text-lg font-semibold text-gray-900 mt-1">
-                    ${parseFloat(favorite.price).toFixed(2)}
+                    ${formatPrice(favorite.price)}
                   </p>
                 )}
                 <button

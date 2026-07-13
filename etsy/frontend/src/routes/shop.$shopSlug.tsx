@@ -4,6 +4,7 @@ import api from '../services/api';
 import type { Product, Shop } from '../types';
 import { ProductCard } from '../components/ProductCard';
 import { useAuthStore } from '../stores/authStore';
+import { isFree } from '../utils/format';
 
 export const Route = createFileRoute('/shop/$shopSlug')({
   component: ShopPage,
@@ -146,7 +147,7 @@ function ShopPage() {
           Items for Sale
         </h2>
 
-        {products.length === 0 ? (
+        {isFree(products.length) ? (
           <div className="text-center py-12">
             <p className="text-gray-600">No products listed yet</p>
           </div>

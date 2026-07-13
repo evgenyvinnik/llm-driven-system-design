@@ -4,6 +4,7 @@ import { useCartStore } from '../stores/cartStore';
 import { useAuthStore } from '../stores/authStore';
 import api from '../services/api';
 import type { Order } from '../types';
+import { formatPrice, isFree } from '../utils/format';
 
 export const Route = createFileRoute('/checkout')({
   component: CheckoutPage,
@@ -31,7 +32,7 @@ function CheckoutPage() {
     return null;
   }
 
-  if (!cart || cart.shops.length === 0) {
+  if (!cart || isFree(cart.shops.length)) {
     window.location.href = '/cart';
     return null;
   }
@@ -178,13 +179,13 @@ function CheckoutPage() {
                       <span>
                         {item.title} x {item.quantity}
                       </span>
-                      <span>${item.itemTotal.toFixed(2)}</span>
+                      <span>${formatPrice(item.itemTotal)}</span>
                     </div>
                   ))}
                   <div className="flex justify-between text-sm text-gray-600 mt-1">
                     <span>Shipping</span>
                     <span>
-                      {shop.shippingTotal === 0 ? 'Free' : `$${shop.shippingTotal.toFixed(2)}`}
+                      {isFree(shop.shippingTotal) ? 'Free' : `$${formatPrice(shop.shippingTotal)}`}
                     </span>
                   </div>
                 </div>
@@ -194,14 +195,14 @@ function CheckoutPage() {
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
                 <span className="text-gray-600">Subtotal</span>
-                <span>${cart.summary.itemTotal.toFixed(2)}</span>
+                <span>${formatPrice(cart.summary.itemTotal)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-600">Shipping</span>
                 <span>
-                  {cart.summary.shippingTotal === 0
+                  {isFree(cart.summary.shippingTotal)
                     ? 'Free'
-                    : `$${cart.summary.shippingTotal.toFixed(2)}`}
+                    : `$${formatPrice(cart.summary.shippingTotal)}`}
                 </span>
               </div>
             </div>
@@ -209,7 +210,7 @@ function CheckoutPage() {
             <div className="border-t border-gray-200 mt-4 pt-4">
               <div className="flex justify-between text-lg font-semibold">
                 <span>Total</span>
-                <span>${cart.summary.grandTotal.toFixed(2)}</span>
+                <span>${formatPrice(cart.summary.grandTotal)}</span>
               </div>
             </div>
 
@@ -218,7 +219,7 @@ function CheckoutPage() {
               disabled={isProcessing}
               className="btn btn-primary w-full mt-6 py-3"
             >
-              {isProcessing ? 'Processing...' : `Place Order - $${cart.summary.grandTotal.toFixed(2)}`}
+              {isProcessing ? 'Processing...' : `Place Order - $${formatPrice(cart.summary.grandTotal)}`}
             </button>
 
             <p className="text-xs text-gray-500 text-center mt-4">

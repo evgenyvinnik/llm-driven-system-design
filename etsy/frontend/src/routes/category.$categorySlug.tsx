@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import api from '../services/api';
 import type { Product, Category } from '../types';
 import { ProductCard } from '../components/ProductCard';
+import { isFree } from '../utils/format';
 
 export const Route = createFileRoute('/category/$categorySlug')({
   component: CategoryPage,
@@ -81,7 +82,7 @@ function CategoryPage() {
         </select>
       </div>
 
-      {products.length === 0 ? (
+      {isFree(products.length) ? (
         <div className="text-center py-12">
           <p className="text-gray-600 mb-4">No products in this category yet</p>
           <Link to="/" className="btn btn-secondary">
