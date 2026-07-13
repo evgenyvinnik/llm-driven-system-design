@@ -5,7 +5,8 @@ dotenv.config();
 
 /** PostgreSQL connection pool for the Twitter database. */
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString:
+    process.env.DATABASE_URL || 'postgresql://twitter:twitter_secret@localhost:5432/twitter_db',
 });
 
 pool.on('error', (err: Error) => {

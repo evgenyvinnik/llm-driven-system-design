@@ -10,7 +10,8 @@ dotenv.config();
  * Used by all services requiring persistent data storage.
  */
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString:
+    process.env.DATABASE_URL || 'postgresql://payment_user:payment_pass@localhost:5432/payment_db',
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,

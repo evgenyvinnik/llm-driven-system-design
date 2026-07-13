@@ -1,0 +1,30 @@
+{
+  "generated": "2026-07-13T04:19:34.543Z",
+  "projects": {
+    "slack": {
+      "project": "slack",
+      "timestamp": "2026-07-13T04:17:50.895Z",
+      "hasConfig": true,
+      "hasDockerCompose": true,
+      "hasSeedSql": true,
+      "hasInitSql": true,
+      "dockerUp": true,
+      "postgresReady": true,
+      "redisReady": true,
+      "migrationOk": true,
+      "seedOk": true,
+      "backendStarted": false,
+      "frontendStarted": false,
+      "frontendLoads": false,
+      "backendHealthOk": false,
+      "loginOk": false,
+      "mainPageOk": false,
+      "errors": [
+        "Backend: /Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/slack/backend/src/index.ts:13\nimport RedisStore from 'connect-redis';\n       ^\n\nSyntaxError: The requested module 'connect-redis' does not provide an export named 'default'\n    at ModuleJob._instantiate (node:internal/modules/esm/module_job:228:21)\n    at async ModuleJob.run (node:internal/modules/esm/module_job:335:5)\n    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:647:26)\n    at async asyncRunEntryPoin",
+        "Frontend: \u001b[31mfailed to load config from /Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/slack/frontend/vite.config.js\u001b[39m\n\u001b[31merror when starting dev server:\nError: Cannot find package '/Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/slack/frontend/node_modules/zod/index.js' imported from /Users/evgenyvinnik/Documents/GitHub/llm-driven-system-design/slack/frontend/node_modules/@tanstack/router-plugin/dist/esm/core/config.js\nDid you mean to import \"zod/index.cjs\"?\n    at leg"
+      ],
+      "duration": 104,
+      "grade": "RED"
+    }
+  }
+}

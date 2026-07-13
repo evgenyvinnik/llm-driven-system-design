@@ -7,7 +7,8 @@ let pool: PoolType | null = null;
 export function getPool(): PoolType {
   if (!pool) {
     pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
+      connectionString:
+        process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/youtube_topk',
       max: 20,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 2000,

@@ -99,3 +99,15 @@ The Elasticsearch configuration includes:
 - [Etsy Engineering](https://www.etsy.com/codeascraft)
 - [Search Relevance Tuning](https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-match-query.html)
 - [Elasticsearch Synonyms](https://www.elastic.co/guide/en/elasticsearch/reference/current/analysis-synonym-tokenfilter.html)
+
+---
+
+## Repair Log (2026-07-12)
+
+The project was unable to run from a fresh clone; three defects were found and fixed during the repo-wide implementation audit:
+
+1. **Missing database schema**: commit 439fde56 removed `src/db/migrate.js` (schema + triggers) assuming migrations were "handled elsewhere" — they were not. Restored the schema as `backend/src/db/init.sql` (recovered from git history), added `backend/src/db/migrate.ts` and an `npm run db:migrate` script, and mounted init.sql into `docker-entrypoint-initdb.d` so a fresh `docker-compose up` self-initializes.
+2. **Backend crash on boot**: `src/shared/logger.ts` used CommonJS `require('pino-http')` in an ESM package (`"type": "module"`), throwing `ReferenceError: require is not defined` at import time. Replaced with the named ESM import `{ pinoHttp }` (pino-http v11+).
+3. **README drift**: README instructed `npm run migrate`, which did not exist. Now documents `npm run db:migrate`.
+
+Verified end-to-end after the fixes: docker-compose up → migrate → seed → backend boots (health 200) → products/categories APIs return seeded data → login succeeds → frontend serves on 5173.

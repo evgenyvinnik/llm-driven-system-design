@@ -10,7 +10,8 @@
  */
 
 import type { Request, Response, NextFunction, ErrorRequestHandler } from 'express';
-import { recordOperation } from '../shared/metrics.js';
+import { recordOperation, updateCacheStats } from '../shared/metrics.js';
+import { logHotKeysDetected } from '../shared/logger.js';
 import type { ServerContext, AsyncRequestHandler, CacheOperation } from './types.js';
 
 /**
@@ -122,9 +123,6 @@ export function createMetricsUpdater(context: ServerContext) {
    * metrics. Also checks for hot keys and logs them if detected.
    */
   return function updateMetrics(): void {
-    const { updateCacheStats } = require('../shared/metrics.js');
-    const { logHotKeysDetected } = require('../shared/logger.js');
-
     const stats = cache.getStats();
     updateCacheStats(config.nodeId, stats);
 

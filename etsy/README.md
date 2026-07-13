@@ -78,8 +78,8 @@ npm install
 # Copy environment file
 cp .env.example .env
 
-# Run database migrations
-npm run migrate
+# Run database migrations (also auto-applied via docker-entrypoint-initdb.d on first docker-compose up)
+npm run db:migrate
 
 # Seed with sample data
 npm run seed

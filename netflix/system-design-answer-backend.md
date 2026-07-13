@@ -2,224 +2,354 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## Problem Statement
+## 📋 Problem Statement
 
-Design Netflix, a video streaming platform serving hundreds of millions of subscribers globally. The backend challenge focuses on adaptive bitrate streaming, CDN architecture, viewing history at scale, and A/B testing infrastructure.
+Design the backend for Netflix: a video streaming platform serving 200M+ subscribers, roughly 15% of downstream internet traffic, with personalized discovery for every profile. The defining property of this system is a **radical asymmetry between two planes**: the video plane moves petabytes through a purpose-built CDN and must basically never touch application servers, while the control plane (browse, personalize, resume, experiment) is a high-QPS metadata business where a full outage should degrade the experience, not end it.
 
-## Requirements Clarification
+The other defining constraint: almost nothing here needs strong consistency. A viewing position off by ten seconds, a homepage an hour stale, a Top 10 row computed from last night's data — all fine. The design should *spend* that freedom deliberately to buy availability and latency, rather than paying for consistency nobody needs.
+
+## 🎯 Requirements Clarification
+
+Questions I'd ask up front:
+
+- **Are we designing the encoding pipeline and CDN, or just the serving stack?** Both matter, but the CDN strategy shapes everything else, so I'll cover the video path at the architecture level and go deep on the serving-side systems: playback, progress, personalization, experimentation.
+- **Live streaming?** No — on-demand only. Live inverts the caching assumptions entirely (nothing is cacheable ahead of time) and deserves its own design.
+- **How fresh must recommendations be?** I'll assert hourly batch freshness with lightweight real-time re-ranking, and defend that below.
+- **Consistency bar for resume?** "Close enough": resuming within ~30 seconds of where you stopped on another device is acceptable; losing the position entirely is not.
 
 ### Functional Requirements
-- **Streaming API**: Generate DASH manifests with quality tiers
-- **Progress Tracking**: Store viewing position for resume across devices
-- **Personalization API**: Generate personalized homepage rows
-- **A/B Testing**: Allocate users to experiments consistently
+
+- **Stream**: Start playback in under 2 seconds with adaptive quality up to 4K HDR
+- **Resume**: Continue watching across devices — position survives device switches and crashes
+- **Browse**: Personalized homepage (40–75 rows per profile), search, title detail
+- **Profiles**: Up to 5 per account with independent history, maturity settings, and recommendations
+- **Experiment**: Hundreds of concurrent A/B tests with consistent cross-device allocation
 
 ### Non-Functional Requirements
-- **Latency**: < 2 seconds to start playback
-- **Availability**: 99.99% for streaming service
-- **Scale**: 200M subscribers, 15% of global internet traffic
-- **Throughput**: Handle millions of progress updates per second
+
+- **Playback start**: < 2s from click to first frame; rebuffer ratio < 0.5%
+- **Availability**: 99.99% for the streaming path — playback must survive control-plane outages
+- **Homepage**: < 100ms server time at ~100K generations/sec
+- **Scale**: 200M subscribers, ~10M peak concurrent streams, ~500K API req/sec
+- **Kids safety**: maturity filtering enforced server-side, unconditionally — this one is not a soft requirement
 
 ### Scale Estimates
-- **Peak Concurrent Viewers**: 50 million
-- **Progress Updates**: 50M viewers x 1 update/10s = 5M writes/second
-- **Daily Playback Starts**: 500 million
-- **Video Catalog**: 15,000+ titles
 
-## High-Level Architecture
+- ~15,000 titles × ~1,200 encoded variants each (resolutions × bitrates × codecs × audio) ≈ 10 PB of stored video
+- 10M concurrent streams sending a progress beacon every 30s → **~330K progress writes/sec sustained** — the single largest write load in the system
+- ~160M viewing hours/day feeding the analytics and recommendation pipelines
+- ~100K homepage generations/sec, each assembling 40–75 rows — the largest *read* amplification in the system
+- A 4K stream at ~15 Mbps × 10M concurrent ≈ tens of Tbps aggregate — no application tier on earth serves this; it exists to justify the CDN-first architecture
+- Catalog metadata is tiny — 15K titles fits in RAM on every serving node. The catalog is a *caching* problem, never a *sharding* problem
+
+That last point is worth saying out loud: this system has one huge write stream (progress), one huge read fan-out (homepage), one huge byte stream (video), and a metadata core that is almost comically small. Each gets a different tool.
+
+## 🏗️ High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│    Smart TV │ Mobile │ Web │ Gaming Console │ Set-top Box       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Open Connect CDN                             │
-│         (Netflix's custom CDN, ISP-embedded appliances)         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway (Kong/Zuul)                      │
-│              Rate Limiting │ Auth │ Routing                     │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Playback Svc  │    │Personalization│    │ Experiment Svc│
-│               │    │    Service    │    │               │
-│ - Manifest    │    │ - Homepage    │    │ - Allocation  │
-│ - DRM         │    │ - Ranking     │    │ - A/B tests   │
-│ - Progress    │    │ - Rows        │    │ - Metrics     │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├──────────────┬──────────────────┬───────────────────────────────┤
-│  PostgreSQL  │    Cassandra     │         Redis + Kafka         │
-│  - Catalog   │  - View History  │    - Sessions, Cache          │
-│  - Accounts  │  - Progress      │    - Events                   │
-└──────────────┴──────────────────┴───────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│        Clients: Smart TV │ Mobile │ Web │ Console │ Set-top         │
+│        (ABR player + DRM module + UI shell)                         │
+└───────────────┬───────────────────────────────────┬─────────────────┘
+        video   │ segments (bulk bytes)     API     │ (metadata, tiny)
+                ▼                                   ▼
+┌───────────────────────────┐        ┌──────────────────────────────┐
+│   Open Connect CDN        │        │        API Gateway           │
+│   ~16K appliances inside  │        │  auth, rate limits, routing, │
+│   ~6K ISP networks        │        │  A/B allocation headers      │
+│   (pre-filled off-peak)   │        └──────┬───────┬───────┬───────┘
+└───────────▲───────────────┘               ▼       ▼       ▼
+            │ nightly push          ┌─────────┐ ┌─────────┐ ┌──────────┐
+┌───────────┴───────────────┐       │Playback │ │Personal-│ │ Account/ │
+│  Video Pipeline (offline) │       │Service  │ │ization  │ │Experiment│
+│  ingest → per-title       │       │manifest,│ │homepage,│ │profiles, │
+│  encode → package/DRM →   │       │DRM lic, │ │search,  │ │allocation│
+│  distribute               │       │progress │ │rows     │ │          │
+└───────────────────────────┘       └──┬───┬──┘ └──┬───┬──┘ └────┬─────┘
+                                       ▼   ▼       ▼   ▼         ▼
+                                ┌─────────┐ ┌──────────┐ ┌────────────┐
+                                │Cassandra│ │ EVCache/ │ │ PostgreSQL │
+                                │progress,│ │  Redis   │ │ accounts,  │
+                                │history  │ │ hot data │ │ catalog    │
+                                └────┬────┘ └──────────┘ └────────────┘
+                                     ▼
+                            ┌────────────────┐
+                            │ Kafka → batch  │
+                            │ ML pipelines → │
+                            │ precomputed    │
+                            │ recommendations│
+                            └────────────────┘
 ```
 
-## Deep Dives
+The load-bearing structural decision: **video bytes never touch the application tier.** The API hands the client a signed manifest; every segment thereafter comes from an Open Connect appliance sitting inside the user's own ISP. The application tier is sized for metadata QPS, which is five orders of magnitude cheaper than the byte stream.
 
-### 1. Playback Service Architecture
+## 💾 Data Model
 
-**DASH Manifest Generation:**
+Split across stores by access pattern, described as prose tables:
 
-The manifest generation function produces a playback manifest containing video metadata, available quality tiers, subtitle tracks, and audio tracks. It proceeds through five steps:
+| Store | Data | Key Structure | Why this store |
+|-------|------|---------------|----------------|
+| PostgreSQL | accounts, profiles, subscriptions, billing | account_id PK; profiles FK to account, max 5 enforced | Low write rate, needs ACID (billing), relational integrity |
+| PostgreSQL + cache | catalog: videos, seasons, episodes, video_files (variant registry), genres | video_id; video_files rows per (content, resolution, bitrate, codec) | Read-heavy, tiny, cached to near-100% hit rate |
+| Cassandra | viewing_progress | partition = profile_id, clustered by last_watched_at DESC | 330K writes/sec; every read is "recent items for one profile" — the partition key *is* the query |
+| Cassandra | watch_history | partition = profile_id, time-clustered; title/genres denormalized in | Append-only; denormalization avoids cross-store joins on display |
+| Redis/EVCache | sessions, resume positions (hot), precomputed homepage rows, experiment allocation cache | per-profile keys with TTLs | Sub-ms reads on the hot path |
+| Elasticsearch | search index: title, cast, description, genres | sharded by language/region | Fuzzy match, prefix autosuggest, faceting |
+| Kafka + warehouse | playback QoE events, view events | keyed by profile_id | Feeds ML training and experiment metrics; never read on the request path |
 
-1. **Get video metadata**: Query PostgreSQL for the video record, joining with episodes and seasons tables if the content is a series
-2. **Get available encodings**: Query video_encodings filtered by the device's supported codecs and maximum resolution, ordered by bandwidth descending
-3. **Get resume position**: Query Cassandra's viewing_progress table for the profile's last known position on this content
-4. **Generate CDN URLs**: For each encoding, create a signed CDN URL with a 1-hour expiry token. The URL uses a segment template pattern (e.g., `seg-$Number$.m4s`) so the client can request individual segments by index
-5. **Get subtitles and audio**: Fetch subtitle and audio track metadata in parallel
+Key modeling decisions:
 
-The manifest includes: videoId, title, duration, resumePosition, an array of quality tiers (each with resolution, bandwidth, codec, segment duration, and base URL), plus subtitle and audio track arrays.
+**viewing_progress is keyed for its one query.** Every access is "give me recent progress for profile X" — Continue Watching, resume lookup, both. Partitioning by profile_id with time-descending clustering makes that a single-partition read. The cost: no ad-hoc queries ("who watched title Y yesterday?") — those go through the Kafka event stream into the warehouse, which is where analytics belongs anyway.
 
-**CDN URL Signing:**
+**video_files is a registry, not a blob store.** One row per encoded variant records resolution, bitrate, codec, and the storage key. Manifest generation is a filtered read of this registry (device codec support × subscription tier × licensing region), never a filesystem walk.
 
-Each CDN URL is signed with an HMAC token containing the video ID, encoding ID, profile ID, and a 1-hour expiry timestamp. The client embeds this token as a query parameter when requesting segments, and the CDN validates it before serving content. This prevents unauthorized access and link sharing.
+**Maturity level lives on both profile and title**, and filtering is a WHERE clause applied in every catalog query path — not a UI concern. A kids profile cannot receive an adult title in any API response no matter how the request is crafted, because the restriction is enforced at the lowest query layer, applied uniformly.
 
-### 2. Viewing Progress at Scale
+## 🔌 API Design
 
-**Cassandra Schema for High-Write Throughput:**
+```
+POST /api/auth/login                    → Session (httpOnly cookie, Redis-backed)
+GET  /api/profiles                      → Profiles for account
+POST /api/profiles/:id/select           → Bind profile to session
 
-| Table | Partition Key | Clustering Columns | Key Columns | Notes |
-|-------|--------------|-------------------|-------------|-------|
-| **viewing_progress** | profile_id | last_watched_at DESC, content_id | content_type, video_id, episode_id, position_seconds, duration_seconds, progress_percent, completed | Keyspace uses NetworkTopologyStrategy with RF=3 across us-east, us-west, eu-west. 90-day TTL. Ordered by last_watched_at DESC for "Continue Watching" queries |
-| **watch_history** | profile_id | watched_at DESC, content_id | content_type, title (denormalized), genres (SET, denormalized for recommendations) | 1-year TTL. Title and genres denormalized to avoid cross-database joins when displaying history |
+GET  /api/browse/homepage               → Personalized rows (precomputed + re-ranked)
+GET  /api/browse/continue-watching      → In-progress content (5–95% complete)
+GET  /api/browse/search?q=              → Search with personalized ranking
+GET  /api/videos/:id                    → Title detail, seasons/episodes
 
-> "Cassandra is chosen over PostgreSQL for viewing progress because we need to handle 5M writes/second at peak. Each viewer sends a progress update every 10 seconds, and Cassandra's write-optimized LSM tree architecture handles this without the write amplification that would cripple PostgreSQL. The trade-off is we lose cross-table joins -- that's why we denormalize title and genres into watch_history."
+GET  /api/stream/:id/manifest           → Quality ladder + signed segment URLs + resume position
+POST /api/stream/:id/progress           → Position beacon (idempotent upsert)
+POST /api/stream/:id/events             → QoE beacons: rebuffer, error, bitrate switch
 
-**Progress Update Handler:**
+GET  /api/experiments/allocations       → All active variant assignments for profile
+```
 
-The progress update function performs four operations:
+Contract-level notes:
 
-1. **Write to Cassandra**: Insert the current position, duration, progress percentage, and completion flag (>95% = completed) into the viewing_progress table
-2. **Invalidate cache**: Delete the Redis key `continue_watching:{profileId}` so the next homepage request fetches fresh data
-3. **Emit analytics event**: Publish a progress_update message to the `viewing-events` Kafka topic, keyed by profileId for partition affinity
-4. **Handle completion**: If the viewer passed the 95% threshold, record the content in watch_history and update genre preference weights for the profile
+- **The manifest is the handoff point** between control plane and video plane: quality ladder, per-variant segment URL templates signed with short-TTL HMAC tokens (bound to profile + content + expiry), and the resume position — one response, then the API steps out of the way.
+- **Progress is a beacon, not an RPC**: the client fires and forgets every 30 seconds. The server must tolerate loss, duplication, and out-of-order arrival — the design burden is on the write path, not the client.
+- **QoE events are the product's sensory system**: rebuffer and error beacons feed both operations (alerting on rebuffer ratio) and the ABR/encoding feedback loop.
+- **Profile binding lives in the session, not the URL**: every downstream query inherits the selected profile server-side, which is what makes maturity filtering unforgeable — there is no profile parameter for a crafted request to lie about.
 
-**Progress Batching:**
+## 🔧 Deep Dive 1: The Video Path — Per-Title Encoding and an ISP-Embedded CDN
 
-To reduce Cassandra write load, a ProgressBatcher class buffers updates in memory, keyed by `{profileId}:{contentId}`. Only the latest position for each profile-content pair is kept. A timer flushes the buffer every 5 seconds as a Cassandra batch insert. This reduces write volume by roughly 2x since most viewers generate multiple updates between flushes, and only the final position matters.
+**The pipeline**: studios deliver mezzanine masters (4K HDR, 100+ Mbps). The encoding system analyzes each title shot-by-shot for complexity, then produces ~1,200 variants across resolutions (240p–4K), codecs (H.264 for reach, HEVC, VP9, AV1 for efficiency), and audio tracks. Packaging splits each variant into 2–4 second independently decodable segments, applies per-segment DRM encryption (Widevine/FairPlay/PlayReady by platform), and generates DASH/HLS manifests. Distribution pushes content to Open Connect appliances during off-peak hours based on predicted regional popularity.
 
-### 3. Continue Watching API
+**Why per-title encoding rather than a fixed bitrate ladder:**
 
-**Efficient Query Pattern:**
+> "A fixed ladder encodes every title at the same bitrates — 720p is always 2,350 kbps whether it's a flat-color cartoon or a rain-soaked action scene. That wastes bits on simple content and starves complex content. Per-title analysis picks the ladder per title: the cartoon looks perfect at 1,500 kbps and the action film gets 3,000. Across a catalog served billions of times, that's roughly 20% bandwidth saved *at identical perceived quality* — and at 15% of internet traffic, 20% is a number visible on national infrastructure charts. The cost is encoding compute: multiple analysis passes make the pipeline 5–10x slower per title. But the asymmetry is total — encode once, serve a million times — so trading offline compute for delivery efficiency is nearly free money. What it really costs is orchestration complexity: thousands of parallel per-shot encoding jobs with dependency tracking, which is why the pipeline is its own substantial system rather than a script around an encoder."
 
-The Continue Watching API builds a personalized list of in-progress content through six steps:
+**Why build a CDN instead of buying one:**
 
-1. **Check cache**: Look up `continue_watching:{profileId}` in Redis. If found, return the cached list immediately
-2. **Query Cassandra**: Fetch recent viewing progress for the profile, ordered by last_watched_at descending, over-fetching at 2x the limit to account for filtering
-3. **Filter**: Keep only items where progress is between 5% and 95% (started but not completed)
-4. **Enrich with metadata**: Batch-fetch video metadata (title, poster, episode info) from PostgreSQL using the content IDs from the filtered results
-5. **Build response**: Combine Cassandra progress data with PostgreSQL metadata into response objects containing: contentId, title, episode info (e.g., "S2:E5"), poster URL, progress percentage, resume position, and last watched timestamp
-6. **Cache**: Store the assembled list in Redis with a 5-minute TTL
+> "Commercial CDNs price per GB delivered and optimize for many tenants with unpredictable content. Netflix's workload is the opposite: a small catalog, extreme popularity skew, and *predictable demand* — tonight's top titles are knowable this morning. That predictability means appliances can be pre-filled during off-peak hours rather than cache-filling on demand. Embedding those appliances inside ISP networks means video bytes never cross paid transit or peering links — an estimated ~90% delivery cost reduction at this scale, and better QoE because fewer network hops means less jitter. What breaks with a third-party CDN isn't function, it's economics: at 15% of internet traffic, per-GB pricing is an existential line item. What we give up is enormous: a global hardware fleet across ~6,000 ISP partners, appliance failure handling, fill scheduling, and ISP relationship management. Below Netflix's scale this trade is wrong — the honest answer is that Open Connect is justified only by extreme scale, and a smaller service should buy its CDN."
 
-> "We over-fetch from Cassandra (2x limit) because filtering out completed and barely-started content reduces the set. The metadata enrichment is a single PostgreSQL query using ANY($1) rather than N+1 queries -- this keeps the cross-database join efficient."
+**Failure behavior on the video path**: if a local appliance dies mid-stream, the client's next segment request fails over to a peer appliance in the same ISP, then a regional tier, then origin. Because segments are independent and the player holds a 30–60 second buffer, a failover costs one slow segment, not a visible interruption. And because the manifest is already in the client's hands, **a total control-plane outage does not stop in-progress playback** — that is the availability story the two-plane split buys.
 
-### 4. A/B Testing Framework
+**The playback-start sequence, against its 2-second budget:**
 
-**Experiment Configuration:**
+```
+Client                Playback Service          Cassandra/Redis      OCA (CDN)
+  │  play(title) ──────────▶ │                        │                 │
+  │                          │── resume position ────▶│ (Redis, <1ms)   │
+  │                          │── variant registry ───▶│ (cached, <1ms)  │
+  │                          │── steering: pick OCA   │                 │
+  │ ◀── manifest + DRM ──────│   for user's ISP       │                 │
+  │      license + signed    │                        │                 │
+  │      segment URLs        │                        │                 │
+  │  first segments ────────────────────────────────────────────────▶  │
+  │ ◀───────────────────────────────────────────────── segments ──────  │
+  │  (decode + render first frame)                                      │
+```
 
-Each experiment contains: id, name, description, status (draft/running/paused/completed), traffic allocation percentage (0-100), an array of variants (each with id, name, weight, and config map), targeting groups (by country, device, plan, or tenure), tracked metrics, and start/end dates.
+Budget allocation for the 2-second promise:
 
-**Consistent Allocation with MurmurHash:**
+- Manifest generation: < 100ms — every lookup it makes is cache-resident precisely for this reason
+- DRM license issuance: runs in parallel with the first segment fetches, off the critical path
+- The remaining budget belongs to the network — first segments plus initial buffer fill — which is the CDN's problem, and the reason the CDN sits inside the user's ISP
 
-The allocation algorithm ensures each user always sees the same variant for a given experiment, without storing per-user assignments:
+The backend's whole job on this path is to get out of the way fast.
 
-1. **Experiment population check**: Hash `{userId}:{experimentId}` with MurmurHash v3 and take modulo 10,000 (0.01% granularity). If the result exceeds the experiment's allocation percentage x 100, the user is not in the experiment
-2. **Variant assignment**: Hash `{userId}:{experimentId}:variant` separately and map the result to variant weights. Iterate through variants, accumulating weights until the hash falls within a variant's range
+Two backend details in that flow worth flagging:
 
-This approach is deterministic -- the same user always gets the same variant, even across different server instances and restarts.
+- **OCA steering happens at manifest time**: the service maps the client's IP to its ISP and returns URLs pointing at the best appliance *for that user*. Steering is a control-plane decision made once per playback, not per segment — another reason segment traffic never needs the API tier.
+- **Segment URLs are HMAC-signed** with the profile, content, and a short expiry baked in. A shared link dies within the hour, and the appliance validates signatures locally with no callback to origin — authorization at the edge without an authorization service in the loop.
 
-**Getting all experiments for a user:**
+## 🔧 Deep Dive 2: Viewing Progress — 330K Writes/Sec That Must Never Block Playback
 
-The system queries all running experiments from PostgreSQL, checks targeting rules against the user's context (country, device type, subscription plan, tenure), runs the allocation algorithm for each eligible experiment, and caches the full allocation map in Redis with a 1-hour TTL.
+Every active stream beacons its position every 30 seconds. At 10M concurrent that's ~330K writes/sec sustained, with evening peaks well above. This write stream powers resume-across-devices and the Continue Watching row.
 
-**Using Experiments in Application Code:**
+**Why Cassandra and not PostgreSQL:**
 
-Feature flags are consumed by checking the user's experiment allocations against specific experiment names. For example, an artwork experiment might have three variants: "personalized" (returns ML-ranked artwork), "genre_based" (returns genre-themed artwork), or control (returns default artwork). Similarly, homepage row ordering experiments can test different strategies like "continue watching first" vs "trending first" vs "personalized order."
+> "Postgres *can* absorb heavy writes with batching and partitioning, but this workload fights its architecture: every progress update is logically an overwrite of one (profile, content) row, which in Postgres means index maintenance, MVCC bloat from constant updates to hot rows, and vacuum pressure that grows with exactly the traffic you're trying to serve. You end up hand-sharding Postgres and re-implementing what Cassandra gives natively: LSM-tree writes that are sequential appends (overwrites are cheap by design), partition-key data placement, linear scale-out by adding nodes, and multi-datacenter replication out of the box. The price is real: no joins, no ad-hoc queries, eventual consistency. For a dataset whose only online query is 'recent progress for profile X' and whose correctness bar is 'within 30 seconds,' none of those prices matter. I keep Postgres for the data that *does* need its guarantees — accounts and billing."
 
-### 5. Rate Limiting Strategy
+**Write-path mechanics:**
 
-**Tiered Rate Limits:**
+1. Beacon arrives → validate session → upsert into Cassandra keyed (profile_id, content_id), clustered by time
+2. Server-side batching: a short in-memory buffer coalesces multiple beacons for the same (profile, content) pair and writes only the latest — since only the final position matters, this roughly halves write volume for free
+3. Completion detection: crossing 95% flags the title completed, appends to watch_history, and emits a view event to Kafka
+4. Hot cache: the latest position is also written to Redis per profile, so manifest generation reads the resume position in sub-milliseconds instead of touching Cassandra on the playback-start critical path
 
-| Endpoint Category | Limit | Window | Rationale |
-|-------------------|-------|--------|-----------|
-| browse | 100 req | 60s | Normal browsing patterns |
-| playbackStart | 30 req | 60s | Streaming is expensive |
-| progressUpdate | 60 req | 60s | Frequent automated updates |
-| search | 50 req | 60s | Prevent catalog scraping |
-| auth | 5 req | 300s | Credential stuffing protection |
+**Idempotency and ordering**: beacons carry the client's playback position and timestamp, and the upsert is last-writer-wins per (profile, content). A duplicated beacon rewrites the same value — harmless. An out-of-order pair (position 300 arriving after 330) could regress the position by one beacon interval; resolving last-write-wins by *client timestamp* rather than arrival time fixes even that. The design deliberately makes the write so semantically forgiving that retries need no coordination at all.
 
-The rate limiter uses a **sliding window** implemented with Redis sorted sets. For each request:
+**Continue Watching assembly** (the read side):
 
-1. Remove entries older than the window start from the sorted set
-2. Add the current timestamp as a new entry
-3. Count remaining entries in the set
-4. Set a TTL on the key equal to the window duration
+1. Query the profile's Cassandra partition time-descending, over-fetching ~2x the display limit
+2. Filter to items between 5% and 95% progress (started, not finished)
+3. Batch-enrich with catalog metadata from the fully-cached Postgres catalog in one query — never N+1
+4. Cache the assembled row in Redis for 5 minutes, invalidated by that profile's own progress writes
 
-If the count exceeds the limit, the request is rejected with HTTP 429 and a Retry-After header. Response headers include X-RateLimit-Limit, X-RateLimit-Remaining, and X-RateLimit-Reset on every request.
+The cross-store join cost stays contained because one side of the join — the catalog — is effectively free.
 
-The rate limit key is scoped to `ratelimit:{category}:{accountId}` (or IP for unauthenticated requests), allowing different limits per endpoint category while using the same middleware.
+**Why the 5%/95% window matters**: below 5%, the user sampled and bounced — resurfacing it as "continue" is noise that erodes trust in the row. Above 95%, credits are rolling and the right affordance is "next episode," not "resume." These thresholds are product logic enforced in the backend query, because every client platform must agree on them — a TV and a phone disagreeing about what's "in progress" reads as data loss to the user.
 
-### 6. Circuit Breaker for External Services
+## 🔧 Deep Dive 3: Personalization — Precompute the Expensive Thing, Re-Rank the Cheap Thing
 
-**Implementation with Fallback:**
+A homepage is 40–75 rows assembled per profile: Continue Watching, "Because You Watched X," affinity-ordered genre rows, regional Top 10, new releases — at ~100K homepage generations/sec.
 
-The circuit breaker tracks three states (CLOSED, OPEN, HALF_OPEN), a rolling window of failure timestamps, and the last failure time. Configuration includes failure threshold, recovery timeout, and monitoring window duration.
+**The decision: precompute row candidates offline; personalize order and freshness at request time.**
 
-Execution flow:
+1. Batch ML pipelines (hourly) score candidate titles per profile — collaborative filtering on implicit signals (completion rates, watch duration), content similarity, and sequence models predicting the next watch
+2. Results land in cache as per-profile row candidate lists
+3. At request time, a light re-ranker adjusts: inject just-watched context, drop just-completed titles, apply device and time-of-day context, splice in the always-fresh Continue Watching row
+4. Response assembled from cache in well under 100ms
 
-1. **OPEN state**: If the recovery timeout has elapsed, transition to HALF_OPEN. Otherwise, execute the fallback function (if provided) or throw an error
-2. **CLOSED / HALF_OPEN state**: Execute the operation. On success in HALF_OPEN, transition to CLOSED and clear failures. On failure, record the timestamp. If recent failures (within the monitoring window) exceed the threshold, transition to OPEN
+**Why not compute recommendations at request time:**
 
-Each external service gets its own circuit breaker instance with tuned thresholds: personalization (5 failures), recommendations (3 failures, more sensitive), CDN (10 failures, more tolerant).
+> "Full inference per request means running model scoring over a profile's history against a 15K-title candidate set — 100ms to 1s of compute — at 100K requests/sec. That's a model-serving fleet dimensioned for peak *browse* traffic, doing work whose inputs have barely changed since the last request for the same profile. The recommendation signal moves on the timescale of watches (hours), not page loads (seconds), so recomputing per load buys almost nothing. Precomputation inverts the cost structure: the heavy compute runs hourly against stable inputs on a batch fleet you can size and schedule freely, and the request path becomes a cache read plus microseconds of re-ranking. What we give up is freshness at the edges — a title you just finished might linger in a recommendation row for up to an hour — and that's exactly what the request-time re-ranker patches, cheaply, for the handful of signals where staleness is user-visible: just watched, just completed. The residual staleness that remains is invisible."
 
-**Graceful degradation example**: When the personalization circuit opens, the homepage falls back to cached personalized rows if available, or a generic trending-for-all-users homepage if not. The user sees content either way -- just less personalized during outages.
+**Degradation ladder** — personalization has the deepest dependency chain in the system, so its failure story is explicit:
 
-### 7. Observability
+| Condition | Homepage served |
+|-----------|-----------------|
+| Everything healthy | Precomputed rows + real-time re-rank |
+| Re-ranker down | Precomputed rows as-is (hour-stale ordering) |
+| Per-profile cache miss + pipeline late | Previous batch's rows |
+| Personalization fully down | Generic regional rows: Trending, Top 10, New Releases |
 
-**Key Metrics:**
+Every rung is a complete, playable homepage. A user should never be able to tell from a blank screen that an ML pipeline had a bad day — degraded means *less personal*, never *less functional*.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| streaming_starts_total | Counter | Total playback starts, labeled by quality, content_type, device |
-| streaming_playback_errors_total | Counter | Playback errors by error_type and content_type |
-| manifest_generation_seconds | Histogram | Time to generate playback manifest (buckets: 50ms to 2.5s) |
-| progress_write_seconds | Histogram | Time to write viewing progress (buckets: 10ms to 500ms) |
-| experiment_allocations_total | Counter | Experiment allocations by experiment_id and variant_id |
-| circuit_breaker_state | Gauge | Circuit breaker state per service (0=closed, 1=half_open, 2=open) |
+## 🔧 Deep Dive 4: Experimentation — Allocation Without an Allocation Store
 
-**Structured Logging:**
+Hundreds of experiments run concurrently, and allocation must be consistent: the same profile sees the same variant on TV, phone, and web, forever, across server restarts.
 
-Each log entry is serialized as single-line JSON with: timestamp (ISO 8601), level (info/warn/error), service name, requestId, optional profileId, event name, and a metadata object. For example, a `manifest_generated` event logs the videoId, quality count, and latency in milliseconds. This structured format enables correlation by requestId across services and filtering by event type for monitoring.
+**Deterministic hash allocation**: variant = hash of (profile_id + experiment_id) mapped onto variant weight ranges, computed at request time.
 
-## Trade-offs Summary
+- **Consistent by construction** — same inputs, same output, on any server, with no lookup anywhere
+- **Nothing on the hot path** — no store to replicate or fail over; the "allocation database" is a pure function
+- **Orthogonal layering** — salting the hash per experiment makes assignments statistically independent across experiments, so a profile's variant in experiment 1 doesn't correlate with its variant in experiment 2, and hundreds of tests coexist without stratification bias
+- **Exposure logging** — assignments are logged to the metrics pipeline at exposure time, not to serve allocation but to record the analysis denominator: who actually saw the variant
+
+> "The alternative — storing an assignment row per (profile, experiment) — means a read on every request that touches a feature flag, a cross-region consistency problem, and a backfill every time an experiment launches to 200M profiles. The hash gives all of that up for one constraint: you can't reassign an individual user. If a variant is broken, you kill or re-salt the *experiment*, not the user. I've never seen a legitimate need to move one specific user between variants that wasn't better served by stopping the test — so the constraint costs approximately nothing, and the operational simplicity it buys is enormous."
+
+Feature rollouts ride the same rail: 1% → 5% → 25% → 100% is just an allocation-percentage change on an experiment layer, with automatic rollback wired to error-rate metrics. Sequential statistical testing on the metrics pipeline allows early stopping without p-hacking.
+
+**Targeting and eligibility** layer on top of the hash cleanly:
+
+1. Load active experiments (a small, heavily cached set)
+2. Filter by targeting rules against the request context — country, device class, plan, tenure
+3. Run the hash for surviving experiments only
+4. Cache the assembled allocation map per profile for an hour — safe, because the hash can't change; the cache only saves the rule evaluation
+
+One subtlety worth naming: **allocation and exposure are different events.** A profile can be *allocated* to a homepage-row experiment but never *exposed* because they only used search that day. Analyzing on allocation dilutes the measured effect toward zero; analyzing on logged exposure is what makes hundreds of small-lift experiments readable at all.
+
+## 🛡️ Consistency, Idempotency, and Failure Handling
+
+**The consistency budget, spent deliberately:**
+
+| Data | Bar | Mechanism |
+|------|-----|-----------|
+| Billing, subscription state | Strong, ACID | PostgreSQL transactions |
+| Kids/maturity filtering | Strong, always | Query-level enforcement; no cached bypass path exists |
+| Progress/resume | ~30s convergence | Cassandra last-write-wins upserts + Redis hot copy |
+| Homepage content | Up to 1h stale | Hourly batch + request-time patching |
+| Experiment allocation | Deterministic (stronger than consistent) | Pure hash function |
+
+**Idempotency**, mutation by mutation:
+
+- Progress beacons: last-writer-wins upserts — retry-safe by construction, no keys needed
+- My List add/remove: conflict-ignoring upsert and delete — retries converge
+- Experiment allocation: pure function — idempotency is vacuous
+- Session login: retried logins create parallel sessions that expire naturally; multiple sessions per account are a feature (multi-device), not a bug
+- Billing: the one place needing classic idempotency keys, living in the Postgres/payments world where that discipline is standard
+
+**Failure handling:**
+
+- **Circuit breakers** on every cross-service call, tuned per dependency: recommendation calls trip fast (a rich fallback exists), CDN-adjacent calls trip slow (the fallback is worse than patience)
+- **Fallback-first design**: every breaker has a defined degraded response — cached rows, generic rows, last-known resume position. For an entertainment product, availability beats freshness in every single trade.
+- **Rate limiting** fails *open* for browse (briefly losing rate limiting beats blocking paying viewers) and fails *closed* for auth (credential stuffing doesn't get a free window when Redis hiccups)
+- **Region failure**: stateless services plus Cassandra multi-DC replication allow traffic steering to surviving regions; in-flight playback continues regardless, courtesy of the plane split
+- **Chaos discipline**: instance and region kills run continuously in production. A system with this many fallback paths has a specific rot mode — untested fallbacks — and chaos engineering is what keeps the degradation ladder real rather than aspirational.
+
+**Data lifecycle and retention** — often skipped in interviews, but at 330K writes/sec it's a capacity problem, not just a compliance one:
+
+- Completed viewing-progress rows expire after 90 days (TTL-based in Cassandra — expiry is free, no delete jobs against the hot store)
+- Watch history retains ~2 years online, then archives to cold storage; the ML pipelines that want deep history read the archive, not the serving store
+- GDPR/CCPA deletion is a first-class flow: profile deletion cascades through Postgres relationally, tombstones the Cassandra partitions, and emits a purge event so downstream warehouse copies are scrubbed on their own schedule
+- Without TTLs, the progress table grows ~30 billion rows/year — retention policy *is* the sharding policy's silent partner
+
+## 🔐 Security and Content Protection
+
+Content protection is a revenue requirement — studios license content conditional on it — so it's worth its own minute:
+
+- **Multi-DRM licensing**: Widevine (Android/Chrome), FairPlay (Apple), PlayReady (Windows) — one DRM doesn't cover the device matrix, so packaging encrypts once per scheme and a license service issues short-TTL, device-bound decryption keys at playback start, renewed during playback. Short TTLs mean a leaked license is worthless within hours.
+- **Device attestation**: the license service verifies the client is a genuine application on registered hardware before issuing keys; account device counts are tier-limited.
+- **Concurrent stream limits**: 1/2/4 simultaneous streams by plan, enforced with a distributed counter that is *deliberately eventually consistent* — a brief overage during a network partition is tolerated, because hard-blocking a legitimate viewer on a stale counter is the worse failure. Availability over enforcement, by explicit choice.
+- **Forensic watermarking**: invisible per-session marks in the stream let leaked content be traced to the exact account and device — deterrence for the leak paths DRM can't stop (camera-off-screen, decrypted-frame capture).
+- **API auth**: session cookies (httpOnly, Redis-backed, 7-day TTL) with device metadata for audit; RBAC separates viewer, account owner, content admin, and experiment admin; kids profiles are a *server-side* capability boundary as covered in the data model.
+- **Auth rate limiting**: strict per-IP and per-account limits on login (credential stuffing is the top attack on any subscription service), loose limits elsewhere.
+
+## 📊 Observability
+
+| Signal | Why it matters |
+|--------|----------------|
+| Rebuffer ratio (per region/device/title) | *The* QoE metric; SLO < 0.5%, page on breach |
+| Playback start time p50/p99 | The 2-second promise, measured from client beacons |
+| Progress write latency + Cassandra compaction backlog | Leading indicator of the biggest write path degrading |
+| Homepage cache hit ratio + generation p99 | The 100K/sec read path's health in two numbers |
+| Per-title error spikes | A bad encode ships to millions fast; title-dimension alerting catches it in minutes |
+| Circuit breaker states per dependency | The live map of what is degraded right now |
+| Experiment exposure counts vs expected split | Allocation skew silently invalidates weeks of results |
+
+Client QoE beacons are the ground truth — server-side metrics can look perfect while one ISP's appliance serves garbage, and only the client knows.
+
+Three alerting rules I'd insist on from day one:
+
+- **Rebuffer ratio > 0.5% in any (region × device) cell** pages — sliced, not global, because a broken appliance in one ISP disappears inside a global average
+- **Playback start p99 > 3s** pages — the conversion-critical moment; users abandon at the spinner
+- **Homepage fallback-tier counter rising** warns — serving generic rows *works*, which is exactly why nobody notices without a metric that says the ladder has been descended
+
+## 📈 Scalability: What Breaks First
+
+1. **First: homepage generation.** Naive per-request personalization dies earliest — the most expensive computation multiplied by the highest request rate. This is why precompute-plus-cache is a foundational decision rather than an optimization; once made, the browse path scales like a cache tier — near-linearly, by adding nodes.
+
+2. **Second: progress writes.** 330K/sec sustained overwhelms any single-writer relational setup. Cassandra scales by adding ring nodes, and profile_id partitioning spreads load uniformly — there are no hot partitions, because no profile writes faster than one beacon per 30 seconds per stream.
+
+3. **Third: CDN long-tail misses.** Pre-filling covers the popular head; the catalog tail falls back through regional tiers to origin. If tail traffic grows (deeper catalogs, niche regions), the fix is smarter fill prediction and larger regional tiers — an ML-and-hardware problem, not an architecture change.
+
+4. **Fourth: search.** ~50K queries/sec with personalized ranking. Elasticsearch shards by language/region, and personalization runs as a separate re-rank layer over text results, so the search cluster and the ranking fleet scale independently.
+
+5. **What never breaks: catalog metadata.** 15K titles is a rounding error. It gets cached everywhere and sharded nowhere — and recognizing what *doesn't* need scaling machinery is as load-bearing as scaling what does.
+
+## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| CDN | Custom (Open Connect) | Third-party CDN | Cost at scale, ISP integration, control |
-| Progress Storage | Cassandra | PostgreSQL | High write throughput, time-series access |
-| Session Storage | Redis | Database | Low latency, easy revocation |
-| Streaming Protocol | DASH | HLS | More flexibility, industry standard |
-| Experiment Allocation | MurmurHash | Random | Consistent allocation across requests |
-| Rate Limiting | Sliding window | Token bucket | Smoother limiting, prevents burst abuse |
+| CDN | ✅ Open Connect, ISP-embedded, pre-filled | ❌ Commercial CDN | ~90% delivery cost cut + fewer hops; justified only at extreme scale |
+| Encoding | ✅ Per-title ladder, shot-aware | ❌ Fixed bitrate ladder | ~20% bandwidth at equal quality; encode-once, serve-millions asymmetry |
+| Progress store | ✅ Cassandra, profile-partitioned | ❌ PostgreSQL | LSM writes fit overwrite-heavy beacons; the one query is the partition key |
+| Recommendations | ✅ Hourly precompute + request-time re-rank | ❌ Real-time inference | Cache-read latency at browse QPS; staleness patched only where visible |
+| A/B allocation | ✅ Deterministic hash, no store | ❌ Stored assignments | Cross-device consistency with zero hot-path reads; can't move one user (fine) |
+| Degradation | ✅ Fallback rows at every rung | ❌ Fail closed | Entertainment product: less personal always beats less functional |
+| Rate limiting | ✅ Fail open (browse) / fail closed (auth) | ❌ Uniform policy | Availability for viewers; no free window for credential stuffing |
+| Sessions | ✅ Redis + httpOnly cookies | ❌ JWT | Instant revocation and profile-switch rebinding, server-side control |
 
-## Future Enhancements
+## 🚀 Closing: What I'd Build Next
 
-1. **Per-Title Encoding**: Custom encoding ladders based on content complexity
-2. **Predictive Prefetch**: Pre-fetch likely next content during credits
-3. **Multi-Region Active-Active**: Cassandra cross-region replication
-4. **ML-Based ABR**: Neural network for bandwidth prediction
-5. **Real-Time Experiment Analysis**: Streaming metrics with Flink/Spark
-6. **Content-Based Embeddings**: Video fingerprinting for similar titles
-7. **Chaos Engineering**: Automated failure injection testing
-8. **Edge Computing**: Personalization at CDN edge nodes
+The theme running through this design: identify the one hard property each subsystem actually needs — cheap bytes for video, forgiving writes for progress, cached reads for personalization, determinism for experiments — and refuse to pay for any property beyond it. The 99.99% number falls out of that discipline, not out of any single component's reliability.
+
+With more time I'd go deeper on four fronts:
+
+- **The encoding orchestration system** itself — per-shot parallel encoding across thousands of workers with dependency tracking is a distributed scheduling problem worthy of its own interview
+- **Concurrent stream-limit enforcement** — a globally distributed counter that deliberately tolerates brief overages, because falsely blocking a paying family's second stream costs more than a password-sharer's extra stream ever will
+- **Artwork personalization** — A/B-tested poster selection per user segment, which turns even the images into an experimentation surface with its own metrics loop
+- **Predictive prefetch** — using the sequence models to warm the next episode's first segments onto the client during the credits, converting recommendation confidence directly into a zero-latency play button

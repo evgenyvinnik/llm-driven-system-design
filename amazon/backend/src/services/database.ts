@@ -7,7 +7,9 @@ let pool: Pool | null = null;
 /** Initializes the PostgreSQL connection pool and verifies connectivity. */
 export async function initializeDb(): Promise<Pool> {
   pool = new PgPool({
-    connectionString: process.env.DATABASE_URL,
+    connectionString:
+      process.env.DATABASE_URL ||
+      'postgresql://amazon:amazon_secret@localhost:5432/amazon_ecommerce',
   });
 
   // Test connection

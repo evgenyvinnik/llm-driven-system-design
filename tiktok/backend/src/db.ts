@@ -6,7 +6,7 @@ dotenv.config();
 const { Pool } = pg;
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: process.env.DATABASE_URL || 'postgresql://tiktok:tiktok_secret@localhost:5432/tiktok',
 });
 
 pool.on('error', (err: Error) => {

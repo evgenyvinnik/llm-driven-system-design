@@ -1,11 +1,7 @@
 import pino, { Logger } from 'pino';
-import type { HttpLogger } from 'pino-http';
+import { pinoHttp, HttpLogger } from 'pino-http';
 import type { IncomingMessage, ServerResponse } from 'http';
 import config from '../config.js';
-
-// Dynamic import for ESM compatibility - cast to any to avoid callable issues
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const pinoHttp = require('pino-http');
 
 // Structured JSON logger with context support
 const logger: Logger = pino({

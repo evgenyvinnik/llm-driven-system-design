@@ -17,6 +17,7 @@
     "start:fanout-worker": "tsx src/workers/fanout-worker.ts",
     "start:trending-worker": "tsx src/workers/trending-worker.ts",
     "build": "tsc",
+    "db:migrate": "tsx src/db/migrate.ts",
     "type-check": "tsc --noEmit",
     "lint": "eslint src/**/*.ts",
     "format": "prettier --write src/**/*.ts",

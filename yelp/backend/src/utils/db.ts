@@ -4,7 +4,7 @@ const { Pool: PgPool } = pg;
 
 /** PostgreSQL connection pool for the Yelp business reviews system. */
 export const pool: Pool = new PgPool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: process.env.DATABASE_URL || 'postgresql://yelp:yelp_password@localhost:5432/yelp_db',
 });
 
 /** Executes a callback within a PostgreSQL transaction with automatic BEGIN/COMMIT/ROLLBACK. */

@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
-import RedisStore from 'connect-redis';
+import { RedisStore } from 'connect-redis';
 import { redis } from './services/redis.js';
 import { config } from './config/index.js';
 import { apiLimiter } from './services/rateLimiter.js';

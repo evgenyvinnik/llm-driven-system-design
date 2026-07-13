@@ -20,7 +20,7 @@ import { createServer } from 'http';
 import session from 'express-session';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import RedisStore from 'connect-redis';
+import { RedisStore } from 'connect-redis';
 import { config } from './config.js';
 import { redis } from './redis.js';
 import { pool, testConnection } from './db.js';

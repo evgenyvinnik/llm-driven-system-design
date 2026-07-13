@@ -165,21 +165,15 @@ class TrendTracker {
 backend/
 ├── src/
 │   ├── db/
-│   │   ├── pool.js       # PostgreSQL connection
-│   │   ├── redis.js      # Redis connection
-│   │   ├── migrate.js    # Schema + triggers
-│   │   └── seed.js       # Demo data
-│   ├── routes/
-│   │   ├── auth.js       # Login, register, logout
-│   │   ├── users.js      # Profile, follow/unfollow
-│   │   ├── tweets.js     # CRUD + like/retweet
-│   │   ├── timeline.js   # Home, explore, user, hashtag
-│   │   └── trends.js     # Trending hashtags
-│   ├── services/
-│   │   └── fanout.js     # Timeline fanout logic
-│   ├── middleware/
-│   │   └── auth.js       # requireAuth, requireAdmin
-│   └── index.js          # Express server
+│   │   ├── pool.ts       # PostgreSQL connection (defaults to docker-compose credentials)
+│   │   ├── redis.ts      # Redis connection
+│   │   ├── init.sql      # Consolidated schema + triggers
+│   │   ├── migrate.ts    # Applies init.sql (npm run db:migrate)
+│   │   └── seed.ts       # Demo data
+│   ├── routes/           # auth, users, tweets, timeline, trends (TypeScript)
+│   ├── services/         # fanout logic
+│   ├── middleware/       # requireAuth, requireAdmin
+│   └── index.ts          # Express server
 ```
 
 ### Frontend Structure
@@ -217,3 +211,14 @@ frontend/
 - [Twitter's Timeline Architecture](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2017/the-infrastructure-behind-twitter-scale)
 - [Scaling Twitter's Ad Platform](https://blog.twitter.com/engineering)
 - [Designing Data-Intensive Applications - Chapter 11](https://dataintensive.net/)
+
+---
+
+## Repair Log (2026-07-12)
+
+Runtime triage showed the project could not work from a fresh clone; two defects fixed:
+
+1. **Schema never applied**: `src/db/init.sql` existed but nothing ran it — no `db:migrate` script, no docker-entrypoint-initdb.d mount (a fresh database had zero tables; seeding "succeeded" only because psql exit codes were not checked). Added `src/db/migrate.ts` + `npm run db:migrate`, and mounted init.sql into the postgres container in docker-compose.yml.
+2. **No DB connection fallback**: `src/db/pool.ts` used `process.env.DATABASE_URL` with no default, and no `.env` ships with the repo — every query failed on a fresh clone even though the server booted. Added the repo-conventional fallback to the docker-compose credentials (matching `redis.ts`, which already had one).
+
+Verified via `node scripts/triage-projects.mjs twitter`: all checks green including migrate, seed, and login.
