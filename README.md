@@ -126,6 +126,7 @@ Each folder contains an independent implementation of a system design problem.
 | [Payment System](./payment-system/) | Transaction processing system | ✅ Implemented |
 | [Stripe](./stripe/) | Payment processing and APIs | ✅ Implemented |
 | [Venmo](./venmo/) | P2P payment platform | ✅ Implemented |
+| [Splitwise](./splitwise/) | Shared-expense tracking with debt simplification | ✅ Implemented |
 | [Apple Pay](./apple-pay/) | Secure mobile payments | ✅ Implemented |
 
 ### Business Services
