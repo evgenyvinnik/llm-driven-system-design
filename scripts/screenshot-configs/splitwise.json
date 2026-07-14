@@ -1,0 +1,56 @@
+{
+  "name": "splitwise",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "splitwise",
+  "dbUser": "splitwise",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "email": "alice@example.com",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='email'], input[type='email']",
+    "passwordSelector": "input[name='password'], input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-dashboard",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 1500
+    },
+    {
+      "name": "03-groups",
+      "path": "/groups",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "04-group-detail",
+      "path": "/groups/11111111-1111-1111-1111-111111111111",
+      "waitFor": "main",
+      "delay": 1200
+    },
+    {
+      "name": "05-activity",
+      "path": "/activity",
+      "waitFor": "main",
+      "delay": 1000
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}
