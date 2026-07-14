@@ -1,4 +1,5 @@
 import type { Driver, DriverStats } from '@/types';
+import { formatNumber } from '@/utils/format';
 
 /**
  * Props for the DriverStatusHeader component.
@@ -72,7 +73,7 @@ export function DriverStatusHeader({
           <h1 className="text-2xl font-bold text-gray-900 mb-1">{driver.name}</h1>
           <div className="flex items-center gap-4 text-sm text-gray-500">
             <span className="capitalize">{driver.vehicle_type}</span>
-            <span>* {driver.rating.toFixed(2)}</span>
+            <span>* {formatNumber(driver.rating, 2)}</span>
             <span>{driver.total_deliveries} deliveries</span>
           </div>
         </div>

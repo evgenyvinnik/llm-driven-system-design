@@ -4,6 +4,8 @@ import { isAuthenticated } from '../middleware/auth.js';
 
 /** Subscription routes for plan listing, subscription status, subscribe, and cancel operations. */
 const router: Router = express.Router();
+
+interface SubscriptionRow {
   subscription_tier: string;
   subscription_expires_at: Date | null;
 }

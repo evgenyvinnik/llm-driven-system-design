@@ -114,7 +114,7 @@ After running the seed script, these accounts are available:
 | alice@example.com | password123 | Seller (Alice's Handmade Jewelry) |
 | bob@example.com | password123 | Seller (Bob's Woodwork Studio) |
 | carol@example.com | password123 | Seller (Carol's Vintage Finds) |
-| admin@example.com | admin123 | Admin |
+| admin@example.com | password123 | Admin |
 
 ## API Endpoints
 

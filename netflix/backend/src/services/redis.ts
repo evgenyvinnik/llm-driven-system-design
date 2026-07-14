@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { REDIS_CONFIG } from '../config.js';
 
 /**

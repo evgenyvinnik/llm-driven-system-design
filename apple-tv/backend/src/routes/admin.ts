@@ -6,6 +6,8 @@ import { v4 as uuidv4 } from 'uuid';
 
 /** Admin routes for dashboard stats, user management, content CRUD, and viewing analytics. */
 const router: Router = express.Router();
+
+interface StatsRow {
   count: string;
   total?: string;
   subscription_tier?: string;

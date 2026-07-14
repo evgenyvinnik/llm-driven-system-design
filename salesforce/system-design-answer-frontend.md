@@ -1,295 +1,347 @@
-# Salesforce CRM - Frontend System Design Answer
+# Salesforce CRM - System Design Answer (Frontend Focus)
 
-## 1. Requirements Clarification (2 minutes)
+*45-minute system design interview format - Frontend Engineer Position*
 
-"I'm designing the frontend for a CRM system -- the primary tool sales teams use 8+ hours daily. Let me confirm the scope:
+## 📋 Problem Statement
 
-- **Dashboard**: KPI cards and pipeline visualization on the landing page?
-- **Entity views**: List pages for accounts, contacts, leads with search and filtering?
-- **Account detail**: Tabbed view showing related contacts, opportunities, and activities?
-- **Kanban board**: Drag-and-drop opportunity pipeline by stage?
-- **Lead conversion**: Modal workflow to convert a lead into account + contact + opportunity?
-- **Reports**: Visual charts for pipeline, revenue, and lead source analytics?
+Design the web frontend for a CRM: a KPI dashboard, list views for accounts/contacts/leads, a tabbed account detail page, a drag-and-drop opportunity pipeline, a lead-conversion workflow, and reports.
 
-The key frontend challenges here are the kanban drag-drop interaction, optimistic UI updates, complex entity navigation, and dashboard data aggregation. I'll focus on those."
+What makes this frontend hard isn't any single screen. It's that **this is the app a salesperson keeps open for eight hours straight.** That one fact reframes everything. It isn't a page you visit; it's a workspace you live in. So the real problems become: a client-side cache that stays coherent across hundreds of navigations and mutations without ever going stale in a way that costs someone a deal; a drag-and-drop board where the optimistic update must be instant *and* must unwind correctly when a colleague moved the same deal thirty seconds ago; forms whose fields the customer defined rather than us; and a tab that must not leak memory into hour seven.
 
-## 2. UI Architecture (5 minutes)
+## 🎯 Requirements Clarification
 
-```
-┌──────────────────────────────────────────────────────┐
-│                    App Shell                          │
-│  ┌──────────┐ ┌────────────────────────────────────┐ │
-│  │          │ │          Content Area               │ │
-│  │ Sidebar  │ │  ┌──────────────────────────────┐  │ │
-│  │          │ │  │     Route Content             │  │ │
-│  │ - Home   │ │  │  (Dashboard / Accounts /     │  │ │
-│  │ - Accts  │ │  │   Contacts / Pipeline /      │  │ │
-│  │ - Conts  │ │  │   Leads / Reports)           │  │ │
-│  │ - Opps   │ │  │                              │  │ │
-│  │ - Leads  │ │  └──────────────────────────────┘  │ │
-│  │ - Rpts   │ │                                    │ │
-│  │          │ │                                    │ │
-│  │ ──────── │ │                                    │ │
-│  │ User     │ │                                    │ │
-│  │ Sign out │ │                                    │ │
-│  └──────────┘ └────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────┘
-```
+- **How long is a session?** All day, one tab, rarely reloaded. This is the load-bearing answer — it makes cache coherence and memory the primary concerns, not initial page load.
+- **Is the data multi-user-live?** Several reps share a pipeline. It doesn't need real-time collaboration, but it absolutely needs **conflict detection** — silently overwriting a colleague's stage change is a business loss, not a cosmetic bug.
+- **Custom fields?** Yes. Forms are rendered from a server-supplied schema, not hardcoded. That's a frontend architecture decision, not a backend detail.
+- **How big are list views?** Tens of thousands of rows for a large org, filtered down to dozens in practice. So: server-side filtering, plus virtualization for the unfiltered case.
 
-> "The layout uses a fixed sidebar for navigation and a content area that changes per route. The sidebar is persistent -- CRM users navigate between entities constantly, so navigation must always be visible. The sidebar collapses on mobile to a hamburger menu.
+### Functional Requirements
 
-I use file-based routing with TanStack Router. Each route maps to a page component that fetches its own data on mount. State management uses Zustand for global CRM data (accounts, contacts, opportunities, leads, activities, dashboard KPIs) and React state for local UI concerns (form inputs, modals, pagination)."
+- Dashboard: KPI cards and a pipeline chart
+- List views (accounts, contacts, leads): search, filter, paginate
+- Account detail: tabbed — contacts, opportunities, activity timeline
+- Opportunity pipeline: kanban, drag between stages
+- Lead conversion: a modal workflow producing three new entities
+- Reports: pipeline, revenue, lead source
 
-### Component Tree
+### Non-Functional Requirements
+
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Interaction latency | < 100ms perceived | A drag that lags feels broken. This alone forces optimistic updates |
+| Navigation | Instant for already-seen data | Reps bounce between an account and its deals constantly |
+| Correctness | Never silently show a stale value for the record being acted on | The record *is* the product |
+| Memory | Flat across an 8-hour session | An unboundedly growing tab gets killed by the OS at 4pm |
+| Custom fields | Zero deploys to add one | The customer adds fields; we cannot ship code per field |
+| Accessibility | Full keyboard path, including drag | Internal enterprise tools have hard a11y requirements |
+
+## 🏗️ High-Level Architecture
 
 ```
-App
-├── Sidebar (always visible when authenticated)
-├── Routes
-│   ├── / ──── Dashboard
-│   │         ├── DashboardMetrics (KPI cards)
-│   │         └── PipelineChart (bar chart)
-│   ├── /accounts ──── AccountList
-│   │         └── EntityForm (modal)
-│   ├── /accounts/:id ──── AccountDetail
-│   │         ├── Contacts Tab (table)
-│   │         ├── Opportunities Tab (table + StatusBadge)
-│   │         └── Activities Tab
-│   │               ├── ActivityForm
-│   │               └── ActivityTimeline
-│   ├── /contacts ──── ContactList
-│   │         └── EntityForm (modal)
-│   ├── /opportunities ──── KanbanBoard
-│   │         ├── KanbanColumn (per stage)
-│   │         └── OpportunityCard (draggable)
-│   ├── /leads ──── LeadList
-│   │         ├── EntityForm (modal)
-│   │         └── ConvertLeadModal
-│   └── /reports ──── ReportChart (x3)
-├── /login ──── LoginPage
-└── /register ──── RegisterPage
+┌──────────────────────────────────────────────────────────────┐
+│                     React SPA (Vite + TS)                    │
+│                                                              │
+│  ┌────────────┐  ┌────────────────────────────────────────┐ │
+│  │  Sidebar   │  │  Route Outlet (TanStack Router)         │ │
+│  │ persistent │  │  /  ·  /accounts  ·  /accounts/$id      │ │
+│  │            │  │  /opportunities (kanban)  ·  /leads     │ │
+│  │            │  │  /reports                               │ │
+│  └────────────┘  └───────────────────┬────────────────────┘ │
+│                                      │                       │
+│  ┌───────────────────────────────────▼────────────────────┐ │
+│  │      Normalized Entity Cache  ← the center of gravity  │ │
+│  │   accounts[id] · contacts[id] · opportunities[id] …    │ │
+│  │   + query index:  queryKey ──▶ [ids]                   │ │
+│  │   + metadata:  custom-field schema, per entity type    │ │
+│  └────────┬──────────────────────────────┬────────────────┘ │
+│           │ selectors (by id)            │ mutations        │
+│  ┌────────▼─────────┐          ┌─────────▼───────────────┐  │
+│  │  Components      │          │  Optimistic mutation    │  │
+│  │  subscribe to    │          │  queue: apply → confirm │  │
+│  │  one entity      │          │  → rollback / roll-fwd  │  │
+│  └──────────────────┘          └─────────┬───────────────┘  │
+│                                          │                   │
+│  ┌───────────────────────────────────────▼────────────────┐ │
+│  │  API client — sends version; maps 409 → conflict path  │ │
+│  └───────────────────────────────────────┬────────────────┘ │
+└──────────────────────────────────────────┼──────────────────┘
+                                           ▼ HTTPS
+                                    ┌──────────────┐
+                                    │   CRM API    │
+                                    └──────────────┘
 ```
 
-### Route Structure
+The center of gravity is the **normalized entity cache**. Routing, forms, and the kanban board are all views over it. I'll defend that first, because the tempting alternative — each route fetching its own data into its own array — is what most CRM frontends actually do, and it's exactly why most CRM frontends show you numbers that disagree with each other.
+
+## 🗂️ Routes and Component Structure
 
 ```
-/                    Dashboard with KPI cards and pipeline chart
-/login               Login form
-/register            Registration form
-/accounts            Account list with search and create
-/accounts/:id        Account detail with tabs
-/contacts            Contact list with search and create
-/opportunities       Kanban pipeline board
-/leads               Lead list with convert action
-/reports             Pipeline, revenue, and lead source charts
+/                    Dashboard   — KPI cards + pipeline bar chart
+/accounts            List        — search, industry filter, paginate
+/accounts/$id        Detail      — tabs: Contacts | Opportunities | Activities
+/contacts            List
+/opportunities       Kanban      — 7 stage columns, drag to move
+/leads               List        — + Convert action (modal)
+/reports             Charts      — pipeline, revenue, lead source
+/login  /register    Unauthed    — rendered without the sidebar
 ```
 
-## 3. State Management (5 minutes)
+The sidebar is persistent and only rendered when authenticated — checked before the first paint, not rendered-then-hidden, which would produce a visible flash of navigation on the login screen.
 
-> "I split state into two Zustand stores:
+Two component-design decisions worth stating, because both are cases where the "DRY" instinct gives the wrong answer:
 
-**authStore** -- User session state. Handles login, logout, registration, and session check on app load. The root route calls checkAuth() on mount to restore sessions.
+- **The entity form is shared; the entity table is not.** Forms differ only in their *fields* (data), so one modal driven by entity type is right. Tables differ in their *columns, cell formatters, and row actions* — currency here, a status badge there, a Convert button on leads only. A generic table abstracting all that would need so many configuration props it'd be harder to maintain than four honest components. Shared behavior, yes. Shared everything, no.
+- **The status badge is one component with per-entity color maps.** Not one giant lookup, because "New" means a new *lead* (blue) in one context and nothing at all in another. Passing the entity type disambiguates, and it keeps "Closed Won is green" true on the kanban, the account page, and the report simultaneously.
 
-**crmStore** -- All CRM entity data. Contains arrays for accounts, contacts, opportunities, leads, activities, plus dashboard KPIs and report data. Each entity section has its own loading flag and fetch function.
-
-I chose Zustand over React Context because CRM stores have many independent slices. With Context, updating opportunities would re-render the contacts list. Zustand's selector pattern lets components subscribe to only the data they need -- the KanbanBoard subscribes to opportunities, the LeadList subscribes to leads, and neither re-renders when the other changes."
-
-### Store Shape
+## 🔀 Data Flow: One Drag, End to End
 
 ```
-authStore
-├── user (User | null)
-├── loading (boolean)
-├── error (string | null)
-├── login(), register(), logout(), checkAuth()
-
-crmStore
-├── Dashboard
-│   ├── kpis (DashboardKPIs | null)
-│   └── fetchKPIs()
-├── Accounts
-│   ├── accounts[], accountsTotal
-│   └── fetchAccounts(params)
-├── Contacts
-│   ├── contacts[], contactsTotal
-│   └── fetchContacts(params)
-├── Opportunities
-│   ├── opportunities[], opportunitiesTotal
-│   ├── fetchOpportunities(params)
-│   └── updateOpportunityStage(id, stage)
-├── Leads
-│   ├── leads[], leadsTotal
-│   └── fetchLeads(params)
-├── Activities
-│   ├── activities[], activitiesTotal
-│   └── fetchActivities(params)
-└── Reports
-    ├── pipeline[], revenue[], leadsBySource[]
-    └── fetchPipelineReport(), fetchRevenueReport(), fetchLeadsReport()
+  user drops card
+        │
+        ▼
+ ┌──────────────────┐   snapshot previous stage
+ │ mutation queue   │   → cache.opportunities[id].stage = 'Closed Won'
+ └────────┬─────────┘
+          │  board re-renders  ◀── ~0ms. This is the whole point.
+          ▼
+ ┌──────────────────┐
+ │ PUT .../stage    │   body: { stage, version }
+ └────────┬─────────┘
+          │
+   ┌──────┴───────┬──────────────────┐
+   ▼              ▼                  ▼
+ 200 OK        409 Conflict       Network error
+   │              │                  │
+   │              │                  ▼
+   │              │            retry w/ backoff;
+   │              │            on give-up → rollback
+   │              │              to snapshot
+   │              ▼
+   │      write SERVER's current
+   │      state into cache
+   │      + "Dana moved this 2m ago"
+   │      + do NOT auto-retry
+   ▼
+ replace optimistic value with
+ server response (new version,
+ server-derived probability)
 ```
 
-## 4. Deep Dives
+Three different failure modes, three genuinely different responses. The bug I've seen most often is collapsing all three into one `catch` block that reverts to the snapshot — which is correct for the network error, and actively harmful for the 409.
 
-### Deep Dive 1: Kanban Board with Drag-Drop
+## 🔧 Deep Dive 1: A Normalized Cache, Not Per-Route Fetching
 
-> "The kanban board is the most interaction-heavy component. It renders 7 columns (one per pipeline stage) with draggable opportunity cards. Users drag cards between columns to change deal stages.
+**The naive design:** each route fetches what it needs into a store slice — `accounts[]`, `opportunities[]`, `leads[]`. Obvious, simple, and it breaks in a specific and damaging way.
 
-I use @dnd-kit because it provides separate abstractions for draggable items and droppable containers. Each KanbanColumn is a droppable zone identified by its stage name. Each OpportunityCard is a draggable item identified by its opportunity ID.
+**How it concretely breaks.** A rep is on `/accounts/acme`. The Opportunities tab shows "Acme Renewal — $50,000 — Negotiation." They click through to the pipeline board, drag that deal to Closed Won, then navigate back to the account.
 
-**The drag flow:**
+- If the account route re-fetches on every mount, they see the right value — but they paid a round-trip and a spinner to display data the app *already knew*. Do that on every navigation, all day, and the tool feels like a website instead of a workspace.
+- If the account route caches its earlier fetch, they see **$50,000 in Negotiation** — a deal they personally just closed, rendered as still open.
 
-1. User starts dragging a card. DndContext fires onDragStart. I store the active opportunity in local state to render a DragOverlay -- a floating clone of the card that follows the cursor. The original card becomes semi-transparent.
+And it compounds. That opportunity's value feeds the dashboard KPI card, the account's pipeline total, and the board's column sum. Those are three copies of one fact, fetched at three different moments, and they will disagree **on screen simultaneously**. The rep's response isn't to file a bug; it's to stop trusting the numbers — which is fatal for a forecasting tool.
 
-2. As the user drags over columns, @dnd-kit's closestCorners collision detection algorithm determines which column the card is hovering over. The target column highlights with a blue ring.
+The root cause is **duplication**. The same opportunity lives in three arrays. Every mutation must find and update all of them, and it never will, because the list of places grows every sprint and nothing enforces it.
 
-3. User drops the card. DndContext fires onDragEnd with the active item ID and the over container ID (the stage name). I call updateOpportunityStage(oppId, newStage).
+**The fix: one entity, one copy, referenced by ID.**
 
-**Optimistic update pattern:** When the user drops a card, I immediately update the local store to move the opportunity to the new stage. This provides instant visual feedback -- the card appears in the new column before the API responds. If the API call fails, I revert by re-fetching all opportunities.
+- The cache holds `opportunities: { [id]: Opportunity }` — exactly one record per entity.
+- Query results store **IDs, not objects**: the query for "opportunities in Negotiation" resolves to a list of IDs.
+- Components select by ID. The row on the account page and the card on the kanban board subscribe to *the same object*.
+- A mutation writes once, to one place, and every view updates — because there were never separate copies to invalidate.
 
-The alternative to optimistic updates is waiting for the API response before moving the card. This creates a 100-300ms delay where the card snaps back to its original position, then jumps to the new column. Users perceive this as laggy and lose trust in the interaction.
+> "Normalization is the difference between 'I must remember to invalidate the account page when a deal changes' and 'there is no account-page copy to invalidate.' The first is a discipline that decays as the team grows; the second is a property of the data structure. In a CRM specifically, getting this wrong isn't a cosmetic glitch — a rep looks at a stale pipeline number and makes a real decision on it. 'The UI lied to me' is how a tool loses trust permanently, and you don't get it back."
 
-The trade-off with optimistic updates: if two users drag the same deal simultaneously, one will see their change reverted on the next data fetch. For a CRM where deal ownership is typically single-user, this collision is rare. I'd add WebSocket notifications for real-time sync if multi-user editing becomes a requirement.
+**What we give up — and I'd rather name it than pretend.** Selectors get harder. Rendering the account page means resolving an account, then its contact IDs, then its opportunity IDs: a join, performed on the client. A denormalized blob would just render. There's also a real re-render hazard: a selector that *derives* a list returns a fresh array on every call and will re-render on every store write unless memoized. So the cost is paid in selector discipline, and it must be enforced with memoized selectors rather than hoped for.
 
-**DragOverlay vs. in-place drag:** I render a DragOverlay (a portal-rendered clone) instead of transforming the original card. This prevents layout shifts in the source column during drag and ensures the dragged item renders above all other content. Without DragOverlay, the dragged card can clip behind adjacent columns."
+**Memory falls out of this for free.** With exactly one copy per entity, the cache grows with *distinct entities viewed*, not with *navigations performed*. Add LRU eviction for entities no mounted view references, cap at a few thousand records, and memory is flat by construction. Under per-route caching, every navigation appends another array, and hour seven is a garbage-collection stall.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| @dnd-kit | Accessible, composable, typed | More setup than HTML5 drag |
-| react-beautiful-dnd | Simpler API, auto-animations | Deprecated, no active maintenance |
-| HTML5 Drag API | No dependencies | Poor mobile support, no custom drag preview |
+## 🔧 Deep Dive 2: The Kanban Board — Optimism, and the Conflict You Can't Ignore
 
-### Deep Dive 2: Dashboard Data Aggregation
+Dragging a deal between stages must feel instant. Waiting for a round-trip — 200ms on a good connection — reads as broken: the card snaps back, sits there, then jumps. So the update is optimistic: move the card immediately, fire the request, reconcile after.
 
-> "The dashboard displays 8 KPI cards and a pipeline bar chart. This data comes from two API calls: GET /api/dashboard (KPIs) and GET /api/reports/pipeline (stage breakdown).
+**The straightforward part:**
 
-**The loading strategy:** Both calls fire in parallel on mount via the Zustand store. I display a skeleton loading state until both complete. The KPI cards render individually -- if the dashboard API returns first, cards appear while the pipeline chart still shows a spinner.
+1. On drag end, write the new stage into the cached opportunity and snapshot the previous value.
+2. The board re-renders instantly. The card is in its new column.
+3. Fire the stage-change request, including the record's `version`.
+4. On success, replace the optimistic value with the server's response — which carries the new version **and the server-derived probability**. The client must *not* compute the stage→probability mapping itself: duplicating that rule means it lives in two codebases and will drift, and a forecast built on a drifted mapping is silently wrong in a way nobody notices until quarter close.
+5. On failure, restore and surface.
 
-**KPI card design:** Each card shows a metric label, value, and colored indicator. Values use locale-aware formatting: currency uses Intl.NumberFormat with USD, counts use toLocaleString() for thousands separators, percentages append '%'. The metric list is defined as a constant array with format specifications, so adding new KPIs requires only adding an entry to the array -- not a new component.
+**The part that actually matters: what "failure" means.** A network error is easy. The interesting failure is a **409 Conflict** — a colleague moved this same deal since we last read it.
 
-**Pipeline chart:** I built a pure CSS bar chart rather than importing a charting library. Each stage gets a horizontal bar whose width is proportional to its total amount relative to the largest stage. Color-coding matches the kanban column colors for visual consistency. This approach adds zero bundle size compared to Chart.js (40KB gzipped) or Recharts (60KB gzipped).
+Here is where most optimistic-UI implementations quietly do the wrong thing. They roll back to the pre-drag state and show "something went wrong." But that's a lie. The deal *did* change — just not the way this user wanted, and not by them. Rolling back to the local pre-drag value puts a **newly stale** value on screen, and if the user shrugs and drags again, they will obliterate their colleague's change. The optimistic UI has now actively caused the data loss the version check was supposed to prevent.
 
-The trade-off: the CSS-only chart can't render tooltips, animations, or responsive axis labels as elegantly as a charting library. For the reports page where users expect richer visualizations, I'd introduce a lightweight library. But for the dashboard overview, simple bars with inline labels are sufficient and load instantly.
+So the conflict path is:
 
-**Caching strategy:** Dashboard data doesn't change frequently -- a deal closing or a new lead arriving updates one of eight metrics. I cache KPIs in the Zustand store and only re-fetch when the user navigates back to the dashboard or explicitly refreshes. This prevents unnecessary API calls when switching between tabs. A production version would add WebSocket-pushed invalidation when deals move stages."
+1. The 409 response carries the **current server state** of the opportunity.
+2. We write *that* into the cache — not the snapshot. The card snaps to where the deal actually is now.
+3. We show a specific message: "Dana moved this deal to Closed Won two minutes ago." Not "an error occurred."
+4. The user decides what to do next. We do **not** auto-retry, because auto-retry here means "silently overwrite my colleague," which is precisely what we were trying to avoid.
 
-### Deep Dive 3: Entity Relationship Navigation
+> "The rule I'd hold to: **an optimistic update may be rolled back, but never rolled back to a value we already know is stale.** If the server tells us the truth in its error response, the correct rollback target is the truth, not the past. That distinction is the entire difference between an optimistic UI that earns trust and one that feels snappy while quietly corrupting a shared pipeline."
 
-> "CRM users navigate relationships constantly: click an account, see its contacts, click a contact, see their opportunities. The UI must support fluid navigation without losing context.
+**Why the client must send a version.** Without it, the server cannot distinguish "move this deal to Closed Won" from "move this deal to Closed Won, *based on my belief that it is currently in Negotiation*." Last-write-wins turns a shared board into a race the loser never learns about. Sending the version converts an invisible overwrite into a visible, resolvable conflict. Note what that is: **a frontend requirement driving an API contract.** That's the kind of thing a frontend engineer should be arguing for in the design review, not discovering in production.
 
-**Account detail page:** Uses a tabbed interface (Contacts, Opportunities, Activities) within a single page. All three tabs' data loads in parallel on mount via Promise.all. This means switching tabs is instant -- the data is already in memory. The active tab is tracked in local React state, not the URL, because tab state shouldn't create browser history entries.
+**Drag mechanics, briefly.** A drag overlay renders a floating clone under the cursor while the original stays in place, dimmed. If you instead transform or remove the original node, the source column reflows mid-gesture and the drop targets slide out from under the user's cursor. The overlay pattern looks like polish and is actually correctness. And the drag library must support **keyboard drag** — tab to a card, space to lift, arrows to move, space to drop — because "drag-and-drop only" is an accessibility failure that will disqualify the product from enterprise procurement, regardless of how good it feels with a mouse.
 
-**The data loading pattern:** When the user navigates to /accounts/:accountId, the AccountDetail component fires four parallel API calls:
+## 🔧 Deep Dive 3: Rendering Forms for a Schema We Don't Control
 
-1. Account detail (GET /api/accounts/:id)
-2. Account contacts (GET /api/accounts/:id/contacts)
-3. Account opportunities (GET /api/accounts/:id/opportunities)
-4. Account activities (GET /api/activities?relatedType=account&relatedId=:id)
+Every customer adds custom fields. So the account form is not a form we wrote — it's a form we *render*, from a schema the server hands us.
 
-This parallel loading means the page renders in the time of the slowest call, not the sum of all calls. If contacts load in 50ms but activities take 200ms, the page shows content at 200ms instead of 300ms.
+**The metadata flow:**
 
-**Entity forms:** I use a shared EntityForm component that renders different fields based on the entityType prop. Account forms show name, industry, phone. Contact forms show first/last name, email, account selector. This avoids duplicating form logic across 4 entity types. The form renders as a modal overlay so the user doesn't lose their list context.
+1. On login, fetch the org's field metadata: for each entity type, a list of descriptors — name, type (`text`, `number`, `date`, `boolean`, `select`), options, required-ness.
+2. Cache it in the store alongside the entities. It changes rarely (an admin adds a field), so cache for the session and revalidate in the background.
+3. A dynamic form component maps each descriptor to an input via a **type → renderer registry**.
+4. Validation rules are generated from the same descriptors, so the client's rules and the server's rules derive from one source and cannot drift.
 
-The account selector in the contact and opportunity forms loads account options lazily -- only when the user clicks 'New Contact' do I fetch the accounts list for the dropdown. This avoids loading account data on every page where it's not needed.
+**Why this beats the alternative.** The alternative — hardcoded forms with a "Custom Fields" section bolted onto the bottom — is what a lot of CRMs actually ship, and it fails twice. First, standard and custom fields end up with different validation, layout, and error handling, so the custom ones permanently feel second-class — which is backwards, because the custom ones are the fields the customer cared enough to create. Second, adding a new standard field type means editing every form by hand. With a registry-driven renderer, standard fields are simply custom fields we seed by default: one code path, one set of behaviors, and adding a field type means adding one renderer.
 
-**Polymorphic activity display:** Activities are rendered through a shared ActivityTimeline component that works on any entity detail page. The component receives activities as props and renders them chronologically with type-specific icons (phone for calls, envelope for emails, calendar for meetings). The ActivityForm component captures the relatedType and relatedId from the parent context, so creating an activity on an account page automatically associates it with that account."
+**What we give up: compile-time type safety.** A hand-written form is checked by the compiler. A schema-driven form is an untyped bag at the boundary. Mitigation: generate types for the known fields, and validate the custom bag at runtime against a schema built from the metadata. That moves safety from compile time to runtime rather than deleting it — a genuine loss, and the unavoidable price of a product capability that cannot be built any other way.
 
-| Pattern | Pros | Cons |
-|---------|------|------|
-| Parallel data loading | Fast initial render | Wasted bandwidth if user only views one tab |
-| Lazy tab loading | Less data transferred | Tab switch has loading delay |
-| Prefetch on hover | Best perceived performance | Complex, may waste bandwidth |
+**The shared entity form follows from the same logic.** One modal, driven by entity type, renders accounts, contacts, opportunities, and leads. Four separate form components would mean four places to fix a focus-trap bug and four subtly divergent save/cancel behaviors. These forms differ in their *fields*, which is data. They do not differ in their *behavior*, which is code.
 
-## 5. Component Design Patterns (5 minutes)
+## 🔄 Lead Conversion — And Why It Is Deliberately *Not* Optimistic
 
-### Reusable List Pattern
+Kanban is optimistic. Lead conversion isn't, and the reason generalizes into a rule I'd apply everywhere.
 
-> "All entity list pages (AccountList, ContactList, LeadList) follow the same pattern: search input, filter controls, data table with pagination. I extract the pagination UI but keep each list as its own component because the columns, filters, and row click behaviors differ per entity.
+**An optimistic update is only affordable when the client can predict the server's answer.** Moving a deal to Closed Won: the client knows exactly what the result looks like — same record, new stage. Converting a lead: the server creates an account, a contact, and an opportunity, each with a **server-generated ID the client cannot know**. There is no optimistic state to apply. You *could* fabricate temporary IDs and rewrite them on confirmation — but every reference to `temp-1` across the entire normalized cache must then be found and rewritten when the real ID lands, which is a lot of machinery for a workflow a rep performs a few times a day and already expects to take a beat.
 
-Each list receives data, loading state, and callback functions as props from the route component. The route component manages the Zustand store interaction. This separation means list components are pure presentational -- they can be tested without store dependencies.
+So conversion is explicit and pessimistic: modal → confirm → button spinner → on success, write the three new entities into the cache, mark the lead converted, and navigate to the new account. The user gets a real progress indicator, because the operation genuinely takes time and pretending otherwise buys nothing.
 
-The list pattern has five consistent pieces:
+**The principle, stated plainly:** *optimism is affordable exactly when the client can predict the result.*
 
-1. **Header bar** with entity title and 'New' button
-2. **Search input** that triggers parent callback on form submit
-3. **Filter controls** (entity-specific: industry for accounts, status+source for leads)
-4. **Data table** with sortable columns, hover highlighting, and clickable rows
-5. **Pagination footer** showing total count, page number, and previous/next buttons
+| Mutation | Client can predict result? | Treatment |
+|----------|---------------------------|-----------|
+| Stage change | Yes — same record, known new value | ✅ Optimistic |
+| Field edit | Yes | ✅ Optimistic |
+| Delete | Yes — the record is gone | ✅ Optimistic, with undo |
+| Create entity | No — server generates the ID | ⚠️ Pessimistic, unless the UX justifies temp-ID reconciliation |
+| Lead conversion | No — three unpredictable IDs, cross-entity | ❌ Firmly pessimistic |
 
-The data table is intentionally not abstracted into a generic Table component. Each entity has different column configurations, cell formatters (currency for revenue, badges for status, concatenated name for contacts), and click handlers (accounts navigate to detail page, leads have a convert button). A generic table would need so many configuration props that it would be harder to maintain than separate components."
+That single test decides which mutations get which treatment, and it's far more useful than the blanket advice that "optimistic UI is good."
 
-### StatusBadge Component
+**One UX detail worth defending:** conversion happens in a modal over the lead list, not on a separate page. The rep keeps their place and their context — they can see which leads they've already worked through. And on failure ("this lead was already converted by someone else"), the error appears *inline in the modal* without closing it, so the rep doesn't lose the amount and close date they just typed.
 
-> "Status badges appear throughout the CRM -- opportunity stages on the kanban and detail views, lead statuses on the lead list, activity types on timelines. A single StatusBadge component maps status strings to color classes using three separate lookup objects (one per entity type). This centralizes color decisions and ensures visual consistency -- 'Closed Won' is always green whether it appears in the kanban, account detail opportunities tab, or reports page.
+## 🧭 Relationship Navigation: The Account Detail Page
 
-The component accepts a type prop ('opportunity', 'lead', or 'activity') to select the correct color mapping. This avoids a single giant lookup where 'New' could mean a new lead (blue) or a new activity type that doesn't exist. The type parameter disambiguates."
+CRM use is relationship-walking. Click an account, see its contacts; click a contact, see their deals. The detail page is where the normalized cache stops being an abstract nicety and starts paying rent.
 
-### Modal Pattern
+The account page needs four things: the account, its contacts, its opportunities, and its activity timeline. Three options:
 
-> "Entity creation forms and the lead conversion modal render as fixed-position overlays with a semi-transparent backdrop. I use a simple state boolean (showForm/convertingLead) in the route component rather than a modal manager library. The modal traps focus and closes on backdrop click or Escape key.
+| Loading strategy | Pros | Cons |
+|------------------|------|------|
+| ❌ Sequential fetches | Simple | Page paints at the *sum* of four latencies — 300ms+ |
+| ✅ Parallel fetch, all tabs | Paints at the slowest single call (~200ms); tab switching is then instant | Fetches data for tabs the user may never open |
+| ⚠️ Lazy per-tab | Least bandwidth | Every tab click costs a spinner — and reps switch tabs constantly |
 
-For the lead conversion modal specifically, I pre-populate the account name from the lead's company field and generate a default opportunity name. This reduces data entry -- the rep typically only needs to adjust the amount and close date before clicking 'Convert.' The checkbox to skip opportunity creation defaults to checked, because not every lead justifies creating a deal immediately.
+I fetch all four in parallel. The bandwidth "waste" is a few dozen rows; the alternative charges the user a loading state on *every tab click*, all day. For a tool people live in, the cost of a spinner is paid hundreds of times and the cost of a few extra rows is paid once.
 
-The EntityForm component dynamically renders fields based on entityType. When creating a contact or opportunity, it lazily loads account options for the dropdown -- only when the user clicks 'New Contact' does it fetch the accounts list. This avoids loading relationship data on every page load."
+**But the normalized cache changes what "fetch" even means.** Half of this is usually already in memory — the rep got here by clicking a row in the account list, so the account is cached. The fetches become *revalidation* rather than *acquisition*: render immediately from cache, correct quietly when the responses land. The page has content at 0ms and truth at 200ms, instead of a spinner at 0ms and content at 200ms.
 
-### Sidebar Navigation
+**Prefetch on hover** is the natural next step: when the cursor rests on an account row for 150ms, start fetching its detail. By the time the click registers, the data is usually there. It's cheap because the query index means we know exactly what we'd need, and it's the single highest-leverage perceived-performance trick available in an app whose core loop is "click through to the next record."
 
-> "The sidebar uses a fixed-position layout on the left, 224px wide (w-56 in Tailwind), with the Salesforce navy color (#032D60). Navigation items show icon + label, with the active route highlighted by a white/translucent background and a 3px blue left border matching the Salesforce cloud blue (#00A1E0).
+**The activity timeline is polymorphic on the client, too.** One timeline component takes `relatedType` and `relatedId` and renders chronologically with type-specific icons. It appears identically on account, contact, opportunity, and lead pages. That mirrors the server's polymorphic activity model exactly — and it's a good example of a backend data-model decision paying off directly in frontend component count. The alternative (a per-entity activity type) would have meant four timeline components.
 
-The sidebar is only rendered when the user is authenticated. The root route checks for the user in the auth store and conditionally renders the sidebar. Unauthenticated routes (login, register) render full-width without the sidebar. This avoids a flash-of-sidebar that would appear if we rendered it and then hid it on login check."
+## 📱 State Management Layout
 
-## 6. Lead Conversion UX (3 minutes)
+| Store | Contents | Update source |
+|-------|----------|---------------|
+| authStore | user, session status, role | REST (login / me / logout) |
+| entityStore | normalized entities by ID; query→ID indexes; custom-field metadata | REST fetches + optimistic mutations |
+| mutationQueue | in-flight optimistic mutations with rollback snapshots | Local |
+| Local component state | form inputs, modal open/closed, drag state, active tab | User interaction |
 
-> "The lead conversion workflow is the most complex user interaction. The rep clicks 'Convert' on a lead, which opens a modal with three sections:
+Zustand over Redux for footprint, and over Context for a concrete reason: **Context re-renders every consumer on any change to its value.** With a normalized cache holding thousands of entities in one object, a Context-based store means editing one contact re-renders every component that reads the store. Zustand's selector subscriptions mean editing one contact re-renders only the components that selected *that contact*. At CRM data volumes that isn't a micro-optimization — it's the difference between a board that drags smoothly and one that stutters.
 
-**Section 1: Account creation** -- Pre-filled with the lead's company name. The rep can change it if the company name on the lead was informal or incorrect.
+Tab state on the account detail page stays in local component state, not the URL. Switching between Contacts and Opportunities should not create a browser-history entry — a rep clicking Back expects to return to the account *list*, not to the previous tab.
 
-**Section 2: Opportunity creation** -- A checkbox controls whether to create an opportunity. When checked, three fields appear: opportunity name (pre-filled with 'Company - New Opportunity'), amount, and close date. When unchecked, only the account and contact are created. This is important because many leads convert without an immediate sales opportunity -- the rep just wants to promote the lead to a proper account/contact for future follow-up.
+## 🖼️ Rendering and Perceived Performance
 
-**Section 3: Confirmation** -- The convert button triggers a POST /api/leads/:id/convert. On success, the modal closes and the lead list re-fetches, showing the lead's status as 'Converted' with a purple badge. On failure (e.g., lead was already converted by another user), an error message appears inline without closing the modal.
+- **List views**: server-side search, filter, and pagination are the primary defense — a rep almost always narrows to dozens of rows. But the unfiltered "all accounts" view for a large org is thousands of rows, so it's virtualized: render only the viewport. Without virtualization the browser constructs 10,000 DOM rows and first paint takes seconds with the main thread blocked.
+- **Pagination, not infinite scroll.** A rep needs to jump to a page, and a manager needs to see "247 leads" as a real number. Infinite scroll destroys both. This is one of the few places where the older pattern is simply correct.
+- **Debounced search** at ~300ms. Typing "Acme Corporation" without debouncing fires a request per keystroke — 16 requests, 15 of them wasted, and the responses can arrive out of order and render the wrong result set.
+- **The kanban board is the deliberate exception to virtualization.** A virtualized column breaks drag-and-drop, because you cannot drop onto a target that isn't mounted. So instead each column is capped (top N by amount, with "show more") — which is also better product, since nobody drags the 400th card in a column.
+- **Skeleton screens, not spinners**, on first load. A skeleton matching the final layout means no layout shift when data lands, and it communicates *what* is loading rather than merely *that* something is.
+- **Charts built with layout, not a library.** Pipeline and revenue bars are proportional-width elements. A charting library is 40–60KB gzipped to draw rectangles, and that budget is better spent on the data layer. The moment we need tooltips, zoom, and interactive legends the calculus flips — and then I'd code-split the library onto the reports route only, so the dashboard never pays for a dependency it doesn't use.
+- **Route-level code splitting**: the drag-and-drop library loads only on the pipeline route. Login and dashboard never download it.
 
-The key UX decision: I use a modal rather than a separate page for conversion. This keeps the lead list visible in the background, maintaining context. The rep can see which leads they've already processed. After conversion, the lead immediately shows as 'Converted' in the list without a full page reload."
+## 🔍 The Search and Filter Contract
 
-## 7. Performance Considerations (3 minutes)
+Search is where the client/server boundary gets negotiated, and getting it wrong is a common way to build a CRM that's fast in the demo and unusable at a real customer.
 
-> "CRM performance is critical because sales reps use the tool all day. Slow interactions directly impact productivity and adoption.
+**Filtering happens on the server. Always.** The instinct — fetch the accounts once, filter in memory, feel instant — works beautifully for the 200 accounts in a seed database and collapses at the 40,000 accounts a real org has. You cannot filter what you haven't downloaded, and downloading 40,000 accounts to find one is not a strategy.
 
-- **Code splitting**: Each route is a separate chunk via TanStack Router's file-based routing. The kanban page with @dnd-kit (the heaviest dependency) only loads when the user navigates to /opportunities. Login/register pages are separate chunks that aren't loaded for authenticated users.
+**What the client owns:**
 
-- **Selective re-renders**: Zustand selectors ensure the dashboard doesn't re-render when opportunity data changes. Each page subscribes only to its own entity slice. The kanban board uses a flat selector for the opportunities array, so adding a new account doesn't cause 200 opportunity cards to re-render.
+- **Debounce** (~300ms) so typing "Acme Corporation" fires one or two requests, not sixteen.
+- **Request cancellation / last-write-wins on responses.** Without it, the response for "Acm" can land *after* the response for "Acme" and repaint the wrong result set. This is a subtle bug that only shows up on slow connections, which is to say: only for the users who are already suffering.
+- **The query index.** A search result is a list of IDs stored under a key derived from the query. Re-running the same search is free; the entities are already in the cache. Going back to a list you just left is instant.
 
-- **Debounced search**: Search inputs debounce API calls by 300ms to prevent request storms during typing. Without debouncing, typing 'Acme Corporation' would fire 16 API requests. With debouncing, it fires 1-2.
+**What the server owns:** the actual matching, the total count (a real number, because a manager asking "how many leads came in this month" needs an answer, not an estimate), and the sort.
 
-- **Pagination over infinite scroll**: CRM data tables use traditional pagination (OFFSET/LIMIT) because sales reps need to navigate to specific pages and the total count is meaningful for workflow management. A manager asking 'how many leads do we have?' can see the answer in the pagination footer.
+The empty state matters more here than people expect. "No results" for a search and "no accounts yet" for a fresh org are completely different situations needing completely different UI — one offers to clear the filters, the other offers to create the first record. Collapsing them into one blank panel is how a new customer's first five minutes go badly.
 
-- **Lazy account loading**: Contact and opportunity forms load account dropdown options only when the create form opens, not on page mount. This prevents fetching hundreds of accounts on every page navigation.
+## ♿ Accessibility
 
-- **Parallel data loading**: Account detail pages fire four API calls in parallel (account, contacts, opportunities, activities) using Promise.all. This cuts page load time from the sum of all calls to the duration of the slowest call.
+Not a footnote — enterprise procurement checks this, and a CRM that fails an audit doesn't get bought.
 
-- **Stable keys for kanban**: Each opportunity card uses the opportunity ID as its React key and @dnd-kit ID. This ensures stable DOM references during drag operations and prevents React from unmounting/remounting cards when the opportunities array is re-fetched."
+- **Keyboard drag-and-drop** is mandatory, which is a primary input to the library choice. If the board can only be operated with a mouse, the pipeline is unusable for a subset of employees.
+- **Real labels, not placeholders.** Placeholder-as-label disappears the moment the user types, which is exactly when they most need it.
+- **Color is never the only signal.** A "Closed Won" badge is green *and* says "Closed Won." Stage is conveyed by text, not hue.
+- **Focus management on modals**: focus moves into the modal on open and returns to the triggering control on close, so keyboard users don't get dumped at the top of the page.
 
-## 8. Accessibility Considerations (2 minutes)
+## 🛡️ Resilience and the Eight-Hour Tab
 
-> "CRM tools must be accessible -- many organizations have accessibility requirements for internal tools.
+An all-day tab has failure modes a page-per-visit app never encounters:
 
-- **Keyboard navigation**: @dnd-kit provides built-in keyboard support for drag-and-drop. Users can use Tab to focus a card, Space to pick it up, Arrow keys to move between columns, and Space again to drop. This is a primary reason I chose @dnd-kit over HTML5 drag API.
+- **Session expiry mid-action.** The rep returns from lunch, drags a deal, gets a 401. Losing the drag is annoying; losing an unsaved form is enraging. So a 401 on a mutation **preserves the pending change** in the mutation queue, prompts for re-auth inline, and replays on success. Redirecting to `/login` and discarding their work is the single behavior most likely to make someone hate the tool.
+- **Staleness after idle.** Data fetched at 9am is still on screen at 4pm. On tab refocus after a long idle, revalidate the *visible* queries in the background — show what we have immediately, correct it quietly. Never blank the screen to reload.
+- **Memory.** LRU eviction of unreferenced entities, plus dropping query→ID indexes for routes untouched for an hour. Those indexes are cheap to rebuild and they pin entities in memory that would otherwise be evictable.
+- **Flaky network.** Mutations queue and retry with backoff; reads fail soft to cache with a visible "showing data from 3:42pm" indicator. The one thing never permitted is silently presenting stale data as live.
 
-- **Form labels**: All form inputs have associated label elements. The EntityForm component renders explicit labels above each input rather than using placeholder text as pseudo-labels (placeholders disappear when the user starts typing, which is inaccessible).
+## 📊 What I'd Measure in Production
 
-- **Color independence**: Status badges use both color and text to convey meaning. 'Closed Won' is green text on green background, but the text itself ('Closed Won') communicates the status without relying on color alone. This supports color-blind users.
+Frontend performance claims are worthless without real-user data, and the metrics that matter here are not the standard ones.
 
-- **Focus management**: When a modal opens, focus moves to the first form input. When it closes, focus returns to the trigger button. This prevents keyboard users from losing their place in the page."
+| Signal | Why it's the right one for *this* app |
+|--------|--------------------------------------|
+| Time-to-interactive on the **kanban route** | It's the heaviest route and the one with the most expensive dependency. If TTI regresses, someone added to the drag bundle |
+| **Drag-to-render latency** (drop event → paint) | The optimistic update's whole justification. If this exceeds ~50ms, the optimism isn't buying anything |
+| **409 rate on stage changes** | Rising conflicts mean reps are colliding — which is a *product* signal (the team needs real-time sync) disguised as an error metric |
+| Cache hit rate on navigation | Directly measures whether Deep Dive 1 is working. A falling hit rate means someone reintroduced a per-route fetch |
+| **Heap size at hour 4 vs. hour 1** | The eight-hour-tab metric. Nothing else catches an eviction bug |
+| Mutation-queue depth | Sustained depth means the network is failing and the user's work is piling up unsaved — the most user-hostile state the app can be in |
 
-## 9. Trade-offs Summary (2 minutes)
+Note that Largest Contentful Paint, the metric everyone reaches for, is nearly irrelevant here: users load this app once a day. The metrics that matter are all about the *thousandth* interaction, not the first.
+
+## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Drag-drop library | @dnd-kit | react-beautiful-dnd | Active maintenance, TypeScript native, accessible |
-| Charts | CSS-only bars | Chart.js / Recharts | Zero bundle impact, sufficient for KPI display |
-| State management | Zustand (2 stores) | React Context | Selector-based updates, no unnecessary re-renders |
-| Entity forms | Shared EntityForm | Per-entity form components | DRY, consistent UX, single validation pattern |
-| Tab state | Local React state | URL search params | Tabs shouldn't create history entries |
-| Styling | Tailwind CSS | CSS modules | Rapid prototyping, consistent design tokens |
-| Routing | TanStack Router (file-based) | React Router | Type-safe, code splitting, dev tools |
-| Data tables | Per-entity components | Generic table component | Different columns/formatters/actions per entity |
-| Account loading | Lazy on form open | Eager on page mount | Avoids unnecessary API calls |
-| Conversion UX | Modal over list | Separate page | Maintains list context, faster workflow |
+| Client data layer | ✅ Normalized entity cache | ❌ Per-route fetch into arrays | One deal appears on three screens; duplication guarantees they disagree on screen |
+| Kanban update | ✅ Optimistic | ❌ Wait for the server | 200ms of lag on a drag reads as broken |
+| Conflict (409) | ✅ Roll *forward* to server truth, name who changed it | ❌ Roll back to pre-drag value | Rolling back to a value we know is stale invites the user to overwrite a colleague |
+| Concurrency contract | ✅ Client sends `version` | ❌ Last-write-wins | Turns a silent overwrite into a visible, resolvable conflict |
+| Probability mapping | ✅ Server-derived, echoed back | ❌ Computed client-side | Duplicated business rules drift; a drifted forecast is silently wrong |
+| Lead conversion | ✅ Pessimistic with progress | ❌ Optimistic with temp IDs | The client cannot predict server-generated IDs |
+| Forms | ✅ Schema-driven from metadata | ❌ Hardcoded + custom-field appendix | Customers add fields; we cannot deploy per field |
+| Global state | ✅ Zustand selectors | ❌ Context | Context re-renders every consumer on any change |
+| List views | ✅ Server filter + virtualize the tail | ❌ Fetch all, filter on the client | 10K DOM rows blocks the main thread for seconds |
+| List navigation | ✅ Pagination with a real total | ❌ Infinite scroll | Managers need counts; reps need to jump to a page |
+| Kanban columns | ✅ Capped, not virtualized | ❌ Virtualized | You cannot drop onto an unmounted node |
+| Charts | ✅ Layout-based bars | ❌ Charting library up front | 60KB to draw rectangles; split it in only when interactivity is needed |
+
+## 📈 Scaling the Frontend: What Breaks First
+
+1. **The unfiltered list view**, at a few thousand rows. Virtualization fixes rendering; server-side pagination fixes transfer. Both are needed — virtualizing 50,000 rows you already downloaded still means you downloaded and parsed 50,000 rows.
+2. **Selector cost on a large cache.** As the store grows, unmemoized derived selectors recompute on every write and re-render half the app. Fix: memoized selectors with stable references, and subscribing at the narrowest key that works.
+3. **The custom-field explosion.** An org with 100 custom fields on accounts makes the dynamic form enormous and the list view unreadable. The answer is *field sets* — the org configures which fields appear in which context. It looks like a UI feature; it's a performance requirement wearing a costume.
+4. **Bundle size** as features accumulate. Route-level splitting is the first line of defense; the drag library, the reports page, and the admin surface are the natural split points.
+5. **Real-time, eventually.** Today conflicts are detected on write. The next step is a subscription pushing "this deal changed" so a rep's board updates while they're looking at it — turning conflict *detection* into conflict *avoidance*. That's the biggest UX upgrade still on the table, and it's mostly a transport problem, because the normalized cache already gives us exactly one place to apply an incoming change. That's the payoff of Deep Dive 1 arriving a year later.
+
+6. **The activity timeline on a busy account.** A five-year enterprise account can have thousands of logged calls and emails. The timeline is the one place in the app with genuinely unbounded growth per record. It needs cursor pagination ("load earlier") rather than a full fetch, and it's the first place I'd expect a naive implementation to fall over on a real customer's biggest account — which is, of course, their most important one.
+
+## 🚀 Closing
+
+The through-line is two questions, asked of everything: **can the client predict this mutation's result?** and **is there exactly one copy of this data?** Those two produce nearly every decision above. Optimism where prediction is possible, pessimism where it isn't. One copy of every entity, so no two views can disagree. Everything else — virtualization, code splitting, skeletons, drag overlays — is craft layered on top of a data layer that either tells the truth or doesn't.

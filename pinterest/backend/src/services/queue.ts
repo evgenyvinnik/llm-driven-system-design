@@ -1,8 +1,8 @@
-import amqplib, { Connection, Channel } from 'amqplib';
+import amqplib, { ChannelModel, Channel } from 'amqplib';
 import config from '../config/index.js';
 import { logger } from './logger.js';
 
-let connection: Connection | null = null;
+let connection: ChannelModel | null = null;
 let channel: Channel | null = null;
 
 export const QUEUES = {

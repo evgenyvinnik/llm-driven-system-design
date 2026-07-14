@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(30) UNIQUE NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
@@ -11,7 +11,7 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE apps (
+CREATE TABLE IF NOT EXISTS apps (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name VARCHAR(100) NOT NULL,
   description TEXT,
@@ -26,7 +26,7 @@ CREATE TABLE apps (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE app_versions (
+CREATE TABLE IF NOT EXISTS app_versions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   app_id UUID NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
   version_number INT NOT NULL,
@@ -38,7 +38,7 @@ CREATE TABLE app_versions (
   UNIQUE(app_id, version_number)
 );
 
-CREATE TABLE data_sources (
+CREATE TABLE IF NOT EXISTS data_sources (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name VARCHAR(100) NOT NULL,
   type VARCHAR(30) NOT NULL CHECK (type IN ('postgresql', 'rest_api')),
@@ -48,7 +48,7 @@ CREATE TABLE data_sources (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE saved_queries (
+CREATE TABLE IF NOT EXISTS saved_queries (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   app_id UUID NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
   name VARCHAR(100) NOT NULL,
@@ -61,7 +61,7 @@ CREATE TABLE saved_queries (
 );
 
 -- Indexes
-CREATE INDEX idx_apps_owner ON apps(owner_id, updated_at DESC);
-CREATE INDEX idx_app_versions_app ON app_versions(app_id, version_number DESC);
-CREATE INDEX idx_data_sources_owner ON data_sources(owner_id);
-CREATE INDEX idx_saved_queries_app ON saved_queries(app_id);
+CREATE INDEX IF NOT EXISTS idx_apps_owner ON apps(owner_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_versions_app ON app_versions(app_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_data_sources_owner ON data_sources(owner_id);
+CREATE INDEX IF NOT EXISTS idx_saved_queries_app ON saved_queries(app_id);

@@ -1,4 +1,5 @@
 import type { DriverStats } from '@/types';
+import { formatPercent } from '@/utils/format';
 
 /**
  * Props for the DriverStatsGrid component.
@@ -53,7 +54,7 @@ export function DriverStatsGrid({ stats }: DriverStatsGridProps) {
    */
   const formatAcceptanceRate = (): string => {
     const rate = stats.acceptance_rate ?? 1;
-    return `${(rate * 100).toFixed(0)}%`;
+    return formatPercent(rate);
   };
 
   return (

@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { api } from '@/services/api';
+import { formatPrice, formatNumber } from '@/utils/format';
 import { useCartStore } from '@/stores/cartStore';
 import { MenuItemCard } from '@/components/MenuItemCard';
 import { PageLoading } from '@/components/LoadingSpinner';
@@ -80,7 +81,7 @@ function MerchantPage() {
               <p className="text-gray-500 mb-4">{merchant.description}</p>
             )}
             <div className="flex items-center gap-4 text-sm text-gray-500">
-              <span>⭐ {merchant.rating.toFixed(1)}</span>
+              <span>⭐ {formatNumber(merchant.rating, 1)}</span>
               <span>🕐 {merchant.avg_prep_time_minutes} min prep</span>
               <span>📍 {merchant.address}</span>
             </div>
@@ -118,7 +119,7 @@ function MerchantPage() {
           <div className="max-w-4xl mx-auto flex justify-between items-center">
             <div>
               <span className="font-semibold">{itemCount} items</span>
-              <span className="text-gray-500 ml-2">${subtotal.toFixed(2)}</span>
+              <span className="text-gray-500 ml-2">${formatPrice(subtotal)}</span>
             </div>
             <Link to="/cart" className="btn-primary">
               View Cart

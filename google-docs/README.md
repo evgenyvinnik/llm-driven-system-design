@@ -75,7 +75,7 @@ Frontend runs on http://localhost:5173
 
 Open http://localhost:5173 in your browser.
 
-**Demo Accounts** (password: `password` for all):
+**Demo Accounts** (password: `password123` for all):
 - alice@example.com
 - bob@example.com
 - admin@example.com

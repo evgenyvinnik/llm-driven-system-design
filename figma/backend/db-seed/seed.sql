@@ -3,7 +3,7 @@
 
 -- Insert a default demo user
 INSERT INTO users (id, email, name, password_hash, role) VALUES
-  ('00000000-0000-0000-0000-000000000001', 'demo@figma.local', 'Demo User', '$2b$10$demo', 'admin');
+  ('00000000-0000-0000-0000-000000000001', 'demo@figma.local', 'Demo User', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'admin');
 
 -- Insert a default team
 INSERT INTO teams (id, name, owner_id) VALUES

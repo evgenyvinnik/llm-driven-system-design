@@ -100,7 +100,7 @@ The frontend runs on http://localhost:5173
 Open http://localhost:5173 in your browser.
 
 **Demo Credentials:**
-- Admin: `admin@example.com` / `admin123`
+- Admin: `admin@example.com` / `password123`
 - User: `john@example.com` / `password123`
 
 ## Project Structure

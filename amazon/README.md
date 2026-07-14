@@ -131,8 +131,8 @@ Frontend runs on http://localhost:5173
 
 | Role | Email | Password |
 |------|-------|----------|
-| Admin | admin@amazon.local | admin123 |
-| Seller | seller@amazon.local | admin123 |
+| Admin | admin@amazon.local | password123 |
+| Seller | seller@amazon.local | password123 |
 
 Note: Create a new account to test as a regular user.
 

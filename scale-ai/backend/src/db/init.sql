@@ -24,7 +24,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 -- ============================================================================
 
 -- Users table for session tracking (anonymous or authenticated)
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id VARCHAR(255) UNIQUE NOT NULL,
     role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
@@ -34,7 +34,7 @@ CREATE TABLE users (
 );
 
 -- Shape definitions for the drawing game
-CREATE TABLE shapes (
+CREATE TABLE IF NOT EXISTS shapes (
     id SERIAL PRIMARY KEY,
     name VARCHAR(50) UNIQUE NOT NULL,
     description TEXT,
@@ -43,7 +43,7 @@ CREATE TABLE shapes (
 );
 
 -- Drawing submissions from users
-CREATE TABLE drawings (
+CREATE TABLE IF NOT EXISTS drawings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     shape_id INT REFERENCES shapes(id) ON DELETE CASCADE,
@@ -56,7 +56,7 @@ CREATE TABLE drawings (
 );
 
 -- Training job management
-CREATE TABLE training_jobs (
+CREATE TABLE IF NOT EXISTS training_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     status VARCHAR(50) DEFAULT 'pending' CHECK (status IN ('pending', 'queued', 'running', 'completed', 'failed', 'cancelled')),
     config JSONB DEFAULT '{}',  -- hyperparameters, data filters, epochs
@@ -71,7 +71,7 @@ CREATE TABLE training_jobs (
 );
 
 -- Trained model versions
-CREATE TABLE models (
+CREATE TABLE IF NOT EXISTS models (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     training_job_id UUID REFERENCES training_jobs(id) ON DELETE CASCADE,
     version VARCHAR(50) NOT NULL,
@@ -83,7 +83,7 @@ CREATE TABLE models (
 );
 
 -- Admin users with email/password authentication
-CREATE TABLE admin_users (
+CREATE TABLE IF NOT EXISTS admin_users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
@@ -97,29 +97,29 @@ CREATE TABLE admin_users (
 -- ============================================================================
 
 -- Users indexes
-CREATE INDEX idx_users_session ON users(session_id);
-CREATE INDEX idx_users_role ON users(role);
+CREATE INDEX IF NOT EXISTS idx_users_session ON users(session_id);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
 -- Drawings indexes
-CREATE INDEX idx_drawings_shape ON drawings(shape_id);
-CREATE INDEX idx_drawings_user ON drawings(user_id);
-CREATE INDEX idx_drawings_created ON drawings(created_at DESC);
-CREATE INDEX idx_drawings_quality ON drawings(quality_score) WHERE quality_score IS NOT NULL;
-CREATE INDEX idx_drawings_flagged ON drawings(is_flagged) WHERE is_flagged = TRUE;
-CREATE INDEX idx_drawings_deleted_at ON drawings(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_drawings_shape ON drawings(shape_id);
+CREATE INDEX IF NOT EXISTS idx_drawings_user ON drawings(user_id);
+CREATE INDEX IF NOT EXISTS idx_drawings_created ON drawings(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_drawings_quality ON drawings(quality_score) WHERE quality_score IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_drawings_flagged ON drawings(is_flagged) WHERE is_flagged = TRUE;
+CREATE INDEX IF NOT EXISTS idx_drawings_deleted_at ON drawings(deleted_at);
 
 -- Training jobs indexes
-CREATE INDEX idx_training_jobs_status ON training_jobs(status);
-CREATE INDEX idx_training_jobs_created ON training_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_status ON training_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_created ON training_jobs(created_at DESC);
 
 -- Models indexes
 -- Ensure only one active model at a time
-CREATE UNIQUE INDEX idx_models_active ON models(is_active) WHERE is_active = TRUE;
-CREATE INDEX idx_models_version ON models(version);
-CREATE INDEX idx_models_created ON models(created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_models_active ON models(is_active) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_models_version ON models(version);
+CREATE INDEX IF NOT EXISTS idx_models_created ON models(created_at DESC);
 
 -- Admin users indexes
-CREATE INDEX idx_admin_users_email ON admin_users(email);
+CREATE INDEX IF NOT EXISTS idx_admin_users_email ON admin_users(email);
 
 -- ============================================================================
 -- COMMENTS

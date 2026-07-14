@@ -96,8 +96,8 @@ Two demo users are created on first startup:
 
 | User | Email | Password | Role |
 |------|-------|----------|------|
-| Demo User | demo@example.com | demo123 | user |
-| Admin | admin@example.com | admin123 | admin |
+| Demo User | demo@example.com | password123 | user |
+| Admin | admin@example.com | password123 | admin |
 
 Note: The demo password hash in the database is a placeholder. For first-time login, you may need to register a new account or update the password hash.
 

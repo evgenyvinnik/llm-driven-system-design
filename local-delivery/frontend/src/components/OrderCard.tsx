@@ -1,6 +1,7 @@
 import type { OrderWithDetails } from '@/types';
 import { StatusBadge } from './StatusBadge';
 import { Link } from '@tanstack/react-router';
+import { formatPrice, formatNumber } from '@/utils/format';
 
 interface OrderCardProps {
   order: OrderWithDetails;
@@ -41,7 +42,7 @@ export function OrderCard({ order, showDetails = false }: OrderCardProps) {
       <div className="flex justify-between items-center">
         <span className="text-sm text-gray-600">{order.delivery_address}</span>
         <span className="font-semibold text-gray-900">
-          ${order.total.toFixed(2)}
+          ${formatPrice(order.total)}
         </span>
       </div>
 
@@ -52,7 +53,7 @@ export function OrderCard({ order, showDetails = false }: OrderCardProps) {
             <span className="text-gray-600">
               {order.driver.name} ({order.driver.vehicle_type})
             </span>
-            <span className="text-gray-400">⭐ {order.driver.rating.toFixed(1)}</span>
+            <span className="text-gray-400">⭐ {formatNumber(order.driver.rating, 1)}</span>
           </div>
         </div>
       )}

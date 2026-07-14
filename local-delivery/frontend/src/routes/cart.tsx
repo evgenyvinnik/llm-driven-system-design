@@ -4,6 +4,7 @@ import { useCartStore } from '@/stores/cartStore';
 import { useLocationStore } from '@/stores/locationStore';
 import { useAuthStore } from '@/stores/authStore';
 import { api } from '@/services/api';
+import { formatPrice, toNumber } from '@/utils/format';
 
 export const Route = createFileRoute('/cart')({
   component: CartPage,
@@ -124,7 +125,7 @@ function CartPage() {
               <div className="flex-1">
                 <h3 className="font-medium text-gray-900">{item.menuItem.name}</h3>
                 <p className="text-sm text-gray-500">
-                  ${item.menuItem.price.toFixed(2)} each
+                  ${formatPrice(item.menuItem.price)} each
                 </p>
               </div>
 
@@ -146,7 +147,7 @@ function CartPage() {
                 </div>
 
                 <span className="font-semibold text-gray-900 w-20 text-right">
-                  ${(item.menuItem.price * item.quantity).toFixed(2)}
+                  ${formatPrice(toNumber(item.menuItem.price) * item.quantity)}
                 </span>
 
                 <button
@@ -221,21 +222,21 @@ function CartPage() {
         <div className="space-y-2 text-sm">
           <div className="flex justify-between">
             <span className="text-gray-600">Subtotal</span>
-            <span>${subtotal.toFixed(2)}</span>
+            <span>${formatPrice(subtotal)}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-gray-600">Delivery Fee</span>
-            <span>${deliveryFee.toFixed(2)}</span>
+            <span>${formatPrice(deliveryFee)}</span>
           </div>
           {tip > 0 && (
             <div className="flex justify-between">
               <span className="text-gray-600">Tip</span>
-              <span>${tip.toFixed(2)}</span>
+              <span>${formatPrice(tip)}</span>
             </div>
           )}
           <div className="flex justify-between text-lg font-semibold pt-2 border-t">
             <span>Total</span>
-            <span>${total.toFixed(2)}</span>
+            <span>${formatPrice(total)}</span>
           </div>
         </div>
       </div>
@@ -249,7 +250,7 @@ function CartPage() {
         disabled={isSubmitting}
         className="btn-primary w-full btn-lg"
       >
-        {isSubmitting ? 'Placing Order...' : `Place Order - $${total.toFixed(2)}`}
+        {isSubmitting ? 'Placing Order...' : `Place Order - $${formatPrice(total)}`}
       </button>
     </div>
   );

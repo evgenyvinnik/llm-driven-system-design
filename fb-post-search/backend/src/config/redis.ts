@@ -4,7 +4,7 @@
  * Used for session storage, visibility set caching, and search suggestions.
  */
 
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { config } from '../config/index.js';
 
 /**

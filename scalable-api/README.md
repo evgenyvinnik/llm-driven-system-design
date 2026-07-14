@@ -328,8 +328,8 @@ curl http://localhost:8080/api/v1/admin/cache \
 
 | User | Email | Password | Role |
 |------|-------|----------|------|
-| Admin | admin@example.com | admin123 | admin |
-| User | user@example.com | user123 | user |
+| Admin | admin@example.com | password123 | admin |
+| User | user@example.com | password123 | user |
 
 ## Project Structure
 

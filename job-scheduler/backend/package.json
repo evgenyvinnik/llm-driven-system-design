@@ -12,7 +12,9 @@
     "dev:worker2": "WORKER_ID=worker-2 ts-node-dev --respawn --transpile-only src/worker/index.ts",
     "dev:worker3": "WORKER_ID=worker-3 ts-node-dev --respawn --transpile-only src/worker/index.ts",
     "migrate": "ts-node src/db/migrate.ts",
+    "db:migrate": "ts-node src/db/migrate.ts",
     "seed": "ts-node src/db/seed.ts",
+    "db:seed": "ts-node src/db/seed.ts",
     "lint": "eslint src",
     "format": "prettier --write \"src/**/*.ts\"",
     "type-check": "tsc --noEmit"

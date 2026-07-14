@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "LinkedIn clone backend - Professional networking platform",
   "main": "dist/index.js",
+  "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:server1": "PORT=3001 tsx watch src/index.ts",

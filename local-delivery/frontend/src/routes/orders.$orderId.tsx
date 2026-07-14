@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { api } from '@/services/api';
+import { formatPrice, formatNumber, toNumber } from '@/utils/format';
 import { wsService } from '@/services/websocket';
 import { useAuthStore } from '@/stores/authStore';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -131,7 +132,7 @@ function OrderDetailPage() {
                 Driver: <span className="font-medium">{order.driver.name}</span>
               </p>
               <p className="text-sm text-gray-500">
-                {order.driver.vehicle_type} - Rating: {order.driver.rating.toFixed(1)}
+                {order.driver.vehicle_type} - Rating: {formatNumber(order.driver.rating, 1)}
               </p>
             </div>
             {eta && (
@@ -145,7 +146,7 @@ function OrderDetailPage() {
             <div className="mt-4 p-4 bg-white rounded-lg">
               <p className="text-sm text-gray-500">Driver Location</p>
               <p className="font-mono text-sm">
-                {driverLocation.lat.toFixed(6)}, {driverLocation.lng.toFixed(6)}
+                {formatNumber(driverLocation.lat, 6)}, {formatNumber(driverLocation.lng, 6)}
               </p>
             </div>
           )}
@@ -218,7 +219,7 @@ function OrderDetailPage() {
                 )}
               </div>
               <span className="font-medium">
-                ${(item.unit_price * item.quantity).toFixed(2)}
+                ${formatPrice(toNumber(item.unit_price) * item.quantity)}
               </span>
             </div>
           ))}
@@ -227,21 +228,21 @@ function OrderDetailPage() {
         <div className="border-t border-gray-200 pt-4 mt-4 space-y-2">
           <div className="flex justify-between text-sm">
             <span className="text-gray-600">Subtotal</span>
-            <span>${order.subtotal.toFixed(2)}</span>
+            <span>${formatPrice(order.subtotal)}</span>
           </div>
           <div className="flex justify-between text-sm">
             <span className="text-gray-600">Delivery Fee</span>
-            <span>${order.delivery_fee.toFixed(2)}</span>
+            <span>${formatPrice(order.delivery_fee)}</span>
           </div>
           {order.tip > 0 && (
             <div className="flex justify-between text-sm">
               <span className="text-gray-600">Tip</span>
-              <span>${order.tip.toFixed(2)}</span>
+              <span>${formatPrice(order.tip)}</span>
             </div>
           )}
           <div className="flex justify-between font-semibold text-lg pt-2 border-t">
             <span>Total</span>
-            <span>${order.total.toFixed(2)}</span>
+            <span>${formatPrice(order.total)}</span>
           </div>
         </div>
       </div>

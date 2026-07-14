@@ -1,5 +1,6 @@
 import type { Merchant } from '@/types';
 import { Link } from '@tanstack/react-router';
+import { formatNumber } from '@/utils/format';
 
 interface MerchantCardProps {
   merchant: Merchant;
@@ -17,7 +18,7 @@ export function MerchantCard({ merchant }: MerchantCardProps) {
           <h3 className="font-semibold text-lg text-gray-900">{merchant.name}</h3>
           <div className="flex items-center gap-1 text-sm">
             <span>⭐</span>
-            <span>{merchant.rating.toFixed(1)}</span>
+            <span>{formatNumber(merchant.rating, 1)}</span>
           </div>
         </div>
 
@@ -32,7 +33,7 @@ export function MerchantCard({ merchant }: MerchantCardProps) {
         <div className="flex items-center gap-4 text-sm text-gray-500">
           <span>🕐 {merchant.avg_prep_time_minutes} min</span>
           {merchant.distance !== undefined && (
-            <span>📍 {merchant.distance.toFixed(1)} km</span>
+            <span>📍 {formatNumber(merchant.distance, 1)} km</span>
           )}
         </div>
 

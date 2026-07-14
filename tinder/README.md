@@ -117,7 +117,7 @@ After running the seed script, you can use these accounts:
 
 | Role  | Email               | Password    |
 |-------|---------------------|-------------|
-| Admin | admin@example.com   | admin123    |
+| Admin | admin@example.com   | password123    |
 | User  | alice@example.com   | password123 |
 | User  | bob@example.com     | password123 |
 

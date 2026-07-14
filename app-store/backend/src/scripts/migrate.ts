@@ -4,12 +4,11 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { pool } from '../config/database.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 async function migrate(): Promise<void> {
+  // This package is CommonJS (no "type": "module"), so __dirname is available
+  // natively. Using import.meta.url here would be undefined at runtime under tsx.
   const sql = fs.readFileSync(path.join(__dirname, '..', 'db', 'init.sql'), 'utf-8');
 
   try {

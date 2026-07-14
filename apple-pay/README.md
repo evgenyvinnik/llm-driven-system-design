@@ -148,7 +148,7 @@ FRONTEND_URL=http://localhost:5173
 
 Pre-configured demo account:
 - **Email:** demo@example.com
-- **Password:** demo123
+- **Password:** password123
 
 ### Adding Cards
 

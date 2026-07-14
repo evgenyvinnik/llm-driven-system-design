@@ -184,7 +184,7 @@ export const searchEmails = async (
       index: EMAIL_INDEX,
       body: {
         query: { bool: { must } },
-        sort: [{ _score: 'desc' }, { created_at: 'desc' }],
+        sort: [{ _score: { order: 'desc' } }, { created_at: { order: 'desc' } }],
         from: (page - 1) * limit,
         size: limit,
         _source: [

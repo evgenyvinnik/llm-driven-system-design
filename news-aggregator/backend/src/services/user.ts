@@ -4,6 +4,7 @@
  * Reading behavior is used to learn implicit topic preferences for personalization.
  */
 
+import crypto from 'node:crypto';
 import { query, queryOne, execute } from '../db/postgres.js';
 import { v4 as uuid } from 'uuid';
 
@@ -41,7 +42,6 @@ interface ReadingHistoryEntry {
  */
 function hashPassword(password: string): string {
   // In production, use bcrypt.hash()
-  const crypto = require('crypto');
   return crypto.createHash('sha256').update(password + 'salt').digest('hex');
 }
 

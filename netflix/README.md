@@ -141,7 +141,7 @@ npm run dev
 1. Open http://localhost:5173
 2. Login with demo credentials:
    - Email: `demo@netflix.local`
-   - Password: `demo123`
+   - Password: `password123`
 3. Select a profile
 4. Browse the catalog!
 

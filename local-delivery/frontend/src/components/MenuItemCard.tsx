@@ -1,5 +1,6 @@
 import type { MenuItem } from '@/types';
 import { useCartStore } from '@/stores/cartStore';
+import { formatPrice } from '@/utils/format';
 
 interface MenuItemCardProps {
   item: MenuItem;
@@ -32,7 +33,7 @@ export function MenuItemCard({ item }: MenuItemCardProps) {
             <p className="text-sm text-gray-500 mt-1">{item.description}</p>
           )}
           <p className="font-semibold text-primary-600 mt-2">
-            ${item.price.toFixed(2)}
+            ${formatPrice(item.price)}
           </p>
         </div>
 

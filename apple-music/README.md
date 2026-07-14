@@ -75,8 +75,8 @@ minio server ~/.minio/data --console-address ":9001"
 
 After setup, use these accounts to log in:
 
-- **Admin**: admin@applemusic.local / admin123
-- **User**: demo@applemusic.local / demo123
+- **Admin**: admin@applemusic.local / password123
+- **User**: demo@applemusic.local / password123
 
 ## Architecture
 

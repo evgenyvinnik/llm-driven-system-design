@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { Server } from 'http';
-import { activeWebsocketConnections } from '../services/metrics.js';
+import { activeWebsocketConnections } from './services/metrics.js';
 
 interface WSClient {
   ws: WebSocket;

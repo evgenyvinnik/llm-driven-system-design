@@ -1,253 +1,284 @@
-# Salesforce CRM - Full-Stack System Design Answer
+# Salesforce CRM - System Design Answer (Full-Stack Focus)
 
-## 1. Requirements Clarification (2 minutes)
+*45-minute system design interview format - Full-Stack Engineer Position*
 
-"We're designing a CRM system -- the backbone of sales operations. Let me confirm scope:
+## 📋 Problem Statement
 
-- **Core entities**: Accounts, Contacts, Opportunities, Leads, Activities -- the standard CRM object model?
-- **Pipeline management**: Kanban board for opportunity stages with drag-drop transitions?
-- **Lead lifecycle**: Lead capture, qualification, and atomic conversion to account + contact + opportunity?
-- **Activity tracking**: Log calls, emails, meetings, notes against any entity?
-- **Analytics**: Dashboard KPIs, pipeline reports, revenue trends, lead source breakdown?
-- **Scale**: Initially thousands of users, designed to scale to 50K+ concurrent reps with millions of records?
+Design a multi-tenant CRM end to end: accounts, contacts, opportunities, leads, and activities; a kanban sales pipeline; an atomic lead-conversion workflow; and dashboards over the whole book of business.
 
-I'll cover the full stack: data model, API design, frontend architecture, and three deep dives on the hardest problems."
+Because this is the full-stack framing, I'm going to organize the answer around **the seams** — the places where a client decision forces a server decision, or where a server guarantee determines what the UI is allowed to promise. Those seams are where CRMs actually go wrong, and they're invisible if you design the two halves separately:
 
-## 2. High-Level Architecture (5 minutes)
+- A drag on the board must feel instant, which forces optimistic updates on the client — which forces **optimistic concurrency on the server**, or two reps silently overwrite each other.
+- Every read is permission-filtered by a sharing hierarchy, which means the dashboard number is **per-user** — which destroys the obvious server-side cache *and* the obvious client-side cache, at once.
+- Customers define their own fields, which means the form is rendered from a **schema the server ships as data** — a contract, not a payload.
+- Lead conversion creates entities whose IDs the client cannot predict, which is why it's the one mutation that **can't** be optimistic.
+
+## 🎯 Requirements Clarification
+
+- **Multi-tenant?** Yes. Thousands of orgs on shared infrastructure. This determines the data model, so I want it answered first.
+- **Who sees what?** Record-level sharing: ownership plus a role hierarchy (a manager sees their reports' deals). It's a filter on *every* read, client and server.
+- **Custom fields?** Yes, per org, up to ~100 on a hot object.
+- **Session shape?** Reps keep the app open all day in one tab. That makes client cache coherence and memory first-class concerns, not afterthoughts.
+- **Dashboard freshness?** Minutes are fine. Wrong numbers are not.
+
+### Functional Requirements
+
+- CRUD across accounts, contacts, opportunities, leads
+- Kanban pipeline with drag-to-move stage transitions
+- Atomic lead conversion → account + contact + optional opportunity
+- Polymorphic activity logging against any entity
+- Dashboard KPIs and reports (pipeline, revenue, lead source)
+- Custom fields without a deploy
+
+### Non-Functional Requirements
+
+| Requirement | Target | Consequence |
+|-------------|--------|-------------|
+| CRUD p99 | < 200ms | Index on `(org_id, …)` for every access path |
+| Dashboard p99 | < 500ms | Cannot aggregate 5M rows per request → pre-aggregation |
+| Drag feedback | < 100ms perceived | Optimistic client + version-checked server |
+| Tenant isolation | Absolute | Row-Level Security, not developer discipline |
+| Availability | 99.9% business hours | Reps live here; an outage stops revenue work |
+| Memory (client) | Flat over 8 hours | Normalized cache + LRU eviction |
+
+### Scale Estimates
+
+- ~50K orgs, brutally skewed: most have 10 users, a few have 50,000. **The skew is the problem**, not the total.
+- 10M+ accounts, ~5M opportunities, **~200M activities** (activities dominate — every call and note is a row)
+- Read:write ≈ **20:1**. CRM is overwhelmingly a reading tool.
+- Reports: ~2% of requests, each touching millions of rows. The expensive minority.
+
+## 🏗️ High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Client (React SPA)                           │
-│  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌──────────────────┐  │
-│  │ Sidebar  │  │ Dashboard │  │  Kanban   │  │  Entity Lists   │  │
-│  │ (nav)    │  │ (KPIs)    │  │  Board    │  │  + Detail Views │  │
-│  └──────────┘  └───────────┘  └───────────┘  └──────────────────┘  │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ HTTP (REST)
-                             ▼
-┌────────────────────────────────────────────────────────────────────┐
-│                     API Server (Express)                           │
-│  ┌────────┐ ┌──────────┐ ┌───────────┐ ┌─────────┐ ┌──────────┐  │
-│  │  Auth  │ │ Accounts │ │   Opps    │ │  Leads  │ │ Reports  │  │
-│  │ Routes │ │ + Conts  │ │ + Kanban  │ │+Convert │ │+Dashboard│  │
-│  └────────┘ └──────────┘ └───────────┘ └─────────┘ └──────────┘  │
-└──────────────┬────────────────────────┬────────────────────────────┘
-               │                        │
-        ┌──────▼──────┐          ┌──────▼──────┐
-        │ PostgreSQL  │          │    Redis    │
-        │  (8 tables) │          │ (Sessions)  │
-        └─────────────┘          └─────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    React SPA (all-day tab)                   │
+│  Sidebar │ Dashboard │ Kanban │ Lists │ Detail │ Reports     │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  Normalized entity cache (one copy per record, by id)  │ │
+│  │  + query index (queryKey → [ids])                      │ │
+│  │  + field metadata (the org's schema, from the server)  │ │
+│  └───────────────┬────────────────────┬───────────────────┘ │
+│    optimistic    │                    │ pessimistic          │
+│    (stage, edit) │                    │ (create, convert)    │
+└──────────────────┼────────────────────┼──────────────────────┘
+                   │  REST + version headers
+                   ▼                    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  API Gateway — authn, per-org rate limits                     │
+│  Injects org_id from the SESSION, never from the request      │
+└──┬──────────┬──────────┬──────────┬──────────┬───────────────┘
+   ▼          ▼          ▼          ▼          ▼
+┌───────┐┌───────┐┌────────┐┌───────┐┌──────────┐
+│Account││Contact││  Opp   ││ Lead  ││ Activity │  ← every read is
+└───┬───┘└───┬───┘└───┬────┘└───┬───┘└────┬─────┘    sharing-filtered
+    └────────┴────────┼─────────┴─────────┘
+                      ▼
+┌────────────────┐ ┌────────┐ ┌────────────────────────┐
+│  PostgreSQL    │ │ Redis  │ │  Rollup worker         │
+│  org_id + RLS  │ │sessions│ │  (org, owner, stage)   │
+│  on every row  │ │ + tree │ │  ← this is the answer  │
+└───────┬────────┘ │  cache │ │    to the dashboard    │
+        │          └────────┘ └────────▲───────────────┘
+        └───────────── CDC ─────────────┘
 ```
 
-> "This is a monolithic API server that's simple to deploy and reason about, with clear separation into route modules per entity domain. PostgreSQL is the right choice because CRM data is inherently relational -- accounts have contacts, contacts link to opportunities, leads convert into accounts. Redis stores sessions for immediate revocation and can cache dashboard KPIs.
-
-At scale, I'd split the API into microservices per domain, add read replicas for reporting, and introduce Elasticsearch for cross-entity search. But starting monolithic avoids distributed system complexity while we validate the product."
-
-## 3. Data Model (8 minutes)
-
-### Entity Relationships
-
-```
-┌─────────┐      1:N      ┌───────────┐      1:N      ┌──────────────┐
-│  Users  │──────────────▶│ Accounts  │──────────────▶│  Contacts    │
-│ (owner) │               │           │               │              │
-└────┬────┘               └─────┬─────┘               └──────────────┘
-     │                          │
-     │ owns                     │ 1:N
-     │                    ┌─────▼─────┐
-     │                    │Opportuni- │
-     │                    │   ties    │
-     │                    └───────────┘
-     │
-     │ owns               ┌───────────┐     converts     ┌───────────┐
-     └───────────────────▶│   Leads   │ ───────────────▶ │ Account + │
-                          └───────────┘                  │ Contact + │
-                                                         │ Opp       │
-                                                         └───────────┘
-     ┌───────────┐
-     │Activities │ ──── polymorphic ──── any entity above
-     └───────────┘
-```
-
-### Core Tables
+## 💾 Data Model
 
 | Table | Key Columns | Indexes | Notes |
 |-------|-------------|---------|-------|
-| users | id (UUID PK), username (unique), email (unique), password_hash, display_name, role | email | Auth and ownership |
-| accounts | id (UUID PK), name, industry, website, phone, address fields, annual_revenue_cents (BIGINT), employee_count, owner_id (FK) | owner_id | Companies |
-| contacts | id (UUID PK), account_id (FK ON DELETE SET NULL), first_name, last_name, email, phone, title, department, owner_id (FK) | account_id | People at accounts |
-| opportunities | id (UUID PK), account_id (FK), name, amount_cents (BIGINT), stage, probability, close_date, description, owner_id (FK) | stage, owner_id, account_id | Deals in pipeline |
-| leads | id (UUID PK), first_name, last_name, email, company, title, source, status, converted_account_id, converted_contact_id, converted_opportunity_id, converted_at, owner_id (FK) | status, owner_id | Pre-conversion prospects |
-| activities | id (UUID PK), type (call/email/meeting/note), subject, description, due_date, completed, related_type, related_id, owner_id (FK) | (related_type, related_id), (owner_id, due_date) | Polymorphic log |
-| custom_fields | id, entity_type, field_name, field_type, options (JSONB), is_required | UNIQUE(entity_type, field_name) | Field definitions |
-| custom_field_values | id, field_id (FK), entity_id, value (TEXT) | UNIQUE(field_id, entity_id), entity_id | EAV values |
+| orgs | id, name, plan, settings | — | The tenant |
+| users | id, **org_id**, email, password_hash, role_id | unique(org_id, email) | Email unique *within* an org — two orgs can both have `sales@acme.com` |
+| roles | id, org_id, name, parent_role_id | (org_id) | Self-referencing tree = the sharing hierarchy |
+| accounts | id, **org_id**, name, industry, annual_revenue_cents (BIGINT), owner_id, custom (JSONB) | (org_id, owner_id), (org_id, name) | |
+| contacts | id, org_id, account_id, name, email, title, owner_id, custom | (org_id, account_id) | No unique on email — a shared `support@` inbox legitimately appears at two companies |
+| opportunities | id, org_id, account_id, name, amount_cents, stage, probability, close_date, owner_id, **version**, custom | (org_id, stage), (org_id, owner_id) | `version` is what makes optimistic UI safe |
+| leads | id, org_id, name, company, source, status, **converted_account_id / _contact_id / _opportunity_id**, converted_at, owner_id | (org_id, status), (org_id, source) | The three FKs are the conversion audit trail |
+| activities | id, org_id, type, subject, **related_type**, **related_id**, owner_id, due_date | (org_id, related_type, related_id) | Polymorphic; no FK |
+| custom_fields | id, org_id, entity_type, field_name, field_type, options | unique(org_id, entity_type, field_name) | The org's schema, as data — **and an API contract** |
+| report_rollups | org_id, owner_id, report_key, dimension, metric, computed_at | unique(org_id, owner_id, report_key, dimension) | Pre-aggregated per record-*owner* |
 
-> "All monetary values are BIGINT cents -- $1,234.56 stored as 123456. This eliminates floating-point rounding errors in pipeline totals. The frontend converts to display format using Intl.NumberFormat."
+**Money is BIGINT cents**, so summing 10,000 deals is exact integer arithmetic. The client formats for display and never computes on floats.
 
-## 4. API Design (4 minutes)
+**Leads keep three nullable FKs after conversion** rather than being deleted, because reporting must answer "what fraction of Web leads became closed-won revenue" — which requires the join from lead → opportunity. Deleting the lead destroys the org's ability to measure its own lead-source ROI, which is a core CRM value proposition.
 
-### Authentication
+**Activities are polymorphic with no FK.** We lose referential integrity; the payoff is that the unified "everything that happened on this account" timeline is one query, and one client component, for all four entity types. Orphans are harmless on an append-only log, and a nightly reaper cleans them.
 
-```
-POST /api/auth/register      Create user account
-POST /api/auth/login         Session login
-POST /api/auth/logout        Destroy session
-GET  /api/auth/me            Current user
-```
-
-### Entity CRUD (same pattern for accounts, contacts, leads)
+## 🔌 API Design
 
 ```
-GET    /api/{entity}          List (search, filter, pagination)
-GET    /api/{entity}/:id      Detail
-POST   /api/{entity}          Create
-PUT    /api/{entity}/:id      Update
-DELETE /api/{entity}/:id      Delete
+GET    /api/accounts?q=&industry=&page=      List (search, filter, paginate)
+POST   /api/accounts                         Create
+PUT    /api/accounts/:id                     Update
+GET    /api/accounts/:id/contacts            Sub-resource
+GET    /api/accounts/:id/opportunities       Sub-resource
+
+PUT    /api/opportunities/:id/stage          Kanban move — REQUIRES version
+POST   /api/leads/:id/convert                Atomic conversion (Idempotency-Key)
+
+GET    /api/activities?related_type=&related_id=   Polymorphic timeline
+POST   /api/activities                       Log a call/email/meeting/note
+
+GET    /api/dashboard                        KPIs for the CALLING USER
+GET    /api/reports/pipeline | revenue | leads
+
+GET    /api/metadata/fields?entity=account   The org's field schema
 ```
 
-### Specialized Endpoints
+Two contract decisions that are really seam decisions:
 
-```
-PUT    /api/opportunities/:id/stage    Stage transition (kanban)
-POST   /api/leads/:id/convert         Lead conversion
-GET    /api/accounts/:id/contacts      Related contacts
-GET    /api/accounts/:id/opportunities Related opportunities
-GET    /api/dashboard                  Aggregated KPIs
-GET    /api/reports/pipeline           Stage breakdown
-GET    /api/reports/revenue            Monthly revenue
-GET    /api/reports/leads              Source breakdown
-```
+- **`org_id` never appears in a URL or body.** A tenant identifier the client can supply is one the client can forge. It comes from the session, always.
+- **The stage endpoint is separate from the general update, and it requires a version.** That's not REST pedantry — it's the client's optimistic UI reaching back and imposing a requirement on the API, which I'll unpack next.
 
-> "The stage endpoint is separate from the full opportunity PUT because kanban drag-drop should only change stage and auto-compute probability. This keeps the interaction fast and focused."
+## 🔧 Deep Dive 1: The Kanban Seam — Optimism on the Client Requires Versioning on the Server
 
-## 5. Frontend Architecture (5 minutes)
+This is the cleanest example of a decision that cannot be made on one side of the stack.
 
-### State Management
+**The client's need.** A drag must feel instant. Waiting for a round-trip — 200ms on a good connection — means the card snaps back, sits there, then jumps. Users read that as broken. So the client applies the change locally, immediately, and reconciles afterward.
 
-> "Two Zustand stores: authStore for session state, crmStore for all entity data. Zustand's selector pattern prevents cross-entity re-renders -- the kanban board subscribes only to the opportunities slice, so creating a new lead doesn't cause the kanban to re-render."
+**The problem that creates.** Two reps have the board open. Dana drags the Acme deal to Closed Won at 10:00:03. Sam, whose board still shows it in Negotiation, drags it to Proposal at 10:00:07. Both clients applied their change optimistically. Both send an update.
 
-### Component Architecture
+**How last-write-wins concretely breaks.** Sam's write lands second and wins. Dana's Closed Won is gone. Nobody is told. The deal is now in Proposal, the forecast is wrong, and Dana finds out at quarter close. Worse — Dana's UI still shows Closed Won, because *her* optimistic update succeeded and nothing invalidated it. The two reps are now looking at different truths, and the system considers this a completely successful pair of requests.
 
-> "The UI uses a persistent sidebar for navigation and a content area that changes per route. Key component patterns:
+**The fix has to be on both sides, and it's one contract:**
 
-- **EntityForm**: A shared modal form component that renders different fields based on entityType prop. Accounts show name/industry/phone, contacts show name/email/account-selector, etc. This avoids duplicating form logic across 4 entity types.
+- **Server**: `opportunities.version` increments on every write. The stage endpoint takes the client's expected version. If it doesn't match, return **409 with the current server state** — not a bare error, the actual current record.
+- **Client**: on 409, do *not* roll back to the pre-drag snapshot. Write the **server's state** into the cache and tell the user who changed it: "Dana moved this to Closed Won two minutes ago."
 
-- **StatusBadge**: A single component that maps status strings to color classes. Ensures 'Closed Won' is always green, 'New' lead is always blue, everywhere in the app.
+> "The rule I'd hold: an optimistic update may be rolled back, but **never rolled back to a value we already know is stale.** Most implementations catch the error, revert to the snapshot, and show a toast — which is correct for a network failure and actively harmful for a conflict, because it puts a *newly stale* value on screen and invites the user to drag again and overwrite their colleague for real. The optimistic UI would then have caused the exact data loss the version check exists to prevent. So: three failure modes — network, 409, validation — three genuinely different responses. Collapsing them into one `catch` block is the most common bug in optimistic UIs."
 
-- **ActivityTimeline**: A shared component used on any entity detail page. Receives activities as props, renders chronologically with type-specific icons. The parent context provides relatedType/relatedId for creating new activities.
+**Never auto-retry a 409.** An auto-retry means "silently overwrite my colleague," which is the thing we just built machinery to prevent.
 
-- **KanbanBoard/KanbanColumn/OpportunityCard**: Three-tier component hierarchy. Board manages DndContext, columns are droppable zones, cards are draggable items."
+**What we give up:** reps occasionally see a conflict dialog, which is friction. The honest fix is real-time push ("this deal changed") so the board updates while they watch — turning conflict *detection* into conflict *avoidance*. That's the next feature, and it's cheap to add precisely because the client keeps exactly one copy of each entity, so an incoming change has exactly one place to land.
 
-## 6. Deep Dives
+**One more seam detail:** the server returns the derived `probability` with the response, and the client uses it rather than computing the stage→probability mapping itself. Duplicating that rule in the client means it now lives in two codebases and will drift — and a forecast built on a drifted mapping is silently wrong, which is the worst kind of wrong.
 
-### Deep Dive 1: CRM Data Model Design
+## 🔧 Deep Dive 2: The Dashboard Seam — Sharing Rules Break Caching on *Both* Sides
 
-> "The CRM data model has three interesting design decisions: polymorphic activities, the EAV custom fields pattern, and the lead conversion schema.
+Here's the constraint that makes CRM reporting genuinely hard, and it bites the frontend and the backend in the same way.
 
-**Polymorphic activities:** Activities use related_type and related_id columns to associate with any entity type. The composite index (related_type, related_id) enables fast lookups like 'all activities for account X.' The alternative -- separate join tables (account_activities, contact_activities, etc.) -- would require querying multiple tables to build a unified activity timeline. With polymorphic columns, a single query returns all activities for any entity.
+**Every user sees a different subset of records.** A rep sees their own deals. Their manager sees the team's, via the role hierarchy. A VP sees several teams. So "pipeline by stage" is not one number per org — **it is one number per user.**
 
-The trade-off is no foreign key constraint -- we can't create a FK that references different tables depending on the type column. Orphaned activities (pointing to deleted entities) are possible but harmless since activities are immutable logs. I add application-level validation to ensure the related entity exists on creation.
+That kills the obvious design on *both* sides of the wire:
 
-**Money as BIGINT cents:** All amounts use BIGINT cents. When a pipeline report sums 10,000 opportunity amounts, integer addition is exact. DECIMAL would also work but BIGINT is more natural for programmatic arithmetic and avoids any scale/precision configuration. The frontend handles cents-to-dollars conversion for display.
+| Layer | Naive approach | How it concretely breaks |
+|-------|----------------|--------------------------|
+| Server | ❌ Cache `dashboard:{org_id}` | Wrong for everyone but the admin. A rep would see the whole company's pipeline — a data leak *and* a wrong number |
+| Server | ❌ Cache `dashboard:{user_id}` | Correct, but hit rate collapses: any write in a user's visible set invalidates it, and one closed deal invalidates hundreds of users' entries. You spend more on invalidation than you saved |
+| Server | ❌ Compute live per request | `GROUP BY stage` over 5M opportunities joined to the sharing tree, on every load. Fine on average; catastrophic at 9am Monday when the whole sales org opens the app inside ten minutes |
+| Client | ❌ Cache the dashboard response | Same problem, shipped to the browser: it's only valid for *this* user, and it's invalidated by any deal move — including one they just did on the kanban board |
 
-**Lead conversion schema:** Leads have three nullable FK columns: converted_account_id, converted_contact_id, converted_opportunity_id. These create a permanent link from the historical lead record to the converted entities. This lets reporting track 'what percentage of Web leads converted to won deals?' by joining leads -> opportunities -> WHERE stage = 'Closed Won'.
+**The design: pre-aggregate on the dimension that's viewer-independent; filter on the dimension that isn't.**
 
-The alternative is deleting leads after conversion, which is simpler but loses the conversion audit trail. CRM users expect to see the full lifecycle -- where did this account originate?"
+The insight: visibility is a property of the record's **owner**, and the role hierarchy is a **tree** — a manager's visible set is exactly their subtree. So:
 
-| Decision | Chosen | Trade-off |
-|----------|--------|-----------|
-| Polymorphic activities | Single table, one query | No FK constraint, orphans possible |
-| BIGINT cents | Exact arithmetic | Must convert for display |
-| Lead conversion links | Audit trail preserved | Extra nullable FKs on leads table |
+1. A **rollup worker** consumes a change stream from `opportunities` and maintains `report_rollups` per **(org, owner, stage)**. Note what that is *not*: it's not per-viewer. It's per record-owner, which is a fact about the data, not about who's looking at it.
+2. A dashboard request resolves the caller's **visible owner set** — their role subtree — from a Redis cache that only changes when someone's role changes (rare).
+3. The response is a **sum over pre-aggregated rows for those owners.** One row for a rep. Two hundred for a VP. Trivially fast, and *completely independent of how many opportunities those reps have.*
 
-### Deep Dive 2: Sales Pipeline and Forecasting
+We turned "aggregate 5M rows under a permission filter" into "sum 200 integers." The heavy work happens once per write, in a worker, off the request path.
 
-> "The pipeline is the heart of the CRM. The kanban board visualizes it, but the backend must support accurate forecasting.
+**The client seam.** Now the frontend has an easy job — but only if it respects the same rule: **cache the aggregate, never the entity.** The dashboard response can be cached in the client store; the *individual opportunity* it summarizes must always come from the normalized entity cache, which is kept truthful by mutations. If the client caches a denormalized dashboard blob containing deal details, it will show a stale deal alongside a fresh one, and the two will disagree on screen. The KPI card is a summary. The record is the record. They are different kinds of data and they get different cache lifetimes — which is a rule the client and server have to agree on explicitly, or one of them will get it wrong.
 
-**Stage-probability coupling:** Each pipeline stage maps to a default probability: Prospecting (10%), Qualification (20%), Needs Analysis (40%), Proposal (60%), Negotiation (80%), Closed Won (100%), Closed Lost (0%). When a user drags a deal to a new stage via the kanban, the backend automatically updates the probability. This simplifies the weighted pipeline calculation: pipeline value = SUM(amount * probability / 100).
+**What we give up: staleness.** Rollups lag by seconds to a minute. That's why I asked about dashboard freshness up front — for an aggregate, a minute is invisible; nobody trades on second-by-second movement in a pipeline total. And a rep who just closed a deal gets a read-your-writes overlay: the server patches their own recent changes on top of the rollup, so *their* action is always reflected even if the aggregate hasn't caught up. Other people's deals can lag; yours can't, because you'd notice.
 
-The kanban frontend uses @dnd-kit with three component layers. DndContext wraps the entire board, providing drag state and collision detection. KanbanColumn components register as droppable zones via useDroppable, identified by stage name. OpportunityCard components register as draggable items via useDraggable, identified by opportunity ID.
+**The weakness I'd name aloud:** this assumes sharing is a *tree*. Real sharing rules include criteria-based sharing ("everyone in EMEA sees EMEA deals"), which is a **set**, not a subtree, and it breaks the clean "sum over my subtree" trick. Handling that means materializing each user's visible-owner set and accepting a larger, staler cache — the concession real systems make and whiteboard designs pretend not to need.
 
-**Optimistic updates:** When a card is dropped on a new column, I immediately update the local store to move the opportunity. The user sees instant feedback. Then I fire the API call to persist the change. If it fails, I re-fetch all opportunities to revert to the true state. This is safe because stage changes are idempotent -- re-dropping on the same stage is a no-op.
+## 🔧 Deep Dive 3: The Schema Seam — Custom Fields as an API Contract
 
-**Pipeline reporting:** The reports endpoint aggregates opportunities by stage with SUM(amount_cents) and COUNT(*). At small scale (< 1M records), this is a direct GROUP BY query with the stage index. At large scale, I'd use materialized views refreshed every 5 minutes:
+Customers add fields. That single product requirement reaches through every layer: storage, query, API, form rendering, and validation.
 
-- The mat view pre-computes stage counts and totals
-- REFRESH MATERIALIZED VIEW CONCURRENTLY rebuilds without blocking reads
-- Dashboard queries hit the mat view (sub-millisecond) instead of scanning the opportunities table
+**Storage — why JSONB, not EAV.** The killer case is the report a power user actually runs: "pipeline by Deal Region, filtered to Renewal Risk = High, showing Competitor." Three custom fields. Under EAV, each value is a row in a side table — so that's **three self-joins** onto a table holding, at 5M opportunities × 40 fields, ~200M rows. The planner has no useful statistics, because the table is a bag of unrelated values. What should be an index range scan becomes hundreds of millions of random lookups, and the 500ms budget is blown by an order of magnitude. **EAV degrades in proportion to how many custom fields appear in one query — which is exactly what power users do.** With a JSONB column on the entity, that report is one predicate on one row.
 
-The trade-off is 5-minute staleness. A rep closes a $500K deal and the pipeline chart doesn't update for 5 minutes. For most CRM reporting, this is acceptable -- reports are inherently backward-looking. For the individual opportunity view, I always query live data."
+**The contract — `custom_fields` is served to the client as metadata.** The table stays; it just stops holding values and starts being the **schema**. On login, the client fetches the org's field descriptors (name, type, options, required-ness) and caches them for the session.
 
-| Scale | Reporting Strategy | Latency | Freshness |
-|-------|--------------------|---------|-----------|
-| < 1M | Direct GROUP BY | < 100ms | Real-time |
-| 1-10M | Materialized views | < 10ms | 5 min stale |
-| 10M+ | Partitioned tables + mat views | < 10ms | 5 min stale |
+**The client — forms are rendered, not written.** A dynamic form maps each descriptor to an input via a type→renderer registry, and validation is *generated from the same descriptors*. That's the seam working correctly: the client's validation rules and the server's validation rules come from a single source and therefore cannot drift. The alternative — hardcoding forms and bolting a "Custom Fields" section onto the bottom — gives standard and custom fields different validation, layout, and error handling, so the custom ones (the ones the customer cared enough to create) permanently feel second-class.
 
-### Deep Dive 3: Activity Tracking Architecture
+**What we give up, on both sides.** The server loses database-level type enforcement: a coercion bug writes `"50000"` where `50000` belongs and PostgreSQL accepts it. The client loses compile-time type safety at the boundary. Mitigations: validate at exactly one server chokepoint (the write path reads `custom_fields` and coerces), run a background auditor for type violations, and generate client types for known fields while validating the custom bag at runtime. Both are genuinely weaker than a static schema — and both are the unavoidable price of a capability that cannot be built any other way. The failure mode of EAV is *the product is too slow to use*; the failure mode of JSONB is *a validation bug we can find and fix.* Those are not equivalent risks.
 
-> "Activities are the CRM's audit trail -- every customer interaction is logged. The architecture must handle high write volume (email integration, call logging, automated events) while supporting fast reads for entity timelines.
+## 🔄 The Conversion Seam: Why This One Mutation Can't Be Optimistic
 
-**Write path:** Activities are created via POST /api/activities with type, subject, description, due_date, and polymorphic related_type/related_id. The endpoint validates that the type is one of (call, email, meeting, note) and that the related_type is a valid entity. At scale, write-heavy activity logging (especially from automated email sync) would use a Kafka queue: the API publishes activity events to Kafka, and a consumer batch-inserts into PostgreSQL every second. This absorbs write spikes without overwhelming the database connection pool.
+Kanban is optimistic. Lead conversion isn't — and the reason is a rule worth stating, because it decides the treatment of every mutation in the app.
 
-**Read path:** The ActivityTimeline component on entity detail pages fetches activities filtered by related_type and related_id. The composite index (related_type, related_id) makes this a fast index scan even with millions of activities. Activities are ordered by due_date ascending (tasks due soonest first), falling back to created_at descending for completed items.
+**Optimism is affordable exactly when the client can predict the server's answer.**
 
-**Dashboard integration:** The KPI 'Activities Due' counts uncompleted activities with due_date <= tomorrow. This uses the composite index (owner_id, due_date) for a range scan. The ActivityForm component provides inline activity creation on any entity detail page, passing relatedType and relatedId from the parent context.
+| Mutation | Predictable? | Treatment |
+|----------|-------------|-----------|
+| Stage change | Yes — same record, known new value | ✅ Optimistic |
+| Field edit | Yes | ✅ Optimistic |
+| Delete | Yes — the record is gone | ✅ Optimistic, with undo |
+| Create entity | No — the server generates the ID | ⚠️ Pessimistic (temp-ID reconciliation only if the UX demands it) |
+| **Lead conversion** | **No — three unpredictable IDs, cross-entity** | ❌ **Firmly pessimistic** |
 
-**The polymorphic query pattern:** To fetch activities for an account and all its contacts and opportunities, I'd need three queries (one per related_type). At scale, I'd denormalize by adding an account_id column to activities, populated at write time. This avoids the three-query fan-out at the cost of one additional column and write-time computation.
+Conversion creates an account, a contact, and an opportunity, each with a server-generated ID the client cannot know. There's no optimistic state to apply. You could fabricate temp IDs and rewrite every reference across the normalized cache when the real ones arrive — a lot of machinery for a workflow a rep does a few times a day and already expects to take a beat.
 
-The frontend renders activities with the shared ActivityTimeline component. Each activity shows a type-specific icon (phone, envelope, calendar, pencil), the subject, optional description, due date, completion status, and the owner who logged it. Completed activities appear with a strikethrough subject and 'Completed' badge."
+**On the server, it's one transaction, and I'd fight for that.** Verify the lead is unconverted, insert account → contact → optional opportunity, update the lead with the three resulting IDs, commit. Any failure rolls back all four writes and the lead is untouched.
 
-| Pattern | Pros | Cons |
-|---------|------|------|
-| Direct DB writes | Simple, consistent | Write bottleneck at scale |
-| Kafka buffered | Handles write spikes | Eventually consistent, added infra |
-| Pre-aggregated counters | Fast dashboard queries | Counter drift, reconciliation needed |
+**Why not a saga?** A saga is what you build when you *can't* have a transaction — entities in different services, different databases, no shared ACID boundary. Here they're in one database. A saga means an orchestrator, an event per step, and hand-written compensations ("delete the account we just made") that are themselves fallible and must be idempotent. That's an order of magnitude more code to reconstruct — worse — a guarantee the database already gives us. `ROLLBACK` is not a best-effort compensation; it's a guarantee.
 
-## 7. Scalability Discussion (3 minutes)
+**The rule that keeps it safe:** **zero external calls inside the transaction boundary.** The classic failure is someone adding "send a welcome email" inside it; the mail provider hangs for 30 seconds; the conversion now holds row locks for half a minute and the connection pool exhausts. Side effects go into an outbox row written *inside* the transaction and processed *after* commit.
 
-### Frontend Scaling
+And this is the strongest argument for **keeping these five objects in one service and one database as long as possible**: the transactional boundary should follow the *workflow* boundary, and conversion is the workflow that binds them. Splitting them apart is not a free refactor — it's a decision to take on distributed transactions, and it should be made deliberately, not by an org chart.
 
-- **Code splitting**: Route-based chunks via TanStack Router. The kanban page with @dnd-kit loads only on /opportunities navigation.
-- **Selective subscriptions**: Zustand selectors prevent cross-entity re-renders.
-- **Pagination**: CRM list pages use server-side pagination (not infinite scroll) because total counts and page navigation are meaningful for sales workflows.
+## 🧭 Consistency Model
 
-### Backend Scaling
+| Data | Guarantee | Client implication |
+|------|-----------|--------------------|
+| Entity CRUD | Strong, read-your-writes | Safe to render optimistically |
+| Kanban stage | Strong + optimistic concurrency | Client must send `version`; must handle 409 by rolling *forward* |
+| Lead conversion | Serializable, atomic | Client must be pessimistic; show real progress |
+| Dashboard / rollups | Eventual (≤ ~1 min) | Cache the aggregate; never cache the entity inside it |
+| Search | Eventual (seconds) | A record appearing in search 2s late is not a bug anyone notices |
+| **Sharing / role changes** | **Strong + synchronous cache bust** | A revoked permission lingering in *either* cache is a data leak |
 
-```
-┌─────────────┐
-│   Nginx     │
-│   (LB)      │
-└──────┬──────┘
-       │
-  ┌────┼────┐
-  ▼    ▼    ▼
-┌───┐┌───┐┌───┐     ┌─────────┐     ┌──────────┐
-│S1 ││S2 ││S3 │────▶│PG Primary│────▶│PG Replica │
-└───┘└───┘└───┘     └─────────┘     │ (reports) │
-       │                             └──────────┘
-  ┌────▼────┐
-  │  Redis  │
-  │(sessions│
-  │+ cache) │
-  └─────────┘
-```
+The last row is the one people get wrong. Almost everything about permissions is safe to cache — except **revocation**, which must be immediate, on the server *and* in the browser. That write path is deliberately slow-but-correct.
 
-- **Stateless API**: Sessions in Redis, any server handles any request.
-- **Read replicas**: Dedicated replicas for reporting queries, primary for writes.
-- **Connection pooling**: 20 connections per API server, PgBouncer in front of replicas.
-- **Sharding**: At extreme scale, shard by organization_id so each tenant's data lives on a dedicated database.
+## 🛡️ Failure Handling
 
-## 8. Trade-offs Summary (2 minutes)
+| Failure | Server behavior | What the user sees |
+|---------|-----------------|--------------------|
+| Rollup worker down | Serve stale rollups with `computed_at` | Dashboard labeled "as of 10:42" — degraded, honest, still useful |
+| Elasticsearch down | Fall back to a prefix query in PostgreSQL | Narrower search results; the app works |
+| Redis down | Sessions fail | Hard outage. The single biggest fragility — 50K reps logged out at once. First place I'd invest in replication |
+| PostgreSQL primary down | Writes fail loudly; reads from replica | Read-only mode with an explicit banner, not silent failures |
+| Network flaky (client) | — | Mutations queue and retry with backoff; reads fall back to cache with a "showing data from 3:42pm" label |
+| **Session expires mid-drag** | 401 | Client **preserves the pending mutation**, re-auths inline, replays. Redirecting to `/login` and discarding the rep's work is the fastest way to make someone hate the tool |
+
+Circuit breakers wrap Elasticsearch and external integrations so a slow dependency fails fast rather than consuming the connection pool and taking down endpoints that never touch it. The rule: **degrade the fancy features; never degrade the record of truth.**
+
+## 🔐 Security
+
+- **Tenant isolation is structural**: `org_id` on every row, PostgreSQL Row-Level Security keyed on a session variable, a repository layer that owns connection checkout, and **org-namespaced cache keys on both sides of the wire**. A forgotten predicate returns zero rows, not everyone's rows. Isolation cannot depend on remembering.
+- **Sharing is enforced in the data layer**, never in the UI. A hidden button is not a permission — and in a CRM, the API is the product's public surface whether you documented it or not.
+- **Sessions in Redis, server-side revocable**, not JWTs. Offboarding a rep must revoke access *now*, not in 15 minutes, for a system holding the entire customer list.
+- **Rate limits tiered by cost**: generous for CRUD, strict for reports (each is potentially a multi-million-row scan), strictest for auth.
+
+## 📈 Scalability: What Breaks First
+
+1. **Dashboard aggregation** — first by a wide margin, because it's the only thing scanning millions of rows. The rollup worker is the fix, and it's the first thing I'd build after CRUD works.
+2. **Search via SQL `LIKE`** — dies past a few hundred thousand rows, because a leading-wildcard match can't use a B-tree and becomes a sequential scan of the whole tenant's data. Elasticsearch fed by CDC, with **tenant-scoped indices** so a query is physically incapable of reaching another org.
+3. **The `activities` table** — largest by an order of magnitude, growing fastest, and only ever read by `(related_type, related_id)`. Partition by time; archive cold partitions. Automated logging (email sync, call tracking) gets buffered through a queue and batch-inserted, so an integration burst never reaches the OLTP path where reps are working.
+4. **The big-tenant skew** — long before *total* volume hurts, *one* org with 50K users will. That org gets its own shard. This works only because `org_id` is on every row and cross-org queries don't exist. The multi-tenancy decision is what makes the escape hatch exist at all.
+5. **On the client**: the unfiltered list view at a few thousand rows (virtualize + server-paginate), and unmemoized selectors over a growing normalized cache (memoize, subscribe narrowly).
+
+## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Architecture | Monolith | Microservices | Simpler until team/scale demands splitting |
-| Lead conversion | DB transaction | Saga pattern | Single DB, atomic guarantees |
-| Activity model | Polymorphic | Separate join tables | Single timeline query, simpler |
-| Kanban library | @dnd-kit | react-beautiful-dnd | Active, typed, accessible |
-| Pipeline charts | CSS-only bars | Chart.js | Zero bundle cost for simple visuals |
-| State management | Zustand | React Context | Selector-based, no unnecessary re-renders |
-| Session auth | Redis sessions | JWT | Immediate revocation, server control |
-| Money storage | BIGINT cents | DECIMAL | Exact integer arithmetic |
-| Custom fields | EAV pattern | JSONB | Per-field constraints, indexable |
+| Tenancy | ✅ Shared schema + `org_id` + RLS | ❌ DB/schema per tenant | 50K migrations per deploy is unshippable; RLS makes the risk mechanical |
+| Kanban concurrency | ✅ Optimistic client + `version` on server | ❌ Last-write-wins | Silent overwrite of a colleague's deal is a business loss |
+| 409 handling | ✅ Roll *forward* to server truth | ❌ Roll back to snapshot | Rolling back to a known-stale value invites a real overwrite |
+| Dashboards | ✅ Rollups per (org, owner, stage) + sum over role subtree | ❌ Cache per org / per user / compute live | Sharing rules make results per-viewer, so pre-aggregate per record-*owner* |
+| Custom fields | ✅ JSONB + metadata as an API contract | ❌ EAV | EAV needs a self-join per field; three-field reports die |
+| Lead conversion | ✅ One DB transaction; outbox for side effects | ❌ Saga | Compensations reimplement, worse, a guarantee we already have |
+| Client data layer | ✅ Normalized cache, one copy per entity | ❌ Per-route arrays | The same deal renders on three screens; duplication guarantees they disagree |
+| Sessions | ✅ Redis, server-side | ❌ JWT | Offboarding must revoke *now* |
+| Activities | ✅ Polymorphic `(related_type, related_id)` | ❌ Join table per entity | One timeline query, one client component; orphans are harmless on a log |
+| Money | ✅ BIGINT cents | ❌ float | Forecasts must equal the sum of their deals |
+
+## 🚀 Closing
+
+The unifying idea across all three seams: **decide what each side is allowed to assume about the other, and write it into the contract rather than the comments.** The client may be optimistic only where it can predict the server's answer — so the server must return a version, and the client must handle a conflict as new truth rather than as an error. The dashboard is per-viewer, so neither side may cache it as if it were per-org. The schema belongs to the customer, so the server ships it as data and the client renders from it rather than hardcoding it.
+
+Next, I'd build the **workflow/automation engine** — "when a deal hits Negotiation, notify the manager." Architecturally it's a rules engine consuming the same change stream the rollup worker already uses, which is the real payoff of building CDC for reporting: automation, search indexing, and rollups become three consumers of one event log, and none of them belong on the write path. And I'd add real-time push to the board, which upgrades the conflict story from *detection* to *avoidance* — cheap to do, precisely because the client already keeps exactly one copy of every record.

@@ -10,7 +10,8 @@ import pg from 'pg'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/spotlight',
+  connectionString:
+    process.env.DATABASE_URL || 'postgresql://spotlight:spotlight_password@localhost:5432/spotlight',
 })
 
 async function migrate(): Promise<void> {

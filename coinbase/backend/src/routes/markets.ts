@@ -61,7 +61,7 @@ router.get('/currencies', async (_req: Request, res: Response) => {
 /** GET /api/v1/markets/:symbol/price - Returns current price and 24h change for a trading pair. */
 router.get('/:symbol/price', (req: Request, res: Response) => {
   const { symbol } = req.params;
-  const priceData = marketService.getPriceData(symbol);
+  const priceData = marketService.getPriceData(String(symbol));
 
   if (!priceData) {
     res.status(404).json({ error: 'Trading pair not found' });

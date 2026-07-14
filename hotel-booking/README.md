@@ -88,9 +88,9 @@ npm run seed
 ```
 
 This creates test accounts and sample hotels:
-- **User**: user@hotel-booking.com / user123
+- **User**: user@hotel-booking.com / password123
 - **Hotel Admin**: hotel@hotel-booking.com / hoteladmin123
-- **Admin**: admin@hotel-booking.com / admin123
+- **Admin**: admin@hotel-booking.com / password123
 
 4. **Start Backend Server**
 ```bash

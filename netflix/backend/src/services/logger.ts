@@ -10,7 +10,7 @@
  * - Level-based filtering (debug, info, warn, error)
  */
 import pino from 'pino';
-import pinoHttp from 'pino-http';
+import { pinoHttp } from 'pino-http';
 
 /**
  * Base logger instance configured for the current environment.

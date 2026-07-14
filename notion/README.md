@@ -112,7 +112,7 @@ cd frontend && npm install && npm run dev
 ### Default Credentials
 
 - **Email:** admin@notion.local
-- **Password:** admin123
+- **Password:** password123
 
 ## Project Structure
 

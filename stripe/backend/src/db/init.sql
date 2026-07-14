@@ -5,7 +5,7 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Merchants table
-CREATE TABLE merchants (
+CREATE TABLE IF NOT EXISTS merchants (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   name VARCHAR(200) NOT NULL,
   email VARCHAR(200) NOT NULL UNIQUE,
@@ -19,11 +19,11 @@ CREATE TABLE merchants (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_merchants_api_key ON merchants(api_key);
-CREATE INDEX idx_merchants_email ON merchants(email);
+CREATE INDEX IF NOT EXISTS idx_merchants_api_key ON merchants(api_key);
+CREATE INDEX IF NOT EXISTS idx_merchants_email ON merchants(email);
 
 -- Customers table
-CREATE TABLE customers (
+CREATE TABLE IF NOT EXISTS customers (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
   email VARCHAR(200),
@@ -34,11 +34,11 @@ CREATE TABLE customers (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_customers_merchant ON customers(merchant_id);
-CREATE INDEX idx_customers_email ON customers(email);
+CREATE INDEX IF NOT EXISTS idx_customers_merchant ON customers(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_customers_email ON customers(email);
 
 -- Payment Methods (tokenized cards)
-CREATE TABLE payment_methods (
+CREATE TABLE IF NOT EXISTS payment_methods (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
@@ -55,11 +55,11 @@ CREATE TABLE payment_methods (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_payment_methods_customer ON payment_methods(customer_id);
-CREATE INDEX idx_payment_methods_merchant ON payment_methods(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_payment_methods_customer ON payment_methods(customer_id);
+CREATE INDEX IF NOT EXISTS idx_payment_methods_merchant ON payment_methods(merchant_id);
 
 -- Payment Intents (core payment lifecycle)
-CREATE TABLE payment_intents (
+CREATE TABLE IF NOT EXISTS payment_intents (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
   customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
@@ -87,13 +87,13 @@ CREATE TABLE payment_intents (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_payment_intents_merchant ON payment_intents(merchant_id);
-CREATE INDEX idx_payment_intents_customer ON payment_intents(customer_id);
-CREATE INDEX idx_payment_intents_status ON payment_intents(status);
-CREATE UNIQUE INDEX idx_payment_intents_idempotency ON payment_intents(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_payment_intents_merchant ON payment_intents(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_payment_intents_customer ON payment_intents(customer_id);
+CREATE INDEX IF NOT EXISTS idx_payment_intents_status ON payment_intents(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_idempotency ON payment_intents(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- Charges (successful payment records)
-CREATE TABLE charges (
+CREATE TABLE IF NOT EXISTS charges (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
@@ -109,11 +109,11 @@ CREATE TABLE charges (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_charges_merchant ON charges(merchant_id);
-CREATE INDEX idx_charges_payment_intent ON charges(payment_intent_id);
+CREATE INDEX IF NOT EXISTS idx_charges_merchant ON charges(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_charges_payment_intent ON charges(payment_intent_id);
 
 -- Refunds
-CREATE TABLE refunds (
+CREATE TABLE IF NOT EXISTS refunds (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   charge_id UUID NOT NULL REFERENCES charges(id) ON DELETE CASCADE,
   payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
@@ -124,11 +124,11 @@ CREATE TABLE refunds (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_refunds_charge ON refunds(charge_id);
-CREATE INDEX idx_refunds_payment_intent ON refunds(payment_intent_id);
+CREATE INDEX IF NOT EXISTS idx_refunds_charge ON refunds(charge_id);
+CREATE INDEX IF NOT EXISTS idx_refunds_payment_intent ON refunds(payment_intent_id);
 
 -- Ledger Entries (double-entry bookkeeping)
-CREATE TABLE ledger_entries (
+CREATE TABLE IF NOT EXISTS ledger_entries (
   id BIGSERIAL PRIMARY KEY,
   transaction_id UUID NOT NULL, -- Groups related entries
   account VARCHAR(100) NOT NULL,
@@ -146,13 +146,13 @@ CREATE TABLE ledger_entries (
   CONSTRAINT single_direction CHECK (NOT (debit > 0 AND credit > 0))
 );
 
-CREATE INDEX idx_ledger_account ON ledger_entries(account);
-CREATE INDEX idx_ledger_transaction ON ledger_entries(transaction_id);
-CREATE INDEX idx_ledger_payment_intent ON ledger_entries(payment_intent_id);
-CREATE INDEX idx_ledger_created ON ledger_entries(created_at);
+CREATE INDEX IF NOT EXISTS idx_ledger_account ON ledger_entries(account);
+CREATE INDEX IF NOT EXISTS idx_ledger_transaction ON ledger_entries(transaction_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_payment_intent ON ledger_entries(payment_intent_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_created ON ledger_entries(created_at);
 
 -- Webhook Events
-CREATE TABLE webhook_events (
+CREATE TABLE IF NOT EXISTS webhook_events (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
   type VARCHAR(100) NOT NULL,
@@ -160,11 +160,11 @@ CREATE TABLE webhook_events (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_webhook_events_merchant ON webhook_events(merchant_id);
-CREATE INDEX idx_webhook_events_type ON webhook_events(type);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_merchant ON webhook_events(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_type ON webhook_events(type);
 
 -- Webhook Deliveries
-CREATE TABLE webhook_deliveries (
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
   id BIGSERIAL PRIMARY KEY,
   event_id UUID NOT NULL REFERENCES webhook_events(id) ON DELETE CASCADE,
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
@@ -178,11 +178,11 @@ CREATE TABLE webhook_deliveries (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_webhook_deliveries_event ON webhook_deliveries(event_id);
-CREATE INDEX idx_webhook_deliveries_pending ON webhook_deliveries(status, next_retry_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event ON webhook_deliveries(event_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending ON webhook_deliveries(status, next_retry_at) WHERE status = 'pending';
 
 -- Disputes (chargebacks)
-CREATE TABLE disputes (
+CREATE TABLE IF NOT EXISTS disputes (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   charge_id UUID NOT NULL REFERENCES charges(id) ON DELETE CASCADE,
   payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
@@ -201,11 +201,11 @@ CREATE TABLE disputes (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_disputes_charge ON disputes(charge_id);
-CREATE INDEX idx_disputes_status ON disputes(status);
+CREATE INDEX IF NOT EXISTS idx_disputes_charge ON disputes(charge_id);
+CREATE INDEX IF NOT EXISTS idx_disputes_status ON disputes(status);
 
 -- Idempotency Keys tracking
-CREATE TABLE idempotency_keys (
+CREATE TABLE IF NOT EXISTS idempotency_keys (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
   key VARCHAR(100) NOT NULL,
@@ -220,11 +220,11 @@ CREATE TABLE idempotency_keys (
   UNIQUE(merchant_id, key)
 );
 
-CREATE INDEX idx_idempotency_keys_lookup ON idempotency_keys(merchant_id, key);
-CREATE INDEX idx_idempotency_keys_expires ON idempotency_keys(expires_at);
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_lookup ON idempotency_keys(merchant_id, key);
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires ON idempotency_keys(expires_at);
 
 -- Risk Assessments (fraud detection logs)
-CREATE TABLE risk_assessments (
+CREATE TABLE IF NOT EXISTS risk_assessments (
   id BIGSERIAL PRIMARY KEY,
   payment_intent_id UUID NOT NULL REFERENCES payment_intents(id) ON DELETE CASCADE,
   risk_score DECIMAL(5,4) NOT NULL CHECK (risk_score >= 0 AND risk_score <= 1),
@@ -234,12 +234,12 @@ CREATE TABLE risk_assessments (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_risk_assessments_payment_intent ON risk_assessments(payment_intent_id);
-CREATE INDEX idx_risk_assessments_level ON risk_assessments(risk_level);
+CREATE INDEX IF NOT EXISTS idx_risk_assessments_payment_intent ON risk_assessments(payment_intent_id);
+CREATE INDEX IF NOT EXISTS idx_risk_assessments_level ON risk_assessments(risk_level);
 
 -- Audit Log (for compliance and forensic analysis)
 -- Required for PCI DSS Requirement 10 and SOX compliance
-CREATE TABLE audit_log (
+CREATE TABLE IF NOT EXISTS audit_log (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
   actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('merchant', 'admin', 'system', 'api')),
@@ -258,11 +258,11 @@ CREATE TABLE audit_log (
 
 -- Audit log is append-only - no updates or deletes should be performed
 -- Indexes for common query patterns
-CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp);
-CREATE INDEX idx_audit_log_actor ON audit_log(actor_type, actor_id);
-CREATE INDEX idx_audit_log_resource ON audit_log(resource_type, resource_id);
-CREATE INDEX idx_audit_log_action ON audit_log(action);
-CREATE INDEX idx_audit_log_trace ON audit_log(trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_type, actor_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_audit_log_trace ON audit_log(trace_id) WHERE trace_id IS NOT NULL;
 
 -- Helper function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -274,15 +274,19 @@ END;
 $$ language 'plpgsql';
 
 -- Apply updated_at triggers
+DROP TRIGGER IF EXISTS update_merchants_updated_at ON merchants;
 CREATE TRIGGER update_merchants_updated_at BEFORE UPDATE ON merchants
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_customers_updated_at ON customers;
 CREATE TRIGGER update_customers_updated_at BEFORE UPDATE ON customers
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_payment_intents_updated_at ON payment_intents;
 CREATE TRIGGER update_payment_intents_updated_at BEFORE UPDATE ON payment_intents
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_disputes_updated_at ON disputes;
 CREATE TRIGGER update_disputes_updated_at BEFORE UPDATE ON disputes
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 

@@ -5,6 +5,7 @@
  * @module shared/auth
  */
 
+import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { redis } from '../queue/redis';
@@ -137,7 +138,6 @@ export async function destroySession(sessionId: string): Promise<void> {
  * @returns Hashed password
  */
 function hashPassword(password: string): string {
-  const crypto = require('crypto');
   return crypto.createHash('sha256').update(password).digest('hex');
 }
 

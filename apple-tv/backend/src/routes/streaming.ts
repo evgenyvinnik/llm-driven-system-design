@@ -17,6 +17,13 @@ import { withCircuitBreaker } from '../shared/circuitBreaker.js';
 /** HLS streaming routes for manifest generation, segment delivery, and playback lifecycle tracking. */
 const router: Router = express.Router();
 
+interface ContentRow {
+  id: string;
+  title: string;
+  duration: number;
+  status: string;
+}
+
 interface VariantRow {
   id: string;
   resolution: number;

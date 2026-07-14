@@ -142,9 +142,9 @@ After running the seed script, these accounts are available:
 
 | Email | Password | Role |
 |-------|----------|------|
-| admin@appstore.dev | admin123 | Admin |
+| admin@appstore.dev | password123 | Admin |
 | developer@appstore.dev | developer123 | Developer |
-| user@appstore.dev | user123 | User |
+| user@appstore.dev | password123 | User |
 
 ## API Endpoints
 

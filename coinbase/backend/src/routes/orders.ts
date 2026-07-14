@@ -53,7 +53,7 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
     const userId = req.session.userId!;
     const { id } = req.params;
 
-    const cancelled = await orderService.cancelOrder(userId, id);
+    const cancelled = await orderService.cancelOrder(userId, String(id));
 
     if (!cancelled) {
       res.status(404).json({ error: 'Order not found or cannot be cancelled' });

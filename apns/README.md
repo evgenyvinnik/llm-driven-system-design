@@ -257,7 +257,7 @@ ws.onmessage = (event) => {
 ### Default Credentials
 
 - Username: `admin`
-- Password: `admin123`
+- Password: `password123`
 
 ### Creating Additional Admin Users
 

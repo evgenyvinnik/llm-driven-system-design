@@ -144,8 +144,8 @@ npm run dev  # Runs on http://localhost:5173
 
 After starting the services, you can log in with:
 
-- **Admin:** admin@dropbox.local / admin123
-- **User:** demo@dropbox.local / demo123
+- **Admin:** admin@dropbox.local / password123
+- **User:** demo@dropbox.local / password123
 
 ## API Endpoints
 

@@ -5,6 +5,7 @@
  * @module shared/idempotency
  */
 
+import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 import { redis } from '../queue/redis';
 import { logger } from '../utils/logger';
@@ -42,7 +43,6 @@ function generateIdempotencyKey(req: Request, clientKey?: string): string {
   }
 
   // Generate key from request content
-  const crypto = require('crypto');
   const content = JSON.stringify({
     method: req.method,
     path: req.path,

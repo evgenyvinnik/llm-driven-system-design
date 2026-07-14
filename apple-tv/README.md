@@ -90,8 +90,8 @@ npm run seed
 This creates sample users, profiles, series, episodes, and movies.
 
 **Demo Credentials:**
-- User: `user@appletv.local` / `user123`
-- Admin: `admin@appletv.local` / `admin123`
+- User: `user@appletv.local` / `password123`
+- Admin: `admin@appletv.local` / `password123`
 
 ### 4. Start the Backend
 

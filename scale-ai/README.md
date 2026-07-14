@@ -156,7 +156,7 @@ npm run db:migrate   # Creates tables and seeds shape data
 npm run db:seed-admin   # Creates default admin user
 ```
 
-> **Admin credentials:** email: `admin@scaleai.local` / password: `admin123`
+> **Admin credentials:** email: `admin@scaleai.local` / password: `password123`
 
 ### 2. Start Backend Services
 

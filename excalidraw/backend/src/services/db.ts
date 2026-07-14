@@ -1,4 +1,4 @@
-import pg, { Pool, PoolClient, QueryResult } from 'pg';
+import pg, { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import config from '../config/index.js';
 
 const pool: Pool = new pg.Pool({
@@ -18,7 +18,7 @@ pool.on('error', (err: Error) => {
 });
 
 /** Executes a parameterized SQL query against the connection pool. */
-export const query = <T = unknown>(
+export const query = <T extends QueryResultRow = QueryResultRow>(
   text: string,
   params?: unknown[]
 ): Promise<QueryResult<T>> => pool.query<T>(text, params);

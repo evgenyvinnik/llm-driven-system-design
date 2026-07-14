@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { api } from '@/services/api';
+import { formatPrice, formatNumber } from '@/utils/format';
 import { useAuthStore } from '@/stores/authStore';
 import { StatusBadge } from '@/components/StatusBadge';
 import { PageLoading } from '@/components/LoadingSpinner';
@@ -177,7 +178,7 @@ function OverviewTab({
                 </p>
               </div>
               <div className="flex items-center gap-3">
-                <span className="font-medium">${order.total.toFixed(2)}</span>
+                <span className="font-medium">${formatPrice(order.total)}</span>
                 <StatusBadge status={order.status} />
               </div>
             </div>
@@ -254,7 +255,7 @@ function OrdersTab() {
                 {order.delivery_address}
               </td>
               <td className="px-4 py-3 text-sm font-medium text-right">
-                ${order.total.toFixed(2)}
+                ${formatPrice(order.total)}
               </td>
             </tr>
           ))}
@@ -318,7 +319,7 @@ function DriversTab() {
                   {driver.status}
                 </span>
               </td>
-              <td className="px-4 py-3 text-sm text-center">⭐ {driver.rating.toFixed(2)}</td>
+              <td className="px-4 py-3 text-sm text-center">⭐ {formatNumber(driver.rating, 2)}</td>
               <td className="px-4 py-3 text-sm text-center">{driver.total_deliveries}</td>
             </tr>
           ))}
@@ -381,7 +382,7 @@ function MerchantsTab() {
                   {merchant.is_open ? 'Open' : 'Closed'}
                 </span>
               </td>
-              <td className="px-4 py-3 text-sm text-center">⭐ {merchant.rating.toFixed(2)}</td>
+              <td className="px-4 py-3 text-sm text-center">⭐ {formatNumber(merchant.rating, 2)}</td>
             </tr>
           ))}
         </tbody>

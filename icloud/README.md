@@ -111,8 +111,8 @@ Frontend runs on http://localhost:5173
 
 ### Demo Accounts
 
-- **Admin:** admin@icloud.local / admin123
-- **User:** user@icloud.local / user123
+- **Admin:** admin@icloud.local / password123
+- **User:** user@icloud.local / password123
 
 ## Project Structure
 

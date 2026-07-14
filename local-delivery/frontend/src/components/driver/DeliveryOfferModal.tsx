@@ -1,4 +1,5 @@
 import type { OrderWithDetails, DriverOffer } from '@/types';
+import { formatPrice, toNumber } from '@/utils/format';
 
 /**
  * Represents a pending delivery offer with countdown timer.
@@ -54,7 +55,7 @@ export function DeliveryOfferModal({
    * Calculates the total payout for the driver (delivery fee + tip).
    */
   const calculatePayout = (): string => {
-    return (order.delivery_fee + order.tip).toFixed(2);
+    return formatPrice(toNumber(order.delivery_fee) + toNumber(order.tip));
   };
 
   return (

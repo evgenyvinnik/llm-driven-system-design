@@ -17,6 +17,7 @@
  * - Keys expire after 5 minutes (longer than reasonable retry window)
  */
 
+import { createHash } from 'crypto';
 import { getRedisClient } from '../services/redis.js';
 import { idempotencyHits, idempotencyMisses } from './metrics.js';
 import { logger } from './logger.js';
@@ -134,9 +135,7 @@ export function generateICECandidateHash(
   candidateStr: string
 ): string {
   // Simple hash using built-in crypto
-  const crypto = require('crypto');
-  return crypto
-    .createHash('sha256')
+  return createHash('sha256')
     .update(`${callId}:${deviceId}:${candidateStr}`)
     .digest('hex')
     .slice(0, 16);

@@ -5,6 +5,11 @@ import * as db from '../db/index.js';
 
 /** Authentication routes for registration, login, logout, profile selection, and profile CRUD. */
 const router: Router = express.Router();
+
+interface UserRow {
+  id: string;
+  email: string;
+  password_hash: string;
   name: string;
   role: string;
   subscription_tier: string;

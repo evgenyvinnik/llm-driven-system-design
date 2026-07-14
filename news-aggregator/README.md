@@ -80,7 +80,7 @@ A content aggregation and curation platform that crawls RSS feeds, deduplicates 
 6. Access the application:
    - Frontend: http://localhost:5173
    - Backend API: http://localhost:3000
-   - Admin Dashboard: http://localhost:5173/admin (login as admin@newsagg.local / admin123)
+   - Admin Dashboard: http://localhost:5173/admin (login as admin@newsagg.local / password123)
 
 ### Running Multiple Backend Instances
 
