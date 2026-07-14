@@ -9,6 +9,8 @@ interface SearchState {
   checkOut?: string;
   guests: number;
   filters: Partial<SearchParams>;
+  /** True when a destination was typed but could not be geocoded. */
+  locationUnresolved: boolean;
   setLocation: (location: string, lat?: number, lng?: number) => void;
   setDates: (checkIn?: string, checkOut?: string) => void;
   setGuests: (guests: number) => void;
@@ -22,13 +24,19 @@ export const useSearchStore = create<SearchState>((set, get) => ({
   location: '',
   latitude: undefined,
   longitude: undefined,
+  locationUnresolved: false,
   checkIn: undefined,
   checkOut: undefined,
   guests: 1,
   filters: {},
 
   setLocation: (location, lat, lng) =>
-    set({ location, latitude: lat, longitude: lng }),
+    set({
+      location,
+      latitude: lat,
+      longitude: lng,
+      locationUnresolved: Boolean(location) && lat === undefined,
+    }),
 
   setDates: (checkIn, checkOut) => set({ checkIn, checkOut }),
 

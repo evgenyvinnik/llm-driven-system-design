@@ -26,6 +26,6 @@ function TableDataPage() {
   );
 }
 
-export const Route = createFileRoute('/project/$projectId/tables/$tableName')({
+export const Route = createFileRoute('/project/$projectId/tables_/$tableName')({
   component: TableDataPage,
 });

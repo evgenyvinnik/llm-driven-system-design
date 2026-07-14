@@ -168,3 +168,13 @@ Rationale:
 - [Airbnb Engineering Blog](https://medium.com/airbnb-engineering)
 - [PostGIS Documentation](https://postgis.net/documentation/)
 - [Two-Sided Marketplace Design](https://a16z.com/2015/01/22/marketplace-strategies-for-finding-liquidity/)
+
+---
+
+## Repair Log (2026-07-13)
+
+Runtime verification (screenshot harness + live API probing) surfaced two defects:
+
+1. **Search silently ignored the destination.** `SearchBar.handleSearch()` called `setLocation(text)` with no coordinates, but `/api/search` filters geographically on `latitude`/`longitude`. With no coords the backend applied no location predicate, so searching "San Francisco" returned *every* listing — the search box appeared to do nothing. The backend already exposed a geocoding endpoint (`/api/search/suggest`) that the UI never called. Fixed by wiring the search bar to it: debounced autocomplete dropdown, selection sets lat/lng in the store, and free text typed without picking a suggestion is geocoded on submit. Unresolvable destinations now set `locationUnresolved` so the results page shows "We couldn't find X" instead of silently listing everything. Verified: SF search returns 1 SF listing (was: all 5).
+
+2. **Screenshot login failed** — the screenshot config pointed at `guest1@example.com`, a user the seed never creates. Repointed to a seeded user; seeded password hashes across the repo were normalized to `password123`.

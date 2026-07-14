@@ -38,47 +38,48 @@ const IndexRoute = IndexRouteImport.update({
   getParentRoute: () => rootRouteImport,
 } as any)
 const OrgOrgIdRoute = OrgOrgIdRouteImport.update({
-  id: '/org/$orgId',
-  path: '/org/$orgId',
-  getParentRoute: () => rootRouteImport,
+  id: '/$orgId',
+  path: '/$orgId',
+  getParentRoute: () => OrgRoute,
 } as any)
 const OrgOrgIdTeamTeamIdRoute = OrgOrgIdTeamTeamIdRouteImport.update({
-  id: '/org/$orgId/team/$teamId',
-  path: '/org/$orgId/team/$teamId',
-  getParentRoute: () => rootRouteImport,
+  id: '/team/$teamId',
+  path: '/team/$teamId',
+  getParentRoute: () => OrgOrgIdRoute,
 } as any)
-const OrgOrgIdTeamTeamIdChannelChannelIdRoute = OrgOrgIdTeamTeamIdChannelChannelIdRouteImport.update({
-  id: '/org/$orgId/team/$teamId/channel/$channelId',
-  path: '/org/$orgId/team/$teamId/channel/$channelId',
-  getParentRoute: () => rootRouteImport,
-} as any)
+const OrgOrgIdTeamTeamIdChannelChannelIdRoute =
+  OrgOrgIdTeamTeamIdChannelChannelIdRouteImport.update({
+    id: '/channel/$channelId',
+    path: '/channel/$channelId',
+    getParentRoute: () => OrgOrgIdTeamTeamIdRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
-  '/org': typeof OrgRoute
+  '/org': typeof OrgRouteWithChildren
   '/register': typeof RegisterRoute
-  '/org/$orgId': typeof OrgOrgIdRoute
-  '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRoute
+  '/org/$orgId': typeof OrgOrgIdRouteWithChildren
+  '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRouteWithChildren
   '/org/$orgId/team/$teamId/channel/$channelId': typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
-  '/org': typeof OrgRoute
+  '/org': typeof OrgRouteWithChildren
   '/register': typeof RegisterRoute
-  '/org/$orgId': typeof OrgOrgIdRoute
-  '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRoute
+  '/org/$orgId': typeof OrgOrgIdRouteWithChildren
+  '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRouteWithChildren
   '/org/$orgId/team/$teamId/channel/$channelId': typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
-  '/org': typeof OrgRoute
+  '/org': typeof OrgRouteWithChildren
   '/register': typeof RegisterRoute
-  '/org/$orgId': typeof OrgOrgIdRoute
-  '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRoute
+  '/org/$orgId': typeof OrgOrgIdRouteWithChildren
+  '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRouteWithChildren
   '/org/$orgId/team/$teamId/channel/$channelId': typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
 }
 export interface FileRouteTypes {
@@ -114,27 +115,17 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   LoginRoute: typeof LoginRoute
-  OrgRoute: typeof OrgRoute
+  OrgRoute: typeof OrgRouteWithChildren
   RegisterRoute: typeof RegisterRoute
-  OrgOrgIdRoute: typeof OrgOrgIdRoute
-  OrgOrgIdTeamTeamIdRoute: typeof OrgOrgIdTeamTeamIdRoute
-  OrgOrgIdTeamTeamIdChannelChannelIdRoute: typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/org': {
@@ -144,45 +135,83 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OrgRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/org/$orgId': {
       id: '/org/$orgId'
-      path: '/org/$orgId'
+      path: '/$orgId'
       fullPath: '/org/$orgId'
       preLoaderRoute: typeof OrgOrgIdRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof OrgRoute
     }
     '/org/$orgId/team/$teamId': {
       id: '/org/$orgId/team/$teamId'
-      path: '/org/$orgId/team/$teamId'
+      path: '/team/$teamId'
       fullPath: '/org/$orgId/team/$teamId'
       preLoaderRoute: typeof OrgOrgIdTeamTeamIdRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof OrgOrgIdRoute
     }
     '/org/$orgId/team/$teamId/channel/$channelId': {
       id: '/org/$orgId/team/$teamId/channel/$channelId'
-      path: '/org/$orgId/team/$teamId/channel/$channelId'
+      path: '/channel/$channelId'
       fullPath: '/org/$orgId/team/$teamId/channel/$channelId'
       preLoaderRoute: typeof OrgOrgIdTeamTeamIdChannelChannelIdRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof OrgOrgIdTeamTeamIdRoute
     }
   }
 }
 
+interface OrgOrgIdTeamTeamIdRouteChildren {
+  OrgOrgIdTeamTeamIdChannelChannelIdRoute: typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
+}
+
+const OrgOrgIdTeamTeamIdRouteChildren: OrgOrgIdTeamTeamIdRouteChildren = {
+  OrgOrgIdTeamTeamIdChannelChannelIdRoute:
+    OrgOrgIdTeamTeamIdChannelChannelIdRoute,
+}
+
+const OrgOrgIdTeamTeamIdRouteWithChildren =
+  OrgOrgIdTeamTeamIdRoute._addFileChildren(OrgOrgIdTeamTeamIdRouteChildren)
+
+interface OrgOrgIdRouteChildren {
+  OrgOrgIdTeamTeamIdRoute: typeof OrgOrgIdTeamTeamIdRouteWithChildren
+}
+
+const OrgOrgIdRouteChildren: OrgOrgIdRouteChildren = {
+  OrgOrgIdTeamTeamIdRoute: OrgOrgIdTeamTeamIdRouteWithChildren,
+}
+
+const OrgOrgIdRouteWithChildren = OrgOrgIdRoute._addFileChildren(
+  OrgOrgIdRouteChildren,
+)
+
+interface OrgRouteChildren {
+  OrgOrgIdRoute: typeof OrgOrgIdRouteWithChildren
+}
+
+const OrgRouteChildren: OrgRouteChildren = {
+  OrgOrgIdRoute: OrgOrgIdRouteWithChildren,
+}
+
+const OrgRouteWithChildren = OrgRoute._addFileChildren(OrgRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   LoginRoute: LoginRoute,
-  OrgRoute: OrgRoute,
+  OrgRoute: OrgRouteWithChildren,
   RegisterRoute: RegisterRoute,
-  OrgOrgIdRoute: OrgOrgIdRoute,
-  OrgOrgIdTeamTeamIdRoute: OrgOrgIdTeamTeamIdRoute,
-  OrgOrgIdTeamTeamIdChannelChannelIdRoute: OrgOrgIdTeamTeamIdChannelChannelIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

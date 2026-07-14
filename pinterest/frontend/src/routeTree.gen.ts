@@ -11,9 +11,11 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as RegisterRouteImport } from './routes/register'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as CreateRouteImport } from './routes/create'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as AppAppIdPreviewRouteImport } from './routes/app.$appId.preview'
-import { Route as AppAppIdEditRouteImport } from './routes/app.$appId.edit'
+import { Route as ProfileUsernameRouteImport } from './routes/profile.$username'
+import { Route as PinPinIdRouteImport } from './routes/pin.$pinId'
+import { Route as BoardBoardIdRouteImport } from './routes/board.$boardId'
 
 const RegisterRoute = RegisterRouteImport.update({
   id: '/register',
@@ -25,65 +27,98 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CreateRoute = CreateRouteImport.update({
+  id: '/create',
+  path: '/create',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AppAppIdPreviewRoute = AppAppIdPreviewRouteImport.update({
-  id: '/app/$appId/preview',
-  path: '/app/$appId/preview',
+const ProfileUsernameRoute = ProfileUsernameRouteImport.update({
+  id: '/profile/$username',
+  path: '/profile/$username',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AppAppIdEditRoute = AppAppIdEditRouteImport.update({
-  id: '/app/$appId/edit',
-  path: '/app/$appId/edit',
+const PinPinIdRoute = PinPinIdRouteImport.update({
+  id: '/pin/$pinId',
+  path: '/pin/$pinId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BoardBoardIdRoute = BoardBoardIdRouteImport.update({
+  id: '/board/$boardId',
+  path: '/board/$boardId',
   getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/create': typeof CreateRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/app/$appId/edit': typeof AppAppIdEditRoute
-  '/app/$appId/preview': typeof AppAppIdPreviewRoute
+  '/board/$boardId': typeof BoardBoardIdRoute
+  '/pin/$pinId': typeof PinPinIdRoute
+  '/profile/$username': typeof ProfileUsernameRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/create': typeof CreateRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/app/$appId/edit': typeof AppAppIdEditRoute
-  '/app/$appId/preview': typeof AppAppIdPreviewRoute
+  '/board/$boardId': typeof BoardBoardIdRoute
+  '/pin/$pinId': typeof PinPinIdRoute
+  '/profile/$username': typeof ProfileUsernameRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/create': typeof CreateRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/app/$appId/edit': typeof AppAppIdEditRoute
-  '/app/$appId/preview': typeof AppAppIdPreviewRoute
+  '/board/$boardId': typeof BoardBoardIdRoute
+  '/pin/$pinId': typeof PinPinIdRoute
+  '/profile/$username': typeof ProfileUsernameRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/login' | '/register' | '/app/$appId/edit' | '/app/$appId/preview'
+    | '/'
+    | '/create'
+    | '/login'
+    | '/register'
+    | '/board/$boardId'
+    | '/pin/$pinId'
+    | '/profile/$username'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/login' | '/register' | '/app/$appId/edit' | '/app/$appId/preview'
+  to:
+    | '/'
+    | '/create'
+    | '/login'
+    | '/register'
+    | '/board/$boardId'
+    | '/pin/$pinId'
+    | '/profile/$username'
   id:
     | '__root__'
     | '/'
+    | '/create'
     | '/login'
     | '/register'
-    | '/app/$appId/edit'
-    | '/app/$appId/preview'
+    | '/board/$boardId'
+    | '/pin/$pinId'
+    | '/profile/$username'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  CreateRoute: typeof CreateRoute
   LoginRoute: typeof LoginRoute
   RegisterRoute: typeof RegisterRoute
-  AppAppIdEditRoute: typeof AppAppIdEditRoute
-  AppAppIdPreviewRoute: typeof AppAppIdPreviewRoute
+  BoardBoardIdRoute: typeof BoardBoardIdRoute
+  PinPinIdRoute: typeof PinPinIdRoute
+  ProfileUsernameRoute: typeof ProfileUsernameRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -102,6 +137,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/create': {
+      id: '/create'
+      path: '/create'
+      fullPath: '/create'
+      preLoaderRoute: typeof CreateRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
@@ -109,18 +151,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/app/$appId/preview': {
-      id: '/app/$appId/preview'
-      path: '/app/$appId/preview'
-      fullPath: '/app/$appId/preview'
-      preLoaderRoute: typeof AppAppIdPreviewRouteImport
+    '/profile/$username': {
+      id: '/profile/$username'
+      path: '/profile/$username'
+      fullPath: '/profile/$username'
+      preLoaderRoute: typeof ProfileUsernameRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/app/$appId/edit': {
-      id: '/app/$appId/edit'
-      path: '/app/$appId/edit'
-      fullPath: '/app/$appId/edit'
-      preLoaderRoute: typeof AppAppIdEditRouteImport
+    '/pin/$pinId': {
+      id: '/pin/$pinId'
+      path: '/pin/$pinId'
+      fullPath: '/pin/$pinId'
+      preLoaderRoute: typeof PinPinIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/board/$boardId': {
+      id: '/board/$boardId'
+      path: '/board/$boardId'
+      fullPath: '/board/$boardId'
+      preLoaderRoute: typeof BoardBoardIdRouteImport
       parentRoute: typeof rootRouteImport
     }
   }
@@ -128,10 +177,12 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  CreateRoute: CreateRoute,
   LoginRoute: LoginRoute,
   RegisterRoute: RegisterRoute,
-  AppAppIdEditRoute: AppAppIdEditRoute,
-  AppAppIdPreviewRoute: AppAppIdPreviewRoute,
+  BoardBoardIdRoute: BoardBoardIdRoute,
+  PinPinIdRoute: PinPinIdRoute,
+  ProfileUsernameRoute: ProfileUsernameRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -40,36 +40,38 @@ const ProjectProjectIdRoute = ProjectProjectIdRouteImport.update({
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectProjectIdTablesRoute = ProjectProjectIdTablesRouteImport.update({
-  id: '/project/$projectId/tables',
-  path: '/project/$projectId/tables',
-  getParentRoute: () => rootRouteImport,
+  id: '/tables',
+  path: '/tables',
+  getParentRoute: () => ProjectProjectIdRoute,
 } as any)
 const ProjectProjectIdSqlRoute = ProjectProjectIdSqlRouteImport.update({
-  id: '/project/$projectId/sql',
-  path: '/project/$projectId/sql',
-  getParentRoute: () => rootRouteImport,
+  id: '/sql',
+  path: '/sql',
+  getParentRoute: () => ProjectProjectIdRoute,
 } as any)
-const ProjectProjectIdSettingsRoute = ProjectProjectIdSettingsRouteImport.update({
-  id: '/project/$projectId/settings',
-  path: '/project/$projectId/settings',
-  getParentRoute: () => rootRouteImport,
-} as any)
+const ProjectProjectIdSettingsRoute =
+  ProjectProjectIdSettingsRouteImport.update({
+    id: '/settings',
+    path: '/settings',
+    getParentRoute: () => ProjectProjectIdRoute,
+  } as any)
 const ProjectProjectIdAuthRoute = ProjectProjectIdAuthRouteImport.update({
-  id: '/project/$projectId/auth',
-  path: '/project/$projectId/auth',
-  getParentRoute: () => rootRouteImport,
+  id: '/auth',
+  path: '/auth',
+  getParentRoute: () => ProjectProjectIdRoute,
 } as any)
-const ProjectProjectIdTablesTableNameRoute = ProjectProjectIdTablesTableNameRouteImport.update({
-  id: '/project/$projectId/tables/$tableName',
-  path: '/project/$projectId/tables/$tableName',
-  getParentRoute: () => rootRouteImport,
-} as any)
+const ProjectProjectIdTablesTableNameRoute =
+  ProjectProjectIdTablesTableNameRouteImport.update({
+    id: '/tables_/$tableName',
+    path: '/tables/$tableName',
+    getParentRoute: () => ProjectProjectIdRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/project/$projectId': typeof ProjectProjectIdRoute
+  '/project/$projectId': typeof ProjectProjectIdRouteWithChildren
   '/project/$projectId/auth': typeof ProjectProjectIdAuthRoute
   '/project/$projectId/settings': typeof ProjectProjectIdSettingsRoute
   '/project/$projectId/sql': typeof ProjectProjectIdSqlRoute
@@ -80,7 +82,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/project/$projectId': typeof ProjectProjectIdRoute
+  '/project/$projectId': typeof ProjectProjectIdRouteWithChildren
   '/project/$projectId/auth': typeof ProjectProjectIdAuthRoute
   '/project/$projectId/settings': typeof ProjectProjectIdSettingsRoute
   '/project/$projectId/sql': typeof ProjectProjectIdSqlRoute
@@ -92,12 +94,12 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/project/$projectId': typeof ProjectProjectIdRoute
+  '/project/$projectId': typeof ProjectProjectIdRouteWithChildren
   '/project/$projectId/auth': typeof ProjectProjectIdAuthRoute
   '/project/$projectId/settings': typeof ProjectProjectIdSettingsRoute
   '/project/$projectId/sql': typeof ProjectProjectIdSqlRoute
   '/project/$projectId/tables': typeof ProjectProjectIdTablesRoute
-  '/project/$projectId/tables/$tableName': typeof ProjectProjectIdTablesTableNameRoute
+  '/project/$projectId/tables_/$tableName': typeof ProjectProjectIdTablesTableNameRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -132,28 +134,23 @@ export interface FileRouteTypes {
     | '/project/$projectId/settings'
     | '/project/$projectId/sql'
     | '/project/$projectId/tables'
-    | '/project/$projectId/tables/$tableName'
+    | '/project/$projectId/tables_/$tableName'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   LoginRoute: typeof LoginRoute
   RegisterRoute: typeof RegisterRoute
-  ProjectProjectIdRoute: typeof ProjectProjectIdRoute
-  ProjectProjectIdAuthRoute: typeof ProjectProjectIdAuthRoute
-  ProjectProjectIdSettingsRoute: typeof ProjectProjectIdSettingsRoute
-  ProjectProjectIdSqlRoute: typeof ProjectProjectIdSqlRoute
-  ProjectProjectIdTablesRoute: typeof ProjectProjectIdTablesRoute
-  ProjectProjectIdTablesTableNameRoute: typeof ProjectProjectIdTablesTableNameRoute
+  ProjectProjectIdRoute: typeof ProjectProjectIdRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -163,11 +160,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/project/$projectId': {
@@ -177,54 +174,68 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProjectProjectIdRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/project/$projectId/auth': {
-      id: '/project/$projectId/auth'
-      path: '/project/$projectId/auth'
-      fullPath: '/project/$projectId/auth'
-      preLoaderRoute: typeof ProjectProjectIdAuthRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/project/$projectId/settings': {
-      id: '/project/$projectId/settings'
-      path: '/project/$projectId/settings'
-      fullPath: '/project/$projectId/settings'
-      preLoaderRoute: typeof ProjectProjectIdSettingsRouteImport
-      parentRoute: typeof rootRouteImport
+    '/project/$projectId/tables': {
+      id: '/project/$projectId/tables'
+      path: '/tables'
+      fullPath: '/project/$projectId/tables'
+      preLoaderRoute: typeof ProjectProjectIdTablesRouteImport
+      parentRoute: typeof ProjectProjectIdRoute
     }
     '/project/$projectId/sql': {
       id: '/project/$projectId/sql'
-      path: '/project/$projectId/sql'
+      path: '/sql'
       fullPath: '/project/$projectId/sql'
       preLoaderRoute: typeof ProjectProjectIdSqlRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof ProjectProjectIdRoute
     }
-    '/project/$projectId/tables': {
-      id: '/project/$projectId/tables'
-      path: '/project/$projectId/tables'
-      fullPath: '/project/$projectId/tables'
-      preLoaderRoute: typeof ProjectProjectIdTablesRouteImport
-      parentRoute: typeof rootRouteImport
+    '/project/$projectId/settings': {
+      id: '/project/$projectId/settings'
+      path: '/settings'
+      fullPath: '/project/$projectId/settings'
+      preLoaderRoute: typeof ProjectProjectIdSettingsRouteImport
+      parentRoute: typeof ProjectProjectIdRoute
     }
-    '/project/$projectId/tables/$tableName': {
-      id: '/project/$projectId/tables/$tableName'
-      path: '/project/$projectId/tables/$tableName'
+    '/project/$projectId/auth': {
+      id: '/project/$projectId/auth'
+      path: '/auth'
+      fullPath: '/project/$projectId/auth'
+      preLoaderRoute: typeof ProjectProjectIdAuthRouteImport
+      parentRoute: typeof ProjectProjectIdRoute
+    }
+    '/project/$projectId/tables_/$tableName': {
+      id: '/project/$projectId/tables_/$tableName'
+      path: '/tables/$tableName'
       fullPath: '/project/$projectId/tables/$tableName'
       preLoaderRoute: typeof ProjectProjectIdTablesTableNameRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof ProjectProjectIdRoute
     }
   }
 }
 
-const rootRouteChildren: RootRouteChildren = {
-  IndexRoute: IndexRoute,
-  LoginRoute: LoginRoute,
-  RegisterRoute: RegisterRoute,
-  ProjectProjectIdRoute: ProjectProjectIdRoute,
+interface ProjectProjectIdRouteChildren {
+  ProjectProjectIdAuthRoute: typeof ProjectProjectIdAuthRoute
+  ProjectProjectIdSettingsRoute: typeof ProjectProjectIdSettingsRoute
+  ProjectProjectIdSqlRoute: typeof ProjectProjectIdSqlRoute
+  ProjectProjectIdTablesRoute: typeof ProjectProjectIdTablesRoute
+  ProjectProjectIdTablesTableNameRoute: typeof ProjectProjectIdTablesTableNameRoute
+}
+
+const ProjectProjectIdRouteChildren: ProjectProjectIdRouteChildren = {
   ProjectProjectIdAuthRoute: ProjectProjectIdAuthRoute,
   ProjectProjectIdSettingsRoute: ProjectProjectIdSettingsRoute,
   ProjectProjectIdSqlRoute: ProjectProjectIdSqlRoute,
   ProjectProjectIdTablesRoute: ProjectProjectIdTablesRoute,
   ProjectProjectIdTablesTableNameRoute: ProjectProjectIdTablesTableNameRoute,
+}
+
+const ProjectProjectIdRouteWithChildren =
+  ProjectProjectIdRoute._addFileChildren(ProjectProjectIdRouteChildren)
+
+const rootRouteChildren: RootRouteChildren = {
+  IndexRoute: IndexRoute,
+  LoginRoute: LoginRoute,
+  RegisterRoute: RegisterRoute,
+  ProjectProjectIdRoute: ProjectProjectIdRouteWithChildren,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

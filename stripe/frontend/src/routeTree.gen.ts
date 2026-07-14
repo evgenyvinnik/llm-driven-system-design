@@ -75,12 +75,7 @@ export interface FileRoutesById {
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    | '/'
-    | '/balance'
-    | '/checkout'
-    | '/customers'
-    | '/payments'
-    | '/webhooks'
+    '/' | '/balance' | '/checkout' | '/customers' | '/payments' | '/webhooks'
   fileRoutesByTo: FileRoutesByTo
   to: '/' | '/balance' | '/checkout' | '/customers' | '/payments' | '/webhooks'
   id:

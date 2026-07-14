@@ -35,6 +35,14 @@ function SearchPage() {
   const doSearch = async () => {
     setIsLoading(true);
     try {
+      // The API filters geographically. If the user typed a destination we could
+      // not geocode, searching anyway would ignore it and return every listing —
+      // which reads as "search is broken". Show an empty result instead.
+      if (searchStore.locationUnresolved) {
+        setListings([]);
+        setTotal(0);
+        return;
+      }
       const params = {
         ...searchStore.getSearchParams(),
         ...localFilters,
@@ -245,8 +253,21 @@ function SearchPage() {
         </>
       ) : (
         <div className="text-center py-12">
-          <p className="text-gray-500 text-lg mb-4">No places found</p>
-          <p className="text-gray-400">Try adjusting your search or filters</p>
+          {searchStore.locationUnresolved ? (
+            <>
+              <p className="text-gray-500 text-lg mb-4">
+                We couldn&apos;t find &ldquo;{searchStore.location}&rdquo;
+              </p>
+              <p className="text-gray-400">
+                Try a city we host in, like San Francisco or Santa Monica.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-gray-500 text-lg mb-4">No places found</p>
+              <p className="text-gray-400">Try adjusting your search or filters</p>
+            </>
+          )}
         </div>
       )}
     </div>

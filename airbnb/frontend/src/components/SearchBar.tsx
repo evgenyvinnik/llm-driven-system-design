@@ -1,6 +1,16 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { useSearchStore } from '../stores/searchStore';
+import { searchAPI } from '../services/api';
+
+interface Suggestion {
+  label: string;
+  city: string;
+  state: string;
+  country: string;
+  latitude: number;
+  longitude: number;
+}
 
 /** Renders the full search bar with destination, check-in/out dates, and guest count inputs. */
 export function SearchBar() {
@@ -13,15 +23,69 @@ export function SearchBar() {
   const [localCheckOut, setLocalCheckOut] = useState(checkOut || '');
   const [localGuests, setLocalGuests] = useState(guests);
 
-  const handleSearch = () => {
-    setLocation(localLocation);
+  // The search API filters by coordinates, so a typed destination must be
+  // geocoded before searching — otherwise the location is silently ignored
+  // and every listing is returned.
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const selectedRef = useRef<Suggestion | null>(null);
+
+  useEffect(() => {
+    const q = localLocation.trim();
+    if (q.length < 2 || selectedRef.current?.label === q) {
+      setSuggestions([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const res = await searchAPI.suggest(q);
+        setSuggestions(res.suggestions);
+        setShowSuggestions(res.suggestions.length > 0);
+      } catch {
+        setSuggestions([]);
+      }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [localLocation]);
+
+  const selectSuggestion = (s: Suggestion) => {
+    selectedRef.current = s;
+    setLocalLocation(s.label);
+    setShowSuggestions(false);
+    setSuggestions([]);
+  };
+
+  const handleSearch = async () => {
+    const q = localLocation.trim();
+    let picked = selectedRef.current;
+
+    // Resolve free text the user never picked from the dropdown.
+    if (q && picked?.label !== q) {
+      try {
+        const res = await searchAPI.suggest(q);
+        picked = res.suggestions[0] ?? null;
+      } catch {
+        picked = null;
+      }
+    }
+
+    if (!q) {
+      setLocation('', undefined, undefined);
+    } else if (picked) {
+      setLocation(picked.label, picked.latitude, picked.longitude);
+    } else {
+      // Unknown destination: keep the text, but mark it unresolved so the
+      // results page can say "no matches" instead of showing every listing.
+      setLocation(q, undefined, undefined);
+    }
+
     setDates(localCheckIn || undefined, localCheckOut || undefined);
     setGuests(localGuests);
     navigate({ to: '/search' });
   };
 
   return (
-    <div className="flex items-center bg-white rounded-full border border-gray-300 shadow-sm hover:shadow-md transition-shadow">
+    <div className="relative flex items-center bg-white rounded-full border border-gray-300 shadow-sm hover:shadow-md transition-shadow">
       <div className="flex-1 px-6 py-3 border-r border-gray-300">
         <label className="block text-xs font-bold text-gray-800">Where</label>
         <input
@@ -29,8 +93,26 @@ export function SearchBar() {
           placeholder="Search destinations"
           value={localLocation}
           onChange={(e) => setLocalLocation(e.target.value)}
+          onFocus={() => setShowSuggestions(suggestions.length > 0)}
+          onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
+          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
           className="w-full text-sm text-gray-600 placeholder-gray-400 outline-none bg-transparent"
         />
+        {showSuggestions && (
+          <ul className="absolute left-0 top-full z-20 mt-2 w-80 overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-lg">
+            {suggestions.map((s) => (
+              <li key={s.label}>
+                <button
+                  type="button"
+                  onMouseDown={() => selectSuggestion(s)}
+                  className="block w-full px-4 py-3 text-left text-sm text-gray-700 hover:bg-gray-100"
+                >
+                  {s.label}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       <div className="px-4 py-3 border-r border-gray-300">

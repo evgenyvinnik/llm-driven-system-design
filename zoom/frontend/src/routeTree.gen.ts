@@ -9,22 +9,16 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as WalletRouteImport } from './routes/wallet'
-import { Route as RequestRouteImport } from './routes/request'
+import { Route as ScheduleRouteImport } from './routes/schedule'
 import { Route as RegisterRouteImport } from './routes/register'
-import { Route as ProfileRouteImport } from './routes/profile'
-import { Route as PayRouteImport } from './routes/pay'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as HistoryRouteImport } from './routes/history'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as MeetingCodeRouteImport } from './routes/meeting.$code'
 
-const WalletRoute = WalletRouteImport.update({
-  id: '/wallet',
-  path: '/wallet',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const RequestRoute = RequestRouteImport.update({
-  id: '/request',
-  path: '/request',
+const ScheduleRoute = ScheduleRouteImport.update({
+  id: '/schedule',
+  path: '/schedule',
   getParentRoute: () => rootRouteImport,
 } as any)
 const RegisterRoute = RegisterRouteImport.update({
@@ -32,19 +26,14 @@ const RegisterRoute = RegisterRouteImport.update({
   path: '/register',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ProfileRoute = ProfileRouteImport.update({
-  id: '/profile',
-  path: '/profile',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PayRoute = PayRouteImport.update({
-  id: '/pay',
-  path: '/pay',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const HistoryRoute = HistoryRouteImport.update({
+  id: '/history',
+  path: '/history',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -52,77 +41,69 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const MeetingCodeRoute = MeetingCodeRouteImport.update({
+  id: '/meeting/$code',
+  path: '/meeting/$code',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/history': typeof HistoryRoute
   '/login': typeof LoginRoute
-  '/pay': typeof PayRoute
-  '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
-  '/request': typeof RequestRoute
-  '/wallet': typeof WalletRoute
+  '/schedule': typeof ScheduleRoute
+  '/meeting/$code': typeof MeetingCodeRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/history': typeof HistoryRoute
   '/login': typeof LoginRoute
-  '/pay': typeof PayRoute
-  '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
-  '/request': typeof RequestRoute
-  '/wallet': typeof WalletRoute
+  '/schedule': typeof ScheduleRoute
+  '/meeting/$code': typeof MeetingCodeRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/history': typeof HistoryRoute
   '/login': typeof LoginRoute
-  '/pay': typeof PayRoute
-  '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
-  '/request': typeof RequestRoute
-  '/wallet': typeof WalletRoute
+  '/schedule': typeof ScheduleRoute
+  '/meeting/$code': typeof MeetingCodeRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/login' | '/pay' | '/profile' | '/register' | '/request' | '/wallet'
+    '/' | '/history' | '/login' | '/register' | '/schedule' | '/meeting/$code'
   fileRoutesByTo: FileRoutesByTo
-  to:
-    '/' | '/login' | '/pay' | '/profile' | '/register' | '/request' | '/wallet'
+  to: '/' | '/history' | '/login' | '/register' | '/schedule' | '/meeting/$code'
   id:
     | '__root__'
     | '/'
+    | '/history'
     | '/login'
-    | '/pay'
-    | '/profile'
     | '/register'
-    | '/request'
-    | '/wallet'
+    | '/schedule'
+    | '/meeting/$code'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  HistoryRoute: typeof HistoryRoute
   LoginRoute: typeof LoginRoute
-  PayRoute: typeof PayRoute
-  ProfileRoute: typeof ProfileRoute
   RegisterRoute: typeof RegisterRoute
-  RequestRoute: typeof RequestRoute
-  WalletRoute: typeof WalletRoute
+  ScheduleRoute: typeof ScheduleRoute
+  MeetingCodeRoute: typeof MeetingCodeRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/wallet': {
-      id: '/wallet'
-      path: '/wallet'
-      fullPath: '/wallet'
-      preLoaderRoute: typeof WalletRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/request': {
-      id: '/request'
-      path: '/request'
-      fullPath: '/request'
-      preLoaderRoute: typeof RequestRouteImport
+    '/schedule': {
+      id: '/schedule'
+      path: '/schedule'
+      fullPath: '/schedule'
+      preLoaderRoute: typeof ScheduleRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/register': {
@@ -132,25 +113,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/profile': {
-      id: '/profile'
-      path: '/profile'
-      fullPath: '/profile'
-      preLoaderRoute: typeof ProfileRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/pay': {
-      id: '/pay'
-      path: '/pay'
-      fullPath: '/pay'
-      preLoaderRoute: typeof PayRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/login': {
       id: '/login'
       path: '/login'
       fullPath: '/login'
       preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/history': {
+      id: '/history'
+      path: '/history'
+      fullPath: '/history'
+      preLoaderRoute: typeof HistoryRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/': {
@@ -160,17 +134,23 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/meeting/$code': {
+      id: '/meeting/$code'
+      path: '/meeting/$code'
+      fullPath: '/meeting/$code'
+      preLoaderRoute: typeof MeetingCodeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  HistoryRoute: HistoryRoute,
   LoginRoute: LoginRoute,
-  PayRoute: PayRoute,
-  ProfileRoute: ProfileRoute,
   RegisterRoute: RegisterRoute,
-  RequestRoute: RequestRoute,
-  WalletRoute: WalletRoute,
+  ScheduleRoute: ScheduleRoute,
+  MeetingCodeRoute: MeetingCodeRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
