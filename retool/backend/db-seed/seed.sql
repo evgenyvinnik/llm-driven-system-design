@@ -3,8 +3,8 @@
 -- Passwords hashed with bcrypt (10 rounds)
 
 INSERT INTO users (id, username, email, password_hash, display_name, role) VALUES
-  ('a1111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', '$2a$10$rQEY7jVzQlqGYMIkXxGZPOJl.cLfpGYeBBmSLpC.V/MqH4vJTOday', 'Alice Builder', 'admin'),
-  ('b2222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', '$2a$10$rQEY7jVzQlqGYMIkXxGZPOJl.cLfpGYeBBmSLpC.V/MqH4vJTOday', 'Bob Developer', 'user')
+  ('a1111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Builder', 'admin'),
+  ('b2222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Developer', 'user')
 ON CONFLICT (username) DO NOTHING;
 
 -- Data source pointing to the target-postgres sample database

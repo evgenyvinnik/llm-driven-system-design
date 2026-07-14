@@ -10,9 +10,9 @@
 -- Hash: $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
 
 INSERT INTO admin_users (id, username, password_hash, role) VALUES
-    ('a1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'admin', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'admin'),
-    ('a2eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', 'operator', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'admin'),
-    ('a3eebc99-9c0b-4ef8-bb6d-6bb9bd380a13', 'developer', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'admin')
+    ('a1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'admin', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'admin'),
+    ('a2eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', 'operator', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'admin'),
+    ('a3eebc99-9c0b-4ef8-bb6d-6bb9bd380a13', 'developer', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'admin')
 ON CONFLICT (username) DO NOTHING;
 
 -- ============================================================================

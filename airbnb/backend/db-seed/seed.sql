@@ -5,11 +5,11 @@
 -- Create users (password hash for 'password123' with bcrypt)
 INSERT INTO users (email, password_hash, name, avatar_url, bio, phone, is_host, is_verified, role)
 VALUES
-    ('alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice Johnson', 'https://i.pravatar.cc/150?u=alice', 'Superhost with 5 years of experience. Love meeting travelers from around the world!', '+1-555-0101', true, true, 'user'),
-    ('bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Bob Smith', 'https://i.pravatar.cc/150?u=bob', 'Frequent traveler and occasional host.', '+1-555-0102', true, true, 'user'),
-    ('carol@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Carol Davis', 'https://i.pravatar.cc/150?u=carol', 'Adventure seeker looking for unique stays.', '+1-555-0103', false, true, 'user'),
-    ('david@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'David Wilson', 'https://i.pravatar.cc/150?u=david', 'Business traveler who appreciates comfort.', '+1-555-0104', false, true, 'user'),
-    ('admin@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Admin User', 'https://i.pravatar.cc/150?u=admin', 'Platform administrator', '+1-555-0100', false, true, 'admin')
+    ('alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson', 'https://i.pravatar.cc/150?u=alice', 'Superhost with 5 years of experience. Love meeting travelers from around the world!', '+1-555-0101', true, true, 'user'),
+    ('bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith', 'https://i.pravatar.cc/150?u=bob', 'Frequent traveler and occasional host.', '+1-555-0102', true, true, 'user'),
+    ('carol@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Carol Davis', 'https://i.pravatar.cc/150?u=carol', 'Adventure seeker looking for unique stays.', '+1-555-0103', false, true, 'user'),
+    ('david@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'David Wilson', 'https://i.pravatar.cc/150?u=david', 'Business traveler who appreciates comfort.', '+1-555-0104', false, true, 'user'),
+    ('admin@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', 'https://i.pravatar.cc/150?u=admin', 'Platform administrator', '+1-555-0100', false, true, 'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- Create listings for Alice (host)

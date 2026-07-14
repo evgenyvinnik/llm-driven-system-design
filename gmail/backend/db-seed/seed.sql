@@ -4,9 +4,9 @@
 
 -- Insert users
 INSERT INTO users (id, username, email, password_hash, display_name) VALUES
-  ('a1111111-1111-1111-1111-111111111111', 'alice', 'alice@gmail.local', '$2a$12$LJ3m4ys3uz2sFSCKlxDhMODfPMfVFbBNaq6KDeIq0bYeZ8YDKoiGC', 'Alice Johnson'),
-  ('b2222222-2222-2222-2222-222222222222', 'bob', 'bob@gmail.local', '$2a$12$LJ3m4ys3uz2sFSCKlxDhMODfPMfVFbBNaq6KDeIq0bYeZ8YDKoiGC', 'Bob Smith'),
-  ('c3333333-3333-3333-3333-333333333333', 'charlie', 'charlie@gmail.local', '$2a$12$LJ3m4ys3uz2sFSCKlxDhMODfPMfVFbBNaq6KDeIq0bYeZ8YDKoiGC', 'Charlie Brown')
+  ('a1111111-1111-1111-1111-111111111111', 'alice', 'alice@gmail.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson'),
+  ('b2222222-2222-2222-2222-222222222222', 'bob', 'bob@gmail.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith'),
+  ('c3333333-3333-3333-3333-333333333333', 'charlie', 'charlie@gmail.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Charlie Brown')
 ON CONFLICT DO NOTHING;
 
 -- System labels for Alice

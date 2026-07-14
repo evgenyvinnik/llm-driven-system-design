@@ -8,7 +8,7 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "username": "alice",
+      "username": "alice_dance",
       "password": "password123"
     },
     "usernameSelector": "input[name='username'], input[type='text']",

@@ -6,10 +6,10 @@
 INSERT INTO users (id, username, email, password_hash, display_name, bio, follower_count, following_count)
 VALUES
   ('a1b2c3d4-e5f6-7890-abcd-ef1234567890', 'alice', 'alice@example.com',
-   '$2a$12$LQv3c1yqBo9SkvXS7QTJPOoZ9.Xt4lOF2GKrcNJzjwFP4rAG2.cLy',
+   '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi',
    'Alice Johnson', 'Interior design enthusiast. Love collecting inspiration for my dream home.', 1, 1),
   ('b2c3d4e5-f6a7-8901-bcde-f12345678901', 'bob', 'bob@example.com',
-   '$2a$12$LQv3c1yqBo9SkvXS7QTJPOoZ9.Xt4lOF2GKrcNJzjwFP4rAG2.cLy',
+   '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi',
    'Bob Smith', 'Food photographer and recipe collector. Always cooking something new.', 1, 1)
 ON CONFLICT (username) DO NOTHING;
 

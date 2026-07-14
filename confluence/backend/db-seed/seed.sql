@@ -5,8 +5,8 @@
 -- Users
 INSERT INTO users (id, username, email, password_hash, display_name, role)
 VALUES
-  ('a0000000-0000-0000-0000-000000000001', 'alice', 'alice@example.com', '$2a$12$LQv3c1yqBo9SkvXS7QTJPOoGz6URsApousLLatMNGKRp8fLCy.I5q', 'Alice Johnson', 'admin'),
-  ('b0000000-0000-0000-0000-000000000002', 'bob', 'bob@example.com', '$2a$12$LQv3c1yqBo9SkvXS7QTJPOoGz6URsApousLLatMNGKRp8fLCy.I5q', 'Bob Smith', 'user')
+  ('a0000000-0000-0000-0000-000000000001', 'alice', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson', 'admin'),
+  ('b0000000-0000-0000-0000-000000000002', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith', 'user')
 ON CONFLICT (username) DO NOTHING;
 
 -- Spaces

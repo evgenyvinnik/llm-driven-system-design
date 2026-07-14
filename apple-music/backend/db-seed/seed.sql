@@ -7,7 +7,7 @@ VALUES (
   '00000000-0000-0000-0000-000000000001',
   'admin@applemusic.local',
   'admin',
-  '$2b$10$X5cI9kJqY5zK5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e', -- password: admin123
+  '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', -- password: admin123
   'Admin User',
   'admin',
   'individual'
@@ -19,7 +19,7 @@ VALUES (
   '00000000-0000-0000-0000-000000000002',
   'demo@applemusic.local',
   'demo',
-  '$2b$10$X5cI9kJqY5zK5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e5F5e', -- password: demo123
+  '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', -- password: demo123
   'Demo User',
   'user',
   'individual'
@@ -31,7 +31,7 @@ VALUES (
   '00000000-0000-0000-0000-000000000003',
   'alice@example.com',
   'alice',
-  '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', -- password: password123
+  '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', -- password: password123
   'Alice Johnson',
   'user',
   'individual'

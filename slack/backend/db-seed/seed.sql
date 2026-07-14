@@ -3,12 +3,12 @@
 
 -- Sample users
 INSERT INTO users (id, email, password_hash, username, display_name, avatar_url) VALUES
-    ('11111111-1111-1111-1111-111111111111', 'alice@company.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'alice', 'Alice Johnson', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150'),
-    ('22222222-2222-2222-2222-222222222222', 'bob@company.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'bob', 'Bob Smith', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150'),
-    ('33333333-3333-3333-3333-333333333333', 'carol@company.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'carol', 'Carol Williams', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150'),
-    ('44444444-4444-4444-4444-444444444444', 'dave@company.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'dave', 'Dave Brown', 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150'),
-    ('55555555-5555-5555-5555-555555555555', 'eve@company.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'eve', 'Eve Davis', 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150'),
-    ('66666666-6666-6666-6666-666666666666', 'slackbot@company.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'slackbot', 'Slackbot', NULL)
+    ('11111111-1111-1111-1111-111111111111', 'alice@company.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'alice', 'Alice Johnson', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150'),
+    ('22222222-2222-2222-2222-222222222222', 'bob@company.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'bob', 'Bob Smith', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150'),
+    ('33333333-3333-3333-3333-333333333333', 'carol@company.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'carol', 'Carol Williams', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150'),
+    ('44444444-4444-4444-4444-444444444444', 'dave@company.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'dave', 'Dave Brown', 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150'),
+    ('55555555-5555-5555-5555-555555555555', 'eve@company.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'eve', 'Eve Davis', 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150'),
+    ('66666666-6666-6666-6666-666666666666', 'slackbot@company.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'slackbot', 'Slackbot', NULL)
 ON CONFLICT (email) DO NOTHING;
 
 -- Sample workspaces

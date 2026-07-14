@@ -3,9 +3,9 @@
 -- bcrypt hash for 'password123'
 
 INSERT INTO users (id, username, email, password_hash, display_name) VALUES
-  ('a0000000-0000-0000-0000-000000000001', 'alice', 'alice@example.com', '$2a$10$rQXBz.ELij4FiGhVqJkRZeq1fVz9vDGqRcP2jmORaYKjH5GsBdI4a', 'Alice Johnson'),
-  ('a0000000-0000-0000-0000-000000000002', 'bob', 'bob@example.com', '$2a$10$rQXBz.ELij4FiGhVqJkRZeq1fVz9vDGqRcP2jmORaYKjH5GsBdI4a', 'Bob Smith'),
-  ('a0000000-0000-0000-0000-000000000003', 'charlie', 'charlie@example.com', '$2a$10$rQXBz.ELij4FiGhVqJkRZeq1fVz9vDGqRcP2jmORaYKjH5GsBdI4a', 'Charlie Davis')
+  ('a0000000-0000-0000-0000-000000000001', 'alice', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson'),
+  ('a0000000-0000-0000-0000-000000000002', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith'),
+  ('a0000000-0000-0000-0000-000000000003', 'charlie', 'charlie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Charlie Davis')
 ON CONFLICT (username) DO NOTHING;
 
 -- Upcoming meeting (hosted by alice)

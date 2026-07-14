@@ -2,8 +2,8 @@
 
 -- Insert sample users
 INSERT INTO users (email, password_hash, name, role) VALUES
-('admin@shopify-demo.local', crypt('admin123', gen_salt('bf')), 'Platform Admin', 'admin'),
-('merchant@example.com', crypt('merchant123', gen_salt('bf')), 'Demo Merchant', 'merchant');
+('admin@shopify-demo.local', '$2b$10$mMsTwOsDJ8Ej10Y0ExeI1uN6pm0WGfN4QqZwB0Bu6kU2DPL7UIHqm', 'Platform Admin', 'admin'),
+('merchant@example.com', '$2b$10$mMsTwOsDJ8Ej10Y0ExeI1uN6pm0WGfN4QqZwB0Bu6kU2DPL7UIHqm', 'Demo Merchant', 'merchant');
 
 -- Insert sample store
 INSERT INTO stores (owner_id, name, subdomain, description, theme) VALUES

@@ -6,7 +6,7 @@ INSERT INTO accounts (id, email, password_hash, subscription_tier, country)
 VALUES (
     'a0000000-0000-0000-0000-000000000001',
     'demo@netflix.local',
-    '$2b$10$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', -- password: demo123
+    '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', -- password: demo123
     'premium',
     'US'
 );

@@ -3,10 +3,10 @@
 
 -- Sample users
 INSERT INTO users (id, email, password_hash, username, display_name, avatar_url, is_premium, role) VALUES
-    ('ac111111-1111-1111-1111-111111111111', 'alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'alice_music', 'Alice', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150', true, 'user'),
-    ('ac222222-2222-2222-2222-222222222222', 'bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'bob_beats', 'Bob', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150', false, 'user'),
-    ('ac333333-3333-3333-3333-333333333333', 'carol@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'carol_tunes', 'Carol', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150', true, 'user'),
-    ('ac444444-4444-4444-4444-444444444444', 'admin@spotify.local', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'admin', 'Admin', NULL, true, 'admin')
+    ('ac111111-1111-1111-1111-111111111111', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'alice_music', 'Alice', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150', true, 'user'),
+    ('ac222222-2222-2222-2222-222222222222', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'bob_beats', 'Bob', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150', false, 'user'),
+    ('ac333333-3333-3333-3333-333333333333', 'carol@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'carol_tunes', 'Carol', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150', true, 'user'),
+    ('ac444444-4444-4444-4444-444444444444', 'admin@spotify.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'admin', 'Admin', NULL, true, 'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- Sample artists

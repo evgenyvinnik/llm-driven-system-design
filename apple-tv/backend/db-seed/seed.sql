@@ -10,10 +10,10 @@
 -- Hash: $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
 
 INSERT INTO users (id, email, password_hash, name, role, subscription_tier, subscription_expires_at) VALUES
-    ('ac111111-1111-1111-1111-111111111111', 'alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice Johnson', 'user', 'yearly', NOW() + INTERVAL '300 days'),
-    ('ac222222-2222-2222-2222-222222222222', 'bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Bob Smith', 'user', 'monthly', NOW() + INTERVAL '25 days'),
-    ('ac333333-3333-3333-3333-333333333333', 'charlie@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Charlie Brown', 'user', 'free', NULL),
-    ('ac444444-4444-4444-4444-444444444444', 'admin@appletv.local', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Admin User', 'admin', 'yearly', NOW() + INTERVAL '365 days')
+    ('ac111111-1111-1111-1111-111111111111', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson', 'user', 'yearly', NOW() + INTERVAL '300 days'),
+    ('ac222222-2222-2222-2222-222222222222', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith', 'user', 'monthly', NOW() + INTERVAL '25 days'),
+    ('ac333333-3333-3333-3333-333333333333', 'charlie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Charlie Brown', 'user', 'free', NULL),
+    ('ac444444-4444-4444-4444-444444444444', 'admin@appletv.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', 'admin', 'yearly', NOW() + INTERVAL '365 days')
 ON CONFLICT (email) DO NOTHING;
 
 -- ============================================================================

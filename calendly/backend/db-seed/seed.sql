@@ -13,10 +13,10 @@
 -- Hash: $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
 
 INSERT INTO users (id, email, password_hash, name, time_zone, role) VALUES
-    ('d1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice Johnson', 'America/Los_Angeles', 'user'),
-    ('d2eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Bob Smith', 'America/Chicago', 'user'),
-    ('d3eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'charlie@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Charlie Brown', 'Europe/London', 'user'),
-    ('d4eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'diana@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Diana Ross', 'Asia/Tokyo', 'user')
+    ('d1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson', 'America/Los_Angeles', 'user'),
+    ('d2eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith', 'America/Chicago', 'user'),
+    ('d3eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'charlie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Charlie Brown', 'Europe/London', 'user'),
+    ('d4eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'diana@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Diana Ross', 'Asia/Tokyo', 'user')
 ON CONFLICT (email) DO NOTHING;
 
 -- ============================================================================

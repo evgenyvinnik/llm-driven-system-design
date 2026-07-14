@@ -9,7 +9,7 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "guest1@example.com",
+      "email": "alice@example.com",
       "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",

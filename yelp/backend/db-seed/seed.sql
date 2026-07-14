@@ -44,13 +44,13 @@ ON CONFLICT (slug) DO NOTHING;
 -- USERS
 -- ============================================================================
 INSERT INTO users (id, email, password_hash, name, avatar_url, role, review_count) VALUES
-    ('11111111-1111-1111-1111-111111111111', 'alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice Johnson', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=200', 'user', 0),
-    ('22222222-2222-2222-2222-222222222222', 'bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Bob Smith', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=200', 'user', 0),
-    ('33333333-3333-3333-3333-333333333333', 'charlie@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Charlie Brown', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=200', 'user', 0),
-    ('44444444-4444-4444-4444-444444444444', 'diana@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Diana Ross', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=200', 'business_owner', 0),
-    ('55555555-5555-5555-5555-555555555555', 'eve@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Eve Williams', 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=200', 'user', 0),
-    ('66666666-6666-6666-6666-666666666666', 'frank@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Frank Miller', 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=200', 'business_owner', 0),
-    ('77777777-7777-7777-7777-777777777777', 'admin@yelp-clone.local', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Admin User', NULL, 'admin', 0)
+    ('11111111-1111-1111-1111-111111111111', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=200', 'user', 0),
+    ('22222222-2222-2222-2222-222222222222', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=200', 'user', 0),
+    ('33333333-3333-3333-3333-333333333333', 'charlie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Charlie Brown', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=200', 'user', 0),
+    ('44444444-4444-4444-4444-444444444444', 'diana@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Diana Ross', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=200', 'business_owner', 0),
+    ('55555555-5555-5555-5555-555555555555', 'eve@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Eve Williams', 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=200', 'user', 0),
+    ('66666666-6666-6666-6666-666666666666', 'frank@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Frank Miller', 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=200', 'business_owner', 0),
+    ('77777777-7777-7777-7777-777777777777', 'admin@yelp-clone.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', NULL, 'admin', 0)
 ON CONFLICT (email) DO NOTHING;
 
 -- ============================================================================

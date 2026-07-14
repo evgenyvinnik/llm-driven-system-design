@@ -1,8 +1,8 @@
 -- Seed users (passwords are 'password123' hashed with bcrypt)
 INSERT INTO users (id, username, email, password_hash, display_name, is_verified)
 VALUES
-  ('a0000000-0000-0000-0000-000000000001', 'alice', 'alice@example.com', '$2b$12$LJ3m4ys3uz5r/EvFX0TiHe8jP.gGKczxy3yBj2DgK/01QZyxuNOHa', 'Alice Trader', true),
-  ('b0000000-0000-0000-0000-000000000002', 'bob', 'bob@example.com', '$2b$12$LJ3m4ys3uz5r/EvFX0TiHe8jP.gGKczxy3yBj2DgK/01QZyxuNOHa', 'Bob Investor', true)
+  ('a0000000-0000-0000-0000-000000000001', 'alice', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Trader', true),
+  ('b0000000-0000-0000-0000-000000000002', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Investor', true)
 ON CONFLICT (username) DO NOTHING;
 
 -- Seed wallets for alice

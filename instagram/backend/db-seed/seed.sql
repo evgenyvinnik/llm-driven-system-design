@@ -5,12 +5,12 @@
 -- Create users (password hash for 'password123' with bcrypt)
 INSERT INTO users (id, username, email, password_hash, display_name, bio, profile_picture_url, is_private, role)
 VALUES
-    ('11111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice Johnson', 'Photographer | Travel enthusiast | Coffee addict', 'https://i.pravatar.cc/150?u=alice', false, 'user'),
-    ('22222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Bob Smith', 'Foodie | Chef in training | Living the good life', 'https://i.pravatar.cc/150?u=bob', false, 'user'),
-    ('33333333-3333-3333-3333-333333333333', 'carol', 'carol@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Carol Davis', 'Artist | Nature lover | Dog mom', 'https://i.pravatar.cc/150?u=carol', false, 'user'),
-    ('44444444-4444-4444-4444-444444444444', 'david', 'david@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'David Wilson', 'Tech geek | Gamer | Coffee lover', 'https://i.pravatar.cc/150?u=david', false, 'user'),
-    ('55555555-5555-5555-5555-555555555555', 'emma', 'emma@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Emma Thompson', 'Fitness | Yoga | Healthy living', 'https://i.pravatar.cc/150?u=emma', false, 'user'),
-    ('66666666-6666-6666-6666-666666666666', 'admin', 'admin@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Admin User', 'Platform Administrator', 'https://i.pravatar.cc/150?u=admin', false, 'admin')
+    ('11111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson', 'Photographer | Travel enthusiast | Coffee addict', 'https://i.pravatar.cc/150?u=alice', false, 'user'),
+    ('22222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith', 'Foodie | Chef in training | Living the good life', 'https://i.pravatar.cc/150?u=bob', false, 'user'),
+    ('33333333-3333-3333-3333-333333333333', 'carol', 'carol@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Carol Davis', 'Artist | Nature lover | Dog mom', 'https://i.pravatar.cc/150?u=carol', false, 'user'),
+    ('44444444-4444-4444-4444-444444444444', 'david', 'david@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'David Wilson', 'Tech geek | Gamer | Coffee lover', 'https://i.pravatar.cc/150?u=david', false, 'user'),
+    ('55555555-5555-5555-5555-555555555555', 'emma', 'emma@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Emma Thompson', 'Fitness | Yoga | Healthy living', 'https://i.pravatar.cc/150?u=emma', false, 'user'),
+    ('66666666-6666-6666-6666-666666666666', 'admin', 'admin@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', 'Platform Administrator', 'https://i.pravatar.cc/150?u=admin', false, 'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- Create posts with images

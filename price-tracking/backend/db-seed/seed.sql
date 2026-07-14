@@ -16,5 +16,5 @@ ON CONFLICT (domain) DO NOTHING;
 -- Create a default admin user (password: admin123)
 -- Note: In production, use proper password hashing
 INSERT INTO users (email, password_hash, role)
-VALUES ('admin@pricetracker.local', '$2b$10$rQEY1xN1K1vCxQz8s1Xn2Ov.QW7xQW7xQW7xQW7xQW7xQW7xQW7', 'admin')
+VALUES ('admin@pricetracker.local', '$2b$10$mMsTwOsDJ8Ej10Y0ExeI1uN6pm0WGfN4QqZwB0Bu6kU2DPL7UIHqm', 'admin')
 ON CONFLICT (email) DO NOTHING;

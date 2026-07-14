@@ -3,18 +3,18 @@
 
 -- Create admin user (password: admin123)
 INSERT INTO users (id, email, password_hash, name, phone, role) VALUES
-  ('00000000-0000-0000-0000-000000000001', 'admin@delivery.local', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Admin User', '555-0000', 'admin');
+  ('00000000-0000-0000-0000-000000000001', 'admin@delivery.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', '555-0000', 'admin');
 
 -- Create test customers
 INSERT INTO users (id, email, password_hash, name, phone, role) VALUES
-  ('00000000-0000-0000-0000-000000000010', 'customer1@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Alice Customer', '555-0010', 'customer'),
-  ('00000000-0000-0000-0000-000000000011', 'customer2@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Bob Customer', '555-0011', 'customer');
+  ('00000000-0000-0000-0000-000000000010', 'customer1@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Customer', '555-0010', 'customer'),
+  ('00000000-0000-0000-0000-000000000011', 'customer2@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Customer', '555-0011', 'customer');
 
 -- Create test drivers
 INSERT INTO users (id, email, password_hash, name, phone, role) VALUES
-  ('00000000-0000-0000-0000-000000000020', 'driver1@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Charlie Driver', '555-0020', 'driver'),
-  ('00000000-0000-0000-0000-000000000021', 'driver2@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Diana Driver', '555-0021', 'driver'),
-  ('00000000-0000-0000-0000-000000000022', 'driver3@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Eddie Driver', '555-0022', 'driver');
+  ('00000000-0000-0000-0000-000000000020', 'driver1@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Charlie Driver', '555-0020', 'driver'),
+  ('00000000-0000-0000-0000-000000000021', 'driver2@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Diana Driver', '555-0021', 'driver'),
+  ('00000000-0000-0000-0000-000000000022', 'driver3@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Eddie Driver', '555-0022', 'driver');
 
 INSERT INTO drivers (id, vehicle_type, license_plate, status, rating, total_deliveries, current_lat, current_lng) VALUES
   ('00000000-0000-0000-0000-000000000020', 'car', 'ABC123', 'available', 4.85, 150, 37.7749, -122.4194),
@@ -23,9 +23,9 @@ INSERT INTO drivers (id, vehicle_type, license_plate, status, rating, total_deli
 
 -- Create test merchant users
 INSERT INTO users (id, email, password_hash, name, phone, role) VALUES
-  ('00000000-0000-0000-0000-000000000030', 'pizzaplace@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Pizza Place Owner', '555-0030', 'merchant'),
-  ('00000000-0000-0000-0000-000000000031', 'burgerspot@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Burger Spot Owner', '555-0031', 'merchant'),
-  ('00000000-0000-0000-0000-000000000032', 'sushiexpress@test.com', '$2b$10$rR8GrJzJJqRME0v0A9xI3.Kx5Y5HjhGJ3kxj5Y5HjhGJ3kxj5Y5H', 'Sushi Express Owner', '555-0032', 'merchant');
+  ('00000000-0000-0000-0000-000000000030', 'pizzaplace@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Pizza Place Owner', '555-0030', 'merchant'),
+  ('00000000-0000-0000-0000-000000000031', 'burgerspot@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Burger Spot Owner', '555-0031', 'merchant'),
+  ('00000000-0000-0000-0000-000000000032', 'sushiexpress@test.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Sushi Express Owner', '555-0032', 'merchant');
 
 -- Create test merchants
 INSERT INTO merchants (id, owner_id, name, description, address, lat, lng, category, avg_prep_time_minutes, rating) VALUES

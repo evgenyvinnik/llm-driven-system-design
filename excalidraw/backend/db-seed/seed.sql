@@ -5,8 +5,8 @@
 -- Generated with: bcryptjs.hashSync('password123', 12)
 -- Using a pre-computed hash to avoid runtime dependency
 INSERT INTO users (id, username, email, password_hash, display_name) VALUES
-  ('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d', 'alice', 'alice@example.com', '$2a$12$LJ3m4ys3GZfnOcMBRUbQNuYxHf6MFsIOB4GqOOCu/wgy3pNhvvVOe', 'Alice Designer'),
-  ('b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e', 'bob', 'bob@example.com', '$2a$12$LJ3m4ys3GZfnOcMBRUbQNuYxHf6MFsIOB4GqOOCu/wgy3pNhvvVOe', 'Bob Artist');
+  ('a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d', 'alice', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Designer'),
+  ('b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Artist');
 
 -- Alice's drawings
 INSERT INTO drawings (id, title, owner_id, elements, is_public) VALUES

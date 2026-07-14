@@ -13,7 +13,7 @@ ON CONFLICT DO NOTHING;
 
 -- Insert default admin user (password: admin123)
 INSERT INTO users (email, password_hash, name, role) VALUES
-  ('admin@amazon.local', '$2b$10$rPqO8.mLVk3vQzGvXtE8UOqHoS3wHJYZxL/5GZXS0vCaC3B5Q4LlW', 'Admin User', 'admin')
+  ('admin@amazon.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', 'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- Insert sample categories
@@ -43,7 +43,7 @@ ON CONFLICT (slug) DO NOTHING;
 
 -- Create a default seller
 INSERT INTO users (email, password_hash, name, role) VALUES
-  ('seller@amazon.local', '$2b$10$rPqO8.mLVk3vQzGvXtE8UOqHoS3wHJYZxL/5GZXS0vCaC3B5Q4LlW', 'Demo Seller', 'seller')
+  ('seller@amazon.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Demo Seller', 'seller')
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO sellers (user_id, business_name, description)
@@ -59,11 +59,11 @@ ON CONFLICT DO NOTHING;
 -- Hash: $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
 
 INSERT INTO users (email, password_hash, name, role) VALUES
-    ('alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice Johnson', 'user'),
-    ('bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Bob Smith', 'user'),
-    ('charlie@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Charlie Brown', 'user'),
-    ('diana@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Diana Ross', 'seller'),
-    ('eve@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Eve Wilson', 'seller')
+    ('alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Johnson', 'user'),
+    ('bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Smith', 'user'),
+    ('charlie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Charlie Brown', 'user'),
+    ('diana@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Diana Ross', 'seller'),
+    ('eve@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Eve Wilson', 'seller')
 ON CONFLICT (email) DO NOTHING;
 
 -- ============================================================================

@@ -23,11 +23,11 @@ ON CONFLICT (slug) DO NOTHING;
 -- admin123   => $2b$10$rQEY5dO.BEClHFmhLHOBqOD/OGhoZyZJL9MsO1Y6gSlhB7O7RFOXe
 -- ============================================================
 INSERT INTO users (email, password_hash, username, full_name, role) VALUES
-  ('alice@example.com',  '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'alicecraft',    'Alice Johnson',  'user'),
-  ('bob@example.com',    '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'bobsworkshop',  'Bob Smith',      'user'),
-  ('carol@example.com',  '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'carolcreates',  'Carol Williams', 'user'),
-  ('buyer@example.com',  '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'happybuyer',    'Happy Buyer',    'user'),
-  ('admin@example.com',  '$2b$10$rQEY5dO.BEClHFmhLHOBqOD/OGhoZyZJL9MsO1Y6gSlhB7O7RFOXe', 'admin',         'Admin User',     'admin')
+  ('alice@example.com',  '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'alicecraft',    'Alice Johnson',  'user'),
+  ('bob@example.com',    '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'bobsworkshop',  'Bob Smith',      'user'),
+  ('carol@example.com',  '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'carolcreates',  'Carol Williams', 'user'),
+  ('buyer@example.com',  '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'happybuyer',    'Happy Buyer',    'user'),
+  ('admin@example.com',  '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'admin',         'Admin User',     'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- ============================================================

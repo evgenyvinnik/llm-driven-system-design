@@ -2,10 +2,10 @@
 -- Password is 'password123' hashed with bcrypt
 
 INSERT INTO users (email, password_hash, name, phone, role) VALUES
-('customer@example.com', '$2b$10$rQZ5p3Ky5y5y5y5y5y5y5uKq5q5q5q5q5q5q5q5q5q5q5q5q5q5q5', 'John Customer', '555-0100', 'customer'),
-('restaurant@example.com', '$2b$10$rQZ5p3Ky5y5y5y5y5y5y5uKq5q5q5q5q5q5q5q5q5q5q5q5q5q5q5', 'Maria Restaurant', '555-0101', 'restaurant_owner'),
-('driver@example.com', '$2b$10$rQZ5p3Ky5y5y5y5y5y5y5uKq5q5q5q5q5q5q5q5q5q5q5q5q5q5q5', 'Dave Driver', '555-0102', 'driver'),
-('admin@example.com', '$2b$10$rQZ5p3Ky5y5y5y5y5y5y5uKq5q5q5q5q5q5q5q5q5q5q5q5q5q5q5', 'Admin User', '555-0103', 'admin');
+('customer@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'John Customer', '555-0100', 'customer'),
+('restaurant@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Maria Restaurant', '555-0101', 'restaurant_owner'),
+('driver@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Dave Driver', '555-0102', 'driver'),
+('admin@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', '555-0103', 'admin');
 
 -- Sample restaurants (San Francisco area)
 INSERT INTO restaurants (owner_id, name, description, address, lat, lon, cuisine_type, rating, rating_count, prep_time_minutes, is_open, delivery_fee, min_order) VALUES

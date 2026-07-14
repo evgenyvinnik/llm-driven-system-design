@@ -4,11 +4,11 @@
 
 -- Users
 INSERT INTO users (id, email, name, password_hash, avatar_color, role) VALUES
-  ('11111111-1111-1111-1111-111111111111', 'alice@example.com', 'Alice Johnson', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '#EF4444', 'user'),
-  ('22222222-2222-2222-2222-222222222222', 'bob@example.com', 'Bob Smith', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '#22C55E', 'user'),
-  ('33333333-3333-3333-3333-333333333333', 'carol@example.com', 'Carol Williams', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '#3B82F6', 'user'),
-  ('44444444-4444-4444-4444-444444444444', 'david@example.com', 'David Chen', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '#F59E0B', 'user'),
-  ('55555555-5555-5555-5555-555555555555', 'admin@docs.local', 'Admin User', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', '#8B5CF6', 'admin')
+  ('11111111-1111-1111-1111-111111111111', 'alice@example.com', 'Alice Johnson', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', '#EF4444', 'user'),
+  ('22222222-2222-2222-2222-222222222222', 'bob@example.com', 'Bob Smith', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', '#22C55E', 'user'),
+  ('33333333-3333-3333-3333-333333333333', 'carol@example.com', 'Carol Williams', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', '#3B82F6', 'user'),
+  ('44444444-4444-4444-4444-444444444444', 'david@example.com', 'David Chen', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', '#F59E0B', 'user'),
+  ('55555555-5555-5555-5555-555555555555', 'admin@docs.local', 'Admin User', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', '#8B5CF6', 'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- Documents

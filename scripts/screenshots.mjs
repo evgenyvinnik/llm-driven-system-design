@@ -348,8 +348,18 @@ async function waitForRedis(projectDir) {
 }
 
 /**
- * Setup database (run seed.sql if it exists)
- * Note: init.sql is automatically run by PostgreSQL on first startup via docker-entrypoint-initdb.d
+ * Setup database: run migrations, then seed.
+ *
+ * Order matters. Migrations must run BEFORE seeding: some projects' init.sql
+ * recreates tables, which would wipe seed data if seeding ran first.
+ *
+ * Seeding uses backend/db-seed/seed.sql when present, and otherwise falls back
+ * to the project's own seed script (db:seed / seed). Without that fallback,
+ * projects that seed via TypeScript never get any data, and every login-based
+ * screenshot fails with "Invalid credentials".
+ *
+ * Note: init.sql is also applied by PostgreSQL on first startup when the project
+ * mounts it into docker-entrypoint-initdb.d.
  */
 async function setupDatabase(projectDir, projectName, config) {
   if (!config.backendRequired) {
@@ -358,9 +368,20 @@ async function setupDatabase(projectDir, projectName, config) {
 
   const backendDir = path.join(projectDir, 'backend');
   const seedSqlPath = path.join(backendDir, 'db-seed', 'seed.sql');
+  const pkgJsonPath = path.join(backendDir, 'package.json');
 
-  if (!fs.existsSync(seedSqlPath)) {
-    return true; // No seeding needed
+  let scripts = {};
+  if (fs.existsSync(pkgJsonPath)) {
+    try {
+      scripts = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8')).scripts || {};
+    } catch {
+      scripts = {};
+    }
+  }
+  const seedScript = ['db:seed', 'seed'].find(s => scripts[s]);
+
+  if (!fs.existsSync(seedSqlPath) && !seedScript && !scripts['db:migrate']) {
+    return true; // Nothing to migrate or seed
   }
 
   // Get database name from config or use project name
@@ -388,6 +409,45 @@ async function setupDatabase(projectDir, projectName, config) {
     return false;
   }
 
+  // Backend deps are needed for both migrate and TypeScript seed scripts.
+  if ((scripts['db:migrate'] || seedScript) && !fs.existsSync(path.join(backendDir, 'node_modules'))) {
+    await installDeps(backendDir, 'backend');
+  }
+
+  // Migrations FIRST — an init.sql that recreates tables would otherwise wipe the seed.
+  if (scripts['db:migrate']) {
+    logStep('DB', 'Running database migrations...');
+    try {
+      execSync('npm run db:migrate', { cwd: backendDir, stdio: 'pipe' });
+      logSuccess('Migrations complete');
+    } catch (error) {
+      logWarning(`Migration failed: ${error.message}`);
+    }
+  }
+
+  // Run the project's own seed script when seed.sql is missing, or when seed.sql
+  // exists but seeds no user rows (several projects keep reference data in SQL and
+  // create their users in TypeScript — without this, login screenshots fail).
+  const hasSeedSql = fs.existsSync(seedSqlPath);
+  const seedSqlHasUsers = hasSeedSql
+    && /INSERT\s+INTO\s+(users|accounts|app_users)\b/i.test(fs.readFileSync(seedSqlPath, 'utf-8'));
+  const runSeedScript = Boolean(seedScript) && !seedSqlHasUsers;
+
+  if (!hasSeedSql) {
+    if (!runSeedScript) {
+      return true; // Nothing to seed
+    }
+    logStep('DATABASE', `Seeding database (npm run ${seedScript})...`);
+    try {
+      execSync(`npm run ${seedScript}`, { cwd: backendDir, stdio: 'pipe' });
+      logSuccess('Database seeded');
+      return true;
+    } catch (error) {
+      logWarning(`Database seeding failed (npm run ${seedScript}): ${error.message}`);
+      return false;
+    }
+  }
+
   logStep('DATABASE', 'Seeding database...');
 
   // Retry seeding a few times (in case database just became ready)
@@ -399,6 +459,18 @@ async function setupDatabase(projectDir, projectName, config) {
         stdio: 'pipe',
       });
       logSuccess('Database seeded');
+
+      // seed.sql carries reference data only for some projects; their users come
+      // from the TypeScript seeder, so run it too.
+      if (runSeedScript) {
+        logStep('DATABASE', `Seeding users (npm run ${seedScript})...`);
+        try {
+          execSync(`npm run ${seedScript}`, { cwd: backendDir, stdio: 'pipe' });
+          logSuccess('User seed complete');
+        } catch (error) {
+          logWarning(`User seeding failed (npm run ${seedScript}): ${error.message}`);
+        }
+      }
       return true;
     } catch (error) {
       if (attempt === 3) {
@@ -453,23 +525,7 @@ async function startBackend(projectDir, config) {
     return null;
   }
 
-  // Run migrations if db:migrate script exists
-  const pkgJsonPath = path.join(backendDir, 'package.json');
-  if (fs.existsSync(pkgJsonPath)) {
-    const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-    if (pkgJson.scripts?.['db:migrate']) {
-      logStep('DB', 'Running database migrations...');
-      try {
-        execSync('npm run db:migrate', {
-          cwd: backendDir,
-          stdio: 'pipe',
-        });
-        logSuccess('Migrations complete');
-      } catch (error) {
-        logWarning(`Migration failed: ${error.message}`);
-      }
-    }
-  }
+  // Migrations already ran in setupDatabase(), before seeding.
 
   logStep('START', 'Starting backend...');
 

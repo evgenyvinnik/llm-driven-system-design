@@ -9,7 +9,7 @@
     "loginUrl": "/login",
     "credentials": {
       "email": "demo@netflix.local",
-      "password": "demo123"
+      "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
     "passwordSelector": "input[name='password'], input[type='password']",

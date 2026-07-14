@@ -9,7 +9,7 @@
     "loginUrl": "/login",
     "credentials": {
       "email": "admin@appstore.dev",
-      "password": "admin123"
+      "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
     "passwordSelector": "input[name='password'], input[type='password']",

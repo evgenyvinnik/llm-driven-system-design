@@ -4,10 +4,10 @@
 -- Insert sample users (all passwords are 'password123')
 INSERT INTO users (id, username, email, password_hash, display_name, bio, is_celebrity, follower_count)
 VALUES
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'john_doe', 'john@example.com', '$2b$10$rQZ6vXP0a5TbGSKLMRzv8.ZZq5kzv1sN5A7MsMkbz8IlCOq7j9C6a', 'John Doe', 'Software developer and coffee enthusiast', FALSE, 150),
-    ('b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a22', 'jane_smith', 'jane@example.com', '$2b$10$rQZ6vXP0a5TbGSKLMRzv8.ZZq5kzv1sN5A7MsMkbz8IlCOq7j9C6a', 'Jane Smith', 'Designer and photographer', FALSE, 320),
-    ('c2eebc99-9c0b-4ef8-bb6d-6bb9bd380a33', 'tech_guru', 'tech@example.com', '$2b$10$rQZ6vXP0a5TbGSKLMRzv8.ZZq5kzv1sN5A7MsMkbz8IlCOq7j9C6a', 'Tech Guru', 'Tech influencer | 1M followers', TRUE, 1000000),
-    ('d3eebc99-9c0b-4ef8-bb6d-6bb9bd380a44', 'admin', 'admin@example.com', '$2b$10$rQZ6vXP0a5TbGSKLMRzv8.ZZq5kzv1sN5A7MsMkbz8IlCOq7j9C6a', 'Admin User', 'System administrator', FALSE, 0);
+    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'john_doe', 'john@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'John Doe', 'Software developer and coffee enthusiast', FALSE, 150),
+    ('b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a22', 'jane_smith', 'jane@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Jane Smith', 'Designer and photographer', FALSE, 320),
+    ('c2eebc99-9c0b-4ef8-bb6d-6bb9bd380a33', 'tech_guru', 'tech@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Tech Guru', 'Tech influencer | 1M followers', TRUE, 1000000),
+    ('d3eebc99-9c0b-4ef8-bb6d-6bb9bd380a44', 'admin', 'admin@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', 'System administrator', FALSE, 0);
 
 -- Update admin role
 UPDATE users SET role = 'admin' WHERE username = 'admin';

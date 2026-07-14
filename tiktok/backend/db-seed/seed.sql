@@ -4,12 +4,12 @@
 -- Sample users (creators)
 INSERT INTO users (id, username, email, password_hash, display_name, bio, avatar_url, follower_count, following_count, video_count, like_count, role)
 VALUES
-  (1, 'alice_dance', 'alice@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice the Dancer', 'Professional dancer sharing my moves!', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=200', 15420, 256, 45, 125000, 'user'),
-  (2, 'bob_comedy', 'bob@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Funny Bob', 'Making you laugh one video at a time', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=200', 28500, 189, 78, 450000, 'user'),
-  (3, 'charlie_cook', 'charlie@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Chef Charlie', 'Quick recipes for busy people', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=200', 42100, 312, 92, 680000, 'user'),
-  (4, 'diana_fitness', 'diana@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Fit Diana', 'Your daily dose of workout motivation', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=200', 89200, 145, 156, 1250000, 'user'),
-  (5, 'eddie_music', 'eddie@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Eddie Beats', 'Producer and musician', 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=200', 56700, 423, 67, 890000, 'user'),
-  (6, 'admin', 'admin@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'TikTok Admin', 'Platform administrator', 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=200', 0, 0, 0, 0, 'admin')
+  (1, 'alice_dance', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice the Dancer', 'Professional dancer sharing my moves!', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=200', 15420, 256, 45, 125000, 'user'),
+  (2, 'bob_comedy', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Funny Bob', 'Making you laugh one video at a time', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=200', 28500, 189, 78, 450000, 'user'),
+  (3, 'charlie_cook', 'charlie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Chef Charlie', 'Quick recipes for busy people', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=200', 42100, 312, 92, 680000, 'user'),
+  (4, 'diana_fitness', 'diana@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Fit Diana', 'Your daily dose of workout motivation', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=200', 89200, 145, 156, 1250000, 'user'),
+  (5, 'eddie_music', 'eddie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Eddie Beats', 'Producer and musician', 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=200', 56700, 423, 67, 890000, 'user'),
+  (6, 'admin', 'admin@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'TikTok Admin', 'Platform administrator', 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=200', 0, 0, 0, 0, 'admin')
 ON CONFLICT (username) DO NOTHING;
 
 -- Follow relationships

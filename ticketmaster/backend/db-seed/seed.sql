@@ -52,7 +52,7 @@ INSERT INTO venue_sections (venue_id, name, row_count, seats_per_row, base_price
 
 -- Create admin user (password: admin123)
 INSERT INTO users (id, email, password_hash, name, role) VALUES
-('550e8400-e29b-41d4-a716-446655440100', 'admin@ticketmaster.local', '$2b$10$rQZ5Q7Q7Q7Q7Q7Q7Q7Q7Q.kxQZQ5Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7', 'Admin User', 'admin');
+('550e8400-e29b-41d4-a716-446655440100', 'admin@ticketmaster.local', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Admin User', 'admin');
 
 -- Create sample events (to be generated with seats by the application)
 INSERT INTO events (id, name, description, venue_id, artist, category, event_date, on_sale_date, status, total_capacity, available_seats, waiting_room_enabled, max_tickets_per_user, image_url) VALUES
