@@ -60,7 +60,7 @@ INSERT INTO users (id, email, password_hash, first_name, last_name, phone, role)
 VALUES (
   'e4eebc99-9c0b-4ef8-bb6d-6bb9bd380a55',
   'admin@example.com',
-  '$2b$10$rQEY5dO.BEClHFmhLHOBqOD/OGhoZyZJL9MsO1Y6gSlhB7O7RFOXe',
+  '$2a$10$Jwu.HnwmSQGc02Lr7mgZ.uRhHxwKb.KjaUcoz9PlnUfR0lAmhvJAq',
   'Admin',
   'User',
   '+1-555-0999',

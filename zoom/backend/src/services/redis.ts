@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { config } from '../config/index.js';
 
 /** Redis client for session storage and real-time meeting state. */

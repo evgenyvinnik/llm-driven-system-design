@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
 import { RedisStore } from 'connect-redis';
-import pinoHttp from 'pino-http';
+import { pinoHttp } from 'pino-http';
 import { redis } from './services/redis.js';
 import { logger } from './services/logger.js';
 import { config } from './config/index.js';

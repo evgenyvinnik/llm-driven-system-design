@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router';
 import type { Restaurant } from '../types';
+import { formatDecimal, formatPrice } from '../utils/format';
 
 /**
  * Props for the RestaurantCard component.
@@ -59,7 +60,7 @@ export function RestaurantCard({ restaurant }: Props) {
             <svg className="w-4 h-4 text-yellow-400 fill-current" viewBox="0 0 20 20">
               <path d="M10 15l-5.878 3.09 1.123-6.545L.489 6.91l6.572-.955L10 0l2.939 5.955 6.572.955-4.756 4.635 1.123 6.545z" />
             </svg>
-            <span className="font-medium">{restaurant.rating.toFixed(1)}</span>
+            <span className="font-medium">{formatDecimal(restaurant.rating, 1)}</span>
             <span className="text-gray-400">({restaurant.rating_count})</span>
           </span>
           {restaurant.cuisine_type && (
@@ -72,11 +73,11 @@ export function RestaurantCard({ restaurant }: Props) {
         <div className="flex items-center gap-2 mt-2 text-sm text-gray-500">
           <span>{restaurant.prep_time_minutes}-{restaurant.prep_time_minutes + 10} min</span>
           <span className="text-gray-300">|</span>
-          <span>${restaurant.delivery_fee.toFixed(2)} delivery</span>
+          <span>${formatPrice(restaurant.delivery_fee)} delivery</span>
         </div>
         {restaurant.distance !== undefined && (
           <p className="text-sm text-gray-400 mt-1">
-            {restaurant.distance.toFixed(1)} km away
+            {formatDecimal(restaurant.distance, 1)} km away
           </p>
         )}
       </div>

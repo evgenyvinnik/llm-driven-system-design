@@ -77,7 +77,7 @@ router.get('/:symbol/orderbook', (req: Request, res: Response) => {
   const { symbol } = req.params;
   const levels = parseInt(req.query.levels as string) || 20;
 
-  const book = orderBookManager.getBook(symbol);
+  const book = orderBookManager.getBook(String(symbol));
   const depth = book.getDepth(levels);
   const spread = book.getSpread();
 

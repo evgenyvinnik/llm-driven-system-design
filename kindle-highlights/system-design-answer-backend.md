@@ -253,8 +253,11 @@ Authorization is entirely about visibility, and it resolves against three inputs
 | Export | 10/hour | Per user | Each one is a full-history scan and a worker job |
 | Search | 30/min | Per user | CPU-bound; the most expensive read a user can trigger on demand |
 | General API | 1,000/min | Per user | Backstop |
+| Follow | 60/hour | Per user | Follow-spam is how you farm visibility into other people's `friends`-scoped highlights |
 
 The create limit is doing double duty: it's a load control *and* it's the first line of defense against counter manipulation, since inflating a passage's public count requires volume. It won't stop a distributed attack, but it makes the naive one useless.
+
+The follow limit is the one people forget. Follows are the key that unlocks `friends`-visibility highlights, so an account that follows ten thousand people has quietly assembled a read permission over ten thousand people's semi-private annotations. Rate-limiting follows isn't about database load — it's an access-control measure wearing a rate-limiter's clothes.
 
 ## 🛡️ Idempotency and Failure Handling
 

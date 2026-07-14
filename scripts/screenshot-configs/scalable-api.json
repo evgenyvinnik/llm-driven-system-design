@@ -9,8 +9,8 @@
     "enabled": true,
     "loginUrl": "/",
     "credentials": {
-      "email": "admin@example.com",
-      "password": "admin123"
+      "email": "alice@example.com",
+      "password": "password123"
     },
     "usernameSelector": "input[name='email'], input#email",
     "passwordSelector": "input[name='password'], input#password",

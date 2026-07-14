@@ -221,6 +221,69 @@ Conversion creates an account, a contact, and an opportunity, each with a server
 
 And this is the strongest argument for **keeping these five objects in one service and one database as long as possible**: the transactional boundary should follow the *workflow* boundary, and conversion is the workflow that binds them. Splitting them apart is not a free refactor — it's a decision to take on distributed transactions, and it should be made deliberately, not by an org chart.
 
+## 🔎 End-to-End Trace: One Drag, Both Halves
+
+Worth walking once, because it touches every seam in the design.
+
+```
+ rep drops "Acme Renewal" on Closed Won
+        │
+        ▼  CLIENT
+ ┌───────────────────────────┐
+ │ snapshot old stage        │
+ │ cache.opps[id].stage = …  │  ← board repaints in ~0ms.
+ │ push to mutation queue    │     This is the entire reason
+ └────────────┬──────────────┘     any of the rest exists.
+              ▼
+     PUT /opportunities/:id/stage   { stage, version: 7 }
+              │
+              ▼  SERVER
+ ┌───────────────────────────┐
+ │ 1. session → org_id       │  never from the request
+ │ 2. RLS-bound connection   │  a missing predicate = 0 rows
+ │ 3. sharing check: may this│
+ │    user edit this record? │
+ │ 4. UPDATE … WHERE version │
+ │    = 7  → 0 rows? 409.    │
+ │ 5. derive probability     │  server owns the mapping
+ │ 6. emit change event      │  → CDC
+ └────────────┬──────────────┘
+      ┌───────┴────────┐
+      ▼                ▼
+ 200 + record     409 + CURRENT record
+   (version 8)      (version 9, Closed Won, by Dana)
+      │                │
+      ▼  CLIENT        ▼  CLIENT
+ replace optimistic  write SERVER's state (roll FORWARD)
+ value with server   + "Dana moved this 2m ago"
+ truth               + do NOT auto-retry
+      │
+      └──────────▶ meanwhile, async:
+                   CDC → rollup worker → report_rollups
+                   → every affected user's dashboard is
+                     now correct, without anyone recomputing
+                     a GROUP BY over 5M rows
+```
+
+The thing to notice: the *fast* path (repaint) and the *correct* path (version check) and the *aggregate* path (rollup) are three different timescales — 0ms, 200ms, and up to a minute — and each one is allowed to be exactly as slow as its consumer can tolerate. Collapsing them into one synchronous request is what makes CRMs slow; collapsing them into one *optimistic* fire-and-forget is what makes them wrong.
+
+## 📊 Observability Across the Seam
+
+The metrics that matter here are mostly not the standard ones, and several only make sense when you look at both halves together.
+
+| Signal | Layer | Why it's the right one |
+|--------|-------|------------------------|
+| p99 latency **per org** | Server | Aggregate p99 hides the one enormous tenant whose queries are dying. In multi-tenant systems, per-tenant SLOs are the only honest ones |
+| **Queries run without a tenant predicate** | Server | Must be exactly **zero**. Alarm at one. This is the invariant that ends the company if it breaks |
+| Rollup worker lag | Server | Directly bounds dashboard staleness. If it grows, dashboards are quietly lying and nobody can tell |
+| **409 rate on stage changes** | Both | A rising conflict rate is a *product* signal wearing an error-metric costume: reps are colliding, and the answer is real-time push, not a better error message |
+| Drag-to-repaint latency | Client | The optimistic update's whole justification. Above ~50ms, the optimism is buying nothing |
+| Client cache hit rate on navigation | Client | Measures whether the normalized cache is working. A falling rate means someone reintroduced a per-route fetch |
+| Mutation-queue depth | Client | Sustained depth means the network is failing and the rep's work is piling up unsaved — the most user-hostile state the app can reach |
+| Heap size at hour 4 vs. hour 1 | Client | The eight-hour-tab metric. Nothing else catches an eviction bug |
+
+Largest Contentful Paint, the metric everyone reaches for, is nearly irrelevant here — users load this app once a day. What matters is the *thousandth* interaction, not the first.
+
 ## 🧭 Consistency Model
 
 | Data | Guarantee | Client implication |

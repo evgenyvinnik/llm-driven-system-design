@@ -23,6 +23,18 @@ import type { AuthenticatedRequest, Auction, Bid, AutoBid } from '../types.js';
 const router = express.Router();
 
 const MIN_BID_INCREMENT = 1.0;
+
+/**
+ * Coerces a value read from a Postgres DECIMAL/NUMERIC column to a JS number.
+ * `pg` returns DECIMAL as a *string* to avoid float precision loss, so doing
+ * `someNumber + row.decimal_col` silently performs string concatenation
+ * ("100" + "1.00" -> "1001.00") instead of addition. Every bid_increment /
+ * max_amount / current_price read must go through this.
+ */
+function num(value: unknown, fallback = 0): number {
+  const n = typeof value === 'number' ? value : parseFloat(String(value ?? ''));
+  return Number.isFinite(n) ? n : fallback;
+}
 const BID_RATE_LIMIT = 10; // Max bids per minute
 const BID_RATE_WINDOW = 60; // 60 seconds
 
@@ -142,6 +154,9 @@ router.post(
       }
 
       const auction = auctionResult.rows[0] as Auction;
+      // DECIMAL columns arrive from pg as strings - coerce before any arithmetic.
+      const currentPrice = num(auction.current_price);
+      const bidIncrement = num(auction.bid_increment, MIN_BID_INCREMENT) || MIN_BID_INCREMENT;
 
       // Validate auction status
       if (auction.status !== 'active') {
@@ -165,7 +180,7 @@ router.post(
       }
 
       // Calculate minimum bid
-      const minBid = parseFloat(String(auction.current_price)) + (auction.bid_increment || MIN_BID_INCREMENT);
+      const minBid = currentPrice + bidIncrement;
 
       if (bidAmount < minBid) {
         await client.query('ROLLBACK');
@@ -193,9 +208,9 @@ router.post(
         // There's a competing auto-bid with higher max
         const highestAutoBid = autoBidsResult.rows[0] as AutoBid;
 
-        if (highestAutoBid.max_amount > bidAmount) {
+        if (num(highestAutoBid.max_amount) > bidAmount) {
           // Auto-bidder wins, their new bid is one increment above manual bid
-          finalPrice = bidAmount + (auction.bid_increment || MIN_BID_INCREMENT);
+          finalPrice = bidAmount + bidIncrement;
           winnerId = highestAutoBid.bidder_id;
           isAutoBid = true;
 
@@ -216,7 +231,7 @@ router.post(
           });
         } else {
           // New bidder wins (tied max goes to new bidder as they bid first at this level)
-          finalPrice = highestAutoBid.max_amount + (auction.bid_increment || MIN_BID_INCREMENT);
+          finalPrice = num(highestAutoBid.max_amount) + bidIncrement;
 
           // Deactivate the outbid auto-bid
           await client.query('UPDATE auto_bids SET is_active = false WHERE id = $1', [highestAutoBid.id]);
@@ -404,6 +419,9 @@ router.post(
       }
 
       const auction = auctionResult.rows[0] as Auction;
+      // DECIMAL columns arrive from pg as strings - coerce before any arithmetic.
+      const currentPrice = num(auction.current_price);
+      const bidIncrement = num(auction.bid_increment, MIN_BID_INCREMENT) || MIN_BID_INCREMENT;
 
       if (auction.status !== 'active' || new Date(auction.end_time) < new Date()) {
         await client.query('ROLLBACK');
@@ -417,7 +435,7 @@ router.post(
         return;
       }
 
-      const minBid = parseFloat(String(auction.current_price)) + (auction.bid_increment || MIN_BID_INCREMENT);
+      const minBid = currentPrice + bidIncrement;
 
       if (maxAmount < minBid) {
         await client.query('ROLLBACK');
@@ -448,22 +466,22 @@ router.post(
         [auctionId, bidderId]
       );
 
-      let newPrice = parseFloat(String(auction.current_price));
+      let newPrice = currentPrice;
       let winnerId: string | null = null;
 
       if (competingAutoBids.rows.length > 0) {
         const highestCompeting = competingAutoBids.rows[0] as AutoBid;
 
-        if (highestCompeting.max_amount >= maxAmount) {
+        if (num(highestCompeting.max_amount) >= maxAmount) {
           // Competing auto-bid wins
-          newPrice = maxAmount + (auction.bid_increment || MIN_BID_INCREMENT);
+          newPrice = maxAmount + bidIncrement;
           winnerId = highestCompeting.bidder_id;
 
           // Deactivate our auto-bid since it's been outbid
           await client.query('UPDATE auto_bids SET is_active = false WHERE id = $1', [autoBid.id]);
         } else {
           // We win
-          newPrice = highestCompeting.max_amount + (auction.bid_increment || MIN_BID_INCREMENT);
+          newPrice = num(highestCompeting.max_amount) + bidIncrement;
           winnerId = bidderId;
 
           // Deactivate the competing auto-bid
@@ -471,7 +489,7 @@ router.post(
         }
 
         // Only update if we need to increase the price
-        if (newPrice > parseFloat(String(auction.current_price))) {
+        if (newPrice > currentPrice) {
           // Create bid record
           await client.query(
             `INSERT INTO bids (auction_id, bidder_id, amount, is_auto_bid)

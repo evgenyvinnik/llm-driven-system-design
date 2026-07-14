@@ -101,10 +101,10 @@ ON CONFLICT DO NOTHING;
 -- ============================================================
 -- Users
 -- password123 => $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
--- admin123   => $2b$10$rQEY5dO.BEClHFmhLHOBqOD/OGhoZyZJL9MsO1Y6gSlhB7O7RFOXe
+-- admin123   => $2a$10$Jwu.HnwmSQGc02Lr7mgZ.uRhHxwKb.KjaUcoz9PlnUfR0lAmhvJAq
 -- ============================================================
 INSERT INTO users (id, email, password_hash, name, role) VALUES
-  ('a0000000-0000-4000-8000-000000000001', 'admin@example.com',  '$2b$10$rQEY5dO.BEClHFmhLHOBqOD/OGhoZyZJL9MsO1Y6gSlhB7O7RFOXe', 'Admin User',      'admin'),
+  ('a0000000-0000-4000-8000-000000000001', 'admin@example.com',  '$2a$10$Jwu.HnwmSQGc02Lr7mgZ.uRhHxwKb.KjaUcoz9PlnUfR0lAmhvJAq', 'Admin User',      'admin'),
   ('a0000000-0000-4000-8000-000000000002', 'alice@example.com',  '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Alice Developer',  'user'),
   ('a0000000-0000-4000-8000-000000000003', 'bob@example.com',    '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Bob Engineer',     'user'),
   ('a0000000-0000-4000-8000-000000000004', 'carol@example.com',  '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Carol Manager',    'user')

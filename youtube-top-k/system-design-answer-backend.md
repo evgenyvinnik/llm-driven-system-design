@@ -227,6 +227,12 @@ Two details carry the load:
 
 The REST `GET /api/trending` serves the same cached blob, so a cache miss is structurally impossible in steady state — the worker writes the cache before anyone reads it.
 
+**Metadata hydration** is the last mile and it's a small trap. The top-K is a list of video IDs and scores; the response needs titles, thumbnails, channel names, durations. Naively that's a lookup into a 500M-row table on every trending request — 100K RPS of point reads against PostgreSQL, which is a completely unnecessary way to take down a database that we went to some trouble to keep off this path entirely.
+
+The fix is almost too easy, and it's easy for a structural reason worth noticing: **the set of videos needing hydration is, by definition, exactly the trending set.** It's K videos per category — a few hundred rows total, and they change slowly. So the worker hydrates metadata *once* when it builds the ranking and bakes it into the published blob. The read path then serves a fully-formed response with zero joins and zero database contact. The hottest data in the system is also the smallest and the most stable; the only mistake available here is failing to notice that and hydrating per-request instead of per-cycle.
+
+The cost is that a title edited seconds ago shows its old value until the next cycle. Given we already accept a 5-second-stale *ranking*, a 5-second-stale *title* is not a new concession — it's the same one, already paid for.
+
 ## 🧮 Why Not a Stream Processor?
 
 The textbook answer to "sliding-window aggregation over an event stream" is a stream-processing framework — Flink or Kafka Streams, with a windowed aggregation and a top-K operator. Kafka is already in our architecture. An interviewer should ask why I hand-rolled the window in Redis instead, and I'd want a better answer than "I didn't think of it."
@@ -333,6 +339,9 @@ Health checks are the standard three per service. The non-obvious one is the tre
 | Publish policy | ✅ Diff, publish only on change | ❌ Broadcast every cycle | Rankings are far more stable than the counts beneath them |
 | Trending's dependencies | ✅ Redis only | ❌ Redis + PostgreSQL | PostgreSQL can be down and trending still works — a deliberate blast-radius choice |
 | Event log retention | ✅ Time-partitioned, `DROP PARTITION` | ❌ Row-level `DELETE` sweep | 2B rows/day makes row-wise deletion a vacuum catastrophe |
+| Windowing engine | ✅ Redis buckets + TTL | ❌ Flink / Kafka Streams | Event-time correctness costs a stateful cluster to fix errors that don't change a top-10 list |
+| Metadata hydration | ✅ Once per cycle, baked into the blob | ❌ Per-request join | The set needing hydration *is* the trending set — a few hundred slow-moving rows |
+| Fraud posture | ✅ Keep the raw event log so counts can be retroactively invalidated | ❌ Aggregates only | A system that only keeps aggregates can detect fraud but can never undo it |
 
 ## 🚀 Closing: What I'd Build Next
 

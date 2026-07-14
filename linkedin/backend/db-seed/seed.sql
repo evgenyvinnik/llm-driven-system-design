@@ -23,7 +23,7 @@ SELECT setval('companies_id_seq', (SELECT COALESCE(MAX(id), 0) FROM companies));
 -- ============================================================================
 
 -- password123 = $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
--- admin123   = $2b$10$rQEY5dO.BEClHFmhLHOBqOD/OGhoZyZJL9MsO1Y6gSlhB7O7RFOXe
+-- admin123   = $2a$10$Jwu.HnwmSQGc02Lr7mgZ.uRhHxwKb.KjaUcoz9PlnUfR0lAmhvJAq
 
 INSERT INTO users (id, email, password_hash, first_name, last_name, headline, summary, location, industry, profile_image_url, connection_count, role)
 VALUES

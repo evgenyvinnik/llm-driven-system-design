@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { useCartStore } from '../stores/cartStore';
 import { useAuthStore } from '../stores/authStore';
 import { orderAPI } from '../services/api';
+import { formatPrice, toNumber } from '../utils/format';
 
 /**
  * Tax rate applied to orders (8.75% for San Francisco).
@@ -56,7 +57,9 @@ function CartPage() {
   const [error, setError] = useState<string | null>(null);
 
   const subtotalValue = subtotal();
-  const deliveryFee = restaurant?.delivery_fee || 0;
+  // delivery_fee is a DECIMAL column and arrives from the API as a string;
+  // without toNumber() the `+` below concatenates instead of adding.
+  const deliveryFee = toNumber(restaurant?.delivery_fee);
   const tax = subtotalValue * TAX_RATE;
   const total = subtotalValue + deliveryFee + tax + tip;
 
@@ -141,7 +144,7 @@ function CartPage() {
                 <div className="flex-1">
                   <h3 className="font-medium text-gray-900">{item.menuItem.name}</h3>
                   <p className="text-sm text-gray-500">
-                    ${Number(item.menuItem.price).toFixed(2)} each
+                    ${formatPrice(item.menuItem.price)} each
                   </p>
                 </div>
                 <div className="flex items-center gap-4">
@@ -221,25 +224,25 @@ function CartPage() {
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
                 <span className="text-gray-500">Subtotal</span>
-                <span>${subtotalValue.toFixed(2)}</span>
+                <span>${formatPrice(subtotalValue)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-500">Delivery Fee</span>
-                <span>${deliveryFee.toFixed(2)}</span>
+                <span>${formatPrice(deliveryFee)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-500">Tax</span>
-                <span>${tax.toFixed(2)}</span>
+                <span>${formatPrice(tax)}</span>
               </div>
               {tip > 0 && (
                 <div className="flex justify-between">
                   <span className="text-gray-500">Tip</span>
-                  <span>${tip.toFixed(2)}</span>
+                  <span>${formatPrice(tip)}</span>
                 </div>
               )}
               <div className="flex justify-between font-semibold text-base pt-2 border-t">
                 <span>Total</span>
-                <span>${total.toFixed(2)}</span>
+                <span>${formatPrice(total)}</span>
               </div>
             </div>
 

@@ -4,6 +4,7 @@ import { restaurantAPI } from '../services/api';
 import { MenuItemCard } from '../components/MenuItemCard';
 import { useCartStore } from '../stores/cartStore';
 import type { Restaurant, MenuByCategory } from '../types';
+import { formatDecimal, formatPrice } from '../utils/format';
 
 /**
  * Restaurant detail page route configuration.
@@ -109,7 +110,7 @@ function RestaurantPage() {
               <svg className="w-5 h-5 text-yellow-400 fill-current" viewBox="0 0 20 20">
                 <path d="M10 15l-5.878 3.09 1.123-6.545L.489 6.91l6.572-.955L10 0l2.939 5.955 6.572.955-4.756 4.635 1.123 6.545z" />
               </svg>
-              <span className="font-medium">{restaurant.rating.toFixed(1)}</span>
+              <span className="font-medium">{formatDecimal(restaurant.rating, 1)}</span>
               <span className="text-gray-400">({restaurant.rating_count} reviews)</span>
             </span>
             <span className="text-gray-300">|</span>
@@ -120,9 +121,9 @@ function RestaurantPage() {
             </span>
           </div>
           <div className="flex items-center gap-4 mt-2 text-sm text-gray-500">
-            <span>${restaurant.delivery_fee.toFixed(2)} delivery fee</span>
+            <span>${formatPrice(restaurant.delivery_fee)} delivery fee</span>
             <span className="text-gray-300">|</span>
-            <span>${restaurant.min_order.toFixed(2)} minimum</span>
+            <span>${formatPrice(restaurant.min_order)} minimum</span>
           </div>
         </div>
       </div>
@@ -150,7 +151,7 @@ function RestaurantPage() {
                 {itemCount} item{itemCount !== 1 ? 's' : ''}
               </span>
               <span className="text-gray-500 ml-2">
-                ${subtotal.toFixed(2)}
+                ${formatPrice(subtotal)}
               </span>
             </div>
             <Link

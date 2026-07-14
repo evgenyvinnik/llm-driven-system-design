@@ -5,6 +5,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { OrderCard } from '../components/OrderCard';
 import type { Order, WSMessage } from '../types';
+import { formatDecimal } from '../utils/format';
 
 /**
  * Order detail page route configuration.
@@ -223,7 +224,7 @@ function OrderDetailPage() {
                   <p className="font-medium">{order.driver.name}</p>
                   {order.driver.current_lat && order.driver.current_lon && (
                     <p className="text-sm mt-1">
-                      Location: {order.driver.current_lat.toFixed(4)}, {order.driver.current_lon.toFixed(4)}
+                      Location: {formatDecimal(order.driver.current_lat, 4)}, {formatDecimal(order.driver.current_lon, 4)}
                     </p>
                   )}
                   <p className="text-xs mt-2">(Map would display here)</p>

@@ -6,6 +6,7 @@ import { useDriverLocation } from '../hooks/useDriverLocation';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { OrderCard } from '../components/OrderCard';
 import type { Order, WSMessage, Driver } from '../types';
+import { formatDecimal, formatPrice } from '../utils/format';
 
 /**
  * Driver dashboard route configuration.
@@ -184,11 +185,11 @@ function DriverDashboard() {
             <p className="text-sm text-gray-500">Deliveries Today</p>
           </div>
           <div className="bg-white rounded-lg p-4 shadow-sm text-center">
-            <p className="text-2xl font-bold text-green-600">${stats.fees.toFixed(2)}</p>
+            <p className="text-2xl font-bold text-green-600">${formatPrice(stats.fees)}</p>
             <p className="text-sm text-gray-500">Delivery Fees</p>
           </div>
           <div className="bg-white rounded-lg p-4 shadow-sm text-center">
-            <p className="text-2xl font-bold text-green-600">${stats.tips.toFixed(2)}</p>
+            <p className="text-2xl font-bold text-green-600">${formatPrice(stats.tips)}</p>
             <p className="text-sm text-gray-500">Tips</p>
           </div>
         </div>
@@ -299,7 +300,7 @@ function DriverDashboard() {
               <svg className="w-6 h-6 text-yellow-400 fill-current" viewBox="0 0 20 20">
                 <path d="M10 15l-5.878 3.09 1.123-6.545L.489 6.91l6.572-.955L10 0l2.939 5.955 6.572.955-4.756 4.635 1.123 6.545z" />
               </svg>
-              <span className="text-xl font-bold">{driver.rating.toFixed(1)}</span>
+              <span className="text-xl font-bold">{formatDecimal(driver.rating, 1)}</span>
             </div>
           </div>
         </div>
