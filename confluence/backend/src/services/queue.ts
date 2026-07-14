@@ -1,22 +1,25 @@
-import amqplib, { Channel, Connection } from 'amqplib';
+import amqplib, { Channel, ChannelModel } from 'amqplib';
 import { config } from '../config/index.js';
 import { logger } from './logger.js';
 
-let connection: Connection | null = null;
+let connection: ChannelModel | null = null;
 let channel: Channel | null = null;
 
 /** Connects to RabbitMQ and asserts the page-index queue. */
 export async function connectQueue(): Promise<Channel | null> {
   try {
-    connection = await amqplib.connect(config.rabbitmq.url);
-    channel = await connection.createChannel();
+    const conn = await amqplib.connect(config.rabbitmq.url);
+    connection = conn;
 
-    await channel.assertQueue(config.rabbitmq.pageIndexQueue, {
+    const ch = await conn.createChannel();
+    channel = ch;
+
+    await ch.assertQueue(config.rabbitmq.pageIndexQueue, {
       durable: true,
     });
 
     logger.info('Connected to RabbitMQ');
-    return channel;
+    return ch;
   } catch (err) {
     logger.warn({ err }, 'RabbitMQ connection failed - search indexing will be skipped');
     return null;

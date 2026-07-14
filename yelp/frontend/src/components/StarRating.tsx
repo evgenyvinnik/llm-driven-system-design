@@ -7,13 +7,20 @@
  * @module components/StarRating
  */
 import { Star, StarHalf } from 'lucide-react';
+import { formatRating, toNumber } from '../utils/format';
 
 /**
  * Props for the StarRating component.
  */
 interface StarRatingProps {
-  /** The rating value to display (0-5, supports decimals) */
-  rating: number;
+  /**
+   * The rating value to display (0-5, supports decimals).
+   *
+   * Accepts `string` as well as `number`: `businesses.rating` is a DECIMAL
+   * column, and `pg` hands DECIMALs back as strings, so the API really does
+   * send `"4.5"` here despite the `number` in the Business type.
+   */
+  rating: number | string;
   /** Size variant for the stars */
   size?: 'sm' | 'md' | 'lg';
   /** Whether to show the numeric rating value */
@@ -45,9 +52,12 @@ export function StarRating({ rating, size = 'md', showValue = false }: StarRatin
     lg: 'text-base',
   };
 
+  // Coerce once: `rating` may arrive as a DECIMAL string from the API.
+  const value = toNumber(rating);
+
   const stars = [];
-  const fullStars = Math.floor(rating);
-  const hasHalfStar = rating % 1 >= 0.5;
+  const fullStars = Math.floor(value);
+  const hasHalfStar = value % 1 >= 0.5;
 
   for (let i = 0; i < 5; i++) {
     if (i < fullStars) {
@@ -79,7 +89,7 @@ export function StarRating({ rating, size = 'md', showValue = false }: StarRatin
       <div className="flex">{stars}</div>
       {showValue && (
         <span className={`${textClasses[size]} text-gray-600 ml-1`}>
-          {rating.toFixed(1)}
+          {formatRating(rating)}
         </span>
       )}
     </div>

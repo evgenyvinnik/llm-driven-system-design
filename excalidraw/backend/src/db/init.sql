@@ -4,7 +4,7 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Users table
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     username VARCHAR(30) UNIQUE NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -16,7 +16,7 @@ CREATE TABLE users (
 );
 
 -- Drawings table
-CREATE TABLE drawings (
+CREATE TABLE IF NOT EXISTS drawings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     title VARCHAR(255) NOT NULL DEFAULT 'Untitled',
     owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -28,7 +28,7 @@ CREATE TABLE drawings (
 );
 
 -- Drawing collaborators
-CREATE TABLE drawing_collaborators (
+CREATE TABLE IF NOT EXISTS drawing_collaborators (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     drawing_id UUID NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -38,7 +38,7 @@ CREATE TABLE drawing_collaborators (
 );
 
 -- Drawing versions (snapshots for undo/history)
-CREATE TABLE drawing_versions (
+CREATE TABLE IF NOT EXISTS drawing_versions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     drawing_id UUID NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
     version_number INTEGER NOT NULL,
@@ -48,7 +48,7 @@ CREATE TABLE drawing_versions (
 );
 
 -- Operations log (for CRDT merge and conflict resolution)
-CREATE TABLE operations (
+CREATE TABLE IF NOT EXISTS operations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     drawing_id UUID NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -60,10 +60,10 @@ CREATE TABLE operations (
 );
 
 -- Indexes
-CREATE INDEX idx_drawings_owner_id ON drawings(owner_id);
-CREATE INDEX idx_drawings_is_public ON drawings(is_public);
-CREATE INDEX idx_drawing_collaborators_drawing_id ON drawing_collaborators(drawing_id);
-CREATE INDEX idx_drawing_collaborators_user_id ON drawing_collaborators(user_id);
-CREATE INDEX idx_drawing_versions_drawing_id ON drawing_versions(drawing_id, version_number DESC);
-CREATE INDEX idx_operations_drawing_id ON operations(drawing_id, created_at DESC);
-CREATE INDEX idx_operations_element_id ON operations(drawing_id, element_id);
+CREATE INDEX IF NOT EXISTS idx_drawings_owner_id ON drawings(owner_id);
+CREATE INDEX IF NOT EXISTS idx_drawings_is_public ON drawings(is_public);
+CREATE INDEX IF NOT EXISTS idx_drawing_collaborators_drawing_id ON drawing_collaborators(drawing_id);
+CREATE INDEX IF NOT EXISTS idx_drawing_collaborators_user_id ON drawing_collaborators(user_id);
+CREATE INDEX IF NOT EXISTS idx_drawing_versions_drawing_id ON drawing_versions(drawing_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_operations_drawing_id ON operations(drawing_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operations_element_id ON operations(drawing_id, element_id);

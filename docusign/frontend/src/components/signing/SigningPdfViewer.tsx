@@ -9,6 +9,7 @@ import { Document, Page } from 'react-pdf';
 import { DocumentField } from '../../types';
 import { LoadingSpinner } from '../common/LoadingSpinner';
 import { CheckIcon } from '../icons/CheckIcon';
+import { toPx } from '../../utils/format';
 
 interface SigningPdfViewerProps {
   /** URL to fetch the document */
@@ -94,10 +95,10 @@ function SigningFieldOverlay({ field, isCompleted, onClick }: SigningFieldOverla
     <div
       className={`field-highlight ${field.type} ${isCompleted ? 'completed' : ''}`}
       style={{
-        left: field.x,
-        top: field.y,
-        width: field.width,
-        height: field.height,
+        left: toPx(field.x),
+        top: toPx(field.y),
+        width: toPx(field.width),
+        height: toPx(field.height),
       }}
       onClick={handleClick}
     >

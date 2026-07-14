@@ -8,6 +8,7 @@ import { createFileRoute, redirect } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { usePortfolioStore } from '../stores/portfolioStore';
+import { formatPrice, isBlank } from '../utils/format';
 
 /** Route definition with auth guard */
 export const Route = createFileRoute('/orders')({
@@ -99,10 +100,10 @@ function OrdersPage() {
                   <div className="text-left md:text-right">
                     <p className="text-robinhood-gray-400 text-sm">Price</p>
                     <p className="text-white">
-                      {order.avg_fill_price
-                        ? `$${order.avg_fill_price.toFixed(2)}`
-                        : order.limit_price
-                        ? `Limit: $${order.limit_price.toFixed(2)}`
+                      {!isBlank(order.avg_fill_price)
+                        ? `$${formatPrice(order.avg_fill_price)}`
+                        : !isBlank(order.limit_price)
+                        ? `Limit: $${formatPrice(order.limit_price)}`
                         : 'Market'}
                     </p>
                   </div>

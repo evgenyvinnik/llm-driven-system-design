@@ -452,7 +452,10 @@ export class CrawlerService {
     }
 
     const statusCode = response.status;
-    const contentType = response.headers['content-type'] || '';
+    // Axios types response headers as a loose union (string | number | boolean |
+    // string[] | AxiosHeaders). Normalize to a string so the downstream
+    // `.includes('text/html')` check and the CrawlResult field are well-typed.
+    const contentType = String(response.headers['content-type'] ?? '');
 
     // Handle non-success status codes
     if (statusCode >= 400) {

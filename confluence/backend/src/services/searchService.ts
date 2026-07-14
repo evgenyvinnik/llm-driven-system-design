@@ -109,7 +109,7 @@ export async function searchPages(
       filter.push({ term: { space_id: spaceId } });
     }
 
-    const result = await esClient.search({
+    const result = await esClient.search<Record<string, unknown>>({
       index: config.elasticsearch.index,
       body: {
         from: (page - 1) * pageSize,
@@ -134,11 +134,7 @@ export async function searchPages(
     const hits = result.hits.hits;
     const total = typeof result.hits.total === 'number' ? result.hits.total : result.hits.total?.value || 0;
 
-    const results: SearchResult[] = hits.map((hit: {
-      _source?: Record<string, unknown>;
-      _score?: number | null;
-      highlight?: Record<string, string[]>;
-    }) => ({
+    const results: SearchResult[] = hits.map((hit) => ({
       ...(hit._source as unknown as SearchResult),
       score: hit._score || 0,
       highlight: hit.highlight,

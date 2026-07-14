@@ -1,6 +1,7 @@
 import { Link } from '@tanstack/react-router';
 import { MapPin } from 'lucide-react';
 import { StarRating } from './StarRating';
+import { formatDistance } from '../utils/format';
 import type { Business } from '../types';
 
 interface BusinessCardProps {
@@ -66,12 +67,12 @@ export function BusinessCard({ business, rank }: BusinessCardProps) {
           </span>
           {business.distance_km !== undefined && (
             <span className="ml-2">
-              ({business.distance_km.toFixed(1)} km away)
+              ({formatDistance(business.distance_km)} km away)
             </span>
           )}
           {business.distance !== undefined && business.distance_km === undefined && (
             <span className="ml-2">
-              ({business.distance.toFixed(1)} km away)
+              ({formatDistance(business.distance)} km away)
             </span>
           )}
         </div>

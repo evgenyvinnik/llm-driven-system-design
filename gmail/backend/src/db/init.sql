@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(30) UNIQUE NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
@@ -11,7 +11,7 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE threads (
+CREATE TABLE IF NOT EXISTS threads (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   subject VARCHAR(500) NOT NULL,
   snippet TEXT,
@@ -20,7 +20,7 @@ CREATE TABLE threads (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   thread_id UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   sender_id UUID NOT NULL REFERENCES users(id),
@@ -31,7 +31,7 @@ CREATE TABLE messages (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE message_recipients (
+CREATE TABLE IF NOT EXISTS message_recipients (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id),
@@ -39,7 +39,7 @@ CREATE TABLE message_recipients (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE labels (
+CREATE TABLE IF NOT EXISTS labels (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name VARCHAR(100) NOT NULL,
@@ -49,7 +49,7 @@ CREATE TABLE labels (
   UNIQUE(user_id, name)
 );
 
-CREATE TABLE thread_labels (
+CREATE TABLE IF NOT EXISTS thread_labels (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   thread_id UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   label_id UUID NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
@@ -58,7 +58,7 @@ CREATE TABLE thread_labels (
   UNIQUE(thread_id, label_id, user_id)
 );
 
-CREATE TABLE thread_user_state (
+CREATE TABLE IF NOT EXISTS thread_user_state (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   thread_id UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -71,7 +71,7 @@ CREATE TABLE thread_user_state (
   UNIQUE(thread_id, user_id)
 );
 
-CREATE TABLE drafts (
+CREATE TABLE IF NOT EXISTS drafts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   thread_id UUID REFERENCES threads(id),
@@ -87,7 +87,7 @@ CREATE TABLE drafts (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE contacts (
+CREATE TABLE IF NOT EXISTS contacts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   contact_email VARCHAR(255) NOT NULL,
@@ -98,7 +98,7 @@ CREATE TABLE contacts (
   UNIQUE(user_id, contact_email)
 );
 
-CREATE TABLE attachments (
+CREATE TABLE IF NOT EXISTS attachments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   filename VARCHAR(255) NOT NULL,
@@ -109,10 +109,10 @@ CREATE TABLE attachments (
 );
 
 -- Indexes
-CREATE INDEX idx_messages_thread ON messages(thread_id, created_at);
-CREATE INDEX idx_message_recipients_user ON message_recipients(user_id, message_id);
-CREATE INDEX idx_thread_labels_user ON thread_labels(user_id, thread_id);
-CREATE INDEX idx_thread_user_state_user ON thread_user_state(user_id, is_trashed, is_archived);
-CREATE INDEX idx_drafts_user ON drafts(user_id, updated_at DESC);
-CREATE INDEX idx_contacts_user ON contacts(user_id, frequency DESC);
-CREATE INDEX idx_threads_last_message ON threads(last_message_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_recipients_user ON message_recipients(user_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_thread_labels_user ON thread_labels(user_id, thread_id);
+CREATE INDEX IF NOT EXISTS idx_thread_user_state_user ON thread_user_state(user_id, is_trashed, is_archived);
+CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id, frequency DESC);
+CREATE INDEX IF NOT EXISTS idx_threads_last_message ON threads(last_message_at DESC);

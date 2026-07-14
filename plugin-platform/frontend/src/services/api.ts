@@ -3,57 +3,71 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 // Types
+//
+// NOTE: these mirror the JSON the backend actually emits (see
+// backend/src/api/routes/plugins.ts and user-plugins.ts). The API maps its
+// snake_case SQL columns to camelCase before responding, so the client types
+// must be camelCase too - reading `plugin.avg_rating` here silently yields
+// `undefined` and the marketplace renders blank authors/ratings/install counts.
+export interface PluginAuthor {
+  username: string;
+  displayName: string | null;
+}
+
 export interface Plugin {
   id: string;
   name: string;
   description: string;
   category: string;
-  author_name: string;
+  author: PluginAuthor;
   license: string;
-  install_count: number;
-  avg_rating: number;
-  review_count: number;
-  latest_version: string;
-  bundle_url: string;
-  created_at: string;
-  updated_at: string;
+  iconUrl?: string | null;
+  isOfficial?: boolean;
+  installCount: number;
+  averageRating: number;
+  reviewCount: number;
+  latestVersion: string;
+  createdAt: string;
+  updatedAt: string;
   tags?: string[];
 }
 
 export interface PluginDetails extends Plugin {
-  homepage_url?: string;
-  repository_url?: string;
+  homepageUrl?: string;
+  repositoryUrl?: string;
   versions: PluginVersion[];
-  reviews: PluginReview[];
+  reviews?: PluginReview[];
 }
 
 export interface PluginVersion {
   version: string;
-  bundle_url: string;
   changelog?: string;
-  min_platform_version?: string;
-  file_size: number;
-  checksum: string;
-  created_at: string;
+  publishedAt: string;
+  fileSize: number;
 }
 
 export interface PluginReview {
   id: string;
-  user_id: string;
-  username: string;
   rating: number;
   title?: string;
-  content?: string;
-  created_at: string;
+  comment?: string;
+  createdAt: string;
+  author: PluginAuthor;
 }
 
 export interface InstalledPlugin {
-  plugin_id: string;
-  version_installed: string;
-  is_enabled: boolean;
-  installed_at: string;
+  pluginId: string;
+  version: string;
+  enabled: boolean;
+  installedAt: string;
   settings: Record<string, unknown>;
-  plugin?: Plugin;
+  name: string;
+  description: string;
+  category: string;
+  iconUrl?: string | null;
+  isOfficial?: boolean;
+  manifest?: unknown;
+  bundleUrl?: string;
 }
 
 export interface User {

@@ -6,6 +6,7 @@
 import { useState } from 'react';
 import { useQuoteStore } from '../stores/quoteStore';
 import { usePortfolioStore } from '../stores/portfolioStore';
+import { formatPrice } from '../utils/format';
 
 /**
  * Props for the TradeForm component.
@@ -80,7 +81,7 @@ export function TradeForm({ symbol, onSuccess, onClose }: TradeFormProps) {
 
       setSuccess(
         order.status === 'filled'
-          ? `Order filled at $${order.avg_fill_price?.toFixed(2)}`
+          ? `Order filled at $${formatPrice(order.avg_fill_price)}`
           : 'Order placed successfully'
       );
       setQuantity('');

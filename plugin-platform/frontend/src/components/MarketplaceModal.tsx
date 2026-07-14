@@ -105,7 +105,7 @@ export function MarketplaceModal({ isOpen, onClose }: MarketplaceModalProps): Re
   };
 
   const isInstalled = (pluginId: string) => {
-    return installedPlugins.some((p) => p.plugin_id === pluginId);
+    return installedPlugins.some((p) => p.pluginId === pluginId);
   };
 
   if (!isOpen) return null;
@@ -294,12 +294,12 @@ function PluginCard({
           </div>
           <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{plugin.description}</p>
           <div className="flex items-center gap-4 mt-2 text-xs text-gray-500 dark:text-gray-500">
-            <span>by {plugin.author_name}</span>
-            <span>{plugin.install_count} installs</span>
-            {plugin.avg_rating > 0 && (
+            <span>by {plugin.author?.displayName || plugin.author?.username}</span>
+            <span>{plugin.installCount ?? 0} installs</span>
+            {plugin.averageRating > 0 && (
               <span className="flex items-center gap-1">
                 <StarIcon />
-                {plugin.avg_rating.toFixed(1)}
+                {plugin.averageRating.toFixed(1)}
               </span>
             )}
           </div>
@@ -389,19 +389,19 @@ function PluginDetailView({
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         <div className="p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
           <div className="text-sm text-gray-500 dark:text-gray-400">Version</div>
-          <div className="font-semibold text-gray-800 dark:text-white">{plugin.latest_version}</div>
+          <div className="font-semibold text-gray-800 dark:text-white">{plugin.latestVersion}</div>
         </div>
         <div className="p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
           <div className="text-sm text-gray-500 dark:text-gray-400">Installs</div>
-          <div className="font-semibold text-gray-800 dark:text-white">{plugin.install_count}</div>
+          <div className="font-semibold text-gray-800 dark:text-white">{plugin.installCount ?? 0}</div>
         </div>
         <div className="p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
           <div className="text-sm text-gray-500 dark:text-gray-400">Rating</div>
           <div className="font-semibold text-gray-800 dark:text-white flex items-center gap-1">
-            {plugin.avg_rating > 0 ? (
+            {plugin.averageRating > 0 ? (
               <>
                 <StarIcon />
-                {plugin.avg_rating.toFixed(1)} ({plugin.review_count})
+                {plugin.averageRating.toFixed(1)} ({plugin.reviewCount})
               </>
             ) : (
               'No ratings'
@@ -419,7 +419,7 @@ function PluginDetailView({
         <h3 className="text-sm font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wider mb-2">
           Author
         </h3>
-        <p className="text-gray-800 dark:text-white">{plugin.author_name}</p>
+        <p className="text-gray-800 dark:text-white">{plugin.author?.displayName || plugin.author?.username}</p>
       </div>
 
       {/* Versions */}
@@ -439,7 +439,7 @@ function PluginDetailView({
                     v{version.version}
                   </span>
                   <span className="text-sm text-gray-500 dark:text-gray-400">
-                    {new Date(version.created_at).toLocaleDateString()}
+                    {new Date(version.publishedAt).toLocaleDateString()}
                   </span>
                 </div>
                 {version.changelog && (

@@ -8,6 +8,7 @@
 import { Document, Page } from 'react-pdf';
 import { DocumentField, Recipient } from '../../types';
 import { LoadingSpinner } from '../common/LoadingSpinner';
+import { toPx } from '../../utils/format';
 
 interface PdfViewerProps {
   /** URL or path to the PDF document */
@@ -85,10 +86,10 @@ function FieldOverlay({ field, recipientName }: FieldOverlayProps) {
     <div
       className={`field-highlight ${field.type} ${field.completed ? 'completed' : ''}`}
       style={{
-        left: field.x,
-        top: field.y,
-        width: field.width,
-        height: field.height,
+        left: toPx(field.x),
+        top: toPx(field.y),
+        width: toPx(field.width),
+        height: toPx(field.height),
       }}
       title={`${field.type} - ${recipientName || 'Unknown'}`}
     >

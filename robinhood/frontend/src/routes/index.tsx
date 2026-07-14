@@ -10,6 +10,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useQuoteStore } from '../stores/quoteStore';
 import { PortfolioSummary, HoldingsList } from '../components/Portfolio';
 import { usePortfolioStore } from '../stores/portfolioStore';
+import { formatPrice, formatQuantity, isBlank } from '../utils/format';
 
 /** Route definition with auth guard */
 export const Route = createFileRoute('/')({
@@ -90,7 +91,8 @@ function RecentActivity() {
                   {order.symbol}
                 </p>
                 <p className="text-sm text-robinhood-gray-400">
-                  {order.quantity} shares @ ${order.avg_fill_price?.toFixed(2) || '--'}
+                  {formatQuantity(order.quantity)} shares @ $
+                  {isBlank(order.avg_fill_price) ? '--' : formatPrice(order.avg_fill_price)}
                 </p>
               </div>
               <div className="text-right">

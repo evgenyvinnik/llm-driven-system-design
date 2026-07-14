@@ -26,20 +26,36 @@ export function getNights(checkIn: string, checkOut: string): number {
   return differenceInDays(parseISO(checkOut), parseISO(checkIn));
 }
 
+/**
+ * PostgreSQL returns DECIMAL/NUMERIC columns as strings through `pg` (to avoid
+ * float precision loss), so monetary values and ratings coming from the API may
+ * be a string ("189.00", "4.9") or a number depending on whether the backend
+ * computed them in JS. Calling .toFixed() on those strings throws at runtime, so
+ * every formatter below coerces first.
+ */
+type Numeric = number | string | null | undefined;
+
+/** Coerces an API numeric value to a number, defaulting to 0. */
+function toNumber(value: Numeric): number {
+  const n = typeof value === 'number' ? value : parseFloat(String(value ?? 0));
+  return Number.isFinite(n) ? n : 0;
+}
+
 /** Formats a number as USD currency without decimal places (e.g., "$120"). */
-export function formatCurrency(amount: number): string {
+export function formatCurrency(amount: Numeric): string {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency: 'USD',
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
-  }).format(amount);
+  }).format(toNumber(amount));
 }
 
-/** Formats a rating number to two decimal places, or returns "New" if no rating exists. */
-export function formatRating(rating: number | undefined | null): string {
-  if (!rating) return 'New';
-  return rating.toFixed(2);
+/** Formats a rating to two decimal places, or returns "New" if no rating exists. */
+export function formatRating(rating: Numeric): string {
+  const n = toNumber(rating);
+  if (!n) return 'New';
+  return n.toFixed(2);
 }
 
 /** Returns the singular or plural form of a word based on count. */

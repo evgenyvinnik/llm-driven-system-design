@@ -9,7 +9,7 @@ export const apiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(...args) as never,
+    sendCommand: (...args: string[]) => redis.call(...(args as [string, ...string[]])) as never,
     prefix: 'rl:api:',
   }),
   message: { error: 'Too many requests, please try again later' },
@@ -22,7 +22,7 @@ export const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(...args) as never,
+    sendCommand: (...args: string[]) => redis.call(...(args as [string, ...string[]])) as never,
     prefix: 'rl:auth:',
   }),
   message: { error: 'Too many auth attempts, please try again later' },

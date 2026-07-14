@@ -9,6 +9,7 @@ import { useEffect, useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { usePortfolioStore } from '../stores/portfolioStore';
 import { WatchlistView } from '../components/Watchlist';
+import { formatPrice } from '../utils/format';
 
 /** Route definition with auth guard */
 export const Route = createFileRoute('/watchlist')({
@@ -223,7 +224,7 @@ function WatchlistPage() {
                       <p className="text-white font-medium">{alert.symbol}</p>
                       <p className="text-sm text-robinhood-gray-400">
                         {alert.condition === 'above' ? 'Above' : 'Below'} $
-                        {alert.target_price.toFixed(2)}
+                        {formatPrice(alert.target_price)}
                       </p>
                     </div>
                     <div className="flex items-center space-x-4">
