@@ -2,244 +2,287 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## Opening Statement (1 minute)
+## 📋 Problem Statement
 
-"I'll design Google Sheets, a collaborative spreadsheet application supporting real-time multi-user editing with formula calculations. As a backend engineer, I'll focus on the WebSocket infrastructure for real-time synchronization, PostgreSQL schema design with sparse cell storage, Redis pub/sub for multi-server coordination, and the conflict resolution strategy that ensures consistency across collaborators.
+Design the backend for a collaborative spreadsheet: many people editing one grid at once, with live cursors, formulas that recalculate, and undo that works even though someone else is typing.
 
-The key backend challenges are managing WebSocket connections at scale, implementing efficient sparse cell storage, ensuring last-write-wins consistency across distributed servers, and integrating with a formula engine for dependency tracking and recalculation."
+The framing I want to establish early, because it determines the whole design: **a spreadsheet is not a document, it's a dependency graph with a UI.** Two consequences follow immediately. First, a cell edit is not a leaf write — it can trigger a cascade through thousands of dependent cells, so the write amplification is unbounded in a way a chat message never is. Second, the *structure* of the grid is itself mutable: inserting a row rewrites the meaning of every reference below it. That second point is where most designs quietly break, and it's where I'll spend my first deep dive.
 
-## Requirements Clarification (3 minutes)
+## 🎯 Requirements Clarification
+
+- **How many people edit one sheet at once?** Up to ~50 editors, but potentially thousands of *viewers* on a popular shared sheet. Those are very different fan-out problems.
+- **Do formulas evaluate on the client or the server?** Server-authoritative. I'll defend that — it's the difference between everyone agreeing on a number and everyone having their own.
+- **Do we support inserting/deleting rows and columns?** Yes. This is the question I most want answered up front, because the answer changes the concurrency model entirely.
+- **How exact is undo?** Per-user undo that doesn't clobber a collaborator's work. That's a much stronger requirement than a global undo stack.
 
 ### Functional Requirements
-- **Spreadsheet Management**: Create, open, edit, and delete spreadsheets
-- **Real-time Collaboration**: Multiple users editing simultaneously with live cursor visibility
-- **Formula Support**: Excel-compatible formulas with dependency tracking
-- **Cell Formatting**: Bold, colors, alignment, number formats
-- **Grid Operations**: Resize columns/rows, undo/redo
+
+- Real-time collaborative cell editing with live cursors and presence
+- Formulas with dependency tracking, cascading recalculation, and cycle detection
+- Structural operations: insert/delete rows and columns, resize
+- Per-user undo/redo
+- Sparse grids — 10,000+ rows and columns
+- Cell formatting
 
 ### Non-Functional Requirements
-- **Scale**: Support 10,000+ rows/columns per sheet via sparse storage
-- **Latency**: Sub-100ms for local edits, <200ms for broadcast to collaborators
-- **Consistency**: Last-write-wins per cell with server as source of truth
-- **Availability**: Graceful degradation (read-only mode if database unavailable)
+
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Local edit feedback | < 100ms (optimistic) | Typing that lags is unusable |
+| Edit persist + broadcast p99 | < 200ms | Collaborators must feel present |
+| Concurrent editors per sheet | 50 | Fan-out is 49× per edit |
+| Availability | 99.99% for the collab service | People are mid-sentence |
+| Convergence | All clients reach the same state | Non-negotiable — divergence is silent corruption |
+| Durability | No lost edits | An edit you saw applied must survive |
 
 ### Scale Estimates
-- 100K edits per second globally
-- 2M concurrent WebSocket connections
-- 600 KB average per active spreadsheet
-- 100 MB/s broadcast bandwidth
 
-## High-Level Architecture (5 minutes)
+The numbers that force the architecture:
+
+- **100M spreadsheets, 10M DAU, ~2M concurrent editors** at peak.
+- **~500K cell edits/second** at peak (2M editors × ~15 edits/min).
+- Each edit naively costs **one cell UPSERT + one history row = 1M writes/second.** That is the number that kills the obvious design, and I'll come back to it.
+- **~50B stored cells** at ~200 bytes each ≈ **10 TB** — and that's *with* sparse storage. Dense storage of a 10,000 × 100 grid would be 1M rows per sheet where ~1,000 are non-empty: a **1000× waste**, and 10 PB instead of 10 TB.
+- Fan-out: 50 collaborators means each edit is broadcast 49 times. 500K edits/sec × 49 ≈ **24M messages/second** across the fleet.
+
+## 🏗️ High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                           Clients                                │
-│      Browser 1 (Alice)    Browser 2 (Bob)    Browser 3 (Carol)  │
-│              │                  │                  │             │
-│              └──────────────────┼──────────────────┘             │
-│                        WebSocket │                               │
-│                                  ▼                               │
-│         ┌────────────────────────────────────────┐              │
-│         │        WebSocket Server Cluster         │              │
-│         │   (Real-time Collaboration Hub)        │              │
-│         └────────────────┬───────────────────────┘              │
-│                          │                                       │
-│         ┌────────────────┴───────────────────┐                  │
-│         ▼                                    ▼                  │
-│  ┌──────────────┐                   ┌──────────────┐           │
-│  │  REST API    │                   │    Redis     │           │
-│  │  (CRUD ops)  │                   │  Pub/Sub +   │           │
-│  │              │                   │  Sessions +  │           │
-│  │              │                   │  Cache       │           │
-│  └──────┬───────┘                   └──────────────┘           │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌──────────────┐                                               │
-│  │  PostgreSQL  │                                               │
-│  │ (Persistence)│                                               │
-│  └──────────────┘                                               │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                 Clients (browser, one WS each)               │
+└───────────────────────────┬──────────────────────────────────┘
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│         WebSocket Gateways (stateless, ~50K conns each)      │
+│         terminate connections; no sheet logic lives here     │
+└───────────────────────────┬──────────────────────────────────┘
+                            ▼  route by sheet_id
+┌──────────────────────────────────────────────────────────────┐
+│      Sheet Sequencer — ONE owner per active sheet             │
+│  • assigns a monotonic seq number to every operation          │
+│  • transforms cell edits against structural ops               │
+│  • coalesces rapid edits to the same cell                     │
+│  • holds the sheet's cells + dep graph in memory              │
+└────────┬────────────────────────────────┬────────────────────┘
+         │ append (synchronous, cheap)    │ recalc request
+         ▼                                ▼
+┌──────────────────────┐        ┌────────────────────────────┐
+│  Durable op log      │        │  Formula Engine            │
+│  (Kafka / Redis      │        │  • reverse dep index       │
+│   Stream, per sheet) │        │  • topo sort of the        │
+│  ── THE SOURCE OF    │        │    AFFECTED subgraph only  │
+│     TRUTH ──         │        │  • cycle detection         │
+└──────────┬───────────┘        └────────────┬───────────────┘
+           │ async materialize               │
+           ▼                                 ▼
+┌──────────────────────┐        ┌────────────────────────────┐
+│    PostgreSQL        │        │   Redis                    │
+│  cells (sparse)      │        │  • pub/sub fan-out         │
+│  sheets, history     │        │  • presence / cursors      │
+│  ── A MATERIALIZED   │        │  • hot sheet cache         │
+│     VIEW of the log  │        │  (all of it ephemeral)     │
+└──────────────────────┘        └────────────────────────────┘
 ```
 
-### Component Responsibilities
+Two structural decisions carry the whole design:
 
-| Component | Responsibility |
-|-----------|----------------|
-| **WebSocket Server** | Real-time message routing, presence management, cell edit broadcasting |
-| **REST API** | CRUD for spreadsheets/sheets, initial data load, export |
-| **Redis** | Session storage, pub/sub for multi-server sync, cell cache |
-| **PostgreSQL** | Durable storage for all data, edit history for undo/redo |
-| **Formula Engine** | HyperFormula (in-memory per server) for dependency tracking |
+1. **Each active sheet has exactly one sequencer** — a single writer that assigns a total order to operations. This is the thing that makes concurrent structural edits tractable, and I'll defend it below.
+2. **The durable op log is the source of truth; PostgreSQL is a materialized view of it.** That inverts the usual relationship, and it's what makes 500K edits/second survivable.
 
-## Deep Dive: Database Schema (8 minutes)
-
-### Core Tables
+## 💾 Data Model
 
 | Table | Key Columns | Indexes | Notes |
 |-------|-------------|---------|-------|
-| **users** | id (UUID PK), session_id (unique), name (default 'Anonymous'), color (hex, default '#4ECDC4'), last_seen | idx_users_session (session_id) | Session-based auth with display color for cursor visibility |
-| **spreadsheets** | id (UUID PK), title (default 'Untitled Spreadsheet'), owner_id (FK to users) | — | Top-level document container |
-| **sheets** | id (UUID PK), spreadsheet_id (FK cascade), name (default 'Sheet1'), sheet_index, frozen_rows, frozen_cols | idx_sheets_spreadsheet (spreadsheet_id) | Tabs within a spreadsheet |
-| **cells** | id (UUID PK), sheet_id (FK cascade), row_index, col_index, raw_value (text, formulas start with '='), computed_value (text), format (JSONB for styling) | idx_cells_sheet (sheet_id), idx_cells_position (sheet_id, row_index, col_index) | SPARSE storage -- only non-empty cells are stored; unique constraint on (sheet_id, row_index, col_index) |
+| spreadsheets | id, title, owner_id, created_at | (owner_id) | |
+| sheets | id, spreadsheet_id, name, index | (spreadsheet_id) | Tabs |
+| **cells** | sheet_id, row_index, col_index, **raw_value**, **computed_value**, format (JSONB) | **unique(sheet_id, row_index, col_index)** | Sparse — only non-empty cells exist. `raw_value` is `=SUM(A1:A10)`; `computed_value` is `42` |
+| cell_deps | sheet_id, dependent (row,col), precedent (row,col) | (sheet_id, precedent) | The **reverse** index — "who depends on me" is the query that matters |
+| op_log | sheet_id, **seq** (monotonic), user_id, op (JSONB), created_at | (sheet_id, seq) | Append-only. The real source of truth |
+| edit_history | sheet_id, user_id, forward_op, inverse_op, seq | (sheet_id, user_id, seq DESC) | Per-user undo stacks |
+| collaborators | spreadsheet_id, user_id, color, last_seen | unique(spreadsheet_id, user_id) | Presence; ephemeral, could live only in Redis |
 
-### Sparse Storage Pattern
+Three things worth defending:
 
-The key insight is that most cells in a spreadsheet are empty. Storing only non-empty cells provides massive efficiency:
+**Sparse storage is not an optimization, it's the only viable representation.** A dense grid stores every position: 10,000 rows × 100 cols = 1M rows per sheet, of which perhaps 1,000 are non-empty. That's 1000× waste, and at 100M sheets it's the difference between 10 TB and 10 PB. The cost is that "give me rows 100–200" becomes an index range scan instead of an offset calculation — which the composite index handles fine, because a range of rows in a sparse grid is a contiguous slice of that index.
 
-**Cell update** uses an UPSERT pattern: insert the cell with the new value, and on conflict (same sheet_id, row_index, col_index), update the raw_value, computed_value, updated_by, and updated_at timestamp.
+**Storing both `raw_value` and `computed_value` is deliberate denormalization.** The computed value is derivable from the raw value plus the rest of the sheet — so storing it is redundant, and I store it anyway. Without it, opening a sheet with 100,000 formulas means evaluating 100,000 formulas before you can paint a single cell. With it, a read is a read. The cost is that they can drift if a recalculation is lost, which is why recalculation is part of the same durable operation as the edit, not a side effect of it.
 
-**Cell clear** simply deletes the row for that sheet_id, row_index, col_index combination.
+**The dependency index is stored *reversed*.** The question we ask on every edit is never "what does A1 depend on" — it's "**who depends on A1**," because that's who needs recalculating. Indexing by `precedent` makes the hot query an index lookup instead of a scan.
 
-**Viewport loading** uses an efficient range query: select all cells for a given sheet where row_index and col_index fall within the requested viewport boundaries. This avoids loading the entire sheet and only fetches the cells visible on screen.
+## 🔌 API Design
 
-### Edit History for Undo/Redo
+```
+POST   /api/spreadsheets                  Create
+GET    /api/spreadsheets/:id              Metadata + sheet list
+GET    /api/sheets/:id/cells              Load cells (paged by row range)
+PATCH  /api/sheets/:id/cells              Batch update (non-realtime clients, import)
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| **edit_history** | id (UUID PK), sheet_id (FK cascade), user_id (FK), operation_type, operation_data (JSONB -- forward operation), inverse_data (JSONB -- for undo) | idx_edit_history_sheet (sheet_id, created_at DESC) | Each entry stores both the forward and inverse operation so undo/redo can be replayed. Example: operation_data stores the new value for a cell, inverse_data stores the old value. |
+WSS    /ws?sheet_id=…
+  → client sends: CELL_EDIT, INSERT_ROW, DELETE_COL, CURSOR_MOVE, SELECTION
+  → server sends: OP_APPLIED (with seq), CELLS_RECALCULATED, PRESENCE, SYNC
+```
 
-### Collaborators Presence Table
+The WebSocket protocol is where the real API lives. REST exists for load and for clients that aren't in the collaborative session.
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| **collaborators** | spreadsheet_id + user_id (composite PK, both FK cascade), cursor_row, cursor_col, selection_start_row, selection_start_col, selection_end_row, selection_end_col, joined_at, last_seen | idx_collaborators_spreadsheet (spreadsheet_id) | Tracks cursor positions and selection ranges for each active collaborator |
+## 🔧 Deep Dive 1: Conflict Resolution — Where Last-Write-Wins Is Right, and Where It Silently Corrupts
 
-## Deep Dive: WebSocket Infrastructure (8 minutes)
+**The easy half, and I'll defend it.** For two users setting *the same cell to different values*, **last-write-wins is correct**, and reaching for OT or CRDTs here is over-engineering.
 
-### Connection Management
+The reason is semantic, not technical: OT exists to merge *character-level* edits, where "Alice typed 'x' at position 3" and "Bob typed 'y' at position 7" have a meaningful merge. A cell value has no such structure. If Alice sets A1 to `100` and Bob sets it to `200`, there is no merged value — `150` is not a compromise, it's a bug. One of them has to win, and the only question is which. LWW answers that with zero coordination overhead, and because both users see the converged value within one round-trip (~50ms), they *notice* and coordinate socially — which is what actually happens in real spreadsheets.
 
-The collaboration server maintains two in-memory data structures: a map of connection IDs to client metadata (WebSocket reference, user ID, spreadsheet ID, last ping time), and a map of spreadsheet IDs to sets of connection IDs ("rooms").
+**Now the hard half, which most designs miss entirely: structural operations.**
 
-**Handling a new connection:**
+Alice inserts a row at index 5. Simultaneously, Bob — whose client hasn't seen that yet — edits cell A7.
 
-1. Generate a connection ID from the user ID and timestamp.
-2. Register the connection in the connections map.
-3. If this is the first connection to a spreadsheet, create a new room and subscribe to the Redis pub/sub channel for that spreadsheet.
-4. Add the connection to the room.
-5. UPSERT the collaborators table to record presence (or refresh last_seen).
-6. Broadcast a USER_JOINED event (with user name and cursor color) to all other clients in the room.
-7. Send the full spreadsheet state (all cells, sheets, collaborators) to the newly connected client.
+- On Bob's screen, A7 holds the number he's changing.
+- After Alice's insert, everything from row 5 down shifts by one. What *was* A7 is now A8.
+- Bob's edit arrives at the server addressed to **A7**. Applied naively, it lands on the wrong cell — a cell that used to be A6.
 
-**Handling incoming messages:**
+**LWW cannot help here, because this is not a conflict — both operations are individually valid and both should be applied.** The problem is that Bob's operation was written against a *coordinate system that no longer exists*. Naive LWW doesn't detect a conflict; it silently writes the right value into the wrong cell. That is data corruption with no error message, and the user finds it three weeks later in a financial model.
 
-The server dispatches on message type: CELL_EDIT, CURSOR_MOVE, SELECTION_CHANGE, UNDO, or REDO.
+And formulas make it worse: every formula referencing `A7:A10` must have its references rewritten. A cell edit is local; a row insert is a **global rewrite of the sheet's address space.**
 
-**Handling a cell edit:**
+**The fix: a single sequencer per sheet, plus operational transformation on coordinates only.**
 
-1. Check the idempotency cache in Redis using the request ID. If already processed, return the cached response.
-2. If the value starts with "=", compute the formula result using the server-side formula engine.
-3. UPSERT the cell in the database with the raw value and computed value.
-4. Record the edit in edit_history with both forward and inverse data for undo support.
-5. Publish the CELL_UPDATED event to Redis pub/sub for the spreadsheet channel (this reaches all servers).
-6. Store the response in Redis for idempotency (24-hour TTL).
+1. Every active sheet is owned by exactly **one** sequencer process. Every operation for that sheet flows through it and receives a **monotonic sequence number**. This gives a total order, which is the precondition for any of the rest to work.
+2. Every client tags each operation with the **last seq it has seen**.
+3. When an operation arrives that was written against an older seq, the sequencer **transforms its coordinates** against the structural operations that happened in between. Bob's edit to A7, submitted at seq 40 when the insert committed at seq 41, is rewritten to A8 before being applied.
+4. Formula references are rewritten by the same transform, on the same total order.
 
-**Broadcasting to a room:**
+> "This is operational transformation — but applied to *coordinates*, not to characters, and only against *structural* ops. That's a dramatically smaller problem than Google Docs solves. The transform function has to handle maybe six operation types against four structural ops. I'm not building general OT; I'm building the minimum amount of it that stops silent corruption, and I'm keeping LWW for the case where LWW is genuinely correct. The trap is picking one model for the whole system: pure LWW corrupts on structural ops, and full CRDT/OT for cell values is a large amount of machinery to solve a problem — merging `100` and `200` — that has no solution."
 
-Iterate all connections in the room, skip the sender (if specified), and send the serialized message to each connection whose WebSocket is in the OPEN state.
+**What the single sequencer costs me.** It's a single point of failure per sheet and a vertical scaling ceiling per sheet. I accept both, for a specific reason: **a sheet has at most ~50 concurrent editors**, so one process is never remotely near its capacity. The sequencer is not a throughput bottleneck; it's a *correctness* device. Failover is a lease in Redis with a heartbeat — a new sequencer picks up the sheet, replays the op log from the last checkpoint, and rebuilds in-memory state. Because the log is the source of truth, that replay is exact.
 
-### Multi-Server Synchronization with Redis Pub/Sub
+This is also why sheets shard beautifully: sheets are completely independent, so sequencers spread across the fleet by `sheet_id` with zero cross-shard coordination.
 
-A dedicated Redis subscriber listens for messages on spreadsheet channels (format: `spreadsheet:{id}`). When a message arrives, the manager extracts the spreadsheet ID from the channel name, parses the message, and broadcasts it to all local WebSocket clients in that spreadsheet's room. This ensures that edits made on Server A are immediately visible to clients connected to Server B.
+## 🔧 Deep Dive 2: Recalculation — The Cascade Is the Real Workload
 
-The manager subscribes to a channel when the first local client opens a spreadsheet, and unsubscribes when the last local client disconnects.
+A cell edit is not one write. It's one write plus however many cells depend on it, transitively.
 
-## Deep Dive: Caching Strategy (5 minutes)
+**How the naive approaches break:**
 
-### Multi-Layer Cache Architecture
+| Approach | The specific bottleneck |
+|----------|-------------------------|
+| ❌ Recompute the whole sheet on every edit | A sheet with 100K formulas recomputes 100K formulas on every keystroke. At 500K edits/sec this is not a performance problem, it's arithmetic that doesn't fit on the planet |
+| ❌ Recompute lazily, on read | Reads vastly outnumber writes (viewers!), and a read now costs a full evaluation. You've moved the cost to the more frequent operation — exactly backwards |
+| ❌ No dependency tracking; just re-evaluate cells that "look related" | There is no such thing as "looks related." `=SUM(A:A)` depends on an entire column |
+| ✅ Reverse dependency index + topological sort of the **affected subgraph only** | See below |
 
-The cache operates in three layers:
+**The design:**
 
-**Layer 1 - Spreadsheet metadata (30-minute TTL):** Check Redis for cached metadata. On miss, query PostgreSQL, cache the result, and return.
+1. When a formula is written, parse it and extract its precedents. Store the edges **reversed**: `precedent → dependents`.
+2. On an edit to A1, look up A1's dependents. Walk transitively to build the **affected subgraph** — usually a handful of cells, occasionally thousands.
+3. **Topologically sort just that subgraph** and evaluate in order, so each cell is computed after everything it depends on. A cell is evaluated exactly once no matter how many paths reach it.
+4. Broadcast the changed `computed_value`s to collaborators as one batch.
 
-**Layer 2 - Cell data using Redis Hashes (15-minute TTL):** Cell data is stored in Redis hashes keyed by `sheet:{sheetId}:cells`, with individual cells keyed as `{row}:{col}`. On cache miss, load all cells for the sheet from PostgreSQL and populate the Redis hash using a pipeline for efficiency. For cell updates, a write-through strategy is used: the cache and database are updated in parallel. Cache invalidation events are published via Redis pub/sub to other servers.
+Cost is O(affected), not O(sheet). For the overwhelming majority of edits, "affected" is zero — you typed a number into a cell nobody references, and the recalculation is a no-op.
 
-**Layer 3 - Collaborator presence (5-minute TTL):** Active collaborators for a spreadsheet are cached in Redis. The query joins the collaborators table with users to include cursor positions, selection ranges, names, and colors. Only collaborators seen within the last 5 minutes are included.
+**Cycle detection** falls out of the topological sort: if the affected subgraph can't be ordered, there's a cycle, and the cells in it get an error value rather than an infinite loop. This has to be detected at *write* time, not evaluation time, so the user learns immediately.
 
-## Deep Dive: Conflict Resolution (5 minutes)
+**Two failure modes worth naming:**
 
-### Last-Write-Wins Strategy
+**The cascade bomb.** Someone writes a formula that 10,000 cells depend on, and then types into it repeatedly. Each keystroke triggers a 10,000-cell recalculation. The fix is **debounce and coalesce**: aggregate edits over a ~100ms window, then recalculate once against the final state. The user typing "12345" produces five edits to one cell; only the last one's cascade matters, and computing the first four is pure waste. This is the same coalescing that saves the write path — one mechanism, two payoffs.
 
-The backend uses a simple but effective last-write-wins strategy at the cell level:
+**Volatile functions.** `NOW()`, `RAND()`, and `TODAY()` depend on *nothing* and change *anyway*, which means they have no precedents and therefore never appear in any affected subgraph. They break the whole model. The honest answer is that they need a separate periodic recalculation pass, and that they are precisely why a purely dependency-driven engine isn't sufficient. I'd rather name that than pretend the dependency graph is complete.
 
-All edits are routed through the server, which assigns a server-receive timestamp to determine ordering. When concurrent edits arrive for the same cell, the server sorts them by timestamp and keeps only the most recent value. Each cell is treated as an independent unit, so edits to different cells never conflict.
+**Why server-side evaluation, not client-side?** Client-side evaluation is tempting — it's free compute and it's instant. It fails on two counts. First, **50 collaborators evaluating independently can disagree** — different browsers, different float behavior, different versions of the function library — and a spreadsheet where two people see different totals is worse than one that's slow. Second, a **viewer** with a read-only link would have to evaluate 100K formulas just to look at a sheet. The server evaluates once; everyone reads the same answer. The client still evaluates optimistically for instant local feedback, but the server's value is authoritative and overwrites it. Optimism for feel; authority for truth.
 
-> "This works for spreadsheets because: (1) each cell is an independent unit, (2) real conflicts where two users edit the same cell simultaneously are rare, (3) server ordering provides deterministic resolution, and (4) this is much simpler than Operational Transformation or CRDTs."
+## 🔧 Deep Dive 3: Surviving 500K Edits/Second by Inverting the Storage Model
 
-### Optimistic Updates with Rollback
+Here is the number that breaks the obvious design: **500K cell edits/second, each producing an UPSERT and a history row = 1M writes/second to PostgreSQL.** A well-tuned Postgres primary does tens of thousands of writes per second. We are off by roughly two orders of magnitude.
 
-Server-side validation runs before applying each edit:
+**Why the usual fixes don't get there.** Sharding by `sheet_id` helps — spread across 100 shards and it's 10K writes/sec each, which is survivable. But we've now got 100 database primaries doing nothing but absorbing keystrokes, and we still write a row for *every intermediate state* of a cell someone is typing into.
 
-1. **Validate cell coordinates** - Reject if row or column index is negative.
-2. **Validate value size** - Reject if the cell value exceeds 32,768 characters.
-3. **Apply the edit** - Attempt to write to the database.
-4. **Handle failure** - If the edit fails, return a rollback instruction to the client containing the original cell value so the client can revert its optimistic update.
+**The inversion: make the log the truth and the database a materialized view.**
 
-## Deep Dive: Formula Engine Integration (5 minutes)
+1. **The sequencer appends every operation to a durable, per-sheet log** (Kafka partitioned by sheet, or a Redis Stream). This is a **sequential append** — the cheapest write a computer can do — and it's what makes the operation durable. Once it's in the log, the edit cannot be lost.
+2. **The edit is broadcast to collaborators immediately from the sequencer**, straight after the append. Broadcast latency never waits on PostgreSQL.
+3. **A materializer consumes the log asynchronously** and writes to PostgreSQL in batches, **coalescing by cell**. A user typing "12345" into A1 emits five operations; the materializer writes **one** row.
 
-### Server-Side Formula Computation
+**What coalescing actually buys.** Bursty human typing means most cells are written several times in quick succession. Coalescing over a 1-second window typically collapses 5–10 operations per cell into one write — an order of magnitude off the top. Combine that with batching (one multi-row statement instead of N statements) and sharding by sheet, and the write volume lands in territory PostgreSQL is comfortable in.
 
-The server maintains an in-memory HyperFormula engine instance per active sheet. When a formula is set in a cell:
+> "The trade I'm making is a window of *materialization lag* — PostgreSQL is behind the log by up to a second. That sounds alarming for a system holding people's financial models, so let me be precise about what it does and doesn't cost. It does **not** risk losing an edit: the log append is synchronous and durable, so an edit the user saw acknowledged is safe the moment it's in the log. What it costs is that a *cold read* — someone opening the sheet from a different server right now — could miss the last second of edits. The fix is that a cold read replays the log tail past the last materialized checkpoint. So the guarantee is: **durability comes from the log, and freshness comes from replaying it.** Postgres is an optimization for fast loads, not the record of truth. Treating it as the truth is what forces you into 1M writes/second."
 
-1. **Get or create engine** - If no HyperFormula instance exists for this sheet, create one with an empty sheet.
-2. **Set cell contents** - Pass the formula string to HyperFormula at the specified row and column.
-3. **Get computed value** - Retrieve the calculated result from the engine.
-4. **Get dependents** - Query HyperFormula for all cells that depend on this cell (for cascade recalculation).
+**What I give up.** Operational complexity, honestly. There are now two stores that must agree, a materializer that can fall behind (and must be monitored — its lag *is* the freshness bound), and a replay path that has to be exercised or it will be broken when you need it. That's a real cost. I'd take it, because the alternative isn't "simpler" — it's "doesn't work at this scale," and a simple design that doesn't work is not simple.
 
-**Bulk recalculation:** When a cell changes, the engine identifies all dependent cells (those with formulas referencing the changed cell). For each dependent, the server retrieves the new computed value and returns the list of cell updates that need to be broadcast to clients.
+**Fan-out**, meanwhile, is the easy half: 24M messages/second sounds huge, but it's 50 recipients per edit and it parallelizes perfectly. Redis Pub/Sub distributes an op to whichever gateways hold that sheet's connections. Presence and cursor moves — which are high-frequency and completely disposable — are **conflated**: a cursor's newest position supersedes the old one, so we throttle them to ~10/sec per user and drop the rest. Cell edits are never conflated in transit, because each one is a fact.
 
-**Cleanup:** When a spreadsheet is closed (no active connections), the HyperFormula instance is destroyed and removed from memory to prevent leaks.
+## 🧭 Consistency Model
 
-## Deep Dive: Circuit Breaker for Redis (4 minutes)
+| Data | Guarantee | Why |
+|------|-----------|-----|
+| Op log | Durable, totally ordered per sheet | The source of truth. Everything else derives from it |
+| Cell values across clients | **Convergent** — all clients reach the same state | Achieved by the single sequencer's total order, not by hoping |
+| Cell edits (same cell, concurrent) | Last-write-wins by seq number | There's no meaningful merge of `100` and `200` |
+| Structural ops vs. cell edits | Transformed against the total order | LWW here would silently write the right value into the wrong cell |
+| Computed values | Eventual, ~100ms behind the edit (debounce window) | A formula result lagging a tenth of a second is invisible |
+| PostgreSQL | Eventual, ≤ ~1s behind the log | It's a materialized view; freshness comes from log replay |
+| Presence / cursors | Best-effort, conflated, lossy | A stale cursor for 100ms harms nobody |
 
-Redis pub/sub operations are wrapped in a circuit breaker with a 5-second timeout, 50% error threshold, and 10-second reset timeout (minimum 5 requests before evaluating). The fallback continues operation in single-server mode -- edits still work locally but are not broadcast to other servers.
+Cell edits are **idempotent by construction** — an UPSERT keyed on `(sheet_id, row, col)` applied twice produces the same state — which means a replayed log is safe, and that's what makes the whole log-as-truth model work.
 
-The breaker emits events on state transitions: when it opens, a Prometheus metric is set to indicate Redis pub/sub is unavailable and an error is logged. When it closes, the metric resets and an info log is written.
+## 🔁 Undo That Doesn't Clobber Collaborators
 
-For broadcasting edits, the circuit breaker wraps the Redis PUBLISH call, ensuring that Redis failures do not block cell editing on the primary server.
+Undo is deceptively hard in a collaborative system, and the naive design is actively harmful.
 
-## Database Indexing and Query Optimization (3 minutes)
+**The naive design:** a global undo stack. Alice hits Ctrl-Z and it undoes *Bob's* last edit. This is a genuinely awful experience and it's what you get for free if you store one stack per sheet.
 
-### Index Strategy
+**What's needed is per-user undo:** each user's history is their own operations, and undoing one applies its **inverse**. So every operation is stored with both a forward op and an inverse op (`set A1 to "new"` / `set A1 to "old"`), and Alice's undo emits the inverse of *her* last operation as a **new operation** appended to the log.
 
-| Index | Purpose | Query Pattern |
-|-------|---------|---------------|
-| `idx_users_session` | Session lookup | `WHERE session_id = ?` |
-| `idx_sheets_spreadsheet` | Load spreadsheet | `WHERE spreadsheet_id = ?` |
-| `idx_cells_sheet` | Load all cells | `WHERE sheet_id = ?` |
-| `idx_cells_position` | Viewport loading | `WHERE sheet_id = ? AND row_index BETWEEN ? AND ?` |
-| `idx_collaborators_spreadsheet` | Presence list | `WHERE spreadsheet_id = ?` |
-| `idx_edit_history_sheet` | Undo stack | `WHERE sheet_id = ? ORDER BY created_at DESC` |
+That last point is what makes it correct: **undo is not a rewind, it's a new forward operation.** It gets a sequence number, it gets broadcast, it gets transformed against structural ops just like any other edit. Trying to actually rewind the log — removing an operation from history — would mean re-deriving every subsequent operation, which is unsolvable when those operations were other people's.
 
-### Connection Pool Configuration
+**The honest wrinkle:** if Bob has since overwritten the cell Alice is undoing, Alice's undo will overwrite Bob. There is no universally right answer here; real spreadsheets accept this. What matters is that the *behavior is defined* and the operation goes through the same ordered pipeline as everything else, rather than being a special path that bypasses the sequencer.
 
-The PostgreSQL connection pool is configured with a maximum of 20 connections, 30-second idle timeout, 2-second connection timeout, and a 5-second statement timeout to kill runaway queries. Pool metrics (active connections) are tracked via Prometheus counters on acquire and release events.
+## 🛠️ Failure Handling
 
-## Trade-offs Discussion (3 minutes)
+| Failure | Behavior |
+|---------|----------|
+| **Sequencer for a sheet dies** | Lease expires; a peer acquires it, replays the op log from the last checkpoint, rebuilds cells + dep graph in memory. Clients see a brief pause, then a `SYNC`. Because the log is the truth, the rebuild is exact — no guessing |
+| **Redis Pub/Sub down** | Fan-out degrades to single-gateway; collaborators on *other* gateways stop seeing updates. Circuit-break and surface it — a collaborative editor that silently stops being collaborative is the worst possible failure, because users keep typing |
+| **PostgreSQL down** | Editing **continues** — the log is the truth and broadcast doesn't depend on Postgres. Cold loads of inactive sheets fail. This is exactly the resilience the inverted storage model buys |
+| **Op log unavailable** | **Reject edits.** This is the one place we fail closed: without a durable append we cannot promise the edit survives, and acknowledging an edit we might lose is worse than refusing it |
+| **Client disconnects** | Reconnect with its last-seen seq; the server sends operations since then, or a full state sync if it's too far behind |
+| **Formula engine overloaded** | Recalculation queues and lags; raw values still save and broadcast. Cells show a "calculating" state — degraded and honest |
+
+The rule: **the log is sacred; everything else degrades.**
+
+## 📊 Observability
+
+| Signal | What it tells me |
+|--------|------------------|
+| Sequencer op-processing latency, p99 | The core SLO. It's the serialization point, so it's where queuing shows up first |
+| **Materializer lag** | Directly bounds how stale PostgreSQL is — which is to say, it *is* the freshness guarantee. If it grows without bound, cold loads are silently wrong |
+| Recalculation cascade size, p99 | Detects the cascade bomb before a user does. A p99 of 10,000 affected cells means someone built a spreadsheet that will melt |
+| Convergence check | Periodically hash each client's visible state and compare. **Divergence is silent** — it produces no errors, no exceptions, just two people looking at different numbers. It is the single most dangerous failure in this system and the only way to catch it is to look for it |
+| WebSocket connections per gateway | Rebalancing signal |
+| Op log append latency | If this degrades, we start rejecting edits — it's the one hard dependency |
+
+## 📈 Scalability: What Breaks First
+
+1. **PostgreSQL write volume** — first, and by a wide margin. The log-as-truth inversion plus coalescing plus sharding by `sheet_id` is the answer, and it's the single most important thing in this design.
+2. **WebSocket connections** — ~50K per gateway before event-loop latency eats the 200ms budget. Horizontal gateways, routed by sheet so that a sheet's collaborators tend to land together and much of the fan-out becomes local rather than crossing Redis.
+3. **Recalculation cascades** — a pathological sheet (one cell feeding 10,000 formulas) can saturate a formula worker. Debounce, batch, and move heavy evaluation to a worker pool so it never blocks the sequencer's event loop. The sequencer must stay responsive: it's a serialization point, and anything that blocks it blocks everyone on that sheet.
+4. **Op log / history growth** — every edit is a row, forever. Checkpoint periodically (snapshot the sheet state, truncate the log before it), and prune per-user history after 30 days. Without checkpoints, sequencer failover replay time grows without bound, and the recovery path degrades silently until the day you need it.
+5. **The one-thousand-viewer sheet** — a popular public template has few editors and enormous read fan-out. That's a completely different problem, and it gets a different answer: viewers don't need a sequencer, they need a **CDN-cached snapshot** plus a low-frequency update channel. Serving a read-only viewer through the collaborative editing path is a waste of an expensive resource.
+
+## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Conflict Resolution | Last-write-wins | OT/CRDT | Much simpler, good enough for cells |
-| Cell Storage | Sparse (only non-empty) | Dense array | 1000x storage efficiency |
-| Multi-server Sync | Redis Pub/Sub | Kafka | Lower latency, simpler for real-time |
-| Formula Engine | HyperFormula | Custom | 380+ Excel functions, battle-tested |
-| Session Storage | Redis | PostgreSQL | Fast lookups, natural TTL support |
-| Database | PostgreSQL | MongoDB | ACID for edit history, JSONB for flexibility |
+| Cell conflict | ✅ Last-write-wins | ❌ OT / CRDT on values | There's no meaningful merge of `100` and `200` |
+| **Structural ops** | ✅ Single sequencer + coordinate transform | ❌ LWW | LWW silently writes the right value into the *wrong cell* — corruption with no error |
+| Ordering | ✅ One sequencer per sheet | ❌ Multi-writer with vector clocks | 50 editors never saturate one process; the sequencer buys correctness, not throughput |
+| Source of truth | ✅ Durable op log | ❌ PostgreSQL | 1M writes/sec doesn't fit; a sequential append does |
+| Persistence | ✅ Async materialize + coalesce | ❌ Synchronous write per edit | Typing "12345" should be one row, not five |
+| Storage | ✅ Sparse cells | ❌ Dense grid | 1000× waste; 10 TB vs 10 PB |
+| Formula eval | ✅ Server-authoritative (client optimistic) | ❌ Client-side | 50 clients computing independently can disagree; viewers shouldn't have to compute |
+| Recalculation | ✅ Reverse dep index + topo sort of the affected subgraph | ❌ Full-sheet recompute | O(affected), not O(sheet) — and usually affected is zero |
+| Cursors/presence | ✅ Conflated, throttled, lossy | ❌ Reliable delivery | Newest cursor supersedes; nobody needs the old one |
+| Undo | ✅ Per-user, inverse ops appended as new ops | ❌ Global stack / log rewind | Undoing your colleague's work is unforgivable; rewinding a shared log is unsolvable |
+| Edit log unavailable | ✅ Fail closed (reject edits) | ❌ Accept and hope | Acknowledging an edit we might lose is worse than refusing it |
 
-### Limitations and Future Improvements
+## 🚀 Closing: What I'd Build Next
 
-1. **No Offline Support**: Would require CRDTs for proper offline merge
-2. **Single Redis Instance**: Production would need Redis Cluster
-3. **Formula Engine Per-Server**: State must be synced across servers
-4. **Large Formula Graphs**: Complex dependencies may cause recalculation lag
+The most interesting unbuilt thing is **offline editing**, and it's interesting because it breaks my central assumption. Everything here rests on a single sequencer assigning a total order — which requires the client to be *online* to get one. A client that edits offline for an hour and reconnects has a batch of operations written against an ancient coordinate system, and transforming them all against an hour of other people's structural changes is exactly the case where OT gets genuinely hard and where a CRDT starts to look like the right tool after all. I'd want to be honest that the design I've described is a *connected* design, and that offline is not a feature you bolt on — it's a different concurrency model.
 
-## Closing Summary (1 minute)
-
-"The Google Sheets backend architecture centers on three key systems:
-
-1. **WebSocket Infrastructure**: Connection management with room-based routing, heartbeat for connection health, and full state sync on reconnect.
-
-2. **Sparse Cell Storage**: PostgreSQL with UPSERT pattern stores only non-empty cells, reducing storage by orders of magnitude while supporting viewport-based loading.
-
-3. **Multi-Server Synchronization**: Redis pub/sub enables real-time broadcast across server instances, with circuit breakers for graceful degradation when Redis is unavailable.
-
-The key architectural insight is that treating each cell as an independent unit simplifies conflict resolution dramatically. Last-write-wins per cell is sufficient because real conflicts (two users editing the same cell simultaneously) are rare in practice, and the server ordering provides deterministic resolution."
+Beyond that: **cell-level permissions and protected ranges** (which turn every operation into an authorization check on the sequencer's hot path), **import/export** at scale (a 500MB CSV is a very different write pattern than a keystroke and shouldn't go anywhere near the sequencer), and **a real formula language** — the moment you support `VLOOKUP` across sheets, the dependency graph stops being per-sheet and the clean sharding boundary I've been relying on all answer quietly disappears. That last one is the kind of thing that looks like a feature request and is actually an architecture change.

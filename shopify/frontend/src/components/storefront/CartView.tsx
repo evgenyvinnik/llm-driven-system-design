@@ -1,5 +1,6 @@
 import { Cart, CartLineItem } from '../../types';
 import { CartIconLarge } from '../icons';
+import { formatPrice, toNumber } from '../../utils/format';
 
 /**
  * Props for CartView component.
@@ -48,7 +49,7 @@ export function CartView({
       </div>
 
       <CartSummary
-        subtotal={cart?.subtotal || 0}
+        subtotal={toNumber(cart?.subtotal)}
         onCheckout={onCheckout}
         onContinueShopping={onContinueShopping}
         primaryColor={primaryColor}
@@ -104,7 +105,7 @@ function CartItem({ item, onUpdateQuantity }: CartItemProps) {
       <div className="flex-1">
         <h3 className="font-medium text-gray-900">{item.product_title}</h3>
         <p className="text-sm text-gray-500">{item.variant_title}</p>
-        <p className="font-medium mt-1">${item.price.toFixed(2)}</p>
+        <p className="font-medium mt-1">${formatPrice(item.price)}</p>
       </div>
       <QuantityControls
         quantity={item.quantity}

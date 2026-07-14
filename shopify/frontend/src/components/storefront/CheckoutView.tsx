@@ -1,5 +1,6 @@
 import { Cart, CartLineItem } from '../../types';
 import { BackArrowIcon } from '../icons';
+import { toNumber } from '../../utils/format';
 
 /**
  * Checkout data interface for shipping information form.
@@ -51,7 +52,9 @@ export function CheckoutView({
   onBack,
   primaryColor,
 }: CheckoutViewProps) {
-  const subtotal = cart?.subtotal || 0;
+  // carts.subtotal is a DECIMAL column and arrives from the API as a string;
+  // coerce before any arithmetic or `+` would concatenate instead of add.
+  const subtotal = toNumber(cart?.subtotal);
   const shipping = 0; // Free shipping
   const tax = subtotal * 0.1; // 10% tax
   const total = subtotal + shipping + tax;
