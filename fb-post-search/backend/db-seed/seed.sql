@@ -1,15 +1,15 @@
 -- Facebook Post Search Seed Data
 -- Password for all users: password123
--- Hash: $2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom
+-- Hash: ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f
 
 -- Users
 INSERT INTO users (id, username, email, display_name, password_hash, avatar_url, role) VALUES
-  ('11111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', 'Alice Johnson', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150', 'user'),
-  ('22222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', 'Bob Smith', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150', 'user'),
-  ('33333333-3333-3333-3333-333333333333', 'carol', 'carol@example.com', 'Carol Williams', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150', 'user'),
-  ('44444444-4444-4444-4444-444444444444', 'david', 'david@example.com', 'David Chen', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150', 'user'),
-  ('55555555-5555-5555-5555-555555555555', 'emma', 'emma@example.com', 'Emma Garcia', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150', 'user'),
-  ('66666666-6666-6666-6666-666666666666', 'admin', 'admin@facebook.local', 'Admin User', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', NULL, 'admin')
+  ('11111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', 'Alice Johnson', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150', 'user'),
+  ('22222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', 'Bob Smith', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150', 'user'),
+  ('33333333-3333-3333-3333-333333333333', 'carol', 'carol@example.com', 'Carol Williams', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150', 'user'),
+  ('44444444-4444-4444-4444-444444444444', 'david', 'david@example.com', 'David Chen', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150', 'user'),
+  ('55555555-5555-5555-5555-555555555555', 'emma', 'emma@example.com', 'Emma Garcia', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150', 'user'),
+  ('66666666-6666-6666-6666-666666666666', 'admin', 'admin@facebook.local', 'Admin User', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', NULL, 'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- Friendships (bidirectional)

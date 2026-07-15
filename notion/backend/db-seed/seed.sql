@@ -3,7 +3,7 @@
 
 -- Insert default admin user (password: admin123)
 INSERT INTO users (id, email, password_hash, name, role) VALUES
-    ('00000000-0000-0000-0000-000000000001', 'admin@notion.local', '$2b$10$8K1p/a0dR6OQS6qL5uF4.uBXLH5Y5IQ0NQDCzWQKXpHzJMF7QJQXG', 'Admin User', 'admin')
+    ('00000000-0000-0000-0000-000000000001', 'admin@notion.local', '$2b$10$H7vKWTFB.lP5/btyuA8ttO8eqqU2bXcc5vlcdanvOmPL4t4/vK3UW', 'Admin User', 'admin')
 ON CONFLICT (email) DO NOTHING;
 
 -- Insert default workspace

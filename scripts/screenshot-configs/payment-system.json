@@ -8,11 +8,10 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "alice@example.com",
-      "password": "password123"
+      "username": "pk_test_5a8f3c2e1b9d4f6a7c0e2d1b"
     },
-    "usernameSelector": "input[name='email'], input[type='email']",
-    "passwordSelector": "input[name='password'], input[type='password']",
+    "usernameSelector": "input#apiKey",
+    "passwordSelector": false,
     "submitSelector": "button[type='submit']",
     "successIndicator": "main"
   },

@@ -679,3 +679,10 @@ import { pool } from '../shared/db'     // ❌
 import { pool } from '../shared/db.js'
 import express from 'express'
 ```
+
+
+## Screenshot harness seeding race (2026-07-14)
+
+Root cause of "login shows Invalid credentials / page shows Log in" on large-schema projects (airbnb was the reported case, but it affected any project whose schema loads via the docker-entrypoint-initdb.d mount): Postgres accepts local-socket connections *while* initdb.d scripts are still creating tables, so `pg_isready` returns ready too early. The harness seeded before the `users` table existed; because `psql` without `ON_ERROR_STOP` exits 0 on SQL errors, the failed INSERT was silent and reported as "Database seeded" — leaving zero users, so login failed.
+
+Fixed in `scripts/screenshots.mjs`: for projects without a `db:migrate` step, wait until `information_schema.tables` in the public schema is non-empty before seeding; run the seed with `-v ON_ERROR_STOP=1`; raise retries to 5 with 2s backoff. Verified airbnb messages now render the seeded Carol Davis conversation.

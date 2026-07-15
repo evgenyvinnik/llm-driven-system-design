@@ -10,7 +10,7 @@
     "loginUrl": "/",
     "credentials": {
       "email": "admin@findmy.local",
-      "password": "admin123"
+      "password": "password123"
     },
     "usernameSelector": "input[type='email']",
     "passwordSelector": "input[type='password']",

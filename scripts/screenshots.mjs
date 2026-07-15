@@ -409,6 +409,28 @@ async function setupDatabase(projectDir, projectName, config) {
     return false;
   }
 
+  // pg_isready can report ready while the docker-entrypoint-initdb.d schema
+  // scripts are STILL running (Postgres accepts local-socket connections during
+  // init). For projects that load their schema via the initdb.d mount rather
+  // than a db:migrate script, seeding here would hit tables that don't exist yet
+  // — and because psql without ON_ERROR_STOP exits 0 on SQL errors, that failure
+  // is silent and login later fails with "Invalid credentials". So when there's
+  // no migrate step, wait until the public schema actually has tables.
+  if (!scripts['db:migrate']) {
+    for (let i = 0; i < 30; i++) {
+      try {
+        const out = execSync(
+          `docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName} -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"`,
+          { cwd: projectDir, stdio: 'pipe' }
+        ).toString().trim();
+        if (parseInt(out, 10) > 0) break;
+      } catch {
+        // psql not reachable yet
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+
   // Backend deps are needed for both migrate and TypeScript seed scripts.
   if ((scripts['db:migrate'] || seedScript) && !fs.existsSync(path.join(backendDir, 'node_modules'))) {
     await installDeps(backendDir, 'backend');
@@ -450,11 +472,14 @@ async function setupDatabase(projectDir, projectName, config) {
 
   logStep('DATABASE', 'Seeding database...');
 
-  // Retry seeding a few times (in case database just became ready)
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // Retry seeding a few times (in case database just became ready).
+  // ON_ERROR_STOP=1 makes psql exit non-zero on SQL errors; without it, a seed
+  // that hits a missing table (initdb.d race) or a bad row exits 0 and the
+  // failure is silent — reported as "seeded" while no user rows exist.
+  for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       // Use cat to pipe the seed file into psql (shell redirection doesn't work with docker exec)
-      execSync(`cat backend/db-seed/seed.sql | docker-compose exec -T postgres psql -U ${dbUser} -d ${dbName}`, {
+      execSync(`cat backend/db-seed/seed.sql | docker-compose exec -T postgres psql -v ON_ERROR_STOP=1 -U ${dbUser} -d ${dbName}`, {
         cwd: projectDir,
         stdio: 'pipe',
       });
@@ -473,11 +498,11 @@ async function setupDatabase(projectDir, projectName, config) {
       }
       return true;
     } catch (error) {
-      if (attempt === 3) {
+      if (attempt === 5) {
         logWarning(`Database seeding failed after ${attempt} attempts: ${error.message}`);
         return false;
       }
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
 
