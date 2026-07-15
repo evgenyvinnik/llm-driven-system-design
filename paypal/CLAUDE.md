@@ -1,62 +1,62 @@
-# PayPal - Development Notes
+# PayPal — Development with Claude
 
 ## Project Context
 
-This project implements a simplified P2P payment platform inspired by PayPal. It demonstrates financial transaction patterns: double-entry bookkeeping, idempotent payment processing, optimistic locking for wallet balances, and money request workflows.
+A simplified P2P payment platform: users hold a wallet, deposit/withdraw funds, send money to each other, and request money with a pay/decline/cancel workflow. The core hard problem is *moving money between two wallets correctly under concurrency* — a transfer must debit exactly one wallet and credit exactly one other, atomically, and never double-execute on a retry or deadlock when two people pay each other simultaneously.
 
-## Development Phases
+**Learning goals:** double-entry bookkeeping, optimistic locking vs. `SELECT ... FOR UPDATE` for wallet balances, deadlock-free multi-row locking, and idempotency that survives a crash.
 
-### Phase 1: Architecture and Design
-- Defined double-entry bookkeeping model with ledger entries
-- Designed wallet schema with optimistic locking (version column)
-- Planned idempotency key storage within the same database transaction as payments
-- Established transfer flow: lock wallets in user_id order, debit sender, credit recipient
+## Architecture at a Glance (what actually runs)
 
-### Phase 2: Backend Implementation
-- Express API with session auth (Redis-backed)
-- Wallet service: deposit, withdraw, balance query with transactional integrity
-- Transfer service: P2P sends with double-entry ledger, optimistic locking, deadlock prevention
-- Idempotency service: check/store keys with 24-hour TTL
-- Request flow: create request, pay, decline, cancel with authorization checks
-- Payment method CRUD with default management
-- User search for send/request flows
+Two datastores in `docker-compose.yml` — this is deliberately a single-relational-DB design; money correctness lives in Postgres, not spread across systems:
 
-### Phase 3: Frontend Implementation
-- Dashboard with wallet balance card, pending requests, recent activity
-- Send money flow: user search (debounced), amount input, note, idempotency key generation
-- Request money flow: similar UX to send
-- Activity page with type filters (all/transfer/deposit/withdrawal)
-- Payment method management with add modal
-- PayPal brand colors and gradient wallet card
+| Store | Role | Why this one |
+|-------|------|--------------|
+| **PostgreSQL** (`pg`) | Wallets, transactions, `ledger_entries`, transfer_requests, payment_methods, **and idempotency keys** | The transfer + its ledger entries + its idempotency key all commit in *one* ACID transaction — that atomicity is the whole point |
+| **Valkey/Redis** (`ioredis`) | Session store (`connect-redis`) + rate-limit counters (`rate-limit-redis`) | Ephemeral, revocable session state and atomic counters — data whose loss on restart is tolerable, unlike ledger data |
+
+Idempotency keys live in **Postgres, not Redis** — a deliberate inversion of the usual "cache it in Redis" instinct (see Decision 3). Backend: Express app (`app.ts`/`index.ts`) with routes `auth`, `wallet`, `transfers`, `requests`, `paymentMethods`, `users`; services `walletService`, `transferService`, `idempotencyService`, plus `circuitBreaker` (Opossum), `metrics` (prom-client), `logger` (pino). Frontend: React 19 + TanStack Router + Zustand.
 
 ## Key Design Decisions
 
-### Double-Entry Bookkeeping
-Every balance change creates paired debit/credit ledger entries within a single database transaction. The `transactions` table records the business event; the `ledger_entries` table records the accounting impact. This enables reconciliation: SUM(credits) - SUM(debits) per wallet should equal `wallet.balance_cents`.
+### 1. Double-entry bookkeeping as the reconciliation invariant
+Every balance change writes paired debit/credit rows in `ledger_entries` inside the same transaction that mutates the wallet. The `transactions` row is the business event; the ledger rows are the accounting impact. The invariant that makes the system auditable: `SUM(credits) − SUM(debits)` for a wallet must equal `wallet.balance_cents`. Trade-off given up: 2× write amplification per transfer versus a bare `UPDATE balance` — accepted because a single mutable balance can't be reconciled or audited after a bug.
 
-### Optimistic Locking for Wallets
-Wallet updates use `WHERE version = $expected` to detect concurrent modifications. For P2P transfers specifically, we use `SELECT ... FOR UPDATE` with consistent lock ordering (by user_id) to prevent deadlocks while still getting atomic read-modify-write.
+### 2. Optimistic locking for single-wallet ops, ordered `FOR UPDATE` for transfers
+Deposits/withdrawals use a `version` column (`WHERE version = $expected`) so a concurrent write is detected and retried rather than silently lost. But a P2P transfer touches *two* wallets, and two users paying each other at once is a classic deadlock: A locks A→tries B while B locks B→tries A. `transferService` avoids it by acquiring `SELECT ... FOR UPDATE` on both wallets in a **consistent order (by user_id)**, so the two transactions can't form a cycle. Trade-off: `FOR UPDATE` serializes concurrent transfers touching the same wallet — correct over fast, which is the right call for money.
 
-### Idempotency in Same Transaction
-The idempotency key is stored in the same PostgreSQL transaction as the payment. This guarantees atomicity -- it's impossible to have the key stored without the payment completing, or vice versa. Redis-based idempotency keys would risk divergence on crash.
+### 3. Idempotency keys in Postgres, in the payment's own transaction
+`idempotencyService` reads/writes `idempotency_keys` through the *same* `PoolClient` as the transfer. If the transaction rolls back, the key rolls back with it — so it's impossible to have a stored key without a completed payment, or a completed payment without a key. Redis would be sub-ms faster, but a crash between "payment committed" and "Redis SET" would leave the next retry free to re-execute the charge. For money, that consistency gap outweighs the latency. (This is the opposite choice from the merchant-facing `payment-system` project, which caches in Redis with a DB `UNIQUE` backstop — worth contrasting.)
 
-### BIGINT Cents for Amounts
-All monetary amounts stored as integer cents (BIGINT). Eliminates floating-point arithmetic errors in application code. Database CHECK constraints prevent negative balances.
+### 4. BIGINT cents everywhere
+All amounts are integer cents (`BIGINT`) with DB `CHECK` constraints preventing negative balances. No floating-point money in application code, ever. Trade-off: callers must format cents→dollars at the edge, but that's cheap insurance against rounding drift.
 
-### Session Auth over JWT
-HTTP-only session cookies prevent XSS-based session theft, which is critical for a financial application. Redis session store enables immediate revocation.
+### 5. Session auth over JWT
+HTTP-only session cookies (`express-session` + `connect-redis`, bcryptjs password hashing) instead of JWT. Rationale: XSS can't read an HttpOnly cookie, and deleting the Redis session revokes access instantly — a JWT would need short expiry (bad UX) or a blacklist (which re-implements sessions anyway). For a financial app, instant revocation wins over statelessness.
+
+## Current State
+
+Implemented end to end: registration/login with session auth, wallet deposit/withdraw/balance, P2P transfers with double-entry ledger + optimistic locking + ordered `FOR UPDATE`, money-request lifecycle (create/pay/decline/cancel with authorization checks), payment-method CRUD with default management, debounced user search, idempotency (Postgres, 24h TTL, background cleanup), Opossum circuit breaker on external calls, `express-rate-limit` backed by Redis, Prometheus metrics, and pino structured logging. Frontend: dashboard (wallet card, pending requests, recent activity), send/request flows, activity page with type filters.
+
+Intentionally omitted: multi-currency / FX, transfer-request expiry, dispute/refund flows, real bank-transfer or card-processor integration (deposits/withdrawals are simulated), and a WebSocket notification service (request pay/decline is poll/refresh, not push). The production architecture diagram shows Kafka + a notification service — those are the production layer, not built locally.
+
+## Iteration & Repair Log
+
+- **2026-07 (CLAUDE.md restructure):** This file was already substantive but was organized around a "Development Phases" narrative and lacked an Architecture-at-a-Glance table, an accurate Current State, and a repair log. Restructured to the exemplar shape while keeping the (correct) key design decisions.
+- **Idempotency location:** early instinct was Redis for speed; changed to Postgres-in-transaction after reasoning about the crash-consistency gap (Decision 3). `architecture.md` documents the same reasoning (§"Idempotency Keys in PostgreSQL (Not Redis)").
+- **Repo-wide fixes that touched this project:** ESM `connect-redis` v7 named-import + `pino-http` named-import hardening; DB/Redis connection-string fallbacks to the docker-compose creds (`paypal:paypal123`, `redis://localhost:6379`); the schema-apply path is `db/migrate.ts` run via `npm run db:migrate` (also mounted at `docker-entrypoint-initdb.d`).
+- **CI:** the repo-wide smoke-test workflow was removed (no Docker services in CI).
 
 ## Open Questions
 
-- Should wallet balance be cached in Redis with a short TTL for read-heavy dashboards?
-- How to handle multi-currency transfers (exchange rate service)?
-- Should transfer requests have an expiration time?
-- How to implement dispute resolution and refund flows?
-- Would a notification service (WebSocket) improve the request pay/decline experience?
+1. Should wallet balance be cached in Redis with a short TTL for the read-heavy dashboard, and how do we invalidate it the instant a transfer commits?
+2. How should multi-currency transfers work — a per-currency wallet with an FX service, or a single base currency with conversion at send time?
+3. Should money requests expire? An unbounded pending request is a UX and reconciliation smell.
+4. Dispute/refund: refunds are just reverse ledger entries, but who authorizes them and how do we prevent a refund from being replayed?
+5. `SELECT ... FOR UPDATE` serializes transfers on a hot wallet — at what throughput does a popular payee need a different model (e.g. append-only ledger with async balance projection)?
 
-## Learnings
+## Resources
 
-- Double-entry bookkeeping adds write amplification (2 ledger entries per transfer) but is essential for financial systems -- the reconciliation capability justifies the overhead
-- Idempotency key storage location matters: same transaction as the payment guarantees consistency
-- Lock ordering is critical for preventing deadlocks in multi-wallet transfers
-- Frontend financial UX is about trust: clear feedback, confirmation steps, and honest error messages when uncertain about payment status
+- [Accounting for Developers (double-entry)](https://www.moderntreasury.com/journal/accounting-for-developers-part-i)
+- [PostgreSQL: explicit row locking & deadlocks](https://www.postgresql.org/docs/current/explicit-locking.html)
+- [Opossum circuit breaker](https://nodeshift.dev/opossum/)
