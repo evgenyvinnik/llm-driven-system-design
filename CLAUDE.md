@@ -396,13 +396,23 @@ Screenshots are saved to `<project>/screenshots/` at 2x resolution (retina).
 
 ## CI/CD
 
-GitHub Actions (`.github/workflows/smoke-tests.yml`) runs Playwright smoke tests:
+There is intentionally **no CI build/test workflow**. A previous GitHub Actions
+workflow ran Playwright smoke tests on every PR, but smoke tests require the full
+Docker stack (PostgreSQL, Redis, etc.) running — which the CI runner did not
+provide — and `npm ci` breaks whenever a project's `package-lock.json` drifts
+from its `package.json`. The result was a workflow that failed on essentially
+every PR without signalling a real defect.
 
-- **On PRs**: Tests only projects with changed files (compared to `origin/main`)
-- **Nightly (3:00 AM UTC)**: Tests all projects with screenshot configs
-- **Manual dispatch**: Tests all projects
+Verification is done locally instead:
 
-Tests run sequentially (`max-parallel: 1`) to avoid port conflicts. Each project generates smoke tests from its screenshot config, then runs them. Playwright reports are uploaded as artifacts (14-day retention).
+- **Build/typecheck**: `npm run build` / `npm run type-check` in each `frontend`/`backend`
+- **Runtime**: `npm run triage <project>` or `node scripts/screenshots.mjs --start <project>`
+  bring up Docker, migrate, seed, and exercise the app end to end (login + page render)
+- **Smoke tests**: `npm run test:smoke <project>` after the stack is up
+
+If CI is reintroduced later, keep it to what a runner can actually do without
+Docker services — a per-project `tsc --noEmit` and `vite build` matrix — rather
+than full integration smoke tests.
 
 ## Technology Stack Defaults
 
