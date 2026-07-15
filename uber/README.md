@@ -137,19 +137,27 @@ If you prefer to run PostgreSQL and Redis natively:
    psql uber_db -c "GRANT ALL PRIVILEGES ON DATABASE uber_db TO uber;"
    ```
 
-2. **Install and start Redis**:
+2. **Install and start Redis** (Valkey works too):
    ```bash
    # macOS with Homebrew
    brew install redis
    brew services start redis
    ```
 
-3. **Initialize database**:
+3. **Install and start RabbitMQ** (required for the matching/notification/analytics workers):
    ```bash
-   psql -U uber -d uber_db -f backend/src/models/init.sql
+   # macOS with Homebrew
+   brew install rabbitmq
+   brew services start rabbitmq
    ```
 
-4. Follow steps 2-6 from Option 1 above.
+4. **Initialize the schema and seed test users**:
+   ```bash
+   psql -U uber -d uber_db -f backend/src/db/init.sql
+   psql -U uber -d uber_db -f backend/db-seed/seed.sql
+   ```
+
+5. Follow steps 2-6 from Option 1 above.
 
 ### Running Multiple Backend Instances
 

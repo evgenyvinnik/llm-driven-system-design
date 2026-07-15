@@ -41,7 +41,7 @@ A simplified Shopify-like platform demonstrating multi-tenant e-commerce, checko
 
 ### Prerequisites
 - Docker and Docker Compose
-- Node.js 18+ and npm
+- Node.js 20+ and npm
 
 ### 1. Start Infrastructure
 
@@ -51,8 +51,9 @@ docker-compose up -d
 ```
 
 This starts:
-- **PostgreSQL** on port 5432 (with RLS enabled)
-- **Redis** on port 6379
+- **PostgreSQL** on port 5432 (with RLS enabled; schema auto-applied from `backend/src/db/init.sql` on a fresh volume)
+- **Redis/Valkey** on port 6379 (sessions, cache)
+- **RabbitMQ** on ports 5672 (AMQP) and 15672 (management UI) — async order/inventory/webhook/email workers
 
 ### 2. Start Backend
 
@@ -78,7 +79,7 @@ Frontend runs on http://localhost:5173
 
 ### Platform Access
 - **Email**: `merchant@example.com`
-- **Password**: `merchant123`
+- **Password**: `password123`
 
 ### Demo Store
 - **Subdomain**: `demo`
@@ -132,17 +133,20 @@ POST /api/storefront/:subdomain/checkout     - Process checkout
 
 ```
 shopify/
-├── docker-compose.yml        # PostgreSQL + Redis
+├── docker-compose.yml        # PostgreSQL + Redis/Valkey + RabbitMQ
 ├── backend/
 │   ├── package.json
-│   ├── scripts/
-│   │   └── init.sql          # Database schema with RLS
+│   ├── db-seed/
+│   │   └── seed.sql          # Sample merchant, store, products (manual psql load)
 │   └── src/
-│       ├── index.js          # Express server
+│       ├── index.ts          # Express server
+│       ├── db/
+│       │   └── init.sql      # Database schema with RLS
 │       ├── config/           # Configuration
 │       ├── middleware/       # Auth middleware
 │       ├── routes/           # API routes
-│       └── services/         # DB and Redis clients
+│       ├── services/         # DB, Redis, RabbitMQ, circuit breaker, metrics
+│       └── workers/          # order / inventory / webhook / email queue consumers
 └── frontend/
     ├── package.json
     ├── index.html
@@ -220,9 +224,9 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 ## What's Not Included
 
 For simplicity, this learning project omits:
-- Real payment processing (Stripe integration mocked)
+- Real payment processing (payment is a mocked internal function behind a circuit breaker; no Stripe dependency)
 - Custom domain SSL provisioning
-- Email notifications
+- Real email delivery (the email worker renders templates and logs them; no SMTP)
 - File upload/image hosting
 - Full theme customization
 - Real-time inventory sync

@@ -574,30 +574,8 @@ Service Worker Cache
 
 ## 🚀 Future Enhancements
 
-1. **AR Precision Finding**: Camera overlay with augmented reality arrow
-2. **Home Screen Widgets**: Quick device status without opening app
-3. **Family Sharing UI**: View shared devices with permission controls
-4. **History Playback**: Timeline scrubber to replay device movement
-5. **Accessibility Audit**: Full WCAG 2.1 AA compliance
-6. **Dark Mode**: System-aware theme with map style switching
-7. **Voice Control**: "Hey Siri, find my keys" integration
-8. **Predictive Locations**: ML-based "likely at home/work" suggestions
-
----
+With more time I'd add AR precision finding (a camera overlay with a directional arrow), a home-screen widget for at-a-glance device status, a family-sharing UI with per-device permission controls, and a history-playback scrubber to replay a device's movement. Longer term: a full WCAG 2.1 AA accessibility audit, system-aware dark mode with map-style switching, and ML-driven "likely at home/work" location hints.
 
 ## 💡 Summary
 
-The Find My frontend for AirTag balances three core concerns:
-
-1. **Privacy**: Client-side decryption ensures Apple never sees locations
-2. **Usability**: Progressive disclosure and multi-sensory feedback guide users
-3. **Reliability**: Offline support works when you need it most
-
-Key architectural decisions:
-- Leaflet for cross-platform map consistency
-- WebCrypto for hardware-backed client decryption
-- Zustand for pragmatic state management
-- Service Worker for offline-first experience
-- UWB with Bluetooth fallback for precision finding
-
-The anti-stalking UI demonstrates thoughtful design - alerting users to potential threats without causing panic over false positives. Progressive disclosure lets users access information at their own pace while keeping the initial experience calm.
+The through-line of this frontend: **client-side decryption keeps the server blind, progressive disclosure keeps the anti-stalking flow calm, and offline support works precisely when a device is lost and the network isn't there.** Leaflet gives one cross-platform map, WebCrypto does hardware-backed decryption in the owner's session, Zustand keeps state pragmatic, and UWB-with-Bluetooth-fallback drives precision finding. The hardest judgment call is the anti-stalking UI — surfacing a real threat without triggering panic over a friend's tag riding along — which progressive disclosure solves by letting users reveal detail at their own pace.

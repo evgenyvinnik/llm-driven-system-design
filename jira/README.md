@@ -43,7 +43,8 @@ A simplified Jira-like platform demonstrating issue tracking, workflow automatio
 
 - **Frontend**: TypeScript, Vite, React 19, Tanstack Router, Zustand, Tailwind CSS
 - **Backend**: Node.js, Express, TypeScript
-- **Database**: PostgreSQL (primary data), Redis (sessions/cache), Elasticsearch (search)
+- **Database**: PostgreSQL (primary data), Redis/Valkey (sessions/cache), Elasticsearch (search)
+- **Messaging**: RabbitMQ (async search-indexing, notification, and webhook workers)
 
 ## Prerequisites
 
@@ -61,8 +62,9 @@ docker-compose up -d
 
 This starts:
 - PostgreSQL on port 5432
-- Redis on port 6379
+- Redis (Valkey) on port 6379
 - Elasticsearch on port 9200
+- RabbitMQ on ports 5672 (AMQP) and 15672 (management UI)
 
 ### 2. Set Up Backend
 
@@ -74,7 +76,7 @@ npm install
 cp .env.example .env
 
 # Run database migrations
-npm run migrate
+npm run db:migrate
 
 # Seed demo data
 npm run seed
@@ -100,8 +102,9 @@ The frontend runs on http://localhost:5173
 Open http://localhost:5173 in your browser.
 
 **Demo Credentials:**
-- Admin: `admin@example.com` / `password123`
+- Admin: `admin@example.com` / `admin123`
 - User: `john@example.com` / `password123`
+- User: `jane@example.com` / `password123`
 
 ## Project Structure
 
@@ -229,6 +232,13 @@ brew services start redis
 brew tap elastic/tap
 brew install elastic/tap/elasticsearch-full
 brew services start elasticsearch-full
+```
+
+### RabbitMQ
+```bash
+# macOS
+brew install rabbitmq
+brew services start rabbitmq
 ```
 
 Update `.env` file with your local service URLs.

@@ -19,9 +19,10 @@ A simplified Airbnb-like platform demonstrating two-sided marketplace dynamics, 
 ## Tech Stack
 
 - **Frontend:** TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
-- **Backend:** Node.js + Express
+- **Backend:** Node.js + Express (TypeScript, ESM)
 - **Database:** PostgreSQL with PostGIS extension
-- **Cache:** Redis
+- **Cache:** Redis / Valkey
+- **Message Queue:** RabbitMQ (async notifications, analytics, search reindex)
 - **Containerization:** Docker Compose
 
 ## Quick Start
@@ -35,7 +36,7 @@ A simplified Airbnb-like platform demonstrating two-sided marketplace dynamics, 
 ### 1. Start Infrastructure
 
 ```bash
-# Start PostgreSQL (with PostGIS) and Redis
+# Start PostgreSQL (with PostGIS), Redis/Valkey, and RabbitMQ
 docker-compose up -d
 
 # Verify containers are running
@@ -108,30 +109,32 @@ npm run dev   # Start on port 5173
 
 ```
 airbnb/
-├── docker-compose.yml      # PostgreSQL + Redis
+├── docker-compose.yml      # PostgreSQL + Redis/Valkey + RabbitMQ
 ├── backend/
 │   ├── src/
-│   │   ├── index.js        # Express server
-│   │   ├── db.js           # PostgreSQL connection
-│   │   ├── redis.js        # Redis connection
+│   │   ├── index.ts        # Express server
+│   │   ├── db.ts           # PostgreSQL connection + transaction helper
+│   │   ├── redis.ts        # Redis connection
+│   │   ├── seed.ts         # Sample-data seeder (npm run seed)
 │   │   ├── routes/         # API endpoints
-│   │   │   ├── auth.js
-│   │   │   ├── listings.js
-│   │   │   ├── search.js
-│   │   │   ├── bookings.js
-│   │   │   ├── reviews.js
-│   │   │   └── messages.js
+│   │   │   ├── auth.ts
+│   │   │   ├── listings.ts
+│   │   │   ├── search.ts
+│   │   │   ├── bookings.ts
+│   │   │   ├── reviews.ts
+│   │   │   └── messages.ts
 │   │   ├── shared/           # Common modules
-│   │   │   ├── cache.js      # Redis caching with cache-aside pattern
-│   │   │   ├── queue.js      # RabbitMQ producer/consumer
-│   │   │   ├── metrics.js    # Prometheus metrics
-│   │   │   ├── logger.js     # Pino structured logging
-│   │   │   ├── audit.js      # Audit logging for compliance
-│   │   │   └── circuitBreaker.js  # Circuit breaker pattern
-│   │   ├── services/       # Business logic
-│   │   └── middleware/     # Auth middleware
-│   └── migrations/
-│       └── init.sql        # Database schema
+│   │   │   ├── cache.ts      # Redis caching with cache-aside pattern
+│   │   │   ├── queue.ts      # RabbitMQ producer/consumer
+│   │   │   ├── metrics.ts    # Prometheus metrics
+│   │   │   ├── logger.ts     # Pino structured logging
+│   │   │   ├── audit.ts      # Audit logging for compliance
+│   │   │   └── circuitBreaker.ts  # Circuit breaker pattern
+│   │   ├── services/       # Business logic (auth hashing, etc.)
+│   │   ├── workers/        # RabbitMQ consumers (booking, notification, analytics)
+│   │   ├── middleware/     # Auth middleware
+│   │   └── db/
+│   │       └── init.sql    # Database schema (mounted into Postgres initdb.d)
 ├── frontend/
 │   ├── src/
 │   │   ├── routes/         # Tanstack Router pages

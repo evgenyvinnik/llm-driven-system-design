@@ -51,7 +51,8 @@ A simplified AirTag-like platform demonstrating Bluetooth item tracking, crowd-s
 
 - **Frontend:** TypeScript + Vite + React 19 + Zustand + Tailwind CSS + Leaflet
 - **Backend:** Node.js + Express + TypeScript
-- **Database:** PostgreSQL (data storage) + Redis (sessions)
+- **Database:** PostgreSQL (data storage) + Redis/Valkey (sessions, cache, rate limiting)
+- **Message Queue:** RabbitMQ (async location-report ingestion + notifications)
 
 ## Project Structure
 
@@ -63,8 +64,10 @@ airtag/
 │   │   ├── middleware/   # Express middleware (auth)
 │   │   ├── routes/       # API route handlers
 │   │   ├── services/     # Business logic
+│   │   ├── shared/       # Cache, queue, metrics, logger, rate limit, health
+│   │   ├── workers/      # RabbitMQ consumers (location, notification)
 │   │   ├── types/        # TypeScript definitions
-│   │   ├── utils/        # Crypto utilities
+│   │   ├── utils/        # Crypto utilities (KeyManager, encrypt/decrypt)
 │   │   └── index.ts      # Express app entry point
 │   ├── package.json
 │   └── tsconfig.json
@@ -78,7 +81,7 @@ airtag/
 │   │   └── main.tsx      # Entry point
 │   ├── package.json
 │   └── vite.config.ts
-├── docker-compose.yml    # PostgreSQL + Redis
+├── docker-compose.yml    # PostgreSQL + Redis/Valkey + RabbitMQ
 ├── architecture.md       # System design documentation
 ├── CLAUDE.md             # Development notes
 └── README.md             # This file
@@ -93,7 +96,7 @@ airtag/
    cd airtag
    docker-compose up -d
    ```
-   This starts PostgreSQL (port 5432) and Redis (port 6379).
+   This starts PostgreSQL (port 5432), Redis/Valkey (port 6379), and RabbitMQ (ports 5672 / 15672 management UI).
 
 2. **Install and start the backend:**
    ```bash

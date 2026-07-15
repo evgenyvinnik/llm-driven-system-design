@@ -415,15 +415,15 @@ TimescaleDB continuous aggregates provide zero-application-code rollups:
 
 ### Query Routing Logic
 
-The query API automatically selects the optimal table based on requested time range:
+The query API (`queryService.selectTable()`) automatically selects a table based on the requested time range:
 
 | Requested Range | Table Used | Resolution | Why |
 |-----------------|-----------|------------|-----|
-| <= 1 hour | `metrics` | 1 second | Full fidelity for recent data |
-| <= 24 hours | `metrics_1min` | 1 minute | Sufficient resolution, 60x fewer rows |
-| > 24 hours | `metrics_1hour` | 1 hour | Efficient for trends, 3600x fewer rows |
+| <= 6 hours | `metrics` | raw (10s ingest in seed data) | Full fidelity for recent data |
+| <= 7 days | `metrics_hourly` | 1 hour | Efficient for medium ranges |
+| > 7 days | `metrics_daily` | 1 day | Efficient for long-range trends |
 
-This routing is transparent to the frontend. A 7-day dashboard query scans ~168 rows per metric (7 days x 24 hours) instead of 604,800 raw rows.
+This routing is transparent to the frontend. **Local-implementation caveat:** the `metrics_hourly` and `metrics_daily` rollups are *referenced* by the query router but are **not created** in `init.sql` (no continuous aggregates are configured locally). Consequently, queries with a range longer than 6 hours hit a non-existent table; the circuit breaker around the query catches the error and returns an empty result set rather than crashing. In practice the seed data spans one hour, so panels operate in the raw-table path. Materializing the two continuous aggregates is the first production hardening step and is tracked in CLAUDE.md.
 
 ---
 
@@ -789,7 +789,7 @@ This section maps the production architecture to the actual local implementation
 | Kafka for ingestion queue | Direct DB writes (synchronous) | No Kafka/Zookeeper overhead (Kafka in docker-compose only via profile) |
 | Ingestion worker cluster | Inline writes in API handler | No separate worker process needed at 1K/sec |
 | TimescaleDB multi-node | Single TimescaleDB instance | Sufficient for local data volume |
-| Continuous aggregates | Not configured (query raw data) | Simpler, raw data small enough |
+| Continuous aggregates (`metrics_hourly`/`metrics_daily`) | Not created; query router references them but only the raw `metrics` path returns data (long ranges fall back to empty via the circuit breaker) | Seed data spans 1 hour, so raw path suffices; materializing the rollups is the first hardening step |
 | Read replicas | Single database | Low query volume |
 | Redis Cluster | Single Valkey instance | < 256 MB cache |
 | CDN / edge cache | Direct Vite dev server | No CDN needed locally |

@@ -410,14 +410,14 @@ The event volume (issue creates, updates, transitions) is moderate -- thousands 
 
 ### Write Consistency Model
 
-**PostgreSQL (Source of Truth):** Strong consistency for all issue writes within a single project. Transactions wrap multi-table operations (issue update + history record + custom field updates). Transitions use optimistic locking with a `version` column to prevent concurrent conflicting state changes.
+**PostgreSQL (Source of Truth):** Strong consistency for all issue writes within a single project. An issue update writes the `issues` row and then appends one `issue_history` row per changed field. At production scale these would be wrapped in a single transaction, and concurrent conflicting transitions would be guarded by optimistic locking (a `version` column + compare-and-swap update); the local implementation issues the writes sequentially and does **not** yet carry a `version` column, so two simultaneous transitions on the same issue can both succeed. This is called out as a hardening step, not a claimed guarantee.
 
 **Elasticsearch (Search Index):** Eventual consistency with PostgreSQL as authoritative source. Index updates happen asynchronously via RabbitMQ. Typical lag: 100-500ms.
 
 | Operation | Consistency | Rationale |
 |-----------|-------------|-----------|
 | Issue create/update | Strong (PostgreSQL) | Single-project writes require immediate consistency |
-| Status transitions | Strong + optimistic locking | Workflow state must be atomic |
+| Status transitions | Strong (PostgreSQL) | Workflow state written synchronously; optimistic locking is a production hardening step, not yet implemented |
 | Comment add | Strong | User expects immediate visibility |
 | Search results | Eventual (~500ms) | Slight delay acceptable for search |
 | Board views | Eventually consistent | Cached aggregations, refreshed periodically |

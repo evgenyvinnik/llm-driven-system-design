@@ -1,168 +1,68 @@
-# Job Scheduler - Development with Claude
+# Job Scheduler — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing a distributed task scheduling system.
+A distributed, cron-capable job scheduler with priority queueing, worker pools, and **at-least-once execution**. The hard problems are the classic distributed-systems ones: exactly one scheduler must decide what to run (or jobs double-fire), a crashed worker mid-job must not lose the work (or jobs silently vanish), and a poison job must not retry forever (or it starves the pool). The design answers these with Redis leader election, a visibility-timeout queue, and bounded exponential-backoff retries with a dead-letter queue.
 
-## Key Challenges to Explore
+**Learning goals:** distributed coordination (leader election, distributed locks), at-least-once delivery with recovery, priority scheduling on a sorted set, and failure isolation with circuit breakers.
 
-1. Distributed coordination
-2. At-least-once execution
-3. Priority scheduling
-4. Failure handling
+## Architecture at a Glance (what actually runs)
 
-## Development Phases
+Two datastores and several independently-scaled process roles — this matches `docker-compose.yml` and `backend/package.json`:
 
-### Phase 1: Requirements and Design
-*Completed*
+| Component | Tech | Role |
+|-----------|------|------|
+| **PostgreSQL 15** (`pg`) | Source of truth | `jobs` (definitions, cron `schedule`, `next_run_time`, priority, retry policy), `job_executions` (per-attempt history), `execution_logs`, `users` |
+| **Redis / Valkey 7** (`ioredis`) | Coordination + queue | Priority queue (`job_scheduler:queue` sorted set), in-flight set (`:processing` with timeout score), dead-letter list (`:dead_letter`), leader lock, per-job distributed locks |
+| **API service** | Express (port 3001) | Stateless job/execution CRUD + metrics; serves the dashboard |
+| **Scheduler service** | Node process | Leader-elected; runs scan / stalled-recovery / retry / metrics loops |
+| **Workers 1–3** | Node processes | Pull from the shared queue, `MAX_CONCURRENT_JOBS=5` each, run handlers |
+| **Frontend** | React 18 + TanStack Router + Zustand | Dashboard: jobs, executions, workers, DLQ |
 
-**Decisions made:**
-- Used system-design-answer-fullstack.md as the architecture blueprint
-- Chose PostgreSQL for job storage (ACID compliance, relational model)
-- Chose Redis for queues and distributed locking (speed, atomic operations)
-- Designed for horizontal worker scaling
+Supporting libraries that matter: `cron-parser` (computes `next_run_time` for recurring jobs), `opossum` (per-handler circuit breakers), `prom-client` (17+ metrics at `GET /metrics`), `pino` (structured logs). Built-in handlers: `http.webhook`, `shell.command`, `system.cleanup`, and `test.echo/delay/log`.
 
-### Phase 2: Initial Implementation
-*In progress*
+## Key Design Decisions
 
-**Focus areas:**
-- [x] Implement core functionality
-- [x] Get something working end-to-end
-- [x] Validate basic assumptions
+### 1. Single active scheduler via Redis leader election
+`LeaderElection` uses `SET key instanceId EX 30 NX` to claim leadership, refreshes it on a heartbeat at TTL/3 (~10s), and releases it with a Lua compare-and-delete so it can never delete another instance's lock. Only the leader scans for due jobs. Trade-off: this makes scheduling a single-writer operation (no duplicate enqueues), but leadership failover has a gap — if the leader dies, up to ~30s (the lock TTL) can pass before a standby claims the lock and scanning resumes. That's acceptable because jobs are time-windowed, not sub-second, and a brief scheduling pause is far cheaper than the double-firing a multi-leader design would cause.
 
-**Completed components:**
-- Backend API server with Express
-- Scheduler service with leader election
-- Worker service with retry logic
-- Frontend dashboard with React + TanStack Router
-- Docker Compose for local development
+### 2. At-least-once via a visibility-timeout queue
+`enqueue` does `ZADD` with an inverted-priority score (`Date.now() - priority*1_000_000`) so higher priority dequeues first via `ZPOPMIN`; `dequeue` atomically pops and records the item in the `:processing` set with a future timeout score. A completed job is `ZREM`'d; a job whose worker crashes leaves its `:processing` entry, and the scheduler's recovery loop (`ZRANGEBYSCORE … -inf now`) re-enqueues anything past its timeout. Trade-off: this is **at-least-once, not exactly-once** — a worker that stalls past the visibility timeout but is still alive can have its job re-run, so handlers must be idempotent. We accept possible duplicates to guarantee no lost executions, which is the right bias for a scheduler.
 
-### Phase 3: Scaling and Optimization
-*Not started*
+### 3. Bounded exponential backoff + dead-letter queue
+Retries follow `min(initial_backoff_ms * 2^attempt, max_backoff_ms)` up to `max_retries`; the scheduler's retry loop creates a fresh `job_executions` row (attempt+1) rather than mutating the old one, preserving full attempt history. After the retry budget is exhausted the item is `LPUSH`'d to the dead-letter list. Trade-off: a genuinely broken job is parked for human inspection instead of retried forever — we give up automatic self-healing for that job in exchange for not letting one poison payload burn worker capacity.
 
-**Focus areas:**
-- Add caching layer
-- Optimize database queries
-- Implement load balancing
-- Add monitoring
+### 4. Per-handler circuit breakers (Opossum)
+Each handler type gets its own breaker (opens at 50% error rate over 5 requests, tests recovery after 30s). If the webhook target is down, its breaker opens and those jobs are requeued for later rather than counted as failures — isolating one bad dependency from the shell/log handlers. Trade-off: added state and tuning per handler, justified because a single failing external endpoint would otherwise drain every worker slot.
 
-### Phase 4: Polish and Documentation
-*Not started*
+### 5. Separate scheduler and worker processes
+Scheduling (leader-only, coordination-heavy) and execution (embarrassingly parallel, stateless) scale on different axes, so they're different entry points (`scheduler/index.ts`, `worker/index.ts`) sharing the same codebase. Trade-off: more processes to run locally, bought back by being able to add workers without touching the scheduler.
 
-**Focus areas:**
-- Complete documentation
-- Add comprehensive tests
-- Performance tuning
-- Code cleanup
+## Current State
 
-## Design Decisions Log
+Implemented and running end to end: job CRUD + pause/resume/trigger, cron and one-shot scheduling, the leader-elected scheduler with all four loops (scan, stalled-recovery, retry, metrics), three workers with bounded concurrency, the reliable priority queue with visibility timeout and DLQ, exponential-backoff retries, per-handler Opossum circuit breakers, a full `prom-client` metric set at `GET /metrics`, structured `pino` logging, and the React dashboard (jobs / executions / workers / DLQ views).
 
-### 2024-01-XX: Initial Architecture
+Note: **monitoring is implemented**, not pending — the earlier checklist-style CLAUDE.md listed "Add monitoring" as "Not started," which contradicted `src/shared/metrics.ts` and the Opossum breakers already emitting metrics.
 
-**Decision**: Use Redis-based leader election for scheduler
-- **Rationale**: Simple implementation using `SET NX EX`
-- **Trade-off**: Single scheduler active at a time, but ensures no duplicate scheduling
-- **Alternative considered**: Multiple schedulers with database-level locking (more complex)
+Intentionally omitted: DAG/job-dependency workflows, multi-tenancy (jobs are single-tenant), request rate limiting, and a comprehensive automated test suite. Auth exists as a module (`shared/auth.ts`, express-session) but the seed does not create login users, so the local dashboard runs without a login wall.
 
-**Decision**: Use Redis sorted sets for priority queue
-- **Rationale**: O(log n) insertion, O(1) pop, built-in ordering
-- **Trade-off**: Memory-bound, but acceptable for expected scale
-- **Alternative considered**: PostgreSQL queue table (slower, but more durable)
+## Iteration & Repair Log
 
-**Decision**: Visibility timeout for at-least-once execution
-- **Rationale**: Jobs in processing have a timeout; if not completed, they are recovered
-- **Trade-off**: Possible duplicate execution if timeout is too short
-- **Alternative considered**: Distributed transaction (overkill for this use case)
+- **Metrics + circuit-breaker pass.** `src/shared/metrics.ts` and `src/shared/circuit-breaker.ts` were added, wiring `prom-client` and Opossum through the scheduler/worker/API and instrumenting the queue, scheduler leadership, and per-handler breaker state. This is what makes the old "monitoring not started" note obsolete.
+- **DB layer split.** The repository was broken into `job-repository.ts`, `execution-repository.ts`, `schedule-repository.ts`, and `queries.ts` under `src/db/` for focus.
+- **Migrate-at-startup + dual scripts.** `migrate()` is idempotent (`CREATE … IF NOT EXISTS`) and is called both from the scheduler on boot and via `npm run migrate` / `npm run db:migrate` (both aliases exist). Seeding is `npm run seed` / `npm run db:seed`.
+- **CLAUDE.md rewrite (this pass).** Replaced the generic Phase 1–4 checklist ("Phase 3: Not started", "will be updated throughout the development process") with the real architecture and decision rationale grounded in `scheduler/index.ts`, `queue/reliable-queue.ts`, and `queue/leader-election.ts`.
 
-**Decision**: Separate scheduler and worker processes
-- **Rationale**: Clear separation of concerns, independent scaling
-- **Trade-off**: More processes to manage
-- **Alternative considered**: Combined process (simpler, but less flexible)
+## Open Questions
 
-**Decision**: PostgreSQL for job definitions and history
-- **Rationale**: ACID compliance, complex queries for reporting
-- **Trade-off**: Scaling limits at very high volume
-- **Alternative considered**: MongoDB (flexible schema, but less suited for transactional workloads)
+1. **Job dependencies:** to support DAG workflows, add a `dependencies` field and trigger downstream jobs on completion — but how to detect and reject cycles at definition time?
+2. **Failover gap:** the ~30s leadership TTL bounds worst-case scheduling latency after a leader crash. Is a shorter TTL (faster failover, more Redis chatter) or a standby pre-warm worth it?
+3. **Exactly-once:** could a per-execution distributed lock (`DistributedLock` already exists) plus a "completed" marker in Postgres upgrade at-least-once toward effectively-once for non-idempotent handlers?
+4. **Queue durability:** the queue lives in Redis; on Redis loss, in-flight queue state is gone though `job_executions` in Postgres survives. Is a rebuild-from-Postgres recovery path worth adding?
 
-### Handler System
-
-**Decision**: Plugin-based handler architecture
-- **Rationale**: Easy to add new job types without modifying core logic
-- **Trade-off**: Handlers must be registered at startup
-- **Alternative considered**: Dynamic handler loading (more complex, security concerns)
-
-### Frontend Architecture
-
-**Decision**: Zustand for state management
-- **Rationale**: Simple, lightweight, TypeScript-friendly
-- **Trade-off**: Less opinionated than Redux
-- **Alternative considered**: Redux Toolkit (more boilerplate)
-
-**Decision**: TanStack Router for routing
-- **Rationale**: Type-safe routing, modern API
-- **Trade-off**: Steeper learning curve than React Router
-- **Alternative considered**: React Router (more common, but less type-safe)
-
-## Iterations and Learnings
-
-### Iteration 1: Basic MVP
-- Created job CRUD API
-- Implemented simple scheduler loop
-- Added worker with basic execution
-
-### Iteration 2: Reliability Features
-- Added leader election for scheduler
-- Implemented visibility timeout for queue
-- Added exponential backoff retries
-- Created dead letter queue
-
-### Iteration 3: Dashboard
-- Built React frontend with job management
-- Added execution monitoring
-- Created worker status page
-
-## Questions and Discussions
-
-### Open Questions
-
-1. **Job dependencies**: How to implement DAG-based workflows?
-   - Current: Not implemented
-   - Future: Could add `dependencies` field and trigger on completion
-
-2. **Multi-tenancy**: How to isolate jobs between tenants?
-   - Current: Single-tenant
-   - Future: Add tenant_id to jobs table, separate queues per tenant
-
-3. **Rate limiting**: How to prevent job flooding?
-   - Current: Not implemented
-   - Future: Token bucket per job type or tenant
-
-### Resolved Questions
-
-1. **How to handle time zones?**
-   - Resolution: Store all times in UTC, convert on display
-   - Cron expressions interpreted as UTC
-
-2. **How to scale workers?**
-   - Resolution: Stateless workers, auto-scale based on queue depth
-   - Each worker polls the shared Redis queue
-
-## Resources and References
+## Resources
 
 - [Designing a Distributed Job Scheduler](https://levelup.gitconnected.com/designing-a-distributed-job-scheduler-461ac0c3a9e8)
-- [Building a Job Queue with Redis](https://redis.io/docs/patterns/queues/)
-- [cron-parser npm package](https://www.npmjs.com/package/cron-parser)
-- [TanStack Router Documentation](https://tanstack.com/router/latest)
-
-## Next Steps
-
-- [ ] Add comprehensive tests (unit, integration, e2e)
-- [ ] Implement job dependencies
-- [ ] Add metrics/monitoring (Prometheus, Grafana)
-- [ ] Implement job rate limiting
-- [ ] Add webhook notifications for job completion/failure
-- [ ] Performance testing under load
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings.*
+- [Redis distributed locks](https://redis.io/docs/manual/patterns/distributed-locks/) — the SET NX EX + Lua pattern used for leader election
+- [cron-parser](https://www.npmjs.com/package/cron-parser) — next-run computation
+- [Opossum circuit breaker](https://nodeshift.dev/opossum/) — per-handler failure isolation

@@ -81,8 +81,8 @@ The schema includes three core tables:
 
 **Merchants Table** - Payment system customers with dashboard access:
 - id (UUID, primary key)
-- name, email (unique), password_hash for dashboard login
-- api_key_hash for API authentication
+- name, email (unique)
+- api_key_hash — bcrypt hash of the `pk_` API key; the reference build authenticates *both* the programmatic API and the dashboard with this key. A production dashboard would add a `password_hash` + session login for human operators (described below) on top of the machine-facing API key.
 - webhook_url, webhook_secret for event delivery
 - default_currency, status, created_at
 
@@ -219,48 +219,7 @@ The payment creation endpoint handles idempotency and fraud scoring:
 
 ### Frontend: Transaction List Component
 
-The dashboard displays transactions with filters and pagination:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Transaction List UI Structure                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  TransactionFilters                                                   │  │
-│  │  ├── Status dropdown (All, Authorized, Captured, Refunded, Failed)   │  │
-│  │  ├── Date range picker                                                │  │
-│  │  └── Search input (debounced)                                         │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Table Header (sticky)                                                │  │
-│  │  │ Transaction ID │ Amount │ Status │ Customer │ Date │               │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Table Body (scrollable)                                              │  │
-│  │  ├── TransactionRow (clickable, navigates to details)                │  │
-│  │  ├── TransactionRow                                                   │  │
-│  │  ├── TransactionRow                                                   │  │
-│  │  └── ... (loading skeleton when fetching)                            │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Pagination                                                           │  │
-│  │  Page 1 of 42  │  [<] [1] [2] [3] ... [42] [>]                       │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  State Management (Zustand):                                                 │
-│  ├── transactions: Transaction[]                                            │
-│  ├── totalCount: number                                                     │
-│  ├── page, pageSize: pagination state                                       │
-│  ├── filters: TransactionFilters                                            │
-│  ├── isLoading: boolean                                                     │
-│  └── Actions: setFilters, setPage, fetchTransactions                        │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The dashboard renders a filter bar (status dropdown, date-range picker, debounced search input), a sticky table header, a scrollable body of clickable `TransactionRow`s (each navigating to a detail view, with a loading skeleton while fetching), and server-side pagination. A single Zustand store holds `transactions`, `totalCount`, `page`/`pageSize`, the active `filters`, and `isLoading`, exposing `setFilters`, `setPage`, and `fetchTransactions` actions. Filters and pagination are pushed to the server rather than applied client-side — at 50M transactions/day a merchant can accumulate far more rows than the browser can hold, so the list must be a windowed view over a server query, never a full download.
 
 ### Backend: List Transactions with Filters
 
@@ -297,49 +256,7 @@ The API endpoint supports filtering and pagination:
 
 ### Frontend: Refund Modal
 
-The refund dialog supports full and partial refunds:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Refund Dialog Layout                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Dialog Header                                                        │  │
-│  │  "Refund Transaction"                                                 │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Refund Type Selection                                                │  │
-│  │  ( ) Full refund ($150.00)                                           │  │
-│  │  ( ) Partial refund                                                   │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Amount Input (shown when partial selected)                           │  │
-│  │  Max refundable: $150.00                                              │  │
-│  │  [ $ ][ 75.00                    ]                                    │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Error Display (red background when error occurs)                     │  │
-│  │  "Refund amount exceeds available balance"                            │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Dialog Footer                                                        │  │
-│  │  [ Cancel ]                              [ Process Refund ]           │  │
-│  │  (outline)                               (primary, shows spinner)     │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  Component State:                                                            │
-│  ├── amount: number (initialized to max refundable)                         │
-│  ├── isFullRefund: boolean (default true)                                   │
-│  ├── isProcessing: boolean                                                  │
-│  └── error: string | null                                                   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The refund dialog supports full and partial refunds. It offers a full-refund radio (pre-filled with the captured amount) and a partial option that reveals an amount input capped at the remaining refundable balance (`amount − refunded_amount`). Client-side validation blocks over-refunds before the request is sent, an inline error region surfaces server rejections (e.g. "Refund amount exceeds available balance"), and the primary button shows a spinner while `isProcessing`. Local component state is just `amount`, `isFullRefund`, `isProcessing`, and `error` — the authoritative refundable balance always comes from the server-returned transaction, never a client guess.
 
 ### Backend: Refund Endpoint
 
@@ -385,38 +302,7 @@ The refund endpoint validates and processes the refund:
 
 ### Frontend: Risk Assessment Component
 
-The fraud score display uses a gauge visualization:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Fraud Score Display Layout                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Score Gauge (SVG arc)                                                │  │
-│  │                                                                       │  │
-│  │      ┌─────────────────────────┐                                     │  │
-│  │      │     ( ══════ )          │  Score: 45                          │  │
-│  │      │         45              │  [ Medium Risk ] (yellow badge)     │  │
-│  │      └─────────────────────────┘                                     │  │
-│  │                                                                       │  │
-│  │  Arc colors by score:                                                │  │
-│  │  ├── 0-29   ──▶ Green  (#22c55e) "Low Risk"                          │  │
-│  │  ├── 30-69  ──▶ Yellow (#eab308) "Medium Risk"                       │  │
-│  │  └── 70-100 ──▶ Red    (#ef4444) "High Risk"                         │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Risk Factors (when flags.length > 0)                                │  │
-│  │                                                                       │  │
-│  │  Risk Factors:                                                        │  │
-│  │  ├── ⚠️ High transaction velocity                                    │  │
-│  │  ├── ⚠️ Amount significantly above average                           │  │
-│  │  └── ⚠️ New geographic location                                      │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The fraud score renders as an SVG gauge arc coloured by band — green for 0–29 ("Low Risk"), yellow for 30–69 ("Medium Risk"), red for 70–100 ("High Risk") — with the numeric score and a matching badge. Below it, when the transaction carries risk flags, a "Risk Factors" list spells out the human-readable reasons the backend returned ("High transaction velocity", "Amount significantly above average", "New geographic location"). The point is explainability: a merchant deciding whether to ship goods needs the *why*, not just a number.
 
 ### Backend: Fraud Service
 
@@ -463,7 +349,7 @@ The fraud evaluation service checks multiple signals:
 
 ### Backend: Session Configuration
 
-Sessions are stored in Valkey/Redis for scalability:
+This is the **production** human-auth layer: the reference build authenticates the dashboard with the merchant's bcrypt-hashed API key, but a real product separates machine auth (long-lived API keys) from human auth (password + revocable server-side session). Sessions are stored in Valkey/Redis for scalability:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -566,36 +452,7 @@ Optimistic updates provide instant feedback with rollback on failure:
 
 ### Frontend: Webhook Settings
 
-The webhook settings page allows merchants to configure and test webhooks:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Webhook Settings Layout                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Card: Webhook Endpoint                                               │  │
-│  │                                                                       │  │
-│  │  URL:                                                                 │  │
-│  │  [ https://your-site.com/webhooks                              ]     │  │
-│  │                                                                       │  │
-│  │  [ Save ]  [ Send Test ]                                             │  │
-│  │  (primary)  (outline, shows "Testing..." during request)            │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Card: Recent Deliveries                                              │  │
-│  │                                                                       │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │  │ Event: payment.captured     Status: 200 OK      12:34 PM       │ │  │
-│  │  │ Event: refund.created       Status: 200 OK      12:30 PM       │ │  │
-│  │  │ Event: payment.captured     Status: 500 Error   12:25 PM       │ │  │
-│  │  │ (shows retry count and next retry time for failures)           │ │  │
-│  │  └─────────────────────────────────────────────────────────────────┘ │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The webhook settings page has two cards. The first lets the merchant edit their endpoint URL and fire a signed test delivery ("Send Test" shows a "Testing..." state while awaiting the round-trip). The second lists recent deliveries with event type, response status, and timestamp — and for failures, the retry count and next scheduled retry, so a merchant can diagnose a broken endpoint without leaving the dashboard. Delivery history is read from the `webhook_deliveries` table the worker updates on every attempt.
 
 ### Backend: Webhook Test Endpoint
 

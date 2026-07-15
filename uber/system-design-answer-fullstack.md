@@ -190,107 +190,26 @@
 ### 🔄 Sequence Diagram
 
 ```
-┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
-│  Rider  │  │ Rider   │  │   API   │  │ Matching│  │  Redis  │  │ Driver  │
-│   App   │  │  Store  │  │ Gateway │  │ Worker  │  │   Geo   │  │   App   │
-└────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘
-     │            │            │            │            │            │
-     │ Tap        │            │            │            │            │
-     │ "Request"  │            │            │            │            │
-     ├───────────►│            │            │            │            │
-     │            │            │            │            │            │
-     │            │ Set status:│            │            │            │
-     │            │ 'requesting'            │            │            │
-     │            ├───────────►│            │            │            │
-     │            │            │            │            │            │
-     │            │ POST /rides/request     │            │            │
-     │            │ X-Idempotency-Key: uuid │            │            │
-     │            ├───────────►│            │            │            │
-     │            │            │            │            │            │
-     │            │            │ Check      │            │            │
-     │            │            │ idempotency│            │            │
-     │            │            ├───────────►│            │            │
-     │            │            │            │            │            │
-     │            │            │ Insert ride (status: requested)      │
-     │            │            ├────────────────────────►│            │
-     │            │            │            │            │            │
-     │            │            │ Publish to │            │            │
-     │            │            │ matching   │            │            │
-     │            │            │ queue      │            │            │
-     │            │            ├───────────►│            │            │
-     │            │            │            │            │            │
-     │            │ 202 Accepted            │            │            │
-     │            │ {rideId,   │            │            │            │
-     │            │  status:   │            │            │            │
-     │            │  'matching'}            │            │            │
-     │            │◄───────────┤            │            │            │
-     │            │            │            │            │            │
-     │            │ Set status:│            │            │            │
-     │            │ 'matching' │            │            │            │
-     │            ├──────────► │            │            │            │
-     │            │            │            │            │            │
-     │ Show       │            │            │            │            │
-     │ "Searching"│            │            │            │            │
-     │ animation  │            │            │            │            │
-     │◄───────────┤            │            │            │            │
-     │            │            │            │            │            │
-     ├────────────────────────────────────────────────────────────────┤
-     │                    MATCHING WORKER PROCESS                     │
-     ├────────────────────────────────────────────────────────────────┤
-     │            │            │            │            │            │
-     │            │            │            │ GEORADIUS  │            │
-     │            │            │            │ 5km radius │            │
-     │            │            │            ├───────────►│            │
-     │            │            │            │            │            │
-     │            │            │            │ [driver1,  │            │
-     │            │            │            │  driver2,  │            │
-     │            │            │            │  driver3]  │            │
-     │            │            │            │◄───────────┤            │
-     │            │            │            │            │            │
-     │            │            │            │ Score by:  │            │
-     │            │            │            │ • ETA      │            │
-     │            │            │            │ • Rating   │            │
-     │            │            │            │ • Accept   │            │
-     │            │            │            │   rate     │            │
-     │            │            │            │            │            │
-     │            │            │            │ Send offer │            │
-     │            │            │            │ via WS     │            │
-     │            │            │            ├────────────────────────►│
-     │            │            │            │            │            │
-     │            │            │            │            │     Offer  │
-     │            │            │            │            │     modal  │
-     │            │            │            │            │    ┌──────►│
-     │            │            │            │            │            │
-     │            │            │            │            │     Driver │
-     │            │            │            │            │     taps   │
-     │            │            │            │            │     Accept │
-     │            │            │            │            │◄───────────┤
-     │            │            │            │            │            │
-     │            │            │ POST /driver/rides/:id/accept        │
-     │            │            │◄─────────────────────────────────────┤
-     │            │            │            │            │            │
-     │            │            │ UPDATE rides            │            │
-     │            │            │ SET status='matched'    │            │
-     │            │            │ WHERE status='matching' │            │
-     │            │            ├────────────────────────►│            │
-     │            │            │            │            │            │
-     │            │            │ ZREM drivers:available  │            │
-     │            │            ├────────────────────────►│            │
-     │            │            │            │            │            │
-     │            │ WsRideMatched           │            │            │
-     │            │ (driver info, ETA)      │            │            │
-     │            │◄───────────┤            │            │            │
-     │            │            │            │            │            │
-     │            │ Set status:│            │            │            │
-     │            │ 'matched'  │            │            │            │
-     │            │ + driver   │            │            │            │
-     │            ├──────────► │            │            │            │
-     │            │            │            │            │            │
-     │ Show       │            │            │            │            │
-     │ driver     │            │            │            │            │
-     │ info, ETA  │            │            │            │            │
-     │◄───────────┤            │            │            │            │
-     │            │            │            │            │            │
+ Rider App          API Gateway            Matching Worker          Driver App
+    │                    │                       │                      │
+    │ POST /rides/request (X-Idempotency-Key)    │                      │
+    ├───────────────────►│ insert ride(requested)│                      │
+    │                    │ publish to match queue │                      │
+    │ 202 {rideId, status:matching}              │                      │
+    │◄───────────────────┤                       │                      │
+    │  store → matching, show "Searching"        │                      │
+    │                    │   ── async matching ──│ GEORADIUS 5km        │
+    │                    │                       │ score (ETA+rating)   │
+    │                    │                       │ offer via WS ───────►│ modal
+    │                    │                       │                      │ +15s timer
+    │                    │ POST /driver/rides/:id/accept                │
+    │                    │◄─────────────────────────────────────────────┤
+    │                    │ UPDATE rides SET status='matched'            │
+    │                    │   WHERE status='matching' (optimistic lock)  │
+    │                    │ ZREM drivers:available                       │
+    │  WsRideMatched (driver info, ETA)          │                      │
+    │◄───────────────────┤ store → matched, show driver card           │
+    │                    │                       │                      │
 ```
 
 ### 🎯 Key Integration Points
@@ -416,22 +335,7 @@
 
 ### ⚠️ Standardized Error Response
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     ERROR RESPONSE STRUCTURE                        │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│   {                                                                 │
-│     "error": {                                                      │
-│       "code": "ERROR_CODE",           // Machine-readable           │
-│       "message": "User message",      // Display to user            │
-│       "retryable": true/false,        // Can client retry?          │
-│       "retryAfter": 30                // Seconds to wait (optional) │
-│     }                                                               │
-│   }                                                                 │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Every error returns a consistent envelope: a machine-readable `code`, a human `message`, a `retryable` boolean, and an optional `retryAfter` (seconds). The client branches on `code` and `retryable` rather than parsing prose, so error handling stays uniform across every endpoint.
 
 ### 📋 Error Codes
 
@@ -516,85 +420,11 @@
 
 ### 🔄 Optimistic Updates with Rollback
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                   OPTIMISTIC UPDATE PATTERN                         │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  User Action (e.g., Cancel Ride)                                    │
-│       │                                                             │
-│       ▼                                                             │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │ onMutate: (before API call)                                 │    │
-│  │   1. Snapshot current state (previousStatus)                │    │
-│  │   2. Optimistically update: status → 'cancelled'            │    │
-│  │   3. Update UI immediately                                  │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│       │                                                             │
-│       ▼                                                             │
-│  ┌─────────────────────────┐                                        │
-│  │    API Call            │                                        │
-│  │    POST /rides/:id/    │                                        │
-│  │    cancel              │                                        │
-│  └───────────┬─────────────┘                                        │
-│              │                                                      │
-│    ┌─────────┴─────────┐                                            │
-│    ▼                   ▼                                            │
-│  Success            Failure                                         │
-│    │                   │                                            │
-│    ▼                   ▼                                            │
-│  Invalidate        ┌─────────────────────────────────────────┐      │
-│  cache             │ onError:                                │      │
-│  (confirm state)   │   1. Rollback: status → previousStatus  │      │
-│                    │   2. Show "Failed to cancel" toast      │      │
-│                    └─────────────────────────────────────────┘      │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+On a user action like Cancel Ride, `onMutate` snapshots the current status and optimistically flips the store to `cancelled` so the UI responds instantly. If the API call succeeds we invalidate the cache to confirm; if it fails, `onError` rolls the status back to the snapshot and surfaces a "Failed to cancel" toast. The user never waits on the network for feedback, and a rejected mutation leaves the store exactly where it started.
 
 ### 🔄 Reconciling WebSocket and REST State
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                   STATE RECONCILIATION                              │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│                    ┌───────────────┐                                │
-│                    │  Ride Store   │                                │
-│                    │               │                                │
-│                    │ status: X     │                                │
-│                    │ driver: {...} │                                │
-│                    └───────┬───────┘                                │
-│                            │                                        │
-│         ┌──────────────────┼──────────────────┐                     │
-│         │                  │                  │                     │
-│         ▼                  ▼                  ▼                     │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐              │
-│  │  WebSocket  │    │ REST Poll   │    │ User Action │              │
-│  │  Events     │    │ (backup)    │    │             │              │
-│  │             │    │             │    │             │              │
-│  │ Immediate   │    │ Every 10s   │    │ Immediate   │              │
-│  │ push        │    │ as fallback │    │ optimistic  │              │
-│  └──────┬──────┘    └──────┬──────┘    └─────────────┘              │
-│         │                  │                                        │
-│         └────────┬─────────┘                                        │
-│                  ▼                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                  RECONCILIATION LOGIC                        │    │
-│  │                                                              │    │
-│  │  Define status order:                                        │    │
-│  │    matching → matched → driver_arrived → in_progress → done  │    │
-│  │                                                              │    │
-│  │  If REST status is "ahead" of store status:                  │    │
-│  │    → Log divergence warning                                  │    │
-│  │    → Update store to match REST                              │    │
-│  │    → Update driver info if present                           │    │
-│  │                                                              │    │
-│  │  Reason: WebSocket may have dropped an event                 │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The store is the single source of truth, fed by three inputs: WebSocket events (immediate push), a REST poll every 10s as a fallback, and local optimistic user actions. Reconciliation defines a status order — matching → matched → driver_arrived → in_progress → completed — and only ever moves *forward*: if the REST poll reports a status ahead of the store (a WebSocket event was dropped), the store advances to match REST and logs the divergence. It never regresses to a stale WebSocket message, which is how we avoid flicker when a late event races a poll.
 
 ### 📴 Offline Action Queue
 
@@ -611,28 +441,7 @@
 
 ### 🧪 Testing Layers
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                       TESTING PYRAMID                               │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│                           /\                                        │
-│                          /  \                                       │
-│                         / E2E\      • Full ride flow test           │
-│                        /  (5) \     • WebSocket integration         │
-│                       /────────\                                    │
-│                      /          \                                   │
-│                     / Integration\   • API endpoint tests           │
-│                    /    (20)      \  • Database transactions        │
-│                   /────────────────\                                │
-│                  /                  \                               │
-│                 /    Unit Tests      \  • Matching algorithm        │
-│                /       (100+)         \ • Store reducers            │
-│               /                        \• Component rendering       │
-│              /__________________________\                           │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The pyramid: ~100+ **unit tests** (matching/scoring algorithm, store reducers, component rendering), ~20 **integration tests** (API endpoints, DB transactions, status-transition guards), and ~5 **E2E tests** (the full ride flow plus WebSocket delivery). The weight sits at the base because the pure functions — scoring, surge, fare math — are the cheapest to test exhaustively and where a regression is most costly.
 
 ### 🔄 E2E Test Flow
 

@@ -61,7 +61,7 @@ cd payment-system
 docker-compose up -d
 ```
 
-This starts PostgreSQL and Redis with the database schema automatically initialized.
+This starts PostgreSQL, Valkey/Redis, and RabbitMQ (management UI on http://localhost:15672, guest/guest), with the database schema automatically initialized from `backend/src/db/init.sql`. RabbitMQ is only required for the background workers (webhook delivery and async fraud scoring); the core API server runs without it.
 
 2. **Setup and run the backend:**
 

@@ -57,19 +57,16 @@ cd backend
 npm install
 ```
 
-### 3. Run Database Migrations
+### 3. Database Schema
 
-```bash
-npm run db:migrate
-```
-
-This creates:
+There is no separate migration step. The schema in `backend/db/init.sql` is applied automatically by TimescaleDB on first container start (mounted into `/docker-entrypoint-initdb.d`). It creates:
 - Users table
 - Metric definitions table
-- Metrics hypertable (time-series data)
-- Hourly and daily rollup tables
+- Metrics hypertable (time-series data) with a 7-day retention policy
 - Dashboards and panels tables
 - Alert rules and instances tables
+
+Note: the `metrics_hourly` / `metrics_daily` continuous-aggregate rollups referenced by the query router are **not** created by `init.sql`. Ranges longer than 6 hours therefore fall back to an empty result set (see `architecture.md` → Query Routing Logic). If you recreate the schema on an existing volume, run `docker-compose down -v` first so the init script re-runs.
 
 ### 4. Seed Sample Data
 
