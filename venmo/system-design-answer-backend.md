@@ -15,6 +15,7 @@ Questions I'd ask first:
 - **Are we the ledger of record, or do we sit on top of banks?** I'll assume we hold a real balance (a stored-value wallet) and integrate with ACH/card networks for funding and cashout. This is what makes the funding waterfall a core problem rather than a detail.
 - **Is the feed social-network-scale?** Friends lists, not follower graphs — a few hundred friends typical, not millions of followers. That single fact decides the fan-out strategy.
 - **Do we need instant payouts?** Yes — instant cashout to debit card (with a fee) alongside free standard ACH. These have very different failure semantics.
+- **What's the regulatory posture?** Holding balances makes us a money transmitter: KYC on signup, transaction monitoring, and immutable audit retention are hard requirements, not features to negotiate. I'll assume they constrain the design from day one rather than being bolted on later — it's why the ledger is append-only and the audit log has no UPDATE/DELETE grants.
 
 ### Functional Requirements
 
@@ -38,6 +39,20 @@ Questions I'd ask first:
 - 80M users, ~10M sends/day (~120/sec average, ~1,000/sec at Friday-night peak)
 - Average ~200 friends per user → feed fan-out ~400 rows per public transaction
 - Feed reads dominate: ~50M app opens/day, each pulling a timeline
+
+## 📐 Capacity Estimation
+
+Sizing the two halves separately, because they scale on different axes:
+
+| Dimension | Estimate | Consequence |
+|-----------|----------|-------------|
+| Transfer write QPS | ~120/s avg, ~1,000/s peak | Comfortably a single primary's territory — the constraint is lock contention on hot rows, not raw throughput |
+| Feed read QPS | ~50M opens/day ≈ 600/s avg, multi-thousand peak | Read-replica territory; feeds tolerate replica lag by definition |
+| Feed write amplification | 10M transfers/day × ~400 fan-out rows = **~4B feed rows/month** | The dominant storage cost by an order of magnitude; drives TTL + eventual Cassandra migration |
+| Wallet/ledger size | 80M wallets (~tiny) + 2 ledger entries/transfer ≈ **20M rows/day** | Ledger is the durable core; grows linearly, partitioned by time, never deleted |
+| Balance cache | 80M × ~16 bytes ≈ **~1.3GB** hot set | Fits in a single Redis node; invalidated per transfer, not written through |
+
+The headline: **the ledger is small and precious; the feed is enormous and disposable.** That inversion — the thing you must never lose is tiny, the thing you can drop is huge — is what lets us pick a strict store for one and a cheap TTL'd store for the other, and is the single most important sizing insight for the whole design.
 
 ## 🏗️ High-Level Architecture
 
@@ -98,17 +113,33 @@ The critical boundary: **the money path is synchronous and transactional; the so
 ## 🔌 API Design
 
 ```
-POST   /api/v1/transfers            → Send money (Idempotency-Key header required)
-POST   /api/v1/requests             → Request money from a user
-POST   /api/v1/requests/:id/approve → Approve → executes a transfer
-GET    /api/v1/feed?cursor=…        → Friends' transaction feed (cursor-paginated)
-POST   /api/v1/feed/:id/like        → Like a feed item
-GET    /api/v1/wallet               → Balance + available balance
-POST   /api/v1/cashout              → Withdraw to bank (ACH) or card (instant)
-GET    /api/v1/transfers?cursor=…   → Personal transaction history
+POST   /api/v1/transfers             → Send money (Idempotency-Key header required)
+GET    /api/v1/transfers?cursor=…    → Personal transaction history
+POST   /api/v1/requests              → Request money from a user
+POST   /api/v1/requests/:id/approve  → Approve → executes a transfer from the requestee
+POST   /api/v1/requests/:id/decline  → Decline a pending request
+GET    /api/v1/feed?cursor=…         → Friends' transaction feed (cursor-paginated)
+POST   /api/v1/feed/:id/like         → Like a feed item
+POST   /api/v1/feed/:id/comments     → Comment on a feed item
+GET    /api/v1/wallet                → Balance + available balance
+POST   /api/v1/cashout               → Withdraw to bank (ACH) or card (instant)
+GET    /api/v1/payment-methods       → List linked banks/cards (last-4 only)
+POST   /api/v1/payment-methods       → Link a bank/card (stored as a token)
+GET    /api/v1/friends               → Friend list + pending requests
+POST   /api/v1/friends               → Send / accept a friend request
 ```
 
 Cursor pagination throughout, keyed on `created_at`. Offset pagination on a feed is a correctness bug as much as a performance one — new items shift the window and users see duplicates and gaps.
+
+**The exactly-once guarantee, end to end.** A send is safe to retry indefinitely because five checks line up:
+
+1. **Client** attaches a stable `Idempotency-Key` (a UUID minted once per user intent, reused across retries).
+2. **Redis fast path** returns the stored response if the key was seen — most retries die here, before any DB work.
+3. **DB backstop**: the transaction re-checks `transfers(sender_id, idempotency_key)`; if Redis was cold, the unique index makes the second insert fail loudly instead of double-paying.
+4. **Wallet lock** serializes the sender's concurrent attempts so step 3's check can't race itself.
+5. **Response is stored, not a flag** — the retry gets the *original* transfer's id and status, so the client reconciles instead of resubmitting.
+
+Miss any one and you either double-charge (drop 2–5) or block a legitimate payment that never happened (write the key before the transfer commits). The ordering — key recorded *inside* the same transaction as the money movement — is the part that's easy to get subtly wrong.
 
 ## 🔧 Deep Dive 1: Balance Consistency — Why Pessimistic Locking Here
 
@@ -152,8 +183,9 @@ The subtlety people miss: **you must store the *response*, not just a "seen" fla
 **The funding waterfall** decides where the money comes from when the balance is short. Priority order:
 
 1. **Venmo balance** — free, instant, no external dependency. Always exhaust this first.
-2. **Linked bank account (ACH)** — free to the user, but ACH settlement takes 1–3 business days
-3. **Debit/credit card** — instant but carries a ~3% fee, so it's the last resort
+2. **Default verified bank account (ACH)** — free to the user, but settlement takes 1–3 business days.
+3. **Any other verified bank account** — the fallback when there's no default set, so a linked-but-not-default bank still funds before we reach for a card.
+4. **Debit/credit card** — instant but carries a fee, so it's the last resort.
 
 Here's the interesting part, and it's a consistency question, not a routing question: **the ACH debit has not settled when we credit the receiver.** We have handed the recipient real, spendable money against funds that are days from actually arriving, and ACH transfers can fail after the fact (insufficient funds, closed account) — days later.
 
@@ -179,6 +211,34 @@ Two more details that matter:
 
 The cost I accept: **privacy changes are not retroactive.** If a user flips a transaction from public to private after the fact, the rows are already fanned out. That's handled with a tombstone check on read for the rare edit — the one place I deliberately pay a small read cost, because "leaked after I made it private" is the kind of bug that ends up on the news.
 
+## 🔁 Requests, Approvals, and Cashout
+
+Two flows sit around the core transfer and share its consistency machinery without duplicating it.
+
+**A money request is a claim, not a transfer.** When Alice requests $20 from Bob, we write a `payment_requests` row (`requester_id`, `requestee_id`, `amount`, `status = pending`) — no money moves, no wallet is touched. The interesting decision is *who executes the transfer and when*. It has to be Bob's approval that triggers execution, funded from **Bob's** wallet, running the exact same locked-transfer path as a normal send. The request row then flips to `approved` and stores the resulting `transfer_id`, so the two are permanently linked for the audit trail.
+
+> "The trap here is treating a request as a pre-authorized pull. If approving a request could debit the requestee without re-running the full funding-and-locking path, you've built a way to move money that bypasses your one hardened code path — and now you have two places that can create a negative balance instead of one. So a request approval is *literally* a transfer with a different button on it: it re-checks the balance, re-runs the waterfall, takes the same wallet lock. The request table is just a durable intent record that makes the transfer idempotent — approving twice finds the row already `approved` with a `transfer_id` and returns it."
+
+**Cashout is the reverse valve: balance leaving the system.** The `cashouts` table records `speed` (`instant` or `standard`), `fee`, `payment_method_id`, and `estimated_arrival`. The two speeds have opposite risk profiles:
+
+| Speed | Rail | Fee | Settlement | Failure mode |
+|-------|------|-----|-----------|--------------|
+| Standard | ACH | Free | 1–3 business days | Return after the fact (rare) |
+| Instant | Debit-card push | ~1.75% | Seconds | Network decline at request time |
+
+A cashout debits the wallet *inside the same locked transaction* that creates the cashout row — the money leaves the balance immediately even though the external payout is still in flight. That's the safe direction: we're holding the user's money and paying it out, so worst case a failed payout is *credited back*, never double-paid. Contrast with funding, where the danger is the opposite (we credit before external money arrives). The asymmetry is the whole game: **debits are safe to do eagerly, credits against unsettled external money are not.**
+
+## 🔐 Security and Auth
+
+Auth is deliberately boring so the money code can be interesting. Sessions are opaque tokens in Redis with a 24-hour TTL, checked on every request — server-side sessions over JWTs specifically because **a compromised payment session must be revocable in one `DEL`**, and a stateless JWT can't be. A stolen JWT is valid until it expires; a stolen session dies the moment we notice.
+
+Two payment-specific protections:
+
+- **A payment PIN** (`pin_hash`, bcrypt) gates high-value sends independently of the login session — so a phone left unlocked for a minute can't drain a wallet. It's a second factor scoped to the money action, not the login.
+- **We never store raw instrument data.** Card numbers are network **tokens** (`card_token`); bank account numbers are encrypted at rest (`account_number_encrypted`) and only last-4 is ever returned. This keeps the PAN/account number out of our blast radius entirely — a database leak exposes tokens that are useless off our platform, which is the difference between an incident and a catastrophe.
+
+Rate limiting is enforced at the gateway per user and per device, with tighter velocity limits on *external-funded* transfers and new/unverified accounts — the same population where ACH-return fraud concentrates.
+
 ## 🛡️ Failure Handling
 
 **External networks (bank, card) are the least reliable component and the most dangerous to retry.** They're wrapped in circuit breakers: after a threshold of failures the breaker opens and calls fail immediately rather than piling up 30-second timeouts until the connection pool is exhausted and the *whole* API goes down with it. After a cooldown, a probe request tests recovery.
@@ -198,10 +258,17 @@ That last row is the philosophy of the whole system: **for the money path, unava
 
 Beyond the standard latency/error/saturation metrics, the payment-specific signals I'd alert on:
 
-- **Ledger reconciliation drift** — nightly re-derivation of every balance from ledger entries. Any mismatch is a P0, no exceptions
-- **Transfer duration broken down by step** (lock wait, debit, credit, commit) — lock-wait time creeping up is the earliest warning of a hot-account contention problem
-- **Circuit breaker state per external service** — plus the rate of external charge *failures after settlement*, which is the fraud/credit-risk signal
-- **Idempotency hit rate** — a spike means clients are retrying, which means something upstream is timing out
+| Signal | Metric | Alerts when | Tells us |
+|--------|--------|-------------|----------|
+| Reconciliation drift | Nightly ledger re-derivation vs `wallets.balance` | Any non-zero delta | A balance bug — **P0, always** |
+| Transfer outcome mix | `transfers_total{status,funding_source}` | `insufficient_funds` / `failed` ratio spikes | Funding or contention problems, sliced by source |
+| Transfer duration by step | histogram: lock-wait, debit, credit, commit | p99 lock-wait climbing | Hot-account contention, the earliest warning |
+| Feed fan-out lag | `feed_fanout_duration` | p99 > seconds, or queue depth grows | Workers falling behind the Friday-night spike |
+| Circuit-breaker state | breaker open/half-open per external rail | Breaker opens | Bank/card network degraded |
+| Idempotency hit rate | Redis + DB idempotency hits | Sudden spike | Clients retrying → something upstream is timing out |
+| Post-settlement charge failures | ACH-return / late-decline rate | Above baseline | The fraud / credit-risk signal behind the waterfall |
+
+The two that are unique to a payments system — and that a generic dashboard wouldn't have — are **reconciliation drift** (it's how you catch a money bug before your users do) and **post-settlement failures** (it's how you catch fraud you already paid out). Everything writes an immutable audit entry (actor, action, resource, IP, request ID, outcome) with 7-year retention, because regulators require reconstructing any transaction's full history on demand.
 
 Every money movement writes an immutable audit entry (actor, action, resource, IP, request ID, outcome) with 7-year retention, because financial regulators require reconstructing any transaction's full history on demand.
 

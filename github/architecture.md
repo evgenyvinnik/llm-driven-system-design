@@ -521,7 +521,7 @@ DELETE /api/repos/:owner/:repo/star           Unstar repository
 
 **Decision**: Store repositories as bare Git repositories on the local filesystem.
 
-Git operations (diff, merge, log, tree) require the native Git object model. Storing objects in a database or S3 would require reimplementing Git's pack file format, delta compression, and ref management. Using bare repos with `simple-git` and `isomorphic-git` libraries provides full Git functionality. The trade-off is that filesystem storage doesn't scale horizontally -- at GitHub's scale, you'd shard repositories across storage servers with a routing layer. For a learning project, filesystem storage is the pragmatic choice.
+Git operations (diff, merge, log, tree) require the native Git object model. Storing objects in a database or S3 would require reimplementing Git's pack file format, delta compression, and ref management. Using bare repos driven by the `simple-git` library (which shells out to the system `git` binary) provides full Git functionality. The trade-off is that filesystem storage doesn't scale horizontally -- at GitHub's scale, you'd shard repositories across storage servers with a routing layer. For a learning project, filesystem storage is the pragmatic choice.
 
 ### 2. Repository-Scoped Numbering for Issues and PRs
 
@@ -717,7 +717,7 @@ This section documents the actual local setup and maps production concepts to th
 | Admin endpoints | Circuit breaker status/reset, audit log query | `backend/src/index.ts` |
 | Session auth | Redis-backed sessions with X-Session-Id header | `backend/src/middleware/auth.ts` |
 | Code search | Elasticsearch with code tokenizer, symbol extraction, language detection | `backend/src/services/search.ts` |
-| Git operations | simple-git + isomorphic-git for bare repository management | `backend/src/services/git.ts` |
+| Git operations | simple-git (system `git` binary) for bare repository management | `backend/src/services/git.ts` |
 | Graceful shutdown | SIGTERM/SIGINT handlers with connection draining | `backend/src/index.ts` |
 
 ### Production Pattern Deep Dives

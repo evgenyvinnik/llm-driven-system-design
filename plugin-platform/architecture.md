@@ -405,7 +405,7 @@ The alternative (events only, or state only) would force one mechanism to serve 
 
 Anonymous users can browse the marketplace and install plugins, tracked by session ID in `anonymous_installs`. When they register, installs migrate to `user_plugins`. This reduces friction -- users can try the editor immediately without creating an account.
 
-The trade-off is session storage: anonymous sessions consume Redis memory. A 24-hour session TTL bounds this cost while giving users a day to decide whether to register.
+The trade-off is session storage: anonymous sessions consume Redis memory. The session cookie is set to a 7-day `maxAge` (`api/app.ts`), which bounds this cost while giving users a week to decide whether to register; a shorter TTL would trade lower memory for more lost anonymous carts.
 
 ### MinIO for Plugin Storage
 
@@ -453,7 +453,7 @@ The alternative (separate repositories per plugin) would provide stronger isolat
 ### What breaks first
 1. **Plugin bundle downloads** -- Without a CDN, the backend serves every bundle download. Solution: S3/CloudFront with aggressive cache headers (bundles are immutable per version).
 2. **Marketplace browse queries** -- Full-text search across plugin names/descriptions degrades with thousands of plugins. Solution: Elasticsearch for search, PostgreSQL for structured queries.
-3. **Anonymous session storage** -- Without cleanup, sessions accumulate in Redis. Solution: TTL-based expiry (24 hours), session count monitoring.
+3. **Anonymous session storage** -- Without cleanup, sessions accumulate in Redis. Solution: TTL-based expiry (the cookie `maxAge` is 7 days today; a shorter TTL would cap memory), session count monitoring.
 4. **Plugin count per slot** -- Rendering 50+ plugins in a single slot impacts paint performance. Solution: lazy rendering with intersection observer, priority-based loading.
 
 ### Scaling path
