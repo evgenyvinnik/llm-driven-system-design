@@ -346,7 +346,7 @@ RESTful API under `/api/v1/`. Session-based authentication with Redis-backed ses
 | GET | `/api/v1/pages/:id` | Get page with metadata |
 | GET | `/api/v1/pages/space/:key/slug/:slug` | Get page by space key + slug |
 | PUT | `/api/v1/pages/:id` | Update page (creates version) |
-| DELETE | `/api/v1/pages/:id` | Archive page |
+| DELETE | `/api/v1/pages/:id` | Delete page (hard delete; children reparented via `ON DELETE SET NULL`) |
 | GET | `/api/v1/pages/:id/versions` | Get version history |
 | GET | `/api/v1/pages/:id/versions/:v1/diff/:v2` | Diff two versions |
 | GET | `/api/v1/pages/:id/comments` | Get threaded comments |
@@ -356,7 +356,7 @@ RESTful API under `/api/v1/`. Session-based authentication with Redis-backed ses
 | GET | `/api/v1/search` | Full-text search with filters |
 | GET | `/api/v1/templates` | List templates |
 | GET | `/api/health` | Health check |
-| GET | `/metrics` | Prometheus metrics |
+| GET | `/api/metrics` | Prometheus metrics |
 
 ## Key Design Decisions
 
@@ -557,7 +557,7 @@ All infrastructure runs via Docker Compose (`docker-compose.yml`). The API serve
 
 1. **Circuit Breaker** (Opossum): Wraps Elasticsearch and RabbitMQ calls. Opens after 50% error rate, resets after 30s. Prevents cascade failures when external services are down. See `src/services/circuitBreaker.ts`.
 
-2. **Prometheus Metrics** (prom-client): HTTP request duration histogram with method/route/status labels, request counters, page operation counters (create/update/delete/move), and search latency histogram. Exposed at `/metrics`. See `src/services/metrics.ts`.
+2. **Prometheus Metrics** (prom-client): HTTP request duration histogram with method/route/status labels, request counters, page operation counters (create/update/delete/move), and search latency histogram. Exposed at `/api/metrics`. See `src/services/metrics.ts`.
 
 3. **Structured Logging** (Pino): JSON-formatted logs with request correlation via pino-http. Every log line includes timestamp, level, and request context for log aggregation. See `src/services/logger.ts`.
 

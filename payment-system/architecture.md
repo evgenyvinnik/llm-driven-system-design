@@ -109,7 +109,7 @@ The API gateway is the single entry point for all merchant traffic. In productio
 Handles the full payment lifecycle: authorize, capture, void, refund, and chargeback. Each instance is stateless -- all state lives in PostgreSQL and Valkey -- enabling horizontal scaling by adding instances behind the gateway.
 
 Key responsibilities:
-- Validate merchant API keys (SHA-256 hashed, looked up from cache or DB)
+- Validate merchant API keys (bcrypt-hashed; the plaintext `Bearer pk_...` key is compared against stored hashes)
 - Enforce idempotency: check Valkey for existing key before processing
 - Acquire distributed locks to prevent concurrent processing of the same payment
 - Execute payment within a PostgreSQL transaction (transaction + ledger entries + audit log)
@@ -158,7 +158,7 @@ CREATE TABLE merchants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
-    api_key_hash VARCHAR(64) NOT NULL,  -- SHA-256 of API key
+    api_key_hash VARCHAR(255) NOT NULL,  -- bcrypt hash of the pk_ API key
     webhook_url TEXT,
     webhook_secret VARCHAR(64),
     status VARCHAR(20) DEFAULT 'active',  -- active, suspended, closed
@@ -300,7 +300,7 @@ CREATE INDEX idx_transactions_idempotency ON transactions(idempotency_key) WHERE
 
 ### Authentication
 
-API key in `Authorization: Bearer sk_live_xxx` header. Keys use `sk_live_*` and `sk_test_*` prefixes to distinguish environments. Keys are hashed with SHA-256 before storage -- the plaintext key is shown to the merchant only once at creation.
+API key in `Authorization: Bearer pk_xxx` header. Keys are generated with a `pk_` prefix at merchant creation and hashed with bcrypt before storage -- the plaintext key is shown to the merchant only once. Authentication compares the presented key against stored bcrypt hashes of active merchants. (A production system would add `sk_live_*`/`sk_test_*` environment prefixes and an indexed key-id lookup rather than scanning; the local build keeps the single `pk_` scheme.)
 
 ### Core Endpoints
 

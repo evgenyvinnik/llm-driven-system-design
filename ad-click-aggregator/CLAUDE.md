@@ -1,146 +1,58 @@
-# Ad Click Aggregator - Development with Claude
+# Ad Click Aggregator — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing a real-time analytics system for aggregating ad clicks.
+A real-time analytics pipeline that ingests ad-click events, deduplicates them, runs rule-based fraud detection, and serves aggregated metrics (by minute / hour / day, sliceable by campaign, ad, country, device). The interesting tension is a **1000:1 write-to-read ratio** against a **hard exactly-once-ish requirement**: clicks drive billing, so a double-counted or lost click is money.
 
-## Key Challenges to Explore
+**Learning goals:** high-volume write ingestion, real-time aggregation without a heavyweight stream processor, approximate vs exact counting trade-offs, and columnar OLAP for time-series.
 
-1. High-volume writes
-2. Real-time aggregation
-3. Exactly-once semantics
-4. Time-series data
+## Architecture at a Glance (what actually runs)
 
-## Development Phases
+Three datastores, each chosen for a specific access pattern — this is a *hybrid* design, not a single-DB one:
 
-### Phase 1: Requirements and Design
-*Completed*
+| Store | Role | Why this one |
+|-------|------|--------------|
+| **PostgreSQL** (`pg`) | Raw click audit trail + metadata (campaigns, ads) | ACID durability for billing disputes — the provable record of every click |
+| **ClickHouse** (`@clickhouse/client`) | Analytics: raw events + minute/hour/day rollups via materialized views | Columnar storage + MV auto-aggregation; 10–100× faster than PG for the dashboard's group-by queries |
+| **Redis/Valkey** (`ioredis`) | Click-ID dedup (5-min TTL) + real-time counters | Sub-ms lookups on the ingestion hot path; HyperLogLog for unique-user counts |
 
-**Key decisions made:**
-- Target scale: 10,000 clicks/second for design, simplified for local dev
-- Core features: Click ingestion, real-time aggregation, fraud detection, analytics
-- PostgreSQL instead of ClickHouse for simplicity in local development
-- Redis for deduplication, rate limiting, and real-time counters
-- Express + TypeScript backend, React + TanStack Router frontend
+Every ingested click is written to **both** PostgreSQL (audit) and ClickHouse (analytics) — the aggregation is done by ClickHouse materialized views, not application code.
 
-### Phase 2: Initial Implementation
-*In progress*
+Backend services: `click-ingestion`, `aggregation`, `fraud-detection`, `clickhouse`, `database`, `redis`. Routes: `clicks` (ingest), `analytics` (query), `admin` (stats). Frontend: React + TanStack Router + Zustand + Recharts.
 
-**Completed:**
-- Click event ingestion API with validation (Zod)
-- Deduplication using Redis with 5-minute TTL
-- Real-time aggregation (minute, hour, day granularity)
-- Fraud detection based on click velocity and patterns
-- Query API for analytics with flexible grouping
-- Admin API for system stats and monitoring
-- React dashboard with Recharts visualizations
-- Test click generator for development
+## Key Design Decisions
 
-**Focus areas:**
-- Implement core functionality
-- Get something working end-to-end
-- Validate basic assumptions
+### 1. Hybrid PostgreSQL + ClickHouse (not one or the other)
+Raw clicks go to PostgreSQL for a transactionally-consistent audit trail (billing disputes need provable records that survive a ClickHouse merge/compaction), and to ClickHouse for analytics. Aggregations live only in ClickHouse, computed by materialized views on write. Trade-off: every click is a dual write, and the two stores can briefly diverge — acceptable because PG is the source of truth for billing and CH is the source of truth for dashboards, and they answer different questions.
 
-### Phase 3: Scaling and Optimization
-*Not started*
+### 2. Materialized-view aggregation over a stream processor
+Minute/hour/day rollups are ClickHouse MVs (`click_aggregates_minute_mv` → `click_aggregates_minute`, etc.), not a Kafka/Flink job. For this scale it removes an entire moving part: aggregation happens synchronously as a side effect of the insert, with columnar storage doing the heavy lifting. The production doc notes where Kafka + Flink would take over at 10K+ clicks/sec.
 
-**Focus areas:**
-- Add caching layer for aggregated queries
-- Optimize database queries with better indexes
-- Implement load balancing across multiple backend instances
-- Add monitoring with Prometheus/Grafana
-- Consider Kafka for event streaming
+### 3. Redis for dedup, not a DB uniqueness constraint
+Deduplication uses a Redis key per click-ID with a 5-minute TTL. A unique constraint in PG would serialize the write path and grow unbounded; Redis gives an O(1) check that auto-expires. Trade-off: dedup is best-effort within the TTL window — a duplicate arriving after 5 minutes is not caught, which is the right window for retry storms but not for long-delayed replays.
 
-### Phase 4: Polish and Documentation
-*Not started*
+### 4. Rule-based fraud detection
+Velocity thresholds (100 clicks/min per IP, 50/min per user) plus pattern heuristics (missing device info, suspiciously regular timing). Fraudulent clicks are **flagged, not dropped** — stored for analysis so the rules can be tuned. ML-based detection is deliberately out of scope.
 
-**Focus areas:**
-- Complete documentation
-- Add comprehensive tests
-- Performance tuning
-- Code cleanup
+## Current State
 
-## Design Decisions Log
+All core paths are implemented and run end to end: click ingestion with Zod validation + Redis dedup, dual-write to PG/ClickHouse, MV-based rollups at three granularities, rule-based fraud flagging, the analytics query API, an admin/stats API, and a Recharts dashboard with a test-click generator.
 
-### PostgreSQL vs ClickHouse
-**Decision:** Use PostgreSQL for this learning project
-**Rationale:**
-- Simpler setup and operation
-- Familiar SQL interface
-- Good enough for local development scale
-- Built-in UPSERT for aggregation updates
-- ClickHouse would be preferred at production scale for columnar storage and faster analytics
+Not built (intentionally, noted as production extensions): Kafka event streaming, watermarking for late-arriving clicks, geo-velocity ("impossible travel") fraud, ML fraud models, and raw-data archival/tiering.
 
-### Redis for Deduplication
-**Decision:** Use Redis for click deduplication and real-time counters
-**Rationale:**
-- Sub-millisecond lookups for dedup checks
-- Automatic TTL (5 minutes) for click IDs
-- HyperLogLog for efficient unique user counting
-- Hash maps for real-time click counters per time bucket
+## Iteration & Repair Log
 
-### Aggregation Strategy
-**Decision:** Update aggregates synchronously on each click
-**Rationale:**
-- Simpler than async processing with Kafka
-- Acceptable for learning project scale
-- Uses UPSERT for atomic counter updates
-- Trade-off: Higher latency per click vs. simpler architecture
+- **2026-07 (schema self-heal):** `initClickHouse()` only *pinged* ClickHouse and relied entirely on the `docker-entrypoint-initdb.d` mount to create the schema. That mount runs only on a fresh volume, so a persisted or partially-initialized volume left the `click_aggregates_minute` table missing and analytics queries threw `Table adclick.click_aggregates_minute does not exist`. Fixed by applying the (idempotent, `CREATE ... IF NOT EXISTS`) schema on every boot from `initClickHouse()` — self-healing regardless of volume state.
+- **2026-07 (doc drift):** this file previously claimed "PostgreSQL instead of ClickHouse for simplicity in local development." That was stale from an earlier PG-only prototype; the project uses ClickHouse (and Redis) alongside PostgreSQL. Corrected here to match `docker-compose.yml`, `backend/src/services/clickhouse.ts`, and `architecture.md`.
 
-### Fraud Detection
-**Decision:** Rule-based fraud detection with velocity thresholds
-**Rationale:**
-- 100 clicks/minute per IP triggers fraud flag
-- 50 clicks/minute per user triggers fraud flag
-- Suspicious patterns (missing device info, regular timing)
-- Fraudulent clicks are flagged but stored for analysis
-- ML-based detection is a future enhancement
+## Open Questions
 
-## Iterations and Learnings
+1. Late-arriving clicks currently update aggregates immediately with no watermark — at what event-time skew does this need windowing?
+2. When does exact ClickHouse counting need to give way to approximate sketches (Count-Min / HyperLogLog) on the query side, not just for unique-user counts?
+3. Best archival strategy for raw PG click rows once they age past the billing-dispute window?
 
-### Iteration 1: Basic Implementation
-- Set up Express backend with TypeScript
-- Implemented click ingestion with Zod validation
-- Added Redis deduplication layer
-- Created PostgreSQL schema with aggregation tables
-- Built React dashboard with real-time updates
+## Resources
 
-**Key learnings:**
-- UPSERT pattern works well for aggregation updates
-- Redis HyperLogLog is efficient for unique user counting
-- TanStack Router with file-based routing is productive
-
-## Questions and Discussions
-
-### Open Questions
-1. How to handle late-arriving clicks? (Currently: update aggregates immediately)
-2. Should we implement watermarking for time window handling?
-3. Best strategy for archiving old raw click data?
-
-### Future Considerations
-1. Kafka integration for higher throughput
-2. ClickHouse for production-scale analytics
-3. ML-based fraud detection model
-4. Geo-velocity fraud detection (impossible travel)
-
-## Resources and References
-
-- [ClickHouse Documentation](https://clickhouse.com/docs/)
+- [ClickHouse Materialized Views](https://clickhouse.com/docs/en/materialized-view)
 - [Redis HyperLogLog](https://redis.io/docs/data-types/hyperloglog/)
-- [Apache Flink for Stream Processing](https://flink.apache.org/)
-- [Exactly-Once Semantics](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/)
-
-## Next Steps
-
-- [x] Define detailed requirements
-- [x] Sketch initial architecture
-- [x] Choose technology stack
-- [x] Implement MVP
-- [ ] Test and iterate
-- [ ] Add Kafka for async processing (optional)
-- [ ] Implement comprehensive tests
-- [ ] Add monitoring and observability
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings.*
+- [Apache Flink](https://flink.apache.org/) — the production streaming path this project deliberately avoids

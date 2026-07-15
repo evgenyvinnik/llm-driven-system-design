@@ -1,180 +1,63 @@
-# Design Airbnb - Development with Claude
+# Design Airbnb — Development with Claude
 
 ## Project Context
 
-Building a two-sided marketplace to understand availability calendars, geographic search, and trust systems.
+A two-sided vacation-rental marketplace: hosts list properties with availability calendars, guests search by location/dates/filters and book, and both sides review each other after a stay. The core hard problems are **double-booking prevention** (two guests must never confirm the same dates on the same listing) and **geographic search with availability filtering** (find bookable listings near a point, fast). It is deliberately a single-database design where PostgreSQL + PostGIS carries both the relational and the geo workload.
 
-**Key Learning Goals:**
-- Design efficient availability calendar storage
-- Build geographic search with PostGIS
-- Handle concurrent booking attempts
-- Implement two-sided review systems
+**Learning goals:** efficient availability-calendar storage, PostGIS radius search, concurrent-booking correctness under row locks, mutual-reveal two-sided reviews, and cache-aside + async-queue patterns around a marketplace core.
 
----
+## Architecture at a Glance (what actually runs)
 
-## Implementation Summary
+Three backing services (see `docker-compose.yml`), each for a distinct access pattern:
 
-### What Was Built
+| Store | Client lib | Role | Why this one |
+|-------|-----------|------|--------------|
+| **PostgreSQL + PostGIS** (`postgis/postgis:16-3.4`) | `pg` | Source of truth: users, listings, `availability_blocks`, bookings, reviews, messages, sessions, `audit_logs` | ACID for booking correctness; `GEOGRAPHY(POINT,4326)` + GIST index gives `ST_DWithin` radius search in the same DB — no separate search index to keep in sync |
+| **Redis / Valkey** (`valkey/valkey:7-alpine`) | `redis` (node-redis v4) | Session cache, cache-aside for listing/availability/search, and queue-consumer idempotency (`processed:<eventId>` keys, 7-day TTL) | Sub-ms reads on the hot search/listing path; auto-expiring keys make dedup cheap |
+| **RabbitMQ** (`rabbitmq:3-management`) | `amqplib` | Topic exchange `airbnb.events` → background workers (booking, notification, analytics), with a dead-letter exchange | Decouples booking latency from notification/analytics work; DLQ + at-least-once + idempotent consumers give reliable async delivery |
 
-**Backend (Node.js + Express)**
-- Session-based authentication with Redis caching
-- Listings API with photo uploads and availability management
-- Geographic search using PostGIS ST_DWithin queries
-- Booking system with transaction-based double-booking prevention
-- Two-sided reviews with automatic visibility on both submissions
-- Real-time messaging between hosts and guests
+Photos are uploaded via **multer to local disk** (`./uploads`, served statically) — there is no MinIO/S3 locally. Auth is **session-based** (bcryptjs hashes, Redis-cached sessions with a PostgreSQL `sessions` backup), not JWT. The backend is a single Express monolith with route-based separation (`auth`, `listings`, `search`, `bookings`, `reviews`, `messages`); the frontend is React 19 + TanStack Router + Zustand + Tailwind (no charting/map libraries).
 
-**Frontend (React + TypeScript)**
-- Home page with featured listings
-- Search page with filters (price, amenities, property type)
-- Listing detail page with booking widget
-- Calendar component for date selection
-- Host dashboard for managing listings and reservations
-- Guest trips page
-- Messaging interface
+## Key Design Decisions
 
-**Database (PostgreSQL + PostGIS)**
-- Users, listings, bookings, reviews, messages tables
-- Availability blocks stored as date ranges (not day-by-day)
-- GIST spatial index on listings.location
-- Triggers for automatic review visibility and rating updates
+### 1. Date-range `availability_blocks`, not day-by-day rows
+Availability is stored as `(start_date, end_date, status)` ranges and queried with the PostgreSQL `OVERLAPS` operator. Day-by-day rows would be ~10M listings × 365 = billions of rows; ranges cut that ~18×. **Trade-off given up:** updating a partial range (host blocks 3 nights inside an open month) requires split/merge logic in `listings.ts` rather than a trivial per-day flip.
 
----
+### 2. Pessimistic locking (`SELECT … FOR UPDATE`) for booking correctness
+`POST /api/bookings` opens a transaction, locks the listing row with `FOR UPDATE`, re-checks for `booked`/`blocked` overlaps *inside* the lock, then inserts the booking and its availability block atomically. This makes the check-then-write race impossible: a concurrent second booking blocks on the row lock and then sees the conflict. **Trade-off given up:** all booking attempts for one hot listing serialize through its row lock — acceptable because contention per *single* listing is low (unlike a flash sale on one SKU), and it buys a dead-simple correctness proof versus optimistic-locking retry loops.
 
-## Key Challenges to Explore
+### 3. PostGIS as the primary search engine (locally), Elasticsearch only in the production design
+Search runs `ST_DWithin` against the GIST index with faceted filters (price, property/room type, amenities `@>`, guest count, bed counts) plus an availability `NOT IN (overlapping blocks)` sub-select, all in one SQL query. Keeping search in Postgres means zero index-sync machinery. **Trade-off given up:** no real full-text relevance (location autocomplete is `ILIKE`), and a single Postgres instance caps search throughput — `architecture.md` documents Elasticsearch + CDC as the production path when that ceiling is hit.
 
-### 1. Calendar Complexity
+### 4. Mutual-reveal reviews enforced by a DB trigger
+Both a guest and host review are inserted with `is_public = FALSE`; a trigger flips both to public only once both `author_type`s exist for the booking, and a second trigger recomputes the listing's denormalized `rating`/`review_count`. Putting this in the database, not app code, means no request path can accidentally leak one side's review early. **Trade-off given up:** there is no 14-day auto-publish for a single-sided review (a real Airbnb rule), so a one-sided review stays hidden forever here.
 
-**Challenge**: Hosts have complex availability patterns
+### 5. Best-effort async, correctness-first sync
+The booking commit is the source of truth; publishing the `booking.created` event to RabbitMQ is wrapped in try/catch so a queue outage **never** fails a booking. Consumers dedup on Redis `processed:<eventId>` and nack-to-DLQ after retries. **Trade-off given up:** notifications/analytics are eventually consistent and can lag or be dropped if the queue is down — deliberately, because a guest's reservation must not hinge on the notification pipeline.
 
-**Patterns to Handle:**
-- Blocked dates (not available)
-- Custom pricing (weekends, holidays)
-- Minimum stay requirements
-- Gap nights (fill short gaps)
+### 6. Circuit breaker (Opossum) on the search path
+Search and availability calls run through Opossum breakers that fail fast and return a fallback (empty results / assume-unavailable) when Postgres is degraded, instead of piling up slow queries. **Trade-off given up:** during an open breaker the UI shows degraded/empty results rather than accurate ones — chosen so one slow dependency can't cascade into a full outage.
 
-**Solution Implemented:**
-- Date ranges stored as `availability_blocks` table
-- Overlap detection using PostgreSQL OVERLAPS operator
-- Split/merge logic when updating ranges
+## Current State
 
-### 2. Search Ranking
+**Implemented end to end:** session auth + become-host flow; listing CRUD with multer photo upload and split/merge availability editing; PostGIS faceted search with result caching + circuit breaker; location autocomplete (`/api/search/suggest`) and popular destinations; booking with `FOR UPDATE` double-booking prevention, instant-book vs request-to-book, host confirm/decline, cancellation with date release, completion; two-sided mutual-reveal reviews with trigger-driven rating rollups; host↔guest messaging (HTTP polling); RabbitMQ workers (booking/notification/analytics) with DLQ + idempotency; full observability (Prometheus metrics, Pino logs, `audit_logs`, `/health` `/ready` `/live` `/metrics`).
 
-**Factors:**
-- Location relevance (distance to search center)
-- Price (within budget)
-- Quality (ratings, reviews)
-- Availability (matching dates)
-- Host responsiveness
+**Intentionally omitted (documented in `architecture.md` Layer 2):** payments/Stripe (prices computed, never charged), Elasticsearch, S3 + CDN + image pipeline, WebSocket real-time messaging, ML smart pricing, request rate limiting, single-sided review auto-publish window, and an admin UI (the `requireAdmin`/`role` plumbing exists but no dashboard).
 
-**Solution Implemented:**
-- PostGIS for geographic queries with ST_DWithin
-- Combined filtering: geo + availability + amenities
-- Sorting by relevance, price, rating, or distance
+## Iteration & Repair Log
 
-### 3. Instant Book vs Request
+- **2026-07-13 (search silently ignored the destination):** `SearchBar.handleSearch()` set only the free-text location with no coordinates, but `/api/search` filters geographically on `latitude`/`longitude`. With no coords the backend applied no location predicate, so "San Francisco" returned *every* listing — the search box looked broken. The backend already had `/api/search/suggest` (city→lat/lng) that the UI never called. Fixed by wiring the search bar to it: debounced autocomplete, selection sets lat/lng in `searchStore`, and free text submitted without a pick is geocoded on submit; unresolvable destinations set `locationUnresolved` so the results page says "We couldn't find X" instead of listing everything. Verified: SF search returns 1 SF listing (was: all 5).
+- **2026-07-13 (screenshot login / seed password):** the screenshot config authenticated as `guest1@example.com`; that user *is* seeded (`src/seed.ts`), but seeded password hashes across the repo were normalized to the shared `password123`. Confirmed the five seeded logins (`host1`/`host2`/`guest1`/`guest2`/`admin@example.com`) all use `password123`, matching the README credentials table.
 
-**Trade-off:**
-- Instant: Better conversion, less host control
-- Request: Host screening, slower booking
+## Open Questions
 
-**Solution Implemented:**
-- `instant_book` flag on listings
-- Instant book creates confirmed booking immediately
-- Request flow creates pending booking awaiting host response
-
-### 4. Double-Booking Prevention
-
-**Solution Implemented:**
-- Database transaction with FOR UPDATE row lock
-- Availability check within transaction
-- Availability block inserted atomically with booking
-
----
-
-## Development Phases
-
-### Phase 1: Listings - COMPLETED
-- [x] Property CRUD
-- [x] Photo upload
-- [x] Basic availability
-
-### Phase 2: Search - IN PROGRESS
-- [x] PostGIS setup
-- [x] Radius search
-- [x] Availability filtering
-- [ ] Full-text search on descriptions
-- [ ] Search result caching
-
-### Phase 3: Booking - COMPLETED
-- [x] Booking workflow
-- [x] Double-booking prevention
-- [x] Cancellation handling
-- [ ] Payment integration (simulated)
-
-### Phase 4: Trust - COMPLETED
-- [x] Two-sided reviews
-- [x] Rating aggregation
-- [ ] Verification badges (UI only)
-
----
-
-## Design Decisions
-
-### 1. Date Ranges vs Day-by-Day
-
-**Chose: Date Ranges**
-
-Rationale:
-- 10M listings x 365 days = 3.65B rows for day-by-day
-- Date ranges: ~200M rows (18x reduction)
-- PostgreSQL OVERLAPS operator handles range queries efficiently
-
-### 2. PostGIS vs Elasticsearch for Geo
-
-**Chose: PostGIS**
-
-Rationale:
-- Keeps all data in single database
-- No sync complexity
-- PostGIS GIST index very efficient for radius queries
-- Would add Elasticsearch if needed full-text search
-
-### 3. Session-based Auth vs JWT
-
-**Chose: Session-based with Redis**
-
-Rationale:
-- Simpler for learning project
-- Easy session invalidation
-- Redis provides fast lookups
-- PostgreSQL backup for persistence
-
----
-
-## Future Improvements
-
-1. **Elasticsearch integration** for full-text search
-2. **Dynamic pricing** based on demand
-3. **Real-time notifications** with WebSockets
-4. **Image optimization** and CDN
-5. **Admin dashboard** for moderation
-6. **Load testing** with multiple instances
-
----
+1. Pessimistic `FOR UPDATE` is correct but serializes per-listing writes — at what booking-concurrency per listing (or once a payment-authorize step is added mid-transaction) does this need to become optimistic locking or a short-lived Redis reservation lock?
+2. Availability is filtered in-query with `NOT IN (overlapping blocks)` sub-selects; at what listing/booking volume does this need the Elasticsearch 365-day bitmap the production doc describes, and how would CDC keep it consistent with the `FOR UPDATE` write path?
+3. The mutual-reveal trigger never auto-publishes a single-sided review. Adding the 14-day window means a scheduled job — worker cron, or a Postgres `pg_cron`-style task? Which keeps the trigger invariant intact?
+4. Cache invalidation on booking wipes all search-result caches for simplicity. What is the right key granularity (by geo tile? by listing?) before that becomes a thundering-herd problem?
 
 ## Resources
 
-- [Airbnb Engineering Blog](https://medium.com/airbnb-engineering)
-- [PostGIS Documentation](https://postgis.net/documentation/)
-- [Two-Sided Marketplace Design](https://a16z.com/2015/01/22/marketplace-strategies-for-finding-liquidity/)
-
----
-
-## Repair Log (2026-07-13)
-
-Runtime verification (screenshot harness + live API probing) surfaced two defects:
-
-1. **Search silently ignored the destination.** `SearchBar.handleSearch()` called `setLocation(text)` with no coordinates, but `/api/search` filters geographically on `latitude`/`longitude`. With no coords the backend applied no location predicate, so searching "San Francisco" returned *every* listing — the search box appeared to do nothing. The backend already exposed a geocoding endpoint (`/api/search/suggest`) that the UI never called. Fixed by wiring the search bar to it: debounced autocomplete dropdown, selection sets lat/lng in the store, and free text typed without picking a suggestion is geocoded on submit. Unresolvable destinations now set `locationUnresolved` so the results page shows "We couldn't find X" instead of silently listing everything. Verified: SF search returns 1 SF listing (was: all 5).
-
-2. **Screenshot login failed** — the screenshot config pointed at `guest1@example.com`, a user the seed never creates. Repointed to a seeded user; seeded password hashes across the repo were normalized to `password123`.
+- [PostGIS Documentation](https://postgis.net/documentation/) — `ST_DWithin`, GIST indexing
+- [Airbnb: Avoiding Double Payments in a Distributed Payments System](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) — idempotency the production design would extend into payments
+- [Listing Search Ranking at Airbnb](https://medium.com/airbnb-engineering/listing-search-ranking-at-airbnb-4ab8ec5d76fb) — the ML ranking layer deliberately out of scope here

@@ -372,9 +372,9 @@ Exponential backoff for failed operations: 100ms initial delay, 5s max, 3 attemp
 
 ## Security and Auth
 
-- **Session-based authentication** via express-session
-- **CORS** restricted to frontend origin
-- **File permissions** table with view/edit/admin levels per user per file
+- **Session-based authentication** (production design) — at scale, an authenticated session validated on connect scopes every file/WebSocket action to a real user. In the local build this is **not yet wired**: `express-session` is present as a dependency but unused, REST routes act as a fixed demo user (`00000000-0000-0000-0000-000000000001`), and the WebSocket handler trusts the `userId`/`userName` supplied in the `subscribe` payload. Wiring session validation on connect is the first hardening step.
+- **CORS** restricted to frontend origin (`FRONTEND_URL`, default `http://localhost:5173`), credentials enabled
+- **File permissions** table with view/edit/admin levels per user per file — schema and API are designed for this, but enforcement middleware is not implemented in the local build (see RBAC deep dive)
 - **Parameterized SQL** via the pg library
 - **JSON body size limit** of 10MB to prevent abuse
 
@@ -667,7 +667,7 @@ This section explains each production-grade pattern implemented in the backend, 
 
 **Why it matters**: Loading a design file involves reading the `files` row (including the `canvas_data` JSONB blob, which can be hundreds of KB for complex designs) and joining with permissions and team membership. This is a heavy query. When 50 users are collaborating on the same file, each WebSocket reconnection triggers a full file load. Caching the file data in Redis reduces this from a ~50ms database query to a ~2ms cache read.
 
-**How it works in this project**: While the project does not implement a general-purpose cache-aside layer, it uses Redis for specific caching patterns: session data is stored in Redis for fast validation on every WebSocket message, presence data (cursor positions, selections) is stored exclusively in Redis (never hitting PostgreSQL), and idempotency keys are cached in Redis with 5-minute TTLs. The architecture notes indicate that a full cache-aside layer for file metadata and canvas data would be the next scaling step, with invalidation triggered by any write operation.
+**How it works in this project**: While the project does not implement a general-purpose cache-aside layer, it uses Redis (Valkey) for specific patterns: presence data (cursor positions, selections) is stored exclusively in Redis with a 30-second TTL (never hitting PostgreSQL), a dedicated publisher/subscriber pair (`redisPub`/`redisSub`) carries presence updates on `presence:<fileId>` channels for cross-server sync, and idempotency keys are cached in Redis. The architecture notes indicate that a full cache-aside layer for file metadata and canvas data would be the next scaling step, with invalidation triggered by any write operation.
 
 ### RBAC (Role-Based Access Control)
 
