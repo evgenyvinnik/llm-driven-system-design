@@ -11,9 +11,9 @@
 
 INSERT INTO users (id, email, password_hash, role, tier) VALUES
   ('00000000-0000-0000-0000-000000000001', 'admin@example.com',
-   '240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9', 'admin', 'enterprise'),
+   'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'admin', 'enterprise'),
   ('00000000-0000-0000-0000-000000000002', 'user@example.com',
-   'e606e38b0d8c19b24cf0ee3808183162ea7cd63ff7912dbb22b5e803286b4446', 'user', 'free'),
+   'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'user', 'free'),
   ('00000000-0000-0000-0000-000000000003', 'alice@example.com',
    'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'admin', 'enterprise'),
   ('00000000-0000-0000-0000-000000000004', 'bob@example.com',

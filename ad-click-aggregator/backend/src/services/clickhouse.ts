@@ -4,6 +4,8 @@
  * ClickHouse handles click event storage and auto-aggregation via materialized views.
  */
 
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { createClient, ClickHouseClient, ClickHouseLogLevel } from '@clickhouse/client';
 import { logger } from '../shared/logger.js';
 
@@ -47,6 +49,25 @@ export async function initClickHouse(): Promise<void> {
       log.info({ host: CLICKHOUSE_CONFIG.host }, 'ClickHouse connected successfully');
     } else {
       throw new Error('ClickHouse ping failed');
+    }
+
+    // Apply schema on boot. The docker-entrypoint-initdb.d mount only runs on a
+    // fresh volume, so a persisted (or partially-initialized) volume can leave
+    // the tables/materialized views missing. The schema is idempotent
+    // (CREATE ... IF NOT EXISTS), so re-running it every boot is safe and
+    // self-healing.
+    try {
+      const schemaPath = join(__dirname, '../../db/clickhouse-init.sql');
+      const schema = readFileSync(schemaPath, 'utf-8');
+      for (const stmt of schema.split(';')) {
+        const query = stmt.trim();
+        if (query) {
+          await client.command({ query });
+        }
+      }
+      log.info('ClickHouse schema ensured');
+    } catch (schemaError) {
+      log.error({ error: schemaError }, 'Failed to apply ClickHouse schema');
     }
   } catch (error) {
     log.error({ error }, 'Failed to connect to ClickHouse');
