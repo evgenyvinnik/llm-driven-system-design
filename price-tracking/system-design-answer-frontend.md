@@ -627,33 +627,7 @@ MOBILE (< 640px)                    TABLET (640-1023px)
 
 ### Mobile-First Approach
 
-```
-Base styles (mobile)
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  .product-grid {                                              │
-│    display: grid;                                             │
-│    grid-template-columns: 1fr;    ← Single column default    │
-│  }                                                            │
-└──────────────────────────────────────────────────────────────┘
-       │
-       │ @media (min-width: 640px)
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  .product-grid {                                              │
-│    grid-template-columns: 1fr 1fr;  ← Two columns on tablet  │
-│  }                                                            │
-└──────────────────────────────────────────────────────────────┘
-       │
-       │ @media (min-width: 1024px)
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  .product-grid {                                              │
-│    grid-template-columns: 1fr 2fr;  ← Sidebar + main area    │
-│  }                                                            │
-└──────────────────────────────────────────────────────────────┘
-```
+CSS is authored mobile-first: the base `.product-grid` is a single-column grid, and `min-width` media queries progressively add columns (two at ~640px, a sidebar+main ratio at ~1024px). Starting from the constrained layout and adding space as it becomes available is more robust than starting wide and clawing columns back — the default state is the one that always works.
 
 ---
 

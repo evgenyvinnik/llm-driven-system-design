@@ -82,8 +82,13 @@ This starts:
 ```bash
 cd backend
 npm install
-npm run seed    # Creates tables and seed data
-npm run dev     # Starts server on port 3001
+npm run db:migrate   # Creates tables (idempotent)
+npm run seed         # Seeds catalog + demo user
+npm run dev          # Starts API server on port 3001
+
+# In a second terminal, run the Kafka consumer that turns playback
+# events into stream counts, listening stats, and taste profiles:
+npm run dev:worker
 ```
 
 ### 3. Setup Frontend
@@ -115,12 +120,14 @@ spotify/
 │   ├── src/
 │   │   ├── routes/          # API route handlers
 │   │   ├── services/        # Business logic
-│   │   ├── models/          # Database migrations
+│   │   ├── models/          # Database migrations (schema)
 │   │   ├── middleware/      # Auth middleware
-│   │   ├── db.js            # Database connections
-│   │   ├── storage.js       # MinIO client
-│   │   ├── index.js         # Express server
-│   │   └── seed.js          # Sample data seeding
+│   │   ├── shared/          # kafka, idempotency, rateLimit, metrics, logger, audit
+│   │   ├── workers/         # analytics-worker (Kafka consumer)
+│   │   ├── db.ts            # Postgres connection pool
+│   │   ├── storage.ts       # MinIO client
+│   │   ├── index.ts         # Express server
+│   │   └── seed.ts          # Sample data seeding
 │   └── package.json
 ├── frontend/
 │   ├── src/
