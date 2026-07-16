@@ -1,168 +1,69 @@
-# Design Kindle Community Highlights - Development with Claude
+# Kindle Community Highlights — Development with Claude
 
 ## Project Context
 
-Building a social reading platform to understand real-time sync, large-scale aggregation, and privacy-preserving social features.
+A social reading platform modeled on Kindle's "Popular Highlights": readers highlight passages, sync them across devices, and see aggregated community highlights ("N readers highlighted this") without exposing who highlighted what. Three tensions make it interesting: **cross-device sync** must feel instant (<2s) over flaky mobile links, **community aggregation** must count highlights across millions of readers without a contended write on every save, and **privacy** must let people opt highlights out of the community count entirely.
 
-**Key Learning Goals:**
-- Build real-time sync across devices
-- Design aggregation at scale (billions of highlights)
-- Implement privacy-preserving community features
-- Handle offline-first architecture
+**Learning goals:** WebSocket sync with offline queueing and last-write-wins conflict resolution, write-optimized aggregation (Redis counters flushed to Postgres), and per-record privacy that gates what enters an aggregate.
 
----
+## Architecture at a Glance (what actually runs)
 
-## Implementation Status
+Two datastores and four HTTP services plus a worker — this matches `docker-compose.yml` (only Postgres + Redis) and `backend/package.json`:
 
-### Phase 1: Core Highlights ✅
-- [x] Highlight CRUD operations
-- [x] PostgreSQL storage with migrations
-- [x] Basic sync protocol (WebSocket)
-- [x] Personal library view
+| Component | Tech | Role |
+|-----------|------|------|
+| **PostgreSQL 16** (`pg`) | Source of truth | `users`, `books`, `user_books`, `highlights`, `deleted_highlights` (tombstones), `popular_highlights` (aggregates), `follows`, `user_privacy_settings`, `sessions` |
+| **Redis / Valkey 7** (`redis` / node-redis v4) | Hot path | Session cache, per-book highlight counters (`book:*:highlights` hashes), offline sync queues, popular-highlights cache |
+| **Highlight service** | Express 5 (port 3001*) | CRUD, keyword search, export (Markdown/CSV/JSON), library view |
+| **Sync service** | `ws` WebSocket (port 3002) | Device connection registry, real-time push, offline queue, conflict resolution |
+| **Aggregation service** | Express 5 (port 3003) | Popular / trending / heatmap read APIs |
+| **Social service** | Express 5 (port 3004) | Auth (register/login/session), follow/unfollow, share, privacy settings |
+| **Aggregation worker** | Node loop | Every 60s: flush Redis counters → `popular_highlights`; hourly cleanup of zero-count passages |
 
-### Phase 2: Sync ✅
-- [x] WebSocket server with connection management
-- [x] Conflict resolution via timestamps
-- [x] Offline queue in Redis
-- [x] Multi-device sync events
+Frontend: React + TanStack Router (file-based) + Zustand, talking to services through a Vite `/api` proxy. Auth is a session token (`Authorization: Bearer <sessionId>`) hashed with **sha256** (not bcrypt) — fine for a learning build, not production password storage.
 
-### Phase 3: Community ✅
-- [x] Popular highlights aggregation
-- [x] Privacy settings (public/friends/private)
-- [x] Social features (follow, share)
-- [x] Export functionality (Markdown, CSV, JSON)
+> *The highlight service's code default is `HIGHLIGHT_PORT || 3000`, but the frontend Vite proxy and the README both expect **3001**. Run it with `HIGHLIGHT_PORT=3001` (or via the documented env) so `/api/highlights` resolves — see Open Questions.
 
-### Phase 4: Scale ✅
-- [x] Redis caching for popular highlights
-- [x] Batch aggregation worker job
-- [x] PostgreSQL full-text search (Elasticsearch optional)
-- [x] Connection pooling and query optimization
+## Key Design Decisions
 
----
+### 1. Redis counters flushed to Postgres, not per-save aggregate updates
+Creating a highlight does an O(1) Redis increment on a per-book passage counter; a background worker batches those counters into `popular_highlights` every 60 seconds (`ON CONFLICT … DO UPDATE`). Trade-off: popular counts are **eventually consistent** — a passage's community count lags by up to the aggregation interval plus the read-cache TTL. We accept that staleness because the alternative — a contended `UPDATE popular_highlights … SET count = count+1` on every save across millions of readers — serializes the write path on the hottest passages ("the one quote everyone highlights") and turns a fast save into a lock-wait.
 
-## Key Challenges Explored
+### 2. Passage normalization into location windows
+Highlights rarely start and end on the exact same character, so raw location ranges would never group. Highlights are bucketed into normalized location windows (a `passage_id` derived from the range) so near-identical selections collapse into one community passage. Trade-off: window size is a precision knob — too wide merges distinct sentences, too narrow fragments the same quote into several low-count passages. The chosen window trades some boundary precision for meaningful grouping.
 
-### 1. Real-time Sync
+### 3. WebSocket push + Redis offline queue for sync
+Connected devices get an immediate push over a persistent `ws` connection; devices that are offline have events parked in a Redis queue and drained on reconnect. Conflicts use last-write-wins by timestamp, and deletes are propagated via a `deleted_highlights` tombstone table so a delete on one device reaches devices that were offline when it happened. Trade-off vs. HTTP polling: WebSocket hits the <2s target with zero idle-poll traffic, but connections are stateful — they need a connection registry and, at scale, sticky routing or a shared registry. Trade-off of LWW vs. CRDT: LWW can silently drop a concurrent edit (last writer wins), which we accept because a highlight is a small, rarely-co-edited object; a CRDT would be correct but is far more machinery than the payoff here.
 
-**Challenge**: Propagate highlights across devices in < 2 seconds
+### 4. Privacy gates entry into the aggregate
+Each highlight has `visibility` (private/friends/public) and each user has `user_privacy_settings.include_in_aggregation`. The worker's sample query only pulls non-private highlights, and only opted-in users contribute to counts. Trade-off: the community view is intentionally incomplete (it under-counts by however many readers opted out) in exchange for never revealing an individual's private highlights.
 
-**Implementation:**
-- WebSocket persistent connections via `ws` library
-- Device connection registry in memory + Redis for state
-- Push sync events to all connected devices
-- Offline queue persisted in Redis (30-day TTL)
-- Last-write-wins conflict resolution using timestamps
+### 5. ILIKE search locally, Elasticsearch as the production path
+Keyword search is a case-insensitive `ILIKE` on `highlighted_text`/`note`. Trade-off: ILIKE needs no extra infrastructure and is fine at local scale, but it's a scan-heavy, index-unfriendly query that would fall over at production volume — the architecture doc names Elasticsearch as the scale-out replacement. There is **no** Elasticsearch container; it's a documented future component, not an "optional" running one.
 
-**Code Pattern:**
-```typescript
-// Sync Service broadcasts to all user devices
-async function pushHighlight(userId: string, event: SyncEvent) {
-  const devices = connections.get(userId)
-  for (const [deviceId, ws] of devices) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(event))
-    } else {
-      await queueForDevice(userId, deviceId, event)
-    }
-  }
-}
-```
+## Current State
 
-### 2. Aggregation at Scale
+Implemented and running end to end: highlight CRUD + colors + notes, keyword (ILIKE) search, export in three formats, personal library with per-book counts, WebSocket sync with offline queue and tombstone deletes, the Redis→Postgres aggregation worker, popular/trending/heatmap APIs, follow/unfollow and friends'-highlights, share, per-user privacy settings, sha256 session auth, and the React SPA (library, book detail, trending, export, login/register). Seed users: `alice@example.com`, `bob@example.com`, `charlie@example.com`, all `password123`.
 
-**Problem**: Count highlights across millions of readers efficiently
+Intentionally omitted (production concepts, not built locally): Elasticsearch search, a real on-device local store (the "SQLite" box in the architecture diagram is a client-device concept), CRDT conflict resolution (uses LWW), and request rate limiting.
 
-**Implementation:**
-- Redis hash counters for real-time increments
-- Passage normalization: 100-character windows for grouping
-- Background worker syncs Redis → PostgreSQL periodically
-- 5-minute cache TTL for popular highlights API
+## Iteration & Repair Log
 
-**Trade-off:** Eventual consistency (acceptable) for write performance
+- **DB migrate/seed scripts added.** `db:migrate` runs `src/db/init.sql` (idempotent `CREATE … IF NOT EXISTS`) and `db:seed` loads the three demo users + sample books/highlights. This was part of the repo-wide "missing schema-apply path" repair.
+- **Schema location corrected in docs.** The prior CLAUDE.md listed the schema as `src/db/migrations/001_initial_schema.sql`; the actual file is `src/db/init.sql`. Fixed here.
+- **Search description corrected.** Both this file and `architecture.md` described search as "PostgreSQL full-text search" and hinted "Elasticsearch optional." The code uses `ILIKE` substring matching and there is no Elasticsearch. Corrected to reflect ILIKE-now / Elasticsearch-at-scale.
+- **CLAUDE.md rewrite (this pass).** Replaced the Phase 1–4 ✅ checklist and "Files Created" inventory with architecture and decision rationale grounded in `aggregation/worker.ts`, `db/init.sql`, and the service entry points.
 
-### 3. Privacy
+## Open Questions
 
-**Challenge**: Show community data without exposing individuals
-
-**Implementation:**
-- Per-highlight visibility: `private`, `friends`, `public`
-- User privacy settings table with defaults
-- Aggregation only includes opted-in users
-- Friends' highlights require follow relationship
-
----
-
-## Architecture Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Sync Protocol | WebSocket | Low latency, bidirectional |
-| Aggregation Counter | Redis → PostgreSQL | Fast writes, durable reads |
-| Passage Grouping | 100-char windows | Balance precision vs. aggregation |
-| Auth | Session tokens in Redis | Simple, stateless services |
-| Frontend State | Zustand | Minimal boilerplate |
-| Routing | TanStack Router | Type-safe, file-based |
-
----
-
-## Files Created
-
-### Backend (`backend/`)
-- `src/shared/db.ts` - PostgreSQL connection pool
-- `src/shared/cache.ts` - Redis client
-- `src/shared/auth.ts` - Session middleware
-- `src/shared/logger.ts` - Pino structured logging
-- `src/highlight/app.ts` - CRUD, search, export
-- `src/sync/app.ts` - WebSocket sync
-- `src/aggregation/app.ts` - Popular highlights API
-- `src/aggregation/worker.ts` - Background aggregation job
-- `src/social/app.ts` - Auth, follow, share
-- `src/db/migrations/001_initial_schema.sql` - Database schema
-- `src/db/migrate.ts` - Migration runner
-- `src/db/seed.ts` - Demo data seeder
-
-### Frontend (`frontend/`)
-- `src/api/client.ts` - Typed API client
-- `src/stores/useStore.ts` - Zustand global state
-- `src/routes/__root.tsx` - Layout with navigation
-- `src/routes/index.tsx` - Landing page
-- `src/routes/login.tsx` - Login form
-- `src/routes/register.tsx` - Registration form
-- `src/routes/library.tsx` - User's books and highlights
-- `src/routes/books.$bookId.tsx` - Book detail with tabs
-- `src/routes/trending.tsx` - Trending highlights
-- `src/routes/export.tsx` - Export functionality
-
----
+1. **Highlight-service port footgun:** the code defaults to 3000 but the frontend proxy targets 3001. Should the default be changed to 3001 (source fix) so `npm run dev` works without setting `HIGHLIGHT_PORT`, or should the proxy move to 3000?
+2. **Aggregation cadence vs. freshness:** 60s + cache TTL is fine for "popular," but "trending" implies recency — does trending need a shorter window or a time-decayed counter rather than a raw count?
+3. **Tombstone growth:** `deleted_highlights` grows unbounded. When can a tombstone be reaped — after all a user's devices have acknowledged the delete?
+4. **Sync scale:** the in-memory connection registry is per-instance. Moving to multiple sync instances needs the registry (and fan-out) in Redis; what's the routing story for a user's devices landing on different instances?
 
 ## Resources
 
 - [Amazon Kindle Popular Highlights](https://www.amazon.com/gp/help/customer/display.html?nodeId=201630920)
-- [WebSocket Protocol](https://tools.ietf.org/html/rfc6455)
-- [Conflict-free Replicated Data Types](https://crdt.tech/)
-- [Local-First Software](https://www.inkandswitch.com/local-first/)
-- [Figma's Multiplayer Technology](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/)
-
----
-
-## Running the Project
-
-```bash
-# Start infrastructure
-docker-compose up -d
-
-# Backend
-cd backend
-npm install
-npm run db:migrate
-npm run db:seed
-npm run dev
-
-# Frontend (separate terminal)
-cd frontend
-npm install
-npm run dev
-```
-
-Frontend: http://localhost:5173
-Demo login: alice@example.com / password123
+- [Local-First Software](https://www.inkandswitch.com/local-first/) — offline-first and sync philosophy
+- [CRDTs](https://crdt.tech/) — the conflict-resolution path we deliberately did not take
+- [RFC 6455 — The WebSocket Protocol](https://tools.ietf.org/html/rfc6455)

@@ -83,8 +83,9 @@ npm install
 # Copy environment config
 cp .env.example .env
 
-# Run database migrations (auto-runs on first Docker start)
-npm run db:migrate
+# No migration step: the schema in backend/src/db/init.sql is applied
+# automatically by Postgres on first container start (mounted into
+# /docker-entrypoint-initdb.d). Recreate it with `docker-compose down -v`.
 
 # Start the server
 npm run dev

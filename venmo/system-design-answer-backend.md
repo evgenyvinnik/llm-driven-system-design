@@ -297,3 +297,5 @@ Every money movement writes an immutable audit entry (actor, action, resource, I
 If I had more time, the three threads I'd pull: **fraud and risk scoring** (velocity limits, device fingerprinting, social-graph anomaly detection — the ACH-return decision above is only survivable with this in place); **the reversal/dispute lifecycle** as a first-class state machine rather than manual ops; and **sharding the ledger**, where the interesting problem is cross-shard settlement without two-phase commit.
 
 The thing I'd want to leave the interviewer with: this system's design is driven almost entirely by *recognizing which half of it is a bank and which half is a social network*, and refusing to let either one's requirements contaminate the other.
+
+If forced to name the single load-bearing decision, it's the append-only double-entry ledger with a cached balance: it's what makes correctness *provable* (reconcile against history), *reversible* (compensating entries, never deletes), and *shardable later* (each side settles independently) — every other choice here is downstream of getting the ledger right.

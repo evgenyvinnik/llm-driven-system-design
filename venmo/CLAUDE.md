@@ -1,107 +1,62 @@
-# Design Venmo - Development with Claude
+# Venmo — P2P Payments — Development with Claude
 
 ## Project Context
 
-Building a peer-to-peer payment platform to understand wallet systems, social feeds, and instant money transfers.
+A peer-to-peer payment app with a social layer: send and request money, fund from a balance/bank/card waterfall, cash out, and see a friends' feed of transactions with notes, likes, and comments. The defining tension is that it's **two products with opposite consistency requirements bolted together** — the money movement demands strict serializability (a negative balance is a company-ending bug), while the social feed wants cheap, eventually-consistent reads at high fan-out.
 
-**Key Learning Goals:**
-- Build consistent wallet balance systems
-- Design real-time P2P transfer flows
-- Implement social transaction feeds
-- Handle multi-source funding waterfall
+**Learning goals:** atomic wallet transfers under concurrency, idempotency for retried money operations, a multi-source funding waterfall, and fan-out-on-write social feeds — all on a single relational store.
 
----
+## Architecture at a Glance (what actually runs)
 
-## Key Challenges to Explore
+Matches `docker-compose.yml` (two services) and `backend/package.json` — no queue, no WebSocket:
 
-### 1. Balance Consistency
+| Store | Client | Role | Why this one |
+|-------|--------|------|--------------|
+| **PostgreSQL 16** | `pg` | Everything durable: wallets, transfers, requests, cashouts, feed_items, friendships, likes/comments, audit_log | One ACID store makes the locked-transfer + same-transaction fan-out easy to reason about |
+| **Redis / Valkey** | `ioredis` | Session store, balance cache, idempotency fast-path | Sub-ms revocable sessions; cache the balance so reads don't fold the ledger |
 
-**Challenge**: Prevent negative balances and double-spends
+**Money is integer cents** everywhere (`wallets.balance`, `transfers.amount`) — never floats. Single Express API (`backend/src/index.ts`) with routes `auth`, `transfers`, `requests`, `wallet`, `paymentMethods`, `friends`, `feed`. Shared modules under `backend/src/shared/`: `idempotency`, `audit`, `circuit-breaker` (hand-rolled, not Opossum), `retry`, `metrics` (prom-client), `logger` (pino), `archival`. **Frontend:** React 19 + TanStack Router + Zustand, routes for pay / request / wallet / profile / feed.
 
-**Approaches:**
-- Row-level locking (SELECT FOR UPDATE)
-- Optimistic locking with version numbers
-- Serializable transactions
-- Event sourcing with projections
+## Key Design Decisions
 
-**Implemented**: Row-level locking with PostgreSQL transactions. The `transfer.js` service uses `SELECT FOR UPDATE` to lock wallet rows during transfers.
+### 1. Pessimistic row locking on wallets, not optimistic versioning
+`executeTransfer` runs inside a `transaction()` and takes `SELECT … FOR UPDATE` on the sender's (and receiver's) wallet before touching balances. Contention here is *per-sender* — a user's own concurrent sends are exactly the double-spend case that must be serialized anyway — so there's no parallelism for optimistic locking to preserve, and the correctness argument becomes trivial: the DB won't let two transactions hold the same wallet row. Trade-off: a hot receiver (a business taking thousands of payments) serializes on its row; the production fix is lock-free append-only credits with an async-materialized balance.
 
-### 2. Feed Performance
+### 2. Two-layer idempotency (Redis fast-path + DB unique index)
+Every transfer carries an idempotency key. The DB has a `UNIQUE (sender_id, idempotency_key)` index and `executeTransfer` also re-checks for an existing transfer *inside the transaction*, returning the cached row (`_cached: true`) on a hit. The shared Redis idempotency module catches most retries before any DB work. Trade-off: the two layers fail differently on purpose — Redis is fast but ephemeral, the unique index is the durable backstop when Redis is cold.
 
-**Problem**: Generating feeds for millions of users
+### 3. Funding waterfall, computed inside the lock
+`determineFunding` resolves the source in priority order: balance → default verified bank → any verified bank → verified card, running while the wallet row is locked so the decision can't race a concurrent debit. Notably the sender is debited only for the *balance* portion while the receiver is credited the full amount — external (bank/card) money is simulated as entering from outside. Trade-off: crediting before ACH settles is a credit-risk decision, not just routing; the app accepts it (as real Venmo does) rather than holding funds for days.
 
-**Solutions:**
-- Fan-out on write (precompute feeds)
-- Fan-in on read (query on demand)
-- Hybrid (hot users fan-out, cold users fan-in)
-- Time-windowed caching
+### 4. Fan-out on write to `feed_items`, after commit
+When a transfer completes, `fanOutToFeed` inserts feed rows for the sender, receiver, and the accepted-friends of both (private transfers go only to the two participants). This works precisely because Venmo is a **friend graph, not a follower graph** — fan-out is bounded, so the pattern that kills Twitter can't occur. Trade-off: privacy is resolved at fan-out time (one decision point, read path can't leak), so a later public→private edit isn't retroactive without a tombstone check. Fan-out failure is caught and logged, never rolls back the money.
 
-**Implemented**: Fan-out on write. When a transaction occurs, feed items are inserted for the sender, receiver, and all their friends.
+### 5. Append-only audit log for compliance
+Every money movement writes an immutable `audit_log` entry (`audit.ts`: actor, action, resource, IP, request ID, outcome). Holding balances makes this a regulatory requirement, not a nicety. Trade-off: extra write per transfer, justified by money-transmitter obligations.
 
-### 3. Fraud Detection
+## Current State
 
-**Challenge**: Detect account takeover and money laundering
+Implemented end to end: session auth (Redis, 24h TTL) with a payment PIN hash, atomic P2P transfers with locking + idempotency + funding waterfall, money requests with approve/decline that execute as a real transfer (linked via `transfers.id`), instant/standard cashout, payment-method linking (stored as tokens / encrypted, last-4 surfaced), friendships, the social feed via fan-out-on-write with public/friends/private visibility, likes and comments, balance-cache invalidation, a hand-rolled circuit breaker around external calls, retry helper, Prometheus metrics, pino logging, and the audit log.
 
-**Solutions:**
-- Velocity limits per user/device
-- Unusual activity detection
-- Social graph analysis
-- Device fingerprinting
+Schema-present but not wired as features: **bill splitting** (`splits` / `split_participants` tables exist, no route yet). Intentionally omitted: fraud/velocity scoring, recurring payments, QR-code pay, real ACH/card integration, and any message queue (fan-out is synchronous within the request in local scale).
 
-**Status**: Not yet implemented - future enhancement.
+## Iteration & Repair Log
 
----
+- **DB migrate + seed path** (`backend/src/db/migrate.ts`, `seed.ts`, `db-seed/seed.sql`): schema applies via `npm run db:migrate` and demo users via `npm run seed`; docker-compose runs Postgres + Valkey only.
+- **Seed password normalization (repo-wide):** demo users `alice / bob / charlie / diana / admin` all log in with **`password123`**; README table matches. `bcryptjs` is the verify path (not native `bcrypt`).
+- **Answer-file depth pass:** `system-design-answer-backend.md` was ~232 lines (under the 300 floor); added grounded sections for the request/approval and cashout flows, security/auth, capacity estimation, an exactly-once recap, and a metrics table to bring it into range without diluting the existing (strong) deep dives.
+- **Doc drift fixes (this pass):** the old CLAUDE.md used banned Phase-1/2/3/4 checklists and referred to `transfer.js` — the code is TypeScript (`backend/src/services/transfer.ts`). Rewritten to real architecture + decisions; file references corrected. Verified `architecture.md` already frames RabbitMQ/Cassandra correctly as *production* extensions while the local build does synchronous Postgres fan-out — left as-is.
+- **CI note (repo-wide):** the GitHub Actions smoke-test workflow was removed; don't treat it as active.
 
-## Development Phases
+## Open Questions
 
-### Phase 1: Core Transfers - COMPLETED
-- [x] User wallets
-- [x] P2P transfer flow
-- [x] Transaction history
-- [x] Basic notifications (in-app)
-
-### Phase 2: Social Features - IN PROGRESS
-- [x] Friend connections
-- [x] Social feed
-- [x] Privacy settings (public/friends/private)
-- [x] Comments/likes
-
-### Phase 3: Funding Sources - COMPLETED
-- [x] Bank account linking (simulated)
-- [x] Card payments (simulated)
-- [x] Funding waterfall
-- [x] Instant/standard cashout
-
-### Phase 4: Advanced Features - PARTIAL
-- [x] Payment requests
-- [ ] Bill splitting
-- [ ] Recurring payments
-- [ ] QR code payments
-
----
-
-## Implementation Notes
-
-### Transfer Service (`backend/src/services/transfer.js`)
-- Uses PostgreSQL transactions with `SELECT FOR UPDATE` locking
-- Implements funding waterfall: Balance -> Bank -> Card
-- Fan-out to social feed after commit
-- Balance cache invalidation via Redis
-
-### Feed System
-- Fan-out on write to `feed_items` table
-- Visibility filtering: public, friends, private
-- Hydrated with user data on read
-
-### Authentication
-- Session-based auth stored in Redis
-- 24-hour session TTL
-- Simple role-based access (user/admin)
-
----
+1. Wallet locks serialize a hot receiver — at what payments-per-second on one account do we need lock-free append-only credits with an async-materialized balance?
+2. External funding credits the receiver before ACH settles. Without fraud/velocity scoring in place, what trust threshold should gate fronting money vs. forcing instant card funding?
+3. `feed_items` grows ~400 rows per public transfer. At what row count does time-partitioning + TTL stop being enough and the Cassandra migration become mandatory?
+4. Bill splitting has tables but no route — should a split be modeled as N linked payment requests, or its own settlement state machine?
 
 ## Resources
 
-- [PayPal/Venmo Engineering Blog](https://medium.com/paypal-tech)
-- [Building a Payment System](https://newsletter.pragmaticengineer.com/p/designing-a-payment-system)
-- [ACH Payment Processing](https://www.nacha.org/)
+- [Designing a Payment System (Pragmatic Engineer)](https://newsletter.pragmaticengineer.com/p/designing-a-payment-system)
+- [NACHA / ACH processing](https://www.nacha.org/) — the settlement semantics behind the funding waterfall's credit risk
+- [PayPal/Venmo engineering](https://medium.com/paypal-tech)

@@ -107,7 +107,7 @@ A social reading platform enabling users to highlight passages in books, sync hi
 
 ### Highlight Service
 
-Handles CRUD operations on highlights with full-text search and export.
+Handles CRUD operations on highlights with keyword search and export.
 
 **Create highlight flow**:
 1. Validate input (book exists, location range valid, color in palette)
@@ -118,7 +118,7 @@ Handles CRUD operations on highlights with full-text search and export.
 6. Store idempotency result in Redis (24-hour TTL)
 7. Push sync event to all user's other connected devices via Sync Service
 
-**Search**: PostgreSQL full-text search on `highlighted_text` and `note` fields. At production scale, an Elasticsearch cluster would handle search to avoid loading PostgreSQL with LIKE queries.
+**Search**: locally, a case-insensitive substring match (`ILIKE`) on the `highlighted_text` and `note` fields, always scoped to the requesting user's own highlights. At production scale this moves to an Elasticsearch cluster — `ILIKE` is scan-heavy and index-unfriendly, so it would overload PostgreSQL as highlight volume grows.
 
 **Export**: Generate Markdown, CSV, or JSON from a user's highlights, filtered by book, date range, or tag.
 
