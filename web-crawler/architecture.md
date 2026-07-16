@@ -306,11 +306,13 @@ Rate limiting uses Redis sliding window: ZREMRANGEBYSCORE to remove old entries,
 
 ## Key Design Decisions
 
-### 1. URL Frontier: PostgreSQL vs Kafka
+### 1. URL Frontier: hybrid Redis queue + PostgreSQL state (vs Kafka)
 
-**Chosen: PostgreSQL with indexed priority queue.** The frontier needs three operations: enqueue (INSERT), dequeue highest-priority eligible URL (SELECT ... FOR UPDATE SKIP LOCKED), and status update (UPDATE). PostgreSQL handles all three with ACID guarantees and queryable state. Kafka would provide higher throughput but loses queryability -- you cannot inspect or reprioritize URLs already in a Kafka topic, and frontier management (recover stale URLs, clear frontier, inspect queue) requires random access.
+**Chosen: Redis priority sorted-sets for the hot dequeue path, PostgreSQL for durable, queryable frontier state.** The frontier needs three things: fast "get the next highest-priority URL" (Redis), durable status tracking that survives a restart and is inspectable (PostgreSQL), and idempotent enqueue. The implementation splits them: `addUrl` inserts into `url_frontier` with `ON CONFLICT (url_hash) DO NOTHING` *and* pushes the URL hash onto one of three Redis sorted-sets (high/medium/low) keyed by insert time. `getNextUrl` pops candidates from Redis high→medium→low, loads the row from PostgreSQL, and flips its status to `in_progress`. Kafka would give higher throughput but loses queryability -- you cannot inspect, reprioritize, or recover stale URLs from a topic, and frontier management needs random access.
 
-**Trade-off acknowledged:** PostgreSQL becomes a bottleneck at >1,000 pages/second because the dequeue operation (`SELECT ... ORDER BY priority DESC, scheduled_at ASC ... FOR UPDATE SKIP LOCKED`) creates contention on the priority index. Production would partition the frontier by domain and use multiple PostgreSQL instances or switch to a dedicated distributed queue (Redis Streams or Kafka with a sidecar state store).
+**Why not pure PostgreSQL with `FOR UPDATE SKIP LOCKED`?** That's the textbook single-store answer and it works, but every dequeue then contends on the priority index under all workers at once. Putting the priority ordering in Redis sorted-sets keeps the hot path off the PostgreSQL index; PostgreSQL is consulted per-URL by primary/unique key (`url_hash`), which is cheap. The cost is that Redis and PostgreSQL can briefly disagree — a URL hash can sit in a Redis queue after its row already moved on — so `getNextUrl` re-checks `status = 'pending'` in PostgreSQL and drops stale queue entries.
+
+**Trade-off acknowledged:** the two stores are eventually consistent, and Redis is the volatile half — if Redis is flushed, the priority queues must be rebuilt from `url_frontier` (the durable source of truth). Worker exclusivity is *not* provided by a database row lock here; it comes from the per-domain Redis lock in Decision 3. Production would partition the frontier by domain across multiple queue shards.
 
 ### 2. URL Deduplication: Redis SET vs Bloom Filter
 
@@ -338,13 +340,13 @@ Crawl operations are inherently idempotent: fetching the same URL multiple times
 
 - **URL ingestion**: The `url_hash UNIQUE` constraint on url_frontier prevents duplicate URL insertions. `INSERT ... ON CONFLICT (url_hash) DO NOTHING` makes ingestion idempotent.
 - **Page metadata**: `url_hash UNIQUE` on crawled_pages with `ON CONFLICT DO UPDATE` ensures re-crawls update rather than duplicate.
-- **Worker claim**: `UPDATE url_frontier SET status='in_progress' WHERE id = (SELECT id FROM url_frontier WHERE status='pending' ORDER BY priority DESC LIMIT 1 FOR UPDATE SKIP LOCKED)` ensures exactly one worker claims each URL.
+- **Worker claim**: exactly-once claiming is enforced by the per-domain Redis lock (`SET domain:lock NX EX crawlDelay`), not a database row lock. A worker only crawls a domain if it wins that lock; it then marks the specific URL `in_progress` in `url_frontier`. Two workers can't hold the same domain's lock, so they can't crawl the same URL concurrently.
 
 ### Consistency Model
 
 | Entity | Consistency | Rationale |
 |--------|-------------|-----------|
-| URL frontier state | Strong (PostgreSQL FOR UPDATE) | Worker claims must be exclusive; double-crawling wastes resources |
+| URL frontier state | Durable in PostgreSQL; exclusivity via per-domain Redis lock | Worker claims must be exclusive; the domain lock (not a row lock) guarantees one crawler per domain |
 | Visited URLs (Redis SET) | Eventual (small duplicate window) | Brief period where two workers may crawl the same URL before SET is updated |
 | robots.txt cache | Eventual (1h TTL) | Stale robots.txt is acceptable; re-fetch hourly |
 | Circuit breaker state | Eventual (Redis, distributed) | Workers share domain failure state with seconds delay |

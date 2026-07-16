@@ -1,207 +1,66 @@
-# LeetCode - Online Judge - Development with Claude
+# LeetCode (Online Judge) — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing an online coding practice and evaluation platform.
+An online coding-practice platform: users pick a problem, write a solution in one of four languages, and get it run against hidden test cases with a verdict. The hard problem is **running untrusted code safely and at throughput** — every submission is arbitrary code that could loop forever, fork-bomb, or try to phone home. The whole design is organized around isolating that execution, failing fast when the executor is unhealthy, and keeping the rest of the API responsive while code runs.
 
-## Key Challenges to Explore
+**Learning goals:** sandboxed multi-language execution, protecting an expensive/fragile subsystem with circuit breakers + rate limits + idempotency, and offering both an in-process and a queue-decoupled execution path.
 
-1. Sandboxed code execution
-2. Multiple language support
-3. Resource limiting
-4. Plagiarism detection
+## Architecture at a Glance (what actually runs)
 
-## Development Phases
+Matches `docker-compose.yml` and `backend/package.json`:
 
-### Phase 1: Requirements and Design
-*Completed*
+| Component | Tech | Role |
+|-----------|------|------|
+| **PostgreSQL 16** (`pg`) | Source of truth | `users`, `problems`, `test_cases`, `submissions`, `user_problem_status` |
+| **Redis / Valkey 7** (`ioredis`) | Hot path | Sessions (`connect-redis`), submission-status cache for polling, idempotency keys, rate-limit counters, problem cache |
+| **Kafka + Zookeeper** (`kafkajs`) | Optional queue | `submissions` / `submission-results` topics — the decoupled execution path (opt-in via `USE_KAFKA_QUEUE=true`) |
+| **Code executor** | `dockerode` | Spawns a fresh, locked-down Docker container per run |
+| **Worker** (`src/worker`) | Kafka consumer | Consumes `submissions`, runs the executor, writes results — the horizontally-scalable execution tier |
 
-**Outcomes:**
-- Defined functional requirements: problem database, code submission, execution, test validation, leaderboards
-- Identified scale targets: support for concurrent users, multiple languages
-- Documented security requirements for sandboxed execution
-- See `system-design-answer-fullstack.md` for detailed architecture
+Languages (from `codeExecutor.ts`): **Python** (`python:3.11-alpine`), **JavaScript** (`node:20-alpine`), **C++** (`gcc:13`), **Java** (`openjdk:21-slim`) — each with its own compile/run command and time/memory limits. Frontend: React 19 + **react-router-dom v6** (code-based routing under `pages/`) + Zustand (`authStore`, `editorStore`), a CodeMirror editor (`@uiw/react-codemirror`), and a virtualized problem list (`@tanstack/react-virtual`).
 
-### Phase 2: Initial Implementation
-*Completed*
+## Key Design Decisions
 
-**Completed:**
-- Backend API with Express.js
-  - Authentication (register, login, logout, session management)
-  - Problems CRUD with caching
-  - Submissions with async processing
-  - User progress tracking
-  - Admin dashboard APIs
-- Database schema with PostgreSQL
-  - Users, Problems, TestCases, Submissions, UserProblemStatus tables
-  - Proper indexes for performance
-- Redis integration for sessions and caching
-- Code execution sandbox using Docker
-  - Security restrictions (no network, dropped capabilities, resource limits)
-  - Support for Python and JavaScript
-  - Output comparison with normalization
-- Frontend with React + TypeScript
-  - Problem catalog with filtering and virtualized list
-  - Code editor with syntax highlighting (CodeMirror)
-  - Real-time test results
-  - Submission status polling
-  - User progress dashboard
-  - Admin dashboard
-- Seed data with 15 problems covering various algorithm types:
-  - Easy: Two Sum, Palindrome Number, Valid Parentheses, Merge Two Sorted Lists, Reverse String, Climbing Stairs, Best Time to Buy and Sell Stock, Contains Duplicate, FizzBuzz, Binary Search
-  - Medium: Maximum Subarray, Longest Common Subsequence, Coin Change, Longest Substring Without Repeating Characters
-  - Hard: Median of Two Sorted Arrays
-- Multi-language support: Python, JavaScript, C++, Java
-- Kafka queue-based execution (optional, for production scale)
+### 1. A fresh, locked-down Docker container per submission (not gVisor/Firecracker/seccomp)
+`codeExecutor` uses `dockerode` to launch a container per run with `CapDrop: ALL`, `no-new-privileges`, no network, a read-only rootfs, tmpfs work dirs, and hard memory/pids/CPU limits. Trade-off: Docker's namespace+cgroup isolation shares the host kernel, so a kernel-level exploit could in principle escape — gVisor or Firecracker add a stronger barrier. We accept that residual risk because gVisor breaks some Python/Node syscalls and Firecracker is AWS-specific and operationally heavy; for a learning judge, `dockerode`-managed containers give strong isolation with tooling that's easy to reason about. (A separate hardened `sandbox` image exists under a compose `profiles: [sandbox]` block as an alternative isolation approach; the default path spawns its own per-run containers.)
 
-### Phase 3: Scaling and Optimization
-*Completed*
+### 2. Circuit breaker around code execution
+Execution is wrapped in an Opossum breaker (opens at 50% error rate over 5+ requests, 30s reset). If the Docker daemon hangs or dies, the breaker trips and submissions fail fast with a 503 instead of piling up blocked requests. Trade-off: while open, some legitimate submissions are rejected — but the alternative (every request blocking on a dead daemon) takes the whole API down, and problem browsing/auth stay healthy because only the execution call is behind the breaker.
 
-**Implemented:**
-- Rate limiting (fully implemented in src/shared/rateLimiter.ts)
-  - Submissions: 10/minute per user
-  - Code runs: 30/minute per user
-  - General API: 100/minute per user/IP
-  - Auth endpoints: 5/15 minutes per IP (brute force protection)
-- Circuit breaker for code execution (src/shared/circuitBreaker.ts)
-  - Protects against Docker daemon failures
-  - Opens after 50% error rate with 5+ requests
-  - 30-second reset timeout
-- Idempotency for submissions (src/shared/idempotency.ts)
-  - Content-hash based deduplication
-  - 5-minute TTL in Redis
-- Prometheus metrics (src/shared/metrics.ts)
-  - HTTP request metrics
-  - Submission lifecycle metrics
-  - Code execution metrics
-  - Circuit breaker state
-  - Cache hit/miss rates
-- Structured logging with pino (src/shared/logger.ts)
-- Health check endpoints (/health, /health/live, /health/ready)
-- Graceful shutdown handling
-- Frontend virtualized problem list (@tanstack/react-virtual)
-- Rate limit error handling in frontend API client
+### 3. Two execution paths: in-process default, Kafka-queued for scale
+This is the decision the old notes got wrong. **Kafka is implemented, not deferred.** By default (`USE_KAFKA_QUEUE=false`) a submission is processed in-process by an async `processSubmission` that returns `202` immediately and updates status in Redis/Postgres as it runs. Set `USE_KAFKA_QUEUE=true` and the API instead publishes a `SubmissionJob` to the `submissions` topic, and independent workers (`dev:worker1/2`) consume and execute it. Trade-off: in-process is simplest and fine locally, but execution capacity is tied to API processes and an API crash loses the in-flight run; the Kafka path decouples execution onto scalable, restartable workers at the cost of running a broker (hence Kafka+Zookeeper in compose).
 
-### Phase 4: Polish and Documentation
-*In progress*
+### 4. Polling + Redis status cache instead of WebSocket
+A run takes ~2–15s. The client `POST`s, gets a submission id, and polls `GET /:id/status`, which reads a Redis-cached status (sub-ms) that `processSubmission`/worker updates after each test case. Trade-off: up to ~1–2s of staleness vs. instant WebSocket push — imperceptible against a multi-second run, and it avoids persistent-connection lifecycle management and per-connection server memory.
 
-**Completed:**
-- System design answer documents (fullstack, frontend, backend variants)
-- Architecture.md with comprehensive trade-off discussions
-- README with setup instructions
+### 5. Content-hash idempotency + tiered rate limits
+Submissions are deduped by `hash(userId + problemSlug + normalizedCode + language)` with a 5-minute Redis TTL, and `express-rate-limit` enforces tiers (submissions 10/min, runs 30/min, general 100/min, auth 5 per 15 min). Trade-off: a genuine identical re-submit within 5 minutes is folded into the first — accepted, because the expensive, resource-bound execution path is exactly what must be protected from double-submits and retry storms.
 
-**Completed:**
-- Comprehensive tests with vitest (auth routes, idempotency module, code executor)
-- Expanded seed data from 7 to 15 problems
+## Current State
 
-## Design Decisions Log
+Implemented and running end to end: session auth (bcrypt + Redis store), problem catalog with caching, submit + run-against-samples + status polling, the `dockerode` executor for all four languages with the Opossum breaker, both execution paths (in-process default and Kafka worker), content-hash idempotency, tiered rate limiting, `prom-client` metrics, `pino` logging, `/health` + `/health/live` + `/health/ready`, graceful shutdown, and vitest tests (auth routes, idempotency, code executor). Frontend: catalog with virtualized list + filtering, CodeMirror editor, live test results, progress dashboard, admin page. Seed: 15 problems (easy/medium/hard) plus `admin`/`admin123` and `demo`/`user123`.
 
-### Decision 1: Docker for Code Execution
-**Choice:** Use Docker containers with security restrictions instead of gVisor or Firecracker
-**Rationale:**
-- Simpler setup for local development
-- Sufficient security for learning project
-- Easy to upgrade to gVisor later if needed
+Intentionally omitted: plagiarism detection (MOSS), contests/time-limited submissions, WebSocket status push, and VM-grade isolation (gVisor/Firecracker).
 
-### Decision 2: React Router DOM instead of TanStack Router
-**Choice:** Use react-router-dom v6 for routing
-**Rationale:**
-- Simpler setup without code generation
-- Well-documented and widely used
-- Sufficient for this project's needs
+## Iteration & Repair Log
 
-### Decision 3: Polling for Submission Status
-**Choice:** Use HTTP polling instead of WebSocket
-**Rationale:**
-- Simpler implementation
-- Adequate for learning project
-- Can upgrade to WebSocket for real-time updates later
+- **Kafka execution path added, then mis-documented.** `shared/kafka.ts`, the worker, and the `USE_KAFKA_QUEUE` branch in `routes/submissions.ts` were built, and Kafka+Zookeeper added to compose — but the CLAUDE.md still claimed queue execution was "not needed… can add Kafka later." Corrected: Kafka is an implemented opt-in path.
+- **Language set expanded.** The executor grew from Python/JS to four languages (added C++ via `gcc:13`, Java via `openjdk:21-slim`); older notes still said "Python and JavaScript."
+- **Seed grown to 15 problems** (from 7) and vitest tests added for auth, idempotency, and the executor.
+- **README command fix (this pass).** README step 3 used `npm run seed`, which doesn't exist; the scripts are `db:migrate` / `db:seed`. Fixed, and a `db:migrate` step added (schema also auto-applies via the `docker-entrypoint-initdb.d` init.sql mount on a fresh volume).
+- **CLAUDE.md rewrite (this pass).** Replaced the Phase 1–4 checklist (with a self-contradictory "Phase 4: In progress" that then listed everything "Completed") with real architecture + decisions grounded in `codeExecutor.ts`, `routes/submissions.ts`, and `worker/index.ts`.
 
-### Decision 4: Session-based Auth with Redis
-**Choice:** Use express-session with Redis store
-**Rationale:**
-- Simple and secure
-- Follows repository guidelines (avoid JWT complexity)
-- Easy session management and revocation
+## Open Questions
 
-### Decision 5: Circuit Breaker for Code Execution
-**Choice:** Use opossum library to protect code execution
-**Rationale:**
-- Docker daemon can become unavailable or hang
-- Circuit breaker provides fail-fast behavior
-- Prevents cascading failures to rest of API
-- Users can still browse problems when execution is down
+1. **Credentials not normalized:** the seed uses `admin123` / `user123` (bcrypt); the repo-wide `password123` normalization never reached this seed. Align the seed (source change) or leave as documented?
+2. **Large outputs:** a solution that prints megabytes should be truncated/streamed rather than buffered — where's the right cap, and does it count as wrong-answer or a distinct verdict?
+3. **Plagiarism:** hash-based near-duplicate detection is cheap but weak; is MOSS-style structural comparison worth the complexity for a practice platform?
+4. **Warm containers:** per-run container startup dominates latency for fast solutions. Would a pool of pre-warmed, reset-between-runs containers be safe, or does reuse risk state bleed between submissions?
 
-### Decision 6: Virtualized Problem List
-**Choice:** Use @tanstack/react-virtual for problem list
-**Rationale:**
-- Scales to thousands of problems efficiently
-- Only renders visible rows + overscan buffer
-- Maintains 60fps scrolling performance
-- Reduces DOM node count from N to ~20
+## Resources
 
-### Decision 7: Rate Limiting with Multiple Tiers
-**Choice:** Implement per-endpoint rate limiting
-**Rationale:**
-- Submissions need strict limits (Docker resources expensive)
-- Code runs can be more lenient (no persistence)
-- Auth needs brute force protection
-- General API needs abuse prevention
-
-## Iterations and Learnings
-
-### Iteration 1: Initial Setup
-- Created project structure with separate frontend/backend
-- Set up Docker Compose for PostgreSQL and Redis
-- Implemented basic API routes
-
-### Iteration 2: Code Execution
-- Implemented Docker-based sandbox execution
-- Added security restrictions (no network, resource limits)
-- Handled output comparison with normalization
-
-### Iteration 3: Frontend
-- Built problem catalog and detail pages
-- Integrated CodeMirror for code editing
-- Added test results display with status badges
-
-## Questions and Discussions
-
-### Open Questions
-1. How to handle very large test case outputs? (Consider streaming or truncation)
-2. How to detect and prevent plagiarism? (MOSS algorithm, or simpler hash-based detection)
-
-### Resolved Questions
-1. Should we implement queue-based execution? **Decision:** Not needed for local dev scope. Current async processing with circuit breaker is sufficient. Can add Kafka/RabbitMQ later for production scale.
-
-### Future Considerations
-- WebSocket for real-time updates
-- Contests with time-limited submissions
-- More language support (C++, Java, Go, Rust)
-- Queue-based execution with Kafka for production scale
-
-## Resources and References
-
-- [Docker Security Best Practices](https://docs.docker.com/engine/security/)
-- [LeetCode System Design](https://github.com/donnemartin/system-design-primer)
-- [CodeMirror](https://codemirror.net/)
-
-## Next Steps
-
-- [x] Define detailed requirements
-- [x] Sketch initial architecture
-- [x] Choose technology stack
-- [x] Implement MVP
-- [x] Add rate limiting
-- [x] Add circuit breaker
-- [x] Add metrics and observability
-- [x] Add idempotency
-- [x] Add list virtualization
-- [x] Add more problems (expanded from 7 to 15)
-- [x] Add comprehensive tests (vitest)
-- [x] Add more language support (C++, Java)
-- [x] Queue-based execution with Kafka (optional)
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings.*
+- [Docker security](https://docs.docker.com/engine/security/) — the isolation primitives the executor relies on
+- [dockerode](https://github.com/apocas/dockerode) — programmatic container lifecycle
+- [Opossum circuit breaker](https://nodeshift.dev/opossum/)
+- [KafkaJS](https://kafka.js.org/) — the optional queue path

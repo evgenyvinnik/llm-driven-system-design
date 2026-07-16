@@ -104,58 +104,7 @@ Design a price tracking service similar to CamelCamelCamel or Honey. This system
 
 ### URL Validation and Domain Extraction
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         ADD PRODUCT FLOW                                  │
-├──────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  1. VALIDATE INPUT                                                        │
-│     ┌──────────────────┐                                                  │
-│     │  User submits    │                                                  │
-│     │  product URL     │                                                  │
-│     └────────┬─────────┘                                                  │
-│              │                                                            │
-│              ▼                                                            │
-│     ┌──────────────────┐     ┌──────────────────┐                        │
-│     │  Parse URL       │────▶│  Check against   │                        │
-│     │  (hostname)      │     │  SUPPORTED_LIST  │                        │
-│     └──────────────────┘     └────────┬─────────┘                        │
-│                                       │                                   │
-│              ┌────────────────────────┴────────────────────┐              │
-│              │                                             │              │
-│              ▼                                             ▼              │
-│     ┌──────────────────┐                         ┌──────────────────┐    │
-│     │  ✓ Supported     │                         │  ✗ Unsupported   │    │
-│     │  Continue        │                         │  Return 400      │    │
-│     └──────────────────┘                         └──────────────────┘    │
-│                                                                           │
-│  2. CHECK EXISTING                                                        │
-│     ┌──────────────────────────────────────────────────────────────┐     │
-│     │  SELECT * FROM products WHERE url = ?                         │     │
-│     │                                                               │     │
-│     │  If exists → Skip to step 4 (link to user)                   │     │
-│     │  If not    → Continue to step 3                               │     │
-│     └──────────────────────────────────────────────────────────────┘     │
-│                                                                           │
-│  3. CREATE PRODUCT                                                        │
-│     ┌──────────────────────────────────────────────────────────────┐     │
-│     │  INSERT INTO products (url, domain, status)                   │     │
-│     │  VALUES (?, ?, 'pending')                                     │     │
-│     │  RETURNING *                                                  │     │
-│     │                                                               │     │
-│     │  Then: Enqueue to scrape.{domain} queue (priority: 1)        │     │
-│     └──────────────────────────────────────────────────────────────┘     │
-│                                                                           │
-│  4. LINK TO USER                                                          │
-│     ┌──────────────────────────────────────────────────────────────┐     │
-│     │  INSERT INTO user_products (user_id, product_id)              │     │
-│     │  ON CONFLICT DO NOTHING                                       │     │
-│     │                                                               │     │
-│     │  (Allows multiple users to track same product)               │     │
-│     └──────────────────────────────────────────────────────────────┘     │
-│                                                                           │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+Adding a product is four steps. (1) **Validate**: parse the submitted URL's hostname and check it against the supported-domains list; an unsupported retailer returns 400 rather than queuing a scrape no parser can handle. (2) **Dedup**: `SELECT` the product by URL — if it already exists (another user tracks it), skip creation and jump straight to linking. (3) **Create**: `INSERT` the product with `status='pending'` and enqueue a high-priority job to `scrape.{domain}`. (4) **Link**: `INSERT INTO user_products ... ON CONFLICT DO NOTHING`, so many users can track the same product row without duplicating scrape work. The key idea: products are shared and scraped once; the user relationship is a separate many-to-many link.
 
 ### Supported Domains
 
@@ -540,34 +489,7 @@ Frontend computes trigger state in real-time:
 
 ### Session Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    SESSION FLOW                                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐            │
-│  │   Browser    │────▶│   Backend    │────▶│    Redis     │            │
-│  │   (cookie)   │     │  (Express)   │     │   (store)    │            │
-│  └──────────────┘     └──────────────┘     └──────────────┘            │
-│                                                                          │
-│  Cookie contains:                                                        │
-│  ┌──────────────────────────────────────────────────────────────┐      │
-│  │  connect.sid = s:abc123xyz.signature                         │      │
-│  │                   │                                           │      │
-│  │                   └── Session ID (lookup key in Redis)       │      │
-│  └──────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  Redis stores:                                                           │
-│  ┌──────────────────────────────────────────────────────────────┐      │
-│  │  sess:abc123xyz = {                                          │      │
-│  │    userId: 42,                                               │      │
-│  │    role: "user",                                             │      │
-│  │    createdAt: 1703548123456                                  │      │
-│  │  }                                                           │      │
-│  └──────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The browser holds only a signed, HttpOnly cookie (`connect.sid = s:<sessionId>.<signature>`) — the session ID is a lookup key, nothing sensitive. Redis holds the actual session record under `sess:<sessionId>` (`{ userId, role, createdAt }`). Every authenticated request presents the cookie; middleware resolves it against Redis and attaches the user. Because the payload lives server-side, a logout is a single Redis `DEL` — the cookie is instantly worthless.
 
 ### Cookie Configuration
 
@@ -580,69 +502,7 @@ Frontend computes trigger state in real-time:
 
 ### Login Flow
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Frontend   │     │   Backend    │     │  PostgreSQL  │     │    Redis     │
-└──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
-       │                     │                     │                     │
-       │  POST /auth/login   │                     │                     │
-       │  {email, password}  │                     │                     │
-       │─────────────────────▶                     │                     │
-       │                     │                     │                     │
-       │                     │  SELECT user        │                     │
-       │                     │  WHERE email=?      │                     │
-       │                     │─────────────────────▶                     │
-       │                     │                     │                     │
-       │                     │  user record        │                     │
-       │                     │◀─────────────────────                     │
-       │                     │                     │                     │
-       │                     │  bcrypt.compare()   │                     │
-       │                     │                     │                     │
-       │                     │  Store session      │                     │
-       │                     │─────────────────────────────────────────▶│
-       │                     │                     │                     │
-       │  Set-Cookie +       │                     │                     │
-       │  { user object }    │                     │                     │
-       │◀─────────────────────                     │                     │
-       │                     │                     │                     │
-       │  Store in authStore │                     │                     │
-       │                     │                     │                     │
-```
-
-### Frontend Auth Store
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         AUTH STORE (Zustand)                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─── State ────────────────────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   user: User | null       → Currently logged in user             │   │
-│  │   isLoading: boolean      → Checking session on app load         │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── Actions ──────────────────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   checkSession()   → GET /auth/me, restore user if valid         │   │
-│  │   login(email, pw) → POST /auth/login, set user                  │   │
-│  │   logout()         → POST /auth/logout, clear user               │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── App Initialization ───────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   useEffect(() => {                                              │   │
-│  │     checkSession()  // Called once on app mount                  │   │
-│  │   }, [])                                                         │   │
-│  │                                                                   │   │
-│  │   if (isLoading) return <LoadingScreen />                        │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Login posts `{email, password}`; the backend selects the user by email, runs `bcrypt.compare`, and on success writes a session record to Redis and returns a `Set-Cookie` plus the user object. The frontend stashes the user in its Zustand auth store. That store holds just `user` and `isLoading`, with `checkSession()` (GET `/auth/me`), `login()`, and `logout()` actions; on app mount it calls `checkSession()` once and shows a loading screen until the session is resolved, so a returning user with a valid cookie is silently restored rather than bounced to login.
 
 ### Session vs JWT Comparison
 
@@ -670,67 +530,7 @@ Frontend computes trigger state in real-time:
 
 ### Stats Aggregation
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    ADMIN STATS QUERY                                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Parallel queries for performance:                                       │
-│                                                                          │
-│  ┌──────────────────────┐  ┌──────────────────────┐                     │
-│  │  SELECT COUNT(*)     │  │  SELECT COUNT(*)     │                     │
-│  │  FROM products       │  │  FROM users          │                     │
-│  │                      │  │                      │                     │
-│  │  → totalProducts     │  │  → totalUsers        │                     │
-│  └──────────────────────┘  └──────────────────────┘                     │
-│                                                                          │
-│  ┌──────────────────────┐  ┌──────────────────────────────────────────┐ │
-│  │  SELECT COUNT(*)     │  │  SELECT domain,                         │ │
-│  │  FROM alerts         │  │         COUNT(*) as total,              │ │
-│  │  WHERE is_active     │  │         COUNT(*) FILTER (status='ok'),  │ │
-│  │                      │  │         COUNT(*) FILTER (status='fail'),│ │
-│  │  → activeAlerts      │  │         AVG(age)                        │ │
-│  └──────────────────────┘  │  FROM products                          │ │
-│                            │  GROUP BY domain                        │ │
-│                            │                                         │ │
-│                            │  → scraperHealth[]                      │ │
-│                            └──────────────────────────────────────────┘ │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Admin Dashboard Layout
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         ADMIN DASHBOARD                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─── Stats Cards ──────────────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Products │  │  Users   │  │  Alerts  │  │  Scrape  │         │   │
-│  │  │  10.2M   │  │  524K    │  │  892K    │  │ 1.2K/min │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── Scraper Health Table ─────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │  ┌────────────┬──────────┬────────────┬──────────┬──────────┐   │   │
-│  │  │ Domain     │ Products │ Success %  │ Avg Age  │ Status   │   │   │
-│  │  ├────────────┼──────────┼────────────┼──────────┼──────────┤   │   │
-│  │  │ amazon.com │ 4.2M     │ 98.5%      │ 2.1h     │ 🟢 OK    │   │   │
-│  │  │ walmart    │ 2.1M     │ 97.2%      │ 3.4h     │ 🟢 OK    │   │   │
-│  │  │ bestbuy    │ 1.8M     │ 89.1%      │ 5.2h     │ 🟡 WARN  │   │   │
-│  │  │ ebay.com   │ 1.5M     │ 65.3%      │ 8.7h     │ 🔴 FAIL  │   │   │
-│  │  │ target.com │ 0.6M     │ 99.1%      │ 1.8h     │ 🟢 OK    │   │   │
-│  │  └────────────┴──────────┴────────────┴──────────┴──────────┘   │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The stats endpoint fans out several independent aggregates in parallel (`COUNT(*)` of products, users, and active alerts) plus a per-domain `GROUP BY domain` that computes total tracked products, `COUNT(*) FILTER (WHERE status='ok')` vs `'fail'`, and average price-age. Running them concurrently rather than sequentially keeps the dashboard load fast; the per-domain roll-up is what powers the scraper-health view. Results feed a stats-card row (products, users, alerts, scrape rate) and a **scraper health table** — one row per domain with product count, extraction success %, average data age, and a status badge — so an operator can spot a domain whose parser has silently broken (e.g. a retailer at 65% success is failing) at a glance.
 
 ### Status Badge Logic
 
@@ -742,20 +542,7 @@ Frontend computes trigger state in real-time:
 
 ### Scraper Config Update Flow
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Admin UI   │────▶│   Backend    │────▶│  PostgreSQL  │────▶│    Redis     │
-│   (form)     │     │   PATCH      │     │   UPDATE     │     │   DEL cache  │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-                                                                       │
-                                                                       │
-                                                                       ▼
-                                                              ┌──────────────┐
-                                                              │ Next scrape  │
-                                                              │ fetches new  │
-                                                              │ config       │
-                                                              └──────────────┘
-```
+Editing a domain's config (`PATCH /api/admin/scrapers/:domain`) writes the new selectors/rate-limit to PostgreSQL and then deletes the cached config key in Redis, so the next scrape for that domain fetches the fresh configuration rather than a stale cached copy. This is the operator's lever when a retailer changes its markup: update the selectors and the fleet picks them up on the next cycle without a redeploy.
 
 ---
 

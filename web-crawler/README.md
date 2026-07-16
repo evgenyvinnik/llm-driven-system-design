@@ -111,8 +111,9 @@ cd backend
 # Install dependencies
 npm install
 
-# Run database migrations
-npm run db:migrate
+# Schema is applied automatically: the Docker Postgres runs backend/db/init.sql
+# on first boot, and the API also runs CREATE TABLE IF NOT EXISTS on startup.
+# No separate migrate step.
 
 # Seed initial URLs (optional)
 npm run db:seed

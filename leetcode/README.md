@@ -70,10 +70,11 @@ cd backend
 npm install
 ```
 
-3. **Seed the database:**
+3. **Apply the schema and seed the database:**
 
 ```bash
-npm run seed
+npm run db:migrate   # idempotent; also auto-applied via docker-entrypoint-initdb.d on a fresh volume
+npm run db:seed
 ```
 
 This creates:

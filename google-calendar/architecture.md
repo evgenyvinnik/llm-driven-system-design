@@ -60,8 +60,8 @@ A calendar and scheduling platform that allows users to manage events across mul
                                                                         │
                               ┌─────────────┐  ┌─────────────┐  ┌──────┴──────┐
                               │ PostgreSQL   │  │   Redis     │  │  Message    │
-                              │ (Events,     │  │  (Sessions, │  │  Queue      │
-                              │  Calendars,  │  │   Cache)    │  │ (Reminders) │
+                              │ (Events,     │  │   (Cache)   │  │  Queue      │
+                              │  Calendars,  │  │             │  │ (Reminders) │
                               │  Users)      │  │             │  │             │
                               └─────────────┘  └─────────────┘  └─────────────┘
 ```

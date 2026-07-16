@@ -1,151 +1,65 @@
-# Web Crawler - Development with Claude
+# Web Crawler — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing a distributed web crawling system for indexing the internet.
+A distributed web crawler: seed it with URLs, and a pool of workers fetch pages, extract links and metadata, and feed newly-discovered URLs back into a shared frontier — all while respecting robots.txt and per-domain crawl delays. The core hard problem is the **URL frontier**: a queue that must be prioritized, deduplicated, politeness-throttled per domain, and safely shared across crashing workers, without ever crawling the same URL twice or hammering one host.
 
-## Key Challenges to Explore
+**Learning goals:** priority-queue frontier design, exact deduplication at scale, distributed politeness (one crawler per domain), and crash-safe work distribution across stateless workers.
 
-1. Distributed coordination
-2. Duplicate detection
-3. Crawl politeness
-4. URL prioritization
+## Architecture at a Glance (what actually runs)
 
-## Development Phases
+Matches `docker-compose.yml` (Postgres, Valkey, an API container, and three worker containers) and `backend/package.json`:
 
-### Phase 1: Requirements and Design
-*Completed*
+| Store | Client | Role | Why this one |
+|-------|--------|------|--------------|
+| **PostgreSQL 16** | `pg` | Durable frontier state (`url_frontier` with status), crawled-page metadata, domains + robots cache, crawl stats | ACID + queryability: inspect/recover/reprioritize the queue, which a log-based queue can't do |
+| **Redis / Valkey** | `ioredis` | Three priority sorted-sets (high/medium/low), the `VISITED_URLS` dedup set, per-domain crawl locks, live counters, sessions | O(1) dedup + fast priority pop on the hot path; self-expiring domain locks |
 
-**Completed:**
-- Defined functional requirements (URL discovery, page fetching, content extraction, politeness)
-- Established scale targets based on system-design-answer-fullstack.md
-- Identified key technical constraints (robots.txt compliance, rate limiting)
+**No message queue** — the frontier *is* the queue, split across Redis (fast) and Postgres (durable). One Express **API/dashboard** server + **three worker processes** (`backend/src/worker.ts`, run as `webcrawler-worker-1/2/3`). Key deps: `cheerio` (HTML parse), `robots-parser` (politeness), `cockatiel` (retry/circuit-breaker/timeout in `shared/resilience.ts`), `express-session` + `connect-redis` (admin auth), `helmet`/`compression`/`express-rate-limit`, `prom-client`, `pino`. **Frontend:** React 19 + TanStack Router + Zustand + Tailwind dashboard that polls stats.
 
-### Phase 2: Initial Implementation
-*In Progress*
+## Key Design Decisions
 
-**Completed items:**
-- Set up project structure (backend, frontend, Docker configuration)
-- Implemented URL frontier with priority queue (PostgreSQL + Redis)
-- Created crawler workers with politeness (robots.txt, rate limiting)
-- Built content storage and link extraction
-- Implemented API endpoints for dashboard and admin
-- Created frontend dashboard with React, Vite, TanStack Router, Zustand, Tailwind CSS
-- Set up Docker Compose for both development and production
+### 1. Hybrid frontier: Redis priority queues + PostgreSQL durability
+`addUrl` writes the URL to `url_frontier` with `ON CONFLICT (url_hash) DO NOTHING` *and* pushes its hash onto one of three Redis sorted-sets by priority. `getNextUrl` pops from Redis high→medium→low, loads the row from Postgres, re-checks `status='pending'` (dropping stale queue entries), and marks it `in_progress`. Trade-off: the two stores are eventually consistent — a hash can linger in Redis after its row moved on — which is why the read path re-validates against Postgres, the source of truth. Chose this over pure-Postgres `FOR UPDATE SKIP LOCKED` to keep the hot dequeue off the priority index.
 
-**Focus areas:**
-- [x] Implement core functionality
-- [x] Get something working end-to-end
-- [x] Validate basic assumptions
+### 2. Exact dedup via Redis SET (not a Bloom filter)
+Each URL is normalized then SHA-256 hashed; `addUrl` checks membership in the Redis `VISITED_URLS` set (`SISMEMBER`, O(1)) and the Postgres `url_hash` UNIQUE index backstops it. Trade-off: exact dedup means zero false negatives (we never skip a real page), but the set grows unbounded — at 10B URLs it's ~640GB. A Bloom filter is the production answer (10× less memory, ~0.1% false positives); exact is correct and simple at the 100K-URL learning scale.
 
-### Phase 3: Scaling and Optimization
-*Not started*
+### 3. Politeness = per-domain Redis lock, not a global rate limiter
+Before crawling, a worker runs `SET crawler:domain:{d}:lock {workerId} NX EX {crawlDelay}`. Winning the lock is permission to crawl that domain; the TTL equals the domain's crawl-delay (from robots.txt or a 1s default), so the lock self-releases and the next fetch can't happen until the delay elapses. This *also* provides worker exclusivity — two workers can't hold one domain's lock, so they can't double-crawl. Trade-off: domain-level (not path-level) granularity means one busy domain is a single-lane road regardless of worker count, and workers burn cycles when every eligible domain is locked; token-bucket would smooth this but adds complexity for marginal gain.
 
-**Focus areas:**
-- Add caching layer
-- Optimize database queries
-- Implement load balancing
-- Add monitoring
+### 4. Crash recovery by leasing, not transactions
+A worker marks a URL `in_progress` and crawls it outside any long transaction. If the worker dies, that row is stuck — so `recoverStaleUrls` periodically resets `in_progress` rows older than N minutes back to `pending`. Trade-off: a crashed worker's URL is re-crawled (at-least-once), which is fine because crawling is idempotent; the alternative (holding a DB lock for the whole fetch) would tie up connections for slow pages and turn a hung request into a stuck lock.
 
-### Phase 4: Polish and Documentation
-*Not started*
+### 5. Metadata-only page storage
+`crawled_pages` stores `title`, `description`, `content_hash`, `content_length`, `status_code`, `links_count` — **not the raw HTML body**. Content dedup is by `content_hash`. Trade-off: we can detect duplicate content and drive the dashboard without an object store; storing full pages (for a real index) is the explicit v2 that would add S3/MinIO.
 
-**Focus areas:**
-- Complete documentation
-- Add comprehensive tests
-- Performance tuning
-- Code cleanup
+## Current State
 
-## Design Decisions Log
+Implemented end to end: the hybrid frontier with 3-level priority, URL normalization + SHA-256 dedup (Redis set + PG unique), robots.txt fetch/parse/cache (`robots-parser`, Redis 1h TTL + PG), per-domain NX-lock politeness, three workers pulling from the shared frontier with `cheerio` link/metadata extraction, `cockatiel`-wrapped fetches (retry + circuit breaker + timeout), stale-URL recovery, crawl-stats aggregation, a session-authenticated admin API (add seeds, recover jobs), Prometheus metrics, pino logging, and a polling React dashboard.
 
-### 2025-01-16: Initial Implementation Decisions
+Intentionally omitted: raw-HTML/content storage (S3/MinIO, v2), JavaScript rendering (Puppeteer for SPAs, v2), Bloom-filter dedup, near-duplicate/shingle detection, and any real distributed queue (Kafka/Redis Streams) — the Redis+PG frontier stands in.
 
-1. **Database Choice: PostgreSQL for URL Frontier**
-   - *Decision:* Use PostgreSQL for the URL frontier and metadata storage
-   - *Rationale:* PostgreSQL provides ACID guarantees for URL state transitions, efficient indexing for priority-based queries, and good support for concurrent access
-   - *Trade-off:* Slower than pure Redis for simple queue operations, but more durable and queryable
-   - *Alternative considered:* Kafka for the frontier, but added complexity not needed for learning project
+## Iteration & Repair Log
 
-2. **Deduplication: Redis Sets**
-   - *Decision:* Use Redis SSET for visited URL tracking
-   - *Rationale:* O(1) lookup time, memory-efficient for URL hashes, natural fit with Redis rate limiting
-   - *Trade-off:* Memory-bound; at 10 billion URLs with 64-byte hashes = ~640GB RAM
-   - *Alternative considered:* Bloom filter would use less memory but has false positives
+- **Distributed rate-limit + politeness** (`services/frontier.ts`): settled on `SET NX EX` per-domain locks after noting that a naive shared queue lets all three workers stampede one domain; the lock TTL doubles as the crawl-delay timer.
+- **Stale-URL recovery added**: early runs left URLs pinned in `in_progress` when a worker was killed mid-fetch; `recoverStaleUrls` (reset after 10 min) makes the frontier self-healing at at-least-once cost.
+- **Schema self-applies (no `db:migrate`):** there is no migrate script — Docker runs `backend/db/init.sql` via `docker-entrypoint-initdb.d`, and `models/database.ts` runs `CREATE TABLE IF NOT EXISTS` on API startup. README previously told users to run `npm run db:migrate` (nonexistent); corrected this pass to explain the auto-apply and keep `npm run db:seed`.
+- **Doc drift fixes (this pass):** the old CLAUDE.md was Phase-1/2/3/4 checklists with "Not started" placeholders; rewritten to real decisions. `architecture.md` Decision 1 (and the "worker claim" / consistency notes) claimed a Postgres `FOR UPDATE SKIP LOCKED` dequeue that the code doesn't use — corrected to the actual Redis-queue + PG-durability hybrid with Redis-lock exclusivity.
+- **CI note (repo-wide):** the GitHub Actions smoke-test workflow was removed; don't treat it as active.
 
-3. **Rate Limiting: Redis Locks with TTL**
-   - *Decision:* Use Redis SET NX EX for per-domain rate limiting
-   - *Rationale:* Distributed coordination without complex locking, automatic expiry
-   - *Trade-off:* Lock granularity is per-domain, not per-path; slightly less optimal for large sites
-   - *Alternative considered:* Token bucket algorithm for smoother rate limiting
+## Open Questions
 
-4. **Priority Queue: Three-Level Queues**
-   - *Decision:* Implement three priority levels (high, medium, low)
-   - *Rationale:* Simple to understand and implement, good enough for most use cases
-   - *Trade-off:* Less granular than continuous priority scores
-   - *Alternative considered:* Redis sorted sets with priority scores as scores
+1. The `VISITED_URLS` Redis set is exact but unbounded — at what crawl size does it need to become a Bloom filter with Postgres as the exact-check backstop, and how do we migrate without a full re-crawl?
+2. Politeness is per-domain; a CDN or shared host behind one IP can still be overwhelmed across many domains. Should throttling key on resolved IP as well?
+3. Cheerio can't see JS-rendered content — worth detecting empty extractions and flagging those URLs for a Puppeteer lane, or is that a separate crawler entirely?
+4. Priority is three coarse levels; does a continuous score (domain authority × freshness × depth) actually improve coverage, or just add starvation risk for low-priority URLs?
 
-5. **Frontend State Management: Zustand**
-   - *Decision:* Use Zustand for state management
-   - *Rationale:* Lightweight, simple API, good TypeScript support, no boilerplate
-   - *Trade-off:* Less structured than Redux for very large applications
-   - *Alternative considered:* TanStack Query for server state, but simpler polling approach chosen
+## Notes / Known Gaps
 
-6. **Routing: TanStack Router**
-   - *Decision:* Use TanStack Router for frontend routing
-   - *Rationale:* Type-safe routing, file-based routing option, modern API
-   - *Trade-off:* Slightly newer/less ecosystem than React Router
-   - *Alternative considered:* React Router v6
+- The dashboard admin login is `admin` / `admin`, hardcoded (pbkdf2) in `backend/src/middleware/auth.ts` — it is **not** the repo-standard `password123`. Normalizing it requires a source-code change (out of scope for a docs pass), so the README intentionally doesn't advertise a login credential.
 
-## Iterations and Learnings
+## Resources
 
-### Iteration 1: Core Implementation (2025-01-16)
-- Built complete backend with Express.js
-- Implemented URL frontier, crawler workers, and API
-- Created React dashboard with real-time updates
-- Set up Docker deployment
-
-**Key learnings:**
-- Redis NX locks work well for distributed rate limiting
-- Separating API server from workers allows independent scaling
-- Priority queues need careful design to avoid starvation of low-priority URLs
-
-## Questions and Discussions
-
-### Open Questions
-1. How to handle JavaScript-rendered pages? (Puppeteer integration)
-2. What's the best approach for near-duplicate detection at scale?
-3. How to efficiently rebalance work when workers are added/removed?
-
-### Resolved Questions
-1. **How to handle robots.txt caching?**
-   - Cache in Redis with 1-hour TTL, also store in PostgreSQL for persistence
-   - In-memory cache for hot domains
-
-2. **How to prioritize URLs?**
-   - Three-level priority based on depth, URL patterns, and domain authority
-   - High: seed URLs, homepages, shallow pages
-   - Medium: content pages, blog posts
-   - Low: paginated content, archive pages
-
-## Resources and References
-
-- [Mercator paper](https://www.cs.cornell.edu/courses/cs685/2002fa/mercator.pdf) - Classic web crawler architecture
-- [Google's web crawling patent](https://patents.google.com/patent/US7454444B1/en)
-- [robots-parser npm](https://www.npmjs.com/package/robots-parser) - robots.txt parsing
-- [Cheerio](https://cheerio.js.org/) - HTML parsing
-
-## Next Steps
-
-- [x] Define detailed requirements
-- [x] Sketch initial architecture
-- [x] Choose technology stack
-- [x] Implement MVP
-- [ ] Test and iterate
-- [ ] Add comprehensive tests
-- [ ] Implement monitoring (Prometheus/Grafana)
-- [ ] Add content storage (S3/local)
-- [ ] Implement near-duplicate detection
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings.*
+- [Mercator: A Scalable, Extensible Web Crawler](https://www.cs.cornell.edu/courses/cs685/2002fa/mercator.pdf)
+- [robots-parser](https://www.npmjs.com/package/robots-parser) · [Cheerio](https://cheerio.js.org/) · [Cockatiel](https://github.com/connor4312/cockatiel)

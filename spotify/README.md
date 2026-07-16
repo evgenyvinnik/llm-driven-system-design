@@ -53,14 +53,15 @@ A simplified Spotify-like platform demonstrating music streaming, playlist manag
 - **Frontend**: TypeScript, Vite, React 19, TanStack Router, Zustand, Tailwind CSS
 - **Backend**: Node.js, Express
 - **Database**: PostgreSQL (metadata, users, playlists)
-- **Cache**: Redis (sessions, caching)
-- **Object Storage**: MinIO (audio files, cover art)
+- **Cache**: Redis/Valkey (sessions, playback state, caching, rate limits)
+- **Object Storage**: MinIO (audio files, cover art) — served to the client via presigned URLs
+- **Event Pipeline**: Kafka (`playback-events` topic) with a separate analytics worker consuming events to update stream counts, listening stats, and taste profiles
 
 ## Quick Start
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20+
 - Docker and Docker Compose
 
 ### 1. Start Infrastructure
@@ -72,8 +73,9 @@ docker-compose up -d
 
 This starts:
 - PostgreSQL on port 5432
-- Redis on port 6379
+- Redis/Valkey on port 6379
 - MinIO on ports 9000 (API) and 9001 (Console)
+- Kafka on port 9092 (with Zookeeper) — required for the playback event pipeline
 
 ### 2. Setup Backend
 

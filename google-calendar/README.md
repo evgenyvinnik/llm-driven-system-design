@@ -66,8 +66,8 @@ npm run dev
 
 ### Backend
 - **Runtime**: Node.js with Express
-- **Database**: PostgreSQL 16
-- **Session Store**: Valkey (Redis-compatible)
+- **Database**: PostgreSQL 16 (also stores sessions)
+- **Session Store**: PostgreSQL via `connect-pg-simple` (Valkey runs in docker-compose but is currently unused — reserved for future caching)
 - **Auth**: express-session with connect-pg-simple
 
 ## API Endpoints

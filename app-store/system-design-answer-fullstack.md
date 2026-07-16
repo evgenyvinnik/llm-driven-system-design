@@ -1,283 +1,162 @@
-# App Store - System Design Answer (Fullstack Focus)
+# App Store — System Design Answer (Fullstack Focus)
 
-*45-minute system design interview format - Fullstack Engineer Position*
+*45-minute system design interview format — Fullstack Engineer Position*
 
-## Problem Statement
+## 📋 Problem Statement
 
-Design the App Store, Apple's digital marketplace serving 2M+ apps to billions of users. As a fullstack engineer, the key challenges span:
-- End-to-end search flow from UI to Elasticsearch and back
-- Review submission pipeline with frontend validation through backend integrity analysis
-- Purchase flow with secure checkout and real-time receipt delivery
-- Developer dashboard connecting analytics data to visualization
-- Real-time ranking updates displayed in charts
+Design an app marketplace like the App Store: developers publish apps with rich media, users search and browse quality-ranked charts, download apps, and leave reviews — and the review corpus has to resist manipulation. As a fullstack engineer I care about the **seams**: how a keystroke in the search box becomes a quality-ranked result list, how a review travels from a client form through an integrity pipeline to a published (or rejected) verdict, and how a developer's upload becomes a searchable, downloadable app. The through-line is that the hard work happens **off the request path** — search re-ranking, integrity scoring, and media handling all have to feel instant to the user while doing real work behind them.
 
-## Requirements Clarification
+## 🎯 Requirements Clarification
+
+- **Scope:** discovery (search + charts), app detail, reviews with integrity, and the developer publish lifecycle. Commerce (paid purchases, subscriptions, payouts) I'll treat as an entitlement layer behind an interface — most apps are free and the interesting problems are discovery and trust.
+- **Consistency bar:** app metadata and reviews can be eventually consistent (seconds); a developer publishing an app should see it live quickly; download entitlement must be exact.
 
 ### Functional Requirements
-1. **Search & Discovery**: Full-text search with filters, category browsing, rankings
-2. **App Details**: View metadata, screenshots, reviews with ratings
-3. **Review System**: Submit reviews, view responses, integrity indicators
-4. **Purchases**: Secure checkout, receipt validation, subscription management
-5. **Developer Portal**: App management, analytics, review responses
+- Search with filters + category browse + precomputed charts (Top Free/Paid/Grossing)
+- App detail: metadata, screenshots, ratings, reviews
+- Reviews: submit, vote helpful, developer response, integrity gating
+- Developer portal: create/update app, upload media, submit, publish, analytics
 
 ### Non-Functional Requirements
-1. **Latency**: < 100ms for search, < 200ms for app details
-2. **Consistency**: Strong for purchases, eventual for rankings
-3. **Availability**: 99.99% for purchase endpoints
-4. **Security**: Secure payment flows, receipt validation
+- Search p95 < 100ms, app detail < 200ms
+- Reviews visible within seconds of passing integrity; never block the writer
+- Publish → searchable within seconds
+- No lost events between a DB write and downstream processing
 
-## High-Level Architecture
+## 🏗️ High-Level Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    React Frontend                                │
-├─────────────────────────────────────────────────────────────────┤
-│  Consumer Views          │         Developer Views              │
-│  - Home (Charts)         │         - Dashboard                  │
-│  - Search                │         - App Management             │
-│  - App Details           │         - Analytics                  │
-│  - Checkout              │         - Review Responses           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
+│                    React SPA (Vite + TanStack Router)           │
+│   Consumer: Home/Charts · Search · App Detail · Reviews         │
+│   Developer: Dashboard · App Editor · Media Upload · Analytics  │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ REST (session cookie)
+                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Express Backend                               │
-├─────────────────────────────────────────────────────────────────┤
-│  /api/v1/search          │  /api/v1/developer/*                 │
-│  /api/v1/apps            │  /api/v1/purchases                   │
-│  /api/v1/reviews         │  /api/v1/admin/*                     │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  PostgreSQL   │    │ Elasticsearch │    │    Redis      │
-│  - Apps       │    │ - Search      │    │ - Sessions    │
-│  - Purchases  │    │ - Suggestions │    │ - Cache       │
-│  - Reviews    │    │               │    │ - Idempotency │
-└───────────────┘    └───────────────┘    └───────────────┘
+│                    Express API (stateless, xN)                  │
+│   /apps · /apps/search · /apps/:id/reviews · /developer/*       │
+└───┬───────────────┬───────────────┬───────────────┬─────────────┘
+    ▼               ▼               ▼               ▼
+┌────────┐   ┌────────────┐   ┌──────────┐   ┌───────────────┐
+│Postgres│   │Elasticsearch│  │  Redis   │   │    MinIO      │
+│apps,   │   │search index │  │sessions, │   │icons,         │
+│reviews,│   │+ suggest    │  │cache,    │   │screenshots,   │
+│outbox  │   │+ similar    │  │idempotency│  │packages       │
+└───┬────┘   └────────────┘   └──────────┘   └───────────────┘
+    │ outbox rows
+    ▼
+┌────────────┐   consume   ┌────────────────────────────────┐
+│  RabbitMQ  │────────────▶│ Workers: reviewWorker (integrity)│
+│            │             │          downloadWorker (counts) │
+└────────────┘             └────────────────────────────────┘
 ```
 
-## Deep Dive: End-to-End Search Flow
+Two disciplines meet here: a **read path** optimized with Elasticsearch + Redis for discovery, and a **write path** that uses Postgres as the source of truth and a transactional outbox to hand work to RabbitMQ workers. The API servers are stateless; all durable state and all async work live behind them.
+
+## 🔧 Deep Dive 1: End-to-End Search with Quality Re-Ranking
+
+The seam between a fast-feeling UI and a relevance engine.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Search Flow Sequence                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   User Types "photo editor"                                              │
-│            │                                                             │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │   SearchBar     │ ← Debounce 150ms                                   │
-│   │   Component     │                                                    │
-│   └────────┬────────┘                                                    │
-│            │ GET /api/v1/search?q=photo+editor                           │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │   API Gateway   │ ← Rate limit check                                 │
-│   └────────┬────────┘                                                    │
-│            │                                                             │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │ Search Service  │ ← Build Elasticsearch query                        │
-│   └────────┬────────┘                                                    │
-│            │ multi_match query                                           │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │ Elasticsearch   │ ← Fuzzy match, scoring                             │
-│   └────────┬────────┘                                                    │
-│            │ hits with _score                                            │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │ Rerank Service  │ ← Quality signals applied                          │
-│   └────────┬────────┘                                                    │
-│            │ Final sorted results                                        │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │   SearchBar     │ ← Display results                                  │
-│   │   Component     │                                                    │
-│   └─────────────────┘                                                    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+User types "photo editor"
+   │  debounce 150ms, ≥2 chars
+   ▼
+SearchBar ──GET /apps/search?q=photo+editor──▶ API
+   │                                            │ Redis cache check (5-min TTL, page 1)
+   │                                            ▼
+   │                                    Elasticsearch multi_match
+   │                                    (name^3, developer^2, fuzzy)
+   │                                            │ fetch 2× requested
+   │                                            ▼
+   │                                    Quality re-rank in the service
+   │                                    text score (0.6) + quality (0.4)
+   ▼◀────────────ranked page──────────────────┘
+Render results (skeleton → list)
 ```
 
-### Frontend: Debounced Search Input
+**Frontend discipline.** The input keeps two states: the immediate value (drives the text field) and a debounced value (drives the request), so typing never blocks on the network. A stale-while-revalidate cache keeps repeated queries instant and shows the last good results while the new ones load, so the list never flashes empty. Suggestions are typed by kind (app / developer / category) so the dropdown communicates *what* each hit is.
 
-> "I'm debouncing user input at 150ms with a 2-character minimum before API calls. This balances responsiveness with API efficiency. React Query handles caching with a 60-second stale time, so repeated searches are instant."
+**Backend discipline — why re-rank instead of trusting Elasticsearch's `_score`?**
 
-The SearchBar component maintains both immediate query state (for the input) and a debounced query (for API calls). Search suggestions are typed by category (app/developer/category) with optional icons for visual distinction.
+> "Text relevance alone is exactly what App Store Optimization spam exploits — stuff the right keywords and you outrank a better app. So I fetch roughly twice the page size from Elasticsearch to get headroom, then re-rank in the service blending the text score (~60%) with quality signals — rating, review count, downloads (~40%). The cost is extra CPU per query and a second sort, but the alternative is surfacing keyword-stuffed junk above the app users actually want. I fetch 2× rather than 10× because re-ranking a huge candidate set would blow the latency budget for marginal quality gain."
 
-### Backend: Search with Quality Re-ranking
+**What I give up:** the Elasticsearch index is refreshed when an app is published, not via change-data-capture, so an edited-but-unpublished app can rank on slightly stale text. For a marketplace that's acceptable (metadata edits are rare relative to reads); the fix at scale is an outbox → indexer so edits propagate in seconds.
 
-> "I'm fetching 2x the requested results from Elasticsearch to create headroom for re-ranking. This lets us balance text relevance (60%) with quality signals (40%) before returning the final set."
+## 🔧 Deep Dive 2: The Review Pipeline — Client Form to Integrity Verdict
 
-**GET /api/v1/search** accepts query, category, price, rating filters with pagination. The flow checks Redis cache first, builds a multi_match Elasticsearch query (boosting name 3×, developer 2×), applies fuzzy matching, then re-ranks results combining text score with quality metrics (rating, review count, downloads, engagement). First-page results are cached for 5 minutes.
-
-## Deep Dive: Review Submission Pipeline
+A review must feel submitted instantly, but its integrity score is real work that can't run in the request.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Review Submission Pipeline                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   User Submits Review                                                    │
-│            │                                                             │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  ReviewForm     │ ← Client validation (Zod)                          │
-│   │  Component      │   - rating: 1-5 required                           │
-│   │                 │   - title: 5-100 chars                             │
-│   │                 │   - body: 20-2000 chars                            │
-│   └────────┬────────┘                                                    │
-│            │ POST /api/v1/reviews                                        │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  Review API     │ ← Server validation                                │
-│   │                 │   - Verified purchase check                        │
-│   │                 │   - Duplicate review check                         │
-│   └────────┬────────┘                                                    │
-│            │ Insert with status='pending'                                │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  PostgreSQL     │                                                    │
-│   └────────┬────────┘                                                    │
-│            │ Publish review.created event                                │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  RabbitMQ       │                                                    │
-│   └────────┬────────┘                                                    │
-│            │ Async processing                                            │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │ Integrity       │ ← Multi-signal analysis                            │
-│   │ Worker          │                                                    │
-│   └────────┬────────┘                                                    │
-│            │ UPDATE status based on score                                │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  PostgreSQL     │ ← status: approved/rejected/manual_review          │
-│   └─────────────────┘                                                    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+ReviewForm  ──POST /apps/:id/reviews──▶  Review API
+ (client validation:                      │ server re-validate
+  rating 1–5, title, body)                │ must have downloaded app
+                                          │ reject duplicate review
+                                          ▼
+                              ┌── single Postgres txn ──┐
+                              │ INSERT review (pending) │
+                              │ INSERT event_outbox row │
+                              └───────────┬─────────────┘
+                                          │ relay
+                                          ▼
+                                      RabbitMQ ──▶ reviewWorker
+                                                     │ Redis dedup (idempotent)
+                                                     │ 6-signal integrity score
+                                                     ▼
+                                          UPDATE review status
+                                          published / rejected
 ```
 
-### Frontend: Review Form
+**Why the outbox, not "insert then publish"?** This is the decision I'd defend hardest:
 
-> "I'm validating on both ends with Zod - same schema shared between frontend and backend. This gives users immediate feedback while maintaining server-side security."
+> "The naive version inserts the review, then publishes `review.created` to RabbitMQ. Those are two systems and you cannot make both commit atomically — if the process dies between the Postgres commit and the publish, the review is saved but its integrity job never runs, so it sits `pending` forever and is invisible. The transactional outbox writes the event into an `event_outbox` table *inside the same Postgres transaction* as the review insert. Either both land or neither does. A relay then reads unpublished rows and pushes them to RabbitMQ, marking them sent. The price is at-least-once delivery — the relay can publish a row twice if it crashes after publishing but before marking it — so `reviewWorker` dedups on the event id in Redis before doing work. I'd rather pay idempotency-on-the-consumer than risk silently losing events."
 
-The ReviewForm validates rating (1-5), title (5-100 chars), and body (20-2000 chars). Error states handle 409 (already reviewed) and 403 (must download first). The UI includes a star rating input, text fields with inline errors, and a submit button with loading state.
+**The integrity score itself** is a weighted sum of six signals the worker computes: review velocity (0.15 — many reviews in 24h looks like spam), content quality (0.25 — generic phrases like "great app" score low, specifics like "fixed the crash on launch" score high), account age (0.1), verified download (0.2 — did this user actually install the app?), coordination (0.2 — a review count spiking to 5× the app's baseline flags review-bombing), and originality (0.1). Below ~0.3 the review is rejected, mid-range flags for manual review, above ~0.6 publishes. It's deliberately heuristic — false positives happen (a genuine one-liner scores low) — because synchronous ML scoring would block the write and full ML detection is out of scope.
 
-### Backend: Review Submission
+**Frontend closes the loop:** the form shows the review as "submitted, pending review" immediately (optimistic-ish), and the app's review list refetches when the worker publishes. Error states are specific — 403 "download the app first," 409 "you already reviewed this."
 
-> "Reviews start in 'pending' status and process asynchronously. This keeps the API responsive while integrity analysis runs in the background."
+## 🔧 Deep Dive 3: The Developer Publish Pipeline
 
-**POST /api/v1/reviews** validates the request, verifies the user has downloaded the app, checks for duplicate reviews, then inserts with status='pending'. A review.created event publishes to RabbitMQ, and app rating aggregates update in the same transaction.
-
-### Backend: Integrity Worker
-
-> "The worker uses Redis for deduplication - if we've already processed an event, we skip it. This makes the queue consumer idempotent and safe for retries."
-
-The worker consumes review.created events, runs multi-signal integrity analysis (velocity, content quality, account age, coordination detection), calculates a weighted score, and updates the review status. Scores below 0.3 are rejected, 0.3-0.6 require manual review, and above 0.6 are approved.
-
-## Deep Dive: Purchase Flow
+The other big fullstack seam: how a developer's upload becomes a live, searchable, downloadable app.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Purchase Flow Sequence                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   User Clicks "Buy"                                                      │
-│            │                                                             │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  Checkout Modal │ ← Confirm payment method                           │
-│   │                 │   Generate idempotency key (UUID)                  │
-│   └────────┬────────┘                                                    │
-│            │ POST /api/v1/purchases                                      │
-│            │ Header: Idempotency-Key                                     │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  Purchase API   │ ← Layer 1: Check cached result                     │
-│   │                 │   Layer 2: Acquire lock (30s)                      │
-│   └────────┬────────┘                                                    │
-│            │                                                             │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  Payment        │ ← Process payment                                  │
-│   │  Provider       │                                                    │
-│   └────────┬────────┘                                                    │
-│            │ Transaction                                                 │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  PostgreSQL     │ ← Insert purchase                                  │
-│   │                 │   Insert user_apps                                 │
-│   │                 │   Update download_count                            │
-│   └────────┬────────┘                                                    │
-│            │ Generate receipt                                            │
-│            ▼                                                             │
-│   ┌─────────────────┐                                                    │
-│   │  Checkout Modal │ ← Show success, download button                    │
-│   └─────────────────┘                                                    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+Developer Editor                         API / Storage
+   │ create app (status: draft)          Postgres apps row
+   │ request presigned URL ──────────────▶ MinIO presigned PUT
+   │ PUT icon/screenshots ───────────────▶ MinIO (bypasses API)
+   │ submit for review ──────────────────▶ status: pending
+   │ publish ────────────────────────────▶ status: published
+   │                                        └─▶ index doc in Elasticsearch
+   ▼                                        └─▶ now appears in /apps/search
+App is live
 ```
 
-### Frontend: Checkout Modal
+**Why presigned uploads?** App icons and screenshots (and, at scale, multi-hundred-MB packages) should never stream through the API servers — that ties up request-handling capacity and memory on binary I/O.
 
-> "The idempotency key is generated once when the modal opens and reused for retries. This ensures duplicate clicks or network retries don't result in double charges."
+> "The editor asks the API for a presigned PUT URL, then uploads the media directly to MinIO. The API only ever handles the small metadata request and stores the resulting object key. Small icons can go through a `multipart` endpoint for convenience, but anything large takes the presigned path. The trade-off is a two-step client flow — get URL, then PUT — and the client has to handle a partial upload (URL issued, PUT failed). But it keeps the API servers stateless and cheap to scale horizontally, which is the whole point of putting object storage behind them."
 
-The modal displays app details with price confirmation. A UUID idempotency key is generated via useState on mount. The mutation includes this key as a header and enables retry: 3 since the operation is safe to retry. Error display shows payment failures while Cancel and Confirm buttons handle user actions.
+**Publish is the consistency moment:** flipping `status` to `published` in Postgres and indexing the document in Elasticsearch are two writes to two systems. Locally that's done inline on publish; at scale it's the same outbox pattern as reviews — write `app.published` to the outbox in the publish transaction, let an indexer consume it — so a crash between the DB flip and the ES index can't leave an app "published but unsearchable."
 
-### Backend: Idempotent Purchase API
+## ⚖️ Trade-offs Summary
 
-> "I'm using three layers of protection: Redis cache check, distributed lock, then database verification. The lock prevents concurrent requests from the same user while the cache makes retries instant."
+| Decision | ✅ Chosen | ❌ Alternative | Rationale |
+|----------|----------|----------------|-----------|
+| Search ranking | Fetch 2× + quality re-rank | Trust ES `_score` | Beats ASO keyword-stuffing |
+| Review processing | Async via outbox + worker | Sync integrity in request | Non-blocking writes, no lost events |
+| Event publishing | Transactional outbox | Insert-then-publish | Atomic with the DB write |
+| Consumer safety | Redis dedup (idempotent) | At-most-once delivery | Survives at-least-once redelivery |
+| Charts | Precomputed `rankings` table | Rank on each request | Avoids full-catalog scan per load |
+| Media upload | Presigned PUT to MinIO | Stream through API | Keeps API servers stateless/cheap |
+| Search freshness | Reindex on publish | CDC on every edit | Simpler; edits are rare vs reads |
+| Auth | Session + Redis | JWT | Immediate revocation |
 
-**POST /api/v1/purchases** first checks Redis for a cached result (instant for retries), then acquires a 30-second lock. The purchase flow validates the request, processes payment, creates database records in a transaction (purchase, user_apps, download count), generates a receipt, caches the result for 24 hours, publishes purchase.completed, and releases the lock.
+## 📈 Scalability: What Breaks First
 
-## Deep Dive: Developer Analytics Dashboard
+1. **Elasticsearch relevance drift.** As the catalog grows, "reindex on publish" leaves edits invisible to search until republish. Fix: outbox → dedicated ES indexer so every metadata change propagates in seconds; shard the index by locale.
+2. **The single RabbitMQ / worker pool.** Review and download volume both flow through one broker. Fix: partition by event type, scale `reviewWorker`/`downloadWorker` as independent consumer groups; at 100M events/day this is where RabbitMQ gives way to Kafka's partitioned log.
+3. **Ranking freshness vs. cost.** Precomputed daily charts feel stale for fast-moving categories. Fix: incremental ranking off the download/review event stream rather than a nightly full recompute.
+4. **Hot app-detail reads.** A featured app's page is read-heavy; Redis cache-aside on app detail + denormalized rating aggregates absorb it, and CDN edge-caching of the (public) detail response is the next step.
 
-### Frontend: Analytics Component
+## 🚀 Closing: What I'd Build Next
 
-> "Analytics data has 1-minute staleness which balances real-time feel with API efficiency. The dashboard shows summary cards for quick KPIs and a time-series chart for trend analysis."
-
-The AppAnalytics component fetches downloads and revenue over time plus summary totals. The UI presents three summary cards (downloads, revenue, rating) above a Recharts line chart showing downloads over the last 30 days with formatted axes and tooltips.
-
-### Backend: Analytics API
-
-> "I'm caching analytics for 5 minutes since developers don't need real-time data - they're looking at trends, not individual transactions."
-
-**GET /api/v1/developer/apps/:id/analytics** verifies app ownership, checks Redis cache, then queries the last 30 days of download and revenue trends grouped by date. Summary metrics aggregate totals in a single query. Results cache for 5 minutes to reduce database load.
-
-## Deep Dive: Developer Review Response
-
-### Frontend: Response Form
-
-> "Developers can respond to reviews which shows users their feedback is heard. The form is collapsed by default to reduce visual clutter, expanding only when the developer wants to engage."
-
-The ResponseForm component toggles between collapsed/expanded states and handles both new responses and edits to existing ones. Mutation invalidates the reviews query to show updated responses immediately.
-
-### Backend: Response API
-
-> "I'm verifying ownership through a JOIN rather than separate queries - this ensures atomic authorization checking."
-
-**POST /api/v1/developer/reviews/:id/respond** validates the response text (10-1000 chars), verifies the review belongs to the developer's app via a single JOIN query, then updates the review with the response and timestamp.
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Search debouncing | ✅ 150ms client-side | ❌ Server throttle | Better UX, reduces latency |
-| Review processing | ✅ Async with queue | ❌ Sync in request | Non-blocking, scales integrity analysis |
-| Purchase idempotency | ✅ Redis + header key | ❌ DB constraint only | Handles concurrent retries |
-| Analytics caching | ✅ 5 min Redis TTL | ❌ Real-time queries | Balance freshness with DB load |
-| Review validation | ✅ Zod on both ends | ❌ Backend only | Fast feedback, security defense |
-| Chart rendering | ✅ Recharts | ❌ Custom Canvas | Development speed, accessibility |
-
-## Future Fullstack Enhancements
-
-1. **Real-time Updates**: WebSocket for live ranking changes
-2. **Optimistic UI**: Show review immediately, reconcile after processing
-3. **GraphQL**: Efficient data fetching for mobile clients
-4. **Server Components**: Next.js RSC for faster initial load
-5. **Edge Caching**: CDN-cached API responses for popular apps
-6. **A/B Testing**: Feature flags for search algorithm experiments
+With more time I'd wire the outbox into an Elasticsearch indexer for near-real-time search freshness, add a real entitlement/purchase layer behind the existing `purchases`/`app_prices` schema (with idempotent checkout keyed on a client UUID), and move chart generation to an incremental job over the event stream. The consistent theme: keep the user-facing paths fast by pushing every expensive, failure-prone operation — integrity scoring, indexing, ranking, media handling — onto the durable async side of the outbox.

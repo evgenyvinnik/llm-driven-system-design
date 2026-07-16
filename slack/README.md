@@ -86,7 +86,7 @@ slack/
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20+
 - Docker and Docker Compose
 - npm or yarn
 
