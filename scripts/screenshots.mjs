@@ -437,14 +437,27 @@ async function setupDatabase(projectDir, projectName, config) {
   }
 
   // Migrations FIRST — an init.sql that recreates tables would otherwise wipe the seed.
+  // Retry: pg_isready (checked above via the container socket) can pass while the host
+  // TCP port mapping isn't fully up yet, so the first migrate can hit ECONNRESET/
+  // ECONNREFUSED. Retrying a few times makes migrate robust to that startup race.
   if (scripts['db:migrate']) {
     logStep('DB', 'Running database migrations...');
-    try {
-      execSync('npm run db:migrate', { cwd: backendDir, stdio: 'pipe' });
-      logSuccess('Migrations complete');
-    } catch (error) {
-      logWarning(`Migration failed: ${error.message}`);
+    let migrated = false;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        execSync('npm run db:migrate', { cwd: backendDir, stdio: 'pipe' });
+        logSuccess('Migrations complete');
+        migrated = true;
+        break;
+      } catch (error) {
+        if (attempt === 5) {
+          logWarning(`Migration failed after ${attempt} attempts: ${error.message}`);
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
     }
+    void migrated;
   }
 
   // Run the project's own seed script when seed.sql is missing, or when seed.sql

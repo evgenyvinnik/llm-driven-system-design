@@ -204,25 +204,30 @@ app.get('/health/ready', async (req: Request, res: Response): Promise<void> => {
 // Rate limiters middleware getter
 export const getRateLimiters = (): RateLimiters | null => rateLimiters;
 
-// Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/videos', videoRoutes);
-app.use('/api/comments', commentRoutes);
-app.use('/api/feed', feedRoutes);
-
-// 404 handler
-app.use((req: Request, res: Response): void => {
-  res.status(404).json({ error: 'Not found' });
-});
-
 // Error interface for typed error handling
 interface AppError extends Error {
   status?: number;
 }
 
-// Error handler with structured logging
-app.use((err: AppError, req: Request, res: Response, _next: NextFunction): void => {
+// Routes and handlers are mounted AFTER the async session middleware (see start()),
+// so req.session is defined for route handlers. Registering them at module load
+// would place them before session middleware in the stack, leaving req.session
+// undefined and every authenticated route failing with "Cannot set properties of
+// undefined (setting 'userId')".
+function mountRoutesAndHandlers(): void {
+  app.use('/api/auth', authRoutes);
+  app.use('/api/users', userRoutes);
+  app.use('/api/videos', videoRoutes);
+  app.use('/api/comments', commentRoutes);
+  app.use('/api/feed', feedRoutes);
+
+  // 404 handler
+  app.use((req: Request, res: Response): void => {
+    res.status(404).json({ error: 'Not found' });
+  });
+
+  // Error handler with structured logging
+  app.use((err: AppError, req: Request, res: Response, _next: NextFunction): void => {
   const requestId = req.requestId || 'unknown';
 
   // Log error with context
@@ -247,7 +252,8 @@ app.use((err: AppError, req: Request, res: Response, _next: NextFunction): void 
     error: message,
     requestId,
   });
-});
+  });
+}
 
 // Graceful shutdown
 const gracefulShutdown = async (signal: string): Promise<void> => {
@@ -283,6 +289,9 @@ async function start(): Promise<void> {
   try {
     await setupSession();
     appLogger.info('Session store connected');
+
+    // Mount routes AFTER session middleware so req.session is available.
+    mountRoutesAndHandlers();
 
     server = app.listen(PORT, () => {
       appLogger.info({
