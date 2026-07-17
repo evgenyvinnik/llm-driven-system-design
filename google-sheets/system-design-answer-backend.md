@@ -233,6 +233,33 @@ That last point is what makes it correct: **undo is not a rewind, it's a new for
 
 **The honest wrinkle:** if Bob has since overwritten the cell Alice is undoing, Alice's undo will overwrite Bob. There is no universally right answer here; real spreadsheets accept this. What matters is that the *behavior is defined* and the operation goes through the same ordered pipeline as everything else, rather than being a special path that bypasses the sequencer.
 
+## 🔒 Authorization, Sharing, and Formula Injection
+
+Authorization in a spreadsheet is deceptively load-bearing, because the mutating path is the WebSocket, not REST — so an auth model that only guards HTTP endpoints protects nothing.
+
+**The sharing model.** A spreadsheet has an owner and a `collaborators` table mapping `user_id → role`, where role is one of **owner / editor / commenter / viewer**. Access is checked at two points: once when a client opens the WebSocket (reject the connection outright if the user has no role on the sheet), and again — this is the part people miss — **on the sequencer's hot path for every mutating operation**. The sequencer is already the single point every op flows through, which makes it the natural and only correct place to enforce "can this user edit at all," and later "can this user edit *this range*."
+
+> "The trap is doing the authorization check as a database round-trip per keystroke — that would put a 2ms Postgres read in front of the one process that serializes the entire sheet, and turn the correctness device into a latency bottleneck. Instead the sequencer holds the sheet's ACL in memory alongside its cell and dependency state, refreshed only when a share actually changes. Auth becomes a hash lookup on the hot path, not an I/O. The cost is that a revoked collaborator can linger for the refresh window — acceptable, because the blast radius is one sheet and the fix is a targeted cache bust on the share-change event."
+
+**Protected ranges** are the same idea one level finer: instead of a sheet-level yes/no, the sequencer consults a per-range rule before applying a coordinate. It's deferred in this design, but it lives in exactly one place — which is the whole point of routing every op through a single owner.
+
+**Formula injection is a real attack surface, not a footnote.** `raw_value` is untrusted user input that the server *evaluates*. Any implementation that reaches for language `eval()` on that string (the kind of shortcut a demo takes for `=5+3*2`) is a remote-code-execution hole. The production formula engine must be a **sandboxed evaluator over a whitelist of functions** — it parses to an AST it controls, never executes arbitrary host code, bounds recursion/iteration to stop a `=SUM` over a giant range from becoming a DoS, and treats cross-sheet references as authorization checks (a `VLOOKUP` into a sheet you can't read must not leak its values). Server-authoritative evaluation is what makes this enforceable at all: there's one trusted evaluator, not fifty browsers.
+
+**Idempotency pairs with the log.** Every `CELL_EDIT` carries a client-generated op id. On reconnect a client replays its unacknowledged ops; the sequencer dedupes by op id so a replayed edit produces exactly one log entry. That client-id dedup stops duplicate *log entries*; the UPSERT keyed on `(sheet_id, row, col)` stops duplicate *state*. Two layers, two different failure modes — a network retry can neither double-append nor double-apply.
+
+## 🚀 The Read Path: Opening a 100,000-Cell Sheet Fast
+
+The write path gets all the attention, but the read path has its own trap: a popular sheet is opened far more often than it's edited, and a cold open must paint fast.
+
+| Concern | How it's handled |
+|---------|------------------|
+| Don't evaluate on open | `computed_value` is denormalized alongside `raw_value`, so opening a sheet with 100K formulas is 100K reads, not 100K evaluations. This is why the denormalization earns its keep despite the drift risk |
+| Don't ship the whole grid | Cells load **paged by row range** (`GET /api/sheets/:id/cells?rows=1-200`), and because storage is sparse, a row range is a contiguous slice of the `(sheet_id, row, col)` index — an index range scan, not a full-sheet fetch |
+| Don't hit Postgres for hot sheets | Active sheets are cached in Redis; the sequencer already holds the authoritative state in memory, so a warm open can be served without touching the database at all |
+| Don't serve stale after a cold open | Postgres lags the log by up to ~1s, so a cold read replays the **log tail** past the last materialized checkpoint before handing the client a `SYNC` — durability from the log, freshness from replaying it |
+
+> "The read path is where the storage inversion pays a second dividend. Because the sequencer holds live state and the log holds truth, the database is free to be *only* a fast-load cache for inactive sheets — it never has to be current, only close. That's what lets a viewer-heavy sheet scale: a read-only viewer doesn't join the collaborative session at all, it gets a CDN-cached snapshot of `computed_value`s plus a low-frequency update channel, and never consumes a sequencer slot meant for the ~50 people actually editing."
+
 ## 🛠️ Failure Handling
 
 | Failure | Behavior |

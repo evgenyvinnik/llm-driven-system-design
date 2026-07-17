@@ -72,7 +72,7 @@ An electronic signature platform with document workflow automation. Core challen
 
 ### 1. Document Processing
 
-The document pipeline handles PDF upload, validation, page image rendering for the field placement UI, and field coordinate storage. Documents are validated using pdf-lib to verify PDF integrity before storage. Page images are rendered server-side and stored in S3 for the web-based field placement interface.
+The document pipeline handles PDF upload, validation, page rendering for the field placement UI, and field coordinate storage. On upload, documents are validated and page-counted with pdf-lib (`backend/src/routes/documents.ts`) and the raw PDF is stored in MinIO. Page rendering for both the field-placement UI and the signing ceremony is done **client-side** with react-pdf (a PDF.js wrapper); fields are absolutely-positioned overlays keyed to page coordinates. (A production system might pre-render page images server-side to S3, but this implementation renders in the browser.)
 
 Field types include signature, initial, date, text, and checkbox. Each field is positioned at specific coordinates on a page and assigned to a recipient. Required fields must be completed before a recipient can finish their signing session.
 
@@ -342,7 +342,6 @@ For electronic signatures, idempotency is legally critical. A duplicate signatur
 - Recipient completion and workflow advancement run in a single transaction
 
 **Eventual Consistency:**
-- Audit log indexing in Elasticsearch lags by <1 second
 - Redis session/idempotency cache invalidation propagates within 100ms
 - Notification delivery is async via RabbitMQ (at-least-once semantics)
 
@@ -455,7 +454,6 @@ Opossum circuit breakers protect MinIO/S3 storage operations. Configuration: 30-
 | Redis down | Idempotency falls back to PostgreSQL-only checks |
 | RabbitMQ down | Notifications sent synchronously (slower but functional) |
 | MinIO down | Circuit breaker opens; existing documents served from cache |
-| Elasticsearch down | Audit search falls back to PostgreSQL ILIKE queries |
 
 ## Scalability Considerations
 

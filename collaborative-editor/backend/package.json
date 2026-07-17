@@ -4,7 +4,7 @@
   "description": "Backend server for collaborative text editor",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "PORT=3001 tsx watch src/index.ts",
     "dev:server1": "PORT=3001 SERVER_ID=server1 tsx watch src/index.ts",
     "dev:server2": "PORT=3002 SERVER_ID=server2 tsx watch src/index.ts",
     "dev:server3": "PORT=3003 SERVER_ID=server3 tsx watch src/index.ts",

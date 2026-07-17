@@ -1,121 +1,62 @@
-# r/place - Collaborative Real-time Pixel Canvas - Development with Claude
+# r/place — Collaborative Real-time Pixel Canvas — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing a collaborative real-time pixel art canvas where users can place colored pixels with rate limiting.
+A shared pixel canvas: every user can place one colored pixel at a time (subject to a cooldown), and every placement must appear on everyone else's screen in near-real-time. The hard problems are all about *fan-out and hot state* — a single canvas is a global shared object that thousands of clients read and write concurrently, so the design lives or dies on how fast a write propagates and how cheaply the canvas can be read.
 
-## Key Challenges to Explore
+**Learning goals:** real-time synchronization (WebSocket + pub/sub) across horizontally-scaled servers, atomic hot-state storage in Redis, race-free rate limiting, and keeping durable history off the write hot path.
 
-1. Real-time pixel synchronization across millions of users
-2. Rate limiting at scale
-3. Canvas state storage and persistence
-4. Efficient broadcast of pixel updates
-5. Canvas history and timelapse generation
-6. Handling concurrent pixel placements
+## Architecture at a Glance (what actually runs)
 
-## Development Phases
+Three infrastructure services in `docker-compose.yml`, each with a sharply different job:
 
-### Phase 1: Requirements and Design
-*Completed*
+| Store | Role | Why this one |
+|-------|------|--------------|
+| **Valkey/Redis** (`ioredis`) | Canvas byte array (`SETRANGE`), rate-limit cooldowns, sessions, **and pub/sub** for cross-server broadcast | In-memory + atomic byte ops = the only thing fast enough for the read/write hot path; pub/sub fans placements to every server |
+| **PostgreSQL** (`pg`) | Pixel-event history + snapshots (durable record for timelapse/analytics) | The provable "who placed what, when" log — durability the ephemeral canvas doesn't provide |
+| **RabbitMQ** (`amqplib`) | Queue of pixel events consumed by the persistence worker | Decouples durable writes from the WebSocket path so a DB slowdown never stalls pixel placement |
 
-**Outcomes:**
-- Defined functional requirements: shared canvas, real-time updates, rate limiting, color palette, history
-- Target scale: 500x500 canvas for local development, designed for horizontal scaling
-- Technology stack chosen: React/Zustand frontend, Express/WebSocket backend, Redis for state, PostgreSQL for history
+Backend: Express + a `ws` WebSocket server (`websocket.ts`), routes `auth`/`canvas`, services `canvas`/`redis`/`database`/`auth`, a standalone `workers/persistence-worker.ts`, shared `circuitBreaker` (Opossum), `metrics` (prom-client), `logger` (pino). Frontend: React 19 + Zustand + Tailwind, HTML5 Canvas with zoom/pan, 16-color palette, cooldown timer. Runs as 1–3 instances (`dev:server1..3`).
 
-### Phase 2: Initial Implementation
-*In progress*
+## Key Design Decisions
 
-**Completed:**
-- Express backend with TypeScript
-- WebSocket server with Redis pub/sub for real-time updates
-- Canvas state stored in Redis as byte array
-- Rate limiting with Redis TTL keys
-- PostgreSQL for pixel event history and snapshots
-- Session-based authentication (including anonymous guests)
-- React frontend with Zustand state management
-- Interactive canvas with zoom/pan
-- 16-color palette
-- Cooldown timer UI
+### 1. Canvas as a single Redis byte array, updated with SETRANGE
+The 500×500 canvas is one Redis value (250 KB, one byte per pixel = a palette index). A placement is `SETRANGE canvas:main (x + y*width) colorByte` — an atomic byte write, no read-modify-write, no lock. A full read is a single `GET`. Trade-off given up: a single key can't be sharded, so a much larger canvas would need a tile-based scheme (many keys) — but at this size one key is simplest and fastest, and there's no concurrency bug possible on an atomic single-byte write.
 
-**Focus areas:**
-- Implement core functionality
-- Get something working end-to-end
-- Validate basic assumptions
+### 2. WebSocket for clients + Redis pub/sub between servers
+Clients hold a WebSocket; when a pixel lands, the receiving server writes Redis then `PUBLISH`es to `canvas:updates`, and *every* server (subscribed to the same channel) pushes it to its own connected clients. This makes horizontal scaling linear — a new server just subscribes and serves its own sockets. Why not Kafka: pixel updates are ephemeral; a client that missed updates just refetches the whole 250 KB canvas on reconnect, so Kafka's durable, ordered streams buy nothing but broker/partition/offset operational cost. What we give up: pub/sub has no replay, so a disconnected client has a gap — mitigated by the full-canvas refetch on reconnect.
 
-### Phase 3: Scaling and Optimization
-*Not started*
+### 3. Rate limiting via `SET NX EX` cooldown
+The per-user cooldown is a single atomic `SET cooldown:{userId} 1 NX EX {seconds}`: it succeeds only if no key exists, and auto-expires. That check-and-set is race-free without a lock, so two rapid clicks can't both slip through. Trade-off: it's a simple fixed cooldown, not a sliding window or token bucket — fine for "one pixel every N seconds," but a burst-tolerant policy would need a different structure.
 
-**Focus areas:**
-- Add caching layer
-- Optimize database queries
-- Implement load balancing
-- Add monitoring
+### 4. Async, batched persistence off the hot path
+Placement writes Redis and enqueues a pixel event to RabbitMQ; the persistence worker consumes and **batch-inserts** (100 events / 1s window) into Postgres. The WebSocket path never touches Postgres, so history durability and analytics can't slow down or fail pixel placement. Trade-off: history is eventually-consistent with the live canvas (up to a batch window behind) — acceptable because the canvas of record is Redis and Postgres is for replay/timelapse, not live rendering.
 
-### Phase 4: Polish and Documentation
-*Not started*
+### 5. Session auth with anonymous guests
+Redis-backed sessions (bcryptjs, cookie-parser) plus an anonymous-guest path (`POST /api/auth/anonymous`) that mints a session with a unique user ID. Lowering the friction to place a pixel is the whole point of r/place. Trade-off: anonymous identities don't persist across sessions, so cooldown evasion by dropping a session is possible — accepted for a demo.
 
-**Focus areas:**
-- Complete documentation
-- Add comprehensive tests
-- Performance tuning
-- Code cleanup
+## Current State
 
-## Design Decisions Log
+Implemented end to end: Express + `ws` WebSocket server, canvas stored as a Redis byte array with atomic `SETRANGE`, cross-server broadcast via Redis pub/sub, `SET NX EX` cooldown rate limiting, session auth with anonymous guests, RabbitMQ + batching persistence worker writing pixel history to Postgres, Opossum circuit breakers, Prometheus metrics (incl. circuit-breaker state and persistence counters), pino logging, and a React canvas UI with zoom/pan, 16-color palette, and a live cooldown timer. Seed data creates `alice`/`bob` (+ an admin) with password `password123`. Runs as 1–3 instances behind the same Redis channel.
 
-### Canvas Storage (Redis)
-**Decision:** Store canvas as a single byte array in Redis using SETRANGE for atomic pixel updates.
-**Rationale:** Simple, fast, atomic operations. 500x500 = 250KB fits easily in memory. Can use GETRANGE for efficient partial reads if needed.
-**Trade-off:** Single key limits sharding; for larger canvases, would need tile-based approach.
+Intentionally omitted / simulated: a timelapse viewer UI, canvas moderation/reset tooling, WebSocket message batching for extreme update rates, a tile-sharded canvas for larger dimensions, and multi-region. The canvas is fixed at 500×500 locally.
 
-### Real-time Updates (WebSocket + Redis Pub/Sub)
-**Decision:** WebSocket connections for clients, Redis pub/sub for cross-server coordination.
-**Rationale:** WebSocket provides efficient bidirectional communication. Redis pub/sub allows multiple server instances to broadcast updates.
-**Trade-off:** Each WebSocket server subscribes to the same channel, creating redundant processing.
+## Iteration & Repair Log
 
-### Rate Limiting (Redis TTL)
-**Decision:** Use Redis SET with NX and EX flags for atomic check-and-set cooldown.
-**Rationale:** Atomic operation prevents race conditions. TTL auto-expires keys.
-**Trade-off:** Simple per-user limiting; more complex patterns (sliding window) would need different approach.
+- **2026-07 (CLAUDE.md rewrite):** Replaced the template phase checklist (Phase 3 "Scaling" / Phase 4 "Polish" marked *Not started* while the features were already built) with an accurate Current State plus the Architecture table and this log. Added the RabbitMQ + persistence-worker decision the old file omitted. Kept the (correct) canvas-storage, pub/sub, rate-limit, and auth reasoning.
+- **Persistence worker:** confirmed to batch-insert pixel events (batch 100 / 1s) from RabbitMQ into Postgres — a durability path deliberately kept off the WebSocket hot path.
+- **Repo-wide fixes that touched this project:** schema-apply via `db/migrate.ts` + `npm run db:migrate` (also mounted at `docker-entrypoint-initdb.d`) and `db:seed`; seed users normalized to `password123`; DB/Redis/RabbitMQ connection-string fallbacks to the docker-compose creds (`rplace`/`rplace_dev`, RabbitMQ `guest:guest`); `pino`/pino-pretty logging.
+- **CI:** the repo-wide smoke-test workflow was removed (no Docker services in CI).
 
-### Authentication
-**Decision:** Session-based auth with Redis session storage, plus anonymous guest option.
-**Rationale:** Simple for learning project. Anonymous option reduces friction.
-**Trade-off:** No persistent identity for anonymous users across sessions.
+## Open Questions
 
-## Iterations and Learnings
+1. Should high-frequency WebSocket updates be batched (coalesce N placements into one frame) to cut client render churn during a hot event?
+2. What's the optimal snapshot interval for timelapse — periodic full-canvas snapshots vs. replaying the pixel-event log, and where does each win on storage vs. reconstruction cost?
+3. Every server processes every pub/sub message even for pixels no local client is viewing — at what scale does viewport-scoped subscription (or regional channels) become worth the complexity?
+4. Anonymous guests can evade cooldown by dropping their session — is IP/device fingerprinting worth it, or does that undermine the low-friction design?
 
-### Iteration 1: Initial Implementation
-- Built complete backend with Express, WebSocket, Redis, PostgreSQL
-- Frontend with React, Zustand, Tailwind CSS
-- Canvas rendering with HTML5 Canvas element
-- Real-time pixel updates working via Redis pub/sub
+## Resources
 
-## Questions and Discussions
-
-### Open Questions
-1. Should we batch WebSocket messages for high-frequency updates?
-2. What's the optimal snapshot interval for timelapse generation?
-3. How to handle canvas reset/moderation actions?
-
-## Resources and References
-
-- [Reddit's r/place technical blog post](https://www.reddit.com/r/place)
-- [WebSocket scaling patterns](https://www.nginx.com/blog/websocket-nginx/)
-- [Redis pub/sub documentation](https://redis.io/docs/manual/pubsub/)
-
-## Next Steps
-
-- [x] Define detailed requirements
-- [x] Sketch initial architecture
-- [x] Choose technology stack
-- [x] Implement MVP
-- [ ] Test and iterate
-- [ ] Add admin interface
-- [ ] Implement timelapse viewer
-- [ ] Add monitoring/observability
-- [ ] Load testing
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings.*
+- [Reddit r/place: how we built it](https://www.reddit.com/r/place/)
+- [Redis SETRANGE / bitfields](https://redis.io/commands/setrange/) and [Pub/Sub](https://redis.io/docs/manual/pubsub/)
+- [Opossum circuit breaker](https://nodeshift.dev/opossum/)

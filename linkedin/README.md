@@ -49,8 +49,9 @@ A simplified LinkedIn-like platform demonstrating professional social graphs, co
 - **Frontend:** TypeScript + Vite + React 19 + TanStack Router + Zustand + Tailwind CSS
 - **Backend:** Node.js + Express + TypeScript
 - **Database:** PostgreSQL
-- **Cache:** Redis
-- **Search:** Elasticsearch
+- **Cache:** Redis / Valkey
+- **Search:** Elasticsearch (user + job full-text/fuzzy search)
+- **Messaging:** RabbitMQ (feed fan-out, search indexing, notifications)
 - **Containerization:** Docker Compose
 
 ## Quick Start
@@ -64,7 +65,7 @@ A simplified LinkedIn-like platform demonstrating professional social graphs, co
 ### 1. Start Infrastructure
 
 ```bash
-# Start PostgreSQL, Redis, and Elasticsearch
+# Start PostgreSQL, Redis, Elasticsearch, and RabbitMQ
 docker-compose up -d
 
 # Wait for services to be healthy (about 30 seconds)
@@ -78,6 +79,9 @@ cd backend
 
 # Install dependencies
 npm install
+
+# Apply the schema (idempotent; also auto-applied via docker-entrypoint-initdb.d on a fresh volume)
+npm run db:migrate
 
 # Seed the database with test data
 npm run seed

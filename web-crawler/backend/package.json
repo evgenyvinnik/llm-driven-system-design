@@ -5,7 +5,7 @@
   "main": "dist/server.js",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "PORT=3001 tsx watch src/server.ts",
     "dev:server1": "PORT=3001 tsx watch src/server.ts",
     "dev:server2": "PORT=3002 tsx watch src/server.ts",
     "dev:server3": "PORT=3003 tsx watch src/server.ts",

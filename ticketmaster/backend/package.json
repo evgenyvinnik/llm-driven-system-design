@@ -4,7 +4,7 @@
   "description": "Event ticketing platform backend",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "PORT=3001 tsx watch src/index.ts",
     "dev:server1": "PORT=3001 tsx watch src/index.ts",
     "dev:server2": "PORT=3002 tsx watch src/index.ts",
     "dev:server3": "PORT=3003 tsx watch src/index.ts",

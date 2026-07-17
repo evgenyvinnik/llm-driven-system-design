@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "NODE_ENV=development tsx watch src/index.ts",
+    "dev": "PORT=3001 NODE_ENV=development tsx watch src/index.ts",
     "dev:server1": "PORT=3001 npm run dev",
     "dev:server2": "PORT=3002 npm run dev",
     "dev:server3": "PORT=3003 npm run dev",

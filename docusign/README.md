@@ -94,10 +94,10 @@ Frontend runs on http://localhost:5173
 
 Open http://localhost:5173 in your browser.
 
-**Test Accounts:**
-- Admin: `admin@docusign.local` (any password)
-- User: `alice@example.com` (any password)
-- User: `bob@example.com` (any password)
+**Test Accounts** (all use password `password123`):
+- Admin: `admin@docusign.local` / `password123`
+- User: `alice@example.com` / `password123`
+- User: `bob@example.com` / `password123`
 
 ## Running Without Docker
 
@@ -110,7 +110,7 @@ If you prefer to run services natively:
 brew install postgresql@16
 brew services start postgresql@16
 createdb docusign
-psql docusign < backend/db/init.sql
+psql docusign < backend/src/db/init.sql
 ```
 
 Set environment variables:

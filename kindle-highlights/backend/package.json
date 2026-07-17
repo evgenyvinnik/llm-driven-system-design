@@ -4,7 +4,7 @@
   "description": "Backend for Kindle Community Highlights platform",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm:dev:*\"",
+    "dev": "PORT=3001 concurrently \"npm:dev:*\"",
     "dev:highlight": "tsx watch src/highlight/index.ts",
     "dev:sync": "tsx watch src/sync/index.ts",
     "dev:aggregation": "tsx watch src/aggregation/index.ts",

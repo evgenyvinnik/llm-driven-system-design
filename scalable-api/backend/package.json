@@ -4,6 +4,7 @@
   "description": "Scalable API backend with gateway, load balancer, and API servers",
   "type": "module",
   "scripts": {
+    "dev": "npm run dev:all",
     "dev:gateway": "tsx watch gateway/src/index.ts",
     "dev:lb": "tsx watch load-balancer/src/index.ts",
     "dev:server1": "PORT=3001 INSTANCE_ID=api-1 tsx watch api-server/src/index.ts",

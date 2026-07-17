@@ -125,14 +125,9 @@ When two users edit the same cell simultaneously, the last write persists. This 
 
 ### Formula Calculation Engine
 
-Formulas (cells starting with `=`) are parsed and evaluated with dependency tracking:
+**What is actually implemented (local):** `src/websocket/formula-handler.ts` evaluates a cell value server-side when it starts with `=`. It supports the aggregate functions `SUM`, `AVERAGE`, `COUNT`, `MIN`, `MAX` over **literal comma-separated numeric arguments** (e.g. `=SUM(1,2,3)` → `6`, `=AVERAGE(2,4,6)` → `4`) and simple arithmetic (`=5+3*2` → `11`, evaluated via a `Function()` expression). It returns Excel-style error strings (`#ERROR`, `#DIV/0!`, `#VALUE!`) on failure. This is a **stateless per-value evaluator**: it does **not** resolve cell references (`A1`, `A1:A10`), builds no dependency graph, and does no cascade recalculation — each formula is computed only from the literals inside it.
 
-1. **Parsing** -- Extract cell references from the formula string (e.g., `=SUM(A1:A10)` references cells A1 through A10)
-2. **Dependency graph** -- Build a DAG of cell dependencies. When cell A1 changes, all cells that reference A1 are recalculated.
-3. **Topological evaluation** -- Process the dependency graph in topological order to ensure dependent cells are evaluated after their dependencies.
-4. **Circular reference detection** -- Detect cycles in the dependency graph and display an error instead of infinite looping.
-
-At production scale, the formula engine runs as a separate service to avoid blocking the WebSocket event loop. Heavy calculations (large range operations across thousands of cells) are offloaded to worker threads or a dedicated computation cluster.
+**Production-ideal (not built here):** a real spreadsheet engine parses cell references, builds a **DAG of cell dependencies**, evaluates in **topological order** so dependents compute after their inputs, and performs **circular-reference detection** to avoid infinite loops. At scale that engine runs as a separate service (off the WebSocket event loop), with heavy range operations offloaded to worker threads. Integrating a library such as HyperFormula would provide this cell-reference + dependency-tracking behavior; the current code is a deliberate demo stand-in.
 
 ### Virtualized Grid Rendering
 

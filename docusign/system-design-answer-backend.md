@@ -461,52 +461,13 @@
 
 ### Authentication Levels
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                  Authentication Methods                              │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  email          ──▶  Email link with access token (default)         │
-│  sms            ──▶  6-digit code sent via SMS                      │
-│  knowledge      ──▶  Knowledge-based questions                      │
-│  id_verification──▶  Government ID verification                     │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The envelope's `authentication_level` supports a ladder of assurance, from lightest to strongest:
 
-### SMS Verification Flow
+- **email** (default, and the level actually enforced): recipient authenticates by clicking an email link carrying a unique per-recipient access token. Account-less — the signer never registers.
+- **sms**: a 6-digit code is generated, stored in Redis with a 5-minute expiry, and sent via an SMS provider; the recipient must enter it before the signing session is minted. Each send/verify is an audit event.
+- **knowledge / id_verification**: knowledge-based questions or a government-ID check, delegated to a third-party identity provider for high-value agreements.
 
-```
-┌────────────────────┐
-│ Recipient requests │
-│ signing access     │
-└─────────┬──────────┘
-          │
-          ▼
-┌────────────────────┐                    ┌────────────────────┐
-│ Generate 6-digit   │───────────────────▶│ Store in Redis     │
-│ random code        │                    │ 5-minute expiry    │
-└─────────┬──────────┘                    └────────────────────┘
-          │
-          ▼
-┌────────────────────┐                    ┌────────────────────┐
-│ Send SMS via       │───────────────────▶│ Log audit event:   │
-│ provider           │                    │ sms_verification_  │
-└─────────┬──────────┘                    │ sent               │
-          │                               └────────────────────┘
-          ▼
-┌────────────────────┐
-│ Recipient enters   │
-│ code               │
-└─────────┬──────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────────────┐
-│ Compare with stored code                                        │
-│ ├── Match: delete key, log success, return authenticated       │
-│ └── No match: log failure, return error                        │
-└────────────────────────────────────────────────────────────────┘
-```
+> "I'd gate the second factor *before* minting the signing session, not per-field — once a signer is authenticated for an envelope, re-challenging on every field would be hostile. The access token proves possession of the link; the SMS/KBA step proves the person. For most business e-signature flows, email-link possession is the accepted bar, which is why it's the default."
 
 ---
 

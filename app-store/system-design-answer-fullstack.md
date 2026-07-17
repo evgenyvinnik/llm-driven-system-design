@@ -8,11 +8,14 @@ Design an app marketplace like the App Store: developers publish apps with rich 
 
 ## 🎯 Requirements Clarification
 
-- **Scope:** discovery (search + charts), app detail, reviews with integrity, and the developer publish lifecycle. Commerce (paid purchases, subscriptions, payouts) I'll treat as an entitlement layer behind an interface — most apps are free and the interesting problems are discovery and trust.
-- **Consistency bar:** app metadata and reviews can be eventually consistent (seconds); a developer publishing an app should see it live quickly; download entitlement must be exact.
+Questions I'd ask before drawing anything:
+
+- **Scope of commerce?** Most apps are free; I'll treat paid purchases, subscriptions, and payouts as an entitlement layer behind an interface and spend my time on discovery and trust, which is where the system's real difficulty lives.
+- **Freshness expectations?** App metadata and reviews can be eventually consistent (seconds). A developer publishing an app should see it searchable quickly. Download entitlement must be exact.
+- **Who are the users?** Two personas with different apps: consumers (search/browse/review) and developers (publish/manage/analytics). The frontend serves both from one codebase.
 
 ### Functional Requirements
-- Search with filters + category browse + precomputed charts (Top Free/Paid/Grossing)
+- Search with filters + category browse + precomputed charts (Top Free / Paid / Grossing)
 - App detail: metadata, screenshots, ratings, reviews
 - Reviews: submit, vote helpful, developer response, integrity gating
 - Developer portal: create/update app, upload media, submit, publish, analytics
@@ -52,7 +55,48 @@ Design an app marketplace like the App Store: developers publish apps with rich 
 └────────────┘             └────────────────────────────────┘
 ```
 
-Two disciplines meet here: a **read path** optimized with Elasticsearch + Redis for discovery, and a **write path** that uses Postgres as the source of truth and a transactional outbox to hand work to RabbitMQ workers. The API servers are stateless; all durable state and all async work live behind them.
+Two disciplines meet here: a **read path** optimized with Elasticsearch + Redis for discovery, and a **write path** that uses Postgres as the source of truth and a transactional outbox to hand work to RabbitMQ workers. The API servers are stateless; all durable state and all async work live behind them, which is what lets the API tier scale by just adding instances.
+
+## 💾 Data Model
+
+Described as tables rather than DDL:
+
+| Table | Key columns | Notes |
+|-------|-------------|-------|
+| users | id (UUID), email (unique), username (unique), role | role: user / developer / admin |
+| developers | id, user_id (unique FK), name, verified | one per user who publishes |
+| apps | id, bundle_id (unique), developer_id, category_id, status, download_count, rating_sum, rating_count, average_rating | status: draft → pending → published; rating aggregates denormalized |
+| app_screenshots | id, app_id (FK), url, device_type, sort_order | URLs point at MinIO objects |
+| reviews | id, user_id, app_id, rating, title, body, integrity_score, status, developer_response | status: pending → published / rejected |
+| review_votes | id, review_id, user_id, helpful | UNIQUE(review_id, user_id) — one vote per user |
+| rankings | (date, country, category, rank_type, app_id) PK | precomputed charts |
+| download_events | id, app_id, user_id, country, device_type | append-only; aggregated by worker |
+| user_apps | (user_id, app_id) PK, download_count | the entitlement / "has downloaded" record |
+| event_outbox | id, event_type, payload (JSONB), published | the reliable-publish table |
+| purchases / app_prices | — | schema present; no checkout API yet (future commerce layer) |
+
+The two design notes I'd call out: **denormalized rating aggregates** on `apps` (so app detail is one row, not an aggregate over the review table), and the **outbox** table that makes async work reliable.
+
+## 🔌 API Design
+
+```
+GET  /api/v1/apps                     → list / browse
+GET  /api/v1/apps/top                 → precomputed charts
+GET  /api/v1/apps/search?q=&category= → Elasticsearch + re-rank
+GET  /api/v1/apps/suggest?q=          → typeahead suggestions
+GET  /api/v1/apps/:id                 → detail (cached)
+POST /api/v1/apps/:id/download        → entitlement + count event
+GET  /api/v1/apps/:appId/reviews      → paginated, published only
+POST /api/v1/apps/:appId/reviews      → submit (async integrity)
+POST /api/v1/reviews/:id/vote         → helpful / not-helpful
+POST /api/v1/reviews/:id/respond      → developer response
+POST /api/v1/developer/apps           → create (draft)
+GET  /api/v1/developer/apps/:id/upload-url → presigned MinIO PUT
+POST /api/v1/developer/apps/:id/publish    → publish + index
+GET  /api/v1/developer/apps/:id/analytics  → downloads/revenue trends
+```
+
+Reads are public and cacheable; writes require the session cookie, and developer routes add a `requireDeveloper` role check.
 
 ## 🔧 Deep Dive 1: End-to-End Search with Quality Re-Ranking
 
@@ -75,7 +119,7 @@ SearchBar ──GET /apps/search?q=photo+editor──▶ API
 Render results (skeleton → list)
 ```
 
-**Frontend discipline.** The input keeps two states: the immediate value (drives the text field) and a debounced value (drives the request), so typing never blocks on the network. A stale-while-revalidate cache keeps repeated queries instant and shows the last good results while the new ones load, so the list never flashes empty. Suggestions are typed by kind (app / developer / category) so the dropdown communicates *what* each hit is.
+**Frontend discipline.** The input keeps two states: the immediate value (drives the text field) and a debounced value (drives the request), so typing never blocks on the network. A stale-while-revalidate cache keeps repeated queries instant and shows the last good results while new ones load, so the list never flashes empty. Suggestions are typed by kind (app / developer / category) so the dropdown communicates *what* each hit is.
 
 **Backend discipline — why re-rank instead of trusting Elasticsearch's `_score`?**
 
@@ -111,9 +155,18 @@ ReviewForm  ──POST /apps/:id/reviews──▶  Review API
 
 > "The naive version inserts the review, then publishes `review.created` to RabbitMQ. Those are two systems and you cannot make both commit atomically — if the process dies between the Postgres commit and the publish, the review is saved but its integrity job never runs, so it sits `pending` forever and is invisible. The transactional outbox writes the event into an `event_outbox` table *inside the same Postgres transaction* as the review insert. Either both land or neither does. A relay then reads unpublished rows and pushes them to RabbitMQ, marking them sent. The price is at-least-once delivery — the relay can publish a row twice if it crashes after publishing but before marking it — so `reviewWorker` dedups on the event id in Redis before doing work. I'd rather pay idempotency-on-the-consumer than risk silently losing events."
 
-**The integrity score itself** is a weighted sum of six signals the worker computes: review velocity (0.15 — many reviews in 24h looks like spam), content quality (0.25 — generic phrases like "great app" score low, specifics like "fixed the crash on launch" score high), account age (0.1), verified download (0.2 — did this user actually install the app?), coordination (0.2 — a review count spiking to 5× the app's baseline flags review-bombing), and originality (0.1). Below ~0.3 the review is rejected, mid-range flags for manual review, above ~0.6 publishes. It's deliberately heuristic — false positives happen (a genuine one-liner scores low) — because synchronous ML scoring would block the write and full ML detection is out of scope.
+**The integrity score** is a weighted sum of six signals the worker computes:
 
-**Frontend closes the loop:** the form shows the review as "submitted, pending review" immediately (optimistic-ish), and the app's review list refetches when the worker publishes. Error states are specific — 403 "download the app first," 409 "you already reviewed this."
+- **Review velocity** (0.15) — many reviews from one account in 24h looks like spam
+- **Content quality** (0.25) — generic phrases ("great app") score low; specifics ("fixed the launch crash") score high
+- **Account age** (0.1) — brand-new accounts are discounted
+- **Verified download** (0.2) — did this user actually install the app? (checks `user_apps`)
+- **Coordination** (0.2) — a review count spiking to 5× the app's baseline flags review-bombing
+- **Originality** (0.1) — duplicate / near-duplicate text is penalized
+
+Below ~0.3 the review is rejected, mid-range flags for manual review, above ~0.6 publishes. It's deliberately heuristic — false positives happen (a genuine one-liner scores low) — because synchronous ML scoring would block the write and full ML detection is out of scope.
+
+**Frontend closes the loop:** the form shows the review as "submitted, pending review" immediately, and the app's review list refetches when the worker publishes. Error states are specific — 403 "download the app first," 409 "you already reviewed this."
 
 ## 🔧 Deep Dive 3: The Developer Publish Pipeline
 
@@ -133,9 +186,38 @@ App is live
 
 **Why presigned uploads?** App icons and screenshots (and, at scale, multi-hundred-MB packages) should never stream through the API servers — that ties up request-handling capacity and memory on binary I/O.
 
-> "The editor asks the API for a presigned PUT URL, then uploads the media directly to MinIO. The API only ever handles the small metadata request and stores the resulting object key. Small icons can go through a `multipart` endpoint for convenience, but anything large takes the presigned path. The trade-off is a two-step client flow — get URL, then PUT — and the client has to handle a partial upload (URL issued, PUT failed). But it keeps the API servers stateless and cheap to scale horizontally, which is the whole point of putting object storage behind them."
+> "The editor asks the API for a presigned PUT URL, then uploads the media directly to MinIO. The API only ever handles the small metadata request and stores the resulting object key. Small icons can go through a multipart endpoint for convenience, but anything large takes the presigned path. The trade-off is a two-step client flow — get URL, then PUT — and the client has to handle a partial upload (URL issued, PUT failed). But it keeps the API servers stateless and cheap to scale horizontally, which is the whole point of putting object storage behind them."
 
 **Publish is the consistency moment:** flipping `status` to `published` in Postgres and indexing the document in Elasticsearch are two writes to two systems. Locally that's done inline on publish; at scale it's the same outbox pattern as reviews — write `app.published` to the outbox in the publish transaction, let an indexer consume it — so a crash between the DB flip and the ES index can't leave an app "published but unsearchable."
+
+## 📱 Frontend State & Data Flow
+
+| State | Contents | Source |
+|-------|----------|--------|
+| Session store (Zustand) | current user, role | REST `/auth/me` |
+| Server cache (stale-while-revalidate) | apps, search results, reviews, analytics | REST, keyed by query |
+| Local component state | form inputs, modals, star-rating widget | user interaction |
+
+The split matters: **consumer** views are read-mostly and lean on the server cache with generous stale times (charts change slowly); **developer** views are write-heavy (create app, upload, publish) and invalidate the relevant cache keys after each mutation so the dashboard reflects reality immediately. Role gating happens twice — the router hides developer routes from non-developers for UX, and the API enforces `requireDeveloper` because client checks are advisory, not security.
+
+## 🛡️ Idempotency & Failure Handling
+
+- **Consumer idempotency:** every worker dedups on the event id in Redis before acting, so RabbitMQ's at-least-once redelivery can't double-score a review or double-count a download.
+- **Circuit breakers (Opossum):** calls to fragile dependencies fail fast; search falls back to a simpler Postgres query rather than hanging the request when Elasticsearch is degraded.
+- **Graceful degradation order:** Postgres is the source of truth — if it committed, it happened. Elasticsearch down → search degrades, browse/detail still work. RabbitMQ down → the outbox retains rows and the relay drains them on recovery, so no event is lost, only delayed.
+- **Idempotent writes:** review submission rejects duplicates by `(user_id, app_id)`; the future purchase layer would key on a client-generated UUID with a UNIQUE constraint as the durable backstop.
+
+## 📊 Observability
+
+| Signal | Why it matters |
+|--------|----------------|
+| Search latency histogram (p50/p95) | The core discovery SLO; regression is felt immediately |
+| Review-worker lag (outbox age) | If the outbox backs up, reviews stay `pending` — a visible trust failure |
+| Integrity score distribution | A sudden shift flags either an attack or a scoring bug |
+| Download-event throughput | The business heartbeat; feeds ranking freshness |
+| Cache hit ratio (search / app detail) | Drives DB load; a drop predicts a latency spike |
+
+Structured Pino logs carry a correlation id so one review's path can be traced across API, outbox, and worker.
 
 ## ⚖️ Trade-offs Summary
 
@@ -155,7 +237,7 @@ App is live
 1. **Elasticsearch relevance drift.** As the catalog grows, "reindex on publish" leaves edits invisible to search until republish. Fix: outbox → dedicated ES indexer so every metadata change propagates in seconds; shard the index by locale.
 2. **The single RabbitMQ / worker pool.** Review and download volume both flow through one broker. Fix: partition by event type, scale `reviewWorker`/`downloadWorker` as independent consumer groups; at 100M events/day this is where RabbitMQ gives way to Kafka's partitioned log.
 3. **Ranking freshness vs. cost.** Precomputed daily charts feel stale for fast-moving categories. Fix: incremental ranking off the download/review event stream rather than a nightly full recompute.
-4. **Hot app-detail reads.** A featured app's page is read-heavy; Redis cache-aside on app detail + denormalized rating aggregates absorb it, and CDN edge-caching of the (public) detail response is the next step.
+4. **Hot app-detail reads.** A featured app's page is read-heavy; Redis cache-aside on app detail + denormalized rating aggregates absorb it, and CDN edge-caching of the public detail response is the next step.
 
 ## 🚀 Closing: What I'd Build Next
 

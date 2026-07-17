@@ -521,42 +521,7 @@ User submits URL
 
 ### Optimistic Update Pattern
 
-```
-┌──────────────────┐
-│  User clicks     │
-│  "Delete Product"│
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐     ┌──────────────────┐
-│  Store previous  │────▶│  Immediately     │
-│  products array  │     │  remove from UI  │
-└──────────────────┘     └──────────────────┘
-         │                        │
-         │                        ▼
-         │               ┌──────────────────┐
-         │               │  API DELETE call │
-         │               └──────────────────┘
-         │                        │
-         │          ┌─────────────┴─────────────┐
-         │          │                           │
-         │          ▼                           ▼
-         │   ┌──────────────┐           ┌──────────────┐
-         │   │   Success    │           │   Failure    │
-         │   │   (done)     │           │              │
-         │   └──────────────┘           └──────────────┘
-         │                                      │
-         └──────────────────────────────────────┘
-                                                │
-                                                ▼
-                                        ┌──────────────┐
-                                        │  Rollback:   │
-                                        │  Restore     │
-                                        │  previous    │
-                                        │  products    │
-                                        │  Show error  │
-                                        └──────────────┘
-```
+Deleting a product snapshots the current `products` array, removes the item from the UI immediately (no spinner), then fires the API `DELETE`. On success there's nothing more to do; on failure the store restores the snapshot and shows an error toast. Because a delete almost always succeeds, optimizing for the common case makes the UI feel instant, and the rollback path keeps it honest when the rare failure happens.
 
 ### State Management Alternatives
 
@@ -582,48 +547,7 @@ User submits URL
 
 ### Responsive Layout Pattern
 
-```
-MOBILE (< 640px)                    TABLET (640-1023px)
-┌─────────────────────┐             ┌─────────────────────────────────┐
-│  [Add Product Form] │             │  [Add Product Form]             │
-├─────────────────────┤             ├─────────────────────────────────┤
-│                     │             │                                 │
-│  ┌───────────────┐  │             │  ┌───────────┐ ┌─────────────┐ │
-│  │ Product Card  │  │             │  │ Product   │ │ Product     │ │
-│  └───────────────┘  │             │  │ List      │ │ Detail      │ │
-│  ┌───────────────┐  │             │  │           │ │ Panel       │ │
-│  │ Product Card  │  │             │  │ ┌───────┐ │ │             │ │
-│  └───────────────┘  │             │  │ │ Card  │ │ │  [Chart]    │ │
-│  ┌───────────────┐  │             │  │ └───────┘ │ │             │ │
-│  │ Product Card  │  │             │  │ ┌───────┐ │ │  [Alerts]   │ │
-│  └───────────────┘  │             │  │ │ Card  │ │ │             │ │
-│       ...           │             │  │ └───────┘ │ │             │ │
-│                     │             │  └───────────┘ └─────────────┘ │
-└─────────────────────┘             └─────────────────────────────────┘
-
-       │
-       │ Click product
-       ▼
-┌─────────────────────┐             DESKTOP (≥ 1024px)
-│ FULL SCREEN MODAL   │             ┌─────────────────────────────────────────┐
-│ ┌─────────────────┐ │             │  [Add Product Form]                     │
-│ │ ← Back   Title  │ │             ├─────────────────────────────────────────┤
-│ ├─────────────────┤ │             │                                         │
-│ │                 │ │             │  ┌─────────┐ ┌──────────────────────┐  │
-│ │    [Chart]      │ │             │  │ Product │ │ Product Detail       │  │
-│ │                 │ │             │  │ List    │ │                      │  │
-│ ├─────────────────┤ │             │  │         │ │  ┌────────────────┐  │  │
-│ │  [Alert Form]   │ │             │  │ ┌─────┐ │ │  │    [Chart]     │  │  │
-│ │                 │ │             │  │ │Card │ │ │  │                │  │  │
-│ └─────────────────┘ │             │  │ └─────┘ │ │  └────────────────┘  │  │
-└─────────────────────┘             │  │ ┌─────┐ │ │                      │  │
-                                    │  │ │Card │ │ │  ┌────────────────┐  │  │
-                                    │  │ └─────┘ │ │  │  [Alert Form]  │  │  │
-                                    │  │         │ │  │                │  │  │
-                                    │  └─────────┘ │  └────────────────┘  │  │
-                                    │              └──────────────────────┘  │
-                                    └─────────────────────────────────────────┘
-```
+The layout collapses across the breakpoints above. **Mobile** is a single scrolling column of product cards; tapping one opens a full-screen modal holding the chart and alert form (no room for a side panel). **Tablet** becomes a two-pane list + detail panel, so a selected product's chart and alerts sit beside the list. **Desktop** widens the same two panes into a sidebar list + roomy main detail area with chart and alert form stacked. Crucially the detail view is one component throughout — only its container (modal vs. panel) changes — so there's a single code path for product detail, not three.
 
 ### Mobile-First Approach
 

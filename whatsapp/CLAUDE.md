@@ -1,152 +1,61 @@
-# WhatsApp - Messaging Platform - Development with Claude
+# WhatsApp — Messaging Platform — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing a real-time messaging platform with end-to-end encryption.
+A real-time messaging platform: 1:1 and group chats with presence, typing indicators, delivery/read receipts, emoji reactions, and an offline-first client that keeps working with no network. The core hard problem is **delivering a message in real time to a recipient who may be connected to a different server instance — or not connected at all** — while the receipts and presence that make chat feel alive stay consistent across those instances.
 
-## Key Challenges to Explore
+**Learning goals:** WebSocket fan-out across horizontally-scaled servers (Redis pub/sub), per-recipient delivery-state tracking, presence/typing ephemera, and offline-first sync from an IndexedDB client cache.
 
-1. Real-time message delivery
-2. End-to-end encryption
-3. Offline message storage
-4. Group chat at scale
+## Architecture at a Glance (what actually runs)
 
-## Development Phases
+Matches `docker-compose.yml` (two services) and `backend/package.json`:
 
-### Phase 1: Requirements and Design
-*Completed*
+| Store | Client | Role | Why this one |
+|-------|--------|------|--------------|
+| **PostgreSQL 16** | `pg` | Durable: users, conversations, participants, messages, `message_status` (per-recipient), reactions | ACID; a message and its per-recipient receipts must not diverge |
+| **Redis / Valkey** | `ioredis` | Session store, **cross-server pub/sub** for message/presence routing, presence + typing keys (TTL), rate-limit buckets | Fan-out between instances + sub-ms ephemeral state that should auto-expire |
 
-**Completed:**
-- Defined core functional requirements (1:1 messaging, groups, presence, delivery receipts)
-- Established tech stack (Node.js/Express, PostgreSQL, Redis, React 19)
-- Designed database schema for users, conversations, messages, and message status
-- Planned WebSocket-based real-time communication with Redis pub/sub for cross-server messaging
+**WebSocket-first backend:** a `ws` server (`backend/src/websocket/`) split into `connection-manager`, `message-handler`, `presence`, `typing-handler`, `chat-handler`, and `redis-handler` (the cross-instance bridge). REST (`routes/auth`, `conversations`, `messages`) handles login and history; live traffic is all WebSocket. Resilience via `opossum` (`shared/circuitBreaker`), `shared/deliveryTracker`, `rate-limit-redis`, `prom-client`, `pino`. **Frontend:** React 19 + TanStack Router + Zustand, **offline-first** — `dexie` (IndexedDB) caches messages locally, `vite-plugin-pwa` makes it installable/offline, `@tanstack/react-virtual` virtualizes long message lists, sends are optimistic.
 
-### Phase 2: Initial Implementation
-*In progress*
+## Key Design Decisions
 
-**Completed:**
-- Docker Compose setup with PostgreSQL and Redis
-- Backend server with Express + WebSocket (ws library)
-- Session-based authentication with Redis store
-- Database schema with users, conversations, messages, message_status tables
-- REST API endpoints for auth, conversations, and messages
-- WebSocket handler for real-time messaging:
-  - Message sending/receiving
-  - Delivery receipts (sent, delivered, read)
-  - Typing indicators
-  - User presence (online/offline)
-  - Cross-server message routing via Redis pub/sub
-- Frontend React application:
-  - Login/Register forms
-  - Conversation list with unread counts
-  - Chat view with message history
-  - Real-time message updates
-  - Typing indicators
-  - Message status indicators (sent, delivered, read)
-  - New chat/group creation dialog
+### 1. WebSocket + Redis pub/sub, not sticky-only or Kafka
+Each server owns the WebSocket connections of the users attached to it. To deliver a message the sender's server persists to Postgres, looks up the recipient's server, and — if it's a *different* instance — publishes to that server's Redis channel, which pushes it down the recipient's socket. Trade-off: Redis pub/sub is fire-and-forget with no persistence, which is exactly right here because the message is *already durable in Postgres* before routing — if a server misses the pub/sub event (it was down), the recipient pulls the message from the DB on reconnect. Kafka's durability/consumer-groups would add overhead for a delivery hop that doesn't need replay.
 
-**Focus areas:**
-- Implement core functionality
-- Get something working end-to-end
-- Validate basic assumptions
+### 2. Per-recipient `message_status`, not a single flag on the message
+Delivery state lives in its own row per (message, recipient) with `sent → delivered → read` and timestamps. This is what makes group receipts correct: in a 10-person group, "delivered" means different things to different members at different times. Trade-off: a fan-out of status rows per message (N rows for an N-person group) and more writes, but it's the only model where the double-check-marks are actually truthful per person.
 
-### Phase 3: Scaling and Optimization
-*Not started*
+### 3. Presence and typing are ephemeral Redis keys with TTL, never Postgres
+Online status and "Alice is typing…" are written to Redis with short TTLs and broadcast over pub/sub; they never touch the durable store. Trade-off: presence can be briefly stale (a crashed client shows online until its key expires), which is the correct trade — persisting presence would generate enormous write churn for data that's worthless a second later.
 
-**Focus areas:**
-- Add caching layer
-- Optimize database queries
-- Implement load balancing
-- Add monitoring
+### 4. Offline-first client with IndexedDB (Dexie)
+The client is the source of truth for *display*: messages land in IndexedDB, the UI renders from there, and sends are optimistic (shown immediately, reconciled when the server acks). On reconnect the client syncs missed messages. Trade-off: two copies of message state (client cache + server) that must reconcile, and optimistic sends can momentarily show before they're durable — accepted because a chat app that freezes without signal is unusable.
 
-### Phase 4: Polish and Documentation
-*Not started*
+### 5. PostgreSQL now, Cassandra later — deliberately
+Messages are a growing, write-heavy, time-ordered, partition-by-conversation workload — the textbook Cassandra shape at 2B users. At local scale a single Postgres is simpler and the access patterns are identical, so the migration path (partition by conversation, cluster by time) is preserved without paying Cassandra's operational cost now.
 
-**Focus areas:**
-- Complete documentation
-- Add comprehensive tests
-- Performance tuning
-- Code cleanup
+## Current State
 
-## Design Decisions Log
+Implemented end to end: session auth (Redis-backed, shared between HTTP and WebSocket), 1:1 and group conversations, real-time send/receive over WebSocket, per-recipient delivery receipts (sent/delivered/read), typing indicators, online/offline presence, emoji reactions, cross-server routing via Redis pub/sub, offline message delivery on reconnect, an offline-first PWA client (Dexie/IndexedDB, optimistic sends, virtualized lists), circuit breakers, Redis rate limiting, Prometheus metrics, and pino logging.
 
-### WebSocket vs Long Polling
-**Decision:** WebSocket with ws library
-**Rationale:** Lower latency, full-duplex communication, efficient for real-time messaging. Native browser support is widespread.
+**Not implemented (production layer only):** end-to-end encryption — **messages are stored plaintext** (`messages.content`); the Signal Protocol is described in `architecture.md` as the production ideal and listed as a future phase, not a shipped feature. Also omitted: media upload/download (columns exist, no S3/CDN flow), voice/video calling (no TURN/STUN), and Cassandra/Kafka/S3 (their production roles are stood in by Postgres + Redis).
 
-### Session Storage
-**Decision:** Redis-backed sessions with connect-redis
-**Rationale:** Enables distributed session storage across multiple server instances, supports session sharing for WebSocket authentication.
+## Iteration & Repair Log
 
-### Message Persistence
-**Decision:** PostgreSQL for messages
-**Rationale:** For learning project scale, PostgreSQL handles message storage well. In production at WhatsApp scale, Cassandra would be preferred for its write-optimized, partition-friendly design.
+- **WebSocket built out in layers** (per the design log): basic setup → session sharing between HTTP and WS → presence → message flow with optimistic updates → typing/presence broadcast → cross-server pub/sub routing. The pub/sub step is what let a message reach a recipient on another instance.
+- **Offline-first added on the client:** Dexie/IndexedDB + `vite-plugin-pwa` so the app renders and queues sends with no network; missed messages sync on reconnect.
+- **Seed password normalization (repo-wide):** demo users `alice / bob / charlie` all log in with **`password123`** (bcrypt); README table matches. Docker Postgres uses `whatsapp_secret` (infra credential, unchanged).
+- **Doc drift fixes (this pass):** the old CLAUDE.md's Project Context claimed the platform has "end-to-end encryption" and used banned Phase-1/2/3/4 checklists. Corrected: E2E is production-ideal only (plaintext locally, per `architecture.md` Implementation Notes), and the file now covers the offline-first frontend it never mentioned. `architecture.md` already frames Cassandra/Kafka/S3/Signal correctly as production with a "What Was Simplified" table — left as-is.
+- **CI note (repo-wide):** the GitHub Actions smoke-test workflow was removed; don't treat it as active.
 
-### Cross-Server Messaging
-**Decision:** Redis Pub/Sub
-**Rationale:** Simple to implement, low latency for real-time routing. Each server subscribes to its own channel and publishes to target server's channel when routing messages.
+## Open Questions
 
-### Message Delivery Flow
-1. Sender sends message via WebSocket
-2. Server persists to PostgreSQL
-3. Server looks up recipient's connected server in Redis
-4. If same server: deliver directly
-5. If different server: publish to Redis, target server delivers
-6. If offline: message stays in DB, delivered on next connect
+1. Message ordering currently relies on `created_at`; under clock skew across instances, does a per-conversation sequence number become necessary, and where does it get assigned?
+2. Redis pub/sub is best-effort — the DB backstop covers a downed server, but is there a window where a message is "delivered" to a socket that silently dropped? Does the receipt need an app-level ack, not just a socket write?
+3. Presence via TTL keys is eventually consistent — is the "ghost online" window (crashed client) short enough, or do we need heartbeats?
+4. Offline sync pulls missed messages on reconnect — how does that scale for a user offline for days in busy groups, and does it need cursor-based backfill?
 
-## Iterations and Learnings
+## Resources
 
-### Iteration 1: Basic Setup
-- Set up Docker Compose with PostgreSQL and Redis
-- Created Express backend with session authentication
-- Implemented basic REST API for users and conversations
-
-### Iteration 2: WebSocket Integration
-- Added WebSocket server alongside Express
-- Implemented session sharing between HTTP and WebSocket
-- Created presence tracking with Redis
-
-### Iteration 3: Message Flow
-- Implemented message sending via WebSocket
-- Added optimistic updates on frontend
-- Integrated delivery receipts (sent, delivered, read)
-
-### Iteration 4: Real-time Features
-- Added typing indicators with Redis expiry
-- Implemented presence broadcasting
-- Created cross-server message routing via Redis pub/sub
-
-## Questions and Discussions
-
-### How to handle message ordering?
-Current approach: Use database timestamp for ordering, client sorts messages by created_at. For strict ordering, we'd need sequence numbers per conversation.
-
-### How to scale WebSocket connections?
-Current design supports multiple server instances with Redis pub/sub for message routing. Load balancer should use sticky sessions for WebSocket connections.
-
-### How to handle offline message delivery?
-Messages are persisted to DB with 'sent' status. On user connect, we query for pending messages and deliver them, updating status to 'delivered'.
-
-## Resources and References
-
-- [WhatsApp System Design - system-design-answer-fullstack.md](./system-design-answer-fullstack.md)
-- [WebSocket API - MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket)
-- [Redis Pub/Sub](https://redis.io/topics/pubsub)
-- [ws - Node.js WebSocket library](https://github.com/websockets/ws)
-
-## Next Steps
-
-- [x] Define detailed requirements
-- [x] Sketch initial architecture
-- [x] Choose technology stack
-- [x] Implement MVP
-- [ ] Test and iterate
-- [ ] Add media sharing support
-- [ ] Implement end-to-end encryption
-- [ ] Add group admin features
-- [ ] Performance testing
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings.*
+- [The Signal Protocol](https://signal.org/docs/) — the production E2E design (not built here)
+- [Redis Pub/Sub](https://redis.io/docs/latest/develop/interact/pubsub/) · [ws](https://github.com/websockets/ws) · [Dexie.js](https://dexie.org/)
