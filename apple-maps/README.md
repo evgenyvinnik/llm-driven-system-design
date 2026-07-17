@@ -79,7 +79,9 @@ This starts:
 ```bash
 cd backend
 npm install
-npm run seed
+# Docker applies the schema (init.sql) automatically on first start.
+# For a native Postgres, run the migration first: npm run db:migrate
+npm run db:seed   # loads the grid road network + POIs
 ```
 
 3. **Start the backend**:

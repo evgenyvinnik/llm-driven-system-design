@@ -1,156 +1,63 @@
-# Rate Limiter - Development with Claude
+# Rate Limiter — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing an API rate limiting service to prevent abuse.
+A distributed API rate-limiting service: given an identifier (user, IP, API key), decide in sub-millisecond time whether a request is allowed, and stay correct when many gateway nodes ask about the same identifier at once. It implements **five** classic algorithms behind one interface so the trade-offs are visible side by side. The hard problem is *correctness under concurrency without adding latency* — a rate check sits in front of every API call, so it must be atomic yet nearly free.
 
-## Key Challenges to Explore
+**Learning goals:** the five rate-limiting algorithms and their accuracy/memory trade-offs, why atomicity requires Redis Lua scripts, fail-open vs. fail-closed degradation, and circuit-breaking a dependency that's on every request's critical path.
 
-1. Distributed counting
-2. Low latency
-3. Accuracy vs performance
-4. Handling clock skew
+## Architecture at a Glance (what actually runs)
 
-## Development Phases
+Redis is the star; the rest support config and analytics. From `docker-compose.yml`:
 
-### Phase 1: Requirements and Design
-*Completed*
+| Store | Role | Why this one |
+|-------|------|--------------|
+| **Valkey/Redis** (`ioredis`) | Live rate-limit counters/state for all 5 algorithms, executed via **Lua scripts** | In-memory + server-side Lua = atomic read-compute-write in <1ms; the only thing fast enough to gate every request |
+| **PostgreSQL** (`pg`) | `rate_limit_rules` (config) + `rate_limit_metrics` (aggregated history) | Durable rule storage and historical analytics — data that outlives ephemeral counters |
+| **RabbitMQ** (`amqplib`) | `rate-limit-events` → analytics worker; `metrics-aggregation` → metrics worker | Moves auditing/analytics off the hot path so the check response never waits on Postgres |
+| **redis-commander** (`dev` profile) | Redis inspection UI (`:8081`) | Debugging only; not part of the runtime |
 
-**Decisions made:**
-- Implemented 5 rate limiting algorithms: Fixed Window, Sliding Window, Sliding Log, Token Bucket, Leaky Bucket
-- Used Redis for distributed state management (required for horizontal scaling)
-- Designed API with standard rate limit headers (X-RateLimit-*)
+Backend (Express, port **3001**, no auth — it's a service): `algorithms/` (fixed-window, sliding-window, sliding-log, token-bucket, leaky-bucket over a common `base`), `middleware/rate-limit.ts`, `shared/circuit-breaker.ts` (Opossum), `metrics` (prom-client), `queue`, two `workers/`. Frontend: React 19 + Zustand + Tailwind — an interactive tester that exercises every algorithm.
 
-### Phase 2: Initial Implementation
-*In progress*
+## Key Design Decisions
 
-**Focus areas:**
-- Implement core functionality
-- Get something working end-to-end
-- Validate basic assumptions
+### 1. Lua scripts for atomic read-compute-write
+Token Bucket and Leaky Bucket must read current state, compute refill/leak since last access, and write back — three steps that, if interleaved between two gateway nodes, both read "1 token left" and both allow a request, spending a budget of 1 twice. Running the whole sequence as a Redis Lua script makes it atomic on the server, eliminating the race. Trade-off given up: logic in Lua is harder to write/debug than TypeScript, but correctness under concurrency is non-negotiable for a limiter.
 
-**Completed items:**
-- Backend Express server with TypeScript
-- All 5 rate limiting algorithms implemented with Lua scripts for atomicity
-- API endpoints for check, state, reset, batch-check
-- Metrics collection and health monitoring
-- Frontend React dashboard with Vite + Tailwind
-- Interactive test interface for all algorithms
-- Docker Compose setup with Redis and PostgreSQL
+### 2. Sliding Window Counter as the default
+Of the five, sliding-window-counter is the default: ~1–2% error, far less memory than Sliding Log (which stores every timestamp), and no boundary-burst problem that Fixed Window has (where 2× the limit can pass across a window edge). Trade-off: it's approximate, not exact like Sliding Log — accepted because for abuse protection "roughly N per window, smoothly" beats "exactly N but with a memory cost per request."
 
-### Phase 3: Scaling and Optimization
-*Not started*
+### 3. Fail-open on Redis failure (configurable)
+When Redis is unavailable, the default is to **allow** requests. Rate limiting protects against *sustained* abuse; blocking every legitimate user because the limiter's datastore blipped is worse than briefly under-enforcing. This is configurable per-endpoint via `DEGRADATION_MODE` — security-critical paths (auth, payment) should fail-*closed* because unauthorized access costs more than brief unavailability. Trade-off: a real abuse window exists during a Redis outage, mitigated by aggressive alerting on Redis health.
 
-**Focus areas:**
-- Add caching layer
-- Optimize database queries
-- Implement load balancing
-- Add monitoring
+### 4. Circuit breaker on every Redis call
+All Redis ops are wrapped in an Opossum breaker. Without it, a Redis outage makes every request wait out the connection timeout (3–30s), exhausting the thread pool and turning a limiter failure into a site-wide latency spike. The breaker opens after ~5 failures in 30s and immediately returns the degradation-mode answer instead of hanging. Trade-off: added moving part, but it's the difference between "limiter degrades gracefully" and "limiter takes down everything behind it."
 
-### Phase 4: Polish and Documentation
-*Not started*
+### 5. Redis server time for all clocks
+Every time-based calculation uses Redis's clock (via `TIME`/timestamps inside Lua), never the API node's local clock. Distributed gateway nodes can have skewed clocks; anchoring all windows to one clock keeps counts consistent across instances. Trade-off: one more reason the logic must live in Lua on Redis rather than in application code.
 
-**Focus areas:**
-- Complete documentation
-- Add comprehensive tests
-- Performance tuning
-- Code cleanup
+## Current State
 
-## Design Decisions Log
+Implemented end to end: all five algorithms behind a common `check`/`getState`/`reset` interface with Lua-backed atomicity; API endpoints for check, state, reset, and batch-check plus a `/api/demo` and health check; Opossum circuit breaker + fail-open/closed degradation; Prometheus metrics at `/metrics`; RabbitMQ event + metrics-aggregation queues with an analytics worker (auditing → Postgres) and a metrics worker (dashboard aggregation); pino logging; and a React tester UI that drives each algorithm and visualizes headers/state. Standard `X-RateLimit-*` response headers are emitted.
 
-### 2024-01-XX: Algorithm Implementation Strategy
+Intentionally omitted / simulated: authentication (the service itself is unauthenticated locally), a rule administration UI (rules live in `rate_limit_rules` but are configured directly), Redis Cluster sharding, local in-process caching for hot identifiers, and TLS to Redis. Postgres rule storage exists but rules are largely static in this build.
 
-**Decision:** Use Lua scripts for Token Bucket and Leaky Bucket algorithms.
+## Iteration & Repair Log
 
-**Rationale:** These algorithms require multiple Redis operations (read state, calculate refill/leak, update state) that must be atomic. Lua scripts execute atomically on Redis server, eliminating race conditions in distributed environments.
+- **2026-07 (CLAUDE.md rewrite):** Replaced the template phase checklist (Phase 3 "Scaling" / Phase 4 "Polish" marked *Not started* while the features shipped; Design Decisions dated `2024-01-XX`) with an accurate Current State plus the Architecture table and this log. Added the RabbitMQ analytics/metrics-worker + Postgres roles the old file left out of its decisions. Kept the (correct) Lua / sliding-window-default / fail-open / Zustand reasoning.
+- **2026-07 (answer file):** rewrote `system-design-answer-fullstack.md` — it was 261 lines (too shallow) and drew architecture with ASCII `+--+` boxes; replaced with Unicode box diagrams and expanded deep dives.
+- **Repo-wide fixes that touched this project:** schema loads from `backend/src/db/init.sql` via the `docker-entrypoint-initdb.d` mount (no `migrate.ts`); DB/Redis/RabbitMQ connection-string fallbacks to docker-compose creds (`postgres:postgres`, RabbitMQ `guest:guest`); `pino`/pino-pretty logging; backend serves on port 3001.
+- **CI:** the repo-wide smoke-test workflow was removed (no Docker services in CI).
 
-**Trade-off:** Slightly more complex code, but guarantees correctness under concurrent access.
+## Open Questions
 
-### 2024-01-XX: Sliding Window Counter as Default
+1. At ~100K RPS per Redis instance the single-node model saturates — is the right next step sharding identifiers across Redis Cluster, or local token-bucket caches that sync periodically (trading accuracy for throughput)?
+2. Fail-open is configurable per-endpoint, but who owns the policy per route, and how do we test that security-critical paths are actually set to fail-closed?
+3. Sliding Window Counter's 1–2% error is fine for abuse control — is there a billing/quota use case here that needs Sliding Log's exactness, and is its per-request memory acceptable?
+4. Rules live in Postgres but are effectively static — what does hot rule reloading (change a limit without redeploy) look like, and how is it cached without reintroducing a per-request DB read?
 
-**Decision:** Use Sliding Window Counter as the default algorithm.
+## Resources
 
-**Rationale:**
-- Best balance of accuracy (~1-2% error) and memory efficiency
-- Smoother than Fixed Window (no boundary burst issue)
-- Much less memory than Sliding Log
-- Easier to explain to users than Token/Leaky Bucket
-
-**Trade-off:** Not perfectly accurate, but acceptable for most use cases.
-
-### 2024-01-XX: Fail-Open on Redis Errors
-
-**Decision:** Allow requests when Redis is unavailable (fail-open).
-
-**Rationale:** Rate limiting is about protecting from sustained abuse, not blocking individual requests. Temporary Redis failures should not block legitimate users.
-
-**Trade-off:** Potential for abuse during Redis outages. Mitigation: aggressive alerting on Redis connection issues.
-
-### 2024-01-XX: Frontend Architecture
-
-**Decision:** Use Zustand for state management instead of Redux or Context.
-
-**Rationale:**
-- Simpler API, less boilerplate
-- Excellent TypeScript support
-- No providers/wrappers needed
-- Good for this scale of application
-
-**Trade-off:** Less ecosystem tooling than Redux, but sufficient for this project.
-
-## Iterations and Learnings
-
-### Iteration 1: Basic Implementation
-
-**What worked:**
-- Redis atomic operations (INCR, ZADD) are very fast (<1ms)
-- Lua scripts provide atomic multi-step operations
-- Express middleware pattern works well for rate limiting
-
-**What to improve:**
-- Add local caching for hot paths
-- Implement rule-based configuration from database
-- Add more comprehensive metrics
-
-## Questions and Discussions
-
-### Q: How to handle clock skew across distributed servers?
-
-**A:** All time-based calculations use Redis server time via Lua scripts, ensuring consistency across all API server instances. The TIME command or timestamps within Lua scripts use Redis's clock.
-
-### Q: What happens at extreme scale (1M+ RPS)?
-
-**A:** Current implementation works well up to ~100K RPS per Redis instance. For higher scale:
-1. Shard by identifier across Redis Cluster
-2. Implement local caching with periodic sync
-3. Consider sampling-based approaches for approximate counting
-
-### Q: Token Bucket vs Leaky Bucket - when to use which?
-
-**A:**
-- **Token Bucket:** When you want to allow controlled bursts. Good for APIs where occasional spikes are acceptable.
-- **Leaky Bucket:** When you need consistent output rate. Good for protecting downstream services with strict rate requirements.
-
-## Resources and References
-
-- [Token Bucket Algorithm](https://en.wikipedia.org/wiki/Token_bucket)
-- [Leaky Bucket Algorithm](https://en.wikipedia.org/wiki/Leaky_bucket)
-- [Redis Rate Limiting Patterns](https://redis.io/learn/howtos/ratelimiting)
-- [Stripe's Rate Limiting](https://stripe.com/blog/rate-limiters)
-- [Cloudflare's Rate Limiting](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/)
-
-## Next Steps
-
-- [x] Define detailed requirements
-- [x] Sketch initial architecture
-- [x] Choose technology stack
-- [x] Implement MVP
-- [ ] Add comprehensive tests
-- [ ] Implement rule-based configuration from PostgreSQL
-- [ ] Add Prometheus metrics export
-- [ ] Load test and optimize
-- [ ] Add local caching for hot paths
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings.*
+- [Token Bucket](https://en.wikipedia.org/wiki/Token_bucket) / [Leaky Bucket](https://en.wikipedia.org/wiki/Leaky_bucket)
+- [Redis rate-limiting patterns](https://redis.io/learn/howtos/ratelimiting) and [Stripe's rate limiters](https://stripe.com/blog/rate-limiters)
+- [Cloudflare: counting things at scale](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/)

@@ -569,23 +569,7 @@
 
 ## 12. Future Enhancements (2-3 minutes)
 
-### Short-term
-- Service worker for offline search caching
-- Photo cropping before upload
-- Review draft auto-save to localStorage
-- Dark mode support
-
-### Medium-term
-- PWA with install prompt
-- WebGL map clustering for dense areas
-- Voice search integration
-- AR "view in space" for restaurant interiors
-
-### Long-term
-- Real-time review notifications via WebSocket
-- Collaborative collections ("want to try")
-- Personalized recommendations based on review history
-- Multi-language support with i18n
+Roughly in priority order: a service worker for offline search caching and review-draft auto-save (localStorage), then a full PWA with install prompt; WebGL map clustering for dense areas and "search this area" refinements; real-time review notifications over WebSocket; and personalized recommendations driven by review history. Each is additive to the architecture above rather than a rework of it — the state and data-fetching seams already accommodate them.
 
 ---
 

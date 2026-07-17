@@ -58,6 +58,11 @@ docker-compose up -d
 
 # Wait for services to be healthy
 docker-compose ps
+
+# Load demo accounts and sample data.
+# The mounted init.sql only creates the schema; the seed users live in
+# backend/db-seed/seed.sql, which must be loaded explicitly (there is no npm seed script).
+PGPASSWORD=delivery_secret psql -h localhost -U delivery -d delivery -f backend/db-seed/seed.sql
 ```
 
 ### 2. Start Backend
@@ -97,13 +102,14 @@ The database is seeded with test accounts:
 
 | Role | Email | Password |
 |------|-------|----------|
-| Customer | customer1@test.com | password |
-| Customer | customer2@test.com | password |
-| Driver | driver1@test.com | password |
-| Driver | driver2@test.com | password |
-| Admin | admin@delivery.local | password |
+| Customer | customer1@test.com | password123 |
+| Customer | customer2@test.com | password123 |
+| Driver | driver1@test.com | password123 |
+| Driver | driver2@test.com | password123 |
+| Driver | driver3@test.com | password123 |
+| Admin | admin@delivery.local | password123 |
 
-Note: The seed data uses a placeholder password hash. For demo purposes, any password will work with these accounts. In production, use proper bcrypt password hashing.
+All seeded accounts share the bcrypt-hashed password `password123`. Login is verified with `bcrypt.compare` in `authService.validatePassword`, so the password must match exactly — earlier notes claiming "any password works" were incorrect. (The comment in `db-seed/seed.sql` still says `admin123`; the hash is actually `password123`.)
 
 ## API Endpoints
 
