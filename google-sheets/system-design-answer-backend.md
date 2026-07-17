@@ -124,6 +124,19 @@ WSS    /ws?sheet_id=…
 
 The WebSocket protocol is where the real API lives. REST exists for load and for clients that aren't in the collaborative session.
 
+**The protocol semantics matter more than the endpoint list.** Every client-to-server message carries the client's `last_seen_seq`; every server-to-client `OP_APPLIED` carries the authoritative `seq` the sequencer assigned. That pairing is the entire concurrency contract:
+
+| Message | Direction | Semantics |
+|---------|-----------|-----------|
+| `CELL_EDIT` | C→S | Op id + coordinate + raw value + last-seen seq. Sequencer orders it, transforms coordinates if it was written against an older seq, applies, appends to log |
+| `INSERT_ROW` / `DELETE_COL` | C→S | Structural op — becomes the thing later cell edits are transformed *against*. Rewrites references on the same total order |
+| `OP_APPLIED` | S→C | The assigned seq + final coordinate. Doubles as the ack; the client advances its last-seen seq |
+| `CELLS_RECALCULATED` | S→C | A batch of `(coord, computed_value)` from the affected-subgraph recalc, sent after the triggering edit |
+| `CURSOR_MOVE` / `SELECTION` | C↔S | Conflated and throttled (~10/sec); newest supersedes, drops are fine |
+| `SYNC` | S→C | Full or since-seq state, sent on join and on reconnect-too-far-behind |
+
+The design rule: the client is never the authority on order. It proposes; the sequencer disposes and echoes back the truth via `OP_APPLIED`. A client that sends an edit and sees its own `OP_APPLIED` come back with a *transformed* coordinate learns, correctly, that the grid shifted under it.
+
 ## 🔧 Deep Dive 1: Conflict Resolution — Where Last-Write-Wins Is Right, and Where It Silently Corrupts
 
 **The easy half, and I'll defend it.** For two users setting *the same cell to different values*, **last-write-wins is correct**, and reaching for OT or CRDTs here is over-engineering.
@@ -283,6 +296,17 @@ The rule: **the log is sacred; everything else degrades.**
 | Convergence check | Periodically hash each client's visible state and compare. **Divergence is silent** — it produces no errors, no exceptions, just two people looking at different numbers. It is the single most dangerous failure in this system and the only way to catch it is to look for it |
 | WebSocket connections per gateway | Rebalancing signal |
 | Op log append latency | If this degrades, we start rejecting edits — it's the one hard dependency |
+
+## 📐 Capacity Planning (Back-of-Envelope)
+
+Turning the scale numbers into a fleet, because "it scales" means nothing without the arithmetic:
+
+- **WebSocket gateways:** 2M concurrent editors ÷ ~50K connections per gateway ≈ **40 gateways**, call it ~60 with headroom. Viewers don't hold sequencer state and are served from CDN snapshots, so they don't size the editing fleet — which is the whole reason to keep them off it.
+- **Sequencers:** one owner per *active* sheet, but each sheet is tiny (≤50 editors), so one process comfortably owns thousands of them. The binding constraint is **memory** — each sequencer holds its sheets' cells + dependency graphs in RAM — not CPU. Packed by `sheet_id`, this is low hundreds of processes, and it scales by adding processes and rebalancing sheet ownership.
+- **Op log:** partitioned by `sheet_id`. 500K edits/sec across ~200 partitions ≈ 2.5K appends/sec/partition — trivial for Kafka. Partition count is chosen for **materializer parallelism**, not for append throughput, which sequential appends make a non-issue.
+- **Materializers and Postgres:** coalescing collapses ~5–10 ops/cell into one write, turning the naive ~1M writes/sec into ~100–200K coalesced writes/sec spread across sharded Postgres — tens of shards, each in comfortable range-scan territory.
+
+> "The single ratio that sizes the whole system is **materializer throughput vs. log ingest rate.** If materializers keep up, Postgres lags the log by well under a second and cold reads are fast. If they fall behind, lag grows without bound, cold reads replay more and more log tail, and the failure is *silent* — nothing errors, opens just get slower. That ratio, not CPU or connection count, is the capacity SLO I'd alert on first."
 
 ## 📈 Scalability: What Breaks First
 
