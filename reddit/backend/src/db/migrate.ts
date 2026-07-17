@@ -7,7 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const pool = new pg.Pool({
   connectionString:
-    process.env.DATABASE_URL || 'postgresql://reddit:reddit_password@localhost:5432/reddit',
+    process.env.DATABASE_URL || 'postgresql://reddit:reddit_password@127.0.0.1:5432/reddit',
 });
 
 async function migrate(): Promise<void> {

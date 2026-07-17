@@ -7,7 +7,7 @@ import bcrypt from 'bcryptjs'
 import { v4 as uuidv4 } from 'uuid'
 
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/rplace',
+  connectionString: process.env.DATABASE_URL || 'postgresql://rplace:rplace_dev@localhost:5432/rplace',
 })
 
 async function seed(): Promise<void> {

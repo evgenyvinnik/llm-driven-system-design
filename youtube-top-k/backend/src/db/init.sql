@@ -71,8 +71,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_view_events_idempotency_key
 -- Partial index for efficient cleanup of old events
 -- Only indexes rows older than 7 days (used by cleanup script)
 CREATE INDEX IF NOT EXISTS idx_view_events_viewed_at_for_cleanup
-  ON view_events(viewed_at)
-  WHERE viewed_at < NOW() - INTERVAL '7 days';
+  ON view_events(viewed_at);
 
 -- ============================================================================
 -- TRENDING SNAPSHOTS TABLE

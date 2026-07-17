@@ -161,8 +161,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_logs(target_type, target_id
 CREATE INDEX IF NOT EXISTS idx_audit_subreddit ON audit_logs(subreddit_id);
 
 -- Partial index for recent audit events (most common query pattern)
-CREATE INDEX IF NOT EXISTS idx_audit_recent ON audit_logs(timestamp DESC)
-  WHERE timestamp > NOW() - INTERVAL '90 days';
+CREATE INDEX IF NOT EXISTS idx_audit_recent ON audit_logs(timestamp DESC);
 
 -- =============================================================================
 -- TABLE: schema_migrations

@@ -236,8 +236,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 -- Partial index to find expired sessions for cleanup
-CREATE INDEX IF NOT EXISTS idx_sessions_expired ON sessions(expires_at)
-  WHERE expires_at < NOW();
+CREATE INDEX IF NOT EXISTS idx_sessions_expired ON sessions(expires_at);
 
 -- =============================================================================
 -- IDEMPOTENCY & RELIABILITY

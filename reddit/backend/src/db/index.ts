@@ -9,7 +9,7 @@ dotenv.config();
 const { Pool } = pg;
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://reddit:reddit_password@localhost:5432/reddit',
+  connectionString: process.env.DATABASE_URL || 'postgresql://reddit:reddit_password@127.0.0.1:5432/reddit',
   // Connection pool settings
   max: parseInt(process.env.DB_POOL_MAX ?? '', 10) || 20,
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT ?? '', 10) || 30000,
