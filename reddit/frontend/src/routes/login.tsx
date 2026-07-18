@@ -41,6 +41,7 @@ function LoginPage() {
             <label className="block text-sm font-medium mb-1">Username</label>
             <input
               type="text"
+              name="username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-reddit-blue"
@@ -52,6 +53,7 @@ function LoginPage() {
             <label className="block text-sm font-medium mb-1">Password</label>
             <input
               type="password"
+              name="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-reddit-blue"

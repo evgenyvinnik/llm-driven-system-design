@@ -119,6 +119,7 @@ export function AuthPanel() {
       <form onSubmit={handleSubmit} className="space-y-3">
         <input
           type="text"
+          name="username"
           placeholder="Username"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
@@ -128,6 +129,7 @@ export function AuthPanel() {
         />
         <input
           type="password"
+          name="password"
           placeholder="Password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}

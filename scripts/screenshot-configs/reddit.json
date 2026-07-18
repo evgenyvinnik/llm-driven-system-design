@@ -11,8 +11,8 @@
       "username": "alice",
       "password": "password123"
     },
-    "usernameSelector": "input[name='username'], input[type='text']",
-    "passwordSelector": "input[name='password'], input[type='password']",
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
     "submitSelector": "button[type='submit']",
     "successIndicator": "main"
   },
