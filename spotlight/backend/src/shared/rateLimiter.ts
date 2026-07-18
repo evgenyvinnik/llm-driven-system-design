@@ -1,4 +1,4 @@
-import rateLimit, { RateLimitRequestHandler, Options } from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, Options, ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
 import { rateLimitHitsTotal } from './metrics.js';
 import { logAuditEvent } from './logger.js';
@@ -33,7 +33,7 @@ export const searchRateLimiter: RateLimitRequestHandler = rateLimit({
   },
   keyGenerator: (req: RequestWithSession): string => {
     // Use user ID if authenticated, otherwise IP
-    return req.session?.userId || req.ip || 'unknown';
+    return req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
   },
   handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     // Track rate limit hits in metrics
@@ -43,7 +43,7 @@ export const searchRateLimiter: RateLimitRequestHandler = rateLimit({
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip || null,
+      ip: ipKeyGenerator(req.ip || '0.0.0.0') || null,
       details: {
         route: '/api/search',
         windowMs: options.windowMs,
@@ -75,14 +75,14 @@ export const suggestionsRateLimiter: RateLimitRequestHandler = rateLimit({
     retryAfterSeconds: 10
   },
   keyGenerator: (req: RequestWithSession): string => {
-    return req.session?.userId || req.ip || 'unknown';
+    return req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
   },
   handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('/api/suggestions').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip || null,
+      ip: ipKeyGenerator(req.ip || '0.0.0.0') || null,
       details: {
         route: '/api/suggestions',
         windowMs: options.windowMs,
@@ -109,14 +109,14 @@ export const indexRateLimiter: RateLimitRequestHandler = rateLimit({
     retryAfterSeconds: 60
   },
   keyGenerator: (req: RequestWithSession): string => {
-    return req.session?.userId || req.ip || 'unknown';
+    return req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
   },
   handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('/api/index').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip || null,
+      ip: ipKeyGenerator(req.ip || '0.0.0.0') || null,
       details: {
         route: '/api/index',
         windowMs: options.windowMs,
@@ -143,14 +143,14 @@ export const bulkRateLimiter: RateLimitRequestHandler = rateLimit({
     retryAfterSeconds: 60
   },
   keyGenerator: (req: RequestWithSession): string => {
-    return req.session?.userId || req.ip || 'unknown';
+    return req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
   },
   handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('/api/index/bulk').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip || null,
+      ip: ipKeyGenerator(req.ip || '0.0.0.0') || null,
       details: {
         route: '/api/index/bulk',
         windowMs: options.windowMs,
@@ -177,14 +177,14 @@ export const globalRateLimiter: RateLimitRequestHandler = rateLimit({
     retryAfterSeconds: 60
   },
   keyGenerator: (req: Request): string => {
-    return req.ip || 'unknown';
+    return ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
   },
   handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
     rateLimitHitsTotal.labels('global').inc();
     logAuditEvent({
       eventType: 'RATE_LIMIT_EXCEEDED',
       userId: req.session?.userId || null,
-      ip: req.ip || null,
+      ip: ipKeyGenerator(req.ip || '0.0.0.0') || null,
       details: {
         route: 'global',
         path: req.path,
@@ -222,14 +222,14 @@ export function createRateLimiter({ windowMs, max, routeName }: CreateRateLimite
       retryAfterSeconds: Math.ceil(windowMs / 1000)
     },
     keyGenerator: (req: RequestWithSession): string => {
-      return req.session?.userId || req.ip || 'unknown';
+      return req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
     },
     handler: (req: RequestWithSession, res: Response, _next: NextFunction, options: Options): void => {
       rateLimitHitsTotal.labels(routeName).inc();
       logAuditEvent({
         eventType: 'RATE_LIMIT_EXCEEDED',
         userId: req.session?.userId || null,
-        ip: req.ip || null,
+        ip: ipKeyGenerator(req.ip || '0.0.0.0') || null,
         details: {
           route: routeName,
           windowMs: options.windowMs,

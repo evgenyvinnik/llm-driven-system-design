@@ -1,4 +1,4 @@
-import rateLimit, { RateLimitRequestHandler, Options } from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, Options, ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response } from 'express';
 import { redis } from '../services/redis.js';
 import { rateLimitHits } from './metrics.js';
@@ -109,14 +109,14 @@ function createLimiter(options: LimiterOptions): RateLimitRequestHandler {
     validate: { ip: false, keyGeneratorIpFallback: false },
     keyGenerator: keyGenerator || ((req: Request): string => {
       // Use user ID if authenticated, otherwise IP
-      return req.user?.id || req.ip || (req.connection as { remoteAddress?: string })?.remoteAddress || 'unknown';
+      return req.user?.id || ipKeyGenerator(req.ip || '0.0.0.0') || (req.connection as { remoteAddress?: string })?.remoteAddress || 'unknown';
     }),
     handler: (req: Request, res: Response, _next, opts): void => {
       // Track rate limit hits in metrics
       rateLimitHits.inc({ category });
       logger.warn({
         userId: req.user?.id,
-        ip: req.ip,
+        ip: ipKeyGenerator(req.ip || '0.0.0.0'),
         path: req.path,
         category
       }, 'Rate limit exceeded');
@@ -187,7 +187,7 @@ export const loginLimiter = createLimiter({
   max: 5,
   category: 'login',
   message: 'Too many login attempts, please try again later',
-  keyGenerator: (req: Request): string => req.ip || (req.connection as { remoteAddress?: string })?.remoteAddress || 'unknown'
+  keyGenerator: (req: Request): string => ipKeyGenerator(req.ip || '0.0.0.0') || (req.connection as { remoteAddress?: string })?.remoteAddress || 'unknown'
 });
 
 /**

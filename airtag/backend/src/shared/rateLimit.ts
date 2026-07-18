@@ -1,4 +1,4 @@
-import rateLimit, { Options } from 'express-rate-limit';
+import rateLimit, { Options, ipKeyGenerator } from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
 import redis from '../db/redis.js';
 import { createComponentLogger } from './logger.js';
@@ -68,7 +68,7 @@ function createRateLimiter(options: {
     keyGenerator: options.keyGenerator || ((req: Request) => {
       // Use X-Forwarded-For if behind a proxy, otherwise use IP
       return (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-        req.ip ||
+        ipKeyGenerator(req.ip || '0.0.0.0') ||
         'unknown';
     }),
 
@@ -79,7 +79,7 @@ function createRateLimiter(options: {
     handler: (req: Request, res: Response) => {
       const endpoint = options.endpoint || req.path;
       log.warn(
-        { ip: req.ip, endpoint, path: req.path },
+        { ip: ipKeyGenerator(req.ip || '0.0.0.0'), endpoint, path: req.path },
         'Rate limit exceeded'
       );
       rateLimitHits.inc({ endpoint });
@@ -196,7 +196,7 @@ export function perUserRateLimiter(maxPerMinute: number) {
     keyGenerator: (req: Request) => {
       // Use user ID if authenticated, otherwise fall back to IP
       const userId = (req.session as { userId?: string })?.userId;
-      return userId || req.ip || 'unknown';
+      return userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
     },
     endpoint: 'per_user',
     message: 'You have made too many requests. Please wait before trying again.',

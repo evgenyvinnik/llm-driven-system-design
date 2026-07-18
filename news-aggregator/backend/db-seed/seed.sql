@@ -3,7 +3,7 @@
 
 -- Insert default admin user (password: admin123)
 INSERT INTO users (username, email, password_hash, role)
-VALUES ('admin', 'admin@newsagg.local', 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', 'admin');
+VALUES ('admin', 'admin@newsagg.local', 'f3ab6d7f779ddc29da66448ff3711af1df1289c9de16f5d76c918d9f3ef63b2e', 'admin');
 
 -- Insert sample sources
 INSERT INTO sources (name, domain, feed_url, category) VALUES

@@ -1,4 +1,4 @@
-import rateLimit, { RateLimitRequestHandler } from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, ipKeyGenerator } from 'express-rate-limit';
 import { RedisStore } from 'rate-limit-redis';
 import { Request, Response, NextFunction } from 'express';
 import { RedisClientType } from 'redis';
@@ -72,7 +72,7 @@ export const createRateLimiter = (
         // Use user ID if authenticated, otherwise use IP
         return req.session?.userId
           ? `user:${req.session.userId}`
-          : `ip:${req.ip || req.socket?.remoteAddress}`;
+          : `ip:${ipKeyGenerator(req.ip || '0.0.0.0') || req.socket?.remoteAddress}`;
       }),
     handler: (req: Request, res: Response, _next: NextFunction, optionsUsed) => {
       // Log rate limit hit
@@ -84,7 +84,7 @@ export const createRateLimiter = (
           endpoint,
           userType,
           userId: req.session?.userId,
-          ip: req.ip,
+          ip: ipKeyGenerator(req.ip || '0.0.0.0'),
           limit: optionsUsed.max,
           windowMs: optionsUsed.windowMs,
         },
@@ -165,7 +165,7 @@ export const createRateLimiters = (redisClient: RedisClientType): RateLimiters =
       message: 'Too many login attempts. Please try again in 15 minutes.',
       prefix: 'rl:login:',
       keyGenerator: (req: Request): string =>
-        `ip:${req.ip || req.socket?.remoteAddress}`,
+        `ip:${ipKeyGenerator(req.ip || '0.0.0.0') || req.socket?.remoteAddress}`,
       endpointName: 'login',
     }),
 
@@ -177,7 +177,7 @@ export const createRateLimiters = (redisClient: RedisClientType): RateLimiters =
       message: 'Too many registration attempts. Please try again later.',
       prefix: 'rl:register:',
       keyGenerator: (req: Request): string =>
-        `ip:${req.ip || req.socket?.remoteAddress}`,
+        `ip:${ipKeyGenerator(req.ip || '0.0.0.0') || req.socket?.remoteAddress}`,
       endpointName: 'register',
     }),
 

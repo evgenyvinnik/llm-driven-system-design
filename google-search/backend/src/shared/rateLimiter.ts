@@ -1,4 +1,4 @@
-import rateLimit, { RateLimitRequestHandler } from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response } from 'express';
 import { redis } from '../models/redis.js';
 import { logger } from './logger.js';
@@ -99,7 +99,7 @@ export const searchRateLimiter: RateLimitRequestHandler = rateLimit({
   }),
   keyGenerator: (req: Request): string => {
     // Rate limit by IP, or by API key if provided
-    return (req.headers['x-api-key'] as string) || req.ip || 'unknown';
+    return (req.headers['x-api-key'] as string) || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
   },
   handler: (req: Request, res: Response, _next, options): void => {
     rateLimitRejectionsCounter.labels('search').inc();
@@ -107,7 +107,7 @@ export const searchRateLimiter: RateLimitRequestHandler = rateLimit({
       {
         event: 'rate_limit_exceeded',
         endpoint: 'search',
-        ip: req.ip,
+        ip: ipKeyGenerator(req.ip || '0.0.0.0'),
         limit: options.max,
       },
       'Search rate limit exceeded'
@@ -137,7 +137,7 @@ export const autocompleteRateLimiter: RateLimitRequestHandler = rateLimit({
     prefix: 'rl:autocomplete:',
     windowMs: config.rateLimit?.autocompleteWindowMs || 60 * 1000,
   }),
-  keyGenerator: (req: Request): string => (req.headers['x-api-key'] as string) || req.ip || 'unknown',
+  keyGenerator: (req: Request): string => (req.headers['x-api-key'] as string) || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown',
   handler: (req: Request, res: Response, _next, options): void => {
     rateLimitRejectionsCounter.labels('autocomplete').inc();
     res.status(429).json({
@@ -160,14 +160,14 @@ export const adminRateLimiter: RateLimitRequestHandler = rateLimit({
     prefix: 'rl:admin:',
     windowMs: config.rateLimit?.adminWindowMs || 60 * 1000,
   }),
-  keyGenerator: (req: Request): string => req.ip || 'unknown',
+  keyGenerator: (req: Request): string => ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown',
   handler: (req: Request, res: Response, _next, options): void => {
     rateLimitRejectionsCounter.labels('admin').inc();
     logger.warn(
       {
         event: 'rate_limit_exceeded',
         endpoint: 'admin',
-        ip: req.ip,
+        ip: ipKeyGenerator(req.ip || '0.0.0.0'),
       },
       'Admin rate limit exceeded'
     );
@@ -187,13 +187,13 @@ export const globalRateLimiter: RateLimitRequestHandler = rateLimit({
   max: config.rateLimit?.globalMaxRequests || 200, // 200 total requests per minute
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req: Request): string => req.ip || 'unknown',
+  keyGenerator: (req: Request): string => ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown',
   handler: (req: Request, res: Response): void => {
     rateLimitRejectionsCounter.labels('global').inc();
     logger.warn(
       {
         event: 'global_rate_limit_exceeded',
-        ip: req.ip,
+        ip: ipKeyGenerator(req.ip || '0.0.0.0'),
       },
       'Global rate limit exceeded'
     );

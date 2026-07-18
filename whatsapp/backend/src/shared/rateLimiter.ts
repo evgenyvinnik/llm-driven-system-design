@@ -18,7 +18,7 @@
  * - Registration: 3/hour (prevents account spam)
  */
 
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { redis } from '../redis.js';
 import { rateLimitHits } from './metrics.js';
 import { logger, LogEvents } from './logger.js';
@@ -110,7 +110,7 @@ export function createRateLimiter(options: {
       },
       init: () => {},
     },
-    keyGenerator: options.keyGenerator || ((req) => req.session?.userId || req.ip || 'unknown'),
+    keyGenerator: options.keyGenerator || ((req) => req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown'),
     skip: (req) => {
       // Skip rate limiting for health checks
       return req.path === '/health' || req.path === '/metrics';
@@ -123,7 +123,7 @@ export function createRateLimiter(options: {
         event: LogEvents.RATE_LIMITED,
         endpoint: options.endpoint,
         user_id: req.session?.userId,
-        ip: req.ip,
+        ip: ipKeyGenerator(req.ip || '0.0.0.0'),
       });
 
       res.status(429).json({
@@ -153,7 +153,7 @@ export const loginRateLimiter = createRateLimiter({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 5,
   endpoint: 'login',
-  keyGenerator: (req) => req.ip,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || '0.0.0.0'),
   skipFailedRequests: false,
 });
 
@@ -165,7 +165,7 @@ export const registerRateLimiter = createRateLimiter({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 3,
   endpoint: 'register',
-  keyGenerator: (req) => req.ip,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || '0.0.0.0'),
 });
 
 /**

@@ -1,4 +1,4 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
 import { redis } from '../db/index.js';
 import { rateLimitConfig } from './config.js';
@@ -33,7 +33,7 @@ export const apiRateLimiter = rateLimit({
     if (userId) {
       return String(userId);
     }
-    return req.ip || (req.headers['x-forwarded-for'] as string) || 'unknown';
+    return ipKeyGenerator(req.ip || '0.0.0.0') || (req.headers['x-forwarded-for'] as string) || 'unknown';
   },
 });
 
@@ -60,7 +60,7 @@ export const messageRateLimiter = rateLimit({
     if (userId) {
       return String(userId);
     }
-    return req.ip || (req.headers['x-forwarded-for'] as string) || 'unknown';
+    return ipKeyGenerator(req.ip || '0.0.0.0') || (req.headers['x-forwarded-for'] as string) || 'unknown';
   },
 });
 

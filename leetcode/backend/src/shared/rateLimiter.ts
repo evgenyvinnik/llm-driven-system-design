@@ -1,4 +1,4 @@
-import rateLimit, { type Options } from 'express-rate-limit';
+import rateLimit, { type Options, ipKeyGenerator } from 'express-rate-limit';
 import type { Request, Response } from 'express';
 import { createModuleLogger } from './logger.js';
 import { metrics } from './metrics.js';
@@ -18,7 +18,7 @@ const keyGenerator = (req: Request): string => {
   if (req.session && req.session.userId) {
     return `user:${req.session.userId}`;
   }
-  return `ip:${req.ip}`;
+  return `ip:${ipKeyGenerator(req.ip || '0.0.0.0')}`;
 };
 
 // Normalize endpoint for metrics (reduce cardinality)
@@ -35,7 +35,7 @@ const limitHandler = (req: Request, res: Response, _next: unknown, options: Opti
 
   logger.warn({
     userId: req.session?.userId,
-    ip: req.ip,
+    ip: ipKeyGenerator(req.ip || '0.0.0.0'),
     path: req.path,
     method: req.method,
     userType
@@ -124,10 +124,10 @@ export const authRateLimiter = rateLimit({
   max: 5, // 5 attempts
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req: Request) => `auth:${req.ip}`, // Always use IP for auth
+  keyGenerator: (req: Request) => `auth:${ipKeyGenerator(req.ip || '0.0.0.0')}`, // Always use IP for auth
   handler: (req: Request, res: Response) => {
     logger.warn({
-      ip: req.ip,
+      ip: ipKeyGenerator(req.ip || '0.0.0.0'),
       path: req.path
     }, 'Auth rate limit exceeded');
 

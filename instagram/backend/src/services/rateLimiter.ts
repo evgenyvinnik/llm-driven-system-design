@@ -1,4 +1,4 @@
-import rateLimit, { RateLimitRequestHandler, Options } from 'express-rate-limit';
+import rateLimit, { RateLimitRequestHandler, Options, ipKeyGenerator } from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
 import type { Request, Response, NextFunction } from 'express';
 import type { Session, SessionData } from 'express-session';
@@ -71,7 +71,7 @@ const createRateLimiter = (options: RateLimiterOptions): RateLimitRequestHandler
     skipFailedRequests,
     keyGenerator: (req: ExtendedRequest): string => {
       // Use user ID if authenticated, otherwise IP
-      return req.session?.userId || req.ip || 'unknown';
+      return req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0') || 'unknown';
     },
     handler: (
       req: ExtendedRequest,
@@ -80,7 +80,7 @@ const createRateLimiter = (options: RateLimiterOptions): RateLimitRequestHandler
       opts: Options
     ): void => {
       // Log and track rate limit hits
-      const key = req.session?.userId || req.ip;
+      const key = req.session?.userId || ipKeyGenerator(req.ip || '0.0.0.0');
       logger.warn(
         {
           type: 'rate_limit',
