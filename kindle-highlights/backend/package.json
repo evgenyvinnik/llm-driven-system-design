@@ -5,10 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "PORT=3001 concurrently \"npm:dev:*\"",
-    "dev:highlight": "tsx watch src/highlight/index.ts",
+    "dev:highlight": "HIGHLIGHT_PORT=3000 tsx watch src/highlight/index.ts",
     "dev:sync": "tsx watch src/sync/index.ts",
     "dev:aggregation": "tsx watch src/aggregation/index.ts",
-    "dev:social": "tsx watch src/social/index.ts",
+    "dev:social": "SOCIAL_PORT=3001 tsx watch src/social/index.ts",
     "dev:worker": "tsx watch src/aggregation/worker.ts",
     "build": "tsc",
     "start": "node dist/highlight/index.js",

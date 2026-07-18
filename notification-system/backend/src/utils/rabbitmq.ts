@@ -25,10 +25,20 @@ export async function initRabbitMQ(): Promise<void> {
 
   try {
     connection = await amqplib.connect(url);
+    // Don't let a RabbitMQ connection/channel 'error' event crash the process —
+    // notifications are non-critical to the core API (login, reads).
+    connection.on('error', (err) => console.error('RabbitMQ connection error:', err.message));
     channel = await connection.createChannel();
+    channel.on('error', (err) => console.error('RabbitMQ channel error:', err.message));
 
-    // Create all queues
+    // Dead letter queue first, WITHOUT a DLX of its own.
+    await channel.assertQueue(QUEUES.DEAD_LETTER, { durable: true });
+
+    // Create the work queues, each dead-lettering into DEAD_LETTER.
+    // DEAD_LETTER itself is excluded — declaring it here with the DLX args and
+    // again above without them raises a 406 PRECONDITION_FAILED (inequivalent args).
     for (const queue of Object.values(QUEUES)) {
+      if (queue === QUEUES.DEAD_LETTER) continue;
       await channel.assertQueue(queue, {
         durable: true,
         arguments: {
@@ -37,9 +47,6 @@ export async function initRabbitMQ(): Promise<void> {
         },
       });
     }
-
-    // Dead letter queue without DLX
-    await channel.assertQueue(QUEUES.DEAD_LETTER, { durable: true });
 
     console.log('RabbitMQ queues initialized');
   } catch (error) {

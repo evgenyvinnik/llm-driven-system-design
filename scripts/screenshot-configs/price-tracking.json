@@ -8,7 +8,7 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "alice@example.com",
+      "email": "admin@pricetracker.local",
       "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
