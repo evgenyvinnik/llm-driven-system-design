@@ -266,9 +266,6 @@ async function start() {
     logger.info('Testing database connections...');
     await testConnections();
 
-    logger.info('Initializing Elasticsearch index...');
-    await initElasticsearchIndex();
-
     // Initialize WebSocket
     wsGateway = new WebSocketGateway(server);
     logger.info('WebSocket gateway initialized');
@@ -281,6 +278,9 @@ async function start() {
       }
     }, 5000);
 
+    // Bind the port FIRST so auth/CRUD are reachable immediately. Elasticsearch
+    // (discovery only) is initialized in the background — a slow ES start must not
+    // delay the server or the harness's login.
     server.listen(PORT, () => {
       logger.info({ port: PORT }, 'Server started');
       logger.info(`API: http://localhost:${PORT}/api`);
@@ -288,6 +288,11 @@ async function start() {
       logger.info(`Health: http://localhost:${PORT}/health`);
       logger.info(`WebSocket: ws://localhost:${PORT}/ws`);
     });
+
+    logger.info('Initializing Elasticsearch index (background)...');
+    initElasticsearchIndex()
+      .then(() => logger.info('Elasticsearch index ready'))
+      .catch((e) => logger.warn({ error: (e as Error).message }, 'Elasticsearch init failed; discovery degraded'));
   } catch (error) {
     logger.fatal({ error }, 'Failed to start server');
     process.exit(1);

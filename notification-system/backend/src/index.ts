@@ -224,21 +224,24 @@ let connectionCount = 0;
 // Initialize and start
 async function start(): Promise<void> {
   try {
-    // Initialize database connection
+    // Initialize database connection (critical for auth/reads)
     await initDatabase();
     log.info('Database connected');
-
-    // Initialize RabbitMQ
-    await initRabbitMQ();
-    log.info('RabbitMQ connected');
 
     // Initialize circuit breakers for delivery channels
     initializeCircuitBreakers();
     log.info('Circuit breakers initialized');
 
+    // Bind the port FIRST so the API (login, reads) is reachable immediately.
+    // RabbitMQ (async notification delivery) is initialized in the background —
+    // it's slow to start and NOT required for auth, so it must not delay the server.
     const server: Server = app.listen(PORT, () => {
       log.info({ port: PORT }, `Notification API server running on port ${PORT}`);
     });
+
+    initRabbitMQ()
+      .then(() => log.info('RabbitMQ connected'))
+      .catch((e) => log.warn({ error: (e as Error).message }, 'RabbitMQ init failed; delivery degraded'));
 
     // Track connections for graceful shutdown
     server.on('connection', (socket: Socket) => {

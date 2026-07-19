@@ -96,9 +96,15 @@ export async function testConnections(): Promise<void> {
     const redisResult = await redis.ping();
     console.log('Redis connected:', redisResult);
 
-    // Test Elasticsearch
-    const esResult = await elasticsearch.ping();
-    console.log('Elasticsearch connected:', esResult);
+    // Elasticsearch powers discovery only — it is NOT required for auth/CRUD, and
+    // it is slow to start. Treat it as non-fatal so a slow/absent ES never blocks
+    // or crashes the API (login must work immediately).
+    try {
+      const esResult = await elasticsearch.ping();
+      console.log('Elasticsearch connected:', esResult);
+    } catch (esError) {
+      console.warn('Elasticsearch not reachable yet (discovery degraded):', (esError as Error).message);
+    }
   } catch (error) {
     console.error('Database connection error:', error);
     throw error;

@@ -1,7 +1,7 @@
 {
   "name": "scalable-api",
   "frontendPort": 5173,
-  "backendPort": 3000,
+  "backendPort": 8080,
   "backendRequired": true,
   "dbName": "scalable_api",
   "dbUser": "postgres",
