@@ -264,7 +264,18 @@ let wsGateway: WebSocketGateway;
 async function start() {
   try {
     logger.info('Testing database connections...');
-    await testConnections();
+    // Retry: Postgres/Redis may not accept connections the instant the backend
+    // boots (container still starting), which would otherwise crash the process.
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      try {
+        await testConnections();
+        break;
+      } catch (err) {
+        if (attempt === 10) throw err;
+        logger.warn({ attempt }, 'DB not ready, retrying in 2s...');
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
 
     // Initialize WebSocket
     wsGateway = new WebSocketGateway(server);
