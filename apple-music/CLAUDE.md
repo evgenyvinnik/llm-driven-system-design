@@ -1,127 +1,71 @@
-# Design Apple Music - Development with Claude
+# Apple Music — Development with Claude
 
 ## Project Context
 
-Building a music streaming service to understand audio delivery, library management, and personalized recommendations.
+A music streaming service looks like a CRUD catalog with an audio player bolted on. It isn't. The interesting constraint is that **the same track has to be a different file depending on who is asking and from where** — a free-tier listener on 3G should get 256kbps AAC, an individual subscriber on Wi-Fi should get 24-bit/192kHz ALAC, and the decision has to be made server-side before a single byte of audio moves, because the client cannot be trusted to enforce its own subscription tier. That turns "play a track" into a three-way constraint solve (preference ∩ tier ceiling ∩ network ceiling) that resolves to a specific row in `audio_files` and a specific presigned URL.
 
-**Key Learning Goals:**
-- Build audio streaming infrastructure
-- Design hybrid recommendation systems
-- Implement library matching and sync
-- Handle DRM and offline playback
+The second hard problem is cross-device library sync. A user's library is mutable state edited from a phone, a laptop, and a car, and none of them are online at the same time. Re-sending the whole library on every open is O(library size) per device per session; the alternative is a change log with a monotonic cursor, which is what this project implements — `library_changes` rows carrying a `sync_token` from a Postgres sequence, and clients asking "what changed since N?"
 
----
+Everything else — playlists, radio stations, "For You" sections — is comparatively ordinary relational work made interesting only by the read/write ratio: catalog browsing is overwhelmingly reads of near-static data, which is what justifies the Redis layer sitting in front of the recommendation queries.
 
-## Key Challenges to Explore
+**Learning goals:** adaptive quality selection under multiple independent ceilings, presigned object-storage URLs instead of proxied byte streams, delta sync with monotonic cursors, tiered rate limiting, and read-through caching for expensive derived data.
 
-### 1. Audio Quality
+## Architecture at a Glance (what actually runs)
 
-**Challenge**: Deliver lossless audio efficiently
+| Component | Port | Role | Why this one |
+|-----------|------|------|--------------|
+| **Express API** (`backend/src/index.ts`) | **3001** | Single process serving all eight route groups; `dev:server1/2/3` also bind 3001–3003 for multi-instance testing | One process, not microservices — all the state that would need coordinating already lives in Postgres and Redis |
+| **PostgreSQL 16** | 5432 | `users`, `artists`, `albums`, `tracks`, `audio_files`, `library_items`, `library_changes`, `listening_history`, `playlists`, `playlist_tracks`, `radio_stations`, `sessions`, `track_genres`, `user_genre_preferences`, `uploaded_tracks` | Catalog is deeply relational (track → album → artist) and that join is on every read path |
+| **Valkey 7** | 6379 | Session cache, rate-limit counters, idempotency records, recommendation cache | One store for four TTL-keyed workloads; none of them need durability |
+| **MinIO** | 9000 / 9001 | Buckets `audio-files` and `album-artwork`, presigned GETs | S3-compatible, so the presigned-URL code is the code you'd actually ship |
+| **Elasticsearch 8.11** | 9200 | **Declared but unused** — see the repair log | — |
 
-**Approaches:**
-- Adaptive bitrate selection
-- Pre-buffering next track
-- Gapless playback
-- Network-aware quality
+Route groups mount under `/api/{auth,catalog,library,playlists,stream,radio,recommendations,admin}`, each with its own rate limiter (`shared/rateLimit.ts`: a global 100/min limiter plus dedicated `stream`, `admin`, and `login` limiters). Cross-cutting concerns live in `backend/src/shared/`: `logger.ts` (Pino + request logging), `metrics.ts` (13 Prometheus collectors including `stream_start_latency` and `active_streams`), `idempotency.ts` (24h Redis-cached responses keyed per-user), `health.ts` (`/health`, `/health/ready`, plus `/healthz` and `/ready` aliases). Frontend is React 19 + TanStack Router + Zustand + Tailwind on 5173, with `stores/playerStore.ts` holding queue state and `components/Player.tsx` as the persistent transport bar; Vite proxies `/api` → 3001.
 
-### 2. Library Matching
+## Key Design Decisions
 
-**Problem**: Match user uploads to catalog
+### 1. Quality is the minimum of three independent ceilings, computed server-side
+`selectQuality()` in `routes/streaming.ts` takes the index of the user's preferred quality, the index of their tier ceiling (`free` → `256_aac`, `student` → `lossless`, `individual`/`family` → `hi_res_lossless`), and the index of their network ceiling (`cellular_3g` → `256_aac`, `wifi` → `hi_res_lossless`), and returns the minimum. Modeling these as one ordered ladder rather than three independent flags is what makes it correct: any scheme where the client picks and the server merely validates has to answer "what happens when the request is invalid?", and both answers are bad — reject, and the player stalls on a network transition; silently substitute, and the client's UI now lies about what's playing. Taking the minimum means every request is satisfiable and the response states what was actually selected. The cost is that quality is fixed at stream start: a listener who walks from Wi-Fi onto cellular mid-track keeps the lossless URL until the next track, because there is no mid-stream renegotiation. Real ABR solves that by segmenting; this serves whole files.
 
-**Solutions:**
-- Audio fingerprinting (Chromaprint)
-- Metadata matching
-- Confidence scoring
-- Manual override
+### 2. Presigned MinIO URLs, not audio proxied through Express
+`GET /api/stream/:trackId` authenticates, resolves quality, looks up the `audio_files` row, and returns a **signed URL** the client fetches directly from MinIO. Proxying the bytes through Node would put a multi-megabyte, multi-minute transfer on the API process for every concurrent listener — a single Node process saturates on socket count and event-loop time long before it runs out of CPU for the actual API work, and scaling would then be driven by bandwidth rather than request rate. Handing out a signed URL keeps the API request short and O(1), and in production the same pattern lets a CDN sit in front of the origin with the API entirely out of the data path. What we give up is control after issuance: once the URL is out we cannot revoke it, count bytes delivered, or detect an abandoned stream — which is precisely why there are separate progress and end-stream endpoints feeding `active_streams` and `stream_start_latency`, reconstructing from client reports what a proxy would have known directly.
 
-### 3. Cross-Device Sync
+### 3. Library sync is a change log with a monotonic cursor, not a full-state diff
+Every library mutation writes a `library_changes` row (`change_type`, `item_type`, `item_id`, `data` JSONB) stamped with `nextval('sync_token_seq')`; `GET /api/library/sync?lastSyncToken=N` runs `WHERE user_id = $1 AND sync_token > $2` against the `(user_id, sync_token)` index and returns the current max as the next cursor. The alternative — ship the full library and let the client diff — is O(library size) on every sync, which for a 10,000-track library is megabytes of JSON per device per app-open, almost all of it unchanged. The change log makes a sync proportional to what actually changed, usually zero rows. The honest cost is twofold. The log grows forever with no compaction path, so a heavy user accumulates rows indefinitely. And the sequence is **global rather than per-user**: tokens are allocated at statement time but rows become visible at commit time, so a row holding token 100 can commit after a row holding token 101, and a client that reads `currentToken = 101` will never be handed row 100. Per-user write concurrency here is effectively zero so it never fires, but the correct fix is a cursor derived from commit order rather than from a sequence.
 
-**Challenge**: Keep library consistent across devices
+### 4. Redis fronts the recommendation queries, but deliberately not the catalog
+`GET /api/recommendations/for-you` checks `recommendations:{userId}` before doing anything else, because building that response means several separate aggregate queries — top albums by play count grouped over listening history, most-recent-per-track via `DISTINCT ON`, new releases by release date, and one additional query per top genre pulled from `user_genre_preferences`. That is a handful of round trips including a `GROUP BY` over a user's entire history, on every page load, for data that changes at most a few times an hour. Catalog reads are intentionally *not* cached the same way: they are single indexed lookups where Redis would add a network hop to avoid a query Postgres answers out of shared buffers anyway. The trade-off is staleness — a user who plays five tracks sees no change in "For You" until the key expires, which feels broken in a demo where watching personalization react is the entire point. Production would invalidate the key on history writes rather than leaning on TTL alone.
 
-**Solutions:**
-- Sync token delta updates
-- Conflict resolution
-- Offline queue
-- Background sync
+### 5. Sessions are written to Postgres *and* cached in Redis, not one or the other
+Login inserts into the `sessions` table and then `SETEX`s `session:{token}`; `middleware/auth.ts` reads Redis first and falls back to the table. Redis-only would mean a Valkey restart logs out every user — acceptable for a cache, not for the thing gating playback. Postgres-only would put a query on literally every authenticated request, which in a read-heavy streaming app makes it the hottest query in the system. Writing both buys immediate revocation (logout deletes from both) *and* a cache-hit path that never touches the database. What we accept is a divergence window: if a session row is removed by any path that doesn't also clear Redis, the cached copy keeps working until its TTL expires.
 
----
+## Current State
 
-## Development Phases
+Runs end to end. `docker-compose up -d` brings up Postgres (schema auto-loaded from `backend/src/db/init.sql` via the initdb mount), Valkey, MinIO with both buckets created and set to anonymous download, and Elasticsearch. The backend on 3001 serves auth (register/login/logout/profile), catalog browse and search, library CRUD + sync + listening history, playlist CRUD with idempotent mutations, streaming with quality negotiation and progress reporting, radio stations (curated plus artist/track/genre-seeded, with shuffle), "For You" recommendations, and an admin API. The frontend covers browse, search, library, album/artist/playlist detail, radio, settings, and an admin dashboard, with a persistent player and queue.
 
-### Phase 1: Catalog - COMPLETED
-- [x] Track/album/artist data
-- [x] Search (PostgreSQL LIKE, Elasticsearch planned)
-- [x] Metadata ingestion (seed data)
-- [x] Artwork serving (MinIO placeholder)
+**Seeded logins** — all three rows carry the same bcrypt hash, and the password is `password123` for every one of them: `admin@applemusic.local` (admin), `demo@applemusic.local`, `alice@example.com`.
 
-### Phase 2: Streaming - IN PROGRESS
-- [x] Audio file serving (MinIO URLs)
-- [x] Adaptive quality (subscription tier based)
-- [ ] DRM integration (placeholder only)
-- [x] Gapless playback (queue prefetching)
+Simplified or simulated: audio objects in MinIO are placeholders rather than real encodes, so quality selection picks a row and signs a URL but no actual ALAC exists behind it; search is `LOWER(...) LIKE '%q%'` across three tables, not a real index; recommendations are SQL aggregates over play counts and genre scores, not embeddings. Omitted entirely: DRM/FairPlay, audio-fingerprint matching for user uploads (`uploaded_tracks` carries `matched_track_id` and `match_confidence` columns that nothing populates), offline downloads, social/friend activity, and WebSocket push for live sync.
 
-### Phase 3: Library - COMPLETED
-- [x] Library management
-- [ ] Upload matching (schema ready, implementation pending)
-- [x] Cross-device sync (sync tokens)
-- [x] Smart playlists (schema ready)
+## Iteration & Repair Log
 
-### Phase 4: Discovery - COMPLETED
-- [x] Listening history
-- [x] Recommendations (For You sections)
-- [x] Personalized radio
-- [ ] Social features (follow friends, share)
+- **2026-07 (docs rewrite):** replaced the phase-checklist CLAUDE.md with this structure. The old checklist was wrong in both directions — it marked **"Phase 2: Streaming — IN PROGRESS"** while quality negotiation, presigned URLs, tier/network ceilings, and stream metrics were all fully implemented, and it listed **"Search (PostgreSQL LIKE, Elasticsearch planned)"** as a *completed* Phase 1 item without mentioning that Elasticsearch is already running and consuming a 512MB heap for nothing.
+- **Elasticsearch is dead weight:** `elasticsearch:8.11.0` is in `docker-compose.yml` with `ES_JAVA_OPTS=-Xms512m -Xmx512m`, and `@elastic/elasticsearch` is a backend dependency — but `grep -r elastic backend/src` returns nothing. Every search path is `LIKE` against Postgres. Either wire it up or drop the service; today it is half a gigabyte of RAM doing nothing.
+- **Seed password comments are wrong:** `backend/db-seed/seed.sql` annotates the three users as `admin123`, `demo123`, and `password123`, but all three rows share one identical bcrypt hash. Only `password123` works — which is why `scripts/screenshot-configs/apple-music.json` signs in as `admin@applemusic.local` / `password123`. The comments are the defect, not the hashes.
+- **Backend port pinned to 3001:** the `dev` script is `PORT=3001 tsx watch src/index.ts`, matching the Vite proxy target in `frontend/vite.config.ts`. Note that `index.ts` still falls back to 3000 when `PORT` is unset, so `npm start` (rather than `npm run dev`) silently breaks the proxy.
+- **CI:** the repo-wide smoke-test workflow was removed — a CI runner can't provide Postgres + Valkey + MinIO + Elasticsearch, so it failed on every PR without signalling a real defect. Verification is `npm run triage apple-music` locally.
 
----
+## Open Questions
 
-## Implementation Notes
-
-### What Was Built
-
-1. **Backend (Express.js)**
-   - Full REST API with authentication
-   - Catalog browsing and search
-   - Library management with sync tokens
-   - Playlist CRUD operations
-   - Radio stations (curated and personal)
-   - Recommendation engine (genre-based, play history)
-   - Admin dashboard API
-
-2. **Frontend (React + Vite)**
-   - Apple Music-inspired dark UI
-   - Full audio player with queue
-   - Browse, search, library views
-   - Album, artist, playlist pages
-   - Radio station player
-   - Admin dashboard
-
-3. **Infrastructure**
-   - PostgreSQL for persistent data
-   - Redis for session caching
-   - MinIO for audio/artwork storage (S3-compatible)
-
-### Trade-offs Made
-
-| Decision | Chosen Approach | Alternative | Rationale |
-|----------|-----------------|-------------|-----------|
-| Search | PostgreSQL LIKE | Elasticsearch | Simpler setup for demo |
-| Auth | Session + Redis | JWT | Easier revocation |
-| Audio files | MinIO URLs | CDN + HLS | Demo simplicity |
-| Recommendations | SQL-based | ML embeddings | No ML infrastructure |
-
-### What's Missing (Future Phases)
-
-1. **Real Audio Files** - Currently uses placeholder URLs
-2. **DRM/FairPlay** - No actual encryption
-3. **Upload Matching** - Fingerprinting not implemented
-4. **Social Features** - No friend activity
-5. **Offline Downloads** - No PWA service worker
-6. **Real-time Updates** - No WebSocket for live sync
-
----
+1. `library_changes` grows without bound and nothing prunes it. Compaction is tempting (collapse an add-then-remove of the same item into nothing), but any device still holding a cursor below the compaction point would silently miss changes — is tracking a floor cursor per user the right mechanism, or is retention-by-age simpler and good enough?
+2. `sync_token` comes from a global sequence, so allocation order is not commit order (decision 3). Is a per-user token allocated inside the mutation's own transaction sufficient, or does correctness here really require something commit-ordered like a replication LSN?
+3. Quality is chosen once per track. Mid-stream adaptation means segmenting audio and shipping a manifest — at what point does the complexity of HLS/DASH beat whole-file delivery for a *music* service, where tracks run minutes rather than hours?
+4. Recommendations are TTL-cached with no invalidation, so listening doesn't visibly change "For You" until expiry. Should a history write invalidate the key directly — and if it does, does the cache stop paying for itself for exactly the users who listen most?
 
 ## Resources
 
-- [Spotify Engineering Blog](https://engineering.atspotify.com/)
-- [Audio Fingerprinting](https://acoustid.org/chromaprint)
-- [Music Recommendation Systems](https://towardsdatascience.com/music-recommendation-system-spotify-dcf7c9e5d99)
+- [Presigned URLs (Amazon S3)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) — the mechanism behind decision 2; MinIO implements the same API
+- [MinIO documentation](https://min.io/docs/minio/linux/index.html)
+- [PostgreSQL: CREATE SEQUENCE](https://www.postgresql.org/docs/current/sql-createsequence.html) — including the non-transactional allocation behavior decision 3 runs into
+- [Spotify Engineering](https://engineering.atspotify.com/) — long-running writing on catalog and personalization at scale
+- [Prometheus metric types](https://prometheus.io/docs/concepts/metric_types/) — the counter/gauge/histogram split used in `shared/metrics.ts`

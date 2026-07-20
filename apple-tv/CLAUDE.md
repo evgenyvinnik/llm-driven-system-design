@@ -1,119 +1,70 @@
-# Design Apple TV+ - Development with Claude
+# Apple TV+ — Development with Claude
 
 ## Project Context
 
-Building a premium video streaming service to understand video transcoding, adaptive streaming, and content delivery.
+Video streaming is the one system in this repo where **the API is not on the data path**. A two-hour movie is tens of gigabytes across all its variants; no amount of Express tuning makes serving that through Node a good idea. The architecture is therefore split in two: a *control plane* that answers "who are you, are you entitled, and what qualities exist for this title?" in milliseconds, and a *data plane* that ships bytes. The artifact joining them is an HLS manifest — a small text file the API generates on demand, listing every variant, audio track, and subtitle with the URLs the player should fetch. Getting the manifest right is the whole job; after that the player does adaptive bitrate selection on its own, with no server involvement.
 
-**Key Learning Goals:**
-- Build video ingestion and encoding pipelines
-- Design adaptive bitrate streaming
-- Implement global CDN strategies
-- Handle DRM and content protection
+The second interesting problem is that watch progress is **multi-writer, offline-tolerant state**. The same profile can be watching on an Apple TV in the living room and an iPhone on the train, both accumulating position updates, both possibly buffering them while offline. There is no single authoritative writer and no useful way to lock. This project resolves it with last-write-wins keyed on a *client-supplied* timestamp rather than server arrival order, which is the correct choice for reasons that only become obvious once you consider a device that syncs an hour late.
 
----
+Third, the profile model changes the shape of everything downstream. Entitlement is per-*account* (`users.subscription_tier`), but progress, watchlist, history, and recommendations are per-*profile*. Every read path has to carry both, and getting that boundary wrong is how a household ends up seeing each other's viewing history.
 
-## Key Challenges to Explore
+**Learning goals:** HLS manifest generation and the ABR contract, control-plane/data-plane separation, conflict resolution for multi-device state, per-account entitlement over per-profile personalization, and circuit-breaking a CDN dependency.
 
-### 1. Video Transcoding
+## Architecture at a Glance (what actually runs)
 
-**Challenge**: Encode masters to multiple qualities efficiently
+| Component | Port | Role | Why this one |
+|-----------|------|------|--------------|
+| **Express API** (`backend/src/index.ts`) | **3001** | Eight route groups: `auth`, `content`, `streaming`, `watchProgress`, `watchlist`, `recommendations`, `subscription`, `admin` | Control plane only — it emits manifests and metadata, never real video |
+| **PostgreSQL 16** | 5432 | 14 tables including `content`, `encoded_variants`, `video_segments`, `audio_tracks`, `subtitles`, `user_profiles`, `watch_progress`, `watch_history`, `watchlist`, `downloads`, `audit_log` | The variant/segment tables *are* the manifest — HLS output is a projection of these rows |
+| **Valkey 7** | 6379 | Session store (`connect-redis` + `express-session`), recommendation cache, progress-idempotency records, segment-request counters | Sessions must survive an API restart; nothing here needs durability |
+| **MinIO** | 9000 / 9001 | Buckets for `videos` and `thumbnails`, created on boot by `db/minio.ts` | S3-compatible origin — the shape a real CDN would sit in front of |
 
-**Approaches:**
-- Distributed encoding clusters
-- Per-scene quality optimization
-- Multi-codec support (HEVC, H.264)
-- HDR tone mapping for SDR
+Streaming endpoints in `routes/streaming.ts` produce a master playlist (`/:contentId/master.m3u8`), per-variant, per-audio, and per-subtitle playlists, plus segment endpoints. Shared infrastructure is in `backend/src/shared/`: `circuitBreaker.ts` (Opossum, with named `storage` and `cdn` breakers), `metrics.ts` (`manifest_generation_duration`, `active_streams`, `segment_requests_total`, `playback_start_latency`, `streaming_errors`), `idempotency.ts` (including a purpose-built `watchProgressIdempotency`), `logger.ts` (Pino + audit events). Frontend is React 19 + TanStack Router + Zustand + Tailwind on 5173: `components/VideoPlayer.tsx` with a decomposed `player/` subtree (`PlayerControls`, `ProgressBar`, `QualitySettings`, `VideoOverlay`), `HeroBanner`, `ContentRow`, and an `admin/` tab set. Vite proxies `/api` → 3001.
 
-### 2. Adaptive Streaming
+## Key Design Decisions
 
-**Problem**: Deliver best quality for network conditions
+### 1. The manifest is generated per-request from SQL, not stored as a file
+`GET /:contentId/master.m3u8` runs three queries — variants ordered by resolution, audio tracks, subtitles — and assembles the `#EXT-X-STREAM-INF` / `#EXT-X-MEDIA` text on the fly, deriving `RESOLUTION` from height × 16/9 and picking `CODECS` strings by codec and HDR flag (`hvc1.2.4.L150.B0` for HEVC+HDR, `avc1.640029` for H.264). Writing the manifest once at ingest and serving it statically would be faster, but it makes the manifest a *cache of the database that nobody invalidates*: add a 4K variant, re-encode an audio track, or ship a new subtitle language, and every stale `.m3u8` on disk now describes content that doesn't match reality — and the failure surfaces as a player error deep in ABR selection, not as an obvious 404. Generating from rows means the manifest cannot drift from the catalog. The cost is real: three queries per playback start rather than a file read, which is why `manifest_generation_duration` is instrumented and why the content lookup is wrapped in the `storage` circuit breaker. At CDN scale this flips — you'd generate once and invalidate explicitly.
 
-**Solutions:**
-- HLS with multiple bitrate variants
-- Buffer-based adaptation
-- Quality prediction models
-- Seamless quality switching
+### 2. Watch progress is last-write-wins on the *client's* timestamp, not the server's
+The upsert in `routes/watchProgress.ts` conflicts on `(profile_id, content_id)` and only overwrites `position`/`duration`/`completed` `WHEN COALESCE(watch_progress.client_timestamp, 0) < $7`, then sets `client_timestamp = GREATEST(existing, incoming)`. Ordering by server arrival — the obvious implementation — is wrong in the specific case that matters: a phone that watched offline and syncs an hour later arrives *after* the living-room device, so its stale position would win and the user's resume point would jump backwards. Ordering by when the observation was *made* rather than when it was *received* fixes exactly that. What we give up is any notion of merge — genuinely concurrent playback on two devices resolves to one winner, and the loser's progress is discarded rather than reconciled. We also inherit trust in client clocks: a device with a skewed clock can pin progress permanently, since its inflated timestamp will beat every honest update forever. A vector clock or per-device row would avoid both, at the cost of a much harder "what do I resume?" query.
 
-### 3. Global Delivery
+### 3. Entitlement is checked per-account at the route boundary; personalization is per-profile
+`hasSubscription` guards every streaming route, reading `subscriptionTier` and `subscriptionExpiresAt` off the session and rejecting `free` or expired accounts with 403. Meanwhile `watch_progress`, `watch_history`, `watchlist`, and recommendations all key on `profile_id`. Collapsing these — one identity for both — breaks in both directions: per-profile entitlement would mean a household paying four times, and per-account personalization would mean a child's profile seeing an adult's continue-watching row, which is precisely the failure mode profiles exist to prevent. Splitting them means every personalized query carries a profile the session must have selected, so "no profile chosen" becomes a real state the API has to handle. The trade-off is that entitlement is evaluated from *session* data rather than re-read from the database, so a subscription that lapses mid-session keeps streaming until the session refreshes.
 
-**Challenge**: Low latency worldwide with high cache hit rates
+### 4. Circuit breakers are named per dependency class (`storage`, `cdn`), not per call site
+`withCircuitBreaker('storage', …)` wraps content lookups; `withCircuitBreaker('cdn', …)` wraps segment fetches. The distinction matters because these fail differently and should degrade differently: a slow origin should stop segment delivery for everyone quickly (players will retry and re-buffer), while a database problem should fail manifest generation without taking down catalog browsing. A single breaker across "external stuff" would couple them, so a CDN blip would open the breaker that also protects metadata reads and the whole catalog would go dark for a video-delivery problem. What we give up is per-content granularity — one badly-encoded title generating errors counts against the same budget as everything else and can open the breaker for the entire library.
 
-**Solutions:**
-- Multi-tier CDN architecture
-- Predictive pre-positioning
-- Origin shield pattern
-- Geographic licensing enforcement
+### 5. Segment endpoints are stubs, and the manifest is what's actually being modeled
+`GET /:contentId/segment/:variantId/:segmentNum.ts` sets `Content-Type: video/mp2t`, increments a Redis counter, and returns a zero-byte buffer. That is deliberate. Producing real segments means an FFmpeg transcoding pipeline, tens of gigabytes of storage per title, and a job queue — none of which teaches anything about *streaming architecture* that the manifest doesn't already teach. Stubbing the data plane keeps every control-plane concern real (auth, entitlement, variant selection, manifest correctness, per-segment metrics, breaker behavior) while cutting the part that is purely an encoding exercise. The honest consequence is that **the player never actually plays anything** — `VideoPlayer.tsx` renders controls over an empty stream — so anything that depends on real playback (buffer-based quality switching, genuine ABR, seek accuracy) cannot be exercised here at all.
 
----
+## Current State
 
-## Development Phases
+Runs end to end: `docker-compose up -d` for Postgres (schema from `backend/src/db/init.sql`), Valkey, and MinIO with buckets created at boot; backend on 3001; frontend on 5173. Implemented: registration/login with bcrypt and Redis-backed express sessions, multi-profile creation and switching, content catalog with movies/series/episode hierarchy and featured flags, HLS master + variant + audio + subtitle manifest generation, playback start/end lifecycle tracking, watch progress with LWW conflict resolution and a batch endpoint, continue-watching, watchlist, genre/trending/personalized recommendation sections, subscription tier gating, an admin dashboard (overview, users, content tabs), audit logging, Prometheus metrics, and circuit breakers.
 
-### Phase 1: Ingestion
-- [ ] Master file validation
-- [ ] Transcoding pipeline
-- [ ] HLS packaging
-- [ ] Origin storage
+**Seeded logins** (all share the bcrypt hash for `password123`): `alice@example.com` (yearly, ~300 days left), `bob@example.com` (monthly, ~25 days), `charlie@example.com` (**free tier — useful for testing the 403 path**), `admin@appletv.local` (admin, yearly).
 
-### Phase 2: Delivery (In Progress)
-- [x] Manifest generation (HLS master/variant playlists)
-- [x] Content catalog API
-- [ ] CDN integration
-- [ ] DRM licensing
-- [ ] Edge caching
+Simulated or omitted: no transcoding pipeline and no real video bytes (decision 5); subtitle files are two hardcoded WEBVTT cues generated per request; `video_segments` and `downloads` tables exist but nothing populates them; no DRM/FairPlay licensing; no CDN, edge caching, or origin shield; no offline downloads; no geographic licensing enforcement.
 
-### Phase 3: Player
-- [x] Quality selection UI
-- [x] Progress tracking
-- [ ] Adaptive bitrate logic
-- [ ] Buffer management
-- [ ] Error recovery
+## Iteration & Repair Log
 
-### Phase 4: Experience
-- [x] Continue watching
-- [x] Watchlist (My List)
-- [x] Recommendations
-- [x] Profile management
-- [ ] Offline downloads
-- [ ] Cross-device sync
+- **2026-07 (docs rewrite):** replaced the phase-checklist CLAUDE.md with this structure. The old checklist listed **all of Phase 1 (Ingestion) as unchecked** and **"Phase 3: Player — Adaptive bitrate logic / Buffer management"** as not done, which reads as "the streaming half isn't built" — while the real situation is the opposite and more interesting: full multi-variant HLS manifest generation with HDR codec strings *is* built, and ABR is unchecked because ABR is the *player's* job in HLS, not the server's. It also left "Continue watching" as a bare checked box with no mention of the LWW conflict resolution that makes it work across devices.
+- **Backend port pinned to 3001:** `dev` is `PORT=3001 tsx watch src/index.ts`, matching the Vite proxy target. Note `npm start` (`tsx src/index.ts`, no `PORT`) does not pin it and will fall through to the config default.
+- **`activeStreams` is tracked in a process-local `Map`:** `routes/streaming.ts` keeps `activeStreamTracking` in memory to pair stream-start with stream-end for the gauge. With `dev:server1/2/3` running behind a balancer, a stream that starts on 3001 and ends on 3002 leaks a permanently-incremented gauge on one instance and an unmatched decrement on the other. The counter is correct only single-process.
+- **Segment counters go to Redis but are never read:** the `cdn` breaker path does `redis.incr('segment:{content}:{variant}:{num}')` on every request, and nothing consumes those keys — they accumulate with no TTL. `segment_requests_total` in Prometheus is the metric that actually gets used.
+- **CI:** the repo-wide smoke-test workflow was removed; a runner can't provide Postgres + Valkey + MinIO. Verify locally with `npm run triage apple-tv`.
 
----
+## Open Questions
 
-## Implementation Notes
-
-### Session 1: Core Implementation
-
-**Date**: 2025-01
-
-**Completed:**
-1. Created PostgreSQL schema with content, users, profiles, watch progress, watchlist, subscriptions
-2. Built Express backend with session-based authentication (Redis store)
-3. Implemented HLS manifest generation (master playlist with quality variants)
-4. Created recommendation engine with genre-based, trending, and personalized sections
-5. Built React frontend with Tanstack Router:
-   - Home page with hero banner and content rows
-   - Content detail page with episode listing for series
-   - Video player with controls (play/pause, seek, volume, quality selection)
-   - Profile selection and management
-   - Watchlist management
-   - Account and subscription pages
-   - Admin dashboard with stats and content management
-
-**Key Design Decisions:**
-- Used simulated HLS manifests (real video segments would require FFmpeg transcoding)
-- Profile-based watch history (each profile has independent progress)
-- Subscription middleware to gate streaming access
-- Redis for session storage and recommendation caching
-
-**Next Steps:**
-- Integrate actual video transcoding with FFmpeg
-- Add real HLS segment generation and delivery from MinIO
-- Implement DRM (FairPlay for Apple devices)
-- Add offline download support
-
----
+1. Manifests are generated per request (decision 1). Caching them in Redis keyed by content ID is easy; correct invalidation is not, because a variant, audio track, or subtitle row can change independently. Is a version column on `content` bumped by any child write the right cache key, or does that just move the drift problem up one level?
+2. LWW on client timestamps trusts client clocks. Would a server-assigned monotonic sequence per profile-device pair be better — and if it is, how does a device that has been offline for a day know where its sequence should resume?
+3. Entitlement is read from the session, so a lapsed subscription streams until the session refreshes. Should `hasSubscription` re-query Postgres on every streaming request, or is a short session TTL the cheaper way to bound the window?
+4. `content_ratings` and `user_profiles` both exist, but nothing filters the catalog by a profile's maturity setting. Is age gating a query predicate on every content read, or a separate materialized view per rating tier — and which one survives a kids' profile browsing a 10,000-title catalog?
 
 ## Resources
 
-- [HLS Authoring Specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices)
-- [FairPlay Streaming](https://developer.apple.com/streaming/fps/)
-- [FFmpeg Documentation](https://ffmpeg.org/documentation.html)
+- [HTTP Live Streaming (Apple)](https://developer.apple.com/streaming/) — the manifest format decision 1 emits
+- [HLS Authoring Specification for Apple Devices](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices) — variant ladder and `CODECS` string requirements
+- [RFC 8216 — HTTP Live Streaming](https://datatracker.ietf.org/doc/html/rfc8216) — normative `#EXT-X-STREAM-INF` / `#EXT-X-MEDIA` semantics
+- [FairPlay Streaming](https://developer.apple.com/streaming/fps/) — the DRM layer this project omits
+- [Opossum circuit breaker](https://nodeshift.dev/opossum/) — the library behind `shared/circuitBreaker.ts`

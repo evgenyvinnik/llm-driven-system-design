@@ -1,82 +1,70 @@
-# Design Apple Pay - Development with Claude
+# Apple Pay — Development with Claude
 
 ## Project Context
 
-Building a mobile payment system to understand tokenization, hardware security, and NFC transactions.
+The whole point of a mobile payment system is a single property: **the merchant never sees the card number, and neither does the payment app's own database.** Everything else follows from that. A card is provisioned once, exchanged for a device-specific token (a DPAN plus a `token_ref`), and from then on the real PAN exists nowhere in the system — `provisioned_cards` stores `last4` and nothing more. That's not a shortcut taken for the demo; it's the actual security model, and it means a full database dump of this project leaks no card numbers.
 
-**Key Learning Goals:**
-- Build payment tokenization systems
-- Design hardware-backed security
-- Implement NFC payment protocols
-- Handle multi-network integration
+The second problem is that a token is a *bearer* credential. If a token alone authorized payment, capturing one transaction would let you replay it forever. Real EMV solves this with a per-transaction cryptogram bound to a monotonically increasing Application Transaction Counter (ATC) held in the Secure Element — the counter is what makes each transaction distinguishable from a replay of the last one. This project models that: there is a cryptogram, an ATC, and a simulated Secure Element, even though the "hardware" is a Redis key.
 
----
+Third: payments are the canonical place where retries are dangerous. A network timeout on `POST /api/payments` leaves the client genuinely unable to tell whether money moved. Retrying might double-charge; not retrying might silently drop a legitimate payment. That ambiguity is why idempotency keys are *required* — not optional — on every mutating endpoint here.
 
-## Key Challenges to Explore
+**Learning goals:** tokenization as a data-minimization strategy, replay prevention via counters and cryptograms, mandatory idempotency on money-moving operations, per-network circuit breakers, biometric challenge-response, and immutable audit logging.
 
-### 1. Secure Tokenization
+## Architecture at a Glance (what actually runs)
 
-**Challenge**: Generate secure, network-valid tokens
+| Component | Port | Role | Why this one |
+|-----------|------|------|--------------|
+| **Express API** (`backend/src/index.ts`) | **3000** | Four route groups: `/api/{auth,cards,payments,merchants}` | Single process; `dev:server1/2/3` bind 3001–3003 for multi-instance experiments |
+| **PostgreSQL 16** | 5432 | `users`, `devices`, `provisioned_cards`, `merchants`, `transactions`, `biometric_sessions`, `audit_logs`, `token_atc` | Money needs ACID; the transaction ledger is the system of record |
+| **Valkey 7** | 6379 | Sessions (1h TTL), idempotency records, simulated Secure Element state (`se:{deviceId}`), recent-transaction lists | Everything cached here is either short-lived or reconstructible from Postgres |
 
-**Approaches:**
-- Network TSP integration
-- Device-specific tokens
-- Cryptogram generation
-- Token lifecycle management
+There is deliberately no object storage, no queue, and no search index — this system has no large blobs, no fan-out, and no free-text corpus. Cross-cutting infrastructure lives in `backend/src/shared/`: `circuit-breaker.ts` (Opossum, one breaker per card network, 10s timeout / 50% error threshold / 30s reset), `idempotency.ts`, `audit.ts`, `logger.ts` (Pino with request correlation IDs), `metrics.ts` (Prometheus at `/metrics`), `health.ts` (`/health/live`, `/health/ready`, `/health/deep`). Domain logic is in `backend/src/services/`: `tokenization.ts` (the Token Service Provider role), `payment.ts` (authorization flow), `biometric.ts` (challenge-response), `auth.ts`. Request bodies are validated with Zod at every route. Frontend is React 19 + TanStack Router + Zustand + Tailwind on 5173 (wallet view, add-card form, pay sheet, merchant terminal, transaction history, `BiometricModal`), proxying `/api` → 3000.
 
-### 2. Hardware Security
+## Key Design Decisions
 
-**Problem**: Protect keys from software attacks
+### 1. The PAN is never persisted — tokenization is data minimization, not obfuscation
+`provisionCard()` accepts a PAN, runs Luhn validation, derives the network from the BIN prefix, generates a `token_ref` and a network-shaped DPAN, and then **drops the PAN on the floor**. What lands in `provisioned_cards` is `last4`, the token reference, and the DPAN. The tempting alternative — store the PAN encrypted and decrypt at payment time — is meaningfully worse: it means a key exists that can reverse the whole table, so the key becomes the single point of catastrophic failure and every compliance question turns into a key-custody question. Storing nothing reversible means a database compromise yields `4242` and a meaningless token string. What we give up is any operation that genuinely needs the PAN — we cannot re-provision a card to a second device without asking the user to re-enter it, and we cannot support network-initiated PAN updates (the "your card was reissued" flow) without a real TSP relationship. Both are correct things to give up.
 
-**Solutions:**
-- Secure Element storage
-- Hardware-backed operations
-- Secure channel establishment
-- Attestation
+### 2. Idempotency is `required: true` on money movement, not best-effort
+`idempotencyMiddleware({ required: true })` gates payment authorization, refunds, and card provisioning — a request without `X-Idempotency-Key` is rejected outright rather than processed. Making the key optional would be strictly worse than not having it: the dangerous case is a client that times out and retries, and a client written without knowledge of the header is exactly the client that will retry blindly. Rejecting the un-keyed request forces the ambiguity to be resolved at integration time, when a developer can see the error, instead of at 2am in production when a customer is charged twice. The trade-off is a harder integration story and a genuine ordering hazard: the key must be generated *before* the first attempt and reused across retries, and a client that regenerates the key on retry gets a double charge with the middleware happily approving both. Refunds get the loudest comment in the codebase for this reason.
 
-### 3. Transaction Speed
+### 3. One circuit breaker per card network, not one per service
+`shared/circuit-breaker.ts` wraps the Visa, Mastercard, and Amex authorization calls in three separate Opossum breakers (10s timeout, 50% error threshold, 30s reset). A single breaker across "the payment network" would mean a Visa outage stops Mastercard transactions — every Amex holder in the system declined because of a problem at a different company. Worse, without any breaker, a hung network call holds a request and its database connection for the full timeout; at even modest concurrency the pool exhausts and *every* endpoint, including reads, starts failing. Per-network isolation bounds the blast radius to the affected network's cardholders. What we accept is that an open breaker fails fast, which means declining transactions that might have succeeded — for payments that is the right direction to err, since a spurious decline is recoverable and a hung payment is not.
 
-**Challenge**: Complete NFC in < 500ms
+### 4. The ATC lives in simulated Secure Element state, and that's where the model gets honest
+`incrementATC()` bumps a counter inside the `se:{deviceId}` Redis blob after each authorization, modeling the EMV property that every transaction from a token carries a strictly increasing counter — the mechanism that distinguishes a fresh payment from a replayed capture. Modeling it in Redis rather than adding a column was a deliberate choice to keep "the device knows its own counter" as the mental model. But the honest statement is that this is where the simulation is thinnest, in two ways. The counter is only in Redis, so a `docker-compose down -v` resets every ATC to zero — in a real system that would be a total replay-protection failure. And the cryptogram itself (`generateCryptogram`) is an unkeyed SHA-256 over `tokenRef:amount:merchantId:timestamp`, all of which the merchant already knows — so anyone holding those four values can forge one. Real EMV derives the cryptogram with a key that exists only inside the Secure Element; that key is exactly the thing a software demo cannot have.
 
-**Solutions:**
-- Pre-generated cryptograms
-- Efficient NFC protocols
-- Local auth caching
-- Parallel operations
+### 5. Biometric auth is a challenge-response session, not a boolean
+`POST` to start authentication creates a `biometric_sessions` row with a random 32-byte challenge and a 5-minute expiry, and payment cannot proceed until that session is verified. The obvious alternative — client sends `biometricVerified: true` — is not authentication at all; it's a field an attacker sets. Even simulated, the challenge-response shape carries the right invariants: the challenge is server-generated (so it can't be precomputed), it's single-use and bound to a `session_id`, and it expires (so a captured challenge has a bounded window). That means the *protocol* is right even though the verification step is stubbed. The cost is a second round trip before every payment and a state machine that can strand a user with a pending session if the device never responds — hence the expiry.
 
----
+## Current State
 
-## Development Phases
+Runs end to end: `docker-compose up -d` (Postgres + Valkey only), then the backend on 3000 and the frontend on 5173. Implemented: registration/login with bcrypt and Redis-backed sessions; device registration; card provisioning with Luhn validation, network detection, duplicate-per-device rejection, and first-card-is-default; the full card lifecycle (suspend, reactivate, remove) as `status` transitions; payment authorization with cryptogram generation, simulated network auth behind per-network circuit breakers, and both deterministic decline scenarios and a 1% random "network error" to exercise the retry path; refunds; a merchant-side payment endpoint; biometric challenge-response with a simulate-verify shortcut for demos; audit logging on every sensitive action; Zod validation on all route bodies; Prometheus metrics; and deep health checks.
 
-### Phase 1: Tokenization - COMPLETED
-- [x] Card provisioning
-- [x] Network integration (simulated TSP)
-- [x] Token storage (Redis + PostgreSQL)
-- [x] Secure Element interface (simulated)
+**Seeded logins** (all share the bcrypt hash for `password123`): `alice@example.com`, `bob@example.com`, `charlie@example.com`, and `admin@applepay.local` (admin).
 
-### Phase 2: NFC Payments - IN PROGRESS
-- [x] Payment terminal protocol (simulated)
-- [x] Cryptogram generation
-- [x] Transaction flow
-- [ ] Receipt handling
-- [ ] NFC communication simulation
+Simulated or omitted: there is no Secure Element (Redis stands in), no real TSP — `token_ref`/DPAN are locally generated rather than requested from Visa/Mastercard — no NFC or physical terminal protocol, no real card-network connectivity, and no Apple Pay JS/payment-sheet integration. `express-session` and `crypto-js` are declared in `backend/package.json` but unused; sessions are hand-rolled over Redis and all crypto goes through Node's built-in `crypto`.
 
-### Phase 3: In-App - COMPLETED
-- [x] Apple Pay JS (simulated)
-- [x] Payment sheet (React UI)
-- [x] Token encryption
-- [x] Server processing
+## Iteration & Repair Log
 
-### Phase 4: Management - COMPLETED
-- [x] Token lifecycle (suspend, reactivate, remove)
-- [x] Lost device handling
-- [x] Card updates
-- [x] Transaction history
+- **2026-07 (docs rewrite):** replaced the phase-checklist CLAUDE.md with this structure. The old checklist claimed **"Phase 2: NFC Payments — IN PROGRESS"** with "Receipt handling" and "NFC communication simulation" unchecked, while listing "Cryptogram generation" and "Transaction flow" as done — but it never mentioned that *nothing validates a cryptogram*, which is the far more interesting gap. It also marked Phase 4 "Management" fully COMPLETED without noting that lost-device handling is a `status` column update with no token-lifecycle notification anywhere.
+- **`token_atc` table is orphaned:** `db/init.sql` creates `token_atc (token_ref, last_atc, updated_at)` with a comment reading *"Write-through caching: updated in both Redis and PostgreSQL"* — but `grep -r token_atc backend/src` matches only the schema file. `incrementATC()` writes solely to the `se:{deviceId}` Redis key, so the durable half of the write-through never happens and clearing Redis silently resets every counter.
+- **`validateCryptogram()` is dead code:** the function is implemented (with a 5-minute freshness window and a timing-safe comparison) and exported, but nothing calls it. `routes/merchants.ts` computes `_expectedCryptogram` and discards it, with the comment *"For demo, we accept payments regardless of cryptogram."* Approval there is `amount < 10000`.
+- **`validateCryptogram()` would also throw if it were called:** `crypto.timingSafeEqual` requires equal-length buffers and throws `RangeError` otherwise, so a wrong-length cryptogram from a client would produce an unhandled 500 rather than a clean `false`. Length must be checked before the comparison.
+- **Backend port is 3000 here, not 3001:** unlike most projects in this repo, `apple-pay`'s `dev` script is bare `tsx watch src/index.ts` and `index.ts` defaults to 3000, which is what `frontend/vite.config.ts` proxies to. The repo-wide "pin `PORT=3001`" fix does **not** apply — changing it would break the proxy.
+- **CI:** the repo-wide smoke-test workflow was removed; a CI runner can't provide Postgres and Valkey. Verify locally with `npm run triage apple-pay`.
 
----
+## Open Questions
+
+1. The ATC is incremented but never *checked* — no code path rejects a transaction whose counter is less than or equal to the last seen value. Should validation live in `payment.ts` (where we control both sides) or only at the simulated network boundary, where a real acquirer would enforce it?
+2. Idempotency records are Redis-only. If Valkey restarts mid-retry-window, a duplicate payment becomes possible again — does the idempotency key need to be a uniqueness constraint on `transactions` rather than a cache entry, making the database rather than the cache the authority?
+3. Circuit breakers are per-network but per-*process*. With three API instances behind a balancer, each learns about a network outage independently and each burns its own error budget before opening. Is shared breaker state (in Redis) worth the coordination cost, or is triplicate learning acceptable at this instance count?
+4. Card suspension flips a `status` column, but any Redis `token:{tokenRef}` entry written at provisioning time has a one-year TTL and is not invalidated. What is the right revocation path for a token that has already been distributed — and does answering it require the same write-through discipline the `token_atc` table was meant to have?
 
 ## Resources
 
-- [EMV Tokenization](https://www.emvco.com/emv-technologies/payment-tokenisation/)
-- [Apple Pay Security](https://support.apple.com/en-us/HT203027)
-- [NFC Payment Standards](https://www.iso.org/standard/70121.html)
+- [EMVCo payment tokenisation](https://www.emvco.com/emv-technologies/payment-tokenisation/) — the DPAN/token-ref model decision 1 implements
+- [Apple Platform Security — Apple Pay](https://support.apple.com/guide/security/apple-pay-security-sec2561eb018/web) — Secure Element, DPAN, and cryptogram roles
+- [Stripe: idempotent requests](https://docs.stripe.com/api/idempotent_requests) — the key semantics decision 2 mirrors
+- [Opossum circuit breaker](https://nodeshift.dev/opossum/) — the library behind `shared/circuit-breaker.ts`
+- [Node.js crypto: timingSafeEqual](https://nodejs.org/api/crypto.html#cryptotimingsafeequala-b) — including the equal-length requirement that makes the dead `validateCryptogram` unsafe to simply enable
