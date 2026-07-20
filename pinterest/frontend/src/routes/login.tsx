@@ -51,6 +51,7 @@ function LoginPage() {
               <label className="block text-sm font-semibold mb-1">Username</label>
               <input
                 type="text"
+                name="username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 placeholder="Username"
@@ -62,6 +63,7 @@ function LoginPage() {
               <label className="block text-sm font-semibold mb-1">Password</label>
               <input
                 type="password"
+                name="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="Password"
