@@ -1,170 +1,69 @@
-# Design Scalable API - Development with Claude
+# Scalable API — Development with Claude
 
 ## Project Context
 
-Building a scalable API system to understand horizontal scaling, traffic management, and high-availability patterns.
+Most projects in this repo *use* an API; this one is about the API tier itself. The premise: a single Express process is easy — the interesting problems appear when you put a load balancer in front of three identical instances and have to answer "which instance?", "is this response cacheable?", "is this caller abusive?", and "is this dependency down?" without any instance knowing what the others are doing.
 
-**Key Learning Goals:**
-- Build horizontally scalable services
-- Design effective caching strategies
-- Implement rate limiting and circuit breakers
-- Create comprehensive observability
+Everything here is deliberately a *shared-nothing* design: instances hold no session state, no sticky affinity, no local coordination. The state that must be shared (rate-limit counters, cache, sessions) lives in Redis, which is what makes "add another instance" a real scaling lever rather than a lie.
 
----
+**Learning goals:** horizontal scaling behind a load balancer, multi-level caching and its invalidation cost, distributed rate limiting that stays correct across instances, circuit breakers for dependency isolation, and the observability needed to see any of it working.
 
-## Key Challenges to Explore
+## Architecture at a Glance (what actually runs)
 
-### 1. Horizontal Scaling
+Five backend processes, started together by `npm run dev` (→ `dev:all` via `concurrently`):
 
-**Challenge**: Add capacity by adding instances
+| Process | Port | Role |
+|---------|------|------|
+| **Gateway** (`gateway/src/index.ts`) | **8080** | Public entry point. Rate limiting, auth, request ID assignment, routing to the LB. This is the port the frontend talks to |
+| **Load balancer** (`load-balancer/src/index.ts`) | 3000 | Least-connections distribution across the API instances, with health-check-driven ejection |
+| **API server ×3** (`api-server/src/index.ts`) | 3001, 3002, 3003 | Identical stateless instances, distinguished only by `INSTANCE_ID` |
 
-**Approaches:**
-- Stateless design
-- Shared nothing architecture
-- Load balancer distribution
-- Connection pooling
+Shared modules in `backend/shared/services/` — `cache.ts`, `rate-limiter.ts`, `circuit-breaker.ts`, `metrics.ts`, `queue.ts`, `database.ts`, `logger.ts`, `retention.ts` — are imported by all three tiers so behavior is identical wherever it runs. Background workers (`audit-worker.ts`, `notification-worker.ts`, `task-worker.ts`) consume from RabbitMQ. Infrastructure: PostgreSQL + Redis (`docker-compose.dev.yml` for just the stores; `docker-compose.yml` additionally containerizes gateway and frontend). Frontend is a React admin dashboard showing live metrics, per-endpoint request stats, circuit-breaker states, and cache hit rates.
 
-### 2. Traffic Management
+**Port note:** the gateway on **8080** is the backend port for this project, not the repo-default 3000 — 3000 is the load balancer, which sits *behind* the gateway. `scripts/screenshot-configs/scalable-api.json` sets `"backendPort": 8080` for exactly this reason.
 
-**Problem**: Protect from abuse and overload
+## Key Design Decisions
 
-**Solutions:**
-- Rate limiting (token bucket, sliding window)
-- Circuit breakers
-- Request queuing
-- Graceful degradation
+### 1. Two-level cache: in-process (5s) in front of Redis
+A read checks a local in-memory map first, then Redis, then Postgres — and a Redis hit back-fills the local map. The local tier exists because at high RPS even a 1ms Redis round-trip dominates the response time of an otherwise trivial handler, and it costs a network hop per request per instance. What we give up is coherence: for up to 5 seconds, three instances can serve three different versions of the same key, and an invalidation in Redis doesn't reach the local maps. That is only acceptable because the cached data here is dashboard/metric-shaped (staleness is invisible), and the TTL is deliberately short enough that no human notices. For anything user-mutable, the local tier would need pub/sub invalidation — the complexity we're explicitly avoiding at this scale.
 
-### 3. Latency Optimization
+### 2. Sliding-window rate limiting in Redis sorted sets, not per-instance counters
+The naive approach — an in-memory counter per instance — is wrong the moment you scale out: with 3 instances and a 100 req/min limit, a caller effectively gets 300, and the limit changes every time you add capacity. So the limiter stores one sorted-set entry per request keyed by timestamp, trims entries outside the window, and counts what remains — atomically, in Redis, so all instances see one shared view. Sliding window over fixed window because a fixed window lets a caller send 2× the limit across a boundary (100 at 0:59, 100 at 1:00). The cost is real: one sorted set per caller, N entries per window, plus the trim — meaningfully more memory and CPU than an `INCR` counter. That's the price of a limit that means the same thing regardless of instance count.
 
-**Challenge**: Maintain fast response times at scale
+### 3. Least-connections load balancing over round-robin
+Round-robin assumes requests are interchangeable; they aren't. One slow endpoint pins an instance while round-robin keeps feeding it new work at the same rate as its idle peers. Least-connections routes to the instance with the fewest in-flight requests, which self-corrects — a struggling instance naturally receives less. The trade-off is that the balancer must now track per-instance in-flight state, so it is stateful in a way round-robin isn't; that state is per-balancer, which is fine with one balancer but becomes an approximation if you run several.
 
-**Solutions:**
-- Multi-level caching
-- Connection reuse
-- Async processing
-- Query optimization
+### 4. Circuit breakers per dependency, not per service
+Each external dependency gets its own breaker, so a failing one degrades only what depends on it instead of taking down the process. Without this, a hung dependency consumes request-handling capacity until the whole instance is unresponsive — the classic cascade, where a non-critical dependency causes total outage. Trade-off: an open breaker fails fast, which means rejecting requests that *might* have succeeded; the half-open state exists to bound how long we stay pessimistic. Current breaker states are exported to the dashboard, because a breaker you can't observe is an unexplained outage.
 
----
+### 5. Demo-grade auth, deliberately
+Sessions live in Redis (not in-process), which is the part that actually matters for this project's thesis: any instance can serve any request because no instance owns the session. The credential check itself is minimal — this project is about the API tier, not about authentication.
 
-## Development Phases
+## Current State
 
-### Phase 1: Foundation (Completed)
-- [x] API server framework
-- [x] Load balancer setup
-- [x] Health checks
-- [x] Request logging
+Runs end to end: gateway (8080) + load balancer (3000) + three API instances (3001–3003) started by one `npm run dev`, two-level caching, Redis sliding-window rate limiting, per-dependency circuit breakers, Prometheus-style metrics, structured logging with request IDs, RabbitMQ workers (audit, notification, task), PostgreSQL schema in `database/schema.sql` with a partitioning migration, and a React admin dashboard that renders live uptime/heap/cache-hit-rate/per-endpoint 2xx-4xx-5xx breakdowns and circuit-breaker state. Seeded login: `alice@example.com` / `password123` (admin).
 
-### Phase 2: Performance (In Progress)
-- [x] Caching layer (local + Redis two-level cache)
-- [x] Connection pooling (PostgreSQL pool)
-- [ ] Query optimization
-- [x] Compression (gzip via Express)
+Not implemented: distributed tracing (request IDs propagate, but there's no Jaeger/Zipkin collector), alerting rules, query optimization beyond the existing indexes, and load-test scripts (k6/Artillery) — the dashboard currently shows only the traffic you generate by hand.
 
-### Phase 3: Protection (In Progress)
-- [x] Rate limiting (sliding window with Redis)
-- [x] Circuit breakers (per-dependency)
-- [x] Authentication (session-based with Redis)
-- [x] Input validation (basic)
+## Iteration & Repair Log
 
-### Phase 4: Observability (In Progress)
-- [x] Metrics collection (Prometheus-compatible)
-- [ ] Distributed tracing
-- [ ] Alerting
-- [x] Dashboards (React admin dashboard)
+- **2026-07 (docs rewrite):** replaced the template phase-checklist CLAUDE.md (Phase 2/3/4 "In Progress" boxes that didn't reflect what was built) with this architecture/decision/state structure. The old file also never explained the gateway-vs-LB port split, which is the single most confusing thing about running this project.
+- **Backend port corrected in the screenshot config:** the harness assumed 3000 (the load balancer) and so probed a port the frontend never uses; set to **8080** (the gateway). Before the fix the harness proceeded before the gateway was listening.
+- **Harness login detection (repo-wide fix, surfaced here):** this project's login page and dashboard are *both* at `/`, so the harness's "did the URL change after submit?" check could never pass and it reported a false login failure — while its own debug screenshot showed a fully logged-in dashboard. `scripts/screenshots.mjs` now decides success by whether the credential field disappeared, not by URL change. Verified: login=OK, 2/2 screens captured.
+- **Backend port resolution (repo-wide):** `scripts/screenshots.mjs` now derives the backend port from config → `PORT=` in the `dev` script → the Vite proxy target → 3000, instead of hardcoding 3000.
+- **CI:** the repo-wide smoke-test workflow was removed (a CI runner can't provide the Docker services these tests need).
 
----
+## Open Questions
 
-## Implementation Notes
-
-### Architecture Decisions
-
-1. **Two-Level Caching**: Local in-memory cache (5s TTL) + Redis (configurable TTL)
-   - Reduces Redis round-trips for hot data
-   - Local cache auto-populates from Redis hits
-
-2. **Sliding Window Rate Limiting**: Using Redis sorted sets
-   - More accurate than fixed window
-   - Atomic operations for distributed correctness
-
-3. **Circuit Breaker Pattern**: Per-dependency isolation
-   - Prevents cascading failures
-   - Half-open state for recovery testing
-
-4. **Load Balancer**: Least connections with weights
-   - Better distribution than round-robin
-   - Dynamic weight adjustment based on health
-
-### Files Created
-
-**Backend:**
-- `backend/api-server/src/index.js` - API server with caching, circuit breakers
-- `backend/gateway/src/index.js` - API gateway with rate limiting
-- `backend/load-balancer/src/index.js` - Load balancer with health checks
-- `backend/shared/services/` - Cache, rate limiter, circuit breaker, metrics
-- `backend/shared/middleware/` - Auth, logging, error handling
-
-**Frontend:**
-- `frontend/src/components/Dashboard.tsx` - Admin dashboard
-- `frontend/src/stores/` - Zustand state management
-- `frontend/src/services/api.ts` - API client
-
-**Database:**
-- `database/schema.sql` - Full schema with users, API keys, request logs
-- `database/migrations/` - Partitioning migration
-
-### Testing the Implementation
-
-```bash
-# Start infrastructure
-docker-compose -f docker-compose.dev.yml up -d
-
-# Start backend services (in separate terminals)
-cd backend && npm install
-npm run dev:gateway    # Port 8080
-npm run dev:lb         # Port 3000
-npm run dev:server1    # Port 3001
-npm run dev:server2    # Port 3002
-npm run dev:server3    # Port 3003
-
-# Start frontend
-cd frontend && npm install && npm run dev
-
-# Test rate limiting
-for i in {1..150}; do curl -s http://localhost:8080/api/v1/status | jq; done
-
-# Test load balancing
-for i in {1..10}; do curl -s http://localhost:3000/api/v1/status | jq '.instanceId'; done
-```
-
----
-
-## Next Steps
-
-1. **Query Optimization**
-   - Add database indexes
-   - Implement query result caching
-   - Add slow query logging
-
-2. **Distributed Tracing**
-   - Propagate trace IDs across services
-   - Add Jaeger/Zipkin integration
-
-3. **Alerting**
-   - Define SLIs/SLOs
-   - Configure alerting rules
-   - Add PagerDuty/Slack integration
-
-4. **Load Testing**
-   - Create k6 or Artillery scripts
-   - Identify bottlenecks
-   - Tune configurations
-
----
+1. The 5s local cache tier has no invalidation path — at what read/write ratio does it stop being worth the staleness, and is pub/sub invalidation cheaper than just deleting the tier?
+2. Sliding-window sorted sets cost one Redis entry per request. At what RPS does that memory pressure justify switching to a token bucket (approximate, far cheaper) instead?
+3. Least-connections state is per-balancer. If we ran two balancers, would the resulting split-brain view of instance load be worse than plain round-robin?
+4. Request IDs already propagate through gateway → LB → instance. Is adding a real tracing backend the highest-value next step, or is per-endpoint p99 in the dashboard already enough to find the slow path?
 
 ## Resources
 
-- [12-Factor App](https://12factor.net/)
-- [Nginx Load Balancing](https://docs.nginx.com/nginx/admin-guide/load-balancer/http-load-balancer/)
-- [Prometheus Metrics](https://prometheus.io/docs/concepts/metric_types/)
-- [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
-- [Rate Limiting Algorithms](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/)
+- [12-Factor App](https://12factor.net/) — the stateless-process discipline this project is built on
+- [Cloudflare: how we count things](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) — sliding-window rate limiting trade-offs
+- [Martin Fowler: Circuit Breaker](https://martinfowler.com/bliki/CircuitBreaker.html)
+- [Nginx load balancing methods](https://docs.nginx.com/nginx/admin-guide/load-balancer/http-load-balancer/) — least-connections vs round-robin
+- [Prometheus metric types](https://prometheus.io/docs/concepts/metric_types/)

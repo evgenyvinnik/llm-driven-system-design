@@ -548,6 +548,41 @@ async function installDeps(dir, name = 'frontend') {
 }
 
 /**
+ * Determine the port the backend actually listens on.
+ *
+ * Most projects run their API on 3001 because that is what their Vite dev-server
+ * proxy targets; a few use 3000 or something else entirely (scalable-api: 8080).
+ * Guessing wrong makes the readiness probe time out silently and the browser then
+ * drives a backend that isn't up yet, which surfaces as "Request failed" on login.
+ *
+ * Precedence: explicit config → PORT= in the backend `dev` script → Vite proxy
+ * target → 3000.
+ */
+function resolveBackendPort(config, backendDir, projectDir) {
+  if (config.backendPort) return config.backendPort;
+
+  const pkgPath = path.join(backendDir, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const devScript = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).scripts?.dev || '';
+      const match = devScript.match(/PORT=(\d+)/);
+      if (match) return parseInt(match[1], 10);
+    } catch {
+      // Malformed package.json — fall through to the proxy/default.
+    }
+  }
+
+  for (const name of ['vite.config.ts', 'vite.config.js']) {
+    const vitePath = path.join(projectDir, 'frontend', name);
+    if (!fs.existsSync(vitePath)) continue;
+    const match = fs.readFileSync(vitePath, 'utf8').match(/target:\s*['"`]http:\/\/localhost:(\d+)/);
+    if (match) return parseInt(match[1], 10);
+  }
+
+  return 3000;
+}
+
+/**
  * Start the backend dev server
  */
 async function startBackend(projectDir, config) {
@@ -583,8 +618,10 @@ async function startBackend(projectDir, config) {
     }
   });
 
-  // Wait for backend to be ready (check port 3000)
-  const backendPort = config.backendPort || 3000;
+  // Wait for the backend to be ready on the port it actually binds. Many projects
+  // run their API on 3001 (the port their Vite proxy targets), so a hardcoded 3000
+  // would never become reachable and the browser would drive an unready backend.
+  const backendPort = resolveBackendPort(config, backendDir, projectDir);
   const backendUrl = `http://localhost:${backendPort}`;
   const startTime = Date.now();
   const maxWait = 30000;
@@ -749,22 +786,32 @@ async function captureWithPlaywright(config, outputDir) {
       // Additional wait for any client-side routing/state updates
       await page.waitForTimeout(1500);
 
-      // Check for error messages on the page
+      // Check for error banners. Red text is also used for ordinary UI (a "0" stat,
+      // a Logout button), so only treat prose-like text as an actual error message.
       const errorElement = await page.$('.text-red-600, .text-red-700, .bg-red-50');
       if (errorElement) {
-        const errorText = await errorElement.textContent();
-        logError(`Login error message: ${errorText}`);
+        const errorText = ((await errorElement.textContent()) || '').trim();
+        if (errorText.length > 3 && !/^\d+$/.test(errorText)) {
+          logError(`Login error banner: ${errorText}`);
+        }
       }
 
-      // Verify we're no longer on the login page
+      // Verify login worked. A URL check alone is unreliable: plenty of apps log in
+      // without navigating — the login form is a panel on the page (r-place), or
+      // loginUrl is "/" which every URL trivially "includes" (scalable-api). The
+      // reliable signal is that the credential field is gone once we're authenticated.
       const currentUrl = page.url();
-      if (currentUrl.includes(auth.loginUrl)) {
-        logWarning('Still on login page after submit - login may have failed');
-        // Take a debug screenshot
+      const passwordSelector = auth.passwordSelector || 'input[name="password"], input[type="password"]';
+      const credentialFieldGone =
+        auth.passwordSelector === false ? false : !(await page.$(passwordSelector));
+      const navigatedAway = auth.loginUrl !== '/' && !currentUrl.includes(auth.loginUrl);
+
+      if (credentialFieldGone || navigatedAway) {
+        logSuccess(`Login successful - now at ${currentUrl}`);
+      } else {
+        logWarning('Login form still present after submit - login may have failed');
         await page.screenshot({ path: path.join(outputDir, 'debug-login-failed.png') });
         logWarning('Saved debug screenshot: debug-login-failed.png');
-      } else {
-        logSuccess(`Login successful - navigated to ${currentUrl}`);
       }
 
       isLoggedIn = true;
