@@ -1,7 +1,6 @@
 {
   "name": "twitch",
   "frontendPort": 5173,
-  "backendPort": 3000,
   "backendRequired": true,
   "dbName": "twitch_db",
   "dbUser": "twitch",

@@ -1,132 +1,73 @@
-# Coinbase (Crypto Exchange) - Development with Claude
+# Coinbase (Crypto Exchange) — Development with Claude
 
 ## Project Context
 
-Building a cryptocurrency exchange platform to understand order matching engines, real-time price feeds, wallet management with DECIMAL precision, and 24/7 market operations.
+An exchange is the one system in this repo where **the database is not fast enough to be the source of truth on the hot path**. Order matching is a tight loop over a sorted structure — find the best bid, find the best ask, check whether they cross, execute, repeat — and doing that with SQL round trips per comparison means the matching latency is dominated by network hops rather than by matching. Real exchanges keep the book in memory and treat the database as a durable log of what already happened. This project does the same, which immediately creates the central tension: the authoritative book lives in a process that can die.
 
-**Key Learning Goals:**
-- Design an order matching engine with price-time priority
-- Implement DECIMAL(28,18) precision for monetary values
-- Build real-time price simulation using Geometric Brownian Motion
-- Handle per-currency wallets with reserved balance management
-- Stream price updates via WebSocket and Kafka
-- Implement idempotent order placement
+The second problem is that **money cannot be a float**, and the naive fix isn't enough. Every monetary column is `DECIMAL(28,18)` and every API response returns amounts as strings, because a JSON number is an IEEE-754 double and `0.1 + 0.2 !== 0.3` is a rounding error you cannot explain to someone who just lost satoshis. Serializing as strings pushes the burden onto the frontend to format rather than compute — which is the correct place for it, since the frontend never needs to do arithmetic.
 
----
+The third is double-spend prevention while orders are resting. A user with 1 BTC must not be able to place two 1-BTC sell orders. There's no lock to take because the "resource" is a balance, not a row you're mutating. The answer is the reserve pattern: `available = balance - reserved_balance`, with reservation happening as a single conditional `UPDATE` whose `WHERE` clause *is* the check.
 
-## Key Challenges Explored
+**Learning goals:** in-memory order books with price-time priority, decimal precision discipline end to end, balance reservation as compare-and-set, WebSocket channel fan-out, and simulating a live market with Geometric Brownian Motion.
 
-### 1. Order Matching Engine
+## Architecture at a Glance (what actually runs)
 
-**Problem**: Match buy and sell limit orders with price-time priority.
+| Component | Port | Role | Why this one |
+|-----------|------|------|--------------|
+| **Express API + WebSocket server** (`backend/src/index.ts`, `app.ts`, `websocket.ts`) | **3001** | `/api/v1/{auth,markets,orders,portfolio,wallets,transactions}` plus `/ws`; also runs its own 2s price-tick loop | HTTP and WS share a port so the Vite proxy forwards both `/api` and `/ws` to one target |
+| **Price broadcaster** (`workers/price-broadcaster.ts`) | — | Independent GBM tick loop; publishes to Kafka and persists 1-minute candles | Separate process — see the repair log, this is where the design gets confusing |
+| **Portfolio updater** (`workers/portfolio-updater.ts`) | — | Writes `portfolio_snapshots` every 60s | Snapshots are for the history chart; they must not block trading |
+| **PostgreSQL 16** | 5432 | `users`, `currencies`, `trading_pairs`, `wallets`, `orders`, `trades`, `price_candles`, `portfolio_snapshots`, `transactions` | `DECIMAL(28,18)` plus `CHECK (balance >= reserved_balance)` — the invariants live in the schema |
+| **Valkey 7** | 6379 | Session store (`connect-redis`), Redis-backed rate limiting, idempotency keys | Rate limits must be shared across instances to mean anything |
+| **Kafka + Zookeeper** | 9092 / 2181 | `price-updates` topic | Event streaming for price ticks; publish failures are non-fatal |
 
-**Solution: In-memory order book per trading pair**
-- Bids sorted by price DESC, then timestamp ASC (best bid first)
-- Asks sorted by price ASC, then timestamp ASC (best ask first)
-- Match when best bid >= best ask at the earlier order's price
-- Update filled quantities and trigger wallet transfers atomically
+The matching engine is `services/orderBook.ts` (per-symbol `OrderBook` with `bids` sorted price-DESC/time-ASC and `asks` price-ASC/time-ASC, managed by `orderBookManager`). `services/orderService.ts` orchestrates placement → reservation → book insertion → matching → settlement; `services/walletService.ts` owns balances; `services/marketService.ts` is the GBM simulator. Support modules: `idempotency.ts`, `rateLimiter.ts` (separate `apiLimiter`, `authLimiter`, `orderLimiter`), `metrics.ts`, `logger.ts`, `db.ts`, `kafka.ts`. Frontend is React + TanStack Router + Zustand + Tailwind on 5173 with TradingView `lightweight-charts`, a depth-bar order book, and `hooks/useWebSocket.ts` driving live ticks. `backend/src/app.test.ts` is a vitest suite over the HTTP surface with shared modules mocked.
 
-### 2. DECIMAL Precision
+## Key Design Decisions
 
-**Problem**: Floating point arithmetic causes rounding errors with money.
+### 1. The order book is in memory; Postgres is the durable record of what already executed
+`orderBookManager.getBook(symbol)` returns a per-symbol `OrderBook` holding two arrays with sorted insertion, and `matchOrders()` walks the tops until they stop crossing. A database-backed book — `SELECT … ORDER BY price DESC LIMIT 1` per iteration — turns each matching step into a network round trip plus query planning, so a single order crossing ten levels costs ten round trips and matching latency becomes entirely I/O. Worse, it makes correctness harder rather than easier: you'd need `SERIALIZABLE` or explicit locking to stop two concurrent matchers from consuming the same resting order, which serializes exactly the operation you most want fast. Keeping the book in memory makes matching a single-threaded pass over sorted arrays with no concurrency to reason about at all. What we give up is stark and worth stating plainly: **the book does not survive a restart.** Resting limit orders remain `open` in Postgres but vanish from the book, so they will never match again — the database and the engine silently diverge. Real exchanges solve this with a replicated, sequenced log the book is rebuilt from on boot; this project has no rehydration step.
 
-**Solution**:
-- PostgreSQL `DECIMAL(28,18)` for all monetary columns
-- All API responses return amounts as strings (not numbers)
-- Frontend handles display formatting, not arithmetic
+### 2. Balance reservation is a single conditional UPDATE, not read-then-write
+`reserveBalance()` is one statement: `UPDATE wallets SET reserved_balance = reserved_balance + $3 WHERE user_id = $1 AND currency_id = $2 AND (balance - reserved_balance) >= $3 RETURNING id`, and the caller treats a zero row count as "insufficient funds." The obvious implementation — `SELECT` the balance, compare in application code, then `UPDATE` — has a race the size of the round trip between the two statements: two orders placed concurrently both read the same available balance, both pass the check, and both reserve, taking `reserved_balance` above `balance`. Folding the predicate into the `WHERE` clause makes the check and the mutation the same atomic operation, so the loser simply updates zero rows. The schema backs it with `CHECK (balance >= reserved_balance)` so even a bug elsewhere cannot persist an over-reserved wallet. The cost is that failure is signalled by a row count rather than an exception, which is easy to ignore — every caller has to remember that a successful query can still mean rejection.
 
-### 3. Price Simulation
+### 3. Every monetary value crosses the API boundary as a string
+`DECIMAL(28,18)` in Postgres, strings in JSON, formatting (never arithmetic) in `frontend/src/utils/format.ts`. Returning JSON numbers is the default thing to do and it silently destroys precision: `JSON.parse` produces a double, 18 decimal places of a large balance do not fit in 53 bits of mantissa, and the corruption is invisible — no error, just a value that's slightly wrong and gets slightly wronger every round trip. Strings preserve the exact decimal representation the database produced. The trade-off is ergonomic friction: the frontend cannot sort or sum without an explicit parse, and every developer touching a balance has to think about it. That friction is the feature — it makes precision loss a deliberate act rather than an accident. **This discipline stops at the matching engine**, which is the interesting inconsistency: `orderBook.ts` types `price` and `quantity` as `number`, so matching arithmetic runs in float64 even though storage and transport are exact.
 
-**Problem**: Need realistic price movement for development without real market data.
+### 4. Prices are simulated with Geometric Brownian Motion, not a random walk
+`simulatePriceTick()` applies `S × exp((μ − σ²/2)·dt + σ·√dt·Z)` with per-asset volatility (BTC ~1.5%, DOGE ~5%), a small upward drift, a Box–Muller normal, and clamping to 50–200% of base price. A uniform random walk would be simpler and would produce prices that look wrong in ways that matter for testing: it can go negative, its volatility doesn't scale with price level, and its increments are additive so a $100 move means the same thing at $100 as at $100,000. GBM is multiplicative, so returns rather than absolute moves are normally distributed — which is why the candles look like real candles and why per-asset σ produces visibly different chart character. What we give up is any market microstructure: prices move independently of the order book, so a large market order does not push the price, and the simulated "market" and the real matching engine are two unrelated systems that happen to share a symbol.
 
-**Solution: Geometric Brownian Motion**
-```
-newPrice = price * exp((mu - sigma²/2)*dt + sigma*sqrt(dt)*Z)
-```
-- Different volatility (sigma) per asset (BTC: 1.5%, DOGE: 5%)
-- Slight upward drift (mu = 0.0001)
-- Clamped to 50%-200% of base price to prevent extreme values
+### 5. Market orders fall back to a synthetic fill when the book is empty
+`placeOrder()` matches market orders against resting limit orders first; if none exist, it fills at `marketService.getCurrentPrice()` instead of rejecting. Rejecting would be more honest — with an empty book there genuinely is no counterparty — but it makes the application untestable in its normal state, because a fresh seeded database has no resting orders and every market order would fail. Real exchanges paper over this with market makers who are always quoting; the synthetic fill stands in for that liquidity. The cost is that the demo teaches a slightly false lesson: users can always trade at the displayed price with zero slippage, which is exactly the property real market orders don't have.
 
-### 4. Wallet Management
+## Current State
 
-**Problem**: Prevent double-spending while orders are pending.
+Runs end to end: `docker-compose up -d` (Postgres, Valkey, Zookeeper, Kafka), `npm run db:migrate`, backend on 3001, frontend on 5173, and optionally the two workers. Implemented: registration/login with bcrypt and Redis-backed sessions; per-currency wallets with reserve semantics; limit and market orders with idempotency keys (unique-indexed on `orders.idempotency_key`); price-time-priority matching with partial fills; order cancellation with reserve release; atomic settlement in a transaction that moves `balance` and `reserved_balance` on both sides; trade and transaction history; 1-minute candle aggregation; portfolio snapshots and allocation breakdown; WebSocket channels for ticker, order book, and per-user updates; Redis-backed rate limiting split across API/auth/order tiers; Prometheus metrics; and a vitest suite over the HTTP routes.
 
-**Solution: Balance + Reserved Balance pattern**
-- `available = balance - reserved_balance`
-- On order placement: increase reserved_balance
-- On order fill: decrease both balance and reserved_balance, add to counterparty
-- On order cancel: decrease reserved_balance only
+**Seeded logins:** `alice` / `alice@example.com` and `bob` / `bob@example.com`, both `password123`. Alice starts with 100,000 USD.
 
----
+Not built: no real market data (GBM only), no blockchain integration — deposits and withdrawals are `transactions` rows, not on-chain transfers — no KYC, no fee schedule beyond the `buyer_fee`/`seller_fee` columns, no stop-order trigger logic (the `stop` type and `stop_price` column exist and are accepted, but nothing monitors for the trigger), and no order-book rehydration on restart.
 
-## Development Phases
+## Iteration & Repair Log
 
-### Phase 1: Infrastructure & Schema (Complete)
-- [x] PostgreSQL schema with DECIMAL(28,18) precision
-- [x] Currencies and trading pairs seed data
-- [x] Session auth with Redis
-- [x] Docker Compose for all services
+- **2026-07 (docs rewrite):** replaced the phase-checklist CLAUDE.md with this structure. Its five phases were all marked **"(Complete)"**, including "Phase 4: Real-time Streaming — Price broadcaster worker (every 2 seconds)" — which is technically true and deeply misleading, because it hides that the worker's prices and the API's prices are two different simulations (below). The old file also had no entry for the WebSocket authentication gap or the split price universe, since a checklist has nowhere to put "this works but is wrong."
+- **Two divergent price universes (design bug):** `index.ts` runs its own `setInterval` calling `marketService.simulatePriceTick()` and broadcasting over WebSocket, while `workers/price-broadcaster.ts` is a **separate process** with its **own in-process** `marketService` instance ticking independently and writing `price_candles` plus Kafka. Because `marketService` holds prices in a plain in-memory `Map` with no Redis backing, the prices users see and the candles persisted to the database drift apart from the first tick. Running `dev:server1/2/3` multiplies this — three instances, three unrelated markets, three unrelated order books.
+- **WebSocket `authenticate` verifies nothing:** `websocket.ts` handles `{type: 'authenticate', userId}` by trusting the client-supplied `userId` and subscribing that socket to `user:{userId}`. Any connected client can subscribe to any user's private channel by guessing or reading a UUID. The session cookie is available on the upgrade request and is not consulted.
+- **`services/circuitBreaker.ts` is dead code:** the module exists and `opossum` is a declared dependency, but nothing imports it — `grep -r circuitBreaker src` matches only the file itself. Kafka publish failures are instead swallowed by a bare `catch (_err) {}` in the broadcaster.
+- **Backend port pinned to 3001:** `dev` is `PORT=3001 NODE_ENV=development tsx watch src/index.ts`, matching both Vite proxy targets (`/api` → `http://localhost:3001`, `/ws` → `ws://localhost:3001`). Note `dev:server2`/`dev:server3` set `PORT` and then invoke `npm run dev`, which re-sets `PORT=3001` — so they do **not** actually bind 3002/3003.
+- **CI:** the repo-wide smoke-test workflow was removed — a runner can't provide Postgres, Valkey, Zookeeper, and Kafka. `npm test` in `backend/` does run standalone, since the suite mocks the shared modules.
 
-### Phase 2: Market Service & Price Simulation (Complete)
-- [x] Geometric Brownian Motion price simulation
-- [x] Per-pair volatility configuration
-- [x] 1-minute candle aggregation
-- [x] Price history tracking
+## Open Questions
 
-### Phase 3: Order System (Complete)
-- [x] In-memory order book (bid/ask sorted)
-- [x] Order matching with price-time priority
-- [x] Market and limit order support
-- [x] Idempotency via Redis keys
-- [x] Wallet balance reservation
-
-### Phase 4: Real-time Streaming (Complete)
-- [x] WebSocket server for price feeds
-- [x] Channel-based subscriptions (ticker, orderbook, user)
-- [x] Price broadcaster worker (every 2 seconds)
-- [x] Kafka integration for event streaming
-
-### Phase 5: Frontend (Complete)
-- [x] Dark theme matching Coinbase design
-- [x] Market overview with asset list
-- [x] TradingView lightweight-charts integration
-- [x] Order book visualization with depth bars
-- [x] Trade form with market/limit toggle
-- [x] Portfolio summary with allocation
-- [x] Order history with cancel support
-
----
-
-## Design Decisions Log
-
-### Decision 1: In-Memory Order Book
-**Context**: Need fast order matching for crypto exchange
-**Decision**: In-memory data structure, not database-backed
-**Trade-off**: Lost on restart, but much faster matching
-**Rationale**: Learning project; production would use replicated state
-
-### Decision 2: Simulated Market Orders
-**Context**: Market orders need counterparty; order book may be empty
-**Decision**: If no matching limit orders, fill at current market price (simulated)
-**Trade-off**: Not realistic matching, but allows testing the full flow
-**Rationale**: Real exchange would always have liquidity providers
-
-### Decision 3: String-based Monetary Values in API
-**Context**: JSON numbers lose precision for large decimals
-**Decision**: All DECIMAL values returned as strings
-**Trade-off**: Frontend must parse; slightly more complex
-**Rationale**: Prevents silent precision loss (critical for crypto)
-
-### Decision 4: Session Auth (Not JWT)
-**Context**: Need simple auth for learning project
-**Decision**: Express sessions stored in Redis
-**Trade-off**: Not suitable for mobile apps
-**Rationale**: Simpler than JWT, follows repo patterns
-
----
+1. The book is memory-only and never rehydrated (decision 1). Rebuilding it at boot from `orders WHERE status IN ('open','partially_filled')` is a few lines — but is replaying stored orders in `created_at` order actually equivalent to the book that was lost, given price-time priority depends on arrival order the database only approximately preserves?
+2. Matching arithmetic is float64 while storage is `DECIMAL(28,18)` (decision 3). Moving the engine to a decimal library costs allocation and speed in the hottest loop in the system. Is integer-satoshi arithmetic the right middle ground, and does that just relocate the precision problem to the conversion boundary?
+3. `marketService` state is per-process, which is what causes the split universe above. Should price state move to Redis so all processes share one market — and if it does, does the 2-second tick become a distributed-leader problem (who is allowed to tick?) rather than a storage problem?
+4. WebSocket authentication currently trusts the client. Reading the session cookie during the upgrade handshake is the obvious fix, but it couples the WS server to the Express session store — is a short-lived signed ticket issued over HTTP and presented on connect a better boundary?
 
 ## Resources
 
-- [TradingView Lightweight Charts](https://tradingview.github.io/lightweight-charts/)
-- [Geometric Brownian Motion](https://en.wikipedia.org/wiki/Geometric_Brownian_motion)
-- [Order Book Data Structures](https://web.archive.org/web/20110219163448/http://howtohft.wordpress.com/2011/02/15/how-to-build-a-fast-limit-order-book/)
+- [How to Build a Fast Limit Order Book](https://web.archive.org/web/20110219163448/http://howtohft.wordpress.com/2011/02/15/how-to-build-a-fast-limit-order-book/) — the data-structure argument behind decision 1
+- [PostgreSQL numeric types](https://www.postgresql.org/docs/current/datatype-numeric.html) — why `DECIMAL(28,18)` rather than `double precision`
+- [Geometric Brownian motion](https://en.wikipedia.org/wiki/Geometric_Brownian_motion) — the price model in decision 4
+- [TradingView Lightweight Charts](https://tradingview.github.io/lightweight-charts/) — the candle renderer used by the frontend
+- [KafkaJS](https://kafka.js.org/docs/getting-started) — the client behind `services/kafka.ts`

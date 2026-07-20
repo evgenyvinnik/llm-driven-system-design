@@ -292,14 +292,35 @@ async function start(): Promise<void> {
   try {
     logger.info('Starting Amazon API server...');
 
-    logger.info('Initializing database...');
-    await initializeDb();
+    // Retry rather than exiting on the first failure: the containers accept
+    // connections while still initializing, so a backend started next to them
+    // can lose the race — and exiting meant the port never bound, which shows
+    // up only as a Vite proxy error on the login request.
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      try {
+        logger.info('Initializing database...');
+        await initializeDb();
 
-    logger.info('Initializing Redis...');
-    await initializeRedis();
+        logger.info('Initializing Redis...');
+        await initializeRedis();
+        break;
+      } catch (error) {
+        if (attempt === 10) throw error;
+        const err = error as Error;
+        logger.warn({ error: err.message, attempt }, 'Dependencies not ready, retrying in 2s...');
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
 
+    // Elasticsearch powers search, which falls back to Postgres full-text — so a
+    // slow or absent ES must degrade search, not prevent the server from starting.
     logger.info('Initializing Elasticsearch...');
-    await initializeElasticsearch();
+    try {
+      await initializeElasticsearch();
+    } catch (error) {
+      const err = error as Error;
+      logger.warn({ error: err.message }, 'Elasticsearch unavailable; search will use the PostgreSQL fallback');
+    }
 
     logger.info('Starting background jobs...');
     startAllBackgroundJobs();

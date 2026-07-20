@@ -177,10 +177,10 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
  */
 async function start() {
   try {
-    // Initialize Elasticsearch index
-    await initializeElasticsearch();
-    logger.info('Elasticsearch initialized');
-
+    // Bind the port FIRST. Elasticsearch is slow to become available and is not
+    // needed to authenticate or serve non-search routes; blocking the listen on
+    // it (and exiting when it wasn't ready yet) meant the port never bound, so
+    // even the login request failed at the Vite proxy.
     app.listen(config.port, () => {
       logger.info({
         port: config.port,
@@ -189,6 +189,21 @@ async function start() {
         healthEndpoint: `/health`,
       }, `Server running on port ${config.port}`);
     });
+
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      try {
+        await initializeElasticsearch();
+        logger.info('Elasticsearch initialized');
+        break;
+      } catch (error) {
+        if (attempt === 10) {
+          logger.error({ error }, 'Elasticsearch unavailable; search endpoints will fail');
+          break;
+        }
+        logger.warn({ attempt }, 'Elasticsearch not ready, retrying in 2s...');
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
   } catch (error) {
     logger.fatal({ error }, 'Failed to start server');
     process.exit(1);

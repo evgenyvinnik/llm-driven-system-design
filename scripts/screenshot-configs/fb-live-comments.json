@@ -1,7 +1,6 @@
 {
   "name": "fb-live-comments",
   "frontendPort": 5173,
-  "backendPort": 3000,
   "backendRequired": true,
   "dbName": "live_comments",
   "dbUser": "postgres",

@@ -1,7 +1,6 @@
 {
   "name": "apple-maps",
   "frontendPort": 5173,
-  "backendPort": 3000,
   "backendRequired": true,
   "dbName": "apple_maps",
   "dbUser": "maps",

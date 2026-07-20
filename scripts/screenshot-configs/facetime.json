@@ -1,7 +1,6 @@
 {
   "name": "facetime",
   "frontendPort": 5173,
-  "backendPort": 3000,
   "backendRequired": true,
   "dbName": "facetime",
   "dbUser": "facetime",

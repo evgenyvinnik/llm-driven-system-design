@@ -269,17 +269,28 @@ async function updateEnvelopeMetrics(): Promise<void> {
 // Initialize services and start server
 async function start(): Promise<void> {
   try {
-    // Initialize database connection
-    await initializeDatabase();
-    logger.info('Database connected');
+    // Retry the core dependencies instead of exiting on the first failure. The
+    // containers accept connections while still initializing, so a backend
+    // started next to them can lose the race — and exiting meant the port never
+    // bound, which shows up only as Vite proxy errors on the login request.
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      try {
+        await initializeDatabase();
+        logger.info('Database connected');
 
-    // Initialize Redis
-    await initializeRedis();
-    logger.info('Redis connected');
+        await initializeRedis();
+        logger.info('Redis connected');
 
-    // Initialize MinIO
-    await initializeMinio();
-    logger.info('MinIO connected');
+        await initializeMinio();
+        logger.info('MinIO connected');
+        break;
+      } catch (error) {
+        if (attempt === 10) throw error;
+        const err = error as Error;
+        logger.warn({ error: err.message, attempt }, 'Dependencies not ready, retrying in 2s...');
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
 
     // Initialize RabbitMQ (optional for local dev)
     try {

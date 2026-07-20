@@ -104,9 +104,21 @@ function gracefulShutdown(signal: string): void {
 
 // Start server
 async function start(): Promise<void> {
-  const dbConnected = await initializeDatabase();
+  // Retry rather than exiting on the first failure: the database container
+  // accepts local connections while its init scripts are still running, so a
+  // backend started alongside it can lose the race. Exiting here meant the port
+  // never bound at all, which surfaces downstream as Vite proxy errors and a
+  // login page that can't submit — indistinguishable from an unimplemented app.
+  let dbConnected = false;
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    dbConnected = await initializeDatabase();
+    if (dbConnected) break;
+    logger.warn({ msg: 'Database not ready, retrying in 2s...', attempt });
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
   if (!dbConnected) {
-    logger.error({ msg: 'Failed to connect to database. Exiting...' });
+    logger.error({ msg: 'Failed to connect to database after 10 attempts. Exiting...' });
     process.exit(1);
   }
 

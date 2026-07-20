@@ -1,287 +1,73 @@
-# Calendly - Meeting Scheduling Platform - Development with Claude
+# Calendly — Development with Claude
 
 ## Project Context
 
-This document tracks the development journey of implementing a meeting scheduling and calendar coordination platform similar to Calendly.
+Scheduling is a concurrency problem wearing a calendar costume. The visible product is "pick a slot," but the actual engineering question is what happens when two invitees load the same availability page, both see 2:00 PM free, and both click Confirm 40 milliseconds apart. Availability is *derived* state — computed from weekly rules minus existing bookings minus buffers — which means it is stale the instant it is rendered, and no amount of frontend polish changes that. The only place the race can actually be settled is at write time, in the database.
 
-## Key Challenges to Explore
+What makes it harder than a generic "two writers, one row" problem is that there is no row to lock. A booking conflicts not with an identical booking but with an *overlapping* one, and overlap is a range predicate, not an equality check. `SELECT … FOR UPDATE` on the thing being booked doesn't work because the thing being booked doesn't exist yet. This project's answer is to lock the **host** — the shared resource all their bookings contend for — and then run the overlap check inside that lock.
 
-1. **Double Booking Prevention**
-   - How to ensure no overlapping bookings with high concurrency?
-   - Database locking strategies vs. optimistic concurrency control
-   - Trade-offs between consistency and availability
+The third dimension is time zones, and specifically that a host's availability is expressed in *their* local wall-clock ("9–5 Tuesdays"), invitees see slots in *theirs*, and the storage layer must be in UTC. Every one of those three representations is correct in its own frame, and every bug in this domain comes from converting between them at the wrong moment.
 
-2. **Availability Calculation**
-   - Efficiently merging multiple calendar sources
-   - Computing available slots from busy periods
-   - Handling buffer times and constraints
-   - Caching strategies for performance
+**Learning goals:** pessimistic locking scoped to a contended parent row, interval overlap and gap-finding algorithms, cache invalidation for derived state, idempotency for public unauthenticated writes, delayed message delivery via TTL + dead-letter routing, and data lifecycle/archival.
 
-3. **Time Zone Complexity**
-   - Storing times in UTC vs. local time zones
-   - Displaying availability across time zones
-   - Handling daylight saving time transitions
-   - Edge cases (same clock time, different days)
+## Architecture at a Glance (what actually runs)
 
-4. **Calendar Integration**
-   - OAuth flows for different providers
-   - Rate limiting and quota management
-   - Two-way sync (read events, write bookings)
-   - Handling webhook delays and failures
-   - Dealing with API inconsistencies across providers
+| Component | Port | Role | Why this one |
+|-----------|------|------|--------------|
+| **Express API** (`backend/src/index.ts`) | **3000** | `/api/{auth,meeting-types,availability,bookings,admin}` | `dev:server1/2/3` bind 3001–3003 to exercise the cross-instance booking race |
+| **Notification worker** (`backend/src/workers/notification-worker.ts`) | — | Consumes booking confirmations and reminders | `dev:worker1/2` run two with distinct `WORKER_ID` to prove prefetch-1 fair dispatch |
+| **PostgreSQL 16** | 5432 | `users`, `meeting_types`, `availability_rules`, `bookings`, `bookings_archive`, `email_notifications`, `sessions` | Range overlap + row locking is exactly what a relational engine is for |
+| **Valkey 7** | 6379 | Session store (`connect-redis`), availability-rule cache, computed-slot cache, idempotency locks and results | The slot cache is the hot read path; everything in here is reconstructible |
+| **RabbitMQ 3** | 5672 / 15672 | `booking-notifications`, `reminders`, a shared DLQ bound to the `notifications-dlx` direct exchange | Confirmation email must not be inside the booking transaction |
 
-5. **Real-Time Availability**
-   - Balancing freshness vs. API costs
-   - Cache invalidation strategies
-   - Handling race conditions during booking
+Booking logic is split across `backend/src/services/booking/`: `create.ts`, `cancel.ts`, `reschedule.ts`, `slots.ts` (queries + cache invalidation), `idempotency.ts`, `notifications.ts`. Supporting services: `availabilityService.ts` (slot computation), `meetingTypeService.ts`, `emailService.ts`, `archivalService.ts`. Cross-cutting modules in `backend/src/shared/`: `queue.ts`, `metrics.ts` (including `double_booking_prevented` and `booking_creation_duration`), `logger.ts`, `idempotency.ts`, `health.ts`, `config.ts` (retention windows and thresholds). Time math uses `date-fns` + `date-fns-tz` via `utils/time.ts`; request bodies are validated with Zod. Frontend is React + TanStack Router + Zustand + Tailwind on 5173 with a public guest-booking route at `/book/$meetingTypeId`; Vite proxies `/api` → 3000.
 
-## Development Phases
+## Key Design Decisions
 
-### Phase 1: Requirements and Design
-*Completed*
+### 1. Lock the host row, then range-check — pessimistic, not optimistic
+`createBooking()` opens a transaction, runs `SELECT id FROM users WHERE id = $1 FOR UPDATE` against the *host*, and only then queries for overlapping confirmed bookings using the half-open predicate `start_time < bufferEnd AND end_time > bufferStart`. Locking the host is the key move: there is no row representing "the 2:00 PM slot," so the only thing two competing bookings provably share is the host, and serializing on it turns a range-conflict problem into an ordinary critical section. Optimistic concurrency was the obvious alternative and it fails on the detection step, not the retry step — you cannot express "no row overlaps my range" as a version check on a row you're inserting, so you'd need `SERIALIZABLE` isolation and a retry loop driven by serialization failures, which is both slower under contention and much harder to reason about. What we give up is throughput per host: every booking for one host serializes, so a host receiving simultaneous bookings for *non-overlapping* times still queues. That is the right trade — a scheduling link's realistic concurrency is a handful of requests per host per second, and correctness here is a double-booked human being.
 
-**Questions to explore with Claude:**
-- What are the absolute core features vs. nice-to-have?
-- What scale should we design for? (users, bookings/day)
-- What are the hardest technical problems?
-- Which calendar providers should we support first?
+### 2. Buffers are applied at both ends and folded into the conflict predicate, not checked separately
+The conflict query widens the candidate range by `buffer_before_minutes` and `buffer_after_minutes` before testing overlap, and the availability calculator widens existing bookings by the same amounts when building busy intervals. Checking buffers as a second, separate query after the overlap test would be subtly wrong: a booking that doesn't overlap but lands inside the buffer would pass step one, and any window between the two checks reintroduces the race the lock exists to close. Widening the interval means there is exactly one predicate and exactly one truth. The asymmetry (before vs after) matters because they model different things — travel/prep time before, note-taking time after — and collapsing them into one number would force hosts to over-reserve on both sides.
 
-**Key discussions needed:**
-- Compare different double-booking prevention approaches
-- Analyze availability calculation algorithms
-- Discuss time zone handling strategies
-- Evaluate calendar sync approaches (polling vs. webhooks)
+### 3. Slots are cached in Redis and invalidated on every booking mutation, not just expired
+`getAvailableSlots()` caches under `slots:{meetingTypeId}:{date}`, and `invalidateAvailabilityCache()` deletes those keys on create, cancel, and reschedule. Slot computation is genuinely expensive — fetch rules, convert wall-clock to UTC in the host's zone, fetch the day's bookings, widen them by buffers, find gaps, generate slots, filter past times, apply daily caps — and it runs on every render of a public booking page, which is the most-hit endpoint in the system. TTL-only expiry was the tempting simpler option, and it is wrong here in a way that's worse than usual staleness: a booked slot would keep being *offered* until expiry, so users would repeatedly select slots that then fail at confirm time with "no longer available." Explicit invalidation makes the common case correct and leaves the TTL as a backstop. The cost is that invalidation uses `redis.keys()` with a glob pattern, which is an O(keyspace) blocking scan — fine at this scale, a production hazard at any real one.
 
-### Phase 2: Core Implementation (MVP)
-*In progress*
+### 4. Idempotency keys are mandatory-by-derivation, because the booking endpoint is public
+`POST /api/bookings` has no `requireAuth` — invitees book through a shared link with no account. `checkBookingIdempotency()` therefore accepts a client-supplied key *or synthesizes one* from `(meeting_type_id, start_time, invitee_email)`, takes a Redis lock on it, caches the result, and the schema backs this with a partial unique index on `bookings(idempotency_key) WHERE idempotency_key IS NOT NULL`. Relying on the client to send a key is not an option when the client is an arbitrary browser that may double-submit a form or be reloaded mid-request; deriving one from the request's natural identity means the protection exists whether or not the caller cooperates. The trade-off is a deliberate false positive: the same invitee genuinely booking the same meeting type at the same time twice is indistinguishable from a retry and gets deduplicated. For scheduling that is the correct default. The Redis lock and the unique index are belt-and-braces — the lock stops concurrent duplicates cheaply, the index is what actually guarantees it if Redis is unavailable.
 
-**Focus areas:**
-1. Basic user and meeting type management
-2. Simple availability rules (weekly schedule)
-3. Availability slot calculation (without external calendars)
-4. Booking creation with double-booking prevention
-5. Basic email notifications
+### 5. Reminders are delayed with per-delay TTL queues dead-lettering into the real queue
+RabbitMQ has no native delayed delivery without a plugin, so `scheduleReminder()` computes `delayMs`, asserts a queue named `reminders-delay-{delayMs}` with `x-message-ttl: delayMs`, `x-dead-letter-routing-key: reminders`, and `x-expires: delayMs + 60000`, and publishes there. When the message's TTL lapses it is dead-lettered into the real `reminders` queue and a worker picks it up. The alternative — a polling job scanning for due reminders — means a database scan on an interval, latency bounded by the poll period, and a scheduler that is itself a single point of failure. This approach makes delivery time an intrinsic property of the message with no scheduler at all. What it costs is queue sprawl: a distinct queue per distinct millisecond delay, which is nearly every reminder. `x-expires` is what makes it survivable — each delay queue self-deletes a minute after its TTL — but the broker still churns through transient durable queues, and the honest production answer is `rabbitmq_delayed_message_exchange`.
 
-**Implementation questions:**
-- How to implement the availability algorithm efficiently?
-- What database indexes are critical?
-- How to structure the booking transaction?
+## Current State
 
-### Phase 3: Calendar Integration
-*Not started*
+Runs end to end: `docker-compose up -d` (Postgres, Valkey, RabbitMQ), backend on 3000, one or more notification workers, frontend on 5173. Implemented: registration/login with bcrypt and Redis-backed express sessions; meeting-type CRUD with duration, buffers, and `max_bookings_per_day`; weekly availability rules with a `CHECK (end_time > start_time)` constraint; slot computation with timezone conversion, gap-finding, buffer widening, past-slot filtering, and daily-cap trimming; public guest booking with derived idempotency; host-row-locked double-booking prevention with a `double_booking_prevented` counter; cancel and reschedule (both callable by an authenticated host *or* an invitee holding the booking link); email notifications persisted to `email_notifications` and printed to the console; RabbitMQ confirmations plus TTL-delayed reminders with a real dead-letter queue; archival of bookings past 90 days into `bookings_archive` with npm scripts for `db:archive-bookings`, `db:maintenance`, and `db:storage-stats`; Prometheus metrics; and an admin dashboard.
 
-**Focus areas:**
-1. Google Calendar OAuth integration
-2. Fetch and cache calendar events
-3. Merge calendar events into availability calculation
-4. Create calendar events on booking
-5. Handle calendar sync errors gracefully
+**Seeded logins** (all four share the bcrypt hash for `password123`, and each has a different time zone — which is the point): `alice@example.com` (America/Los_Angeles), `bob@example.com` (America/Chicago), `charlie@example.com` (Europe/London), `diana@example.com` (Asia/Tokyo).
 
-**Technical challenges:**
-- How to securely store and refresh OAuth tokens?
-- How to handle rate limits from calendar APIs?
-- What happens when calendar API is down during booking?
+Not built: no external calendar integration at all — no Google/Outlook OAuth, no event push, no two-way sync, no webhook handling. Emails are logged rather than sent (no SMTP). No recurring meetings, no group/multi-attendee events, and no round-robin team scheduling.
 
-### Phase 4: Scaling and Optimization
-*Not started*
+## Iteration & Repair Log
 
-**Focus areas:**
-1. Add Valkey/Redis caching layer
-2. Optimize availability queries
-3. Implement background jobs for calendar sync
-4. Add monitoring and metrics
-5. Load testing and bottleneck identification
+- **2026-07 (docs rewrite):** replaced the phase-checklist CLAUDE.md with this structure. The old file was the worst offender in the batch — its entire "Design Decisions Log" read **"Decision: TBD after discussion with Claude"** for the database choice, **"Decision: TBD after exploring options"** for double-booking prevention, and **"Decision: TBD after performance testing"** for caching, while the code already contained a fully-implemented `FOR UPDATE` host lock, buffer-aware overlap detection, and an explicitly-invalidated Redis slot cache. Phase 2 was marked "In progress" and Phases 3–5 "Not started" against a feature-complete booking system with archival tooling.
+- **Backend port is 3000 here, not 3001:** the `dev` script is bare `tsx watch src/index.ts` and the Vite proxy targets 3000. The repo-wide "pin `PORT=3001`" fix does **not** apply to this project.
+- **`cleanupCalendarCache()` targets a table that does not exist:** `services/archivalService.ts` runs `DELETE FROM calendar_events_cache WHERE expires_at < NOW()`, but no such table is in `db/init.sql` — it is a leftover from the never-built calendar-integration phase. Because `runAllMaintenance()` invokes it via `Promise.all`, `npm run db:maintenance` fails on a fresh database. The individual `db:archive-bookings` script is unaffected.
+- **`max_bookings_per_day` uses the server's local midnight:** `create.ts` computes the day window with `dayStart.setHours(0,0,0,0)` / `dayEnd.setHours(23,59,59,999)` on a plain `Date`, so the boundary is the *API process's* timezone — not the host's and not the invitee's. For a host in Asia/Tokyo served by a UTC container, the "day" a cap applies to is shifted by nine hours. The slot calculator does this correctly via `createDateWithTime(dateStr, '00:00', hostTimezone)`; the two disagree.
+- **Cache invalidation uses `KEYS`:** `invalidateAvailabilityCache()` calls `redis.keys('slots:{meetingTypeId}:*')`, which blocks Valkey while scanning the whole keyspace. Correct at seed scale; should be `SCAN`, or a tracked key set per meeting type.
+- **CI:** the repo-wide smoke-test workflow was removed — a runner can't provide Postgres, Valkey, and RabbitMQ. Verify locally with `npm run triage calendly`.
 
-**Questions to explore:**
-- Where are the performance bottlenecks?
-- What should be cached and for how long?
-- How to handle cache invalidation?
-- What metrics matter most?
+## Open Questions
 
-### Phase 5: Polish and Advanced Features
-*Not started*
+1. The partial unique index `bookings(host_user_id, start_time) WHERE status = 'confirmed'` only catches *identical* start times, so real overlap prevention rests entirely on the application-level lock in decision 1. Enabling `btree_gist` would allow a true `EXCLUDE USING gist (host_user_id WITH =, tstzrange(start_time, end_time) WITH &&)` — is pushing the invariant into the database worth the extension dependency, given it would also make the buffer widening invisible to the constraint?
+2. Locking the host serializes all of that host's bookings, including non-conflicting ones. Is a narrower lock key — say an advisory lock on `hash(host_id, date)` — worth the loss of a single obvious contention point, or does per-day locking just create a new class of boundary bug at midnight?
+3. Reminders create a durable queue per distinct delay value (decision 5). Rounding delays to the nearest minute would collapse thousands of queues into a bounded set at the cost of ±30s reminder accuracy. Is that the right trade, or is the delayed-message plugin the only honest answer?
+4. Cancel and reschedule are unauthenticated when called with a booking ID, so possession of the ID is the credential. UUIDv4 makes guessing impractical, but the ID also appears in emails and browser history — should invitee actions carry a separate signed token, and does that survive an invitee who forwards the confirmation email to a colleague?
 
-**Focus areas:**
-1. Rescheduling and cancellation flows
-2. Email reminders (scheduled notifications)
-3. Time zone detection and conversion UI
-4. Analytics dashboard for hosts
-5. Comprehensive error handling
+## Resources
 
-## Design Decisions Log
-
-*Decisions and their rationale will be documented here as development progresses*
-
-### Decision 1: Database Choice - PostgreSQL
-**Context**: Need to choose between PostgreSQL, CouchDB, or Cassandra
-
-**Decision**: TBD after discussion with Claude
-
-**Questions to explore**:
-- Why PostgreSQL over NoSQL for this use case?
-- What specific PostgreSQL features are we leveraging?
-- At what scale would we need to reconsider?
-- Could we use Cassandra for bookings history while keeping PostgreSQL for active bookings?
-
-### Decision 2: Double Booking Prevention Strategy
-**Context**: Multiple users might try to book the same slot simultaneously
-
-**Decision**: TBD after exploring options
-
-**Options to compare**:
-1. Database unique constraints + row-level locking
-2. Optimistic locking with version fields
-3. Distributed locks (Redis/Valkey)
-4. Serializable transaction isolation
-5. Hybrid approach
-
-**Questions**:
-- What are the trade-offs of each approach?
-- How do they perform under high concurrency?
-- What are the failure modes?
-
-### Decision 3: Availability Caching Strategy
-**Context**: Calculating availability is expensive (merges multiple data sources)
-
-**Decision**: TBD after performance testing
-
-**Questions**:
-- What should the cache TTL be?
-- How to invalidate cache when bookings change?
-- Should we cache at slot level or result level?
-- What's the cache hit ratio we should target?
-
-### Decision 4: Calendar Sync Approach
-**Context**: Need to keep external calendar events synchronized
-
-**Decision**: TBD after researching calendar APIs
-
-**Options**:
-1. Periodic polling (every N minutes)
-2. Webhooks/push notifications (Google Calendar supports this)
-3. On-demand sync (when user requests availability)
-4. Hybrid: webhooks + fallback polling
-
-**Questions**:
-- How do different calendar providers handle sync?
-- What are the rate limits?
-- How stale can the data be?
-- What happens if webhook delivery fails?
-
-## Iterations and Learnings
-
-*Development iterations and key learnings will be tracked here*
-
-## Interesting Technical Problems
-
-### Problem 1: The "Booking Race Condition"
-**Scenario**: Two invitees simultaneously try to book the last available slot
-
-**Questions to explore**:
-- How do we detect this race condition?
-- What user experience do we provide when it happens?
-- How do we test this scenario?
-- Can we prevent it entirely or just handle it gracefully?
-
-### Problem 2: Time Zone Edge Cases
-**Scenario**: User in New York schedules availability, invitee in Tokyo books a slot during DST transition
-
-**Questions**:
-- How do we handle DST transitions?
-- What if the meeting time becomes invalid after DST change?
-- How do we communicate the meeting time clearly to both parties?
-- Should we warn users about DST transitions?
-
-### Problem 3: Calendar API Failures During Booking
-**Scenario**: User books a meeting, but Google Calendar API is down when we try to create the event
-
-**Questions**:
-- Do we fail the booking or queue the calendar event creation?
-- How do we retry failed calendar events?
-- How do we communicate this to the user?
-- Should we check calendar availability before booking or trust our cache?
-
-### Problem 4: Optimal Availability Calculation
-**Scenario**: User has 5 calendar integrations, each with 100+ events per month
-
-**Questions**:
-- How do we efficiently merge all busy periods?
-- What data structures optimize this operation?
-- Can we pre-compute anything?
-- At what point do we need to paginate results?
-
-## Questions and Discussions
-
-### Open Questions
-1. Should we support recurring meetings?
-2. How do we handle group meetings (multiple attendees)?
-3. Should we support team scheduling (round-robin across team members)?
-4. What analytics should we provide to users?
-5. How do we handle different calendar event types (tentative vs. confirmed)?
-
-### Discussions to Have with Claude
-1. **Availability Algorithm Deep Dive**
-   - "I want to understand the availability calculation algorithm deeply. Let's explore:
-     - Different algorithmic approaches (interval merging, segment trees, etc.)
-     - Time complexity analysis
-     - Space complexity and optimization opportunities
-     - Implementation in TypeScript with tests"
-
-2. **Database Transaction Design**
-   - "For preventing double bookings, let's compare:
-     - SERIALIZABLE isolation level
-     - SELECT FOR UPDATE with row locking
-     - Optimistic locking with version fields
-     - Application-level distributed locks
-     - Implement each and discuss trade-offs"
-
-3. **Time Zone Handling**
-   - "Time zones are complex. Let's discuss:
-     - Storing UTC vs. local times
-     - Libraries (moment-timezone, Luxon, date-fns-tz)
-     - Edge cases (DST, leap seconds, deprecated time zones)
-     - How to test time zone logic thoroughly"
-
-4. **Calendar API Integration Patterns**
-   - "Let's design the calendar integration layer:
-     - How to abstract different providers (Google, Outlook, iCal)?
-     - Error handling and retry strategies
-     - Token refresh logic
-     - Rate limiting and backoff
-     - Testing without hitting real APIs"
-
-## Resources and References
-
-**Calendar APIs**:
-- [Google Calendar API Documentation](https://developers.google.com/calendar)
-- [Microsoft Graph API (Outlook)](https://docs.microsoft.com/en-us/graph/api/resources/calendar)
-
-**Time Zone Resources**:
-- [IANA Time Zone Database](https://www.iana.org/time-zones)
-- [Moment Timezone](https://momentjs.com/timezone/)
-- [You Don't Need Moment.js](https://github.com/you-dont-need/You-Dont-Need-Momentjs)
-
-**Scheduling Algorithms**:
-- [Interval Scheduling Problem](https://en.wikipedia.org/wiki/Interval_scheduling)
-- [Merge Intervals Algorithm](https://leetcode.com/problems/merge-intervals/)
-
-**System Design References**:
-- [Designing Calendar/Scheduling Systems](https://www.youtube.com/watch?v=3qgLcmGCCjE)
-- [Building Calendly - Engineering Blog](https://www.calendly.com/blog)
-
-## Next Steps
-
-- [ ] Discuss high-level architecture with Claude
-- [ ] Deep dive into double-booking prevention strategies
-- [ ] Design the availability calculation algorithm
-- [ ] Choose technology stack (confirm Node.js + PostgreSQL)
-- [ ] Sketch database schema
-- [ ] Implement MVP (basic availability + booking)
-- [ ] Add Google Calendar integration
-- [ ] Add caching layer
-- [ ] Load test and optimize
-- [ ] Polish UX and error handling
-
----
-
-*This document will be updated throughout the development process to capture insights, decisions, and learnings from collaboration with Claude.*
+- [PostgreSQL: explicit locking / SELECT FOR UPDATE](https://www.postgresql.org/docs/current/explicit-locking.html) — the mechanism behind decision 1
+- [PostgreSQL: range types and exclusion constraints](https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT) — the `EXCLUDE USING gist` alternative in Open Question 1
+- [RabbitMQ: TTL and dead lettering](https://www.rabbitmq.com/dlx.html) — the delayed-delivery mechanism in decision 5
+- [RabbitMQ delayed message exchange plugin](https://github.com/rabbitmq/rabbitmq-delayed-message-exchange) — the production answer that avoids per-delay queues
+- [IANA Time Zone Database](https://www.iana.org/time-zones) — the zone identifiers stored on `users.time_zone`
+- [date-fns-tz](https://github.com/marnusw/date-fns-tz) — the library `utils/time.ts` uses for wall-clock ↔ UTC conversion

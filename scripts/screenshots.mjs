@@ -611,10 +611,26 @@ async function startBackend(projectDir, config) {
 
   spawnedProcesses.push({ process: child, name: `${config.name} backend` });
 
+  // Capture the backend's full output to a file. When a backend dies during startup
+  // the only symptom the harness otherwise shows is "may not be fully ready" followed
+  // by Vite proxy errors, which says nothing about the actual cause — the stack trace
+  // scrolls past in a stream we were filtering for the word "error".
+  const backendLogPath = path.join(projectDir, 'screenshots', 'backend-startup.log');
+  fs.mkdirSync(path.dirname(backendLogPath), { recursive: true });
+  const backendLog = fs.createWriteStream(backendLogPath, { flags: 'w' });
+  child.stdout.on('data', (data) => backendLog.write(data));
+
   child.stderr.on('data', (data) => {
+    backendLog.write(data);
     const msg = data.toString().trim();
     if (msg && !msg.includes('ExperimentalWarning') && msg.toLowerCase().includes('error')) {
       logWarning(`Backend stderr: ${msg}`);
+    }
+  });
+
+  child.on('exit', (code) => {
+    if (code !== 0 && code !== null) {
+      logError(`Backend exited with code ${code} - see ${backendLogPath}`);
     }
   });
 
