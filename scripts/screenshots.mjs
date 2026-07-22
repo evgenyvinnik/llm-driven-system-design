@@ -790,13 +790,36 @@ async function captureWithPlaywright(config, outputDir) {
         await page.fill(passwordSelector, auth.credentials.password);
       }
 
-      // Click submit and wait for navigation
+      // Submit the login form. A bare `button[type="submit"]` is ambiguous: many
+      // of these apps render a header search form whose submit button comes first
+      // in the DOM, so a global click hits Search, not Sign in — no request fires
+      // and the page just sits on the login form. So submit the form the password
+      // field actually belongs to: press Enter inside it (triggers that form's
+      // submit handler), and fall back to a scoped/global button click only if the
+      // field isn't in a form.
       const submitSelector = auth.submitSelector || 'button[type="submit"]';
+      const passwordForSubmit = auth.credentials.password && auth.passwordSelector !== false
+        ? (auth.passwordSelector || 'input[name="password"], input[type="password"]')
+        : null;
 
-      // Wait for navigation after clicking submit (login typically redirects)
+      async function submitLogin() {
+        if (passwordForSubmit) {
+          const pw = await page.$(passwordForSubmit);
+          const ownerForm = pw && (await pw.evaluateHandle(el => el.closest('form')));
+          if (ownerForm && (await ownerForm.evaluate(f => !!f))) {
+            // Prefer this form's own submit button; else just press Enter in the field.
+            const formSubmit = await ownerForm.asElement().$('button[type="submit"], input[type="submit"]');
+            if (formSubmit) return formSubmit.click();
+            return page.press(passwordForSubmit, 'Enter');
+          }
+        }
+        return page.click(submitSelector);
+      }
+
+      // Wait for navigation after submitting (login typically redirects)
       await Promise.all([
         page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {}),
-        page.click(submitSelector)
+        submitLogin()
       ]);
 
       // Additional wait for any client-side routing/state updates

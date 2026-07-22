@@ -4,7 +4,6 @@ import cookieParser from 'cookie-parser';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
-import './types/express.js';
 import { initializeDatabase, query } from './utils/db.js';
 import { redisClient, initializeRedis } from './utils/redis.js';
 import { minioClient, initializeMinio } from './utils/minio.js';

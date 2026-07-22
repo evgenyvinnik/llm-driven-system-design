@@ -26,7 +26,7 @@ export const config: Config = {
   nodeEnv: process.env.NODE_ENV || 'development',
 
   database: {
-    url: process.env.DATABASE_URL || 'postgres://health_user:health_password@localhost:5432/health_data'
+    url: process.env.DATABASE_URL || 'postgres://health_user:health_password@127.0.0.1:5432/health_data'
   },
 
   redis: {

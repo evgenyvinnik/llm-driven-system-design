@@ -44,7 +44,7 @@ CREATE INDEX idx_devices_user ON user_devices(user_id);
 
 -- Raw health samples (TimescaleDB hypertable)
 CREATE TABLE IF NOT EXISTS health_samples (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type VARCHAR(50) NOT NULL,
   value DOUBLE PRECISION,
@@ -55,7 +55,10 @@ CREATE TABLE IF NOT EXISTS health_samples (
   source_device_id UUID REFERENCES user_devices(id),
   source_app VARCHAR(100),
   metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  -- TimescaleDB requires the partitioning column (start_date) to be part of
+  -- every unique/primary-key constraint, so the PK is composite rather than id alone.
+  PRIMARY KEY (id, start_date)
 );
 
 -- Convert to hypertable for time-series optimization
@@ -66,7 +69,7 @@ CREATE INDEX idx_samples_device ON health_samples(source_device_id);
 
 -- Aggregated data (TimescaleDB hypertable)
 CREATE TABLE IF NOT EXISTS health_aggregates (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type VARCHAR(50) NOT NULL,
   period VARCHAR(10) NOT NULL,
@@ -76,6 +79,8 @@ CREATE TABLE IF NOT EXISTS health_aggregates (
   max_value DOUBLE PRECISION,
   sample_count INTEGER DEFAULT 1,
   updated_at TIMESTAMP DEFAULT NOW(),
+  -- Partitioning column (period_start) must be in every key constraint (TimescaleDB).
+  PRIMARY KEY (id, period_start),
   UNIQUE(user_id, type, period, period_start)
 );
 

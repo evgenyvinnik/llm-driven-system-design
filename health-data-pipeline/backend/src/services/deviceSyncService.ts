@@ -143,7 +143,7 @@ export class DeviceSyncService {
       `INSERT INTO health_samples
          (id, user_id, type, value, unit, start_date, end_date, source_device, source_device_id, metadata)
        VALUES ${placeholders.join(', ')}
-       ON CONFLICT (id) DO NOTHING`,
+       ON CONFLICT (id, start_date) DO NOTHING`,
       values
     );
   }
