@@ -110,6 +110,9 @@ async function seed() {
   // Create sample dashboard
   console.log('Creating sample dashboard...');
   const dashboard = await createDashboard('Infrastructure Overview', {
+    // Stable id so the seeded dashboard is reachable at a fixed deep link
+    // (used by the screenshot config and for demos).
+    id: '11111111-1111-1111-1111-111111111111',
     description: 'Overview of system metrics',
     isPublic: true,
     layout: { columns: 12, rows: 8 },

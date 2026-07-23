@@ -28,19 +28,23 @@ import type {
 export async function createDashboard(
   name: string,
   options?: {
+    id?: string;
     userId?: string;
     description?: string;
     layout?: DashboardLayout;
     isPublic?: boolean;
   }
 ): Promise<Dashboard> {
-  const { userId, description, layout, isPublic = false } = options || {};
+  const { id, userId, description, layout, isPublic = false } = options || {};
 
+  // Allow an explicit id so seed data can use a stable, well-known dashboard id
+  // (e.g. for deep links / screenshots). Omitted in normal use → DB generates one.
   const result = await pool.query<Dashboard>(
-    `INSERT INTO dashboards (name, user_id, description, layout, is_public)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO dashboards (id, name, user_id, description, layout, is_public)
+     VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6)
      RETURNING *`,
     [
+      id || null,
       name,
       userId || null,
       description || null,

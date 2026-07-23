@@ -11,8 +11,24 @@
     {
       "name": "01-map-view",
       "path": "/",
-      "waitFor": ".leaflet-container, canvas",
-      "delay": 2000
+      "waitFor": ".leaflet-container",
+      "delay": 2500
+    },
+    {
+      "name": "02-points-of-interest",
+      "path": "/",
+      "waitFor": ".leaflet-container",
+      "click": "button[title='Toggle POIs']",
+      "clickDelay": 1500,
+      "delay": 800
+    },
+    {
+      "name": "03-incidents",
+      "path": "/",
+      "waitFor": ".leaflet-container",
+      "click": "button[title='Toggle incidents']",
+      "clickDelay": 1500,
+      "delay": 800
     }
   ],
   "viewport": {

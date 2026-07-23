@@ -51,7 +51,11 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       profiles: [],
       currentProfile: null,
-      isLoading: false,
+      // Starts true because the app always runs checkAuth() on mount. If this
+      // began false, the very first render would pass the root's isLoading gate
+      // with user still null, and route guards (e.g. /profiles) would redirect
+      // to /login before the session-restore request even completes.
+      isLoading: true,
       error: null,
 
       login: async (email: string, password: string) => {

@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(30) UNIQUE NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
@@ -12,7 +12,7 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE spaces (
+CREATE TABLE IF NOT EXISTS spaces (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   key VARCHAR(10) UNIQUE NOT NULL,
   name VARCHAR(100) NOT NULL,
@@ -24,7 +24,7 @@ CREATE TABLE spaces (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE space_members (
+CREATE TABLE IF NOT EXISTS space_members (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   space_id UUID NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -33,7 +33,7 @@ CREATE TABLE space_members (
   UNIQUE(space_id, user_id)
 );
 
-CREATE TABLE pages (
+CREATE TABLE IF NOT EXISTS pages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   space_id UUID NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
   parent_id UUID REFERENCES pages(id) ON DELETE SET NULL,
@@ -51,9 +51,13 @@ CREATE TABLE pages (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Guarded so init.sql is re-runnable: the schema is applied both by the docker
+-- initdb mount and by `npm run db:migrate`, so a bare ADD CONSTRAINT fails the
+-- second time with "constraint already exists".
+ALTER TABLE spaces DROP CONSTRAINT IF EXISTS fk_homepage;
 ALTER TABLE spaces ADD CONSTRAINT fk_homepage FOREIGN KEY (homepage_id) REFERENCES pages(id) ON DELETE SET NULL;
 
-CREATE TABLE page_versions (
+CREATE TABLE IF NOT EXISTS page_versions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   version_number INT NOT NULL,
@@ -67,7 +71,7 @@ CREATE TABLE page_versions (
   UNIQUE(page_id, version_number)
 );
 
-CREATE TABLE page_labels (
+CREATE TABLE IF NOT EXISTS page_labels (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   label VARCHAR(50) NOT NULL,
@@ -75,7 +79,7 @@ CREATE TABLE page_labels (
   UNIQUE(page_id, label)
 );
 
-CREATE TABLE page_comments (
+CREATE TABLE IF NOT EXISTS page_comments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id),
@@ -86,7 +90,7 @@ CREATE TABLE page_comments (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE templates (
+CREATE TABLE IF NOT EXISTS templates (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
   name VARCHAR(100) NOT NULL,
@@ -97,7 +101,7 @@ CREATE TABLE templates (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE page_approvals (
+CREATE TABLE IF NOT EXISTS page_approvals (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   requested_by UUID NOT NULL REFERENCES users(id),
@@ -109,13 +113,13 @@ CREATE TABLE page_approvals (
 );
 
 -- Indexes
-CREATE INDEX idx_pages_space ON pages(space_id, parent_id, position);
-CREATE INDEX idx_pages_slug ON pages(space_id, slug);
-CREATE INDEX idx_page_versions_page ON page_versions(page_id, version_number DESC);
-CREATE INDEX idx_page_comments_page ON page_comments(page_id, created_at);
-CREATE INDEX idx_page_labels_page ON page_labels(page_id);
-CREATE INDEX idx_page_labels_label ON page_labels(label);
-CREATE INDEX idx_space_members_space ON space_members(space_id);
-CREATE INDEX idx_space_members_user ON space_members(user_id);
-CREATE INDEX idx_templates_space ON templates(space_id);
-CREATE INDEX idx_page_approvals_page ON page_approvals(page_id, status);
+CREATE INDEX IF NOT EXISTS idx_pages_space ON pages(space_id, parent_id, position);
+CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(space_id, slug);
+CREATE INDEX IF NOT EXISTS idx_page_versions_page ON page_versions(page_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_page_comments_page ON page_comments(page_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_page_labels_page ON page_labels(page_id);
+CREATE INDEX IF NOT EXISTS idx_page_labels_label ON page_labels(label);
+CREATE INDEX IF NOT EXISTS idx_space_members_space ON space_members(space_id);
+CREATE INDEX IF NOT EXISTS idx_space_members_user ON space_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_templates_space ON templates(space_id);
+CREATE INDEX IF NOT EXISTS idx_page_approvals_page ON page_approvals(page_id, status);

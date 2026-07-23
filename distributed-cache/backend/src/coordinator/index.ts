@@ -217,8 +217,42 @@ app.use(
 // ======================
 
 // Initial health check
-healthMonitor.checkAllNodesHealth().then(() => {
+healthMonitor.checkAllNodesHealth().then(async () => {
   logger.info({}, 'initial_health_check_completed');
+
+  // In demo/dev mode, populate a spread of realistic keys once the nodes are
+  // healthy so the dashboard and key browser show a distributed keyspace on a
+  // fresh start instead of an empty cache. Routed through the ring exactly like
+  // a client SET, so keys land on their consistently-hashed owner node.
+  if (process.env.SEED_DEMO_KEYS === 'true') {
+    const demoEntries: Array<[string, unknown]> = [
+      ['user:1001:session', { token: 'eyJhbGciOiJIUzI1NiJ9', role: 'member' }],
+      ['product:sku-4471', { name: 'Wireless Earbuds Pro', price: 149.99, stock: 213 }],
+      ['cart:user-1001', { items: 3, total: 284.97 }],
+      ['config:feature-flags', { dark_mode: true, new_checkout: true }],
+      ['rate:api-key-9f3', 42],
+      ['leaderboard:global', ['alice', 'bob', 'carol', 'dave']],
+      ['page:home:v3', '<cached-html>'],
+      ['geo:ip-8.8.8.8', { city: 'Mountain View', region: 'CA' }],
+      ['session:admin', { active: true }],
+      ['counter:visits', 18432],
+    ];
+    let seeded = 0;
+    for (const [key, value] of demoEntries) {
+      try {
+        const node = ring.getNode(key);
+        if (!node) continue;
+        await nodeRequest(node, `/cache/${encodeURIComponent(key)}`, {
+          method: 'PUT',
+          body: JSON.stringify({ value, ttl: 3600 }),
+        });
+        seeded++;
+      } catch (err) {
+        logger.warn({ err, key }, 'demo_seed_key_failed');
+      }
+    }
+    logger.info({ seeded }, 'demo_keys_seeded');
+  }
 });
 
 // Periodic health checks

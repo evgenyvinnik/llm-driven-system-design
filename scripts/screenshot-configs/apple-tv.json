@@ -45,7 +45,7 @@
     {
       "name": "05-profiles",
       "path": "/profiles",
-      "waitFor": "main",
+      "waitFor": "text=Who's watching",
       "delay": 500
     }
   ],

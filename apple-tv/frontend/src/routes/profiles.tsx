@@ -18,11 +18,18 @@ import type { Profile } from '../types';
  */
 function ProfilesPage() {
   const navigate = useNavigate();
-  const { user, profiles, selectProfile, createProfile, deleteProfile } = useAuthStore();
+  const { user, isLoading, profiles, selectProfile, createProfile, deleteProfile } = useAuthStore();
   const [isCreating, setIsCreating] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
   const [isKids, setIsKids] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
+
+  // Wait for the session-restore check to finish before deciding the user is
+  // logged out — redirecting on `!user` while isLoading is still true bounces an
+  // authenticated user straight to /login on a fresh page load.
+  if (isLoading) {
+    return null;
+  }
 
   if (!user) {
     navigate({ to: '/login' });
