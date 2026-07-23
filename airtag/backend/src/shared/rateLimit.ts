@@ -54,14 +54,22 @@ function createRateLimiter(options: {
     standardHeaders: true, // Return rate limit info in RateLimit-* headers
     legacyHeaders: false, // Disable X-RateLimit-* headers (use standard)
 
-    // Use Redis for distributed rate limiting
+    // Use Redis for distributed rate limiting.
+    //
+    // The prefix MUST include the endpoint. rate-limit-redis keys each hit as
+    // `${prefix}${clientKey}`, so every limiter sharing one prefix and the IP
+    // key would increment a single shared counter — making the effective limit
+    // the strictest max across all of them (admin at 20/min), applied to the
+    // sum of ALL requests. That's why loading the admin dashboard after a few
+    // normal reads returned "Too many requests". Namespacing by endpoint gives
+    // each limiter its own independent budget, which is the intent.
     store: new RedisStore({
       // Use 'call' instead of deprecated 'sendCommand'
       sendCommand: async (...args: string[]) => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         return redis.call(args[0], ...args.slice(1)) as any;
       },
-      prefix: 'findmy:ratelimit:',
+      prefix: `findmy:ratelimit:${options.endpoint || 'default'}:`,
     }),
 
     // Custom key generator (default: IP address)
@@ -120,7 +128,11 @@ export const locationReportLimiter = createRateLimiter({
  */
 export const locationQueryLimiter = createRateLimiter({
   windowMs: 60 * 1000, // 1 minute
-  max: 60, // 60 requests per minute
+  // The device list resolves each device's latest location on load — a handful
+  // of GETs per page view, doubled under React StrictMode in dev — so this has
+  // to comfortably clear a few rapid reloads. It's a per-user read cap, not
+  // abuse protection for an ingestion endpoint (that's locationReportLimiter).
+  max: 240,
   endpoint: 'location_query',
   message: 'Too many location queries. Please wait before checking again.',
 });

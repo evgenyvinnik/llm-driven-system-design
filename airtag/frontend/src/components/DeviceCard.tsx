@@ -51,6 +51,7 @@ export function DeviceCard({ device, isSelected, lastLocation }: DeviceCardProps
 
   return (
     <div
+      data-testid="device-card"
       onClick={() => selectDevice(device)}
       className={`device-card bg-white rounded-xl p-4 cursor-pointer border-2 transition ${
         isSelected

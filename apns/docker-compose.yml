@@ -24,7 +24,7 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
+      - redis_state:/data
     command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -34,4 +34,9 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
+  # Named redis_state rather than redis_data: this service was switched from the
+  # redis image to valkey, and Valkey 7.2 refuses to start against an AOF/RDB
+  # written by Redis 7 ("Can't handle RDB format version 12"). Anyone with the
+  # old volume still on disk hits a boot loop, so the rename forces a clean one.
+  # The contents are cache/presence state and are safe to recreate.
+  redis_state:

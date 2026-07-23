@@ -21,15 +21,39 @@
     {
       "name": "01-login",
       "path": "/",
-      "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "waitFor": "form",
+      "delay": 600
     },
     {
       "name": "02-home-devices",
       "path": "/",
-      "waitFor": "main, header",
-      "delay": 1500
+      "waitFor": "main",
+      "delay": 2500
+    },
+    {
+      "name": "03-device-map",
+      "path": "/",
+      "waitFor": "main",
+      "click": "[data-testid='device-card']",
+      "clickDelay": 2500,
+      "delay": 2500
+    },
+    {
+      "name": "04-notifications",
+      "path": "/",
+      "waitFor": "main",
+      "click": "header button",
+      "clickDelay": 1200,
+      "delay": 2500
+    },
+    {
+      "name": "05-admin-dashboard",
+      "path": "/",
+      "waitFor": "main",
+      "click": "button:has-text('Admin Dashboard')",
+      "clickDelay": 2000,
+      "delay": 2500
     }
   ],
   "viewport": {

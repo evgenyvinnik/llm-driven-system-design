@@ -11,12 +11,28 @@
     {
       "name": "01-document-list",
       "path": "/",
-      "waitFor": "h1, h2, select, button",
-      "delay": 2000
+      "waitFor": "[data-testid='document-item']",
+      "delay": 1500
+    },
+    {
+      "name": "02-editor",
+      "path": "/",
+      "waitFor": "[data-testid='document-item']",
+      "click": "[data-testid='document-item']",
+      "clickDelay": 2500,
+      "delay": 1000
+    },
+    {
+      "name": "03-editor-postmortem",
+      "path": "/",
+      "waitFor": "[data-testid='document-item']",
+      "click": "[data-testid='document-item']:has-text('Incident Postmortem')",
+      "clickDelay": 2500,
+      "delay": 1000
     }
   ],
   "viewport": {
-    "width": 1280,
-    "height": 800
+    "width": 1440,
+    "height": 900
   }
 }

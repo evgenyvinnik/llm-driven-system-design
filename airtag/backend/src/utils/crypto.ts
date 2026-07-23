@@ -126,7 +126,7 @@ export class KeyManager {
  * @returns Encrypted payload containing ephemeral key, IV, ciphertext, and auth tag
  */
 export function encryptLocation(
-  location: { latitude: number; longitude: number; accuracy?: number },
+  location: { latitude: number; longitude: number; accuracy?: number; timestamp?: number },
   sharedSecret: string
 ): {
   ephemeralPublicKey: string;
@@ -152,7 +152,10 @@ export function encryptLocation(
     lat: location.latitude,
     lon: location.longitude,
     accuracy: location.accuracy || 10,
-    timestamp: Date.now(),
+    // The observation time — when the finder saw the device — rather than the
+    // encryption time. They're identical for live reports, but seeded/backfilled
+    // history needs to carry its real time so the owner sees an accurate trail.
+    timestamp: location.timestamp ?? Date.now(),
   });
 
   const encrypted = Buffer.concat([

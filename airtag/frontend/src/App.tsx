@@ -30,6 +30,7 @@ function App() {
     devices,
     selectedDevice,
     locations,
+    latestLocations,
     selectDevice,
     simulateLocation,
     fetchLocations,
@@ -71,10 +72,20 @@ function App() {
     }
   };
 
-  // Get latest location for each device
+  // Latest location per device: start from the summary fetched with the device
+  // list, then let the selected device's freshly-loaded history override it so a
+  // simulated report shows up immediately without refetching every card.
   const deviceLocations = new Map<string, { latitude: number; longitude: number; timestamp: string }>();
+  Object.entries(latestLocations).forEach(([deviceId, loc]) => {
+    deviceLocations.set(deviceId, {
+      latitude: loc.latitude,
+      longitude: loc.longitude,
+      timestamp: loc.timestamp,
+    });
+  });
   locations.forEach((loc) => {
-    if (!deviceLocations.has(loc.device_id)) {
+    const existing = deviceLocations.get(loc.device_id);
+    if (!existing || new Date(loc.timestamp) > new Date(existing.timestamp)) {
       deviceLocations.set(loc.device_id, {
         latitude: loc.latitude,
         longitude: loc.longitude,

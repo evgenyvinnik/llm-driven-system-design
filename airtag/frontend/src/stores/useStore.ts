@@ -30,6 +30,8 @@ interface AppState {
   // Locations state
   /** Location history for the selected device */
   locations: Location[];
+  /** Last-known location per device id, for the device list summary */
+  latestLocations: Record<string, Location>;
 
   // Lost Mode state
   /** Lost mode settings indexed by device ID */
@@ -108,6 +110,7 @@ export const useStore = create<AppState>((set, get) => ({
   devices: [],
   selectedDevice: null,
   locations: [],
+  latestLocations: {},
   lostModeSettings: {},
   notifications: [],
   unreadCount: 0,
@@ -146,6 +149,7 @@ export const useStore = create<AppState>((set, get) => ({
         devices: [],
         selectedDevice: null,
         locations: [],
+        latestLocations: {},
         lostModeSettings: {},
         notifications: [],
         unreadCount: 0,
@@ -170,6 +174,28 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const devices = await devicesApi.getAll() as Device[];
       set({ devices });
+
+      // Resolve each device's last-known position up front. Without this the
+      // list can only ever show a location for the *selected* device, so every
+      // other card reads "No location found" — which is indistinguishable from
+      // a device that genuinely has never been seen.
+      //
+      // One request per device is acceptable here because a user owns a handful
+      // of devices; a bulk endpoint would be the right call at a larger fan-out.
+      const results = await Promise.allSettled(
+        devices.map(async (device) => ({
+          deviceId: device.id,
+          location: (await locationsApi.getLatest(device.id)) as Location | null,
+        }))
+      );
+
+      const latestLocations: Record<string, Location> = {};
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value.location) {
+          latestLocations[result.value.deviceId] = result.value.location;
+        }
+      }
+      set({ latestLocations });
     } catch (error) {
       set({ error: (error as Error).message });
     }

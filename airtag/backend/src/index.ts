@@ -124,16 +124,35 @@ app.get('/metrics', metricsHandler);
 // ===== API ROUTES WITH RATE LIMITING =====
 
 /**
- * Authentication routes
- * Low rate limit (10/min) to prevent brute force attacks
+ * Authentication routes.
+ *
+ * The strict brute-force limiter (10/min) is scoped to the credential-checking
+ * endpoints — /login and /register — only. It must NOT cover /me: the client
+ * calls /api/auth/me on every mount to restore the session, and under React
+ * StrictMode's double-invoke that alone can burn several hits per page load, so
+ * a router-wide limiter trips on an ordinary reload and logs the user out with a
+ * 429. /me and /logout read the session cookie; they aren't attack surface for
+ * credential stuffing, so they use the general limiter instead.
  */
-app.use('/api/auth', authLimiter, authRoutes);
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
+app.use('/api/auth', generalLimiter, authRoutes);
 
 /**
- * Device routes
- * Registration has lower limit; queries use general limit
+ * Device routes.
+ *
+ * The strict registration limiter (20/min) must apply only to writes — creating
+ * a device. Listing devices is a read the app performs on every page load (once
+ * for the list, plus a latest-location lookup per device), so putting the whole
+ * router behind the registration cap makes ordinary navigation trip it and the
+ * device list comes back empty. Reads fall through to the general limiter.
  */
-app.use('/api/devices', deviceRegistrationLimiter, deviceRoutes);
+app.use('/api/devices', (req, res, next) => {
+  if (req.method === 'POST') {
+    return deviceRegistrationLimiter(req, res, next);
+  }
+  return generalLimiter(req, res, next);
+}, deviceRoutes);
 
 /**
  * Location routes

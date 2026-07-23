@@ -93,6 +93,7 @@ export function DocumentList({ onSelectDocument, selectedUserId }: DocumentListP
           {documents.map((doc) => (
             <li key={doc.id}>
               <button
+                data-testid="document-item"
                 onClick={() => onSelectDocument(doc)}
                 className="w-full text-left p-4 bg-white rounded-lg shadow-sm hover:shadow-md transition-shadow border border-gray-200"
               >

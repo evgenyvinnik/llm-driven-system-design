@@ -64,26 +64,26 @@ export function AdminDashboard() {
           title="Total Users"
           value={stats.users.total}
           subtitle={`${stats.users.thisWeek} this week`}
-          icon="&#128101;"
+          icon="👥"
         />
         <StatCard
           title="Active Devices"
           value={stats.devices.active}
           subtitle={`${stats.devices.total} total`}
-          icon="&#128205;"
+          icon="📍"
         />
         <StatCard
           title="Lost Devices"
           value={stats.lostMode.active}
           subtitle="In lost mode"
-          icon="&#128270;"
+          icon="🔍"
           highlight
         />
         <StatCard
           title="Location Reports"
           value={stats.reports.last24h}
           subtitle="Last 24 hours"
-          icon="&#127760;"
+          icon="🌐"
         />
       </div>
 
@@ -97,11 +97,11 @@ export function AdminDashboard() {
               className="text-center p-4 bg-gray-50 rounded-lg"
             >
               <div className="text-2xl mb-1">
-                {type === 'airtag' && '&#9898;'}
-                {type === 'iphone' && '&#128241;'}
-                {type === 'macbook' && '&#128187;'}
-                {type === 'ipad' && '&#128241;'}
-                {type === 'airpods' && '&#127911;'}
+                {type === 'airtag' && '⚪'}
+                {type === 'iphone' && '📱'}
+                {type === 'macbook' && '💻'}
+                {type === 'ipad' && '📱'}
+                {type === 'airpods' && '🎧'}
               </div>
               <div className="text-xl font-semibold">{count}</div>
               <div className="text-sm text-gray-500 capitalize">{type}</div>
