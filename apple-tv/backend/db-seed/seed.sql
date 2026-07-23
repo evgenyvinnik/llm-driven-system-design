@@ -37,11 +37,11 @@ ON CONFLICT (id) DO NOTHING;
 -- ============================================================================
 
 INSERT INTO user_devices (id, user_id, device_id, device_name, device_type, active, last_used_at) VALUES
-    ('ud111111-1111-1111-1111-111111111111', 'ac111111-1111-1111-1111-111111111111', 'apple_tv_alice_001', 'Living Room Apple TV', 'apple_tv', true, NOW() - INTERVAL '2 hours'),
-    ('ud112222-2222-2222-2222-222222222222', 'ac111111-1111-1111-1111-111111111111', 'iphone_alice_001', 'Alice''s iPhone', 'iphone', true, NOW() - INTERVAL '30 minutes'),
-    ('ud113333-3333-3333-3333-333333333333', 'ac111111-1111-1111-1111-111111111111', 'ipad_alice_001', 'Alice''s iPad', 'ipad', true, NOW() - INTERVAL '1 day'),
-    ('ud211111-1111-1111-1111-111111111111', 'ac222222-2222-2222-2222-222222222222', 'apple_tv_bob_001', 'Bedroom Apple TV', 'apple_tv', true, NOW() - INTERVAL '5 hours'),
-    ('ud311111-1111-1111-1111-111111111111', 'ac333333-3333-3333-3333-333333333333', 'macbook_charlie_001', 'Charlie''s MacBook', 'mac', true, NOW() - INTERVAL '1 hour')
+    ('ed111111-1111-1111-1111-111111111111', 'ac111111-1111-1111-1111-111111111111', 'apple_tv_alice_001', 'Living Room Apple TV', 'apple_tv', true, NOW() - INTERVAL '2 hours'),
+    ('ed112222-2222-2222-2222-222222222222', 'ac111111-1111-1111-1111-111111111111', 'iphone_alice_001', 'Alice''s iPhone', 'iphone', true, NOW() - INTERVAL '30 minutes'),
+    ('ed113333-3333-3333-3333-333333333333', 'ac111111-1111-1111-1111-111111111111', 'ipad_alice_001', 'Alice''s iPad', 'ipad', true, NOW() - INTERVAL '1 day'),
+    ('ed211111-1111-1111-1111-111111111111', 'ac222222-2222-2222-2222-222222222222', 'apple_tv_bob_001', 'Bedroom Apple TV', 'apple_tv', true, NOW() - INTERVAL '5 hours'),
+    ('ed311111-1111-1111-1111-111111111111', 'ac333333-3333-3333-3333-333333333333', 'macbook_charlie_001', 'Charlie''s MacBook', 'mac', true, NOW() - INTERVAL '1 hour')
 ON CONFLICT (user_id, device_id) DO NOTHING;
 
 -- ============================================================================
@@ -120,43 +120,43 @@ INSERT INTO content (id, title, description, duration, release_date, content_typ
 -- ============================================================================
 
 -- Add multiple quality variants for each movie
-INSERT INTO encoded_variants (id, content_id, resolution, codec, hdr, bitrate, file_path, file_size) VALUES
+INSERT INTO encoded_variants (content_id, resolution, codec, hdr, bitrate, file_path, file_size) VALUES
     -- The Last Horizon variants
-    ('v1111111-4k', 'c1111111-1111-1111-1111-111111111111', 2160, 'hevc', true, 25000, '/content/last-horizon/4k-dv.m3u8', 26250000000),
-    ('v1111111-1080', 'c1111111-1111-1111-1111-111111111111', 1080, 'h264', false, 8000, '/content/last-horizon/1080p.m3u8', 8400000000),
-    ('v1111111-720', 'c1111111-1111-1111-1111-111111111111', 720, 'h264', false, 4000, '/content/last-horizon/720p.m3u8', 4200000000),
+    ('c1111111-1111-1111-1111-111111111111', 2160, 'hevc', true, 25000, '/content/last-horizon/4k-dv.m3u8', 26250000000),
+    ('c1111111-1111-1111-1111-111111111111', 1080, 'h264', false, 8000, '/content/last-horizon/1080p.m3u8', 8400000000),
+    ('c1111111-1111-1111-1111-111111111111', 720, 'h264', false, 4000, '/content/last-horizon/720p.m3u8', 4200000000),
 
     -- Midnight in Manhattan variants
-    ('v1222222-4k', 'c1222222-2222-2222-2222-222222222222', 2160, 'hevc', true, 20000, '/content/midnight-manhattan/4k.m3u8', 15750000000),
-    ('v1222222-1080', 'c1222222-2222-2222-2222-222222222222', 1080, 'h264', false, 6000, '/content/midnight-manhattan/1080p.m3u8', 4725000000),
-    ('v1222222-720', 'c1222222-2222-2222-2222-222222222222', 720, 'h264', false, 3000, '/content/midnight-manhattan/720p.m3u8', 2362500000)
+    ('c1222222-2222-2222-2222-222222222222', 2160, 'hevc', true, 20000, '/content/midnight-manhattan/4k.m3u8', 15750000000),
+    ('c1222222-2222-2222-2222-222222222222', 1080, 'h264', false, 6000, '/content/midnight-manhattan/1080p.m3u8', 4725000000),
+    ('c1222222-2222-2222-2222-222222222222', 720, 'h264', false, 3000, '/content/midnight-manhattan/720p.m3u8', 2362500000)
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================================
 -- AUDIO TRACKS
 -- ============================================================================
 
-INSERT INTO audio_tracks (id, content_id, language, name, codec, channels, file_path) VALUES
-    ('a1111111-en', 'c1111111-1111-1111-1111-111111111111', 'en', 'English (Dolby Atmos)', 'eac3', 8, '/content/last-horizon/audio-en-atmos.m4a'),
-    ('a1111111-en-st', 'c1111111-1111-1111-1111-111111111111', 'en', 'English (Stereo)', 'aac', 2, '/content/last-horizon/audio-en-stereo.m4a'),
-    ('a1111111-es', 'c1111111-1111-1111-1111-111111111111', 'es', 'Spanish', 'aac', 6, '/content/last-horizon/audio-es.m4a'),
-    ('a1111111-fr', 'c1111111-1111-1111-1111-111111111111', 'fr', 'French', 'aac', 6, '/content/last-horizon/audio-fr.m4a'),
-    ('a1222222-en', 'c1222222-2222-2222-2222-222222222222', 'en', 'English', 'aac', 6, '/content/midnight-manhattan/audio-en.m4a'),
-    ('a1222222-es', 'c1222222-2222-2222-2222-222222222222', 'es', 'Spanish', 'aac', 6, '/content/midnight-manhattan/audio-es.m4a')
+INSERT INTO audio_tracks (content_id, language, name, codec, channels, file_path) VALUES
+    ('c1111111-1111-1111-1111-111111111111', 'en', 'English (Dolby Atmos)', 'eac3', 8, '/content/last-horizon/audio-en-atmos.m4a'),
+    ('c1111111-1111-1111-1111-111111111111', 'en', 'English (Stereo)', 'aac', 2, '/content/last-horizon/audio-en-stereo.m4a'),
+    ('c1111111-1111-1111-1111-111111111111', 'es', 'Spanish', 'aac', 6, '/content/last-horizon/audio-es.m4a'),
+    ('c1111111-1111-1111-1111-111111111111', 'fr', 'French', 'aac', 6, '/content/last-horizon/audio-fr.m4a'),
+    ('c1222222-2222-2222-2222-222222222222', 'en', 'English', 'aac', 6, '/content/midnight-manhattan/audio-en.m4a'),
+    ('c1222222-2222-2222-2222-222222222222', 'es', 'Spanish', 'aac', 6, '/content/midnight-manhattan/audio-es.m4a')
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================================
 -- SUBTITLES
 -- ============================================================================
 
-INSERT INTO subtitles (id, content_id, language, name, type, file_path) VALUES
-    ('s1111111-en', 'c1111111-1111-1111-1111-111111111111', 'en', 'English', 'caption', '/content/last-horizon/subs-en.vtt'),
-    ('s1111111-en-cc', 'c1111111-1111-1111-1111-111111111111', 'en', 'English (CC)', 'caption', '/content/last-horizon/subs-en-cc.vtt'),
-    ('s1111111-es', 'c1111111-1111-1111-1111-111111111111', 'es', 'Spanish', 'subtitle', '/content/last-horizon/subs-es.vtt'),
-    ('s1111111-fr', 'c1111111-1111-1111-1111-111111111111', 'fr', 'French', 'subtitle', '/content/last-horizon/subs-fr.vtt'),
-    ('s1111111-de', 'c1111111-1111-1111-1111-111111111111', 'de', 'German', 'subtitle', '/content/last-horizon/subs-de.vtt'),
-    ('s1222222-en', 'c1222222-2222-2222-2222-222222222222', 'en', 'English', 'caption', '/content/midnight-manhattan/subs-en.vtt'),
-    ('s1222222-es', 'c1222222-2222-2222-2222-222222222222', 'es', 'Spanish', 'subtitle', '/content/midnight-manhattan/subs-es.vtt')
+INSERT INTO subtitles (content_id, language, name, type, file_path) VALUES
+    ('c1111111-1111-1111-1111-111111111111', 'en', 'English', 'caption', '/content/last-horizon/subs-en.vtt'),
+    ('c1111111-1111-1111-1111-111111111111', 'en', 'English (CC)', 'caption', '/content/last-horizon/subs-en-cc.vtt'),
+    ('c1111111-1111-1111-1111-111111111111', 'es', 'Spanish', 'subtitle', '/content/last-horizon/subs-es.vtt'),
+    ('c1111111-1111-1111-1111-111111111111', 'fr', 'French', 'subtitle', '/content/last-horizon/subs-fr.vtt'),
+    ('c1111111-1111-1111-1111-111111111111', 'de', 'German', 'subtitle', '/content/last-horizon/subs-de.vtt'),
+    ('c1222222-2222-2222-2222-222222222222', 'en', 'English', 'caption', '/content/midnight-manhattan/subs-en.vtt'),
+    ('c1222222-2222-2222-2222-222222222222', 'es', 'Spanish', 'subtitle', '/content/midnight-manhattan/subs-es.vtt')
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================================
@@ -218,7 +218,7 @@ ON CONFLICT (profile_id, content_id) DO NOTHING;
 -- ============================================================================
 
 INSERT INTO downloads (id, user_id, content_id, device_id, quality, status, license_expires, downloaded_at, last_played) VALUES
-    ('dl111111-1111-1111-1111-111111111111', 'ac111111-1111-1111-1111-111111111111', 'c1111111-1111-1111-1111-111111111111', 'ipad_alice_001', '1080p', 'completed', NOW() + INTERVAL '28 days', NOW() - INTERVAL '2 days', NOW() - INTERVAL '1 day'),
-    ('dl222222-2222-2222-2222-222222222222', 'ac111111-1111-1111-1111-111111111111', 'e2221101-1111-1111-1111-111111111111', 'ipad_alice_001', '720p', 'completed', NOW() + INTERVAL '28 days', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'),
-    ('dl333333-3333-3333-3333-333333333333', 'ac222222-2222-2222-2222-222222222222', 'e2111103-3333-3333-3333-333333333333', 'apple_tv_bob_001', '1080p', 'pending', NOW() + INTERVAL '30 days', NULL, NULL)
+    ('d5111111-1111-1111-1111-111111111111', 'ac111111-1111-1111-1111-111111111111', 'c1111111-1111-1111-1111-111111111111', 'ipad_alice_001', '1080p', 'completed', NOW() + INTERVAL '28 days', NOW() - INTERVAL '2 days', NOW() - INTERVAL '1 day'),
+    ('d5222222-2222-2222-2222-222222222222', 'ac111111-1111-1111-1111-111111111111', 'e2221101-1111-1111-1111-111111111111', 'ipad_alice_001', '720p', 'completed', NOW() + INTERVAL '28 days', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'),
+    ('d5333333-3333-3333-3333-333333333333', 'ac222222-2222-2222-2222-222222222222', 'e2111103-3333-3333-3333-333333333333', 'apple_tv_bob_001', '1080p', 'pending', NOW() + INTERVAL '30 days', NULL, NULL)
 ON CONFLICT (id) DO NOTHING;
