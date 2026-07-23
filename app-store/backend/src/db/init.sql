@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS apps (
   name VARCHAR(200) NOT NULL,
   developer_id UUID REFERENCES developers(id),
   category_id UUID REFERENCES categories(id),
+  subcategory_id UUID REFERENCES categories(id),
   description TEXT,
   short_description VARCHAR(500),
   keywords TEXT[],
@@ -58,7 +59,9 @@ CREATE TABLE IF NOT EXISTS apps (
   rating_sum DECIMAL DEFAULT 0,
   rating_count INTEGER DEFAULT 0,
   average_rating DECIMAL DEFAULT 0,
+  icon_url TEXT,
   status VARCHAR(20) DEFAULT 'draft', -- 'draft', 'pending', 'published', 'rejected', 'removed'
+  rejection_reason TEXT,
   published_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
@@ -140,14 +143,16 @@ CREATE TABLE IF NOT EXISTS review_votes (
 );
 
 -- Daily Rankings (precomputed)
+-- Precomputed chart rankings. category_id is nullable for overall (cross-category)
+-- charts; score is the composite ranking value the offline job would emit.
 CREATE TABLE IF NOT EXISTS rankings (
   date DATE,
-  country VARCHAR(2),
-  category VARCHAR(100),
+  category_id UUID REFERENCES categories(id),
   rank_type VARCHAR(20), -- 'free', 'paid', 'grossing'
   app_id UUID REFERENCES apps(id),
   rank INTEGER,
-  PRIMARY KEY (date, country, category, rank_type, app_id)
+  score DECIMAL DEFAULT 0,
+  PRIMARY KEY (date, rank_type, app_id)
 );
 
 -- Download Events
@@ -167,6 +172,7 @@ CREATE INDEX IF NOT EXISTS idx_download_events_app ON download_events(app_id, cr
 CREATE TABLE IF NOT EXISTS user_apps (
   user_id UUID REFERENCES users(id),
   app_id UUID REFERENCES apps(id),
+  purchased BOOLEAN DEFAULT FALSE,
   download_count INTEGER DEFAULT 1,
   last_downloaded_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (user_id, app_id)

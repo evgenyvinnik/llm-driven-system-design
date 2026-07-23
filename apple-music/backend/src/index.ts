@@ -72,8 +72,15 @@ app.get('/metrics', metricsHandler);
 // API Routes with specific rate limits
 // ============================================
 
-// Auth routes with login rate limiting
-app.use('/api/auth', loginLimiter, authRoutes);
+// Auth routes. The brute-force login limiter (5 attempts / 15 min) is scoped to
+// the credential-checking endpoints only. It must NOT cover /me: the client calls
+// /api/auth/me on every page mount to restore the session, so a router-wide login
+// limiter is exhausted within a few navigations and /me starts returning 429 —
+// which the client reads as "logged out". /me and /logout still get the global
+// limiter via the '/api' mount above.
+app.use('/api/auth/login', loginLimiter);
+app.use('/api/auth/register', loginLimiter);
+app.use('/api/auth', authRoutes);
 
 // Catalog routes (read-heavy, standard limits)
 app.use('/api/catalog', catalogRoutes);
