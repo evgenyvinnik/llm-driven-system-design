@@ -895,6 +895,22 @@ async function captureWithPlaywright(config, outputDir) {
         }
       }
 
+      // Click a selector before capturing. Needed for UI that lives in local
+      // component state rather than a route (modals, slide-over detail panels),
+      // which otherwise can never be screenshotted.
+      if (screen.click) {
+        const clicks = Array.isArray(screen.click) ? screen.click : [screen.click];
+        for (const selector of clicks) {
+          try {
+            await page.waitForSelector(selector, { timeout: 5000 });
+            await page.click(selector);
+            await page.waitForTimeout(screen.clickDelay || 600);
+          } catch {
+            logWarning(`Click target not found: ${selector}`);
+          }
+        }
+      }
+
       // Additional delay if specified
       if (screen.delay) {
         await page.waitForTimeout(screen.delay);

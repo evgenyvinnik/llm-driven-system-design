@@ -129,7 +129,10 @@ function BoardColumn({
   return (
     <div
       className={clsx(
-        'flex-shrink-0 w-72 bg-gray-100 rounded-lg',
+        // Grow to share the available width so a typical 4-status workflow fills
+        // the board, but never shrink below a readable card width — past that the
+        // parent's overflow-x takes over, as it must for longer workflows.
+        'flex-1 min-w-[17rem] bg-gray-100 rounded-lg',
         isDragOver && 'ring-2 ring-blue-400'
       )}
       onDragOver={onDragOver}
@@ -171,6 +174,7 @@ function BoardCard({ issue, onClick, onDragStart, onDragEnd }: BoardCardProps) {
   return (
     <div
       draggable
+      data-testid="issue-card"
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       onClick={onClick}
@@ -260,7 +264,9 @@ export function Backlog({
           <div className="p-4 border-b flex items-center justify-between">
             <div>
               <h2 className="font-semibold text-lg">{sprintName || 'Sprint'}</h2>
-              <p className="text-sm text-gray-500">{sprintIssues.length} issues</p>
+              <p className="text-sm text-gray-500">
+                {sprintIssues.length} {sprintIssues.length === 1 ? 'issue' : 'issues'}
+              </p>
             </div>
           </div>
           <div className="divide-y">
@@ -285,7 +291,9 @@ export function Backlog({
         <div className="p-4 border-b flex items-center justify-between">
           <div>
             <h2 className="font-semibold text-lg">Backlog</h2>
-            <p className="text-sm text-gray-500">{backlogIssues.length} issues</p>
+            <p className="text-sm text-gray-500">
+              {backlogIssues.length} {backlogIssues.length === 1 ? 'issue' : 'issues'}
+            </p>
           </div>
         </div>
         <div className="divide-y">

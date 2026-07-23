@@ -46,7 +46,9 @@ function IssuesPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">{currentProject.name} Issues</h1>
-          <p className="text-gray-500">{filteredIssues.length} issues</p>
+          <p className="text-gray-500">
+            {filteredIssues.length} {filteredIssues.length === 1 ? 'issue' : 'issues'}
+          </p>
         </div>
         <Button onClick={() => setCreateIssueModalOpen(true)}>Create Issue</Button>
       </div>

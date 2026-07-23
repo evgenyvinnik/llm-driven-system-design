@@ -5,20 +5,75 @@
   "dbName": "jira",
   "dbUser": "jira",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/",
+    "credentials": {
+      "email": "admin@example.com",
+      "password": "admin123"
+    },
+    "usernameSelector": "input[type='email']",
+    "passwordSelector": "input[type='password']",
+    "submitSelector": "button[type='submit']"
   },
   "screens": [
     {
-      "name": "01-home",
+      "name": "01-login",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1000
+      "skipAuth": true,
+      "waitFor": "form",
+      "delay": 500
     },
     {
       "name": "02-projects",
       "path": "/projects",
       "waitFor": "main",
+      "delay": 800
+    },
+    {
+      "name": "03-board",
+      "path": "/projects/DEMO/board",
+      "waitFor": "[data-testid='issue-card']",
+      "delay": 1000
+    },
+    {
+      "name": "04-issue-detail",
+      "path": "/projects/DEMO/board",
+      "waitFor": "[data-testid='issue-card']",
+      "click": "[data-testid='issue-card']",
+      "clickDelay": 1200,
       "delay": 500
+    },
+    {
+      "name": "05-backlog",
+      "path": "/projects/DEMO/backlog",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "06-issues",
+      "path": "/projects/DEMO/issues",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "07-create-issue",
+      "path": "/projects/DEMO/board",
+      "waitFor": "[data-testid='issue-card']",
+      "click": "button:has-text('Create Issue')",
+      "clickDelay": 1000,
+      "delay": 500
+    },
+    {
+      "name": "08-settings",
+      "path": "/projects/DEMO/settings",
+      "waitFor": "main",
+      "delay": 800
+    },
+    {
+      "name": "09-infra-board",
+      "path": "/projects/INFRA/board",
+      "waitFor": "main",
+      "delay": 1000
     }
   ],
   "viewport": {

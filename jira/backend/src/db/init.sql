@@ -8,8 +8,8 @@ CREATE TABLE IF NOT EXISTS users (
   name VARCHAR(100),
   avatar_url VARCHAR(500),
   role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Project Roles
@@ -77,8 +77,8 @@ CREATE TABLE IF NOT EXISTS projects (
   workflow_id INTEGER REFERENCES workflows(id),
   permission_scheme_id INTEGER REFERENCES permission_schemes(id),
   issue_counter INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Project Members
@@ -95,11 +95,11 @@ CREATE TABLE IF NOT EXISTS sprints (
   project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
   name VARCHAR(200) NOT NULL,
   goal TEXT,
-  start_date TIMESTAMP,
-  end_date TIMESTAMP,
+  start_date TIMESTAMPTZ,
+  end_date TIMESTAMPTZ,
   status VARCHAR(20) DEFAULT 'planning', -- 'planning', 'active', 'closed'
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Issues
@@ -118,15 +118,21 @@ CREATE TABLE IF NOT EXISTS issues (
   epic_id INTEGER REFERENCES issues(id),
   sprint_id INTEGER REFERENCES sprints(id),
   story_points INTEGER,
+  labels TEXT[] DEFAULT '{}',
+  components TEXT[] DEFAULT '{}',
   custom_fields JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id);
 CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee_id);
 CREATE INDEX IF NOT EXISTS idx_issues_sprint ON issues(sprint_id);
 CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status_id);
+-- GIN indexes support the `labels IN (...)` / `component = ...` JQL clauses,
+-- which translate to array-containment predicates on the PostgreSQL side.
+CREATE INDEX IF NOT EXISTS idx_issues_labels ON issues USING GIN(labels);
+CREATE INDEX IF NOT EXISTS idx_issues_components ON issues USING GIN(components);
 
 -- Issue History (audit trail)
 CREATE TABLE IF NOT EXISTS issue_history (
@@ -136,7 +142,7 @@ CREATE TABLE IF NOT EXISTS issue_history (
   field VARCHAR(100) NOT NULL,
   old_value TEXT,
   new_value TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_issue_history_issue ON issue_history(issue_id, created_at DESC);
@@ -147,8 +153,8 @@ CREATE TABLE IF NOT EXISTS comments (
   issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
   author_id UUID REFERENCES users(id),
   body TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id);
@@ -161,7 +167,7 @@ CREATE TABLE IF NOT EXISTS boards (
   type VARCHAR(20) DEFAULT 'kanban', -- 'kanban', 'scrum'
   filter_jql TEXT,
   column_config JSONB DEFAULT '[]',
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Labels
@@ -189,8 +195,8 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   request_path VARCHAR(200) NOT NULL,
   response_status INTEGER,
   response_body JSONB,
-  created_at TIMESTAMP DEFAULT NOW(),
-  expires_at TIMESTAMP DEFAULT NOW() + INTERVAL '24 hours'
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '24 hours'
 );
 
 CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at);
