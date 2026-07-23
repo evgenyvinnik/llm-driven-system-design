@@ -13,7 +13,8 @@
     "start": "tsx src/index.ts",
     "lint": "eslint src/",
     "format": "prettier --write src/",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "db:seed": "tsx src/db/seed-envelopes.ts"
   },
   "dependencies": {
     "amqplib": "^0.10.9",

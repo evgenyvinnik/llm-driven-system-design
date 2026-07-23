@@ -59,3 +59,23 @@ INSERT INTO menu_items (restaurant_id, name, description, price, category, is_av
 -- Sample driver
 INSERT INTO drivers (user_id, vehicle_type, license_plate, is_active, is_available, current_lat, current_lon, rating, total_deliveries) VALUES
 (3, 'car', 'ABC123', true, true, 37.7879, -122.4074, 4.8, 156);
+
+-- ============================================================
+-- SAMPLE ORDER (customer@example.com) — gives the orders page,
+-- order tracking, and the driver dashboard real content to show.
+-- ============================================================
+INSERT INTO orders (customer_id, restaurant_id, driver_id, status, subtotal, delivery_fee, tax, tip, total, delivery_address, placed_at, confirmed_at, preparing_at)
+SELECT c.id, 1, (SELECT id FROM drivers LIMIT 1), 'PREPARING', 34.50, 3.99, 3.10, 5.00, 46.59,
+       '{"street":"742 Evergreen Terrace","city":"Springfield","state":"CA","zip":"94000"}'::json,
+       NOW() - INTERVAL '18 minutes', NOW() - INTERVAL '16 minutes', NOW() - INTERVAL '12 minutes'
+FROM users c
+WHERE c.email = 'customer@example.com'
+  AND NOT EXISTS (SELECT 1 FROM orders o2 WHERE o2.customer_id = c.id);
+
+INSERT INTO order_items (order_id, menu_item_id, name, price, quantity)
+SELECT o.id, m.id, m.name, m.price, 1
+FROM orders o
+JOIN menu_items m ON m.restaurant_id = 1
+WHERE o.customer_id = (SELECT id FROM users WHERE email = 'customer@example.com')
+  AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id)
+ORDER BY m.id LIMIT 3;

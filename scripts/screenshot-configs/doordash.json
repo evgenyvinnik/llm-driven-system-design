@@ -20,33 +20,47 @@
     {
       "name": "01-login",
       "path": "/login",
-      "waitFor": "form",
       "skipAuth": true,
+      "waitFor": "form",
       "delay": 500
     },
     {
       "name": "02-home",
       "path": "/",
       "waitFor": "main",
-      "delay": 1500
+      "delay": 1200
     },
     {
-      "name": "03-cart",
-      "path": "/cart",
+      "name": "03-restaurant-menu",
+      "path": "/restaurant/1",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1200
     },
     {
-      "name": "04-driver-dashboard",
+      "name": "04-orders",
+      "path": "/orders",
+      "waitFor": "main",
+      "delay": 1200
+    },
+    {
+      "name": "05-driver-dashboard",
       "path": "/driver-dashboard",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1500,
+      "loginAs": {
+        "email": "driver@example.com",
+        "password": "password123"
+      }
     },
     {
-      "name": "05-restaurant-dashboard",
+      "name": "06-restaurant-dashboard",
       "path": "/restaurant-dashboard",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1500,
+      "loginAs": {
+        "email": "restaurant@example.com",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {

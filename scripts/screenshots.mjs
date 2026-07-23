@@ -770,11 +770,31 @@ async function captureWithPlaywright(config, outputDir) {
   let isLoggedIn = false;
 
   // Login function for authenticated screens
-  async function ensureLoggedIn() {
-    if (!config.auth?.enabled || isLoggedIn) return;
+  // Tracks which identity is currently authenticated, so a screen can request a
+  // different role (multi-sided apps: customer vs driver vs restaurant) and we
+  // only re-login when the identity actually changes.
+  let currentLoginId = null;
+
+  async function ensureLoggedIn(overrideCreds) {
+    if (!config.auth?.enabled) return;
 
     const auth = config.auth;
-    logStep('AUTH', 'Logging in...');
+    const creds = overrideCreds || auth.credentials;
+    const credId = creds.username || creds.email;
+
+    // Already authenticated as the right identity — nothing to do.
+    if (isLoggedIn && currentLoginId === credId) return;
+
+    // Switching identities: clear the existing session so the new login sticks.
+    if (isLoggedIn && currentLoginId !== credId) {
+      logStep('AUTH', `Switching login to ${credId}...`);
+      await page.context().clearCookies();
+      await page.goto(`${baseUrl}${auth.loginUrl}`, { waitUntil: 'networkidle', timeout: 30000 }).catch(() => {});
+      await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch { /* ignore */ } });
+      isLoggedIn = false;
+    } else {
+      logStep('AUTH', 'Logging in...');
+    }
 
     try {
       await page.goto(`${baseUrl}${auth.loginUrl}`, { waitUntil: 'networkidle', timeout: 30000 });
@@ -782,12 +802,12 @@ async function captureWithPlaywright(config, outputDir) {
       // Wait for and fill username/email field
       const usernameSelector = auth.usernameSelector || 'input[name="username"], input[name="email"], input[type="email"], input[type="text"]';
       await page.waitForSelector(usernameSelector, { timeout: 10000 });
-      await page.fill(usernameSelector, auth.credentials.username || auth.credentials.email);
+      await page.fill(usernameSelector, creds.username || creds.email);
 
       // Fill password field (optional - some apps only need username/nickname)
-      if (auth.credentials.password && auth.passwordSelector !== false) {
+      if (creds.password && auth.passwordSelector !== false) {
         const passwordSelector = auth.passwordSelector || 'input[name="password"], input[type="password"]';
-        await page.fill(passwordSelector, auth.credentials.password);
+        await page.fill(passwordSelector, creds.password);
       }
 
       // Submit the login form. A bare `button[type="submit"]` is ambiguous: many
@@ -798,7 +818,7 @@ async function captureWithPlaywright(config, outputDir) {
       // submit handler), and fall back to a scoped/global button click only if the
       // field isn't in a form.
       const submitSelector = auth.submitSelector || 'button[type="submit"]';
-      const passwordForSubmit = auth.credentials.password && auth.passwordSelector !== false
+      const passwordForSubmit = creds.password && auth.passwordSelector !== false
         ? (auth.passwordSelector || 'input[name="password"], input[type="password"]')
         : null;
 
@@ -854,6 +874,7 @@ async function captureWithPlaywright(config, outputDir) {
       }
 
       isLoggedIn = true;
+      currentLoginId = credId;
     } catch (error) {
       logError(`Login failed: ${error.message}`);
       throw error;
@@ -863,9 +884,11 @@ async function captureWithPlaywright(config, outputDir) {
   // Capture each screen
   for (const screen of config.screens) {
     try {
-      // Handle auth if needed
+      // Handle auth if needed. A screen may set `loginAs` (its own credentials
+      // object) to be captured under a different identity — essential for
+      // multi-sided apps where customer, driver, and restaurant see different UIs.
       if (!screen.skipAuth && config.auth?.enabled) {
-        await ensureLoggedIn();
+        await ensureLoggedIn(screen.loginAs);
       }
 
       logStep('CAPTURE', `${screen.name} (${screen.path})`);

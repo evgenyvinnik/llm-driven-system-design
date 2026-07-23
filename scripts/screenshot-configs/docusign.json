@@ -25,23 +25,38 @@
       "delay": 500
     },
     {
-      "name": "02-register",
-      "path": "/register",
-      "waitFor": "form",
-      "skipAuth": true,
-      "delay": 500
-    },
-    {
-      "name": "03-home",
+      "name": "02-dashboard",
       "path": "/",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 1200
     },
     {
-      "name": "04-admin",
+      "name": "03-envelopes",
+      "path": "/envelopes",
+      "waitFor": "main",
+      "delay": 1200
+    },
+    {
+      "name": "04-signing-ceremony",
+      "path": "/sign/sign-nda-alice-0000000000000001",
+      "waitFor": ".field-highlight, main",
+      "skipAuth": true,
+      "delay": 2500
+    },
+    {
+      "name": "05-signature-modal",
+      "path": "/sign/sign-nda-alice-0000000000000001",
+      "waitFor": ".field-highlight, main",
+      "skipAuth": true,
+      "click": ".field-highlight.signature",
+      "clickDelay": 1500,
+      "delay": 800
+    },
+    {
+      "name": "06-admin",
       "path": "/admin",
       "waitFor": "main",
-      "delay": 500
+      "delay": 800
     }
   ],
   "viewport": {
