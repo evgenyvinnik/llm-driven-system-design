@@ -64,8 +64,13 @@ INSERT INTO drivers (user_id, vehicle_type, license_plate, is_active, is_availab
 -- SAMPLE ORDER (customer@example.com) — gives the orders page,
 -- order tracking, and the driver dashboard real content to show.
 -- ============================================================
+-- Targeted at Burger Barn (the restaurant the restaurant-owner dashboard opens
+-- to by default) so the same order is visible on all three sides: the customer's
+-- orders page, the driver's active-delivery card, and the restaurant's queue.
 INSERT INTO orders (customer_id, restaurant_id, driver_id, status, subtotal, delivery_fee, tax, tip, total, delivery_address, placed_at, confirmed_at, preparing_at)
-SELECT c.id, 1, (SELECT id FROM drivers LIMIT 1), 'PREPARING', 34.50, 3.99, 3.10, 5.00, 46.59,
+SELECT c.id,
+       (SELECT id FROM restaurants WHERE name = 'Burger Barn' LIMIT 1),
+       (SELECT id FROM drivers LIMIT 1), 'PREPARING', 34.50, 3.99, 3.10, 5.00, 46.59,
        '{"street":"742 Evergreen Terrace","city":"Springfield","state":"CA","zip":"94000"}'::json,
        NOW() - INTERVAL '18 minutes', NOW() - INTERVAL '16 minutes', NOW() - INTERVAL '12 minutes'
 FROM users c
@@ -75,7 +80,7 @@ WHERE c.email = 'customer@example.com'
 INSERT INTO order_items (order_id, menu_item_id, name, price, quantity)
 SELECT o.id, m.id, m.name, m.price, 1
 FROM orders o
-JOIN menu_items m ON m.restaurant_id = 1
+JOIN menu_items m ON m.restaurant_id = o.restaurant_id
 WHERE o.customer_id = (SELECT id FROM users WHERE email = 'customer@example.com')
   AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id)
 ORDER BY m.id LIMIT 3;

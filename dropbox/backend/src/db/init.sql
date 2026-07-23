@@ -30,10 +30,14 @@ CREATE TABLE files (
     sync_status VARCHAR(20) DEFAULT 'synced' CHECK (sync_status IN ('synced', 'syncing', 'pending', 'error')),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    deleted_at TIMESTAMP WITH TIME ZONE,
-
-    UNIQUE(user_id, parent_id, name) WHERE deleted_at IS NULL
+    deleted_at TIMESTAMP WITH TIME ZONE
 );
+
+-- "No duplicate names in a folder, unless soft-deleted." A partial UNIQUE cannot
+-- be an inline table constraint (that's a syntax error that crashes initdb) — it
+-- has to be a partial UNIQUE INDEX.
+CREATE UNIQUE INDEX idx_files_unique_name
+    ON files(user_id, parent_id, name) WHERE deleted_at IS NULL;
 
 -- Index for folder hierarchy queries
 CREATE INDEX idx_files_user_parent ON files(user_id, parent_id) WHERE deleted_at IS NULL;

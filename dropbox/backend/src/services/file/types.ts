@@ -9,7 +9,10 @@
  * @description Core type definitions for file operations
  * @see {@link ../../types/index.js} for full type definitions
  */
-export { FileItem, FileChunk, Chunk, UploadSession, FileVersion } from '../../types/index.js';
+// Type-only re-export: these are interfaces with no runtime binding, so a value
+// re-export (`export { ... }`) throws "does not provide an export named 'Chunk'"
+// under ESM/tsx. `export type` marks it as erasable and fixes the boot crash.
+export type { FileItem, FileChunk, Chunk, UploadSession, FileVersion } from '../../types/index.js';
 
 /**
  * @description Database utility functions for PostgreSQL operations
