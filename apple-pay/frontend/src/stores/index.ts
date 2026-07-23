@@ -20,6 +20,13 @@ interface AuthState {
   devices: Device[];
   /** Whether an auth operation is in progress */
   isLoading: boolean;
+  /**
+   * True once loadUser() has run to completion (success or failure). Route
+   * guards must wait for this before deciding a user is logged out — on a fresh
+   * page load `user` is null until the async session restore finishes, so a
+   * guard keyed on `!user` alone bounces an authenticated user to /login.
+   */
+  authChecked: boolean;
   /** Error message from last operation or null */
   error: string | null;
   /** Authenticates user with email and password */
@@ -47,6 +54,7 @@ export const useAuthStore = create<AuthState>()(
       sessionId: null,
       devices: [],
       isLoading: false,
+      authChecked: false,
       error: null,
 
       login: async (email, password, deviceId) => {
@@ -54,7 +62,7 @@ export const useAuthStore = create<AuthState>()(
         try {
           const { sessionId, user } = await api.login(email, password, deviceId);
           localStorage.setItem('sessionId', sessionId);
-          set({ user, sessionId, isLoading: false });
+          set({ user, sessionId, isLoading: false, authChecked: true });
           await get().loadDevices();
         } catch (error) {
           set({ error: (error as Error).message, isLoading: false });
@@ -81,21 +89,25 @@ export const useAuthStore = create<AuthState>()(
         }
         localStorage.removeItem('sessionId');
         sessionStorage.removeItem('biometricSession');
-        set({ user: null, sessionId: null, devices: [] });
+        set({ user: null, sessionId: null, devices: [], authChecked: true });
       },
 
       loadUser: async () => {
         const sessionId = localStorage.getItem('sessionId');
-        if (!sessionId) return;
+        if (!sessionId) {
+          // No stored session: the check is complete and the user is logged out.
+          set({ authChecked: true });
+          return;
+        }
 
         set({ isLoading: true });
         try {
           const { user } = await api.getMe();
-          set({ user, sessionId, isLoading: false });
+          set({ user, sessionId, isLoading: false, authChecked: true });
           await get().loadDevices();
         } catch {
           localStorage.removeItem('sessionId');
-          set({ user: null, sessionId: null, isLoading: false });
+          set({ user: null, sessionId: null, isLoading: false, authChecked: true });
         }
       },
 

@@ -27,14 +27,27 @@ interface LayoutProps {
  * @returns JSX element representing the app shell, or null if not logged in
  */
 export function Layout({ children, title, showBack }: LayoutProps) {
-  const { user, logout } = useAuthStore();
+  const { user, authChecked, logout } = useAuthStore();
   const navigate = useNavigate();
 
   useEffect(() => {
-    if (!user) {
+    // Only redirect once the session-restore attempt has finished. Redirecting
+    // on `!user` alone fires on every fresh page load before loadUser resolves,
+    // bouncing an authenticated user to /login even though their session is valid.
+    if (authChecked && !user) {
       navigate({ to: '/login' });
     }
-  }, [user, navigate]);
+  }, [authChecked, user, navigate]);
+
+  // Hold rendering until we know whether the user is authenticated, so a valid
+  // session restores into the wallet instead of flashing the login page.
+  if (!authChecked && !user) {
+    return (
+      <div className="min-h-screen bg-apple-gray-100 flex items-center justify-center">
+        <div className="w-8 h-8 border-2 border-apple-blue border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
 
   if (!user) return null;
 
