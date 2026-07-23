@@ -494,3 +494,20 @@ BEGIN
     END IF;
 
 END $$;
+
+-- ============================================================================
+-- CART ITEMS
+-- ============================================================================
+-- Gives the demo user a non-empty cart so the cart and checkout screens show
+-- real content. reserved_until is set well into the future so the background
+-- reservation-cleanup job doesn't release these rows during a demo session.
+
+INSERT INTO cart_items (user_id, product_id, quantity, reserved_until)
+SELECT u.id, p.id, c.qty, NOW() + INTERVAL '30 days'
+FROM (VALUES
+    ('alice@example.com', 'premium-wireless-earbuds-pro', 1),
+    ('alice@example.com', 'wireless-charging-pad', 2)
+) AS c(user_email, product_slug, qty)
+JOIN users u ON u.email = c.user_email
+JOIN products p ON p.slug = c.product_slug
+ON CONFLICT (user_id, product_id) DO NOTHING;

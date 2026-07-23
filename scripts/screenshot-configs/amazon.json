@@ -34,19 +34,31 @@
       "name": "03-search",
       "path": "/search?q=laptop",
       "waitFor": "main",
+      "delay": 1200
+    },
+    {
+      "name": "04-product",
+      "path": "/product/1",
+      "waitFor": "main",
+      "delay": 1200
+    },
+    {
+      "name": "05-cart",
+      "path": "/cart",
+      "waitFor": "main",
       "delay": 1000
     },
     {
-      "name": "04-cart",
-      "path": "/cart",
+      "name": "06-checkout",
+      "path": "/checkout",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1000
     },
     {
-      "name": "05-orders",
+      "name": "07-orders",
       "path": "/orders",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1000
     }
   ],
   "viewport": {
