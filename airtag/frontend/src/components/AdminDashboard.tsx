@@ -172,7 +172,7 @@ export function AdminDashboard() {
  * @param title - Card title
  * @param value - Primary numeric value
  * @param subtitle - Secondary description text
- * @param icon - HTML entity for icon display
+ * @param icon - Emoji character for icon display
  * @param highlight - Whether to use highlight (red) styling
  * @returns Styled statistics card
  */
@@ -205,10 +205,7 @@ function StatCard({
             {subtitle}
           </p>
         </div>
-        <span
-          className="text-2xl"
-          dangerouslySetInnerHTML={{ __html: icon }}
-        />
+        <span className="text-2xl">{icon}</span>
       </div>
     </div>
   );
