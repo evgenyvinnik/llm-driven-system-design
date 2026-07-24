@@ -5,13 +5,40 @@
   "dbName": "github",
   "dbUser": "github",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "username": "johndoe",
+      "password": "password123"
+    },
+    "usernameSelector": "#username",
+    "passwordSelector": "#password",
+    "submitSelector": "button[type='submit']"
   },
   "screens": [
     {
       "name": "01-home",
       "path": "/",
-      "waitFor": "main",
+      "skipAuth": true,
+      "waitFor": "h1, main",
+      "delay": 1500
+    },
+    {
+      "name": "02-repo",
+      "path": "/johndoe/awesome-api",
+      "waitFor": "main, h1",
+      "delay": 2000
+    },
+    {
+      "name": "03-code",
+      "path": "/janedoe/go-cache",
+      "waitFor": "main, h1",
+      "delay": 2000
+    },
+    {
+      "name": "04-pulls",
+      "path": "/johndoe/awesome-api/pulls",
+      "waitFor": "main, h1",
       "delay": 1500
     }
   ],

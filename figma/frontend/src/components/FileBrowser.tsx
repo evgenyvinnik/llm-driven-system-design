@@ -132,6 +132,7 @@ export function FileBrowser({ onSelectFile }: FileBrowserProps) {
               {files.map((file) => (
                 <div
                   key={file.id}
+                  data-testid="file-card"
                   onClick={() => onSelectFile(file.id)}
                   className="bg-figma-panel rounded-lg overflow-hidden border border-figma-border hover:border-figma-accent cursor-pointer transition-colors group"
                 >

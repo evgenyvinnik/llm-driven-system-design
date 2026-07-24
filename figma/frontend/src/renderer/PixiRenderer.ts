@@ -24,6 +24,7 @@ export class PixiRenderer {
   private shapeFactory: ShapeFactory;
   private currentViewport: Viewport = { x: 0, y: 0, zoom: 1 };
   private isInitialized = false;
+  private destroyRequested = false;
 
   /**
    * Creates a new PixiRenderer and attaches it to the given container.
@@ -79,6 +80,14 @@ export class PixiRenderer {
     this.app.stage.hitArea = this.app.screen;
 
     this.isInitialized = true;
+
+    // If destroy() was called while init() was still awaiting (React StrictMode
+    // mounts, then immediately unmounts, then remounts in dev), tear down now
+    // that the app is fully constructed — calling app.destroy() mid-init throws
+    // "_cancelResize is not a function" and blanks the whole editor.
+    if (this.destroyRequested) {
+      this.destroy();
+    }
   }
 
   /** Returns the PixiJS stage container */
@@ -355,6 +364,13 @@ export class PixiRenderer {
    * Should be called when the component unmounts.
    */
   public destroy(): void {
+    // Guard against destroy-before-init: app.init() hasn't finished, so the
+    // PixiJS Application isn't safe to destroy yet. Record the request and let
+    // init() complete the teardown once the app exists.
+    if (!this.isInitialized) {
+      this.destroyRequested = true;
+      return;
+    }
     this.objectMap.forEach((container) => {
       container.destroy({ children: true });
     });

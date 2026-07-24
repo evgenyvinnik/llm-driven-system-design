@@ -208,9 +208,13 @@ export async function getTree(owner: string, repoName: string, ref = 'HEAD', tre
       .split('\n')
       .filter(Boolean)
       .map((line) => {
-        const [mode, type, hash, sizeAndName] = line.split(/\s+/);
-        const [size, ...nameParts] = sizeAndName.split('\t');
+        // `git ls-tree -l` format is: "<mode> <type> <hash> <size>\t<name>".
+        // The name is TAB-separated from the metadata, so split on the tab
+        // first — splitting the whole line on /\s+/ swallows that tab and
+        // leaves every filename empty.
+        const [meta, ...nameParts] = line.split('\t');
         const name = nameParts.join('\t');
+        const [mode, type, hash, size] = meta.split(/\s+/);
 
         return {
           mode,

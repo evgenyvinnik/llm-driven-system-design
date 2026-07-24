@@ -10,9 +10,10 @@
     "dev:server2": "PORT=3002 npm run dev",
     "dev:server3": "PORT=3003 npm run dev",
     "start": "NODE_ENV=production tsx src/index.ts",
-    "db:seed": "tsx src/db/seed.ts",
+    "db:seed": "tsx src/db/seed.ts && tsx src/db/seed-repos.ts",
     "format": "prettier --write src/**/*.ts",
-    "lint": "eslint src/**/*.ts"
+    "lint": "eslint src/**/*.ts",
+    "db:seed:repos": "tsx src/db/seed-repos.ts"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.12.0",

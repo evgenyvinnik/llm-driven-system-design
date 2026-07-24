@@ -28,10 +28,17 @@ const CIRCUIT_OPTIONS: Options = {
 const circuitBreakers = new Map<string, CircuitBreaker>();
 
 /**
- * Create a circuit breaker for a specific operation
+ * Create a circuit breaker for a named operation *class* (e.g. "git_file").
+ *
+ * The breaker's action is a pass-through invoker `(fn) => fn()`, NOT the caller's
+ * specific closure. This is load-bearing: breakers are cached by name and reused,
+ * so binding the breaker to the first call's closure would make every later call
+ * with the same name run the FIRST call's operation — e.g. every getFileContent
+ * returning the first repo's file. Passing the operation to `breaker.fire(op)`
+ * each time keeps per-call arguments correct while still sharing breaker state.
  */
-function createCircuitBreaker<T>(name: string, operation: () => Promise<T>): CircuitBreaker<[], T> {
-  const breaker = new CircuitBreaker(operation, {
+function createCircuitBreaker<T>(name: string): CircuitBreaker<[() => Promise<T>], T> {
+  const breaker = new CircuitBreaker((fn: () => Promise<T>) => fn(), {
     ...CIRCUIT_OPTIONS,
     name,
   });
@@ -87,22 +94,22 @@ function createCircuitBreaker<T>(name: string, operation: () => Promise<T>): Cir
 /**
  * Get or create a circuit breaker for an operation
  */
-function getCircuitBreaker<T>(name: string, operation: () => Promise<T>): CircuitBreaker<[], T> {
+function getCircuitBreaker<T>(name: string): CircuitBreaker<[() => Promise<T>], T> {
   if (!circuitBreakers.has(name)) {
-    return createCircuitBreaker(name, operation);
+    return createCircuitBreaker<T>(name);
   }
 
-  return circuitBreakers.get(name) as CircuitBreaker<[], T>;
+  return circuitBreakers.get(name) as unknown as CircuitBreaker<[() => Promise<T>], T>;
 }
 
 /**
  * Wrap a git operation with circuit breaker protection
  */
 export async function withCircuitBreaker<T>(operationName: string, operation: () => Promise<T>): Promise<T> {
-  const breaker = getCircuitBreaker(operationName, operation);
+  const breaker = getCircuitBreaker<T>(operationName);
 
   try {
-    return await breaker.fire() as T;
+    return await breaker.fire(operation) as T;
   } catch (err) {
     if ((err as Error).message === 'Breaker is open') {
       throw new Error(`Git service temporarily unavailable: ${operationName}`);

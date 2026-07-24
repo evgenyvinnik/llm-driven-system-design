@@ -12,8 +12,15 @@
     {
       "name": "01-file-browser",
       "path": "/",
-      "waitFor": ".grid, h1, h2, button",
-      "skipAuth": true,
+      "waitFor": "[data-testid='file-card']",
+      "delay": 1500
+    },
+    {
+      "name": "02-editor",
+      "path": "/",
+      "waitFor": "[data-testid='file-card']",
+      "click": "[data-testid='file-card']",
+      "clickDelay": 3500,
       "delay": 1500
     }
   ],
