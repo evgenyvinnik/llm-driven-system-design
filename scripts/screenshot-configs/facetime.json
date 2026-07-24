@@ -11,9 +11,16 @@
     {
       "name": "01-login-screen",
       "path": "/",
-      "waitFor": ".rounded-2xl, .max-w-md",
-      "skipAuth": true,
-      "delay": 1500
+      "waitFor": "button",
+      "delay": 1000
+    },
+    {
+      "name": "02-contacts",
+      "path": "/",
+      "waitFor": "[data-testid='user-alice']",
+      "click": "[data-testid='user-alice']",
+      "clickDelay": 2000,
+      "delay": 1000
     }
   ],
   "viewport": {

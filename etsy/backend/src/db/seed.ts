@@ -325,6 +325,72 @@ async function seed(): Promise<void> {
       }
     }
 
+    // ------------------------------------------------------------------
+    // Buyer activity: cart, favorites, and past orders for buyer@example.com,
+    // so the cart / favorites / orders pages show real content instead of
+    // empty states when browsing as a shopper.
+    // ------------------------------------------------------------------
+    const buyer = await db.query<{ id: number }>(
+      `SELECT id FROM users WHERE email = 'buyer@example.com'`
+    );
+    if (buyer.rows.length > 0) {
+      const buyerId = buyer.rows[0].id;
+      const prods = await db.query<{ id: number; shop_id: number; title: string; price: string; images: string[] }>(
+        `SELECT id, shop_id, title, price, images FROM products ORDER BY id LIMIT 6`
+      );
+      const p = prods.rows;
+
+      if (p.length >= 5) {
+        // Cart: two items (idempotent on the unique (user, product) pair).
+        for (const item of [p[0], p[2]]) {
+          await db.query(
+            `INSERT INTO cart_items (user_id, product_id, quantity)
+             VALUES ($1, $2, 1)
+             ON CONFLICT (user_id, product_id) DO NOTHING`,
+            [buyerId, item.id]
+          );
+        }
+
+        // Favorites: a few liked products.
+        for (const item of [p[1], p[3], p[4]]) {
+          await db.query(
+            `INSERT INTO favorites (user_id, favoritable_type, favoritable_id)
+             VALUES ($1, 'product', $2)
+             ON CONFLICT DO NOTHING`,
+            [buyerId, item.id]
+          );
+        }
+
+        // A completed past order with its line item.
+        const orderNo = 'HM-' + String(100000 + buyerId);
+        const existingOrder = await db.query(`SELECT id FROM orders WHERE order_number = $1`, [orderNo]);
+        if (existingOrder.rows.length === 0) {
+          const subtotal = Number(p[1].price);
+          const shipping = 4.5;
+          const order = await db.query<{ id: number }>(
+            `INSERT INTO orders (buyer_id, shop_id, order_number, subtotal, shipping, total, status, shipping_address, tracking_number)
+             VALUES ($1, $2, $3, $4, $5, $6, 'shipped', $7, $8)
+             RETURNING id`,
+            [
+              buyerId,
+              p[1].shop_id,
+              orderNo,
+              subtotal,
+              shipping,
+              subtotal + shipping,
+              JSON.stringify({ name: 'Happy Buyer', street: '88 Maple Ave', city: 'Portland', state: 'OR', zip: '97201' }),
+              '1Z999AA10123456784',
+            ]
+          );
+          await db.query(
+            `INSERT INTO order_items (order_id, product_id, title, price, quantity, image_url)
+             VALUES ($1, $2, $3, $4, 1, $5)`,
+            [order.rows[0].id, p[1].id, p[1].title, p[1].price, (p[1].images && p[1].images[0]) || null]
+          );
+        }
+      }
+    }
+
     console.log('Seeding completed successfully!');
   } catch (error) {
     console.error('Seeding failed:', error);

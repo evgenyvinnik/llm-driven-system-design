@@ -8,7 +8,7 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "alice@example.com",
+      "email": "buyer@example.com",
       "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
@@ -20,33 +20,33 @@
     {
       "name": "01-login",
       "path": "/login",
-      "waitFor": "form",
       "skipAuth": true,
+      "waitFor": "form",
       "delay": 500
     },
     {
       "name": "02-home",
       "path": "/",
-      "waitFor": "main",
+      "waitFor": "main, h1",
       "delay": 1500
     },
     {
       "name": "03-cart",
       "path": "/cart",
-      "waitFor": "main",
-      "delay": 500
+      "waitFor": "main, h1",
+      "delay": 1200
     },
     {
       "name": "04-favorites",
       "path": "/favorites",
-      "waitFor": "main",
-      "delay": 500
+      "waitFor": "main, h1",
+      "delay": 1200
     },
     {
       "name": "05-orders",
       "path": "/orders",
-      "waitFor": "main",
-      "delay": 500
+      "waitFor": "main, h1",
+      "delay": 1200
     }
   ],
   "viewport": {

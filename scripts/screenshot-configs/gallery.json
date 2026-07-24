@@ -1,0 +1,36 @@
+{
+  "name": "gallery",
+  "frontendPort": 5173,
+  "backendRequired": false,
+  "auth": {
+    "enabled": false
+  },
+  "screens": [
+    {
+      "name": "01-tiles",
+      "path": "/",
+      "waitFor": "img",
+      "delay": 2500
+    },
+    {
+      "name": "02-masonry",
+      "path": "/",
+      "waitFor": "button",
+      "click": "button:has-text('Masonry')",
+      "clickDelay": 2500,
+      "delay": 1000
+    },
+    {
+      "name": "03-slideshow",
+      "path": "/",
+      "waitFor": "button",
+      "click": "button:has-text('Slideshow')",
+      "clickDelay": 2500,
+      "delay": 1000
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

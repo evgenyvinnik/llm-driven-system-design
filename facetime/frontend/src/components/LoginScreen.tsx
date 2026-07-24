@@ -55,6 +55,7 @@ export function LoginScreen({ users, onLogin, isLoading }: LoginScreenProps) {
           users.map((user) => (
             <button
               key={user.id}
+              data-testid={`user-${user.username}`}
               onClick={() => onLogin(user.username)}
               className="w-full flex items-center gap-4 p-4 rounded-xl hover:bg-gray-800 transition-colors"
             >
