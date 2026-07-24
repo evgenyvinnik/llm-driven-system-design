@@ -9,14 +9,18 @@
  * @param bytes - Number of bytes to format
  * @returns Formatted string like "1.5 MB" or "256 KB"
  */
-export function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
+export function formatBytes(bytes: number | string | null | undefined): string {
+  // BIGINT columns (used_bytes/quota_bytes) come back from node-pg as strings, and
+  // may be null. Coerce first: without this, formatBytes("0") slips past a truthy
+  // guard and Math.log(0) yields "NaN undefined". After coercion, 0/NaN → "0 B".
+  const n = Number(bytes);
+  if (!n || Number.isNaN(n)) return '0 B';
 
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const i = Math.floor(Math.log(n) / Math.log(k));
 
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  return parseFloat((n / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 /**
@@ -96,9 +100,11 @@ export function getFileIcon(mimeType: string | null, isFolder: boolean): string 
  * @param quota - Total quota in bytes
  * @returns Percentage of storage used (0-100)
  */
-export function getStoragePercentage(used: number, quota: number): number {
-  if (quota === 0) return 0;
-  return Math.min(100, (used / quota) * 100);
+export function getStoragePercentage(used: number | string | null | undefined, quota: number | string | null | undefined): number {
+  const u = Number(used) || 0;
+  const q = Number(quota) || 0;
+  if (q === 0) return 0;
+  return Math.min(100, (u / q) * 100);
 }
 
 /**

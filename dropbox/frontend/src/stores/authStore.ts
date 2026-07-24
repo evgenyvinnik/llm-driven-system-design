@@ -18,6 +18,8 @@ interface AuthState {
   user: User | null;
   token: string | null;
   isLoading: boolean;
+  /** True once the initial checkAuth() has completed (success or failure). */
+  authChecked: boolean;
   error: string | null;
 
   login: (email: string, password: string) => Promise<void>;
@@ -37,6 +39,13 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       token: null,
       isLoading: false,
+      // False until checkAuth() has finished its first run. The route guard must
+      // wait for this before deciding the user is logged out — otherwise the
+      // first render (user still null) redirects to /login before the
+      // session-restore /auth/me call resolves, bouncing a valid cookie session.
+      // Kept separate from isLoading so the login button (disabled={isLoading})
+      // isn't disabled during the initial check.
+      authChecked: false,
       error: null,
 
       login: async (email, password) => {
@@ -74,9 +83,9 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true });
         try {
           const { user } = await authApi.getMe();
-          set({ user, isLoading: false });
+          set({ user, isLoading: false, authChecked: true });
         } catch {
-          set({ user: null, token: null, isLoading: false });
+          set({ user: null, token: null, isLoading: false, authChecked: true });
         }
       },
 

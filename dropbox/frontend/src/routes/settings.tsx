@@ -23,19 +23,19 @@ export const Route = createFileRoute('/settings')({
  */
 function Settings() {
   const navigate = useNavigate();
-  const { user, isLoading, checkAuth } = useAuthStore();
+  const { user, authChecked, checkAuth } = useAuthStore();
 
   useEffect(() => {
     checkAuth();
   }, []);
 
   useEffect(() => {
-    if (!isLoading && !user) {
+    if (authChecked && !user) {
       navigate({ to: '/login' });
     }
-  }, [isLoading, user, navigate]);
+  }, [authChecked, user, navigate]);
 
-  if (isLoading) {
+  if (!authChecked) {
     return (
       <div className="h-screen flex items-center justify-center">
         <Loader2 className="w-8 h-8 animate-spin text-dropbox-blue" />

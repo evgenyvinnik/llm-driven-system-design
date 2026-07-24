@@ -25,7 +25,7 @@ export const Route = createFileRoute('/admin')({
  */
 function AdminDashboard() {
   const navigate = useNavigate();
-  const { user, isLoading: authLoading, checkAuth } = useAuthStore();
+  const { user, authChecked, checkAuth } = useAuthStore();
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [storageBreakdown, setStorageBreakdown] = useState<Array<{ category: string; count: number; totalSize: number }>>([]);
@@ -37,12 +37,12 @@ function AdminDashboard() {
   }, []);
 
   useEffect(() => {
-    if (!authLoading && !user) {
+    if (authChecked && !user) {
       navigate({ to: '/login' });
     } else if (user && user.role !== 'admin') {
       navigate({ to: '/', search: { folder: undefined } });
     }
-  }, [authLoading, user, navigate]);
+  }, [authChecked, user, navigate]);
 
   useEffect(() => {
     if (user && user.role === 'admin') {
@@ -93,7 +93,7 @@ function AdminDashboard() {
     }
   };
 
-  if (authLoading) {
+  if (!authChecked) {
     return (
       <div className="h-screen flex items-center justify-center">
         <Loader2 className="w-8 h-8 animate-spin text-dropbox-blue" />

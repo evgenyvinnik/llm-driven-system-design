@@ -37,7 +37,7 @@ export const Route = createFileRoute('/')({
 function FileBrowser() {
   const navigate = useNavigate();
   const { folder: folderId } = useSearch({ from: '/' });
-  const { user, checkAuth, isLoading: authLoading } = useAuthStore();
+  const { user, checkAuth, authChecked } = useAuthStore();
   const {
     currentFolder,
     isLoading,
@@ -68,12 +68,12 @@ function FileBrowser() {
   }, [user, folderId]);
 
   useEffect(() => {
-    if (!authLoading && !user) {
+    if (authChecked && !user) {
       navigate({ to: '/login' });
     }
-  }, [authLoading, user, navigate]);
+  }, [authChecked, user, navigate]);
 
-  if (authLoading) {
+  if (!authChecked) {
     return (
       <div className="h-screen flex items-center justify-center">
         <Loader2 className="w-8 h-8 animate-spin text-dropbox-blue" />

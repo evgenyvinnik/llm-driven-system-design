@@ -26,7 +26,7 @@ export const Route = createFileRoute('/shared')({
  */
 function SharedWithMe() {
   const navigate = useNavigate();
-  const { user, isLoading: authLoading, checkAuth } = useAuthStore();
+  const { user, authChecked, checkAuth } = useAuthStore();
   const [sharedItems, setSharedItems] = useState<FileItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
@@ -36,10 +36,10 @@ function SharedWithMe() {
   }, []);
 
   useEffect(() => {
-    if (!authLoading && !user) {
+    if (authChecked && !user) {
       navigate({ to: '/login' });
     }
-  }, [authLoading, user, navigate]);
+  }, [authChecked, user, navigate]);
 
   useEffect(() => {
     if (user) {
@@ -61,7 +61,7 @@ function SharedWithMe() {
     }
   };
 
-  if (authLoading) {
+  if (!authChecked) {
     return (
       <div className="h-screen flex items-center justify-center">
         <Loader2 className="w-8 h-8 animate-spin text-dropbox-blue" />
