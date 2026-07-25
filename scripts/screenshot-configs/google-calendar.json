@@ -26,10 +26,26 @@
       "delay": 500
     },
     {
-      "name": "02-calendar-view",
+      "name": "02-month-view",
       "path": "/",
-      "waitFor": "main",
-      "delay": 2000
+      "waitFor": "main, button",
+      "delay": 1500
+    },
+    {
+      "name": "03-week-view",
+      "path": "/",
+      "waitFor": "button",
+      "click": "button:has-text('Week')",
+      "clickDelay": 1500,
+      "delay": 800
+    },
+    {
+      "name": "04-day-view",
+      "path": "/",
+      "waitFor": "button",
+      "click": "button:has-text('Day')",
+      "clickDelay": 1500,
+      "delay": 800
     }
   ],
   "viewport": {

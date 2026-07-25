@@ -42,22 +42,26 @@ async function seed() {
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
 
     await pool.query(`
+      -- start_time/end_time are TIMESTAMPTZ. A bare "date + interval '9 hours'"
+      -- is a naive timestamp that Postgres interprets in the SERVER's zone (UTC in
+      -- the container), so a 9am standup rendered at 2am for a US-Pacific viewer.
+      -- AT TIME ZONE declares the wall-clock time's zone and yields the right instant.
       INSERT INTO events (calendar_id, title, description, location, start_time, end_time, all_day, color)
       VALUES
         -- Today's events
-        ($1, 'Team Standup', 'Daily sync meeting', 'Zoom', $3::date + interval '9 hours', $3::date + interval '9 hours 30 minutes', false, null),
-        ($1, 'Lunch with Sarah', null, 'Cafe downtown', $3::date + interval '12 hours', $3::date + interval '13 hours', false, null),
-        ($2, 'Project Review', 'Q1 project review', 'Conference Room A', $3::date + interval '14 hours', $3::date + interval '15 hours 30 minutes', false, null),
+        ($1, 'Team Standup', 'Daily sync meeting', 'Zoom', (\$3::date + interval '9 hours') AT TIME ZONE 'America/Los_Angeles', (\$3::date + interval '9 hours 30 minutes') AT TIME ZONE 'America/Los_Angeles', false, null),
+        ($1, 'Lunch with Sarah', null, 'Cafe downtown', (\$3::date + interval '12 hours') AT TIME ZONE 'America/Los_Angeles', (\$3::date + interval '13 hours') AT TIME ZONE 'America/Los_Angeles', false, null),
+        ($2, 'Project Review', 'Q1 project review', 'Conference Room A', (\$3::date + interval '14 hours') AT TIME ZONE 'America/Los_Angeles', (\$3::date + interval '15 hours 30 minutes') AT TIME ZONE 'America/Los_Angeles', false, null),
 
         -- Tomorrow's events
-        ($1, 'Morning Yoga', null, 'Gym', $3::date + interval '1 day 7 hours', $3::date + interval '1 day 8 hours', false, '#8B5CF6'),
-        ($2, 'Client Call', 'Demo for new client', 'Phone', $3::date + interval '1 day 10 hours', $3::date + interval '1 day 11 hours', false, null),
+        ($1, 'Morning Yoga', null, 'Gym', (\$3::date + interval '1 day 7 hours') AT TIME ZONE 'America/Los_Angeles', (\$3::date + interval '1 day 8 hours') AT TIME ZONE 'America/Los_Angeles', false, '#8B5CF6'),
+        ($2, 'Client Call', 'Demo for new client', 'Phone', (\$3::date + interval '1 day 10 hours') AT TIME ZONE 'America/Los_Angeles', (\$3::date + interval '1 day 11 hours') AT TIME ZONE 'America/Los_Angeles', false, null),
 
         -- All day event
-        ($1, 'Team Offsite', 'Annual team building', 'Lake Resort', $3::date + interval '3 days', $3::date + interval '4 days', true, '#F59E0B'),
+        ($1, 'Team Offsite', 'Annual team building', 'Lake Resort', (\$3::date + interval '3 days') AT TIME ZONE 'America/Los_Angeles', (\$3::date + interval '4 days') AT TIME ZONE 'America/Los_Angeles', true, '#F59E0B'),
 
         -- Next week
-        ($2, 'Quarterly Planning', 'Planning for Q2', 'Main Office', $3::date + interval '7 days 9 hours', $3::date + interval '7 days 17 hours', false, null)
+        ($2, 'Quarterly Planning', 'Planning for Q2', 'Main Office', (\$3::date + interval '7 days 9 hours') AT TIME ZONE 'America/Los_Angeles', (\$3::date + interval '7 days 17 hours') AT TIME ZONE 'America/Los_Angeles', false, null)
     `, [alicePersonal?.id, aliceWork?.id, today])
 
     console.log('Database seeded successfully')
