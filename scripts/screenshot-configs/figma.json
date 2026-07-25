@@ -16,11 +16,27 @@
       "delay": 1500
     },
     {
-      "name": "02-editor",
+      "name": "02-editor-mobile",
       "path": "/",
       "waitFor": "[data-testid='file-card']",
-      "click": "[data-testid='file-card']",
-      "clickDelay": 3500,
+      "click": "[data-testid='file-card']:has-text('Mobile App')",
+      "clickDelay": 4000,
+      "delay": 1500
+    },
+    {
+      "name": "03-editor-dashboard",
+      "path": "/",
+      "waitFor": "[data-testid='file-card']",
+      "click": "[data-testid='file-card']:has-text('Dashboard')",
+      "clickDelay": 4000,
+      "delay": 1500
+    },
+    {
+      "name": "04-editor-palette",
+      "path": "/",
+      "waitFor": "[data-testid='file-card']",
+      "click": "[data-testid='file-card']:has-text('Palette')",
+      "clickDelay": 4000,
       "delay": 1500
     }
   ],

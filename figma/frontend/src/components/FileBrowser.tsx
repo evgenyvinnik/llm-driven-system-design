@@ -5,6 +5,7 @@
  */
 import React, { useState, useEffect } from 'react';
 import { api } from '../services/api';
+import { DesignThumbnail } from './DesignThumbnail';
 import type { DesignFile } from '../types';
 
 /**
@@ -136,8 +137,8 @@ export function FileBrowser({ onSelectFile }: FileBrowserProps) {
                   onClick={() => onSelectFile(file.id)}
                   className="bg-figma-panel rounded-lg overflow-hidden border border-figma-border hover:border-figma-accent cursor-pointer transition-colors group"
                 >
-                  {/* Thumbnail */}
-                  <div className="aspect-[4/3] bg-figma-bg flex items-center justify-center relative">
+                  {/* Thumbnail — live SVG preview of the design objects */}
+                  <div className="aspect-[4/3] bg-figma-bg flex items-center justify-center relative overflow-hidden">
                     {file.thumbnail_url ? (
                       <img
                         src={file.thumbnail_url}
@@ -145,9 +146,7 @@ export function FileBrowser({ onSelectFile }: FileBrowserProps) {
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <svg className="w-12 h-12 text-figma-border" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M3 3h18v18H3V3zm2 2v14h14V5H5z" />
-                      </svg>
+                      <DesignThumbnail objects={file.canvas_data?.objects ?? []} />
                     )}
 
                     {/* Active users indicator */}

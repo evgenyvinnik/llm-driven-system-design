@@ -61,6 +61,10 @@ export class PixiRenderer {
       antialias: true,
       resolution: window.devicePixelRatio || 1,
       autoDensity: true,
+      // Keep the WebGL backbuffer readable after present so headless screenshot
+      // capture (Playwright/WebKit) sees the rendered frame instead of a cleared
+      // buffer — otherwise the canvas reads back blank in captures.
+      preserveDrawingBuffer: true,
     });
 
     // Add canvas to container
