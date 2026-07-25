@@ -115,8 +115,13 @@ export const listThreads = async (
   } else if (labelName === 'ALL_MAIL') {
     stateFilter = 'AND tus.is_trashed = false AND tus.is_spam = false';
   } else {
+    // Uses $2 (not $1) for the label-join user id so that every positional
+    // param passed is actually referenced. The params array is
+    // [userId, userId, labelName, ...]; if this used $1, then $2 would be passed
+    // but never used, and Postgres fails the whole query with
+    // "could not determine data type of parameter $2".
     joinClause = `
-      JOIN thread_labels tl ON tl.thread_id = t.id AND tl.user_id = $1
+      JOIN thread_labels tl ON tl.thread_id = t.id AND tl.user_id = $2
       JOIN labels l ON l.id = tl.label_id AND l.name = $3
     `;
     stateFilter = 'AND tus.is_trashed = false AND tus.is_spam = false';
