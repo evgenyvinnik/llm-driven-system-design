@@ -164,3 +164,56 @@ VALUES
     ('55555555-5555-5555-5555-555555555555', 'ab111111-1111-1111-1111-111111111111'),
     ('55555555-5555-5555-5555-555555555555', 'ab777777-7777-7777-7777-777777777777')
 ON CONFLICT DO NOTHING;
+
+-- ============================================================
+-- Publish the seeded posts.
+--
+-- posts.status defaults to 'processing' because real uploads are finished
+-- asynchronously by the image worker (resize → post_media → status='published'
+-- → feed fan-out). Seeded rows never pass through that worker, so without this
+-- they stay 'processing' forever: the Explore grid (which filters on
+-- status='published') renders empty and the feed shows almost nothing.
+-- The seed already provides post_media rows, so publishing here is accurate.
+-- ============================================================
+UPDATE posts SET status = 'published' WHERE status = 'processing';
+
+-- ============================================================
+-- DISCOVERABLE ACCOUNTS (nobody follows these)
+--
+-- The Explore query deliberately excludes accounts the viewer already follows
+-- (`p.user_id NOT IN (SELECT following_id FROM follows ...)`) — that's the point
+-- of Explore: surface accounts you *don't* follow. With only the six original
+-- seed users, all followed by alice, Explore rendered permanently empty.
+-- These extra creators are followed by nobody, so the grid always has content.
+-- ============================================================
+INSERT INTO users (id, username, email, password_hash, display_name, bio, profile_picture_url, is_private, role)
+VALUES
+    ('77777777-7777-7777-7777-777777777777', 'frankie', 'frankie@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Frankie Lee', 'Street photography | Tokyo', 'https://i.pravatar.cc/150?u=frankie', false, 'user'),
+    ('88888888-8888-8888-8888-888888888888', 'grace', 'grace@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Grace Kim', 'Architecture & minimalism', 'https://i.pravatar.cc/150?u=grace', false, 'user'),
+    ('99999999-9999-9999-9999-999999999999', 'hugo', 'hugo@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Hugo Martin', 'Mountains, mostly', 'https://i.pravatar.cc/150?u=hugo', false, 'user'),
+    ('aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'iris', 'iris@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Iris Chen', 'Food styling & recipes', 'https://i.pravatar.cc/150?u=iris', false, 'user')
+ON CONFLICT (email) DO NOTHING;
+
+INSERT INTO posts (id, user_id, caption, location, status, like_count, comment_count, created_at)
+VALUES
+    ('ba111111-1111-4111-8111-111111111111', '77777777-7777-7777-7777-777777777777', 'Neon nights in Shinjuku.', 'Tokyo, Japan', 'published', 482, 0, NOW() - INTERVAL '2 hours'),
+    ('ba222222-2222-4222-8222-222222222222', '77777777-7777-7777-7777-777777777777', 'Rainy crossing.', 'Shibuya', 'published', 271, 0, NOW() - INTERVAL '9 hours'),
+    ('ba333333-3333-4333-8333-333333333333', '88888888-8888-8888-8888-888888888888', 'Concrete and light.', 'Rotterdam', 'published', 654, 0, NOW() - INTERVAL '5 hours'),
+    ('ba444444-4444-4444-8444-444444444444', '88888888-8888-8888-8888-888888888888', 'Stairwell study.', NULL, 'published', 388, 0, NOW() - INTERVAL '1 day'),
+    ('ba555555-5555-4555-8555-555555555555', '99999999-9999-9999-9999-999999999999', 'Above the clouds at 4am.', 'Dolomites', 'published', 921, 0, NOW() - INTERVAL '7 hours'),
+    ('ba666666-6666-4666-8666-666666666666', '99999999-9999-9999-9999-999999999999', 'Alpine lake, no filter needed.', NULL, 'published', 733, 0, NOW() - INTERVAL '2 days'),
+    ('ba777777-7777-4777-8777-777777777777', 'aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Sunday brunch spread.', NULL, 'published', 512, 0, NOW() - INTERVAL '11 hours'),
+    ('ba888888-8888-4888-8888-888888888888', 'aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Fresh pasta, slow morning.', NULL, 'published', 445, 0, NOW() - INTERVAL '3 days')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO post_media (id, post_id, media_type, media_url, width, height, order_index)
+VALUES
+    ('bd111111-1111-4111-8111-111111111111', 'ba111111-1111-4111-8111-111111111111', 'image', 'https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?w=800', 800, 800, 0),
+    ('bd222222-2222-4222-8222-222222222222', 'ba222222-2222-4222-8222-222222222222', 'image', 'https://images.unsplash.com/photo-1503899036084-c55cdd92da26?w=800', 800, 800, 0),
+    ('bd333333-3333-4333-8333-333333333333', 'ba333333-3333-4333-8333-333333333333', 'image', 'https://images.unsplash.com/photo-1487958449943-2429e8be8625?w=800', 800, 800, 0),
+    ('bd444444-4444-4444-8444-444444444444', 'ba444444-4444-4444-8444-444444444444', 'image', 'https://images.unsplash.com/photo-1449157291145-7efd050a4d0e?w=800', 800, 800, 0),
+    ('bd555555-5555-4555-8555-555555555555', 'ba555555-5555-4555-8555-555555555555', 'image', 'https://images.unsplash.com/photo-1519681393784-d120267933ba?w=800', 800, 800, 0),
+    ('bd666666-6666-4666-8666-666666666666', 'ba666666-6666-4666-8666-666666666666', 'image', 'https://images.unsplash.com/photo-1439066615861-d1af74d74000?w=800', 800, 800, 0),
+    ('bd777777-7777-4777-8777-777777777777', 'ba777777-7777-4777-8777-777777777777', 'image', 'https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=800', 800, 800, 0),
+    ('bd888888-8888-4888-8888-888888888888', 'ba888888-8888-4888-8888-888888888888', 'image', 'https://images.unsplash.com/photo-1473093295043-cdd812d0e601?w=800', 800, 800, 0)
+ON CONFLICT (id) DO NOTHING;

@@ -527,3 +527,18 @@ VALUES
 ON CONFLICT DO NOTHING;
 
 SELECT setval('audit_logs_id_seq', (SELECT COALESCE(MAX(id), 0) FROM audit_logs));
+
+-- ============================================================
+-- Real avatars and company logos.
+--
+-- users.profile_image_url was NULL for every seeded user (so the UI fell back to
+-- letter placeholders everywhere), and companies.logo_url pointed at
+-- *.example.com hosts that don't resolve, so logos never loaded. Point both at
+-- real image services so profiles, the feed, and job cards show actual imagery.
+-- ============================================================
+UPDATE users SET profile_image_url = 'https://i.pravatar.cc/300?u=linkedin-' || id
+WHERE profile_image_url IS NULL;
+
+UPDATE companies SET logo_url = 'https://ui-avatars.com/api/?background=0A66C2&color=fff&bold=true&size=200&name='
+  || replace(name, ' ', '+')
+WHERE logo_url IS NULL OR logo_url LIKE '%example.com%';

@@ -528,7 +528,12 @@ export async function getRecommendedJobs(userId: number, limit = 10): Promise<Jo
 
   // Get jobs that match user's skills
   const jobs = await query<Job & { match_score: number }>(
-    `SELECT DISTINCT j.*,
+    // No SELECT DISTINCT here: Postgres has no equality operator for `json`, so
+    // DISTINCT over a row containing json_build_object(...) fails outright with
+    // "could not identify an equality operator for type json". De-duplicate with
+    // EXISTS on job_skills instead of a LEFT JOIN that multiplies rows — that
+    // removes the need for DISTINCT altogether (and is cheaper).
+    `SELECT j.*,
             json_build_object(
               'id', c.id,
               'name', c.name,
@@ -541,10 +546,15 @@ export async function getRecommendedJobs(userId: number, limit = 10): Promise<Jo
             ) * 10 as match_score
      FROM jobs j
      JOIN companies c ON j.company_id = c.id
-     LEFT JOIN job_skills js ON j.id = js.job_id
      WHERE j.status = 'active'
        AND NOT EXISTS (SELECT 1 FROM job_applications WHERE job_id = j.id AND user_id = $2)
-       AND (js.skill_id = ANY($1::int[]) OR array_length($1::int[], 1) IS NULL)
+       AND (
+         array_length($1::int[], 1) IS NULL
+         OR EXISTS (
+           SELECT 1 FROM job_skills js
+           WHERE js.job_id = j.id AND js.skill_id = ANY($1::int[])
+         )
+       )
      ORDER BY match_score DESC, j.created_at DESC
      LIMIT $3`,
     [skillIds, userId, limit]
