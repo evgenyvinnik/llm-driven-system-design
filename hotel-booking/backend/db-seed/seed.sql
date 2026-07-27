@@ -541,3 +541,35 @@ VALUES (
 ) ON CONFLICT DO NOTHING;
 
 COMMIT;
+
+-- ============================================================
+-- Real hotel and room photography.
+--
+-- The seed shipped local paths like '/images/grand-metro-1.jpg', but no such
+-- files are served — every hotel card and booking row rendered a broken-image
+-- icon. Point hotels and room types at real photos instead, chosen per hotel so
+-- the imagery matches the property (city hotel, beach resort, mountain lodge…).
+-- ============================================================
+UPDATE hotels SET images = CASE
+  WHEN name ILIKE '%metropolitan%' THEN ARRAY[
+    'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=1200',
+    'https://images.unsplash.com/photo-1590490360182-c33d57733427?w=1200']
+  WHEN name ILIKE '%seaside%' OR name ILIKE '%breeze%' THEN ARRAY[
+    'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=1200',
+    'https://images.unsplash.com/photo-1571003123894-1f0594d2b5d9?w=1200']
+  WHEN name ILIKE '%mountain%' OR name ILIKE '%lodge%' THEN ARRAY[
+    'https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=1200',
+    'https://images.unsplash.com/photo-1518602164578-cd0074062767?w=1200']
+  WHEN name ILIKE '%urban%' OR name ILIKE '%loft%' OR name ILIKE '%boutique%' THEN ARRAY[
+    'https://images.unsplash.com/photo-1611892440504-42a792e24d32?w=1200',
+    'https://images.unsplash.com/photo-1445019980597-93fa8acb246c?w=1200']
+  ELSE ARRAY[
+    'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=1200',
+    'https://images.unsplash.com/photo-1618773928121-c32242e63f39?w=1200']
+END
+WHERE images IS NULL OR array_length(images,1) IS NULL OR images[1] LIKE '/images/%';
+
+UPDATE room_types SET images = ARRAY[
+  'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=800',
+  'https://images.unsplash.com/photo-1595576508898-0ad5c879a061?w=800']
+WHERE images IS NULL OR array_length(images,1) IS NULL OR images[1] LIKE '/images/%';
