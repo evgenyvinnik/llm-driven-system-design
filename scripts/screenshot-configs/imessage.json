@@ -5,14 +5,29 @@
   "dbName": "imessage",
   "dbUser": "imessage",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "input[type='text']",
+    "passwordSelector": "input[type='password']",
+    "submitSelector": "button[type='submit']"
   },
   "screens": [
     {
-      "name": "01-home",
+      "name": "01-login",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1500
+      "skipAuth": true,
+      "waitFor": "form, input",
+      "delay": 800
+    },
+    {
+      "name": "02-conversations",
+      "path": "/",
+      "waitFor": "main, div",
+      "delay": 2500
     }
   ],
   "viewport": {

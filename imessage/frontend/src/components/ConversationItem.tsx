@@ -97,6 +97,7 @@ export function ConversationItem({ conversation, isSelected, onClick }: Conversa
 
   return (
     <div
+      data-testid="conversation-item"
       onClick={onClick}
       className={`flex items-center px-4 py-3 cursor-pointer transition-colors ${
         isSelected ? 'bg-imessage-blue text-white' : 'hover:bg-gray-100'
