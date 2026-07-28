@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import type { Conversation, Message } from '@/types';
+import type { Conversation, Message, TypingUser } from '@/types';
 import { useChatStore } from '@/stores/chatStore';
 import { useAuthStore } from '@/stores/authStore';
 import { MessageBubble } from './MessageBubble';
@@ -8,6 +8,12 @@ import { TypingIndicator } from './TypingIndicator';
 /**
  * Props for the ChatView component.
  */
+// Stable empty fallbacks shared by every render. Returning a literal `[]` from a
+// Zustand selector allocates a new reference each call and causes an infinite
+// re-render loop (see the selectors below).
+const EMPTY_MESSAGES: Message[] = [];
+const EMPTY_TYPING: TypingUser[] = [];
+
 interface ChatViewProps {
   /** The conversation to display messages for */
   conversation: Conversation;
@@ -30,8 +36,15 @@ export function ChatView({ conversation }: ChatViewProps) {
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   const user = useAuthStore((state) => state.user);
-  const messages = useChatStore((state) => state.messages.get(conversation.id) || []);
-  const typingUsers = useChatStore((state) => state.typingUsers.get(conversation.id) || []);
+  // NOTE: these selectors must not build a new value per call. `xs.get(id) || []`
+  // allocates a fresh array every time the selector runs whenever the key is
+  // missing, so Zustand's snapshot comparison never sees a stable reference,
+  // re-renders, re-runs the selector, and React aborts with
+  // "Maximum update depth exceeded" — which crashed the whole chat view as soon
+  // as a conversation was opened. Falling back to shared frozen constants keeps
+  // the reference identical across calls.
+  const messages = useChatStore((state) => state.messages.get(conversation.id) ?? EMPTY_MESSAGES);
+  const typingUsers = useChatStore((state) => state.typingUsers.get(conversation.id) ?? EMPTY_TYPING);
   const sendMessage = useChatStore((state) => state.sendMessage);
   const setTypingIndicator = useChatStore((state) => state.setTyping);
   const isLoadingMessages = useChatStore((state) => state.isLoadingMessages);

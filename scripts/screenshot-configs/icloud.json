@@ -8,7 +8,7 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "admin@icloud.local",
+      "email": "user@icloud.local",
       "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
@@ -28,19 +28,23 @@
       "name": "02-drive",
       "path": "/drive",
       "waitFor": "main",
-      "delay": 1500
+      "delay": 2500
     },
     {
       "name": "03-photos",
       "path": "/photos",
       "waitFor": "main",
-      "delay": 500
+      "delay": 2500
     },
     {
       "name": "04-admin",
       "path": "/admin",
       "waitFor": "main",
-      "delay": 500
+      "delay": 500,
+      "loginAs": {
+        "email": "admin@icloud.local",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {

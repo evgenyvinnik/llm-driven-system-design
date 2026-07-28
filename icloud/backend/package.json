@@ -13,7 +13,9 @@
     "build": "tsc",
     "lint": "eslint src/",
     "format": "prettier --write src/",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "db:seed:photos": "tsx src/db/seed-photos.ts",
+    "db:seed": "tsx src/db/seed-photos.ts"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

@@ -26,8 +26,16 @@
     {
       "name": "02-conversations",
       "path": "/",
-      "waitFor": "main, div",
-      "delay": 2500
+      "waitFor": "[data-testid='conversation-item']",
+      "delay": 2000
+    },
+    {
+      "name": "03-chat-thread",
+      "path": "/",
+      "waitFor": "[data-testid='conversation-item']",
+      "click": "[data-testid='conversation-item']",
+      "clickDelay": 2500,
+      "delay": 1200
     }
   ],
   "viewport": {
