@@ -70,6 +70,17 @@ async function ensureBucket(name: string): Promise<void> {
 }
 
 async function seedPhotos(): Promise<void> {
+  // Drop any rows whose keys aren't real MinIO object names (e.g. left over from
+  // an earlier SQL-only seed that stored external URLs). Those render as broken
+  // tiles because the API streams derivatives from MinIO by key.
+  const cleaned = await pool.query(
+    "DELETE FROM photos WHERE user_id = $1 AND thumbnail_key LIKE 'http%'",
+    [USER_ID]
+  );
+  if ((cleaned.rowCount ?? 0) > 0) {
+    console.log(`Removed ${cleaned.rowCount} photo rows with non-MinIO keys.`);
+  }
+
   const existing = await pool.query('SELECT 1 FROM photos WHERE user_id = $1 LIMIT 1', [USER_ID]);
   if ((existing.rowCount ?? 0) > 0) {
     console.log('Photos already seeded, skipping.');
