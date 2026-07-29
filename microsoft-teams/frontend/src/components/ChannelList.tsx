@@ -51,6 +51,7 @@ export function ChannelList({ orgId }: ChannelListProps) {
             Channels
           </span>
           <button
+            data-testid="create-channel"
             onClick={() => setShowCreateChannel(true)}
             className="text-teams-secondary hover:text-teams-primary text-lg leading-none"
             title="Create channel"

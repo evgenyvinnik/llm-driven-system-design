@@ -12,9 +12,10 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "crawl": "tsx src/scripts/crawl.ts",
-    "seed": "tsx src/scripts/seed.ts",
+    "seed": "tsx src/db/seed.ts",
     "format": "prettier --write src/**/*.ts",
-    "lint": "eslint src/**/*.ts"
+    "lint": "eslint src/**/*.ts",
+    "db:seed": "tsx src/db/seed.ts"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.11.0",

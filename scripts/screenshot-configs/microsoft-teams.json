@@ -64,6 +64,18 @@
       "name": "08-org-list",
       "path": "/org",
       "delay": 2000
+    },
+    {
+      "name": "09-design-team",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000002/channel/cccccccc-0000-0000-0000-000000000003",
+      "delay": 2500
+    },
+    {
+      "name": "10-create-channel",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000001",
+      "delay": 2200,
+      "click": "[data-testid='create-channel']",
+      "clickDelay": 1200
     }
   ],
   "viewport": {

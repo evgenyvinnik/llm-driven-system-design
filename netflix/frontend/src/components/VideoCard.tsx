@@ -19,13 +19,27 @@ interface VideoCardProps {
   showProgress?: boolean;
   /** Progress percentage (0-100) */
   progressPercent?: number;
+  /**
+   * Layout the card is placed in. `row` gives it the fixed width a horizontally
+   * scrolling carousel needs; `grid` lets it fill whatever cell it's given.
+   *
+   * A fixed-width `flex-shrink-0` card dropped into a CSS grid overflows its
+   * column — the cards butt up against and clip each other, and the grid's gap
+   * disappears. That's what the search results and My List pages looked like.
+   */
+  layout?: 'row' | 'grid';
 }
 
 /**
  * Video card with hover expansion effect.
  * Shows poster thumbnail, expands on hover to reveal actions and metadata.
  */
-export function VideoCard({ video, showProgress, progressPercent = 0 }: VideoCardProps) {
+export function VideoCard({
+  video,
+  showProgress,
+  progressPercent = 0,
+  layout = 'row',
+}: VideoCardProps) {
   const [isHovered, setIsHovered] = React.useState(false);
   const [inMyList, setInMyList] = React.useState(false);
   const { addToMyList, removeFromMyList } = useBrowseStore();
@@ -47,7 +61,9 @@ export function VideoCard({ video, showProgress, progressPercent = 0 }: VideoCar
 
   return (
     <div
-      className="relative flex-shrink-0 w-[200px] md:w-[240px] transition-transform duration-300 group"
+      className={`relative transition-transform duration-300 group ${
+        layout === 'row' ? 'flex-shrink-0 w-[200px] md:w-[240px]' : 'w-full'
+      }`}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
     >
@@ -73,6 +89,13 @@ export function VideoCard({ video, showProgress, progressPercent = 0 }: VideoCar
             </div>
           )}
         </div>
+
+        {/* In a grid there is no surrounding context to say what a poster is,
+            so the title sits under the card permanently. In a row the titles
+            would compete with the row heading, so they stay hover-only. */}
+        {layout === 'grid' && (
+          <h3 className="mt-2 text-sm text-white/90 truncate">{video.title}</h3>
+        )}
 
         {/* Hover card */}
         {isHovered && (

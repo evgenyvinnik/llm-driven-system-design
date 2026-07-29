@@ -14,7 +14,8 @@
     "lint": "eslint src",
     "format": "prettier --write src",
     "type-check": "tsc --noEmit",
-    "seed": "tsx src/scripts/seed.ts"
+    "seed": "tsx src/scripts/seed.ts",
+    "db:seed": "tsx src/scripts/seed.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.525.0",
