@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useNotificationStore } from '../stores/notificationStore';
 
 function IndexPage() {
-  const { isAuthenticated, user } = useAuthStore();
+  const { isAuthenticated, hasCheckedAuth, user } = useAuthStore();
   const { notifications, rateLimitUsage, fetchNotifications, fetchRateLimitUsage } = useNotificationStore();
 
   useEffect(() => {
@@ -13,6 +13,11 @@ function IndexPage() {
       fetchRateLimitUsage();
     }
   }, [isAuthenticated, fetchNotifications, fetchRateLimitUsage]);
+
+  // Render nothing rather than the marketing splash while the session check is
+  // still in flight — otherwise a signed-in user sees "Welcome to NotifyHub"
+  // flash on every load.
+  if (!hasCheckedAuth) return null;
 
   if (!isAuthenticated) {
     return (
@@ -119,7 +124,11 @@ function IndexPage() {
               <div key={notification.id} className="px-6 py-4 flex items-center justify-between">
                 <div>
                   <div className="text-sm font-medium text-gray-900">
-                    {notification.template_id || 'Direct notification'}
+                    {/* Same reasoning as the Notifications page: show what was
+                        sent, not the internal template identifier. */}
+                    {typeof notification.content?.title === 'string'
+                      ? notification.content.title
+                      : notification.template_id || 'Direct notification'}
                   </div>
                   <div className="text-sm text-gray-500">
                     {notification.channels.join(', ')} - {new Date(notification.created_at).toLocaleString()}

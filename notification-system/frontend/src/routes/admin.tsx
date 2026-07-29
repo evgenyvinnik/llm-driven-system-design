@@ -3,18 +3,21 @@ import { useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
 function AdminLayout() {
-  const { isAuthenticated, user } = useAuthStore();
+  const { isAuthenticated, hasCheckedAuth, user } = useAuthStore();
   const navigate = useNavigate();
 
   useEffect(() => {
+    // `isAuthenticated` is false on every page load until the session check
+    // completes, so redirecting before then bounces a signed-in admin to /login.
+    if (!hasCheckedAuth) return;
     if (!isAuthenticated) {
       navigate({ to: '/login' });
     } else if (user?.role !== 'admin') {
       navigate({ to: '/' });
     }
-  }, [isAuthenticated, user, navigate]);
+  }, [isAuthenticated, hasCheckedAuth, user, navigate]);
 
-  if (!isAuthenticated || user?.role !== 'admin') {
+  if (!hasCheckedAuth || !isAuthenticated || user?.role !== 'admin') {
     return null;
   }
 

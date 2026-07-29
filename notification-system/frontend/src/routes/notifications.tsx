@@ -225,7 +225,12 @@ function NotificationsPage() {
                       <span className="text-xs text-gray-500 capitalize">{notification.priority}</span>
                     </div>
                     <div className="mt-1 text-sm font-medium text-gray-900">
-                      {notification.template_id || 'Custom notification'}
+                      {/* Prefer the notification's own title: the template id is
+                          an internal identifier, and "Custom notification" tells
+                          the reader nothing about what was actually sent. */}
+                      {typeof notification.content?.title === 'string'
+                        ? notification.content.title
+                        : notification.template_id || 'Custom notification'}
                     </div>
                     <div className="mt-1 text-sm text-gray-500">
                       Channels: {notification.channels.join(', ')}
