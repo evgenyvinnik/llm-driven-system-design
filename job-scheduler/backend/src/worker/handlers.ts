@@ -7,7 +7,7 @@
 
 import { Job, JobExecution } from '../types';
 import { logger } from '../utils/logger';
-import * as _db from '../db/repository.js';
+import * as _db from '../db/repository';
 
 /**
  * Job handler function signature.

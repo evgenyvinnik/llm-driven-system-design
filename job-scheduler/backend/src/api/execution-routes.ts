@@ -5,11 +5,11 @@
  */
 
 import { Router } from 'express';
-import { asyncHandler } from './types.js';
-import { authenticate, authorize } from '../shared/auth.js';
-import * as db from '../db/repository.js';
-import { queue } from '../queue/reliable-queue.js';
-import { ApiResponse, ExecutionStatus } from '../types/index.js';
+import { asyncHandler } from './types';
+import { authenticate, authorize } from '../shared/auth';
+import * as db from '../db/repository';
+import { queue } from '../queue/reliable-queue';
+import { ApiResponse, ExecutionStatus } from '../types/index';
 
 const router = Router();
 

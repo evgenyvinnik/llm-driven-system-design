@@ -4,8 +4,8 @@
  * @module db/queries
  */
 
-import { query, queryOne } from './pool.js';
-import { CountResult, SystemMetrics, SystemMetricsResult, HourlyStats } from './types.js';
+import { query, queryOne } from './pool';
+import { CountResult, SystemMetrics, SystemMetricsResult, HourlyStats } from './types';
 
 /**
  * Builds a WHERE clause from an array of conditions.

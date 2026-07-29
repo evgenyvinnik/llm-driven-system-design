@@ -35,13 +35,39 @@
       "name": "03-library",
       "path": "/",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 2000
     },
     {
-      "name": "04-record",
+      "name": "04-video-detail",
+      "path": "/videos/33333333-aaaa-4aaa-8aaa-333333333333",
+      "waitFor": "main",
+      "delay": 2200
+    },
+    {
+      "name": "05-video-comments",
+      "path": "/videos/11111111-aaaa-4aaa-8aaa-111111111111",
+      "waitFor": "main",
+      "delay": 2200
+    },
+    {
+      "name": "06-share-public",
+      "path": "/share/demo-checkout-walkthrough-2f8a91",
+      "skipAuth": true,
+      "waitFor": "main",
+      "delay": 2000
+    },
+    {
+      "name": "07-share-password",
+      "path": "/share/demo-dashboard-review-7c3e44",
+      "skipAuth": true,
+      "waitFor": "main",
+      "delay": 1500
+    },
+    {
+      "name": "08-record",
       "path": "/record",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 1200
     }
   ],
   "viewport": {

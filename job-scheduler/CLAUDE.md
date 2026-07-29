@@ -44,14 +44,24 @@ Implemented and running end to end: job CRUD + pause/resume/trigger, cron and on
 
 Note: **monitoring is implemented**, not pending — the earlier checklist-style CLAUDE.md listed "Add monitoring" as "Not started," which contradicted `src/shared/metrics.ts` and the Opossum breakers already emitting metrics.
 
-Intentionally omitted: DAG/job-dependency workflows, multi-tenancy (jobs are single-tenant), request rate limiting, and a comprehensive automated test suite. Auth exists as a module (`shared/auth.ts`, express-session) but the seed does not create login users, so the local dashboard runs without a login wall.
+Auth is session-based and **enforced on every `/api/v1` route**. Users live in Redis (`job_scheduler:user:*`), not in the Postgres `users` table — that table is seeded but nothing reads it, which is a wart worth knowing about. `ensureAdminUser()` creates **`admin` / `admin123`** on API boot (override with `ADMIN_USERNAME` / `ADMIN_PASSWORD`); that is the login the dashboard and the screenshot harness use.
+
+Intentionally omitted: DAG/job-dependency workflows, multi-tenancy (jobs are single-tenant), request rate limiting, and a comprehensive automated test suite.
 
 ## Iteration & Repair Log
 
 - **Metrics + circuit-breaker pass.** `src/shared/metrics.ts` and `src/shared/circuit-breaker.ts` were added, wiring `prom-client` and Opossum through the scheduler/worker/API and instrumenting the queue, scheduler leadership, and per-handler breaker state. This is what makes the old "monitoring not started" note obsolete.
 - **DB layer split.** The repository was broken into `job-repository.ts`, `execution-repository.ts`, `schedule-repository.ts`, and `queries.ts` under `src/db/` for focus.
 - **Migrate-at-startup + dual scripts.** `migrate()` is idempotent (`CREATE … IF NOT EXISTS`) and is called both from the scheduler on boot and via `npm run migrate` / `npm run db:migrate` (both aliases exist). Seeding is `npm run seed` / `npm run db:seed`.
-- **CLAUDE.md rewrite (this pass).** Replaced the generic Phase 1–4 checklist ("Phase 3: Not started", "will be updated throughout the development process") with the real architecture and decision rationale grounded in `scheduler/index.ts`, `queue/reliable-queue.ts`, and `queue/leader-election.ts`.
+- **2026-07-29 — the project did not actually run; six separate faults.** It had zero screenshots, and each fix uncovered the next:
+  1. **Every backend service failed to boot.** `tsconfig` sets `"module": "commonjs"`, but 17 files used ESM-style `.js` import suffixes (`from '../db/repository.js'`), which CommonJS `require` cannot resolve — so api, scheduler, and all workers died on their first import with `Cannot find module`. `migrate.ts` was the one file using extensionless imports, which is why migrations appeared to work while nothing else did. 67 imports rewritten to match the module system.
+  2. **A stale compiled `vite.config.js` shadowed `vite.config.ts`.** `tsconfig.node.json` is a composite project with no `outDir`, so `npm run build` emitted the compiled config *next to the source*, and Vite resolves `.js` before `.ts`. The dev server kept starting on the old port 3000 no matter what the TypeScript said. Fixed by pointing the emit at `node_modules/.tmp`.
+  3. **`docker-compose up -d` started the whole app, not just infrastructure**, binding host 3001/3000 before the local dev servers could. The health check passed against the *container*, hiding it. App services now sit behind `profiles: ["app"]`.
+  4. **The frontend had no login screen at all** while every `/api/v1` route requires a session, so the dashboard could never load data. Added `routes/Login.tsx`, an auth store, and a gate in `Layout` keyed on `authChecked` (not `!user`, which flashes the login form on every reload).
+  5. **The dashboard called `/api/v1/metrics`, which does not exist** — the route is `/api/v1/metrics/system`, and bare `/metrics` is the Prometheus scrape endpoint. The 404 became a null metrics object, so every stat card rendered `0` while the job table beneath it was full.
+  6. **`db-seed/seed.sql` had an INSERT missing a value** (`weekly-report-generation` omitted `next_run_time`), which aborted the transaction and left the database empty.
+- **`npm run dev` now starts the real topology** (api + scheduler + 3 workers via `concurrently`), matching what docker-compose describes. Previously it ran a single all-in-one process, so the Workers page could only ever show one worker; the seeded execution history references worker-1/2/3. The old single-process entry point is still available as `dev:all-in-one`.
+- **CLAUDE.md rewrite (earlier pass).** Replaced the generic Phase 1–4 checklist ("Phase 3: Not started", "will be updated throughout the development process") with the real architecture and decision rationale grounded in `scheduler/index.ts`, `queue/reliable-queue.ts`, and `queue/leader-election.ts`.
 
 ## Open Questions
 

@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { pool } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { logger } from '../services/logger.js';
-import { deleteObject } from '../services/storageService.js';
+import { deleteObject, getPresignedDownloadUrl } from '../services/storageService.js';
 
 const router = Router();
 
@@ -49,7 +49,7 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
     ]);
 
     res.json({
-      videos: videosResult.rows.map(mapVideoRow),
+      videos: await withThumbnailUrls(videosResult.rows),
       total: parseInt(countResult.rows[0].count, 10),
       page,
       limit,
@@ -77,9 +77,10 @@ router.get('/:id', async (req: Request, res: Response) => {
     }
 
     const row = result.rows[0];
+    const [mappedWithThumb] = await withThumbnailUrls([row]);
     res.json({
       video: {
-        ...mapVideoRow(row),
+        ...mappedWithThumb,
         author: {
           username: row.username,
           displayName: row.display_name,
@@ -204,6 +205,32 @@ function mapVideoRow(row: Record<string, unknown>) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/**
+ * Attaches a presigned GET URL for each row's thumbnail.
+ *
+ * Thumbnails live in MinIO like the videos do, so the client can't render
+ * `thumbnail_path` directly — it's an object key, not a URL. Presigning is
+ * local HMAC work with no round trip to storage, so doing it per row while
+ * building the list response is cheap and saves the client N extra requests.
+ */
+async function withThumbnailUrls(rows: Record<string, unknown>[]) {
+  return Promise.all(
+    rows.map(async (row) => {
+      const mapped = mapVideoRow(row);
+      if (!row.thumbnail_path) return { ...mapped, thumbnailUrl: null };
+      try {
+        return {
+          ...mapped,
+          thumbnailUrl: await getPresignedDownloadUrl(row.thumbnail_path as string),
+        };
+      } catch (err) {
+        logger.warn({ err, path: row.thumbnail_path }, 'Failed to presign thumbnail');
+        return { ...mapped, thumbnailUrl: null };
+      }
+    }),
+  );
 }
 
 export default router;

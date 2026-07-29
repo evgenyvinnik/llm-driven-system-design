@@ -20,6 +20,6 @@
  * const results = await query('SELECT * FROM jobs WHERE status = $1', ['SCHEDULED']);
  */
 
-export * from './pool.js';
-export * from './repository.js';
-export { migrate, rollback } from './migrate.js';
+export * from './pool';
+export * from './repository';
+export { migrate, rollback } from './migrate';

@@ -95,6 +95,7 @@ VALUES (
   'report-generator',
   '{"report_type": "weekly_summary", "recipients": ["team-leads@example.com", "cto@example.com"], "format": "pdf"}',
   '0 9 * * 1',
+  NOW() + INTERVAL '4 days',
   60,
   2,
   3000,

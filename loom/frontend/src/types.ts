@@ -16,6 +16,8 @@ export interface Video {
   status: 'processing' | 'ready' | 'failed';
   storagePath: string | null;
   thumbnailPath: string | null;
+  /** Presigned GET URL for `thumbnailPath`, generated server-side. Null when there is no thumbnail. */
+  thumbnailUrl?: string | null;
   fileSizeBytes: number | null;
   viewCount: number;
   createdAt: string;

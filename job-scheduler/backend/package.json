@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "dev": "PORT=3001 ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev": "concurrently -n api,sched,w1,w2,w3 -c blue,magenta,green,yellow,cyan \"npm:dev:api\" \"npm:dev:scheduler\" \"npm:dev:worker1\" \"npm:dev:worker2\" \"npm:dev:worker3\"",
+    "dev:all-in-one": "PORT=3001 ts-node-dev --respawn --transpile-only src/index.ts",
     "dev:api": "PORT=3001 ts-node-dev --respawn --transpile-only src/api/index.ts",
     "dev:scheduler": "ts-node-dev --respawn --transpile-only src/scheduler/index.ts",
     "dev:worker1": "WORKER_ID=worker-1 ts-node-dev --respawn --transpile-only src/worker/index.ts",
@@ -46,6 +47,7 @@
     "@types/uuid": "^9.0.7",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
+    "concurrently": "^10.0.4",
     "eslint": "^8.55.0",
     "globals": "^15.14.0",
     "prettier": "^3.1.0",

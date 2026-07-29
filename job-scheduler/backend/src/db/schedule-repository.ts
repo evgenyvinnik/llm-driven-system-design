@@ -5,11 +5,11 @@
  */
 
 import cronParser from 'cron-parser';
-import { query, queryOne } from './pool.js';
-import { Job } from './types.js';
-import { JobStatus } from '../types/index.js';
-import { logger } from '../utils/logger.js';
-import { getJob, updateJobStatus } from './job-repository.js';
+import { query, queryOne } from './pool';
+import { Job } from './types';
+import { JobStatus } from '../types/index';
+import { logger } from '../utils/logger';
+import { getJob, updateJobStatus } from './job-repository';
 
 /**
  * Retrieves jobs due for execution.

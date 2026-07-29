@@ -8,8 +8,8 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-import { migrate } from './migrate.js';
-import * as db from './repository.js';
+import { migrate } from './migrate';
+import * as db from './repository';
 import { logger } from '../utils/logger';
 
 /**

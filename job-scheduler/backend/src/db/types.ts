@@ -10,7 +10,7 @@ import {
   JobWithStats,
   ExecutionLog,
   PaginatedResponse,
-} from '../types/index.js';
+} from '../types/index';
 
 /**
  * Re-export main types for convenience.

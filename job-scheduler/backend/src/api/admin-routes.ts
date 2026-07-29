@@ -5,7 +5,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { asyncHandler } from './types.js';
+import { asyncHandler } from './types';
 import {
   authenticate,
   authorize,
@@ -13,9 +13,9 @@ import {
   destroySession,
   validateCredentials,
   createUser,
-} from '../shared/auth.js';
-import { resetAllCircuitBreakers } from '../shared/circuit-breaker.js';
-import { runCleanup, getCleanupPreview, getStorageStats, retentionConfig } from '../shared/archival.js';
+} from '../shared/auth';
+import { resetAllCircuitBreakers } from '../shared/circuit-breaker';
+import { runCleanup, getCleanupPreview, getStorageStats, retentionConfig } from '../shared/archival';
 
 const router = Router();
 

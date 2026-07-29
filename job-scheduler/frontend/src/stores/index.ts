@@ -256,3 +256,53 @@ export const useExecutionsStore = create<ExecutionsState>((set, get) => ({
     }
   },
 }));
+
+/**
+ * Authentication state interface.
+ * Manages the current session and login/logout transitions.
+ */
+interface AuthState {
+  user: api.AuthUser | null;
+  /** False until the initial session-restore call has completed. */
+  authChecked: boolean;
+  loggingIn: boolean;
+  error: string | null;
+  checkSession: () => Promise<void>;
+  login: (username: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
+}
+
+/**
+ * Auth store backing the login screen and the route guard.
+ *
+ * `authChecked` is deliberately separate from `loggingIn`: the guard must wait
+ * for the session-restore round trip before deciding a user is logged out,
+ * otherwise every reload flashes the login screen for an already-valid session.
+ */
+export const useAuthStore = create<AuthState>((set) => ({
+  user: null,
+  authChecked: false,
+  loggingIn: false,
+  error: null,
+
+  checkSession: async () => {
+    const user = await api.getCurrentUser();
+    set({ user, authChecked: true });
+  },
+
+  login: async (username, password) => {
+    set({ loggingIn: true, error: null });
+    try {
+      const user = await api.login(username, password);
+      set({ user, loggingIn: false, authChecked: true });
+    } catch (error) {
+      set({ error: (error as Error).message, loggingIn: false });
+      throw error;
+    }
+  },
+
+  logout: async () => {
+    await api.logout();
+    set({ user: null });
+  },
+}));

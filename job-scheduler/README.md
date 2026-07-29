@@ -65,27 +65,33 @@ A distributed task scheduling system with cron-like scheduling, priority queues,
 
 ### Option 1: Docker Compose (Full Stack)
 
-Start everything with Docker:
+Start everything — infrastructure *and* the application — with Docker:
 
 ```bash
-# Start all services
-docker-compose up -d
+# Start all services (the `app` profile adds api, scheduler, workers, frontend)
+docker-compose --profile app up -d
 
 # View logs
 docker-compose logs -f
 
 # Stop all services
-docker-compose down
+docker-compose --profile app down
 ```
 
 Access the dashboard at http://localhost:3000
+
+> The application containers sit behind the `app` profile so that a plain
+> `docker-compose up -d` brings up **only PostgreSQL and Redis**. Without that,
+> the api container claims host port 3001 and the frontend container claims
+> 3000, and the local dev servers in Option 2 can never bind — silently, because
+> the containers answer on those ports.
 
 ### Option 2: Native Development
 
 1. Start infrastructure (PostgreSQL + Redis):
 
 ```bash
-docker-compose -f docker-compose.dev.yml up -d
+docker-compose up -d
 ```
 
 2. Install dependencies:
@@ -109,31 +115,25 @@ npm run migrate
 npm run seed
 ```
 
-4. Start services in separate terminals:
+4. Start the backend and frontend in two terminals:
 
 ```bash
-# Terminal 1: API Server
+# Terminal 1: API + scheduler + 3 workers
 cd backend
-npm run dev:api
+npm run dev
 
-# Terminal 2: Scheduler
-cd backend
-npm run dev:scheduler
-
-# Terminal 3: Worker 1
-cd backend
-npm run dev:worker1
-
-# Terminal 4: Worker 2 (optional)
-cd backend
-npm run dev:worker2
-
-# Terminal 5: Frontend
+# Terminal 2: Frontend
 cd frontend
 npm run dev
 ```
 
-Access the dashboard at http://localhost:3000
+`npm run dev` runs the whole topology through `concurrently`, mirroring the
+container layout. To run a role on its own instead, use `npm run dev:api`,
+`npm run dev:scheduler`, or `npm run dev:worker1` / `dev:worker2` / `dev:worker3`.
+
+Access the dashboard at http://localhost:5173 and sign in with **`admin` /
+`admin123`** (created automatically on API startup; override with
+`ADMIN_USERNAME` / `ADMIN_PASSWORD`).
 
 ## Running Distributed Workers
 

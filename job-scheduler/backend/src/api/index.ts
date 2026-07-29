@@ -10,19 +10,19 @@ dotenv.config();
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import { logger } from '../utils/logger.js';
-import { migrate } from '../db/migrate.js';
-import { ensureAdminUser } from '../shared/auth.js';
-import { metricsMiddleware } from '../shared/metrics.js';
+import { logger } from '../utils/logger';
+import { migrate } from '../db/migrate';
+import { ensureAdminUser } from '../shared/auth';
+import { metricsMiddleware } from '../shared/metrics';
 
 // Import middleware
-import { requestLogger, errorHandler } from './middleware.js';
+import { requestLogger, errorHandler } from './middleware';
 
 // Import route modules
-import { jobRoutes } from './job-routes.js';
-import { scheduleRoutes } from './schedule-routes.js';
-import { executionRoutes } from './execution-routes.js';
-import { adminRoutes } from './admin-routes.js';
+import { jobRoutes } from './job-routes';
+import { scheduleRoutes } from './schedule-routes';
+import { executionRoutes } from './execution-routes';
+import { adminRoutes } from './admin-routes';
 
 /** Express application instance */
 const app = express();

@@ -4,10 +4,10 @@
  * @module db/execution-repository
  */
 
-import { query, queryOne } from './pool.js';
-import { JobExecution, Job, ExecutionLog, PaginatedResponse, CountResult, EXECUTION_FIELD_MAP } from './types.js';
-import { calculateOffset, buildWhereClause } from './queries.js';
-import { ExecutionStatus } from '../types/index.js';
+import { query, queryOne } from './pool';
+import { JobExecution, Job, ExecutionLog, PaginatedResponse, CountResult, EXECUTION_FIELD_MAP } from './types';
+import { calculateOffset, buildWhereClause } from './queries';
+import { ExecutionStatus } from '../types/index';
 
 /**
  * Creates a new execution record for a job.

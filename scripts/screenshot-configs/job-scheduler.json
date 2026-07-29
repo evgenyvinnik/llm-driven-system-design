@@ -5,26 +5,58 @@
   "dbName": "job_scheduler",
   "dbUser": "scheduler",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/",
+    "credentials": { "username": "admin", "password": "admin123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "[data-testid='login-submit']"
   },
   "screens": [
     {
-      "name": "01-dashboard",
-      "path": "/dashboard",
-      "waitFor": "main",
-      "delay": 1000
+      "name": "01-login",
+      "path": "/",
+      "skipAuth": true,
+      "waitFor": "input[name='username']",
+      "delay": 800
     },
     {
-      "name": "02-jobs",
+      "name": "02-dashboard",
+      "path": "/",
+      "waitFor": "main",
+      "delay": 2500
+    },
+    {
+      "name": "03-jobs",
       "path": "/jobs",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1800
     },
     {
-      "name": "03-workers",
+      "name": "04-job-detail",
+      "path": "/jobs/b0000000-0000-0000-0000-000000000001",
+      "waitFor": "main",
+      "delay": 1800
+    },
+    {
+      "name": "05-execution-detail",
+      "path": "/executions/c0000000-0000-0000-0000-000000000001",
+      "waitFor": "main",
+      "delay": 1800
+    },
+    {
+      "name": "06-workers",
       "path": "/workers",
       "waitFor": "main",
-      "delay": 500
+      "delay": 2500
+    },
+    {
+      "name": "07-create-job",
+      "path": "/jobs",
+      "waitFor": "main",
+      "delay": 1500,
+      "click": "[data-testid='create-job']",
+      "clickDelay": 900
     }
   ],
   "viewport": {

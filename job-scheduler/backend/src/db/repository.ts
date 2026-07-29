@@ -31,7 +31,7 @@ export {
   updateJob,
   deleteJob,
   updateJobStatus,
-} from './job-repository.js';
+} from './job-repository';
 
 // Re-export all schedule operations
 export {
@@ -39,7 +39,7 @@ export {
   scheduleNextRun,
   pauseJob,
   resumeJob,
-} from './schedule-repository.js';
+} from './schedule-repository';
 
 // Re-export all execution operations
 export {
@@ -51,7 +51,7 @@ export {
   getRetryableExecutions,
   addExecutionLog,
   getExecutionLogs,
-} from './execution-repository.js';
+} from './execution-repository';
 
 // Re-export query helpers and metrics
 export {
@@ -60,7 +60,7 @@ export {
   buildWhereClause,
   calculateOffset,
   getCount,
-} from './queries.js';
+} from './queries';
 
 // Re-export types for convenience
 export type {
@@ -72,4 +72,4 @@ export type {
   SystemMetrics,
   HourlyStats,
   CountResult,
-} from './types.js';
+} from './types';

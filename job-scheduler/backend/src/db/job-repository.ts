@@ -6,11 +6,11 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import cronParser from 'cron-parser';
-import { query, queryOne } from './pool.js';
-import { Job, JobWithStats, PaginatedResponse, CountResult } from './types.js';
-import { calculateOffset } from './queries.js';
-import { JobStatus, CreateJobInput, UpdateJobInput } from '../types/index.js';
-import { logger } from '../utils/logger.js';
+import { query, queryOne } from './pool';
+import { Job, JobWithStats, PaginatedResponse, CountResult } from './types';
+import { calculateOffset } from './queries';
+import { JobStatus, CreateJobInput, UpdateJobInput } from '../types/index';
+import { logger } from '../utils/logger';
 
 /**
  * Creates a new job in the database.

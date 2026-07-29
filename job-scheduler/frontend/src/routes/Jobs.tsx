@@ -52,7 +52,9 @@ export function JobsPage() {
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <h1 className="text-2xl font-bold text-gray-900">Jobs</h1>
-        <Button onClick={() => setShowCreateModal(true)}>Create Job</Button>
+        <Button data-testid="create-job" onClick={() => setShowCreateModal(true)}>
+          Create Job
+        </Button>
       </div>
 
       {loading && jobs.length === 0 ? (

@@ -36,6 +36,22 @@ export function VideoCard({ video, onDelete }: VideoCardProps) {
           <div className="absolute inset-0 flex items-center justify-center bg-red-50">
             <div className="text-sm text-loom-danger">Failed</div>
           </div>
+        ) : video.thumbnailUrl ? (
+          <>
+            <img
+              src={video.thumbnailUrl}
+              alt=""
+              className="absolute inset-0 h-full w-full object-cover"
+              loading="lazy"
+            />
+            {/* Play affordance over the still, so a thumbnail still reads as video. */}
+            <div className="absolute inset-0 flex items-center justify-center bg-black/10 opacity-0 group-hover:opacity-100 transition-opacity">
+              <svg viewBox="0 0 48 48" fill="none" className="w-12 h-12">
+                <circle cx="24" cy="24" r="20" fill="#fff" opacity="0.9" />
+                <polygon points="20,16 34,24 20,32" fill="#625DF5" />
+              </svg>
+            </div>
+          </>
         ) : (
           <div className="absolute inset-0 flex items-center justify-center bg-loom-sidebar/5">
             <svg viewBox="0 0 48 48" fill="none" className="w-12 h-12 opacity-30">

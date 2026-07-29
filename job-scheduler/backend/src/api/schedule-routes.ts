@@ -5,16 +5,16 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { asyncHandler } from './types.js';
-import { authenticate } from '../shared/auth.js';
-import { metricsHandler, updateQueueMetrics } from '../shared/metrics.js';
-import { getCircuitBreakerStates } from '../shared/circuit-breaker.js';
-import { healthCheck as dbHealthCheck } from '../db/pool.js';
-import { healthCheck as redisHealthCheck, redis } from '../queue/redis.js';
-import { queue } from '../queue/reliable-queue.js';
-import * as db from '../db/repository.js';
-import { ApiResponse } from '../types/index.js';
-import { HealthCheckData, WorkerData } from './types.js';
+import { asyncHandler } from './types';
+import { authenticate } from '../shared/auth';
+import { metricsHandler, updateQueueMetrics } from '../shared/metrics';
+import { getCircuitBreakerStates } from '../shared/circuit-breaker';
+import { healthCheck as dbHealthCheck } from '../db/pool';
+import { healthCheck as redisHealthCheck, redis } from '../queue/redis';
+import { queue } from '../queue/reliable-queue';
+import * as db from '../db/repository';
+import { ApiResponse } from '../types/index';
+import { HealthCheckData, WorkerData } from './types';
 
 const router = Router();
 

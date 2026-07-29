@@ -1,4 +1,15 @@
-
+# Two ways to run this project:
+#
+#   docker-compose up -d                  → infrastructure only (Postgres + Redis).
+#                                           Run the app from source: `npm run dev`
+#                                           in backend/ (api + scheduler + 3 workers)
+#                                           and frontend/ (Vite on 5173).
+#   docker-compose --profile app up -d    → the whole containerized stack as well.
+#
+# The application services carry `profiles: ["app"]` so they stay out of the
+# default `up`. They publish host ports 3001 (api) and 3000 (frontend); without
+# the profile gate they bind those ports first and the local dev servers can
+# never start, which is invisible because the containers answer the health check.
 services:
   # PostgreSQL Database
   postgres:
@@ -34,6 +45,7 @@ services:
 
   # API Server
   api:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -55,6 +67,7 @@ services:
 
   # Scheduler Service (only one should be leader)
   scheduler:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -76,6 +89,7 @@ services:
 
   # Worker 1
   worker1:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -96,6 +110,7 @@ services:
 
   # Worker 2
   worker2:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -116,6 +131,7 @@ services:
 
   # Worker 3
   worker3:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -136,6 +152,7 @@ services:
 
   # Frontend
   frontend:
+    profiles: ["app"]
     build:
       context: ./frontend
       dockerfile: Dockerfile

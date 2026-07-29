@@ -5,7 +5,15 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
-    "strict": true
+    "strict": true,
+    // A composite project may not disable emit, so send the output somewhere
+    // harmless instead of leaving it next to the source. Without this, `tsc`
+    // (run by `npm run build`) writes a vite.config.js beside vite.config.ts —
+    // and Vite resolves .js *before* .ts, so the stale compiled copy silently
+    // shadows the real config. That is how the dev server kept starting on port
+    // 3000 long after the source had been changed to 5173.
+    "outDir": "./node_modules/.tmp/tsconfig.node",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo"
   },
   "include": ["vite.config.ts"]
 }

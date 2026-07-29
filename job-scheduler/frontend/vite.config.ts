@@ -12,7 +12,11 @@ export default defineConfig({
   },
   server: {
     allowedHosts: ['host.docker.internal'],
-    port: 3000,
+    // 5173 is the repo-wide Vite dev-server port. It must NOT be 3000: this
+    // project's docker-compose publishes the built frontend container on host
+    // 3000 (`3000:80`), so a dev server on 3000 collides with it, silently falls
+    // back to another port, and any tooling expecting 5173 finds nothing.
+    port: 5173,
     proxy: {
       '/api': {
         target: 'http://localhost:3001',

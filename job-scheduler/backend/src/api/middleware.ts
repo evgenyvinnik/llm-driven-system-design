@@ -5,8 +5,8 @@
  */
 
 import { Request, Response, NextFunction } from 'express';
-import { logger } from '../utils/logger.js';
-import { ApiResponse } from '../types/index.js';
+import { logger } from '../utils/logger';
+import { ApiResponse } from '../types/index';
 
 /**
  * Request logging middleware.

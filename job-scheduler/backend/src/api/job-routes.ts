@@ -5,13 +5,13 @@
  */
 
 import { Router, Response } from 'express';
-import { asyncHandler } from './types.js';
-import { authenticate, authorize } from '../shared/auth.js';
-import { idempotencyMiddleware, markJobCreated, clearJobIdempotency } from '../shared/idempotency.js';
-import { jobsScheduledTotal } from '../shared/metrics.js';
-import * as db from '../db/repository.js';
-import { queue } from '../queue/reliable-queue.js';
-import { ApiResponse, CreateJobInput, UpdateJobInput, JobStatus } from '../types/index.js';
+import { asyncHandler } from './types';
+import { authenticate, authorize } from '../shared/auth';
+import { idempotencyMiddleware, markJobCreated, clearJobIdempotency } from '../shared/idempotency';
+import { jobsScheduledTotal } from '../shared/metrics';
+import * as db from '../db/repository';
+import { queue } from '../queue/reliable-queue';
+import { ApiResponse, CreateJobInput, UpdateJobInput, JobStatus } from '../types/index';
 
 const router = Router();
 

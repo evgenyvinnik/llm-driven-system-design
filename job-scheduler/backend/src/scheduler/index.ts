@@ -10,7 +10,7 @@ dotenv.config();
 
 import { LeaderElection } from '../queue/leader-election';
 import { queue } from '../queue/reliable-queue';
-import * as db from '../db/repository.js';
+import * as db from '../db/repository';
 import { createChildLogger } from '../utils/logger';
 import { JobStatus, ExecutionStatus } from '../types';
 import { migrate } from '../db/migrate';

@@ -41,127 +41,30 @@
 
 ### PostgreSQL Schema
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                             jobs                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│  id                UUID PRIMARY KEY                                 │
-│  name              VARCHAR(255) NOT NULL UNIQUE                     │
-│  description       TEXT                                             │
-│  handler           VARCHAR(255) NOT NULL                            │
-│  payload           JSONB DEFAULT '{}'                               │
-│  schedule          VARCHAR(100) (cron expression)                   │
-│  next_run_time     TIMESTAMP WITH TIME ZONE                         │
-│  priority          INTEGER DEFAULT 50 (0-100, higher = important)   │
-│  max_retries       INTEGER DEFAULT 3                                │
-│  initial_backoff_ms INTEGER DEFAULT 1000                            │
-│  max_backoff_ms    INTEGER DEFAULT 3600000                          │
-│  timeout_ms        INTEGER DEFAULT 300000                           │
-│  status            job_status DEFAULT 'SCHEDULED'                   │
-│  owner_id          UUID FK → users                                  │
-│  created_at        TIMESTAMP WITH TIME ZONE                         │
-│  updated_at        TIMESTAMP WITH TIME ZONE                         │
-├─────────────────────────────────────────────────────────────────────┤
-│  Indexes:                                                            │
-│  • idx_jobs_next_run ON (next_run_time) WHERE status = 'SCHEDULED'  │
-│  • idx_jobs_status ON (status)                                      │
-└─────────────────────────────────────────────────────────────────────┘
+Postgres is the source of truth for definitions and history. Four tables:
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                        job_executions                                │
-│                   PARTITION BY RANGE (created_at)                    │
-├─────────────────────────────────────────────────────────────────────┤
-│  id                UUID PRIMARY KEY                                 │
-│  job_id            UUID FK → jobs                                   │
-│  status            execution_status NOT NULL                        │
-│  attempt           INTEGER DEFAULT 1                                │
-│  scheduled_at      TIMESTAMP WITH TIME ZONE                         │
-│  started_at        TIMESTAMP WITH TIME ZONE                         │
-│  completed_at      TIMESTAMP WITH TIME ZONE                         │
-│  next_retry_at     TIMESTAMP WITH TIME ZONE                         │
-│  result            JSONB                                            │
-│  error             TEXT                                             │
-│  worker_id         VARCHAR(100)                                     │
-│  created_at        TIMESTAMP WITH TIME ZONE                         │
-├─────────────────────────────────────────────────────────────────────┤
-│  Monthly partitions: job_executions_2024_01, job_executions_2024_02 │
-│  Indexes:                                                            │
-│  • idx_executions_job_id ON (job_id)                                │
-│  • idx_executions_status ON (status)                                │
-│  • idx_executions_next_retry ON (next_retry_at)                     │
-│    WHERE status = 'PENDING_RETRY'                                   │
-└─────────────────────────────────────────────────────────────────────┘
+| Table | Key Columns | Indexes | Notes |
+|-------|-------------|---------|-------|
+| `jobs` | id (UUID PK), name (unique), handler, payload (JSONB), schedule (cron), next_run_time, priority (0–100), max_retries, initial_backoff_ms, max_backoff_ms, timeout_ms, status, owner_id | partial index on `next_run_time WHERE status='SCHEDULED'`; index on status | The partial index is the one that matters — the scheduler scans "due and schedulable" every tick, and it keeps that scan off the paused and completed rows entirely |
+| `job_executions` | id (UUID PK), job_id (FK), status, attempt, scheduled_at, started_at, completed_at, next_retry_at, result (JSONB), error, worker_id | (job_id); (status); partial on `next_retry_at WHERE status='PENDING_RETRY'` | Range-partitioned monthly by `created_at`. One row *per attempt*, never mutated in place — attempt 2 is a new row, so the full failure history survives |
+| `execution_logs` | id (UUID PK), execution_id (FK), level, message, metadata (JSONB) | (execution_id) | Highest-volume table; follows the execution partition's lifecycle |
+| `execution_archives` | id, partition_name, start_date, end_date, record_count, file_path, file_size_bytes, checksum | (partition_name) | Bookkeeping for detached partitions shipped to object storage |
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                        execution_logs                                │
-├─────────────────────────────────────────────────────────────────────┤
-│  id                UUID PRIMARY KEY                                 │
-│  execution_id      UUID FK → job_executions                         │
-│  level             VARCHAR(10) NOT NULL                             │
-│  message           TEXT NOT NULL                                    │
-│  metadata          JSONB                                            │
-│  created_at        TIMESTAMP WITH TIME ZONE                         │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│                      execution_archives                              │
-├─────────────────────────────────────────────────────────────────────┤
-│  id                UUID PRIMARY KEY                                 │
-│  partition_name    VARCHAR(50) NOT NULL                             │
-│  start_date        DATE NOT NULL                                    │
-│  end_date          DATE NOT NULL                                    │
-│  record_count      INTEGER NOT NULL                                 │
-│  file_path         VARCHAR(500) NOT NULL                            │
-│  file_size_bytes   BIGINT NOT NULL                                  │
-│  checksum          VARCHAR(64) NOT NULL                             │
-│  archived_at       TIMESTAMP WITH TIME ZONE                         │
-└─────────────────────────────────────────────────────────────────────┘
-```
+> "The design choice I'd defend hardest here is one row per attempt rather than a retry counter on a single row. A counter tells you a job failed four times; separate rows tell you *how* each attempt failed, on which worker, and how long it ran before dying. When someone asks at 3am why a job has been flapping for a week, that history is the entire investigation. The cost is table growth proportional to retries, which is exactly why executions are partitioned and archived."
 
 ### Redis Data Structures
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Redis Key Schema                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Priority Queue:                                                     │
-│    job_scheduler:queue ──▶ Sorted Set                               │
-│    Member: execution_data_json                                       │
-│    Score: 100 - priority (inverted for ZPOPMIN)                     │
-│                                                                      │
-│  Processing Set (Visibility Timeout):                                │
-│    job_scheduler:processing ──▶ Sorted Set                          │
-│    Member: {executionId}:{workerId}:{data}                          │
-│    Score: timeout_timestamp                                         │
-│                                                                      │
-│  Dead Letter Queue:                                                  │
-│    job_scheduler:dead_letter ──▶ List                               │
-│    Value: execution_data_json with error and failedAt               │
-│    TTL: 30 days                                                      │
-│                                                                      │
-│  Leader Election:                                                    │
-│    job_scheduler:scheduler:leader ──▶ String                        │
-│    Value: instance_id                                               │
-│    TTL: 30 seconds (EX 30)                                          │
-│                                                                      │
-│  Job Locks (Deduplication):                                          │
-│    job_scheduler:lock:{job_id} ──▶ String                           │
-│    Value: execution_id                                              │
-│    TTL: 1 hour (EX 3600)                                            │
-│                                                                      │
-│  Worker Registry:                                                    │
-│    job_scheduler:workers ──▶ Hash                                   │
-│    Field: worker_id                                                 │
-│    Value: {startedAt, concurrency, status, lastHeartbeat}           │
-│                                                                      │
-│  Idempotency:                                                        │
-│    idempotency:{key} ──▶ String                                     │
-│    Value: response_json                                             │
-│    TTL: 1 hour (EX 3600)                                            │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Redis holds everything coordination-related — all of it reconstructible, none of it the source of truth:
+
+| Key | Type | Contents | Expiry |
+|-----|------|----------|--------|
+| `job_scheduler:queue` | Sorted set | Pending executions, scored by inverted priority so `ZPOPMIN` returns the most important first | — |
+| `job_scheduler:processing` | Sorted set | In-flight executions scored by their visibility deadline | — (swept by the recovery loop) |
+| `job_scheduler:dead_letter` | List | Executions that exhausted their retry budget, with error and failure time | 30 days |
+| `job_scheduler:scheduler:leader` | String | Instance ID of the current scheduler leader | 30s, refreshed on heartbeat |
+| `job_scheduler:lock:{job_id}` | String | Execution ID currently holding the job — the dedup guard | 1 hour |
+| `job_scheduler:workers` | Hash | worker_id → start time, concurrency, status, last heartbeat | — (staleness judged by heartbeat age) |
+| `idempotency:{key}` | String | Cached response for a repeated mutating request | 1 hour |
 
 ---
 
@@ -572,48 +475,16 @@ Only one scheduler should be active to prevent duplicate job enqueueing, but we 
 
 ### Archival Process
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    DataLifecycleManager                              │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  runDailyMaintenance():                                              │
-│    ├── archiveOldExecutions()                                       │
-│    ├── cleanupLogs()                                                │
-│    └── vacuumTables()                                               │
-│                                                                      │
-│  archiveOldExecutions():                                             │
-│    │                                                                 │
-│    ├── Find partitions older than 30 days:                          │
-│    │   SELECT tablename FROM pg_tables                              │
-│    │   WHERE tablename LIKE 'job_executions_%'                      │
-│    │     AND tablename < 'job_executions_{30_days_ago}'             │
-│    │                                                                 │
-│    └── For each old partition:                                      │
-│          │                                                           │
-│          ├── Export to Parquet                                      │
-│          │   data = SELECT * FROM {partition}                       │
-│          │   parquetBuffer = convertToParquet(data)                 │
-│          │                                                           │
-│          ├── Upload to MinIO                                        │
-│          │   s3Path = "executions/{partition}.parquet"              │
-│          │   minio.putObject('job-scheduler-archive', s3Path, buf)  │
-│          │                                                           │
-│          ├── Record archive metadata                                │
-│          │   INSERT INTO execution_archives                         │
-│          │   (partition_name, start_date, end_date, record_count,   │
-│          │    file_path, file_size_bytes, checksum)                 │
-│          │                                                           │
-│          └── Drop partition                                         │
-│              ALTER TABLE job_executions DETACH PARTITION {name}     │
-│              DROP TABLE {name}                                       │
-│                                                                      │
-│  cleanupLogs():                                                      │
-│    DELETE FROM execution_logs                                        │
-│    WHERE created_at < NOW() - INTERVAL '7 days'                     │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+A daily maintenance pass keeps the hot tables small. Because `job_executions` is range-partitioned by month, aging data out is a metadata operation rather than a mass delete:
+
+1. Find partitions whose range ends more than 30 days ago.
+2. Export each one to Parquet and upload it to object storage.
+3. Record the partition name, date range, row count, file path, size, and checksum in `execution_archives`.
+4. `DETACH PARTITION`, then drop the table.
+
+Execution logs are the highest-volume data and the least useful once a job is known-good, so they're deleted outright after 7 days rather than archived.
+
+> "Detaching a partition is O(1) — it's a catalog update, and the table disappears from the planner's view instantly. The alternative, `DELETE FROM job_executions WHERE created_at < …`, would rewrite millions of rows, bloat the table until autovacuum caught up, and hold locks that contend with the scheduler's own scan the entire time. Partitioning costs us the discipline of pre-creating next month's partition — and if that ever gets missed, inserts fail outright — which is why partition creation runs in the same maintenance job that does the archiving."
 
 ---
 

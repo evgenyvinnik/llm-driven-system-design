@@ -250,7 +250,12 @@ export async function retryExecution(id: string): Promise<JobExecution | null> {
  * @returns System metrics for dashboard display
  */
 export async function getMetrics(): Promise<SystemMetrics | null> {
-  const response = await fetchApi<SystemMetrics>('/metrics');
+  // `/api/v1/metrics/system`, not `/api/v1/metrics` — the latter does not exist
+  // (the bare `/metrics` route is the Prometheus scrape endpoint at the server
+  // root). Requesting the wrong path 404s, which this layer turns into a null
+  // metrics object, so the dashboard rendered zeros for every card while the
+  // job table beneath it was full of data.
+  const response = await fetchApi<SystemMetrics>('/metrics/system');
   return response.data || null;
 }
 
@@ -291,4 +296,58 @@ export async function getDeadLetterItems(
     `/dead-letter?start=${start}&count=${count}`
   );
   return response.data || [];
+}
+
+// === Authentication ===
+//
+// The auth routes are mounted at `/api`, not `/api/v1` like everything else,
+// so they bypass fetchApi's base URL. Session state is a cookie set by the
+// backend; requests are same-origin through the Vite proxy, so it rides along.
+
+/** Authenticated user as returned by the session endpoints. */
+export interface AuthUser {
+  id: string;
+  username: string;
+  role: 'user' | 'admin';
+}
+
+/**
+ * Authenticates with username and password, establishing a session cookie.
+ * @throws Error with the server's message when credentials are rejected
+ */
+export async function login(
+  username: string,
+  password: string
+): Promise<AuthUser> {
+  const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const data: ApiResponse<{ user: AuthUser }> = await response.json();
+
+  if (!response.ok || !data.success || !data.data) {
+    throw new Error(data.error || 'Login failed');
+  }
+  return data.data.user;
+}
+
+/** Destroys the current session. */
+export async function logout(): Promise<void> {
+  await fetch('/api/auth/logout', { method: 'POST' });
+}
+
+/**
+ * Returns the currently authenticated user, or null when there is no session.
+ * Used on boot to restore a session rather than forcing a fresh login.
+ */
+export async function getCurrentUser(): Promise<AuthUser | null> {
+  try {
+    const response = await fetch('/api/auth/me');
+    if (!response.ok) return null;
+    const data: ApiResponse<AuthUser> = await response.json();
+    return data.success ? data.data ?? null : null;
+  } catch {
+    return null;
+  }
 }
