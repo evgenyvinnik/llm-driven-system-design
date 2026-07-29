@@ -6,7 +6,7 @@ import { useAdminStore } from '../stores/adminStore';
 import type { Notification, Template } from '../types';
 
 function NotificationsPage() {
-  const { isAuthenticated } = useAuthStore();
+  const { isAuthenticated, hasCheckedAuth } = useAuthStore();
   const { notifications, isLoading, fetchNotifications, sendNotification, cancelNotification } =
     useNotificationStore();
   const { templates, fetchTemplates } = useAdminStore();
@@ -22,13 +22,16 @@ function NotificationsPage() {
   const [statusFilter, setStatusFilter] = useState('');
 
   useEffect(() => {
+    // Wait for the session check to finish before deciding the user is logged
+    // out — `isAuthenticated` is false on every page load until it completes.
+    if (!hasCheckedAuth) return;
     if (!isAuthenticated) {
       navigate({ to: '/login' });
       return;
     }
     fetchNotifications({ status: statusFilter || undefined });
     fetchTemplates();
-  }, [isAuthenticated, navigate, fetchNotifications, fetchTemplates, statusFilter]);
+  }, [isAuthenticated, hasCheckedAuth, navigate, fetchNotifications, fetchTemplates, statusFilter]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();

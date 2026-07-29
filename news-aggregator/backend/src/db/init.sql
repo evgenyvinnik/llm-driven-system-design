@@ -37,7 +37,10 @@ CREATE TABLE stories (
   primary_topic VARCHAR(50),
   topics TEXT[] DEFAULT '{}',
   entities JSONB DEFAULT '[]',
-  fingerprint BIGINT,
+  -- NUMERIC(20,0), not BIGINT: SimHash produces an *unsigned* 64-bit value, and
+  -- signed BIGINT tops out at 2^63-1, so any fingerprint with the high bit set
+  -- fails to insert outright. NUMERIC(20,0) stores all 20 digits exactly.
+  fingerprint NUMERIC(20, 0),
   article_count INTEGER DEFAULT 1,
   source_count INTEGER DEFAULT 1,
   velocity DECIMAL(10, 4) DEFAULT 0,
@@ -60,7 +63,10 @@ CREATE TABLE articles (
   image_url VARCHAR(500),
   published_at TIMESTAMP,
   crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  fingerprint BIGINT,
+  -- NUMERIC(20,0), not BIGINT: SimHash produces an *unsigned* 64-bit value, and
+  -- signed BIGINT tops out at 2^63-1, so any fingerprint with the high bit set
+  -- fails to insert outright. NUMERIC(20,0) stores all 20 digits exactly.
+  fingerprint NUMERIC(20, 0),
   topics TEXT[] DEFAULT '{}',
   entities JSONB DEFAULT '[]',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

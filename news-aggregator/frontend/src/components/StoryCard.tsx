@@ -52,7 +52,11 @@ export function StoryCard({ story, featured = false }: StoryCardProps) {
     <Link
       to="/story/$storyId"
       params={{ storyId: story.id }}
-      className={`card block ${featured ? 'col-span-2 row-span-2' : ''}`}
+      // `col-span-2` only, not `row-span-2`: the taller variant was sized for a
+      // hero image, but nothing in this UI renders `image_url`, so the extra row
+      // was just a tall empty void under the summary. Wider still reads as
+      // featured without reserving space for something that never arrives.
+      className={`card block ${featured ? 'md:col-span-2' : ''}`}
     >
       <div className="flex flex-col h-full">
         <div className="flex items-start gap-2 mb-2">

@@ -44,9 +44,16 @@
     },
     {
       "name": "05-search",
-      "path": "/search?q=tech",
+      "path": "/search?q=cloud",
       "waitFor": "main",
-      "delay": 500
+      "delay": 2500
+    },
+    {
+      "name": "06-story-detail",
+      "path": "/",
+      "delay": 2500,
+      "click": "a[href^='/story/']",
+      "clickDelay": 2000
     }
   ],
   "viewport": {

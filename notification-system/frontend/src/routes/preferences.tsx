@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useNotificationStore } from '../stores/notificationStore';
 
 function PreferencesPage() {
-  const { isAuthenticated } = useAuthStore();
+  const { isAuthenticated, hasCheckedAuth } = useAuthStore();
   const { preferences, isLoading, fetchPreferences, updatePreferences, setQuietHours } = useNotificationStore();
   const navigate = useNavigate();
   const [quietHoursEnabled, setQuietHoursEnabled] = useState(false);
@@ -12,12 +12,15 @@ function PreferencesPage() {
   const [quietEnd, setQuietEnd] = useState('08:00');
 
   useEffect(() => {
+    // Wait for the session check to finish before deciding the user is logged
+    // out — `isAuthenticated` is false on every page load until it completes.
+    if (!hasCheckedAuth) return;
     if (!isAuthenticated) {
       navigate({ to: '/login' });
       return;
     }
     fetchPreferences();
-  }, [isAuthenticated, navigate, fetchPreferences]);
+  }, [isAuthenticated, hasCheckedAuth, navigate, fetchPreferences]);
 
   useEffect(() => {
     if (preferences) {

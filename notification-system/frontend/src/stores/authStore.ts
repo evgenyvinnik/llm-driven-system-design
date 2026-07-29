@@ -13,6 +13,15 @@ interface AuthState {
   register: (email: string, name: string, phone?: string) => Promise<void>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
+  /**
+   * False until `checkAuth` has finished once.
+   *
+   * `partialize` persists only the token, so `isAuthenticated` starts false on
+   * every page load and only becomes true after the async validation round trip.
+   * Route guards that redirect on `!isAuthenticated` alone therefore bounce an
+   * authenticated user to /login before the check has had a chance to run.
+   */
+  hasCheckedAuth: boolean;
   clearError: () => void;
 }
 
@@ -23,6 +32,7 @@ export const useAuthStore = create<AuthState>()(
       token: null,
       user: null,
       isAuthenticated: false,
+      hasCheckedAuth: false,
       isLoading: false,
       error: null,
 
@@ -82,7 +92,11 @@ export const useAuthStore = create<AuthState>()(
 
       checkAuth: async () => {
         const { token } = get();
-        if (!token) return;
+        if (!token) {
+          // Nothing to validate — the answer is already known.
+          set({ hasCheckedAuth: true });
+          return;
+        }
 
         api.setToken(token);
         set({ isLoading: true });
@@ -92,6 +106,7 @@ export const useAuthStore = create<AuthState>()(
             user: user as User,
             isAuthenticated: true,
             isLoading: false,
+            hasCheckedAuth: true,
           });
         } catch {
           // Token invalid
@@ -101,6 +116,7 @@ export const useAuthStore = create<AuthState>()(
             user: null,
             isAuthenticated: false,
             isLoading: false,
+            hasCheckedAuth: true,
           });
         }
       },

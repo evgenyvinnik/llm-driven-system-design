@@ -326,7 +326,11 @@ async function processArticle(source: Source, item: RSSItem): Promise<boolean> {
       body,
       item.author || '',
       publishedAt,
-      Number(fingerprint),
+      // As a string, not Number(): a JS number is exact only to 2^53, so
+      // Number(fingerprint) silently corrupts the low bits — precisely the bits
+      // Hamming distance is computed over. node-postgres passes the string
+      // straight through to NUMERIC.
+      fingerprint.toString(),
       topics,
       JSON.stringify(entities),
     ]
@@ -427,7 +431,11 @@ async function assignToStory(
       topics[0] || 'general',
       topics,
       JSON.stringify(entities),
-      Number(fingerprint),
+      // As a string, not Number(): a JS number is exact only to 2^53, so
+      // Number(fingerprint) silently corrupts the low bits — precisely the bits
+      // Hamming distance is computed over. node-postgres passes the string
+      // straight through to NUMERIC.
+      fingerprint.toString(),
     ]
   );
 

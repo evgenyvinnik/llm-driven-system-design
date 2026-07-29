@@ -280,12 +280,24 @@ async function seedStories(): Promise<void> {
 
   // Elasticsearch is a derived index — if it isn't reachable, seed Postgres
   // anyway and let search be the only degraded surface.
-  let esReady = true;
-  try {
-    await initElasticsearch();
-  } catch (err) {
-    esReady = false;
-    console.warn(`  Elasticsearch unavailable, skipping indexing: ${(err as Error).message}`);
+  //
+  // The retry matters: a single-node ES cluster takes tens of seconds to accept
+  // requests, and seeding usually runs moments after the stack comes up. Without
+  // waiting, indexing silently fails and the only symptom is that search returns
+  // nothing while the feed is full.
+  let esReady = false;
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    try {
+      await initElasticsearch();
+      esReady = true;
+      break;
+    } catch (err) {
+      if (attempt === 10) {
+        console.warn(`  Elasticsearch unavailable, skipping indexing: ${(err as Error).message}`);
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
   }
 
   const { rows: sources } = await pool.query<{ id: string; domain: string }>(
