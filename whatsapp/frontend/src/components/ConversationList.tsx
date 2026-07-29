@@ -186,6 +186,7 @@ export function ConversationList({ onSelectConversation, onNewChat }: Conversati
             return (
               <div
                 key={conversation.id}
+                data-testid="conversation-item"
                 onClick={() => onSelectConversation(conversation.id)}
                 className={`flex items-center px-3 py-3 cursor-pointer hover:bg-whatsapp-hover border-b border-whatsapp-divider ${
                   currentConversationId === conversation.id ? 'bg-whatsapp-selected' : ''

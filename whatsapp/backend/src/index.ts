@@ -61,9 +61,41 @@ app.use(httpLogger);
 // Prometheus metrics middleware
 app.use(metricsMiddleware);
 
-// Session middleware with Redis store
+// Session middleware with Redis store.
+//
+// connect-redis v9 speaks the *node-redis v5* client API and calls
+//   client.set(key, val, { expiration: { type: 'EX', value: ttl } })
+// but this project's client is **ioredis**, whose set() expects the variadic
+// form `set(key, val, 'EX', ttl)`. Handing ioredis the options object makes
+// Redis reply "ERR syntax error", so every session write silently failed and
+// logins never persisted — the user appeared to sign in and was immediately
+// back on the login screen. This adapter translates just the calls
+// connect-redis makes, leaving the rest of the client untouched.
+const sessionRedisAdapter = new Proxy(redis, {
+  get(target, prop, receiver) {
+    if (prop === 'set') {
+      return (
+        key: string,
+        value: string,
+        opts?: { expiration?: { type: string; value: number } }
+      ) => {
+        const exp = opts?.expiration;
+        if (exp?.type === 'EX' && typeof exp.value === 'number') {
+          return target.set(key, value, 'EX', exp.value);
+        }
+        if (exp?.type === 'PX' && typeof exp.value === 'number') {
+          return target.set(key, value, 'PX', exp.value);
+        }
+        return target.set(key, value);
+      };
+    }
+    const v = Reflect.get(target, prop, receiver);
+    return typeof v === 'function' ? v.bind(target) : v;
+  },
+});
+
 const sessionStore = new (RedisStore as any)({
-  client: redis,
+  client: sessionRedisAdapter,
   prefix: 'sess:',
 });
 

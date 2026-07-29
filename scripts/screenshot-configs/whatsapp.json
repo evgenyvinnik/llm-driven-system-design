@@ -5,14 +5,37 @@
   "dbName": "whatsapp",
   "dbUser": "whatsapp",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "#username",
+    "passwordSelector": "#password",
+    "submitSelector": "button[type='submit']"
   },
   "screens": [
     {
-      "name": "01-home",
+      "name": "01-login",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1500
+      "skipAuth": true,
+      "waitFor": "form",
+      "delay": 800
+    },
+    {
+      "name": "02-chats",
+      "path": "/",
+      "waitFor": "[data-testid='conversation-item']",
+      "delay": 2000
+    },
+    {
+      "name": "03-chat-thread",
+      "path": "/",
+      "waitFor": "[data-testid='conversation-item']",
+      "click": "[data-testid='conversation-item']",
+      "clickDelay": 2500,
+      "delay": 1200
     }
   ],
   "viewport": {
