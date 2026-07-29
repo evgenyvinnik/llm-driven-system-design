@@ -34,14 +34,36 @@
     {
       "name": "03-home",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1000
+      "delay": 2500
     },
     {
-      "name": "04-org-list",
+      "name": "04-general-channel",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000001",
+      "delay": 2500
+    },
+    {
+      "name": "05-deployments-channel",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000002",
+      "delay": 2500
+    },
+    {
+      "name": "06-thread-panel",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000002",
+      "delay": 2200,
+      "click": "[data-testid='thread-open']",
+      "clickDelay": 1500
+    },
+    {
+      "name": "07-member-list",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000001",
+      "delay": 2200,
+      "click": "[data-testid='toggle-members']",
+      "clickDelay": 1500
+    },
+    {
+      "name": "08-org-list",
       "path": "/org",
-      "waitFor": "main",
-      "delay": 1000
+      "delay": 2000
     }
   ],
   "viewport": {

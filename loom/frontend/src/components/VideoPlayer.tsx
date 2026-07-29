@@ -3,11 +3,13 @@ import { useRef, useCallback } from 'react';
 interface VideoPlayerProps {
   videoUrl: string | null;
   status: string;
+  /** Still frame shown before playback begins, and while the first frame loads. */
+  posterUrl?: string | null;
   onTimeUpdate?: (time: number) => void;
 }
 
 /** HTML5 video player with playback controls and time update callbacks for comment anchoring. */
-export function VideoPlayer({ videoUrl, status, onTimeUpdate }: VideoPlayerProps) {
+export function VideoPlayer({ videoUrl, status, posterUrl, onTimeUpdate }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const handleTimeUpdate = useCallback(() => {
@@ -48,6 +50,8 @@ export function VideoPlayer({ videoUrl, status, onTimeUpdate }: VideoPlayerProps
       <video
         ref={videoRef}
         src={videoUrl}
+        poster={posterUrl ?? undefined}
+        preload="metadata"
         controls
         className="w-full h-full"
         onTimeUpdate={handleTimeUpdate}

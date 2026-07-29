@@ -34,39 +34,49 @@
     {
       "name": "03-library",
       "path": "/",
-      "waitFor": "main",
+      "waitFor": "img",
       "delay": 2000
     },
     {
       "name": "04-video-detail",
       "path": "/videos/33333333-aaaa-4aaa-8aaa-333333333333",
-      "waitFor": "main",
+      "waitFor": "video",
       "delay": 2200
     },
     {
-      "name": "05-video-comments",
+      "name": "05-video-analytics",
+      "path": "/videos/33333333-aaaa-4aaa-8aaa-333333333333",
+      "waitFor": "video",
+      "delay": 1500,
+      "click": "[data-testid='analytics-tab']",
+      "clickDelay": 1500
+    },
+    {
+      "name": "06-share-modal",
       "path": "/videos/11111111-aaaa-4aaa-8aaa-111111111111",
-      "waitFor": "main",
-      "delay": 2200
+      "waitFor": "video",
+      "delay": 1800,
+      "click": "[data-testid='share-button']",
+      "clickDelay": 1200
     },
     {
-      "name": "06-share-public",
+      "name": "07-share-public",
       "path": "/share/demo-checkout-walkthrough-2f8a91",
       "skipAuth": true,
-      "waitFor": "main",
+      "waitFor": "video",
       "delay": 2000
     },
     {
-      "name": "07-share-password",
+      "name": "08-share-password",
       "path": "/share/demo-dashboard-review-7c3e44",
       "skipAuth": true,
-      "waitFor": "main",
+      "waitFor": "form, input[type='password']",
       "delay": 1500
     },
     {
-      "name": "08-record",
+      "name": "09-record",
       "path": "/record",
-      "waitFor": "main",
+      "waitFor": "button",
       "delay": 1200
     }
   ],

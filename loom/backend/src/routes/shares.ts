@@ -63,10 +63,16 @@ router.get('/:token', async (req: Request, res: Response) => {
 
     const row = video.rows[0];
     let downloadUrl: string | null = null;
+    let thumbnailUrl: string | null = null;
 
     // Generate presigned download URL for playback
     if (row.storage_path && row.status === 'ready') {
       downloadUrl = await getPresignedDownloadUrl(row.storage_path);
+    }
+    // The poster frame, so a shared link shows the recording rather than a
+    // black rectangle before the viewer presses play.
+    if (row.thumbnail_path) {
+      thumbnailUrl = await getPresignedDownloadUrl(row.thumbnail_path);
     }
 
     res.json({
@@ -79,6 +85,7 @@ router.get('/:token', async (req: Request, res: Response) => {
         viewCount: row.view_count,
         createdAt: row.created_at,
         downloadUrl,
+        thumbnailUrl,
         allowDownload: validation.allowDownload,
         author: {
           username: row.username,

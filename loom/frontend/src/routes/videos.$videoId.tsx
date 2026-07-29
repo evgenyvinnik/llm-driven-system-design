@@ -59,6 +59,7 @@ function VideoPage() {
         <div className="lg:col-span-2">
           <VideoPlayer
             videoUrl={downloadUrl}
+            posterUrl={currentVideo.thumbnailUrl}
             status={currentVideo.status}
             onTimeUpdate={setPlayerTime}
           />
@@ -82,6 +83,7 @@ function VideoPage() {
             {isOwner && (
               <div className="flex gap-2 mt-4">
                 <button
+                  data-testid="share-button"
                   onClick={() => setShowShareModal(true)}
                   className="px-4 py-2 bg-loom-primary text-white rounded-lg hover:bg-loom-hover text-sm font-medium"
                 >
@@ -108,6 +110,7 @@ function VideoPage() {
               </button>
               {isOwner && (
                 <button
+                  data-testid="analytics-tab"
                   onClick={() => setActiveTab('analytics')}
                   className={`flex-1 py-3 text-sm font-medium text-center ${
                     activeTab === 'analytics'

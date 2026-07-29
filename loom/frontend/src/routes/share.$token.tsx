@@ -97,7 +97,11 @@ function SharePage() {
 
   return (
     <div className="max-w-4xl mx-auto px-6 py-8">
-      <VideoPlayer videoUrl={video.downloadUrl} status={video.status} />
+      <VideoPlayer
+        videoUrl={video.downloadUrl}
+        posterUrl={video.thumbnailUrl}
+        status={video.status}
+      />
 
       <div className="mt-4">
         <h1 className="text-xl font-bold text-loom-text">{video.title}</h1>

@@ -76,6 +76,7 @@ export function MessageItem({ message }: MessageItemProps) {
         {/* Thread indicator */}
         {(message.reply_count || 0) > 0 && (
           <button
+            data-testid="thread-open"
             onClick={() => openThread(message.id)}
             className="flex items-center gap-1 mt-1 text-xs text-teams-primary hover:underline"
           >

@@ -36,6 +36,7 @@ export function ChatArea() {
         </div>
         <div className="flex items-center gap-2">
           <button
+            data-testid="toggle-members"
             onClick={toggleMemberList}
             className="p-1.5 text-teams-secondary hover:text-teams-text hover:bg-teams-bg rounded transition-colors"
             title="Toggle member list"

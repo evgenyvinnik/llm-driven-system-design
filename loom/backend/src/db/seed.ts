@@ -56,6 +56,71 @@ const THUMBNAILS: Record<string, string> = {
     'https://images.unsplash.com/photo-1590650153855-d9e808231d41?w=960&h=540&fit=crop',
 };
 
+/**
+ * A short CC0 clip stood in for every seeded recording.
+ *
+ * Without real bytes behind `storage_path`, the presigned playback URL 404s and
+ * the `<video>` element renders an empty black box — WebKit drops the poster
+ * frame once the media resource errors, so even a thumbnail doesn't save it.
+ * One small file reused across all rows is enough to make playback, scrubbing,
+ * and time-anchored comments actually work locally.
+ */
+const SAMPLE_VIDEO_URL =
+  'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm';
+
+/** Fetches once and caches, since every video row reuses the same clip. */
+let sampleVideoBytes: Buffer | null = null;
+async function getSampleVideo(): Promise<Buffer | null> {
+  if (sampleVideoBytes) return sampleVideoBytes;
+  try {
+    const res = await fetch(SAMPLE_VIDEO_URL);
+    if (!res.ok) {
+      console.warn(`  sample video fetch failed (${res.status})`);
+      return null;
+    }
+    sampleVideoBytes = Buffer.from(await res.arrayBuffer());
+    return sampleVideoBytes;
+  } catch (err) {
+    console.warn(`  sample video unavailable: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+async function seedVideoObjects(): Promise<void> {
+  const { rows } = await pool.query<{ id: string; storage_path: string }>(
+    "SELECT id, storage_path FROM videos WHERE storage_path IS NOT NULL AND status = 'ready'",
+  );
+
+  let uploaded = 0;
+  for (const row of rows) {
+    try {
+      await minioClient.statObject(config.minio.bucket, row.storage_path);
+      continue; // Already present.
+    } catch {
+      // Not present — upload below.
+    }
+
+    const bytes = await getSampleVideo();
+    if (!bytes) return; // Offline: leave the rows alone rather than half-seeding.
+
+    try {
+      await minioClient.putObject(config.minio.bucket, row.storage_path, bytes, bytes.length, {
+        'Content-Type': 'video/webm',
+      });
+      // Keep the reported size honest about what's actually stored.
+      await pool.query('UPDATE videos SET file_size_bytes = $1 WHERE id = $2', [
+        bytes.length,
+        row.id,
+      ]);
+      uploaded++;
+    } catch (err) {
+      console.warn(`  skipping ${row.storage_path}: ${(err as Error).message}`);
+    }
+  }
+
+  console.log(`Uploaded ${uploaded} playable video objects to MinIO.`);
+}
+
 async function seedThumbnails(): Promise<void> {
   await ensureBucket();
 
@@ -97,6 +162,7 @@ async function seedThumbnails(): Promise<void> {
 
 applyBaseSeed()
   .then(seedThumbnails)
+  .then(seedVideoObjects)
   .then(() => pool.end())
   .catch((err) => {
     console.error('Seeding failed:', err);

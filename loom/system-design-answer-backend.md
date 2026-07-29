@@ -259,6 +259,31 @@ This caching layer reduces database load by 99% for popular share links while ma
 
 **The trade-off:** Every share access requires a database lookup (token + JOIN to video + JOIN to user). This is three tables joined on indexed foreign keys -- under 1ms in PostgreSQL. We pay this cost on every access to gain: individual revocation (DELETE one row), password protection (bcrypt on the same row), and expiration enforcement (timestamp comparison on the same row). The alternative (signed URLs with HMAC) saves the database lookup but loses all three of these capabilities.
 
+### Deep Dive 4: Abuse Resistance and the bcrypt Cost of Protected Shares
+
+> "The previous deep dive ended on a deliberate gap: password-protected shares can't be cached. That gap is also the system's cheapest denial-of-service target, so it's worth following through."
+
+**The problem:** A public share link is an unauthenticated endpoint that anyone with the URL can hit. For an unprotected share that's fine — the work is one indexed lookup. For a *protected* share, every single request runs bcrypt at 10 rounds, which is ~100ms of deliberately-expensive CPU. That asymmetry is the whole issue: the attacker spends a few bytes on a request, the server spends a tenth of a CPU-second answering it. Twenty requests per second against one protected share saturates two full cores doing nothing but hashing.
+
+**Why the obvious fix is wrong.** The instinct is to cache the validation result, exactly as we cache unprotected tokens. But caching "this token passed its password check" makes the check meaningless — the cache key is the token, and the token is what the attacker already has. Anyone who fetched the URL after a legitimate viewer authenticated would ride that cached entry straight through. Lowering the bcrypt cost factor is the other tempting fix, and it's worse: it speeds up the offline attack the cost factor exists to prevent, trading a real security property for a throughput problem that has a cheaper answer.
+
+**What actually works: make the *viewer* stateful, not the share.** A successful password check mints a short-lived cookie scoped to that one share token. Subsequent requests present the cookie, the server verifies it, and bcrypt runs exactly once per viewer per session rather than once per request. The security property survives because the cookie is issued only after a real password verification and is bound to a single share.
+
+| Approach | Bcrypt runs | Revocable | Safe |
+|----------|-------------|-----------|------|
+| ✅ Verify once, issue a scoped short-lived cookie | Once per viewer session | Yes — cookie TTL is short and the share row still gates issuance | Yes |
+| ❌ Cache validation by token | Once per TTL, globally | No — cache key is the public token | No: grants access to anyone holding the URL |
+| ❌ Reduce bcrypt cost factor | Every request, faster | Yes | No: weakens the offline attack it exists to resist |
+| ❌ Nothing (current implementation) | Every request | Yes | Yes, but trivially DoS-able |
+
+> "What I'd flag in review is that this reintroduces exactly the server-side session state the presigned-URL design worked so hard to avoid. I think that's the right call anyway — it's one small key with a short TTL, not video bytes — but it's a real concession and I'd rather name it than pretend the design is uniformly stateless."
+
+**Rate limiting is the layer underneath.** Two Redis-backed limiters run in front of this. A global limiter covers all `/api` traffic, and a stricter one covers uploads, where a single request costs far more than a JSON response. Redis rather than in-memory counters is the important detail: with in-memory state, every API instance keeps its own tally, so an attacker spreading requests across N instances gets N times the allowance and the limit silently means nothing behind a load balancer.
+
+The limits are deliberately per-endpoint rather than one global number. Uploads, share validation, and metadata reads have completely different costs and completely different abuse profiles — a single shared bucket would either be too loose to stop upload abuse or so tight that ordinary library browsing trips it. The cost is more configuration and more ways to misconfigure; the benefit is that the expensive endpoints get the protection they actually need.
+
+**What we give up:** rate limiting is per-IP, which is the wrong unit for both directions. It punishes legitimate users behind a shared NAT — an office of fifty people looks like one very busy client — and it barely inconveniences a distributed attacker with a pool of addresses. Doing better means per-account limits for authenticated routes and something like proof-of-work or a CAPTCHA on the anonymous share path, neither of which is worth building before there's evidence of abuse.
+
 ## 9. Failure Handling
 
 > "Let me describe how the backend handles failures in each layer."
@@ -267,9 +292,22 @@ This caching layer reduces database load by 99% for popular share links while ma
 
 **Object storage failures:** MinIO/S3 operations (presigned URL generation, object deletion, stat) are wrapped in a circuit breaker (Opossum). If 50% of operations fail within a 10-second window, the circuit opens and subsequent calls fail immediately for 30 seconds. This prevents cascading failures where slow S3 responses consume all Node.js event loop time.
 
-**Upload failure recovery:** If a client fails during upload, the video remains in "processing" status. The client can retry by requesting a new presigned URL -- the old URL may have expired (1-hour TTL). The backend updates the storage_path to the new object name. Orphaned objects from failed uploads are cleaned up by a background job.
+**Upload failure recovery:** If a client fails during upload, the video remains in "processing" status. The client can retry by requesting a new presigned URL -- the old URL may have expired (1-hour TTL). The backend updates the storage_path to the new object name.
+
+**The reconciliation gap.** I want to be precise here rather than wave at a cleanup job, because this is the sharpest unresolved edge in the design. The four upload steps are four independent operations with no transaction spanning them, and there is no distributed transaction available -- one participant is a database, the other is an object store. So two failure modes leak, in opposite directions:
+
+| Client dies after | Leaves behind | Visible to user as |
+|-------------------|---------------|--------------------|
+| Step 1–2 (row created, no PUT) | A `videos` row in `processing` with no object | A recording stuck "processing" forever |
+| Step 3 (PUT done, no complete call) | A real object with a row still in `processing` | Same, but now also paying storage |
+
+Neither self-heals, and nothing currently sweeps them. The honest design question is which side should be authoritative. Marking rows stale after N minutes is easy and wrong on its own -- a viewer on a slow connection legitimately takes longer than any threshold you'd pick for a snappy UI, so you'd fail uploads that were about to succeed. Making the object store authoritative and reconciling rows against a bucket listing is more correct but turns a cheap query into a full-prefix scan, and it's eventually consistent in exactly the window you care about.
+
+The pragmatic answer is both, at different tempos: a short-timeout sweep that only marks rows `failed` when the object genuinely isn't there (a `statObject` check, not a bare timestamp comparison), plus an infrequent, offline reconciliation that garbage-collects objects with no referencing row. What we give up is immediacy -- a user can see a stuck "processing" card for minutes before anything corrects it -- and that's the cost of not having a transaction across the two stores.
 
 **Redis failures:** Redis is used for session storage and caching. If Redis is unavailable, sessions cannot be validated -- authenticated endpoints return 401. The Redis client uses exponential backoff (50ms * attempts, max 2s) for reconnection. Critically, the share validation endpoint can still serve unauthenticated share links without Redis -- share tokens are validated against PostgreSQL directly.
+
+> "That last point is the one I'd highlight. It means a Redis outage degrades the product to read-only public viewing rather than taking it down: creators can't sign in, but every share link already in circulation keeps working. Given that shares are how the content actually reaches people, losing the authoring path while preserving the distribution path is the right way for this system to fail. It's also a direct consequence of choosing Redis-backed sessions over JWTs — with stateless tokens the authoring path would survive a Redis outage too, but we'd have given up the immediate revocation that a sharing product needs.
 
 ## 10. Scalability Discussion
 
@@ -308,3 +346,7 @@ This caching layer reduces database load by 99% for popular share links while ma
 | ❌ HLS/DASH transcoding | Universal playback, adaptive quality | Requires FFmpeg pipeline, storage of multiple renditions |
 | Session auth (Redis) | Immediate revocation, simple implementation | Server-side state, Redis dependency |
 | ❌ JWT tokens | Stateless, scales horizontally | No revocation without blocklist, token size grows with claims |
+| Scoped short-lived cookie after password check | Bcrypt runs once per viewer, not per request | Reintroduces server-side state on the share path |
+| ❌ Cache share validation by token | Removes the bcrypt cost entirely | Cache key is the public token — grants access to anyone holding the URL |
+| Redis-backed per-endpoint rate limits | Correct behind a load balancer, tuned to each endpoint's real cost | More configuration, more ways to misconfigure |
+| ❌ In-memory global rate limit | Zero dependencies | Per-instance counters — N instances means N times the allowance |
