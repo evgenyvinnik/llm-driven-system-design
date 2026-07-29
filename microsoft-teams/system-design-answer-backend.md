@@ -256,6 +256,17 @@ The current implementation polls presence when loading the member list. At produ
 - On key expiry: use Redis keyspace notifications to broadcast "user_offline"
 - Rate-limit presence notifications to at most once per 10 seconds per user to avoid flapping
 
+### Why Not WebSockets
+
+Worth stating plainly, since it's the first question this design invites:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ REST write + SSE receive | Writes keep HTTP status codes, validation, and error semantics; `EventSource` reconnects itself; plain HTTP traverses proxies | One-way, so client-pushed signals need a separate path; ~6 connections per origin on HTTP/1.1 |
+| ❌ Bidirectional WebSocket | One connection both ways | "Send message" becomes a frame with no status code — you reinvent correlation IDs and acks to learn whether the write succeeded |
+
+The traffic is deeply asymmetric: a user in a busy channel receives hundreds of messages and sends a handful, so a bidirectional socket's upstream is almost entirely idle. We're paying connection complexity for a direction we barely use. The concrete cost of choosing SSE is visible in the presence design — heartbeats are `POST` requests on a timer rather than frames on the existing connection, which is more requests than a socket would need. That's the trade: a little redundant traffic in exchange for never having to rebuild HTTP's error handling inside a message protocol.
+
 ## 📊 Observability
 
 ### Metrics (Prometheus)
@@ -276,6 +287,37 @@ JSON-formatted logs via Pino with request correlation via pino-http. Key fields:
 
 `GET /api/health` verifies database connectivity. Used by load balancers to route traffic away from unhealthy instances.
 
+## 🔧 Deep Dive 4: Hierarchical Authorization
+
+> "Everything so far has been about delivery. This one is about the failure that would actually end the product: a message from one company's channel appearing in another's."
+
+**The problem:** Four levels of containment — organization → team → channel → message — and each level has its own membership table. "Can Alice read this message" isn't one check; it's a question about which of those memberships she holds. The tempting shortcut is to check only the innermost level, because channel membership is what the query needs anyway. That shortcut is exactly where cross-tenant leaks come from: a stale `channel_members` row for someone who was removed from the *organization* three months ago still passes an innermost-only check.
+
+**Two ways to answer it:**
+
+| Approach | Read cost | Correctness after a membership change | Failure mode |
+|----------|-----------|----------------------------------------|--------------|
+| ✅ Walk the chain per request | Three indexed lookups, joinable into one query | Immediate — the next request sees the new state | Slower reads; the join is on every message fetch |
+| ❌ Materialize effective permissions per user per channel | One lookup | Only as correct as the invalidation | A missed invalidation is a *silent* leak that persists indefinitely |
+
+I'd walk the chain. The costs are asymmetric in a way that makes this lopsided: the price of walking is a few hundred microseconds on a query that's already hitting the database, and the price of a stale materialized permission is a customer discovering another customer's messages. A cache whose staleness is measured in "until someone notices" is not an acceptable trade for a latency improvement that no user can perceive.
+
+> "The thing I'd want to make explicit is that this isn't really a performance decision, it's a decision about which mistakes are recoverable. If the chain walk is too slow, we find out from a latency graph and fix it. If invalidation has a bug, we find out from a customer, and by then the disclosure has already happened. I'll take the recoverable failure."
+
+**Where authorization actually lives matters as much as its shape.** Membership checks belong in the query, not in application code after the fetch. A handler that loads a message and *then* checks permission has already pulled the row across a trust boundary, and every new endpoint is a fresh chance to forget the check. Expressing it as a join means the unauthorized row is never selected — the default for a new query is to return nothing rather than to return everything.
+
+**What this costs at scale:** every message read carries a membership join, so the hot path grows a dependency on tables that change rarely but are read constantly. The right escape hatch, if it ever becomes necessary, isn't to skip the check but to cache the *narrowest* part of it — an org-level membership set per user, which changes on the order of days — while still verifying channel membership per request. That keeps the fast-moving, security-critical half authoritative and caches only the half that's nearly static.
+
+**Private channels are where the model earns its keep.** `channels.is_private` means team membership is no longer sufficient — a user can be on the team and still not belong in the channel. A model that treated channel access as derived from team access would have no way to express that, and adding private channels later would require rewriting every authorization path. Carrying `channel_members` from the start costs a table and a join; retrofitting it would cost an audit of every query in the system.
+
+### Typing Indicators: The Case Against Building Them
+
+The one real-time feature deliberately left unbuilt. Typing is the highest-frequency signal in a chat product — a burst of events per keystroke run — and it is worthless the instant it's stale. Routing that through the same Postgres-write-then-publish path as messages would mean the noisiest data in the system takes the most expensive route.
+
+The right shape, if built, is a short-TTL Redis key plus an SSE event: no durable write at all, and the TTL doing the expiry that a "stopped typing" event would otherwise have to deliver reliably. That's the same reasoning as presence — for data that's only meaningful for the next few seconds, expiry beats state transitions, because the "off" signal is exactly the one most likely to be lost.
+
+It's also the strongest argument the WebSocket side has. Typing is genuinely client-pushed and high-frequency, which is the traffic shape SSE handles worst. If typing indicators shipped, `POST`-per-keystroke-burst would be the point where the asymmetry assumption stops holding and the decision deserves revisiting.
+
 ## ⚡ Scalability Discussion
 
 ### What Breaks First
@@ -293,6 +335,12 @@ JSON-formatted logs via Pino with request correlation via pino-http. Key fields:
 - **Phase 3**: Database partitioning by date range
 - **Phase 4**: CQRS -- PostgreSQL for writes, Elasticsearch for search, Cassandra for reads
 - **Phase 5**: Multi-region with per-region storage and cross-region metadata sync
+
+### The Subscription Leak
+
+One honest note on the pub/sub layer: subscribing happens on every SSE connect, and unsubscribing — though implemented — is never called on disconnect. Each instance's subscription set therefore only grows for the life of the process.
+
+At this scale nothing breaks; Redis handles thousands of subscriptions without noticing. At real scale it's a slow leak with an unpleasant shape: memory grows monotonically, a restart appears to "fix" it, and the symptom shows up as periodic unexplained instance churn rather than as anything pointing at pub/sub. The fix is to reference-count subscriptions per channel and unsubscribe when the last local client for that channel disconnects — not to unsubscribe on every disconnect, which would silently cut off the other clients on that instance still watching the same channel.
 
 ## ⚖️ Trade-offs Summary
 

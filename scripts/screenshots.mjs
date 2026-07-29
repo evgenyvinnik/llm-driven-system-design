@@ -893,7 +893,19 @@ async function captureWithPlaywright(config, outputDir) {
 
       logStep('CAPTURE', `${screen.name} (${screen.path})`);
 
-      await page.goto(`${baseUrl}${screen.path}`, { waitUntil: 'networkidle', timeout: 30000 });
+      // `networkidle` is the right default, but it can never fire on a page that
+      // deliberately holds a connection open — Server-Sent Events streams and
+      // long-poll endpoints keep a request in flight for the life of the page.
+      // Falling back to `domcontentloaded` lets those pages be captured instead
+      // of failing outright; the per-screen `waitFor`/`delay` below is what
+      // actually establishes that the content has rendered.
+      try {
+        await page.goto(`${baseUrl}${screen.path}`, { waitUntil: 'networkidle', timeout: 30000 });
+      } catch (navError) {
+        if (!/Timeout/i.test(navError.message)) throw navError;
+        logWarning('networkidle timed out (long-lived connection?) - falling back to domcontentloaded');
+        await page.goto(`${baseUrl}${screen.path}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      }
 
       // Wait for specific selector if specified
       if (screen.waitFor) {

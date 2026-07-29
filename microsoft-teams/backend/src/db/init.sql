@@ -98,11 +98,11 @@ CREATE TABLE IF NOT EXISTS files (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_messages_channel ON messages(channel_id, created_at DESC);
-CREATE INDEX idx_messages_parent ON messages(parent_message_id);
-CREATE INDEX idx_reactions_message ON message_reactions(message_id);
-CREATE INDEX idx_files_channel ON files(channel_id);
-CREATE INDEX idx_files_message ON files(message_id);
-CREATE INDEX idx_org_members ON org_members(user_id);
-CREATE INDEX idx_team_members ON team_members(user_id);
-CREATE INDEX idx_channel_members ON channel_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id);
+CREATE INDEX IF NOT EXISTS idx_reactions_message ON message_reactions(message_id);
+CREATE INDEX IF NOT EXISTS idx_files_channel ON files(channel_id);
+CREATE INDEX IF NOT EXISTS idx_files_message ON files(message_id);
+CREATE INDEX IF NOT EXISTS idx_org_members ON org_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_team_members ON team_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_channel_members ON channel_members(user_id);

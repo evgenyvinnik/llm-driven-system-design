@@ -306,6 +306,42 @@ When hovering over a message, a floating action bar appears at the top-right cor
 - SSE connections are properly closed on channel switch and component unmount
 - No accumulation of messages across channel switches
 
+## 🗂️ State: Server Cache vs. UI State
+
+Two kinds of state, deliberately kept apart. Organizations, teams, channels, messages, and presence are *server* state — the client holds a copy that can go stale. Which panel is open, which thread is expanded, and draft text are *UI* state that no server ever needs to know about.
+
+Collapsing them into one store is the common mistake, and it produces a specific bug: a refetch of server data blows away the open thread panel, because both live in the same object and the refetch replaced it. Keeping them separate means the message list can refresh under an open thread panel without disturbing it.
+
+| State | Where | Why |
+|-------|-------|-----|
+| Channels, messages, presence | Zustand store, refetched and stream-updated | Shared across components; must survive navigation within an org |
+| Open thread, member list visibility, drafts | Component or store slice never touched by refetch | Purely local; a server refresh must not disturb it |
+
+The trade-off is discipline rather than machinery — nothing enforces the split, so it's a convention that has to hold as features are added. A data-fetching library with its own cache would enforce it structurally, at the cost of a second state system alongside the store.
+
+## 🧭 Routing the Hierarchy
+
+The URL is `/org/:orgId/team/:teamId/channel/:channelId`, and the route tree mirrors the containment hierarchy exactly — each segment is a layout that loads its own level and renders an outlet for the next.
+
+That structure buys real things. Every level's data loads once at the level that owns it rather than being refetched by children; the sidebar rail lives in the org layout and survives channel navigation without remounting; and any view in the app is a shareable, bookmarkable URL, which for a work chat tool is not a nicety — "here's the channel" is how people hand off context.
+
+**The trap in this shape** is the convenience redirect. Each layout wants to pick a sensible default for the level below: land on the first team, then its first channel. Written as an effect that fires when the child data arrives, it will happily rewrite a URL that already named a channel — the effect can't tell "no channel chosen yet" from "a channel was chosen, and the list just finished loading." The symptom is specific and confusing: clicking a channel works, but reloading that page or opening the link from Slack silently lands on a different channel. The fix is that the redirect must be conditional on the child param being *absent*, not merely on the data being present.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Redirect only when the child param is absent | Deep links and reloads work; defaults still apply on entry | Every layout that picks a default needs the guard |
+| ❌ Redirect whenever the child list loads | Trivial to write | Silently clobbers deep links — the bug only appears on reload, never while clicking |
+
+> "What makes this worth calling out is that it's invisible to the person who wrote it. You build the app by clicking through it, and clicking is the one path that works. It only shows up when someone pastes a link — which is to say, the first time a real user tries to share something."
+
+## 🔌 Rendering a Stream
+
+The message list is fed by two sources that have to agree: an initial `GET` for history, and an `EventSource` pushing everything after. The subtlety is that those overlap. A message can arrive over the stream while the history fetch is still in flight, and naive append gives you either a duplicate or a message that vanishes when the fetch resolves and replaces the list.
+
+Keying by message ID and merging rather than appending is what makes this safe, and it's the same property that makes the optimistic-send path work: the optimistic message carries a temporary ID, the server's response carries the real one, and the merge reconciles them. Without ID-keyed merging you need send-order assumptions that break the moment two people post at once.
+
+The cost is that the client holds the reconciliation logic — the server just broadcasts and has no idea what any given client already has. The alternative, sequence numbers per channel so a reconnecting client can ask for the gap, moves that burden to the server and would also fix the missed-message problem SSE currently has. It's the right next step, and it's not built.
+
 ## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |

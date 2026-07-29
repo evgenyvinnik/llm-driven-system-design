@@ -13,6 +13,7 @@ import { Route as RegisterRouteImport } from './routes/register'
 import { Route as OrgRouteImport } from './routes/org'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as OrgIndexRouteImport } from './routes/org.index'
 import { Route as OrgOrgIdRouteImport } from './routes/org.$orgId'
 import { Route as OrgOrgIdTeamTeamIdRouteImport } from './routes/org.$orgId.team.$teamId'
 import { Route as OrgOrgIdTeamTeamIdChannelChannelIdRouteImport } from './routes/org.$orgId.team.$teamId.channel.$channelId'
@@ -37,6 +38,11 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const OrgIndexRoute = OrgIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => OrgRoute,
+} as any)
 const OrgOrgIdRoute = OrgOrgIdRouteImport.update({
   id: '/$orgId',
   path: '/$orgId',
@@ -60,15 +66,16 @@ export interface FileRoutesByFullPath {
   '/org': typeof OrgRouteWithChildren
   '/register': typeof RegisterRoute
   '/org/$orgId': typeof OrgOrgIdRouteWithChildren
+  '/org/': typeof OrgIndexRoute
   '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRouteWithChildren
   '/org/$orgId/team/$teamId/channel/$channelId': typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
-  '/org': typeof OrgRouteWithChildren
   '/register': typeof RegisterRoute
   '/org/$orgId': typeof OrgOrgIdRouteWithChildren
+  '/org': typeof OrgIndexRoute
   '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRouteWithChildren
   '/org/$orgId/team/$teamId/channel/$channelId': typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
 }
@@ -79,6 +86,7 @@ export interface FileRoutesById {
   '/org': typeof OrgRouteWithChildren
   '/register': typeof RegisterRoute
   '/org/$orgId': typeof OrgOrgIdRouteWithChildren
+  '/org/': typeof OrgIndexRoute
   '/org/$orgId/team/$teamId': typeof OrgOrgIdTeamTeamIdRouteWithChildren
   '/org/$orgId/team/$teamId/channel/$channelId': typeof OrgOrgIdTeamTeamIdChannelChannelIdRoute
 }
@@ -90,15 +98,16 @@ export interface FileRouteTypes {
     | '/org'
     | '/register'
     | '/org/$orgId'
+    | '/org/'
     | '/org/$orgId/team/$teamId'
     | '/org/$orgId/team/$teamId/channel/$channelId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/login'
-    | '/org'
     | '/register'
     | '/org/$orgId'
+    | '/org'
     | '/org/$orgId/team/$teamId'
     | '/org/$orgId/team/$teamId/channel/$channelId'
   id:
@@ -108,6 +117,7 @@ export interface FileRouteTypes {
     | '/org'
     | '/register'
     | '/org/$orgId'
+    | '/org/'
     | '/org/$orgId/team/$teamId'
     | '/org/$orgId/team/$teamId/channel/$channelId'
   fileRoutesById: FileRoutesById
@@ -148,6 +158,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/org/': {
+      id: '/org/'
+      path: '/'
+      fullPath: '/org/'
+      preLoaderRoute: typeof OrgIndexRouteImport
+      parentRoute: typeof OrgRoute
     }
     '/org/$orgId': {
       id: '/org/$orgId'
@@ -199,10 +216,12 @@ const OrgOrgIdRouteWithChildren = OrgOrgIdRoute._addFileChildren(
 
 interface OrgRouteChildren {
   OrgOrgIdRoute: typeof OrgOrgIdRouteWithChildren
+  OrgIndexRoute: typeof OrgIndexRoute
 }
 
 const OrgRouteChildren: OrgRouteChildren = {
   OrgOrgIdRoute: OrgOrgIdRouteWithChildren,
+  OrgIndexRoute: OrgIndexRoute,
 }
 
 const OrgRouteWithChildren = OrgRoute._addFileChildren(OrgRouteChildren)

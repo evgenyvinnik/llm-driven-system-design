@@ -316,6 +316,25 @@ At extreme scale, split write and read models:
 - **Search**: Elasticsearch for message search across channels
 - **Analytics**: ClickHouse for message volume metrics
 
+## 🔐 Authorization Across the Stack
+
+The hierarchy — organization → team → channel → message — is the product's defining structure, and it's also where the worst possible bug lives. Every level has its own membership table, so "can Alice read this" is a question about which memberships she holds, not one check.
+
+**Server side**, the check belongs inside the query rather than in handler code after the fetch. A handler that loads a message and then decides whether the user may see it has already pulled the row across a trust boundary, and every new endpoint is another chance to forget. As a join, the unauthorized row is simply never selected — the default for a newly written query becomes "returns nothing" instead of "returns everything."
+
+The tempting optimization is to materialize effective permissions per user per channel so reads are one lookup. I'd resist it, because the two failure modes aren't comparable:
+
+| Approach | Read cost | Failure mode |
+|----------|-----------|--------------|
+| ✅ Walk the membership chain per request | Three indexed lookups, joinable into one query | Slow reads — visible on a latency graph, fixable |
+| ❌ Cache effective permissions | One lookup | A missed invalidation is a silent cross-tenant leak that persists until a customer finds it |
+
+**Client side**, the same hierarchy shows up as navigation, and the important discipline is that the UI's checks are for *affordances*, not enforcement. Hiding a channel the user can't access is good UX; it is not security, because the API is reachable without the UI. Every check the client makes must be duplicated on the server, and the client's copy exists only so people aren't shown doors that won't open.
+
+> "The line I'd draw is that the frontend decides what to *render* and the backend decides what to *return*. When those disagree the backend wins, and the visible result is an empty state rather than a leak. Designing so the failure mode is a blank panel instead of someone else's data is the whole point."
+
+**Private channels are the case that justifies the extra table.** `is_private` means team membership stops being sufficient — someone can be on the team and still not belong in the channel. A model deriving channel access from team access can't express that at all, so adding private channels later would mean auditing every query in the system. Carrying channel membership from the start costs a join; retrofitting it costs a rewrite.
+
 ## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
