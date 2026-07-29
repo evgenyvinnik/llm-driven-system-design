@@ -20,33 +20,53 @@
     {
       "name": "01-login",
       "path": "/login",
-      "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "waitFor": "form",
+      "delay": 600
     },
     {
       "name": "02-profiles",
       "path": "/profiles",
-      "waitFor": "main",
-      "delay": 1000
+      "waitFor": "[data-testid='profile-tile']",
+      "delay": 1200
     },
     {
       "name": "03-browse",
-      "path": "/browse",
-      "waitFor": "main",
-      "delay": 1500
+      "path": "/profiles",
+      "waitFor": "[data-testid='profile-tile']",
+      "delay": 1000,
+      "click": "[data-testid='profile-tile']",
+      "clickDelay": 2800
     },
     {
-      "name": "04-my-list",
+      "name": "04-series",
+      "path": "/browse/series",
+      "delay": 2200
+    },
+    {
+      "name": "05-movies",
+      "path": "/browse/movies",
+      "delay": 2200
+    },
+    {
+      "name": "06-title-detail",
+      "path": "/video/c0000000-0000-0000-0000-000000000010",
+      "delay": 2200
+    },
+    {
+      "name": "07-search",
+      "path": "/search?q=the",
+      "delay": 2200
+    },
+    {
+      "name": "08-my-list",
       "path": "/my-list",
-      "waitFor": "main",
-      "delay": 1000
+      "delay": 2000
     },
     {
-      "name": "05-search",
-      "path": "/search",
-      "waitFor": "main, input",
-      "delay": 500
+      "name": "09-watch",
+      "path": "/watch/c0000000-0000-0000-0000-000000000001",
+      "delay": 2500
     }
   ],
   "viewport": {

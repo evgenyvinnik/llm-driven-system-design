@@ -40,6 +40,7 @@ export function ProfilesPage() {
         {profiles.map((profile, index) => (
           <button
             key={profile.id}
+            data-testid="profile-tile"
             onClick={() => handleSelectProfile(profile.id)}
             className="group flex flex-col items-center"
           >
