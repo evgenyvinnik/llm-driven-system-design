@@ -23,24 +23,34 @@ export default function MasonryGrid({
   isLoading,
   onSavePin,
 }: MasonryGridProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(0);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
 
-  // Use ResizeObserver to track container width
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
+  /**
+   * Attach the ResizeObserver via a *callback ref*, not a mount effect.
+   *
+   * This component early-returns an empty state when there are no pins, so on
+   * first render the grid div doesn't exist and `containerRef.current` is null.
+   * A `useEffect(..., [])` therefore bailed out and — because its dependency
+   * list is empty — never ran again once pins arrived and the div mounted.
+   * `containerWidth` stayed 0 forever, which made `columnWidth` 0, so every pin
+   * was laid out at left 0 with no width: the masonry grid collapsed into one
+   * overlapping stack. A callback ref fires whenever the node actually attaches.
+   */
+  const setContainerNode = useCallback((node: HTMLDivElement | null) => {
+    resizeObserverRef.current?.disconnect();
+    resizeObserverRef.current = null;
 
+    if (!node) return;
+
+    setContainerWidth(node.clientWidth);
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
         setContainerWidth(entry.contentRect.width);
       }
     });
-
-    observer.observe(container);
-    setContainerWidth(container.clientWidth);
-
-    return () => observer.disconnect();
+    observer.observe(node);
+    resizeObserverRef.current = observer;
   }, []);
 
   // Calculate column count based on container width
@@ -100,7 +110,7 @@ export default function MasonryGrid({
       className="h-[calc(100vh-72px)] overflow-auto"
       style={{ contain: 'strict' }}
     >
-      <div ref={containerRef} className="px-4 max-w-screen-2xl mx-auto">
+      <div ref={setContainerNode} className="px-4 max-w-screen-2xl mx-auto">
         {/* Masonry container with absolute positioning */}
         <div
           className="relative w-full"

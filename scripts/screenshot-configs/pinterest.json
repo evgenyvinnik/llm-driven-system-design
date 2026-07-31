@@ -48,6 +48,23 @@
       "path": "/profile/alice",
       "waitFor": "main",
       "delay": 1500
+    },
+    {
+      "name": "06-pin-detail",
+      "path": "/pin/0000f001-0000-0000-0000-000000000001",
+      "delay": 2500
+    },
+    {
+      "name": "07-board",
+      "path": "/board/0000b001-0000-0000-0000-000000000001",
+      "delay": 2500
+    },
+    {
+      "name": "08-profile-saved",
+      "path": "/profile/alice",
+      "delay": 2000,
+      "click": "button:has-text('Saved')",
+      "clickDelay": 1800
     }
   ],
   "viewport": {

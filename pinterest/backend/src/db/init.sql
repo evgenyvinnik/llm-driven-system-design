@@ -21,9 +21,9 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_users_username ON users(username);
-CREATE INDEX idx_users_email ON users(email);
-CREATE INDEX idx_users_created_at ON users(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC);
 
 -- ============================================
 -- Pins
@@ -46,11 +46,11 @@ CREATE TABLE IF NOT EXISTS pins (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_pins_user_id ON pins(user_id);
-CREATE INDEX idx_pins_status ON pins(status);
-CREATE INDEX idx_pins_created_at ON pins(created_at DESC);
-CREATE INDEX idx_pins_user_created ON pins(user_id, created_at DESC);
-CREATE INDEX idx_pins_save_count ON pins(save_count DESC);
+CREATE INDEX IF NOT EXISTS idx_pins_user_id ON pins(user_id);
+CREATE INDEX IF NOT EXISTS idx_pins_status ON pins(status);
+CREATE INDEX IF NOT EXISTS idx_pins_created_at ON pins(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pins_user_created ON pins(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pins_save_count ON pins(save_count DESC);
 
 -- ============================================
 -- Boards
@@ -68,8 +68,8 @@ CREATE TABLE IF NOT EXISTS boards (
     UNIQUE(user_id, name)
 );
 
-CREATE INDEX idx_boards_user_id ON boards(user_id);
-CREATE INDEX idx_boards_created_at ON boards(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_boards_user_id ON boards(user_id);
+CREATE INDEX IF NOT EXISTS idx_boards_created_at ON boards(created_at DESC);
 
 -- ============================================
 -- Board Pins (many-to-many)
@@ -83,9 +83,9 @@ CREATE TABLE IF NOT EXISTS board_pins (
     UNIQUE(board_id, pin_id)
 );
 
-CREATE INDEX idx_board_pins_board_id ON board_pins(board_id);
-CREATE INDEX idx_board_pins_pin_id ON board_pins(pin_id);
-CREATE INDEX idx_board_pins_position ON board_pins(board_id, position);
+CREATE INDEX IF NOT EXISTS idx_board_pins_board_id ON board_pins(board_id);
+CREATE INDEX IF NOT EXISTS idx_board_pins_pin_id ON board_pins(pin_id);
+CREATE INDEX IF NOT EXISTS idx_board_pins_position ON board_pins(board_id, position);
 
 -- ============================================
 -- Follows
@@ -99,8 +99,8 @@ CREATE TABLE IF NOT EXISTS follows (
     CHECK(follower_id != following_id)
 );
 
-CREATE INDEX idx_follows_follower_id ON follows(follower_id);
-CREATE INDEX idx_follows_following_id ON follows(following_id);
+CREATE INDEX IF NOT EXISTS idx_follows_follower_id ON follows(follower_id);
+CREATE INDEX IF NOT EXISTS idx_follows_following_id ON follows(following_id);
 
 -- ============================================
 -- Pin Comments
@@ -114,9 +114,9 @@ CREATE TABLE IF NOT EXISTS pin_comments (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_pin_comments_pin_id ON pin_comments(pin_id, created_at DESC);
-CREATE INDEX idx_pin_comments_user_id ON pin_comments(user_id);
-CREATE INDEX idx_pin_comments_parent ON pin_comments(parent_comment_id);
+CREATE INDEX IF NOT EXISTS idx_pin_comments_pin_id ON pin_comments(pin_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pin_comments_user_id ON pin_comments(user_id);
+CREATE INDEX IF NOT EXISTS idx_pin_comments_parent ON pin_comments(parent_comment_id);
 
 -- ============================================
 -- Pin Saves (save to board)
@@ -130,6 +130,6 @@ CREATE TABLE IF NOT EXISTS pin_saves (
     UNIQUE(pin_id, user_id, board_id)
 );
 
-CREATE INDEX idx_pin_saves_pin_id ON pin_saves(pin_id);
-CREATE INDEX idx_pin_saves_user_id ON pin_saves(user_id);
-CREATE INDEX idx_pin_saves_board_id ON pin_saves(board_id);
+CREATE INDEX IF NOT EXISTS idx_pin_saves_pin_id ON pin_saves(pin_id);
+CREATE INDEX IF NOT EXISTS idx_pin_saves_user_id ON pin_saves(user_id);
+CREATE INDEX IF NOT EXISTS idx_pin_saves_board_id ON pin_saves(board_id);
