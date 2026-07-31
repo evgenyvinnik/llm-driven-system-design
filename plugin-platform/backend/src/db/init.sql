@@ -54,7 +54,11 @@ CREATE TABLE IF NOT EXISTS plugin_versions (
     min_platform_version VARCHAR(20),
     file_size INTEGER,
     checksum VARCHAR(64),
-    created_at TIMESTAMP DEFAULT NOW(),
+    -- `published_at`, not `created_at`: a plugin_versions row *is* a publication
+    -- event, and every query in the API already referred to it by this name —
+    -- the schema was the odd one out, so listing versions or resolving a
+    -- plugin's latest version failed with `column "published_at" does not exist`.
+    published_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(plugin_id, version)
 );
 

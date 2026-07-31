@@ -19,8 +19,8 @@ userPluginsRouter.get('/', async (req: Request, res: Response) => {
       sql = `
         SELECT
           up.plugin_id,
-          up.version,
-          up.enabled,
+          up.version_installed AS version,
+          up.is_enabled AS enabled,
           up.settings,
           up.installed_at,
           p.name,
@@ -32,7 +32,7 @@ userPluginsRouter.get('/', async (req: Request, res: Response) => {
           pv.bundle_url
         FROM user_plugins up
         JOIN plugins p ON p.id = up.plugin_id
-        JOIN plugin_versions pv ON pv.plugin_id = p.id AND pv.version = up.version
+        JOIN plugin_versions pv ON pv.plugin_id = p.id AND pv.version = up.version_installed
         WHERE up.user_id = $1
         ORDER BY up.installed_at DESC
       `;
@@ -42,8 +42,8 @@ userPluginsRouter.get('/', async (req: Request, res: Response) => {
       sql = `
         SELECT
           ai.plugin_id,
-          ai.version,
-          ai.enabled,
+          ai.version_installed AS version,
+          ai.is_enabled AS enabled,
           ai.settings,
           ai.installed_at,
           p.name,
@@ -55,7 +55,7 @@ userPluginsRouter.get('/', async (req: Request, res: Response) => {
           pv.bundle_url
         FROM anonymous_installs ai
         JOIN plugins p ON p.id = ai.plugin_id
-        JOIN plugin_versions pv ON pv.plugin_id = p.id AND pv.version = ai.version
+        JOIN plugin_versions pv ON pv.plugin_id = p.id AND pv.version = ai.version_installed
         WHERE ai.session_id = $1
         ORDER BY ai.installed_at DESC
       `;
