@@ -71,10 +71,10 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '24 hours'
 );
 
-CREATE INDEX idx_transactions_sender ON transactions(sender_id, created_at DESC);
-CREATE INDEX idx_transactions_recipient ON transactions(recipient_id, created_at DESC);
-CREATE INDEX idx_ledger_wallet ON ledger_entries(wallet_id, created_at DESC);
-CREATE INDEX idx_transfer_requests_payer ON transfer_requests(payer_id, status);
-CREATE INDEX idx_transfer_requests_requester ON transfer_requests(requester_id);
-CREATE INDEX idx_payment_methods_user ON payment_methods(user_id);
-CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
+CREATE INDEX IF NOT EXISTS idx_transactions_sender ON transactions(sender_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_recipient ON transactions(recipient_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_wallet ON ledger_entries(wallet_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transfer_requests_payer ON transfer_requests(payer_id, status);
+CREATE INDEX IF NOT EXISTS idx_transfer_requests_requester ON transfer_requests(requester_id);
+CREATE INDEX IF NOT EXISTS idx_payment_methods_user ON payment_methods(user_id);
+CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at);

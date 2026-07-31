@@ -327,6 +327,16 @@ When sender and recipient are on different database shards, we need a two-phase 
 - PostgreSQL default max_connections is 100, sufficient for Phase 1-2
 - Phase 3+ uses PgBouncer for connection pooling across multiple API servers
 
+## 💰 Deposits and Withdrawals Break the Pairing
+
+Worth stating explicitly, because it changes what the reconciliation check can assert: **transfers are two-sided, deposits and withdrawals are not.**
+
+A transfer debits one wallet and credits another inside one transaction, so its entries sum to zero. A deposit has no internal counterparty — money arrives from a bank we don't control — so it produces a credit with nothing to pair against. A withdrawal is the mirror.
+
+This is why the invariant is written **per wallet** rather than per transaction: `SUM(credits) − SUM(debits)` for a wallet must equal its `balance_cents`. That holds for all three shapes. Had it been "every transaction's entries must sum to zero," deposits would fail it, and the natural workaround is to invent an internal account representing the bank so the books balance. That's a legitimate design — it's what you'd do if you needed to reconcile against bank statements — but it adds an account and a reconciliation surface to solve a problem this system doesn't have yet.
+
+The status field matters more here too. An internal transfer is atomic: it committed or it didn't. A withdrawal sits `pending` until an external system confirms, so the API has to expose a state that isn't yet final, and the client has to render it as such rather than optimistically showing the money as gone.
+
 ## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |

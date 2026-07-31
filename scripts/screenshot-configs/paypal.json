@@ -53,6 +53,20 @@
       "path": "/payment-methods",
       "waitFor": "main, h1",
       "delay": 1000
+    },
+    {
+      "name": "07-activity-deposits",
+      "path": "/activity",
+      "delay": 2000,
+      "click": "button:has-text('Deposits')",
+      "clickDelay": 1500
+    },
+    {
+      "name": "08-activity-withdrawals",
+      "path": "/activity",
+      "delay": 2000,
+      "click": "button:has-text('Withdrawals')",
+      "clickDelay": 1500
     }
   ],
   "viewport": {

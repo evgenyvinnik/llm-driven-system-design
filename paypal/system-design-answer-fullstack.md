@@ -276,6 +276,24 @@ GET /api/users/search?q=       Search users for send/request
 - Send/request forms: max-width 560px centered, large touch targets for amount input
 - Navigation: horizontal on desktop, condensed for mobile
 
+## 🔒 Two Wallets, One Lock Order
+
+The transfer path is the only place in this system that touches **two** contended rows, and that's what makes it the interesting one.
+
+Deposits and withdrawals touch a single wallet, so optimistic locking is enough: read the version, write conditionally, retry on conflict. A transfer locks both the sender's and the recipient's wallet — and two users paying each other at the same moment is the textbook deadlock. A locks its own wallet then reaches for B's; B locks its own then reaches for A's; neither can proceed and the database kills one after its deadlock timeout.
+
+The fix is not a bigger lock or a longer timeout — it's **acquiring both locks in a consistent order** (here, by user id). Two transactions wanting the same pair of wallets will always take them in the same sequence, so one simply waits for the other. A cycle can't form because there's no ordering in which each holds what the other wants.
+
+| Approach | Concurrent A→B and B→A | Cost |
+|----------|------------------------|------|
+| ✅ `SELECT … FOR UPDATE` in a consistent order | One waits a few ms, then both succeed | Transfers touching the same wallet serialize |
+| ❌ Lock in request order | Deadlock; the database aborts one transaction | Retries, and a user-visible failure for a valid transfer |
+| ❌ Optimistic version check on both | No deadlock, but conflicts are frequent on a hot wallet | Every conflict is a retry the *user* has to absorb |
+
+> "The reason I'd reach for pessimistic locking here specifically, when optimistic is usually the better default, is what a failed retry *means*. For a deposit, retrying is invisible — same amount, same intent. For a transfer, by the time you retry the balance may no longer cover it, so a retry isn't a repeat of the same operation, it's a new decision the user has to make. Serializing on the row costs milliseconds; making the user re-confirm costs their trust in the product."
+
+What we give up is throughput on a hot wallet: a popular payee serializes everyone paying them. That's the ceiling, and the escape hatch is an append-only ledger with an asynchronously projected balance — at which point "what's my balance" becomes eventually consistent, which is a much harder thing to explain to someone looking at their money.
+
 ## 📈 Scalability Path
 
 **Phase 1 (Current):** Single PostgreSQL, single API server, Redis sessions. ~100 TPS.
@@ -305,6 +323,24 @@ For most applications, React Query or SWR provide excellent developer experience
 **Form state isolation:**
 
 Each payment form (send, request) manages its own state with `useState`. When the component unmounts (user navigates away), state is naturally discarded. There's no need to persist half-filled payment forms -- re-entering a recipient and amount takes seconds, and stale form data is dangerous (the recipient could have changed their username).
+
+## 💰 Not Every Money Movement Is Two-Sided
+
+A detail that shapes both the schema and the UI: **transfers are paired, deposits and withdrawals are not.**
+
+A P2P transfer debits one wallet and credits another, and those two ledger entries must sum to zero — that's the invariant the whole double-entry model exists to protect. A deposit has no internal counterparty: money arrives from a bank the system doesn't control, so there is a credit and nothing to pair it with inside our books. A withdrawal is the mirror.
+
+| Movement | Internal entries | Counterparty | What the invariant checks |
+|----------|------------------|--------------|---------------------------|
+| Transfer | Debit sender, credit recipient | Another wallet | Debits and credits cancel exactly |
+| Deposit | Credit only | External funding source | `SUM(credits) − SUM(debits)` per wallet still equals `balance_cents` |
+| Withdrawal | Debit only | External bank account | Same, in the other direction |
+
+> "The reconciliation invariant is *per wallet*, not per transaction — `SUM(credits) − SUM(debits)` for a wallet must equal its stored balance. That holds for all three shapes. If I'd written the check as 'every transaction's entries sum to zero,' deposits and withdrawals would fail it, and the temptation would be to invent a fake internal account to balance against. Some ledgers do exactly that, modelling the bank as an account — it's defensible, and it makes the stronger per-transaction invariant hold. I'd only take it on if we needed to reconcile against bank statements, because that's the problem it actually solves."
+
+**This shows up in the UI too.** The activity feed renders a transfer as "From Bob Smith" or "To Carol Williams" — it has a person to name. A deposit or withdrawal has no person, so it renders as the movement itself plus its funding source ("Transfer from Chase Checking"). A feed that assumed every row had a counterparty would render a blank name or crash on a null; the type field is what tells the client which shape it's looking at.
+
+**And it's where status matters most.** A transfer between two internal wallets is atomic — it committed or it didn't. A withdrawal is `pending` until an external system confirms, which is a state the UI has to represent honestly rather than optimistically showing the money as gone.
 
 ## ⚖️ Trade-offs Summary
 
