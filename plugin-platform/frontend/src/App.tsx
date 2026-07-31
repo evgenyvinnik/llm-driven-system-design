@@ -56,6 +56,7 @@ function EditorLayout(): React.ReactElement {
           <div className="flex items-center gap-3">
             {/* Marketplace button */}
             <button
+              data-testid="open-marketplace"
               onClick={() => setShowMarketplace(true)}
               className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors"
             >
@@ -76,6 +77,7 @@ function EditorLayout(): React.ReactElement {
               </div>
             ) : (
               <button
+                data-testid="open-auth"
                 onClick={() => setShowAuth(true)}
                 className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline"
               >

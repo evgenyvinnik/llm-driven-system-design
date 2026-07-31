@@ -12,8 +12,21 @@
     {
       "name": "01-editor",
       "path": "/",
-      "waitFor": "header, main",
-      "delay": 1500
+      "delay": 2000
+    },
+    {
+      "name": "02-marketplace",
+      "path": "/",
+      "delay": 1800,
+      "click": "[data-testid='open-marketplace']",
+      "clickDelay": 2200
+    },
+    {
+      "name": "03-sign-in",
+      "path": "/",
+      "delay": 1500,
+      "click": "[data-testid='open-auth']",
+      "clickDelay": 1500
     }
   ],
   "viewport": {

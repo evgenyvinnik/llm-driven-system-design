@@ -61,6 +61,22 @@ function createPluginContext(pluginId: string): PluginContext {
 // Slot contributions store
 const slotContributions = new Map<SlotId, SlotContributionEntry[]>();
 
+/**
+ * Registers a plugin's contribution into a slot.
+ *
+ * Registration must be **idempotent**. `slotContributions` is module-level
+ * state, while the loader that fills it runs inside a `useEffect` with no
+ * cleanup — so React StrictMode's deliberate double-invoke in development ran
+ * the whole load pass twice and pushed every contribution a second time. The
+ * visible result was a duplicated UI: two font pickers, two size pickers, two
+ * theme toggles, and a status bar reading "0 words | 0 characters | 1 lines"
+ * twice over. `loadedPlugins` is a Map keyed by plugin id so it deduped itself;
+ * this array did not.
+ *
+ * A plugin contributing the same component to the same slot twice is always a
+ * re-registration, never two legitimate entries, so replacing on match is both
+ * safe and what the caller means.
+ */
 function registerSlotContribution(
   slot: SlotId,
   entry: SlotContributionEntry
@@ -68,9 +84,17 @@ function registerSlotContribution(
   if (!slotContributions.has(slot)) {
     slotContributions.set(slot, []);
   }
-  slotContributions.get(slot)!.push(entry);
+  const entries = slotContributions.get(slot)!;
+  const existing = entries.findIndex(
+    (e) => e.pluginId === entry.pluginId && e.component === entry.component
+  );
+  if (existing >= 0) {
+    entries[existing] = entry;
+  } else {
+    entries.push(entry);
+  }
   // Sort by order
-  slotContributions.get(slot)!.sort((a, b) => a.order - b.order);
+  entries.sort((a, b) => a.order - b.order);
 }
 
 // Plugin Host Context
