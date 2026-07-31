@@ -70,7 +70,7 @@ Design the backend infrastructure for a payment processing system that:
 
 | Table | Key Columns | Indexes | Notes |
 |-------|-------------|---------|-------|
-| **merchants** | id (UUID PK), name, email (unique), api_key_hash (SHA-256), webhook_url, webhook_secret, default_currency, status, created_at | Primary key on id, unique on email | API key stored as hash only; status defaults to 'active' |
+| **merchants** | id (UUID PK), account_id (FK→accounts), name, email (unique), api_key_hash (bcrypt), webhook_url, webhook_secret, default_currency, status, created_at | Primary key on id, unique on email | API key stored as a bcrypt hash, never in plaintext. Each merchant owns an `accounts` row — the ledger credits *that* account, so sharing one with a system account would make the books incoherent |
 | **transactions** | id (UUID PK), merchant_id (FK→merchants), idempotency_key, amount (BIGINT, smallest currency unit), currency, captured_amount, refunded_amount, status, failure_code, processor_ref, fraud_score, fraud_flags (JSONB), version (optimistic lock), created_at, updated_at | UNIQUE(merchant_id, idempotency_key) | Status values: pending, authorized, captured, voided, failed, refunded. Amount in cents avoids floating-point issues |
 | **ledger_entries** | id (UUID PK), transaction_id (FK→transactions), entry_type (debit/credit), account_type, amount (BIGINT), currency, balance_after, created_at | Primary key on id | Account types: merchant_balance, platform_fee, processor_cost. Every transaction must have balanced entries |
 | **audit_log** | id (BIGSERIAL PK), entity_type, entity_id, action, actor_type, actor_id, changes (JSONB), ip_address (INET), created_at | Primary key on id | PCI compliance requirement; immutable append-only log |
@@ -84,6 +84,8 @@ Design the backend infrastructure for a payment processing system that:
 | idx_transactions_status | transactions(status, created_at) WHERE status IN ('authorized', 'captured') | Partial index for pending settlement processing |
 | idx_ledger_account_time | ledger_entries(account_type, created_at) | Ledger reconciliation queries by account type |
 | idx_audit_entity | audit_log(entity_type, entity_id, created_at DESC) | Audit trail lookups for specific entities |
+
+> "One consequence of bcrypt worth flagging: bcrypt hashes are salted, so they aren't reversible *or* indexable. You cannot look a merchant up by hashing the presented key — you have to load candidate merchants and `bcrypt.compare` against each. That's fine at a handful of merchants and O(n) bcrypt operations per request at scale, which is a denial-of-service waiting to happen. The fix is a structured key, `pk_<key_id>_<secret>`: index on `key_id` for an O(1) lookup, then run exactly one bcrypt comparison against that row's hash. You keep the property that a database leak doesn't yield usable keys, and you stop paying for it linearly."
 
 ### Why PostgreSQL Over Alternatives?
 
