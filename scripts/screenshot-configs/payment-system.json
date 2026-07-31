@@ -19,33 +19,39 @@
     {
       "name": "01-login",
       "path": "/login",
-      "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "waitFor": "form",
+      "delay": 600
     },
     {
-      "name": "02-home",
+      "name": "02-dashboard",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1000
+      "delay": 2200
     },
     {
       "name": "03-transactions",
       "path": "/transactions",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 2200
     },
     {
-      "name": "04-refunds",
+      "name": "04-transaction-detail",
+      "path": "/transactions/a1000000-0000-4000-8000-000000000001",
+      "delay": 2200
+    },
+    {
+      "name": "05-authorized-payment",
+      "path": "/transactions/a1000000-0000-4000-8000-000000000004",
+      "delay": 2200
+    },
+    {
+      "name": "06-refunds",
       "path": "/refunds",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 2000
     },
     {
-      "name": "05-test-payment",
+      "name": "07-test-payment",
       "path": "/test-payment",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 1800
     }
   ],
   "viewport": {

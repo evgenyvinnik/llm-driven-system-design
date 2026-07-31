@@ -219,6 +219,6 @@ function Transactions() {
   );
 }
 
-export const Route = createFileRoute('/transactions')({
+export const Route = createFileRoute('/transactions/')({
   component: Transactions,
 });

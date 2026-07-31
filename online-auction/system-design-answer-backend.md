@@ -502,51 +502,19 @@ Multiple API servers receive simultaneous bids for the same auction. Without coo
 
 ### 8. Prometheus Metrics (3 minutes)
 
-#### Key Metrics
+The metrics are chosen to answer the two questions this system actually fails on: *is the bid path getting slower under contention*, and *is the lock rejecting more people than it's protecting*.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       PROMETHEUS METRICS                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Bid Metrics:                                                            │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ bid_placement_duration_seconds (Histogram)                    │      │
-│  │   Labels: status                                              │      │
-│  │   Buckets: 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5                 │      │
-│  │                                                               │      │
-│  │ bids_placed_total (Counter)                                   │      │
-│  │   Labels: status, is_auto_bid                                 │      │
-│  │                                                               │      │
-│  │ auction_current_bid_amount (Gauge)                            │      │
-│  │   Labels: auction_id                                          │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  Lock Metrics:                                                           │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ distributed_lock_hold_duration_seconds (Histogram)            │      │
-│  │   Labels: lock_type                                           │      │
-│  │                                                               │      │
-│  │ distributed_lock_contention_total (Counter)                   │      │
-│  │   Labels: lock_type                                           │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  Auction Metrics:                                                        │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ auctions_ended_total (Counter)                                │      │
-│  │   Labels: outcome (sold, unsold, cancelled)                   │      │
-│  │                                                               │      │
-│  │ active_auctions_count (Gauge)                                 │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  Cache Metrics:                                                          │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ cache_hits_total (Counter) - Labels: cache_type               │      │
-│  │ cache_misses_total (Counter) - Labels: cache_type             │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Metric | Type | Labels | What it tells you |
+|--------|------|--------|-------------------|
+| `bid_placement_duration_seconds` | Histogram | status | Where the bid path's tail latency lives; buckets run 10ms→5s because the interesting movement is under a second |
+| `bids_placed_total` | Counter | status, is_auto_bid | Accept/reject ratio, and how much volume is proxy bids rather than humans |
+| `distributed_lock_hold_duration_seconds` | Histogram | lock_type | How long one bidder blocks the rest — this is the auction's real throughput ceiling |
+| `distributed_lock_contention_total` | Counter | lock_type | Every 429 a bidder saw. Rising contention with flat hold duration means genuine demand; rising both means the transaction got slower |
+| `auctions_ended_total` | Counter | outcome (sold/unsold/cancelled) | Whether reserve prices are set sensibly — a high unsold rate is a pricing problem, not a systems one |
+| `active_auctions_count` | Gauge | — | Scheduler load, and a sanity check that closings are actually happening |
+| `cache_hits_total` / `cache_misses_total` | Counter | cache_type | Whether the auction cache is earning its invalidation complexity |
+
+> "The pairing I'd watch on a dashboard is lock hold duration against contention count. Contention alone doesn't tell you anything — a popular auction *should* have contention. But if hold duration starts climbing at the same time, the transaction itself has slowed down and every bidder behind it is now waiting longer for the same answer. That's the signal that the bid path needs work, and it arrives well before users start complaining."
 
 ---
 

@@ -20,37 +20,52 @@
     {
       "name": "01-login",
       "path": "/login",
-      "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "waitFor": "form",
+      "delay": 600
     },
     {
-      "name": "02-home",
+      "name": "02-browse",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1500
+      "delay": 2500
     },
     {
-      "name": "03-create",
-      "path": "/create",
-      "waitFor": "main",
-      "delay": 500
+      "name": "03-auction-detail",
+      "path": "/auction/20000000-0000-4000-8000-000000000001",
+      "delay": 2800,
+      "loginAs": {
+        "email": "nadia@auction.com",
+        "password": "password123"
+      }
     },
     {
-      "name": "04-my-auctions",
+      "name": "04-auction-ended",
+      "path": "/auction/20000000-0000-4000-8000-000000000007",
+      "delay": 2200
+    },
+    {
+      "name": "05-my-auctions",
       "path": "/my-auctions",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 2200
     },
     {
-      "name": "05-watchlist",
+      "name": "06-watchlist",
       "path": "/watchlist",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 2200
+    },
+    {
+      "name": "07-notifications",
+      "path": "/notifications",
+      "delay": 2000
+    },
+    {
+      "name": "08-create",
+      "path": "/create",
+      "delay": 1800
     }
   ],
   "viewport": {
     "width": 1440,
-    "height": 900
+    "height": 1200
   }
 }

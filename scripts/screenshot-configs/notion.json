@@ -20,15 +20,31 @@
     {
       "name": "01-login",
       "path": "/login",
-      "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "waitFor": "form",
+      "delay": 600
     },
     {
       "name": "02-home",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1500
+      "delay": 2500
+    },
+    {
+      "name": "03-page-editor",
+      "path": "/page/00000000-0000-0000-0000-000000000002",
+      "delay": 2500
+    },
+    {
+      "name": "04-database-table",
+      "path": "/page/00000000-0000-0000-0000-000000000003",
+      "delay": 2500
+    },
+    {
+      "name": "05-database-board",
+      "path": "/page/00000000-0000-0000-0000-000000000003",
+      "delay": 2000,
+      "click": "[data-testid='view-tab-board']",
+      "clickDelay": 1800
     }
   ],
   "viewport": {

@@ -58,7 +58,10 @@ INSERT INTO blocks (id, page_id, type, content, position) VALUES
     ('00000000-0000-0000-0000-000000000016', '00000000-0000-0000-0000-000000000002', 'bulleted_list', '[{"text": "Databases with views (table, board, list)"}]'::jsonb, 'g'),
     ('00000000-0000-0000-0000-000000000017', '00000000-0000-0000-0000-000000000002', 'heading_2', '[{"text": "Try it out!"}]'::jsonb, 'h'),
     ('00000000-0000-0000-0000-000000000018', '00000000-0000-0000-0000-000000000002', 'text', '[{"text": "Start editing this page or create a new one from the sidebar."}]'::jsonb, 'i'),
-    ('00000000-0000-0000-0000-000000000019', '00000000-0000-0000-0000-000000000002', 'code', '[{"text": "// Example code block\\nconsole.log(\"Hello, Notion!\");"}]'::jsonb, 'j')
+    ('00000000-0000-0000-0000-000000000019', '00000000-0000-0000-0000-000000000002', 'code', -- A single backslash here: the SQL literal passes `\n` through to the JSON
+    -- parser, which turns it into a real newline. Doubling it (`\\n`) makes JSON
+    -- see an escaped backslash, so the code block rendered a literal "\n".
+    '[{"text": "// Example code block\nconsole.log(\"Hello, Notion!\");"}]'::jsonb, 'j')
 ON CONFLICT DO NOTHING;
 
 -- Insert sample database rows for Tasks

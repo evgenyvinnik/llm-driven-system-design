@@ -131,6 +131,7 @@ export default function DatabaseView({
           return (
             <button
               key={view.id}
+              data-testid={`view-tab-${view.type}`}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors ${
                 isActive
                   ? 'bg-notion-hover font-medium'

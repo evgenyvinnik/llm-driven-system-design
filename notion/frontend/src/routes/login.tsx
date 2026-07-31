@@ -89,7 +89,7 @@ function LoginPage() {
         <div className="mt-4 p-3 bg-notion-background-secondary rounded-md text-sm">
           <p className="font-medium mb-1">Demo credentials:</p>
           <p className="text-notion-text-secondary">Email: admin@notion.local</p>
-          <p className="text-notion-text-secondary">Password: admin123</p>
+          <p className="text-notion-text-secondary">Password: password123</p>
         </div>
       </div>
     </div>

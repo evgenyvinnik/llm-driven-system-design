@@ -50,6 +50,21 @@ function App() {
     }
   }, [isLoading, token, connect]);
 
+  // Don't route until the session check has finished.
+  //
+  // `partialize` persists only the token, so `isAuthenticated` starts false on
+  // every page load and `checkAuth` is what flips it — from the effect above,
+  // which runs *after* the routed component's own guard effect. Rendering the
+  // router immediately therefore sent an authenticated user to /login on every
+  // guarded route; /login then saw the restored session and bounced them to /,
+  // so "go to /notifications" silently landed on the browse page.
+  //
+  // Gating here fixes all five guarded routes at once, rather than teaching
+  // each one to wait.
+  if (isLoading) {
+    return null;
+  }
+
   return <RouterProvider router={router} />;
 }
 

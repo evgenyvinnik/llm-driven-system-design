@@ -71,9 +71,16 @@ function IndexPage() {
 }
 
 export const Route = createFileRoute('/')({
-  beforeLoad: ({ context: _context }) => {
-    const isAuthenticated = useAuthStore.getState().isAuthenticated;
-    if (!isAuthenticated) {
+  beforeLoad: async () => {
+    // `isAuthenticated` is initialised to false even when a token was restored
+    // from localStorage, and `checkAuth` only runs from the root component's
+    // effect — which is *after* this guard. Reading the flag directly therefore
+    // redirected every authenticated user to /login on any load or reload, so
+    // the app was unusable past the login screen. Await the session check first.
+    if (useAuthStore.getState().isLoading) {
+      await useAuthStore.getState().checkAuth();
+    }
+    if (!useAuthStore.getState().isAuthenticated) {
       throw redirect({ to: '/login' });
     }
   },

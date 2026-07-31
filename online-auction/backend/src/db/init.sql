@@ -10,11 +10,19 @@ CREATE TABLE users (
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Auctions table
+-- All timestamp columns are TIMESTAMPTZ, not naive TIMESTAMP.
+--
+-- node-postgres parses a naive TIMESTAMP as *local* time. With the database in
+-- UTC and the app running anywhere else, every `end_time` came back shifted by
+-- the local offset — an auction seeded to end in 11 minutes rendered as "Ends in
+-- 7h 10m", and the scheduler's "what is due now" comparison was wrong by the
+-- same amount. An auction platform is a clock with a shop attached; this column
+-- type is load-bearing.
 CREATE TABLE auctions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     seller_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -25,14 +33,14 @@ CREATE TABLE auctions (
     current_price DECIMAL(12,2) NOT NULL,
     reserve_price DECIMAL(12,2),
     bid_increment DECIMAL(12,2) DEFAULT 1.00,
-    start_time TIMESTAMP NOT NULL,
-    end_time TIMESTAMP NOT NULL,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('pending', 'active', 'ended', 'cancelled')),
     winner_id UUID REFERENCES users(id),
     winning_bid_id UUID,
     snipe_protection_minutes INTEGER DEFAULT 2,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
     version INTEGER DEFAULT 0,
     CONSTRAINT valid_times CHECK (end_time > start_time)
 );
@@ -44,7 +52,7 @@ CREATE TABLE bids (
     bidder_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     amount DECIMAL(12,2) NOT NULL CHECK (amount > 0),
     is_auto_bid BOOLEAN DEFAULT false,
-    created_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     sequence_num SERIAL
 );
 
@@ -55,8 +63,8 @@ CREATE TABLE auto_bids (
     bidder_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     max_amount DECIMAL(12,2) NOT NULL CHECK (max_amount > 0),
     is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(auction_id, bidder_id)
 );
 
@@ -65,7 +73,7 @@ CREATE TABLE watchlist (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     auction_id UUID NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
-    created_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(user_id, auction_id)
 );
 
@@ -77,7 +85,7 @@ CREATE TABLE notifications (
     type VARCHAR(50) NOT NULL,
     message TEXT NOT NULL,
     is_read BOOLEAN DEFAULT false,
-    created_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Sessions table for authentication
@@ -85,8 +93,8 @@ CREATE TABLE sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token VARCHAR(255) UNIQUE NOT NULL,
-    expires_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW()
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Indexes for performance

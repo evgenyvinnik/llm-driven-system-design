@@ -204,6 +204,46 @@ The velocity check uses a sliding window implemented with a Redis sorted set. Fo
 
 All four commands execute in a single MULTI/EXEC pipeline. The resulting count maps to a score: >10 transactions/hour = 50 (very high velocity), >5 = 30 (high), >2 = 15 (moderate), otherwise 0 (normal).
 
+## Deep Dive: The Authorize/Capture Split
+
+> "Every payment API makes you choose whether 'charge the card' is one operation or two. Splitting it is the decision that shapes the ledger."
+
+**Authorize** places a hold on the customer's card: the funds are reserved and the available credit drops, but no money has moved. **Capture** is what actually pulls it. Between them sits **void**, which releases the hold; after capture, the only way back is a **refund**, which is a new movement of money in the opposite direction rather than an undo.
+
+The reason to split is that the merchant usually doesn't know at authorization time whether they can fulfil. A pre-order authorizes today and captures on dispatch, possibly weeks later. Charging up front and refunding on failure looks equivalent and isn't: the customer's money genuinely left their account, refunds take days to land, and — for the platform — the transaction now carries a fee reversal and shows up in refund-rate metrics that are supposed to measure product problems, not inventory problems.
+
+**Where this lands in the ledger is the important part: only capture writes entries.**
+
+| State | Money moved | Ledger entries | Available actions |
+|-------|-------------|----------------|-------------------|
+| authorized | No — hold only | None | capture, void |
+| captured | Yes | Debit AR, credit merchant (net), credit revenue (fee) | refund |
+| voided | No | None, ever | — (terminal) |
+| failed | No | None | — (terminal) |
+| refunded | Yes, then back | Capture entries plus a mirrored reversal including the fee giveback | — |
+
+> "An authorized payment is a business event with no accounting consequence, and that distinction is exactly what a ledger is for. If authorization wrote entries, the books would show revenue for money the platform doesn't have and may never receive — every abandoned pre-order would need a compensating entry, and the ledger would become a record of intentions rather than of movements. Keeping it to capture means the sum of the ledger is, by construction, money that actually exists."
+
+**What the split costs.** Holds expire — typically 7 days, sometimes less — so a capture attempted too late fails against an authorization the processor has already released, and the merchant has to re-authorize a card that may now decline. That's a state machine with a *timer* in it, and nothing in this implementation currently tracks authorization expiry or sweeps stale holds. It's the most obvious missing piece, and at any real volume it would show up as a slow drip of "capture failed" errors that nobody can reproduce.
+
+## Deep Dive: Isolating an Unreliable Processor
+
+The external processor is the one dependency that is both on the critical path and outside our control, so it gets a circuit breaker rather than a raw call plus a timeout.
+
+| Approach | Behaviour when the processor degrades | Cost |
+|----------|---------------------------------------|------|
+| ✅ Circuit breaker, fail fast once open | Requests are rejected in microseconds; the connection pool stays free for everything else | Some payments rejected during a blip a longer wait would have survived |
+| ❌ Timeout only | Every request waits the full timeout before failing | N concurrent payments hold N connections for the timeout duration — the pool drains and *unrelated* endpoints start failing |
+| ❌ Retry immediately on failure | Multiplies load against a processor that is already struggling | Turns a degradation into an outage, and risks double-charging without idempotency |
+
+The failure mode the breaker prevents is not "some payments fail" — payments fail either way when the processor is down. It's the **pool exhaustion** that turns a payments outage into a total one: with a plain timeout, requests pile up holding connections, and login, dashboard reads and webhook writes start failing for a reason that has nothing to do with them. Failing fast keeps the blast radius on the payment path.
+
+> "The trade-off I'd name explicitly is that an open breaker rejects payments the processor might actually have accepted. That's a real cost in revenue. I take it because a fast, honest 'try again' is recoverable — the merchant retries, the customer sees a clear error — whereas a hung request pool is not: it fails invisibly, in a way that looks like our system is broken rather than our processor."
+
+The half-open probe is what keeps this from being a one-way door: after the cooldown, a single request is let through, and success closes the breaker. Recovery therefore costs one request rather than requiring an operator.
+
+**This is also why idempotency and the breaker are designed together.** Fail-fast rejection makes client retries *more* likely, not less — and a retry against a processor that did in fact accept the original charge is exactly how double-charges happen. The idempotency key is what makes the encouraged retry safe.
+
 ## API Design
 
 ### RESTful Endpoints
