@@ -89,55 +89,26 @@ Design a price tracking service similar to CamelCamelCamel or Honey. This system
 ### Chart Component Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         PRICE CHART COMPONENT                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─── Range Selector ───────────────────────────────────────────────┐   │
-│  │   [ 7d ]  [ 30d ]  [ 90d ]  [ 1y ]  [ All ]                      │   │
-│  │      ↓                                                            │   │
-│  │   Selected range triggers data filtering                         │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── Price Statistics Bar ─────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   ┌──────────┐    ┌──────────┐    ┌──────────┐                   │   │
-│  │   │ LOWEST   │    │ AVERAGE  │    │ HIGHEST  │                   │   │
-│  │   │ $24.99   │    │ $32.50   │    │ $45.00   │                   │   │
-│  │   │ (green)  │    │ (neutral)│    │ (red)    │                   │   │
-│  │   └──────────┘    └──────────┘    └──────────┘                   │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── Main Chart Area ──────────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   $50 ┤                                                          │   │
-│  │       │         ╭─╮                                               │   │
-│  │   $40 ┤        ╱   ╲      ╭──╮                                   │   │
-│  │       │       ╱     ╲    ╱    ╲                                   │   │
-│  │   $30 ┤──────╱───────╲──╱──────╲────────── Target: $28          │   │
-│  │       │     ╱          ╲        ╲        (dashed green line)     │   │
-│  │   $20 ┤────╱────────────╲────────╲────────────────────           │   │
-│  │       │                           ╲                               │   │
-│  │       └────┬─────┬─────┬─────┬─────┬─────────────────             │   │
-│  │          Jan   Feb   Mar   Apr   May   (X-axis dates)             │   │
-│  │                                                                   │   │
-│  │   [========= Brush Selector ===========]                         │   │
-│  │   Drag to zoom into specific date range                          │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── Interactive Tooltip (on hover) ───────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   ┌────────────────┐                                              │   │
-│  │   │ March 15, 2024 │                                              │   │
-│  │   │ $29.99         │                                              │   │
-│  │   │ -5.2% ↓        │                                              │   │
-│  │   └────────────────┘                                              │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─ PRICE CHART ───────────────────────────────────────────────┐
+│  [7d] [30d] [90d] [1y] [All]        range → filters series  │
+│                                                              │
+│  LOWEST $24.99    AVERAGE $32.50    HIGHEST $45.00          │
+│   (green)          (neutral)         (red)                   │
+│                                                              │
+│  $50 ┤        ╭─╮                                            │
+│  $40 ┤       ╱   ╲     ╭──╮                                  │
+│  $30 ┤──────╱─────╲───╱────╲───────  Target $28 (dashed)     │
+│  $20 ┤────╱────────╲──────── ╲                               │
+│      └──┬────┬────┬────┬────┬──                              │
+│        Jan  Feb  Mar  Apr  May                               │
+│                                                              │
+│  [===== brush selector =====]   drag to zoom a date range    │
+│                                                              │
+│  hover tooltip → "March 15, 2024 · $29.99 · −5.2% ↓"        │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+The target line is the element doing the most work: it turns the chart from a history into an answer to the question the user actually has, which is "am I close yet?" Everything else on the panel is context for that one comparison.
 
 ### Chart Data Flow
 
@@ -472,52 +443,14 @@ User submits URL
 
 ### Zustand Store Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         ZUSTAND STORE                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─── Server State ─────────────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   products[]          All tracked products                       │   │
-│  │   alerts[]            User's price alerts                        │   │
-│  │   priceHistory{}      Cached chart data by productId             │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── UI State ─────────────────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   selectedProduct     Currently viewing product (or null)        │   │
-│  │   isLoading           Loading indicator                          │   │
-│  │   error               Error message (or null)                    │   │
-│  │   sortOrder           "newest" | "price_asc" | "price_desc"      │   │
-│  │   filterDomain        Filter by e-commerce site                  │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── Actions ──────────────────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   fetchProducts()     Load products from API                     │   │
-│  │   addProduct(url)     Track new product                          │   │
-│  │   removeProduct(id)   Stop tracking (with optimistic update)     │   │
-│  │   selectProduct(p)    Set selected for detail view               │   │
-│  │                                                                   │   │
-│  │   fetchAlerts()       Load user alerts                           │   │
-│  │   createAlert(data)   Create new alert                           │   │
-│  │   updateAlert(id,d)   Modify existing alert                      │   │
-│  │   deleteAlert(id)     Remove alert                               │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ┌─── Persistence (partial) ────────────────────────────────────────┐   │
-│  │                                                                   │   │
-│  │   Only persist: selectedProduct, sortOrder, filterDomain         │   │
-│  │   Don't persist: products, alerts (always fetch fresh)           │   │
-│  │                                                                   │   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Slice | Contents | Persisted? |
+|-------|----------|------------|
+| Server state | `products[]`, `alerts[]`, `priceHistory{}` (cached by productId) | No — always refetched |
+| UI state | `selectedProduct`, `isLoading`, `error`, `sortOrder`, `filterDomain` | Only the user's *choices*: selectedProduct, sortOrder, filterDomain |
+| Product actions | `fetchProducts`, `addProduct(url)`, `removeProduct(id)` (optimistic), `selectProduct(p)` | — |
+| Alert actions | `fetchAlerts`, `createAlert`, `updateAlert`, `deleteAlert` | — |
+
+> "The persistence split is the part I'd call out. Persisting `products` would mean a returning user sees yesterday's prices as though they were current — on a price tracker, stale data isn't a stale UI, it's a wrong answer. So server state is always refetched and only the user's own choices survive a reload.
 
 ### Optimistic Update Pattern
 

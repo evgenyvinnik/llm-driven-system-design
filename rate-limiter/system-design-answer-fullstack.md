@@ -37,46 +37,92 @@
 ## 2. High-Level Architecture (5 minutes)
 
 ```
-+------------------------------------------------------------------+
-|                    Frontend Dashboard (React)                     |
-|  +----------------+  +----------------+  +---------------------+  |
-|  | Algorithm      |  |    Metrics     |  |  Request Tester     |  |
-|  | Configuration  |  |    Charts      |  |  (Test + Headers)   |  |
-|  +-------+--------+  +-------+--------+  +---------+-----------+  |
-|          |                   |                     |              |
-|          +-------------------+---------------------+              |
-|                              |                                    |
-|                   +----------v-----------+                        |
-|                   |    Zustand Store     |                        |
-|                   +----------+-----------+                        |
-+---------------------------|-----------------------------------+---+
-                            |
-                            v REST API
-+------------------------------------------------------------------+
-|                    Backend API (Express)                          |
-|  +----------------+  +----------------+  +---------------------+  |
-|  | Rate Limit     |  |    Metrics     |  |   Check Endpoint    |  |
-|  | Middleware     |  |    Endpoint    |  |   POST /check       |  |
-|  +-------+--------+  +-------+--------+  +---------+-----------+  |
-|          |                   |                     |              |
-|          +-------------------+---------------------+              |
-|                              |                                    |
-|                   +----------v-----------+                        |
-|                   |  Algorithm Factory   |                        |
-|                   +----------+-----------+                        |
-+---------------------------|-----------------------------------+---+
-                            |
-              +-------------+-------------+
-              |                           |
-    +---------v---------+     +-----------v-----------+
-    |   Redis Cluster   |     |     PostgreSQL        |
-    |  (Rate Counters)  |     |   (Rules, Metrics)    |
-    +-------------------+     +-----------------------+
+┌──────────────────────────────────────────────────────────────────┐
+│                    Frontend Dashboard (React)                     │
+│  ┌────────────────┐  ┌────────────────┐  ┌───────────────────┐   │
+│  │ Algorithm      │  │    Metrics     │  │  Request Tester   │   │
+│  │ Configuration  │  │    Charts      │  │  (Test + Headers) │   │
+│  └───────┬────────┘  └───────┬────────┘  └─────────┬─────────┘   │
+│          │                   │                     │             │
+│          └───────────────────┼─────────────────────┘             │
+│                              ▼                                   │
+│                    ┌──────────────────┐                          │
+│                    │  Zustand Store   │                          │
+│                    └────────┬─────────┘                          │
+└─────────────────────────────┼────────────────────────────────────┘
+                              │ REST
+                              ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Backend API (Express)                          │
+│  ┌────────────────┐  ┌────────────────┐  ┌───────────────────┐   │
+│  │ Rate Limit     │  │    Metrics     │  │  Check Endpoint   │   │
+│  │ Middleware     │  │    Endpoint    │  │  POST /check      │   │
+│  └───────┬────────┘  └───────┬────────┘  └─────────┬─────────┘   │
+│          │                   │                     │             │
+│          └───────────────────┼─────────────────────┘             │
+│                              ▼                                   │
+│                    ┌──────────────────┐                          │
+│                    │ Algorithm Factory│                          │
+│                    └────────┬─────────┘                          │
+│                             │                                    │
+│                    ┌────────▼─────────┐                          │
+│                    │ Circuit Breaker  │                          │
+│                    └────────┬─────────┘                          │
+└─────────────────────────────┼────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+┌──────────────────┐ ┌────────────────┐ ┌──────────────────┐
+│   Redis / Valkey │ │   PostgreSQL   │ │    RabbitMQ      │
+│  Lua-atomic      │ │  Rules +       │ │  Events →        │
+│  counters (hot)  │ │  metric history│ │  analytics worker│
+└──────────────────┘ └────────────────┘ └──────────────────┘
 ```
+
+> "The shape worth noticing is that only one of those three stores is on the request's critical path. Redis answers the check; Postgres and RabbitMQ are both *downstream of the answer*. That's deliberate — a rate check runs in front of every API call in the system, so anything that isn't strictly required to say allow-or-deny has to be moved off the hot path or it becomes everyone's latency."
 
 ---
 
-## 3. Deep Dive: API Contract Design (8 minutes)
+## 3. The Five Algorithms, and Why the Default Is What It Is
+
+This is the decision the whole service exists to explore, so it's worth being concrete about what each one actually costs.
+
+| Algorithm | Memory per identifier | Accuracy | Failure mode it has |
+|-----------|----------------------|----------|---------------------|
+| Fixed Window | One counter | Exact within a window | **Boundary burst** — 2× the limit can pass across a window edge |
+| Sliding Window Counter | Two counters | ~1–2% error | Approximate by construction |
+| Sliding Log | One timestamp *per request* | Exact | Memory grows with traffic; a hot identifier is unbounded |
+| Token Bucket | Token count + last-refill time | Exact, burst-tolerant | Needs read-compute-write, so it *must* be atomic |
+| Leaky Bucket | Queue depth + last-leak time | Exact, smooths output | Same atomicity requirement; no burst allowance |
+
+**The boundary burst is the concrete reason Fixed Window isn't the default.** With a limit of 100/minute, a client can send 100 requests at 11:59:59 and another 100 at 12:00:01 — 200 requests in two seconds, every one of them "within the limit." The limiter did exactly what it was told and the service still fell over. Sliding Window Counter fixes this by weighting the previous window's count by how far into the current window you are, which smears the boundary out.
+
+> "Sliding Window Counter is the default because its error is in the *safe* direction and its cost is constant. It's approximate — around 1–2% — but it's two integers per identifier regardless of traffic. Sliding Log is exact, and I'd reach for it if this were metering something billable, where being 2% wrong is a refund conversation. But it stores a timestamp per request, so the single identifier you most want to limit — the one hammering you — is the one that costs the most memory. An abuse-control mechanism whose cost scales with abuse is the wrong shape."
+
+**Token Bucket is the one people reach for when bursts are legitimate.** It lets a client that's been quiet spend accumulated tokens all at once, which matches how real clients behave — idle, then a page-load's worth of parallel calls. The cost is that it's the algorithm most exposed to the concurrency problem in the next section.
+
+---
+
+## 4. Deep Dive: Why the Logic Lives in Lua
+
+**The problem:** Token Bucket and Leaky Bucket are read-compute-write. Read the current token count and last-refill timestamp, compute how many tokens have accrued since, decide, write back. Three steps.
+
+Two gateway nodes checking the same identifier at the same moment both read "1 token left", both compute "1 ≥ 1, allow", and both write "0". A budget of one was spent twice. Nothing errored; the limiter simply didn't limit.
+
+| Approach | Correct under concurrency? | Cost |
+|----------|---------------------------|------|
+| ✅ Redis Lua script | Yes — Redis runs the script atomically, single-threaded | Logic in Lua: harder to write, test and debug than TypeScript |
+| ❌ Read + compute in Node, write back | No — the interleaving above | None, and that's the trap: it works perfectly with one node |
+| ❌ Distributed lock around the check | Yes | Two round trips plus lock contention, on a path that must be sub-millisecond |
+| ❌ `WATCH`/`MULTI` optimistic retry | Yes | Retries under contention — worst exactly when the identifier is hottest |
+
+> "The reason I'd accept writing this in Lua, which nobody enjoys, is that the failure is invisible in every environment where you'd notice it. One node is correct. Your integration tests are correct. It only breaks under real concurrency across instances, which is production — and it breaks *silently*, as slightly-too-permissive limiting that looks like the limit is just set too high."
+
+**Clocks are the same argument.** Every time calculation uses Redis's clock, not the calling node's. Skewed gateway clocks would otherwise put the same identifier in different windows depending on which node it hit — and that's another reason the logic has to be server-side rather than in application code.
+
+---
+
+## 5. Deep Dive: API Contract Design (8 minutes)
 
 ### Endpoint Definitions
 
@@ -102,7 +148,7 @@ Retry-After: 45  (only when status 429)
 
 ---
 
-## 4. Deep Dive: End-to-End Rate Check Flow (10 minutes)
+## 6. Deep Dive: End-to-End Rate Check Flow (10 minutes)
 
 ### Complete Request Flow
 
@@ -170,7 +216,7 @@ A separate `fetchMetrics` action sets a loading flag, calls the metrics endpoint
 
 ---
 
-## 5. Deep Dive: Error Handling (6 minutes)
+## 7. Deep Dive: Error Handling (6 minutes)
 
 ### Backend: Centralized Error Handling
 
@@ -191,7 +237,7 @@ For transient errors (API failures, network issues), a toast notification system
 
 ---
 
-## 6. Deep Dive: Metrics Synchronization (5 minutes)
+## 8. Deep Dive: Metrics Synchronization (5 minutes)
 
 ### Backend: Metrics Collection
 
@@ -210,7 +256,27 @@ The dashboard uses a `useMetricsPolling` hook that calls `fetchMetrics` immediat
 
 ---
 
-## 7. Trade-offs Summary
+## 9. Deep Dive: What Happens When Redis Is Down
+
+A rate limiter is unusual: it's infrastructure that sits in front of *everything*, so its own failure mode is a product decision, not just an ops one.
+
+| On Redis failure | Consequence | Right for |
+|------------------|-------------|-----------|
+| ✅ Fail **open** (allow) — the default | A real abuse window while Redis is down | Ordinary API traffic, where the limiter protects against sustained abuse |
+| ✅ Fail **closed** (deny) — opt-in per endpoint | Legitimate users blocked during the outage | Auth, payment, anything where unauthorized access costs more than downtime |
+| ❌ One global policy | Either you block everyone over a cache blip, or you leave your login endpoint unprotected | Nothing |
+
+> "Defaulting to fail-open is the choice I'd defend hardest, because it sounds wrong. You've built a protection mechanism and you're saying that when it breaks, protection stops. But think about what each failure actually costs: rate limiting defends against *sustained* abuse, and a Redis outage is measured in minutes. Failing open means a few minutes of under-enforcement. Failing closed means every legitimate user is locked out of a working service because a cache they never heard of is unavailable — you've converted a dependency outage into a total outage, which is exactly the amplification the circuit breaker exists to prevent."
+
+**The exception is where the asymmetry flips.** On a login endpoint, failing open means unlimited credential-stuffing attempts for the duration. That damage is permanent in a way downtime isn't — a compromised account doesn't recover when Redis comes back. So the policy is per-endpoint, and the honest admission is that this puts the burden on whoever configures a new route to think about it, which is exactly the kind of decision people get wrong by omission.
+
+**The circuit breaker is what makes either policy survivable.** Without it, a Redis outage doesn't produce a fast fail-open — it produces every request waiting out a 3–30 second connection timeout, exhausting the connection pool and turning "the limiter is degraded" into "the whole site is slow." The breaker opens after repeated failures and returns the degradation-mode answer immediately.
+
+**This surfaces in the UI too**, which is the fullstack half: the dashboard's health panel reports Redis connectivity and breaker state, because an operator looking at a sudden allow-rate of 100% needs to be able to tell "traffic dropped" from "we are failing open and not limiting anything at all." Those are indistinguishable from the request metrics alone.
+
+---
+
+## 10. Trade-offs Summary
 
 | Decision | Choice | Trade-off | Alternative |
 |----------|--------|-----------|-------------|
@@ -219,10 +285,17 @@ The dashboard uses a `useMetricsPolling` hook that calls `fetchMetrics` immediat
 | Error handling | Centralized | Consistent format | Per-route (flexible) |
 | State sync | Optimistic UI | Fast feedback | Wait for confirmation |
 | Header passing | Response headers | Standard approach | Body only (simpler) |
+| Default algorithm | Sliding Window Counter | ~1–2% error | Sliding Log (exact, unbounded memory per hot identifier) |
+| Atomicity | Redis Lua scripts | Logic in Lua is harder to write and debug | Read-compute-write in Node (silently wrong across instances) |
+| Clock source | Redis server time | Forces the logic server-side | Node local time (skew splits one identifier across windows) |
+| Redis failure | Fail open by default, closed per endpoint | A real abuse window during an outage | One global policy (either blocks everyone or leaves auth unprotected) |
+| Redis call wrapping | Circuit breaker | One more moving part | Raw calls (a Redis blip becomes site-wide latency) |
+
+> "If I had to name the single decision that carries the most weight here, it's Lua — not because it's the most interesting, but because it's the only one whose absence is invisible until production. Every other choice on this list fails loudly or measurably. Read-compute-write in application code passes every test you'd think to write and then quietly under-limits the moment you run a second instance."
 
 ---
 
-## 8. Testing Strategy
+## 11. Testing Strategy
 
 ### Backend Integration Tests
 
@@ -235,9 +308,25 @@ The test suite verifies end-to-end behavior:
 
 The RequestTester component test mocks the `checkRateLimit` API call to return an allowed response with 9 remaining. After clicking "Send Request", it waits for the UI to show "Allowed" and display the `X-RateLimit-Remaining: 9` header value.
 
+### The Test That Actually Matters
+
+Both of the above are sequential, and sequential tests cannot catch the bug this system is most likely to have. The Lua decision exists because read-compute-write races across instances; a test that sends request 11 after request 10 has already returned will pass against a completely non-atomic implementation.
+
+So the test worth writing is: **fire N concurrent requests at a limit of N−k and assert exactly N−k were allowed.** Not "at most" — exactly. A limiter that lets through N−k+1 under concurrency is the failure mode, and an assertion of "at most" quietly tolerates it.
+
+| Test shape | Catches the atomicity bug? |
+|------------|---------------------------|
+| ❌ Sequential: send 11 requests one at a time, expect the 11th to 429 | No — passes against a racy implementation |
+| ❌ Concurrent, assert `allowed <= limit` | No — the bug produces *more* than the limit, but a flaky pass hides it |
+| ✅ Concurrent, assert `allowed === limit` exactly, repeated | Yes |
+
+> "I'd also want that test running against more than one process, because a single Node process serializes enough of the work to mask the race. The honest version spins up two instances against one Redis and hammers the same identifier from both — which is awkward enough to set up that it's usually the test nobody writes, and that's precisely why the bug survives to production."
+
+**Boundary-burst is the other one worth asserting explicitly:** send the full limit just before a window boundary and the full limit just after, and confirm the sliding-window default does *not* allow 2× through the way Fixed Window would. That test documents the reason for the default choice, which a comment can't.
+
 ---
 
-## 9. Future Enhancements
+## 12. Future Enhancements
 
 1. **WebSocket Metrics** - Real-time streaming instead of polling
 2. **Rule Configuration UI** - Visual editor for rate limit rules
@@ -258,4 +347,8 @@ The RequestTester component test mocks the `checkRateLimit` API call to return a
 5. **Algorithm selection UI** with visual animations and immediate test feedback
 6. **Testing strategy** covering both backend integration and frontend components
 
-The key insight is that a rate limiter is only useful if developers can understand and configure it correctly. The interactive dashboard with visual algorithm demos and live testing makes the abstract concepts of token buckets and sliding windows concrete and intuitive, while the clean API contract ensures reliable integration with client applications."
+The key insight is that a rate limiter is only useful if developers can understand and configure it correctly. The interactive dashboard with visual algorithm demos and live testing makes the abstract concepts of token buckets and sliding windows concrete and intuitive, while the clean API contract ensures reliable integration with client applications.
+
+If I had to compress the whole design into one idea: **a rate limiter is a piece of infrastructure whose own failures must never be worse than the abuse it prevents.** That single constraint explains almost every decision here — why the check is one atomic Lua round trip rather than three network hops, why auditing and analytics are pushed onto a queue instead of blocking the answer, why Redis calls are wrapped in a breaker so a datastore blip can't become site-wide latency, and why the default on failure is to allow rather than deny. Each of those trades away something real. Together they mean the limiter degrades to 'slightly too permissive for a few minutes' instead of 'the site is down,' and for something sitting in front of every request in the system, that's the only acceptable shape of failure."
+
+**What I'd flag as unfinished if asked:** the algorithms are configurable but the rules that drive them are effectively static — they live in Postgres but nothing reloads them without a redeploy, and adding hot reload means reintroducing a read on the hot path or a cache with its own invalidation problem. That's the next real design question, and it's not a small one.

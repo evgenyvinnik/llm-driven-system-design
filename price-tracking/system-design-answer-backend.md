@@ -231,70 +231,26 @@ Design a price tracking service similar to CamelCamelCamel or Honey. This system
 ### Scraper Worker Flow
 
 ```
-                    ┌─────────────────┐
-                    │   Job Received  │
-                    │   from Queue    │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   Get Proxy     │
-                    │   from Pool     │
-                    └────────┬────────┘
-                             │
-              ┌──────────────▼──────────────┐
-              │    Check: requires_js?      │
-              └──────────────┬──────────────┘
-                    ┌────────┴────────┐
-                    │                 │
-             ┌──────▼──────┐   ┌──────▼──────┐
-             │   Cheerio   │   │  Puppeteer  │
-             │ (HTTP only) │   │ (Headless)  │
-             │   ~100ms    │   │   ~2000ms   │
-             └──────┬──────┘   └──────┬──────┘
-                    │                 │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  Extract Price  │
-                    │  via Selector   │
-                    └────────┬────────┘
-                             │
-              ┌──────────────▼──────────────┐
-              │    Price Valid?             │
-              └──────────────┬──────────────┘
-                    ┌────────┴────────┐
-                    │                 │
-             ┌──────▼──────┐   ┌──────▼──────┐
-             │   YES       │   │    NO       │
-             └──────┬──────┘   └──────┬──────┘
-                    │                 │
-             ┌──────▼──────┐   ┌──────▼──────┐
-             │Store Price  │   │Alert: Parser│
-             │TimescaleDB  │   │   Failure   │
-             └──────┬──────┘   └─────────────┘
-                    │
-             ┌──────▼──────┐
-             │ Price       │
-             │ Changed?    │
-             └──────┬──────┘
-                    │
-           ┌───────┴───────┐
-           │ YES           │
-    ┌──────▼──────┐        │
-    │ Publish to  │        │
-    │ alert queue │        │
-    └─────────────┘        │
-                           │
-                    ┌──────▼──────┐
-                    │Update Product│
-                    │  Metadata    │
-                    └──────┬──────┘
-                           │
-                    ┌──────▼──────┐
-                    │ Mark Proxy  │
-                    │ as Success  │
-                    └─────────────┘
+Job ──▶ get proxy ──▶ requires_js?
+                       ├─ no  ──▶ Cheerio    (~100ms)
+                       └─ yes ──▶ Puppeteer  (~2000ms)
+                                     │
+                                     ▼
+                        extract price via selector
+                                     │
+                       ┌─────────────┴─────────────┐
+                    valid                      invalid
+                       │                           │
+                       ▼                           ▼
+              store in TimescaleDB       flag parser failure
+                       │
+              price changed? ──▶ publish to alert queue
+                       │
+                       ▼
+          update product metadata ──▶ mark proxy success
 ```
+
+The 20× cost difference between the two branches is the reason `requires_js` is a per-domain config flag rather than a runtime guess: getting it wrong in the permissive direction means paying two seconds and a headless Chrome for a page whose price was in the HTML all along.
 
 ## 🔄 Deep Dive 3: Proxy Pool and Rate Limiting (6 minutes)
 

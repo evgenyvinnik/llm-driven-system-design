@@ -342,72 +342,33 @@ Adding a product is four steps. (1) **Validate**: parse the submitted URL's host
 ### Alert Trigger Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    PRICE CHANGE DETECTION                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  SCRAPER WORKER                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                                                                  │    │
-│  │   1. Scrape new price from website                              │    │
-│  │                                                                  │    │
-│  │   2. Compare with stored current_price                          │    │
-│  │      ┌──────────────────────────────────────────────────────┐   │    │
-│  │      │ changePercent = ((newPrice - oldPrice) / oldPrice)*100│   │    │
-│  │      └──────────────────────────────────────────────────────┘   │    │
-│  │                                                                  │    │
-│  │   3. Check if significant (> 0.5% change)                       │    │
-│  │      - Ignore tiny fluctuations                                 │    │
-│  │      - Prevents alert spam                                      │    │
-│  │                                                                  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    ALERT EVALUATION                                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  For each active alert on this product:                                  │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                                                                  │    │
-│  │  ┌────────────────┐                                              │    │
-│  │  │ alert_type =   │                                              │    │
-│  │  │ 'below'        │  → Trigger if newPrice <= targetPrice       │    │
-│  │  └────────────────┘                                              │    │
-│  │                                                                  │    │
-│  │  ┌────────────────┐                                              │    │
-│  │  │ alert_type =   │                                              │    │
-│  │  │ 'above'        │  → Trigger if newPrice >= targetPrice       │    │
-│  │  └────────────────┘                                              │    │
-│  │                                                                  │    │
-│  │  ┌────────────────┐                                              │    │
-│  │  │ alert_type =   │                                              │    │
-│  │  │ 'change_pct'   │  → Trigger if |change%| >= threshold        │    │
-│  │  └────────────────┘                                              │    │
-│  │                                                                  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  If should trigger:                                                      │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                                                                  │    │
-│  │   1. Publish to alerts.send queue                               │    │
-│  │                                                                  │    │
-│  │      {                                                           │    │
-│  │        alertId, userId, productId,                              │    │
-│  │        productTitle, oldPrice, newPrice,                        │    │
-│  │        email, pushToken                                         │    │
-│  │      }                                                           │    │
-│  │                                                                  │    │
-│  │   2. Update last_triggered_at in alerts table                   │    │
-│  │                                                                  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+scrape new price ──▶ compare with stored current_price
+                          │
+                     changePercent = (new − old) / old × 100
+                          │
+                     significant? (>0.5%)  ──no──▶ stop
+                          │ yes
+                          ▼
+              for each active alert on this product
+                          │
+   ┌──────────────────────┼──────────────────────┐
+   ▼                      ▼                      ▼
+'below'               'above'              'change_pct'
+new ≤ target          new ≥ target         |change%| ≥ threshold
+   └──────────────────────┼──────────────────────┘
+                          │ triggered
+                          ▼
+        publish to alerts.send  { alertId, userId, productId,
+                                  productTitle, oldPrice, newPrice,
+                                  email, pushToken }
+                          │
+                          ▼
+             update alerts.last_triggered_at
 ```
 
+**The 0.5% significance floor is the part that makes this usable.** Retailers nudge prices constantly — a few cents on a $400 item — and an alert system that fires on every movement teaches users to ignore it, which is the same as having no alerts. Filtering at the *detection* step rather than the delivery step also means the noise never reaches the queue, so the cost is paid once by the scraper instead of once per subscribed user.
+
+`last_triggered_at` is the other half of that: it's what stops a price hovering either side of a threshold from firing repeatedly.
 ### Alert Worker Processing
 
 ```
