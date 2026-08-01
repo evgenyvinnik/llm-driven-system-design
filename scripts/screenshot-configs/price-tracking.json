@@ -41,6 +41,11 @@
       "path": "/admin",
       "waitFor": "main",
       "delay": 500
+    },
+    {
+      "name": "05-product-detail",
+      "path": "/products/d0000000-0000-4000-8000-000000000001",
+      "delay": 3000
     }
   ],
   "viewport": {

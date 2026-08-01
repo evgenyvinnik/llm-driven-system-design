@@ -82,15 +82,21 @@ function ProductDetailPage() {
   };
 
   const lowestPrice = dailyPrices.length > 0
-    ? Math.min(...dailyPrices.map((d) => d.min_price))
+    ? Math.min(...dailyPrices.map((d) => Number(d.min_price)))
     : null;
 
   const highestPrice = dailyPrices.length > 0
-    ? Math.max(...dailyPrices.map((d) => d.max_price))
+    ? Math.max(...dailyPrices.map((d) => Number(d.max_price)))
     : null;
 
+  // `Number(...)` is load-bearing here, not defensive noise. Postgres DECIMAL
+  // comes back from node-pg as a *string* to preserve precision. `Math.min`/
+  // `Math.max` coerce their arguments, so those two happened to work — but
+  // `sum + d.avg_price` with a numeric `sum` and a string operand is string
+  // concatenation, so the running total became "0398.12397.00…" and dividing it
+  // produced the `$NaN` this panel used to display.
   const averagePrice = dailyPrices.length > 0
-    ? dailyPrices.reduce((sum, d) => sum + d.avg_price, 0) / dailyPrices.length
+    ? dailyPrices.reduce((sum, d) => sum + Number(d.avg_price), 0) / dailyPrices.length
     : null;
 
   return (
