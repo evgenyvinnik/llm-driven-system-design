@@ -30,6 +30,17 @@
       "path": "/",
       "waitFor": "canvas, .bg-gray-900",
       "delay": 2000
+    },
+    {
+      "name": "03-canvas-zoomed",
+      "path": "/",
+      "delay": 2000,
+      "click": [
+        "button:has-text('+')",
+        "button:has-text('+')",
+        "button:has-text('+')"
+      ],
+      "clickDelay": 700
     }
   ],
   "viewport": {

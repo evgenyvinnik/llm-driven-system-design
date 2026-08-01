@@ -39,6 +39,7 @@ export function TestRunner() {
         {/* Manual test button */}
         <div className="flex gap-2">
           <button
+            data-testid="send-request"
             onClick={runTest}
             disabled={isRunning}
             className={`flex-1 px-4 py-3 rounded-md font-medium text-white transition-colors ${
@@ -76,6 +77,7 @@ export function TestRunner() {
               </button>
             ) : (
               <button
+                data-testid="start-auto"
                 onClick={() => startAutoTest(autoTestRate)}
                 className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 font-medium"
               >

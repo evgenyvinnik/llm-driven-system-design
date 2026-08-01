@@ -11,8 +11,51 @@
     {
       "name": "01-dashboard",
       "path": "/",
-      "waitFor": "header, main",
-      "delay": 1500
+      "delay": 2000
+    },
+    {
+      "name": "02-requests-allowed",
+      "path": "/",
+      "delay": 1800,
+      "click": [
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']"
+      ],
+      "clickDelay": 500
+    },
+    {
+      "name": "03-rate-limited",
+      "path": "/",
+      "delay": 1500,
+      "click": [
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']",
+        "[data-testid='send-request']"
+      ],
+      "clickDelay": 350
+    },
+    {
+      "name": "04-token-bucket",
+      "path": "/",
+      "delay": 1500,
+      "click": [
+        "button:has-text('Token Bucket')"
+      ],
+      "clickDelay": 1200
     }
   ],
   "viewport": {
