@@ -11,10 +11,12 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "db:migrate": "tsx src/db/migrate.ts",
-    "db:seed": "tsx src/db/seed.ts",
+    "db:seed": "tsx src/db/seed.ts && tsx src/db/seed-canvas.ts",
     "lint": "eslint src",
     "type-check": "tsc --noEmit",
-    "format": "prettier --write src/**/*.ts"
+    "format": "prettier --write src/**/*.ts",
+    "db:seed:users": "tsx src/db/seed.ts",
+    "db:seed:canvas": "tsx src/db/seed-canvas.ts"
   },
   "dependencies": {
     "amqplib": "^0.10.9",
