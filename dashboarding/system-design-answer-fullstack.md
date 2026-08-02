@@ -6,7 +6,7 @@
 
 ## Introduction
 
-"Today I'll design a metrics monitoring and visualization system similar to Datadog or Grafana. This system collects time-series metrics from servers, stores them efficiently, and provides real-time dashboards and alerting. As a fullstack engineer, I'll focus on how the frontend and backend work together: shared type definitions, API contracts, real-time data flow, and end-to-end feature implementation."
+"Today I'll design a metrics monitoring and visualization system similar to Datadog or Grafana. This system collects time-series metrics from servers, stores them efficiently, and provides real-time dashboards and alerting. As a fullstack engineer, I'll focus on the boundary between a stable dashboard shell, independently owned panel plugins, a coordinated data API, and the time-series backend."
 
 ---
 
@@ -20,7 +20,9 @@
 2. **Dashboard Viewing**: Frontend queries backend, renders charts with auto-refresh
 3. **Dashboard Editing**: Drag-and-drop UI, changes persist to backend
 4. **Alert Configuration**: Create rules in UI, backend evaluates and sends notifications
-5. **Time Range Selection**: Frontend controls time range, backend queries appropriate tables"
+    5. **Time Range Selection**: Frontend controls time range, backend queries appropriate tables
+    6. **Panel Extensibility**: Domain teams can ship panel families without coupling every release to the shell
+    7. **Data Authorization**: Backend enforces tenant and metric access for every panel query"
 
 ### Non-Functional Requirements
 
@@ -29,7 +31,8 @@
 - **End-to-End Latency**: User action to UI update < 200ms
 - **API Contract Stability**: Breaking changes require versioning
 - **Type Safety**: Shared types between frontend and backend
-- **Real-Time Feel**: 10-second refresh without flicker"
+    - **Real-Time Feel**: 10-second refresh without flicker
+    - **Failure Isolation**: One panel or plugin failure does not hide healthy panels"
 
 ---
 
@@ -41,11 +44,11 @@ Types shared by frontend and backend include:
 
 **Metrics Types**: MetricPoint (name, value, tags, timestamp), MetricDataPoint (time, value), QueryParams (query, start, end, aggregation, step, tags), QueryResult (data array, meta with table/resolution/cached)
 
-**Dashboard Types**: Dashboard (id, name, description, ownerId, panels, layout, timestamps), Panel (id, dashboardId, title, type, query, options, position), PanelType ('line' | 'area' | 'bar' | 'gauge' | 'stat'), Position (x, y, w, h), PanelLayout (i, x, y, w, h)
+**Dashboard Types**: Dashboard (id, name, description, ownerId, panels, layout, timestamps), Panel (id, dashboardId, title, type, query, options, position), PanelType ('line' | 'area' | 'bar' | 'gauge' | 'stat'), Position (x, y, w, h), PanelLayout (i, x, y, w, h), PanelPluginDescriptor (id, version, renderer, editor, requiredCapabilities)
 
 **Alert Types**: AlertRule (id, name, query, condition, threshold, duration, severity, enabled, notification), AlertCondition ('gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'ne'), AlertSeverity ('info' | 'warning' | 'critical'), AlertEvent (id, ruleId, status, value, triggeredAt, resolvedAt)
 
-**API Response Types**: ApiResponse<T> with data and optional meta (total, page, pageSize), ApiError with error, code, and details
+**API Response Types**: ApiResponse<T> with data and optional meta (total, page, pageSize), BatchPanelResult keyed by panel ID with results or a panel-level error, ApiError with error, code, and details
 
 ### Zod Validation Schemas
 
@@ -95,18 +98,18 @@ Validation schemas used by both frontend and backend:
   │   Zustand Store      │◄────────────────────────────────────────┘
   │   (dashboardStore)   │
   └──────────┬───────────┘
-             │ State update triggers re-render
+             │ State update triggers shell render
              ▼
   ┌──────────────────────┐
-  │   DashboardGrid      │  For each panel:
+  │   DashboardGrid      │  Registers panels with coordinator:
   │   Component          │
   └──────────┬───────────┘
              │
              ▼
-  ┌──────────────────────┐      POST /api/v1/query
-  │   DashboardPanel     │─────────────────────────────────────────┐
-  │   useQuery hook      │                                         │
-  │   (with polling)     │                                         ▼
+  ┌──────────────────────┐      POST /api/v1/dashboards/:id/data
+  │ Data Coordinator     │─────────────────────────────────────────┐
+  │ batch · dedupe       │                                         │
+  │ refresh · cancel     │                                         ▼
   └──────────┬───────────┘                              ┌──────────────────────┐
              │                                          │   Query Service      │
              │                                          │   - Cache check      │
@@ -122,13 +125,19 @@ Validation schemas used by both frontend and backend:
              │                                          │   - metrics_1hour    │
              │                                          └──────────┬───────────┘
              │                                                     │
-  ┌──────────▼───────────┐      { data: [...], meta: {...} }       │
+  ┌──────────▼───────────┐      { panels: { id: result } }          │
   │   Chart Component    │◄────────────────────────────────────────┘
   │   (Recharts)         │
   └──────────────────────┘
 
-  2. Auto-refresh every 10 seconds (polling in useQuery hook)
+  2. Auto-refresh every 10 seconds in one dashboard coordinator; results fan out to panels
 ```
+
+### Panel Ownership and Data Coordination
+
+The frontend keeps the panel renderer boundary independent from the data boundary. The shell resolves a panel type through a versioned registry, while the coordinator collects all visible panel query plans and sends one dashboard-scoped batch request. The backend authorizes the dashboard and each query, then returns an independent result for every panel. A slow or forbidden panel therefore becomes a panel state instead of a dashboard-wide failure.
+
+Trusted first-party panel families can be delivered as same-origin remotes or Module Federation modules. I would use a sandboxed iframe only for untrusted extensions or cases requiring a separate origin and CSP. The iframe decision is a security boundary, not a substitute for backend authorization.
 
 ### Panel Update Flow
 
@@ -191,6 +200,7 @@ Validation schemas used by both frontend and backend:
 **Dashboard Routes (Express)**:
 - `GET /dashboards` - List dashboards for authenticated user
 - `GET /dashboards/:id` - Get single dashboard with panels (checks ownership or public access)
+- `POST /dashboards/:id/data` - Batch data for authorized panel IDs with independent panel results
 - `POST /dashboards` - Create dashboard with name/description
 - `PUT /dashboards/:id` - Update dashboard (requires owner or admin), validates layout schema, invalidates cache
 - `POST /dashboards/:id/panels` - Add panel to dashboard using CreatePanelSchema validation
@@ -206,6 +216,7 @@ API client class wrapping fetch with:
 - Methods: getDashboards, getDashboard, createDashboard, updateDashboard, deleteDashboard
 - Panel methods: addPanel, updatePanel, deletePanel
 - Query methods: executeQuery
+- Plugin methods: getApprovedPanelManifest, validatePluginCapabilities
 - Alert methods: getAlertRules, createAlertRule, updateAlertRule, deleteAlertRule, getAlertHistory, evaluateAlertRule
 - Metric methods: ingestMetrics, listMetrics, getMetricTags
 
@@ -301,10 +312,13 @@ useAlerts hook provides:
 
 ### Polling with Optimistic Updates
 
-**Dashboard Panel Pattern**:
-- useQuery hook with refetchInterval matching refreshInterval
-- staleTime set to 90% of refresh interval to prevent flicker
-- Automatic polling without loading state on refetch
+**Dashboard Data Coordinator Pattern**:
+- Collect visible panel query plans and normalize them
+- Deduplicate equivalent queries and send one dashboard-scoped batch request
+- Keep prior successful results while a refresh is in flight
+- Cancel obsolete requests when the time range changes
+- Return panel-level loading, stale, empty, forbidden, and error states
+- Refresh visible panels first, pause hidden tabs, and add jitter to avoid synchronized bursts
 
 **Dashboard Layout Pattern**:
 - Local state update immediate via updateLayout()
@@ -338,9 +352,9 @@ Express error middleware handles:
 
 ### Frontend Error Handling
 
-**ErrorBoundary Component**: Catches React errors, displays error message with retry button.
+**Panel Error Boundary**: Catches a plugin renderer error and replaces only that panel with a retryable fallback. The event includes panel ID and plugin version for diagnostics.
 
-**API Error Handling in Hooks**: Try/catch with error message extraction, optional onError callback, error state management.
+**Coordinator Error Handling**: Keeps stale data visible during refresh, validates each panel result, and exposes partial failures without replacing successful sibling panels.
 
 ---
 
@@ -354,6 +368,9 @@ Express error middleware handles:
 | State Management | Zustand | Redux, Context | Lightweight, TypeScript support |
 | Error Handling | Error boundaries + try/catch | Global error store | React-native pattern, localized recovery |
 | Cache Strategy | Redis + short TTL | Stale-while-revalidate | Backend-controlled freshness |
+| Panel architecture | Versioned plugin registry | One giant SPA | Independent domain ownership and deployment |
+| Panel transport | Dashboard batch endpoint | One request per panel | Deduplication, cancellation, and partial failure semantics |
+| Untrusted extensions | Sandboxed iframe | Same-origin remote | Hard origin, CSP, and dependency isolation |
 
 ---
 
@@ -365,14 +382,16 @@ Express error middleware handles:
 
 2. **API Contract**: RESTful endpoints with consistent response format, validation errors include field-level details
 
-3. **Data Flow**: Frontend polls backend every 10 seconds, backend routes queries to appropriate TimescaleDB tables based on time range
+    3. **Data Flow**: A frontend coordinator batches and deduplicates panel queries every 10 seconds, while the backend routes each query to appropriate TimescaleDB tables based on time range
 
 4. **State Management**: Zustand stores on frontend mirror backend data, optimistic updates provide instant feedback
 
-5. **Error Handling**: Zod validation on both ends, error boundaries in React, consistent error response format
+    5. **Error Handling**: Zod validation on both ends, panel-level error boundaries, partial batch results, and consistent error response format
 
 Key fullstack insights:
 - Shared types prevent drift between frontend and backend
+- Plugin contracts let domain teams ship panels without shell-wide releases
+- Coordinated data access avoids a polling thundering herd
 - Optimistic updates + debounced saves provide responsive UX
 - Table routing (raw vs. aggregated) is transparent to frontend
 - Cache invalidation is time-based for simplicity

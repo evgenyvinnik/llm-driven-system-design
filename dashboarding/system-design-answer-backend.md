@@ -266,6 +266,14 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+### Dashboard Batch Query API
+
+The query service is exposed through a dashboard-scoped batch endpoint rather than forcing the browser to issue one request per panel. The request contains the dashboard ID, authorized panel IDs, and a shared time window. The API loads the panel query plans, checks dashboard and metric permissions, canonicalizes equivalent plans, and executes them with bounded concurrency.
+
+The response is keyed by panel ID. Each entry can contain data, an empty result, a forbidden state, or a panel-level error. A single slow query therefore does not discard successful sibling panels. The frontend coordinator can keep the last successful snapshot for failed panels and show their stale age.
+
+This endpoint is a transport optimization, not an authorization shortcut. The backend still validates each panel query against tenant and user capabilities. At larger scale, the service can group identical normalized plans into one query and fan the result back out to all panels that reference it.
+
 ---
 
 ## Step 7: Alerting Engine
