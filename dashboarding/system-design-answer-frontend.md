@@ -6,9 +6,19 @@
 
 “I’ll design the frontend for a metrics monitoring product similar to Datadog or Grafana. The important frontend problem is not drawing a line chart. It is allowing many teams to own different panels while keeping the dashboard responsive, secure, observable, and resilient when one panel is slow or broken.”
 
-I will use a dashboard shell with a versioned panel plugin contract. A centralized data coordinator will schedule and authorize panel queries. The default deployment model is same-origin plugins or Module Federation for independently shipped panel families. I will reserve iframes for untrusted or hard-isolation extensions rather than placing every chart in its own iframe.
+I will use a dashboard shell with a versioned panel plugin contract. A centralized data coordinator will schedule panel queries. The default deployment model is same-origin plugins or Module Federation for independently shipped panel families. I will reserve iframes for untrusted or hard-isolation extensions rather than placing every chart in its own iframe.
 
-## Step 1: Requirements Clarification
+### RADIO Map
+
+| Stage | Dashboard focus |
+|---|---|
+| **R — Requirements** | Operator workflows, ownership, responsiveness, accessibility, and permissions |
+| **A — Architecture** | Shell, registry, panel runtime, coordinator, and server boundary |
+| **D — Data model** | Dashboard configuration, panel state, query plans, and client-only UI state |
+| **I — Interfaces** | Shell-to-plugin capability contract and browser-to-server dashboard APIs |
+| **O — Optimizations** | Render isolation, query coordination, caching, large-dashboard rendering, and rollout |
+
+## R — Requirements
 
 ### Functional Requirements
 
@@ -39,7 +49,15 @@ At production scale I would target:
 
 The backend owns metric authorization, query execution, aggregation, retention, and alert evaluation. The frontend owns composition, layout, rendering, scheduling, caching of view state, and user feedback. A plugin can request data through a capability API, but it cannot make the browser’s authorization decision.
 
-## Step 2: Capacity and Rendering Model
+### Clarifying Questions and Assumptions
+
+I would confirm whether we are designing an operator-facing desktop product, whether dashboards are mostly read-only during incidents, and whether third-party panel code is in scope. I would also ask whether the priority is sub-second streaming or a 10-second freshness target, how many panels are typical, and whether users can edit the same dashboard concurrently.
+
+For this answer, I assume 20–50 panels, desktop-first use with tablet fallback, 10-second freshness for most metrics, first-party panels owned by several teams, and optional third-party extensions. Dashboard viewing, time-range changes, and panel configuration are in scope; offline editing and arbitrary customer code are follow-up scope.
+
+## A — Architecture
+
+### Capacity and Rendering Constraints
 
 Assume 100,000 daily active users, 10,000 concurrent dashboard viewers, and 20 panels on an average dashboard. If every panel polls independently every 10 seconds, one dashboard produces 120 panel requests per minute. At 10,000 viewers, that is 20,000 requests per second before accounting for retries, duplicated queries, or multiple tabs.
 
@@ -47,7 +65,7 @@ The browser should therefore treat a dashboard refresh as one coordinated operat
 
 The frontend also has a rendering budget. A chart should not render every raw point if the viewport cannot display it. The query contract should return an appropriate bucket size, and the renderer should preserve extrema when it downsamples locally. Historical ranges can use coarser server-side rollups; recent ranges can use finer buckets.
 
-## Step 3: High-Level Frontend Architecture
+### High-Level Component Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -63,7 +81,7 @@ The frontend also has a rendering budget. A chart should not render every raw po
 │ │ plugin       │ │ plugin       │ │ plugin       │ │ (optional boundary) │ │
 │ └──────────────┘ └──────────────┘ └──────────────┘ └─────────────────────┘ │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ Backend capability APIs · authorization · query service · Redis · TSDB      │
+│ Server API boundary · authorization · dashboard data · plugin manifests     │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -109,7 +127,7 @@ For a same-origin first-party plugin, Module Federation or an equivalent remote-
 
 I would usually ship a family of related panels as one remote, not one remote for every chart. That preserves team autonomy without creating dozens of independent runtimes.
 
-## Step 4: Plugin Runtime Contract
+### Plugin Runtime Contract
 
 ### Renderer Lifecycle
 
@@ -131,7 +149,7 @@ The editor owns user-facing configuration. The query builder converts that confi
 
 This avoids a common failure mode where two panels request the same metric with different JSON property ordering and miss the cache. It also gives the backend one stable shape to validate and authorize.
 
-## Step 5: Dashboard Data Coordinator
+### Dashboard Data Coordinator
 
 ### Why Coordination Matters
 
@@ -169,7 +187,22 @@ The client cache key includes tenant, dashboard permissions, normalized query, t
 
 The cache must never be used to bypass authorization. A shared browser cache should be partitioned by tenant and user capability context, and sensitive panels should opt out of persistence.
 
-## Step 6: State and Render Lifecycle
+## D — Frontend Data Model
+
+The model separates data received from the server from persisted dashboard configuration and short-lived browser state. That keeps the plugin runtime declarative: renderers consume a panel snapshot rather than owning a hidden network cache.
+
+| Source | Entity | Owner | Important fields |
+|---|---|---|---|
+| Server | Dashboard | Shell/store | `id`, `name`, `permissions`, `layoutVersion`, `panels` |
+| Server | Panel configuration | Registry + editor | `id`, `pluginId`, `pluginVersion`, `queryConfig`, `displayConfig`, `position` |
+| Derived | Query plan | Data coordinator | normalized metric selector, filters, aggregation, range, resolution, capability scope |
+| Server | Panel snapshot | Data coordinator | `results`, `fetchedAt`, `staleAt`, `status`, `error` |
+| Client persisted | View preferences | Shell/store | selected range, refresh preference, collapsed navigation, theme |
+| Client ephemeral | Interaction state | Local component | drag preview, editor draft, focus target, tooltip, retrying state |
+
+The panel configuration is persisted with a `layoutVersion`, so a debounced layout save can use optimistic concurrency. The snapshot is not persisted in the dashboard store: it is cacheable server state whose lifecycle belongs to the coordinator.
+
+### State and Render Lifecycle
 
 I would separate state into three layers:
 
@@ -183,7 +216,9 @@ Zustand is sufficient for local shell state. For a larger product, a server-stat
 
 The grid should virtualize or otherwise defer panels that are outside the viewport when dashboards become large. Layout changes update local state immediately and persist through a debounced mutation with a version number. A conflict response triggers a merge or asks the user to reload rather than silently overwriting another editor.
 
-## Step 7: Failure Isolation and Observability
+### Cross-Cutting Runtime Concerns
+
+### Failure Isolation and Observability
 
 Each panel has at least three independent boundaries:
 
@@ -203,7 +238,7 @@ The frontend should emit:
 
 This makes the dashboard observable as a product, not just a collection of charts.
 
-## Step 8: Authorization and Security
+### Authorization and Security
 
 A frontend plugin cannot safely enforce data access by itself. The backend must authorize the dashboard, panel, tenant, metric, tags, and requested time range. The browser can use capability metadata to hide unavailable editors and avoid unnecessary requests, but a malicious user can still modify JavaScript and network calls.
 
@@ -218,7 +253,7 @@ For first-party plugins:
 
 For third-party or untrusted plugins, use an iframe with a narrow `postMessage` protocol, sandbox attributes, a separate origin, and a per-plugin CSP. The host should validate message schemas, enforce request quotas, and never pass raw session tokens into the frame.
 
-## Step 9: Responsive Design and Accessibility
+### Responsive Design and Accessibility
 
 The shell defines responsive layout behavior; plugins receive the available size and must support a minimum render size. A narrow viewport may collapse a multi-column dashboard into a single column while retaining panel order and heading hierarchy.
 
@@ -226,9 +261,9 @@ Charts need accessible alternatives. Each renderer should expose a text summary 
 
 Loading and stale states should be announced politely rather than on every polling tick. Focus must remain stable when a panel refreshes.
 
-## Step 10: API Contracts
+## I — Interface Definitions
 
-The browser-facing contract should be dashboard-scoped for coordinated reads:
+The browser-facing server contract should be dashboard-scoped for coordinated reads:
 
 ```
 GET  /api/v1/dashboards                         → list accessible dashboards
@@ -244,7 +279,21 @@ The batch endpoint returns a result per requested panel. Each result can be succ
 
 The frontend API client owns serialization and cancellation. Plugins use a capability API rather than importing the raw fetch client, which prevents every remote from inventing a different retry, authentication, or telemetry policy.
 
-## Deep Dive 1: Plugin Architecture Versus One SPA
+### Shell-to-Plugin Interfaces
+
+| Interface | Inputs | Output or event | Why it exists |
+|---|---|---|---|
+| Plugin renderer | panel configuration, dimensions, theme, data snapshot | rendered panel | Separates rendering from fetching |
+| Panel editor | current configuration, available metrics, user capabilities | validated configuration change | Keeps configuration ownership with the plugin |
+| Query builder | configuration, shared time range, variables | normalized query plan | Allows deduplication and server validation |
+| Capability API | declared scope, query plan, cancellation signal | authorized snapshot or typed error | Prevents direct ad hoc fetch behavior |
+| Shell event channel | panel ID, event name, payload | telemetry, resize, retry, edit request | Keeps plugins decoupled from shell internals |
+
+The shell validates plugin events and configuration at its boundary. The server independently validates the resulting query, so a remote plugin cannot obtain data just by claiming a broader capability.
+
+## O — Optimizations and Deep Dives
+
+### Deep Dive 1: Plugin Architecture Versus One SPA
 
 I choose a plugin boundary because panel teams need independent ownership and deployment. A single SPA gives excellent shared-memory performance and the simplest debugging model, but every chart imports the same dependency graph and ships on the shell’s release train. Over time, team boundaries become implicit and a new panel can destabilize the entire dashboard.
 
@@ -252,7 +301,7 @@ Module Federation or a versioned plugin runtime addresses that organizational bo
 
 The cost is runtime compatibility. Remote modules can break because of React, design-system, or contract version mismatches. I mitigate that with a small stable contract, shared dependency policy, manifest validation, canary loading, and a fallback renderer. I would not split every chart into a separately deployed remote because the operational overhead would exceed the benefit.
 
-## Deep Dive 2: Module Federation Versus Iframes
+### Deep Dive 2: Module Federation Versus Iframes
 
 Iframes provide the strongest browser isolation. A bad or untrusted plugin cannot directly corrupt the shell’s DOM, CSS, JavaScript heap, or dependency graph. They also support separate CSPs, origins, and deployment pipelines. This is the right choice for customer-supplied extensions, plugins owned by unrelated security domains, or content that must be treated as untrusted.
 
@@ -260,7 +309,7 @@ I would not make every chart an iframe. Twenty charts would mean twenty document
 
 Therefore my default is same-origin plugins or Module Federation for trusted first-party panel families. I use iframes selectively when hard isolation is more valuable than shared performance and interaction quality.
 
-## Deep Dive 3: Independent Panel Fetching Versus Coordinated Data
+### Deep Dive 3: Independent Panel Fetching Versus Coordinated Data
 
 Independent fetching is attractive because each panel is self-contained. It fails at dashboard scale: twenty timers drift, identical queries are duplicated, retries create bursts, and changing a global time range creates a thundering herd. It is also difficult to show whether the dashboard is partially stale.
 
@@ -268,13 +317,13 @@ A coordinator creates one place for scheduling, deduplication, cancellation, cac
 
 The trade-off is a more sophisticated shell and a less autonomous plugin API. A plugin must declare its query needs and accept the coordinator’s lifecycle. That is worthwhile because the coordinator protects the backend and makes the user’s view consistent. For a small dashboard with five panels, independent hooks may be acceptable; I would evolve toward coordination before the product reaches dozens of panels or multiple teams.
 
-## Deep Dive 4: Data Authorization Versus Frontend Isolation
+### Deep Dive 4: Data Authorization Versus Frontend Isolation
 
 Putting each chart in an iframe does not automatically grant it a safe data boundary. The iframe may still call a backend endpoint that returns data for the wrong tenant, and a same-origin plugin can still be tampered with in the browser. Authorization must happen on the server for every query.
 
 The frontend should still expose capability-scoped APIs because they reduce accidental overreach and make plugin ownership explicit. The backend validates the capability, dashboard membership, metric scope, tag filters, and tenant context. The trade-off is duplicated policy metadata and more contract work, but it gives users fast feedback while preserving real security at the only boundary that can be trusted.
 
-## Trade-offs Summary
+### Trade-offs Summary
 
 | Decision | ✅ Chosen | ❌ Alternative | Reasoning |
 |---|---|---|---|
@@ -288,7 +337,7 @@ The frontend should still expose capability-scoped APIs because they reduce acci
 | Visualization | Plugin-owned renderer | Shell-owned chart switch | Domain teams can evolve visualizations without shell changes |
 | Layout | CSS/grid runtime with virtualization | Render every panel eagerly | Keeps input responsive on large dashboards |
 
-## Step 11: Rollout and Testing
+### Rollout and Testing
 
 I would migrate from a monolithic chart switch in stages rather than introducing remote bundles on day one:
 
@@ -313,13 +362,13 @@ If the interviewer asks what breaks first, I would prioritize three risks. At th
 
 ## Local Implementation Mapping
 
-For the current local React + Vite project, I would keep the implementation intentionally smaller:
+The current local React + Vite project is the migration starting point rather than the full production architecture:
 
 - `DashboardGrid` and `DashboardPanel` remain shell components.
-- A local panel registry maps the existing line, area, bar, gauge, and stat types to renderers.
-- A dashboard data hook owns one refresh lifecycle and supplies panel snapshots.
-- The backend exposes a dashboard-scoped batch data endpoint; each panel result remains independently renderable.
-- A panel error boundary protects sibling panels.
+- The existing type switch and per-panel polling are sufficient for the demo, but do not yet provide plugin or refresh isolation.
+- The first local increment is a registry that maps the current line, area, bar, gauge, and stat types to renderers.
+- The next increment is a dashboard data hook and batch API that supply independently renderable panel snapshots.
+- A panel error boundary is added before loading remote plugins.
 - Recharts remains a reasonable local renderer choice, but it is an implementation detail rather than the central architectural decision.
 - The local project uses HTTP polling and a single Vite bundle; production can replace the registry loader with approved remote manifests and Module Federation.
 
