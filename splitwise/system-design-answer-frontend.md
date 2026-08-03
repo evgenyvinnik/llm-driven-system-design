@@ -60,32 +60,31 @@ I will not design the backend debt-simplification algorithm, payment processor i
 
 ### High-level diagram
 
-``` 
-┌──────────────────────────────────────────────────────────────────┐
-│                         Frontend Shell                           │
-│ routing · auth · responsive layout · announcements · theme       │
-├──────────────────────────────────────────────────────────────────┤
-│ Dashboard / Group Route                                          │
-│ ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐ │
-│ │ Expense Ledger  │  │ Balances Panel   │  │ Activity Feed    │ │
-│ └────────┬────────┘  └────────┬─────────┘  └────────┬─────────┘ │
-│          │                    │                     │           │
-│          └────────────────────┴─────────────────────┘           │
-│                         Server-state layer                      │
-│                query cache · invalidation · retries             │
-├──────────────────────────────────────────────────────────────────┤
-│ Expense Draft / Split Editor                                    │
-│ local reducer · integer-cents preview · validation · focus       │
-├──────────────────────────────────────────────────────────────────┤
-│ Typed API Client                                                │
-│ credentials · idempotency keys · cancellation · typed errors    │
-└──────────────────────────────┬───────────────────────────────────┘
-                               │ HTTPS
-                    ┌──────────▼──────────┐
-                    │ Server API boundary │
-                    │ auth · permissions  │
-                    │ expenses · balances │
-                    └─────────────────────┘
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         React SPA (Vite + TypeScript)                       │
+│ Routes: / groups · /groups/$groupId ledger/balances · /groups/$id/add      │
+│         expense form · /activity cross-group activity                      │
+│                                                                            │
+│ ┌──────────────┐ ┌────────────────┐ ┌────────────────┐ ┌───────────────┐ │
+│ │ authStore    │ │ groupStore     │ │ ledgerStore    │ │ draftStore    │ │
+│ │ session and  │ │ memberships    │ │ expenses and   │ │ form, split,  │ │
+│ │ capabilities │ │ summaries      │ │ cursors        │ │ validation     │ │
+│ └──────────────┘ └───────▲────────┘ └───────▲────────┘ └──────▲────────┘ │
+│                          │ fetch            │ fetch             │ submit   │
+│ ┌────────────────────────┴───────────────────┐ ┌───────────────┴────────┐ │
+│ │ Server-state layer                          │ │ Render/form adapters   │ │
+│ │ query cache · invalidation · retries        │ │ currency · a11y ·      │ │
+│ │                                             │ │ responsive layout      │ │
+│ └─────────────────────────────────────────────┘ └─────────────────────────┘ │
+│ Typed REST client: credentials · idempotency · cancellation · typed errors │
+└────────────────────────────────────┬───────────────────────────────────────┘
+                                     │ HTTPS
+                          ┌──────────▼──────────┐
+                          │ Splitwise API       │
+                          │ auth · groups ·     │
+                          │ expenses · balances │
+                          └─────────────────────┘
 ```
 
 ### Shell
@@ -219,6 +218,40 @@ The modal becomes a full-screen sheet on a narrow viewport while keeping the sam
 
 The balances panel provides a text alternative for visual arrows: “Carol pays Alice 741 dollars.” A reduced-motion preference disables animated balance transitions. Focus returns to the Add Expense button after a successful save or remains in the modal after an error.
 
+### Route lifecycle and data ownership
+
+The group route first loads membership and permissions, then requests the first ledger page and the balance snapshot in parallel. The page can render the group heading and skeleton regions while those requests resolve. A failure in activity should not hide a successfully loaded ledger.
+
+The group store owns identifiers and summary metadata, not the full component tree. The ledger store owns ordered expense IDs and cursors. The draft store owns only the active form, including participant selection and split mode. This lets a user navigate back to a partially completed draft without making every route subscribe to form keystrokes.
+
+### Mutation and invalidation contract
+
+An expense mutation returns the canonical expense, the server version, and the affected group identifier. The client inserts the canonical ledger record, removes any pending placeholder with the same command key, and invalidates balances, totals, and activity. It does not locally derive a new balance from the mutation response unless the API explicitly supplies the authoritative balance result.
+
+Settlement uses the same discipline. The client can disable the command while it is pending, but the server decides whether the current balance is settleable. After success, the balance query refreshes and the activity feed receives the canonical settlement entry.
+
+### Currency and localization boundary
+
+Amounts cross the API as integer minor units plus an ISO currency code. The editor can use a decimal string for input, but it converts only after validating scale and currency. Display formatting belongs to a locale-aware adapter and never changes the stored amount.
+
+If a group contains multiple currencies, the UI must distinguish original amounts from converted totals. A conversion rate timestamp is part of the server response. The client should not silently convert using a browser locale or a stale cached rate.
+
+### Testing and observability
+
+I would test split allocation with unequal shares, remainder cents, participant removal, currency precision, and reordered members. Integration tests should simulate a successful submit followed by a balance refresh failure and verify that the pending row and stale balance are both labeled correctly.
+
+Telemetry records query latency, mutation latency, retry counts, draft abandonment, and conflict frequency. It should use group and expense identifiers only in sampled, access-controlled diagnostics; amounts and member names should not be sent as ordinary analytics fields.
+
+### Capacity assumptions and extension decisions
+
+I would begin with groups of a few dozen members, a paginated ledger, and a dashboard that loads a bounded number of recent groups. Those assumptions make the initial interaction model simple while preserving the server contracts needed for larger groups.
+
+If a group reaches thousands of members, participant search becomes an independent query instead of a dropdown containing every member. The split editor can load selected members and validate membership on submit. The balance view can summarize and paginate without changing the expense draft contract.
+
+The application has natural feature boundaries—ledger, balances, activity, and settlement—but I would keep them in one SPA at first. A shared route shell and query cache make currency formatting, focus management, and invalidation consistent. Independent modules become useful when teams need separate release cadence; iframes are not appropriate for first-party expense panels because they make form focus and responsive layout harder.
+
+The boundary that matters most is authorization. A panel can be isolated as a module for ownership, but it must not receive more group data than its capability allows. The API remains the authority, and a failed balance panel should not prevent a user from reviewing the ledger.
+
 ### Failure matrix
 
 | Failure | UI behavior | Recovery |
@@ -229,6 +262,68 @@ The balances panel provides a text alternative for visual arrows: “Carol pays 
 | Version conflict | retain draft and show server changes | review and resubmit |
 | Session expiry | preserve draft | reauthenticate, then retry |
 | Offline | banner and draft mode | save draft locally or retry later |
+
+### Alternative architecture review
+
+The smallest implementation is route components with local fetches and a form reducer. That is reasonable for one group page, but dashboard and activity routes will duplicate group queries and create inconsistent loading behavior.
+
+A single global client store can deduplicate everything, but it makes ownership unclear and turns local draft keystrokes into global updates. A server-state cache plus feature-local stores is the better middle ground: canonical queries are reusable, while forms and focus remain local.
+
+An offline-first queue would improve capture during travel, but it turns every expense into a conflict-resolution problem. I would first persist drafts and support read-only cached views. A durable write queue comes after the product defines how to resolve membership, currency, and duplicate-expense conflicts.
+
+Independent modules could let ledger and settlement teams deploy separately. I would use a shared shell and explicit capability contracts before using iframes. Hard isolation would complicate modal focus, currency context, responsive layout, and cross-panel invalidation for little benefit in trusted first-party code.
+
+### API semantics worth making explicit
+
+- A group read returns permissions and a server version, not only display fields.
+- Ledger pages use opaque cursors and stable expense IDs.
+- Expense creation accepts one idempotency key per user intent.
+- A successful mutation returns canonical allocation and affected group metadata.
+- A timeout is an unknown command, not an automatic failure.
+- Balance snapshots include freshness and currency context.
+- Conflict responses identify the affected version and preserve the draft path.
+- Errors distinguish validation, authorization, conflict, unavailable, and expired-session cases.
+
+### Presentation checkpoints
+
+I start with the product promise: the user wants to record a shared expense and trust the resulting balances.
+
+I then trace adding an expense from local split preview, through the typed command, to the canonical ledger response and balance invalidation.
+
+I pause on the distinction between a pending ledger row and an authoritative balance because it demonstrates consistency judgment.
+
+I close by explaining how the design grows from one group route to many groups without making every component know about transport, currency, or authorization.
+
+### Implementation sequence
+
+1. Build route composition, authentication context, and accessible loading/error states.
+2. Add typed group, ledger, balance, and activity queries with cursor support.
+3. Add the local expense draft and deterministic split preview.
+4. Add idempotent expense submission and canonical response handling.
+5. Add server-state invalidation and background refresh.
+6. Add draft recovery, conflict presentation, and responsive modal behavior.
+7. Measure ledger rendering, mutation latency, and balance freshness before adding offline writes.
+
+This sequence keeps the correctness boundary visible at every step. It also gives the team a usable product before introducing the most operationally expensive feature, offline mutation replay.
+
+### What I would validate first
+
+I would test a group with concurrent expense submissions, a failed balance refresh, and a session renewal during submit. The expected result is a canonical ledger, a clearly stale balance, and a recoverable draft.
+
+I would also test currency precision and remainder allocation with reordered participants. The success criteria are no duplicate expenses, no silently changed amounts, and a user who can always identify whether a value is preview or server-authoritative.
+
+I would ask whether settlement is in scope, whether groups can mix currencies, and whether offline writes are a launch requirement. Those answers change the mutation protocol, not the basic route and store boundaries.
+
+The final handoff is a route-oriented shell, feature-owned state, a typed API boundary, and explicit freshness and conflict states. It is intentionally simple enough to ship while leaving clear seams for caching, independent feature ownership, and stronger isolation if the product later requires it.
+
+The strongest trade-off is refusing to show an invented balance after a write. The product still feels responsive through local validation and a pending ledger row, but financial truth comes from the server.
+
+### Final interviewer prompts
+
+- What does the user see while balances refresh?
+- How is a duplicate expense prevented?
+- Which values are cached?
+- What does logout clear?
 
 ### Performance and scaling
 

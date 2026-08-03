@@ -58,27 +58,31 @@ I will treat matching, custody, risk engines, ledger storage, and market-data fa
 
 ### High-level diagram
 
-``` 
+```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                         Exchange Frontend Shell                            │
-│ routing · auth context · theme · keyboard shortcuts · freshness banners     │
-├──────────────────────┬──────────────────────┬──────────────────────────────┤
-│ REST Data Layer       │ WebSocket Service   │ Render Adapters               │
-│ snapshots · commands │ channels · sequence │ canvas chart · book rows       │
-│ cache · retries       │ reconnect · resync  │ sparklines · accessibility     │
-├──────────────────────┴──────────────────────┴──────────────────────────────┤
-│ Normalized Domain Stores                                                   │
-│ market · order book · candles · portfolio · order state · connection health │
-├────────────────────────────────────────────────────────────────────────────┤
-│ Web Workers / SharedWorker where justified                                 │
-│ book aggregation · decimal helpers · shared multi-tab market connection   │
-└──────────────────────────────┬─────────────────────────────────────────────┘
-                               │ HTTPS / WSS
-                    ┌──────────▼───────────┐
-                    │ Exchange API boundary │
-                    │ snapshots · commands  │
-                    │ public/private streams│
-                    └──────────────────────┘
+│                       React SPA (Vite + TypeScript)                         │
+│ Routes: / market overview · /trade/$symbol chart/book/form                 │
+│         /portfolio holdings/allocation · /orders history                   │
+│                                                                            │
+│ ┌──────────────┐ ┌───────────────┐ ┌──────────────────┐ ┌───────────────┐ │
+│ │ authStore    │ │ marketStore   │ │ portfolioStore   │ │ orderStore    │ │
+│ │ session and  │ │ prices, book, │ │ wallets, orders, │ │ drafts and    │ │
+│ │ capabilities │ │ candles       │ │ holdings         │ │ lifecycle     │ │
+│ └──────────────┘ └───────▲───────┘ └────────▲─────────┘ └──────▲────────┘ │
+│                          │ push             │ fetch             │ commands │
+│ ┌────────────────────────┴───────┐ ┌───────┴─────────┐ ┌──────┴────────┐ │
+│ │ WebSocket service               │ │ REST data layer │ │ Render        │ │
+│ │ channels · sequence · backoff   │ │ snapshots ·     │ │ adapters      │ │
+│ │ reconnect · resync              │ │ cache · retries │ │ chart · book  │ │
+│ └─────────────────────────────────┘ └─────────────────┘ └───────────────┘ │
+│ Workers where justified: book aggregation, decimal helpers, shared tabs    │
+└────────────────────────────────────┬───────────────────────────────────────┘
+                                     │ HTTPS / WSS
+                        ┌────────────▼─────────────┐
+                        │ Exchange API boundary    │
+                        │ snapshots · commands     │
+                        │ public/private streams   │
+                        └──────────────────────────┘
 ```
 
 ### Two data paths
@@ -227,6 +231,42 @@ Public market channels and private trading channels are separate capabilities. T
 
 Private portfolio and order data are isolated from public market caches. Logout closes private subscriptions and clears private stores. A SharedWorker may share public market data across tabs, but it must not accidentally share private account events between identities.
 
+### Route lifecycle and loading policy
+
+The market overview can render public cached prices before authentication finishes. The trade route needs three independent readiness signals: market data, account permissions, and instrument configuration. I would not block the whole route on a private portfolio request because a user should still inspect the order book when the account endpoint is slow.
+
+Route loaders fetch the initial REST snapshot and pass it into the domain store. The WebSocket service subscribes after the symbol is known. On a symbol change, it removes old public channels before adding new ones, while the chart adapter resets its viewport and sequence marker.
+
+Every snapshot and stream message carries symbol, channel, and sequence metadata before reaching a selector. This prevents a late response for the previous symbol from populating the new route.
+
+### Market data fan-in
+
+The chart, ticker, order book, and asset list may all want market data. They declare channel requirements to one service instead of opening duplicate sockets or REST requests. The service reference-counts channels and publishes normalized updates to the market store.
+
+For a high-rate symbol, the store keeps the latest raw update while a render scheduler publishes a bounded render snapshot. The chart may receive one update per animation frame, while order-state transitions and sequence gaps are processed immediately. Visual coalescing must never drop correctness-sensitive events.
+
+### Order submission lifecycle
+
+The order form owns a draft with decimal strings, side, order type, price, quantity, and a client-generated idempotency key. Local validation checks obvious constraints; the server performs authoritative balance, risk, and tick-size validation.
+
+After submit, the form enters submitting and prevents duplicate commands without disabling navigation. A successful command creates an acknowledged order state. A timeout creates unknown rather than failed: the client queries by idempotency key or order ID before offering another submit.
+
+### Testing and observability
+
+I would test reducers with deterministic snapshot-plus-delta sequences, including duplicates, gaps, reconnects, and out-of-order REST responses. Render adapters need performance tests with synthetic depth and candle counts, not only component snapshots.
+
+Client telemetry records connection duration, reconnect count, resync count, dropped render frames, order latency, and unknown-command recovery. It must not record private quantities or balances by default. These measurements distinguish network freshness from worker cost and main-thread rendering.
+
+### Capacity assumptions and extension decisions
+
+I would size the first version around one active trading symbol, a few hundred visible market rows, and a book depth that can be rendered within one frame. Those numbers are test fixtures, not correctness limits; they help identify the browser bottleneck before a production feed does.
+
+If the overview grows to thousands of assets, the route subscribes only to visible rows and uses a lower-frequency summary channel for off-screen assets. If users open several trade tabs, public channels can be shared through a worker, while private channels stay scoped to an authenticated identity.
+
+If charting becomes a platform capability, I would expose a render adapter contract with normalized candles, viewport commands, and accessibility summaries. I would not turn every chart into an independent iframe by default. A module boundary or registry gives teams ownership without paying for a browser runtime per panel; an iframe is justified for untrusted extensions or a separate security domain.
+
+The same principle applies to the order book. It is an independently testable feature boundary, but hard isolation complicates keyboard focus, resize, theme, and high-frequency data coordination. I would use error and worker boundaries first, then add a stronger process boundary only when trust or crash containment requires it.
+
 ### Failure matrix
 
 | Failure | UI behavior | Recovery |
@@ -237,6 +277,47 @@ Private portfolio and order data are isolated from public market caches. Logout 
 | Private auth expires | public market remains visible | renew and resubscribe |
 | Worker fails | bounded fallback path | restart and resync |
 | Hidden tab | reduce subscriptions | restore on focus |
+
+### Alternative architecture review
+
+The simplest alternative is a single React tree where every component owns its fetch and subscribes directly to a socket. It has low ceremony, but it couples transport lifecycle to route lifecycle and makes duplicate subscriptions likely.
+
+The opposite extreme is an iframe per chart or order-book panel. It provides hard dependency and crash isolation, but every frame pays for its own runtime, authentication handoff, resize protocol, and accessibility integration. I would reserve it for untrusted code or a separate security domain.
+
+Module Federation or a versioned local registry is a middle option. It supports team ownership and independently released render adapters while preserving a shared shell, store contract, and browser runtime. I would adopt it for a chart family after the data and accessibility contracts are stable, not as the first abstraction.
+
+### Presentation checkpoints
+
+At the end of requirements, I confirm that the browser is not the exchange and that market freshness, order correctness, and account privacy have different priorities.
+
+At the end of architecture, I trace one route from initial REST snapshot through WebSocket updates, normalized store, render adapter, and freshness indicator.
+
+At the end of data modeling, I explain which values may be coalesced and which events must be durable.
+
+At the end of interfaces, I walk through a sequence gap and an order timeout because those cases reveal whether the design is actually safe.
+
+At the end of optimization, I return to the frame budget and show which work is moved to a worker, which work is scheduled, and which work is never dropped.
+
+These checkpoints keep the presentation architectural rather than turning into a tour of chart components.
+
+### Implementation sequence
+
+1. Build route composition, auth context, and a REST-only market overview.
+2. Add normalized market state and one public WebSocket channel.
+3. Add sequence validation, stale banners, reconnect, and resync.
+4. Add chart and book render adapters with frame-budget measurements.
+5. Add private portfolio queries and the idempotent order lifecycle.
+6. Add worker aggregation and multi-tab sharing only after profiling.
+
+This order makes the safe fallback usable before optimizing the hot path. It also prevents a worker or shared socket from hiding protocol bugs during the first implementation.
+
+### What I would validate first
+
+I would load-test the active book and chart together, because their combined frame cost matters more than either component in isolation. I would simulate packet loss and delayed messages, not only a clean socket.
+
+I would test an order timeout after server acceptance and verify that recovery never creates a second command. I would also test logout during a reconnect so private data is cleared before a new subscription is attempted.
+
+The success criteria are trustworthy freshness labels, bounded input latency, deterministic resync, and an order lifecycle that never guesses after an ambiguous network failure.
 
 ## Performance and scaling
 

@@ -55,20 +55,30 @@ I will treat server persistence, asset storage, permission enforcement, and conf
 
 ### High-level diagram
 
-``` 
+```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ Editor Shell                                                               │
-│ routing · tools · keyboard · panels · selection · accessibility             │
-├──────────────────────┬──────────────────────┬──────────────────────────────┤
-│ Scene Store           │ Renderer Adapter     │ Tool Controller              │
-│ normalized objects    │ Pixi/WebGL/canvas    │ pointer → operation intent  │
-│ selectors/history     │ viewport/culling     │ keyboard → command           │
-├──────────────────────┴──────────────────────┴──────────────────────────────┤
-│ Collaboration Sync                                                         │
-│ operation queue · revisions · resync · presence channel                    │
-├────────────────────────────────────────────────────────────────────────────┤
-│ Typed File API ───── HTTPS / WebSocket ───── File and Collaboration API     │
-└────────────────────────────────────────────────────────────────────────────┘
+│                         React SPA (Vite + TypeScript)                       │
+│ Routes: /files list · /design/$fileId canvas · /design/$id/prototype       │
+│         /design/$id/share permissions and collaborators                    │
+│                                                                            │
+│ ┌──────────────┐ ┌────────────────┐ ┌────────────────┐ ┌───────────────┐ │
+│ │ authStore    │ │ fileStore      │ │ sceneStore     │ │ toolStore     │ │
+│ │ session and  │ │ files, pages,  │ │ objects,       │ │ active tool,  │ │
+│ │ permissions  │ │ metadata       │ │ selectors      │ │ selection     │ │
+│ └──────────────┘ └───────▲────────┘ └──────▲─────────┘ └──────▲────────┘ │
+│                          │ fetch            │ render             │ intent   │
+│ ┌────────────────────────┴──────────────────┐ ┌───────────────┴─────────┐ │
+│ │ Canvas renderer adapter                    │ │ Collaboration sync      │ │
+│ │ Pixi/WebGL · culling · hit testing         │ │ operations · revisions  │ │
+│ └────────────────────────────────────────────┘ │ presence · resync       │ │
+│                                                └─────────────────────────┘ │
+│ Typed API client: files · assets · operations · presence                    │
+└────────────────────────────────────┬───────────────────────────────────────┘
+                                     │ HTTPS / WebSocket
+                       ┌─────────────▼─────────────┐
+                       │ File and collaboration API│
+                       │ documents · assets · ops  │
+                       └───────────────────────────┘
 ```
 
 ### Shell and scene store
@@ -181,6 +191,48 @@ Geometry calculations, hit testing, image decoding, and export preparation are c
 
 The layers panel provides a semantic list of objects with names, visibility, lock, and selection controls. The properties panel exposes labeled fields and announces changes. Keyboard shortcuts support select, move, duplicate, delete, group, zoom, and tool switching. Canvas pointer affordances always have a panel or command equivalent.
 
+### Route lifecycle and document loading
+
+The file route loads document metadata, page names, permissions, and the first scene snapshot separately. The shell can show the file name and page tabs before the canvas is ready. Prototype or inspect routes can request a read-only scene representation without loading editor-only tools.
+
+The URL identifies the file, page, and mode. Selection, zoom, pan, active tool, and open panels remain session state. This makes links stable while preserving the fast local feel of editing.
+
+### Scene snapshots and dirty regions
+
+The scene store normalizes objects by ID and tracks parent order independently from object properties. A renderer snapshot contains only the visible subtree, resolved transforms, dirty regions, and selection overlays. Updating one rectangle should not serialize or clone the full file.
+
+Dirty regions are useful when a small property changes, but they are not a substitute for culling. A large move can invalidate many regions, and a zoom change can invalidate the entire viewport. The adapter chooses a full redraw when that is cheaper than complex invalidation bookkeeping.
+
+### Asset and font loading
+
+Asset metadata is part of the document model, but decoded images and fonts are runtime resources. The renderer reserves dimensions before assets arrive and shows a labeled placeholder on failure. Font loading affects text measurement, so the scene can render a fallback measurement and schedule a bounded re-layout after the intended font is ready.
+
+The client should not block the entire document on one remote asset. A missing asset is a local layer error. Export and publish flows can apply stricter completeness checks than interactive editing.
+
+### Testing and observability
+
+I would test transforms, nested groups, z-order hit testing, pointer capture, undo after remote operations, worker revision guards, and renderer recovery. Performance tests should include many small objects, a few huge objects, nested groups, text, and image-heavy scenes.
+
+Telemetry records pointer-to-pixel latency, visible object count, hit-test duration, asset failure rate, operation acknowledgement latency, reconnects, and renderer errors. It should identify file and object types through controlled diagnostic IDs without sending document text or private asset URLs.
+
+### Capacity assumptions and extension decisions
+
+I would benchmark a file with thousands of objects, nested groups, large images, text layers, and several active collaborators. The browser should render only the visible scene and keep decoded resources bounded. The logical file can be much larger than the active render snapshot.
+
+If a file contains many pages, page metadata loads first and inactive pages remain outside the scene store. Prototype playback can use a read-only render runtime that does not load editor tools. Export can run in a worker or server service because it has different latency and memory constraints from interactive editing.
+
+The canvas renderer, tools, panels, and collaboration layer are separate feature boundaries, but they share selection, focus, theme, and revision context. I would keep first-party features in one shell with a renderer adapter. Module Federation can support independently owned tool families after the contract stabilizes; an iframe is reserved for untrusted plugins or separate security domains.
+
+### Plugin capability model
+
+A tool receives pointer events scoped to the canvas, selected object snapshots, viewport commands, and operation intents. It does not receive arbitrary credentials or direct access to the collaboration socket. A renderer receives a render snapshot and emits hit-test or accessibility results through a narrow adapter.
+
+This contract lets the shell apply permissions and error boundaries consistently. If a plugin fails, the user can continue through layers and properties. Hard iframe isolation is stronger but makes pointer capture, keyboard focus, resize, and shared undo substantially more complex.
+
+### Compatibility and migration
+
+Scene objects and operations carry schema versions. A client migrates an older object into its in-memory representation and writes the canonical form only through an explicit save or server migration. Published prototypes pin a renderer-compatible version so a tool deployment cannot silently change an existing presentation.
+
 ### Failure matrix
 
 | Failure | UI behavior | Recovery |
@@ -191,6 +243,86 @@ The layers panel provides a semantic list of objects with names, visibility, loc
 | Revision conflict | affected object marked | rebase or review |
 | Socket disconnects | offline/sync banner | reconnect and request missed ops |
 | Worker fails | bounded main-thread fallback | restart worker and recompute |
+
+### Alternative architecture review
+
+The simplest design uses DOM or SVG for every object. It offers accessibility and easy inspection, but layout and style work scale poorly for large scenes with transforms, images, and text.
+
+A canvas or GPU renderer controls draw cost better, but it creates an imperative bridge and a separate accessibility path. I would keep panels and layer navigation in React and expose semantic object summaries alongside the visual canvas.
+
+An iframe per tool or canvas would provide hard crash isolation, but it would make pointer capture, keyboard focus, shared undo, resize, and collaboration coordination expensive. A renderer adapter and worker boundaries provide most of the value for trusted first-party code. Module Federation is useful later for independently owned tool families.
+
+### API semantics worth making explicit
+
+- Scene snapshots identify file, page, and revision.
+- Operations carry stable IDs, author, base revision, and semantic payload.
+- Presence is ephemeral and can be dropped without changing the file.
+- Asset descriptors are separate from decoded browser resources.
+- Renderer snapshots contain visible objects and viewport state only.
+- Undo sends an inverse operation through the normal permission path.
+- Conflicts identify the affected object or property.
+- Published prototypes pin a compatible renderer version.
+
+### Presentation checkpoints
+
+I begin with the user journey: open a file, select an object, transform it, collaborate, undo, and inspect it through the layers panel.
+
+I trace that journey through route state, normalized scene selectors, tool intents, render snapshots, operation sync, and presence.
+
+I pause on the split between durable operations and lossy presence because it demonstrates that not all realtime data has the same consistency requirement.
+
+I close by explaining how the shell preserves accessibility and permissions even when the visual renderer changes.
+
+### Implementation sequence
+
+1. Build file routes, page navigation, layers, and property panels in React.
+2. Add a normalized scene store with selection and operation history.
+3. Add a renderer adapter for visible objects and viewport transforms.
+4. Add tool intents, pointer capture, local previews, and semantic commits.
+5. Add operation acknowledgements, resync, and separate presence updates.
+6. Add culling, spatial hit testing, workers, and asset budgets after profiling.
+7. Add independently deployed tool families only after the capability contract is stable.
+
+### Design review questions
+
+The first question is whether the visual renderer is the source of truth. It should not be; the scene store and operation protocol must remain testable without a canvas.
+
+The second is whether a tool can mutate a document without passing through permissions and history. If it can, undo and collaboration will diverge.
+
+The third is whether a missing asset or renderer prevents access to layers and properties. If it does, the failure boundary is too broad.
+
+The fourth is whether presence traffic can be dropped independently of document operations. If it cannot, the realtime model is over-coupled.
+
+### What I would validate first
+
+I would benchmark a scene with nested transforms, large images, text, and multiple collaborators while measuring pointer-to-pixel latency. I would inject renderer, worker, asset, and socket failures independently.
+
+The success criteria are usable layers and properties when the canvas fails, deterministic undo through the operation path, and collaboration that remains correct even when presence updates are dropped.
+
+I would ask whether pixel-level fidelity, offline editing, and simultaneous character editing are launch requirements. Those answers determine whether the renderer is canvas-first, whether operations must queue offline, and whether a CRDT is justified.
+
+I would also ask whether plugins can be untrusted. First-party tools can use module boundaries; untrusted tools require capability restriction and likely a separate runtime.
+
+The final handoff is a route-oriented shell, normalized scene state, a renderer adapter, semantic tool intents, durable collaboration operations, and a separate presence channel. It protects both interaction performance and document correctness without forcing hard isolation everywhere.
+
+The strongest trade-off is keeping visual rendering imperative while preserving semantic controls in React. That duplicates some state, but it avoids making canvas performance and accessibility mutually exclusive.
+
+The other key trade-off is separating durable operations from presence. Presence can be lossy and fast; document edits need ordering, replay, and permission checks.
+
+### Final interviewer prompts
+
+- What is rendered versus semantic?
+- Where does hit testing live?
+- How is a drag committed?
+- What does undo send?
+- What survives a socket gap?
+- How is an asset failure isolated?
+
+The answers should consistently point back to scene state, renderer snapshots, semantic tool intents, and operation acknowledgements.
+
+The architecture is complete when these answers are visible in the interfaces, not only stated in the interview narrative.
+
+That is the standard I would use for the presentation.
 
 ## Performance and scaling
 

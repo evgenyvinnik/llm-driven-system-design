@@ -51,22 +51,30 @@ I’ll assume technical internal users, SQL-backed queries through a server gate
 
 ### High-level diagram
 
-``` 
+```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ Builder Shell                                                               │
-│ routing · mode · keyboard · dirty state · permissions · publish controls    │
-├───────────────┬──────────────────────────┬─────────────────────────────────┤
-│ Widget Palette│ Canvas / Layout Engine   │ Property Inspector               │
-│ registry      │ selection · drag · resize │ schema-driven controls          │
-├───────────────┴──────────────────────────┴─────────────────────────────────┤
-│ Binding and Query Layer                                                     │
-│ expression parser · query coordinator · result cache · cancellation        │
-├────────────────────────────────────────────────────────────────────────────┤
-│ Normalized App Store                                                        │
-│ app metadata · widget configs · queries · drafts · published version        │
-├────────────────────────────────────────────────────────────────────────────┤
-│ Typed API client ─────── HTTPS ─────── App/Query/Publish API               │
-└────────────────────────────────────────────────────────────────────────────┘
+│                         React SPA (Vite + TypeScript)                       │
+│ Routes: /apps list · /apps/$appId builder · /apps/$id/preview              │
+│         /queries library and permissions                                  │
+│                                                                            │
+│ ┌──────────────┐ ┌────────────────┐ ┌────────────────┐ ┌───────────────┐ │
+│ │ authStore    │ │ appStore       │ │ editorStore    │ │ queryStore    │ │
+│ │ identity and │ │ widgets,       │ │ selection,     │ │ definitions,  │ │
+│ │ capabilities │ │ layout, version│ │ mode, dirty    │ │ results, run  │ │
+│ └──────────────┘ └───────▲────────┘ └──────▲─────────┘ └──────▲────────┘ │
+│                          │ load/save       │ edit                │ execute │
+│ ┌────────────────────────┴──────────────────┐ ┌───────────────┴─────────┐ │
+│ │ Builder shell and widget registry          │ │ Binding/query layer     │ │
+│ │ palette · canvas · inspector · renderers   │ │ parser · cache · abort  │ │
+│ └────────────────────────────────────────────┘ └─────────────────────────┘ │
+│ Typed API client: versions · queries · permissions · publish              │
+└────────────────────────────────────┬───────────────────────────────────────┘
+                                     │ HTTPS
+                            ┌────────▼─────────┐
+                            │ Retool API       │
+                            │ apps · queries ·  │
+                            │ permissions      │
+                            └──────────────────┘
 ```
 
 ### Shell responsibilities
@@ -197,6 +205,122 @@ A widget error boundary isolates a broken renderer. A query error appears inside
 | Autosave conflict | draft retained | diff, rebase, or reload |
 | Publish validation fails | blocked publish report | fix listed capabilities/bindings |
 | Browser refresh with draft | recovery prompt | restore or discard local draft |
+
+### Route lifecycle and editor state
+
+The app route loads metadata and the latest editable version before requesting expensive query results. The shell can display the palette and inspector skeleton while the canvas resolves. Preview mode loads an immutable published version and does not reuse an unsaved editor query result unless the user explicitly asks for draft preview.
+
+The URL identifies the app, mode, and optionally selected widget. Selection is not part of the persisted app definition. This keeps browser history useful without creating a server revision for every inspector click.
+
+### Autosave and publish flow
+
+Layout changes can be debounced and saved as a draft revision. Configuration changes should be validated locally before autosave, but a server response still determines whether the revision is accepted. The editor shows saving, saved, conflict, and offline states independently from query execution state.
+
+Publish is a separate command. The client asks the server to validate the complete version, including widget types, bindings, permissions, and query references. On success it receives an immutable version ID. The runtime requests that version by ID, so a later draft cannot silently alter a published app.
+
+### Widget capability boundary
+
+The widget contract exposes resolved data, theme tokens, dimensions, and a small event API. It does not expose the auth token, raw API client, full app store, or arbitrary DOM outside its mount point. The shell can log widget usage and enforce permissions without knowing the implementation.
+
+For a first-party widget, this is a module boundary. For a remote or third-party widget, the same logical contract can be implemented through Module Federation or an iframe. The capability list must remain narrower than the host application regardless of loading mechanism.
+
+### Testing and observability
+
+Registry tests verify that every widget type has compatible renderer metadata, editor schema, default props, and accessibility labels. Query coordinator tests cover deduplication, cancellation races, result validation, and dependency cycles. End-to-end tests publish an app, open it as a viewer, and verify that editor-only controls are absent.
+
+Telemetry records canvas commit time, autosave failures, query latency, widget error rate, and publish validation failures. It should identify widget type and version, not include customer query rows or secrets. A widget error should be attributable without exposing its data payload.
+
+### Capacity assumptions and extension decisions
+
+I would design the first editor for hundreds of widgets per app, not unlimited widgets. The canvas can virtualize or defer widgets outside the viewport, while the app store keeps configuration normalized. Query execution receives a concurrency budget so one dashboard cannot create an unbounded fan-out.
+
+As the builder grows, the expensive part is usually not React itself but editor metadata, wide query results, and repeated layout measurement. The shell should load the palette and inspectors by route, while the published runtime loads only the widget families used by the immutable version.
+
+There are three possible extension boundaries. A local registry is best while the contract is changing. Module Federation is useful for independently deployed first-party widget families. An iframe is reserved for code that is untrusted or belongs to a separate security domain. The iframe boundary is stronger, but it imposes postMessage protocols, resize negotiation, duplicated dependencies, and separate accessibility testing.
+
+The widget API should therefore be capability-oriented even when all widgets are local. A widget receives resolved props, theme tokens, dimensions, and named actions. It does not receive arbitrary network credentials or the whole store. This makes a later move to remote loading evolutionary rather than a security rewrite.
+
+### Versioning and migration
+
+Widget configuration includes a type version. When a renderer changes its schema, the registry can migrate a draft explicitly and record the migration result. Published versions remain readable with their original renderer or a compatibility adapter.
+
+The alternative is to silently reinterpret old props. That makes rollback unpredictable and can change a production dashboard when a widget deploys. Explicit migration costs more metadata but gives authors a reviewable change and operators a safe rollback point.
+
+### Alternative architecture review
+
+The simplest builder is one React tree with a switch over widget types and widget-owned queries. It is fast to start, but the switch becomes a release bottleneck and a slow widget can take down the editor.
+
+A plugin registry with shared contracts gives each widget family a clear owner. Local modules are best while the contract changes. Module Federation supports independent deployment after versioning, fallback, and dependency policy are mature. An iframe is stronger isolation, but it creates a separate runtime, resize protocol, focus boundary, and data bridge.
+
+The published runtime is another important boundary. Reusing the editor bundle would reduce conceptual duplication but ships drag controls, draft state, and query-authoring code to viewers. A smaller immutable runtime costs a second mode, but it gives predictable startup and rollback.
+
+### API semantics worth making explicit
+
+- App versions are immutable once published.
+- Draft saves include a base revision and return a canonical revision.
+- Query execution receives an app version, parameter set, and capability scope.
+- Query results identify the query key, parameter hash, and freshness state.
+- Publish validates widgets, bindings, permissions, and referenced queries together.
+- A conflict preserves the local draft rather than replacing it silently.
+- Widget errors are scoped to the widget instance.
+- Secrets never cross the widget renderer contract.
+
+### Presentation checkpoints
+
+I begin with one user journey: drag a widget, bind it to a query, preview it, and publish it.
+
+I then trace the journey through route state, normalized app state, registry resolution, query coordination, and immutable publish output.
+
+I pause on the difference between editor state and runtime state because it explains both performance and safety.
+
+I close by showing how a local registry can evolve into independently deployed widget families without forcing every widget into an iframe.
+
+### Implementation sequence
+
+1. Build app routes, auth context, and a single persisted app version.
+2. Add normalized widget layout, selection, inspector, and keyboard commands.
+3. Add the local widget registry and per-widget error boundaries.
+4. Add typed query definitions, binding validation, cancellation, and result caching.
+5. Add autosave revisions, conflict recovery, and publish validation.
+6. Add the smaller published runtime and viewer permissions.
+7. Add remote widget loading only after the contract and fallback behavior are tested.
+
+### Design review questions
+
+The first review question is whether a widget can render without importing the host’s API client. If not, the capability boundary is too weak.
+
+The second is whether a query result can be invalidated without rewriting the app definition. If not, durable configuration and runtime data are coupled.
+
+The third is whether a published app can be reproduced from an immutable version ID. If not, rollback and incident debugging will be unreliable.
+
+The fourth is whether a failed widget, query, or inspector can leave unrelated widgets usable. If not, the failure boundary is too broad.
+
+### What I would validate first
+
+I would build one chart, one table, and one form widget through the full path: configure, bind, autosave, preview, publish, and open as a viewer. That validates the registry and version contracts before adding more widget types.
+
+I would then inject a query timeout, an invalid binding, a renderer exception, and an autosave conflict. The success criteria are local recovery, preserved drafts, and a published version that remains immutable while editing continues.
+
+I would ask whether queries execute in the browser or through a server broker, whether customer-authored code is allowed, and whether third-party widgets are in scope. Browser-side credentials and untrusted extension code would move the design toward a hard sandbox.
+
+I would also ask whether published apps need independent deployment from the builder. If yes, the immutable runtime and registry contracts become first-class platform surfaces rather than later optimizations.
+
+The final handoff is a route-oriented shell, normalized app state, a versioned widget registry, a coordinated query layer, and an immutable published runtime. That combination keeps the first implementation understandable while preserving a credible path to independently owned widget families.
+
+The strongest trade-off is choosing a capability contract before choosing a loading mechanism. Local modules, Module Federation, or an iframe can implement the contract later; the shell should not leak credentials or full-store access to any of them.
+
+The other key trade-off is separating editor drafts from published runtime data. It costs explicit versioning, but it makes preview, rollback, and failure recovery explainable.
+
+### Final interviewer prompts
+
+- Who owns widget versions?
+- What can a widget access?
+- How is a query cancelled?
+- What does publish validate?
+- Can a viewer load editor code?
+- What happens after a widget throws?
+
+The architecture is complete when these answers are visible in the interfaces, not only stated in the interview narrative.
 
 ## Performance and scaling
 

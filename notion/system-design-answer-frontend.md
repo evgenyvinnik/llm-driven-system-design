@@ -55,26 +55,31 @@ I will not design the search index, database query engine, or complete CRDT algo
 
 ### High-level diagram
 
-``` 
+```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ Workspace Shell                                                            │
-│ routing · workspace switcher · sidebar · commands · accessibility          │
-├──────────────────────┬──────────────────────┬──────────────────────────────┤
-│ Page Tree             │ Block Editor         │ Database View Runtime         │
-│ favorites · nesting  │ block registry       │ table · board · list · filter │
-├──────────────────────┴──────────────────────┴──────────────────────────────┤
-│ Normalized Page / Block Store                                               │
-│ blocks · order · selection · drafts · derived render tree                   │
-├──────────────────────────────┬─────────────────────────────────────────────┤
-│ Sync Coordinator             │ Search Data Layer                            │
-│ mutations · versions · retry │ query · cursor pages · highlights            │
-└──────────────────────────────┴─────────────────────────────────────────────┘
-                               │ HTTPS / WSS
-                    ┌──────────▼──────────┐
-                    │ Workspace API       │
-                    │ pages · blocks      │
-                    │ search · presence   │
-                    └─────────────────────┘
+│                         React SPA (Vite + TypeScript)                       │
+│ Routes: /workspace · /pages/$pageId editor · /pages/$id/share              │
+│         /search query results · /databases/$id views                       │
+│                                                                            │
+│ ┌──────────────┐ ┌────────────────┐ ┌────────────────┐ ┌───────────────┐ │
+│ │ authStore    │ │ pageTreeStore  │ │ blockStore     │ │ viewStore     │ │
+│ │ session and  │ │ favorites,     │ │ blocks, order, │ │ filters, rows,│ │
+│ │ capabilities │ │ nesting        │ │ selection      │ │ pagination    │ │
+│ └──────────────┘ └───────▲────────┘ └──────▲─────────┘ └──────▲────────┘ │
+│                          │ fetch            │ edit              │ query    │
+│ ┌────────────────────────┴──────────────────┐ ┌───────────────┴─────────┐ │
+│ │ Block registry and renderers               │ │ Sync and search layers  │ │
+│ │ editor · read-only · error boundaries      │ │ mutations · retry ·     │ │
+│ └────────────────────────────────────────────┘ │ cursor · highlights     │ │
+│                                                └─────────────────────────┘ │
+│ Typed API client: pages · blocks · search · presence                       │
+└────────────────────────────────────┬───────────────────────────────────────┘
+                                     │ HTTPS / WebSocket
+                          ┌──────────▼──────────┐
+                          │ Workspace API       │
+                          │ pages · blocks ·     │
+                          │ search · presence   │
+                          └─────────────────────┘
 ```
 
 ### Shell
@@ -194,6 +199,48 @@ The editor provides keyboard navigation between blocks, a clear focus target, sl
 
 On narrow screens, the sidebar becomes a drawer, the properties panel becomes a sheet, and block editing remains the primary flow. Presence cursors can be hidden or summarized on mobile without changing document correctness.
 
+### Route lifecycle and page loading
+
+The page route loads workspace capabilities, the page title and breadcrumb, and the visible block window as separate concerns. The shell can show navigation and page context while block content resolves. Expanding a page tree branch loads names and children lazily rather than requesting the entire workspace.
+
+The URL identifies workspace, page, view, and search parameters. Selection, open panels, editor composition, and temporary block drafts remain local. A shared page link therefore restores the document location without leaking a private editing session.
+
+### Block operation lifecycle
+
+Typing updates a local block draft and schedules a mutation after a short idle window or explicit blur, depending on the block type. The mutation includes block ID, base version, operation ID, and the smallest meaningful patch. The sync coordinator acknowledges or rejects it without replacing unrelated local drafts.
+
+Moving a block is a sibling-order operation, not a rewrite of the whole page tree. Converting a block is a versioned type change with a fallback representation if the new renderer is unavailable. These distinctions make conflict messages specific and keep undo history usable.
+
+### Database view boundary
+
+A database block owns view configuration, while the view runtime owns query results and row virtualization. Editing a property can invalidate several views, but the block store should receive only the canonical schema change; each view decides whether its cached page is still valid.
+
+The client should not assume that a row visible in one view is complete in another. Row projections can differ by permissions and selected properties. The API response includes a view key and query version so a late response cannot populate a different filter or sort.
+
+### Testing and observability
+
+I would test block insertion, conversion, reorder conflicts, renderer fallbacks, virtualized focus, search cancellation, database cursor expiry, and reconnect replay. Tests should include a page with one broken block and verify that the rest remains editable.
+
+Telemetry records time to first readable block, mutation acknowledgement latency, renderer failures by block version, view query latency, cursor restart rate, and sync conflicts. It should avoid sending page text, search terms, or database row values in standard analytics.
+
+### Capacity assumptions and extension decisions
+
+I would benchmark pages with thousands of blocks, a workspace with deep page nesting, and database views with many rows. The browser should load the page tree lazily, render the visible page progressively, and virtualize rows without requiring the entire workspace or database to be resident.
+
+The block registry is an ownership boundary, not automatically a security boundary. First-party blocks can share the shell’s React runtime and normalized store through a narrow contract. Independently deployed block families can use Module Federation once versioning and fallback behavior are proven. An iframe is reserved for untrusted embeds or a separate security domain because it complicates selection, resize, focus, and cross-block commands.
+
+### Block capability model
+
+A block receives its typed content, block context, theme tokens, editing mode, and named actions. It does not receive the raw API client, the auth token, or every page’s data. Database blocks receive a view-data adapter that enforces the query and permission scope.
+
+This lets the shell isolate a broken block with an error boundary and lets the sync coordinator reason about operations without importing renderer code. It also creates a path for read-only fallback: if an editor plugin is unavailable, the page can still display a safe summary.
+
+### Versioning and migration
+
+Block content carries a type version. A renderer can migrate old content in memory, but persistence requires an explicit migration result. Published or shared pages pin compatible representations so a newly deployed block cannot silently reinterpret old content.
+
+I would prefer a visible migration warning over silently dropping unknown properties. The warning is a small product cost; losing a user’s block or changing a database view without review is a much larger trust failure.
+
 ### Failure matrix
 
 | Failure | UI behavior | Recovery |
@@ -204,6 +251,81 @@ On narrow screens, the sidebar becomes a drawer, the properties panel becomes a 
 | Database view times out | view-local error | retry without losing page edits |
 | Search response is stale | ignore by request ID | keep current result set |
 | Socket disconnects | sync/presence banner | reconnect and resync operations |
+
+### Alternative architecture review
+
+The simplest editor renders every block in one React tree and saves a full page after each change. It is easy to build but makes long pages, embeds, and one broken block a page-wide concern.
+
+A normalized block store and registry add contracts, but they let blocks render independently and let the shell isolate failures. Module Federation can support independently deployed first-party block families after the contract stabilizes. An iframe is reserved for untrusted embeds because a frame makes selection, resize, focus, and slash commands much harder.
+
+The opposite alternative is a fully offline CRDT editor. It provides strong concurrent editing semantics, but it adds operation retention, garbage collection, conflict debugging, and attachment handling. I would begin with versioned operations and clear conflicts unless offline character-level collaboration is a core requirement.
+
+### API semantics worth making explicit
+
+- Page reads return capabilities, block versions, and a cursor or visible range.
+- Block mutations carry block ID, base version, operation ID, and a narrow patch.
+- Reorder operations identify the sibling list and intended position.
+- Search responses carry query identity and opaque cursors.
+- Database view responses carry view key, schema version, and freshness.
+- Presence can expire and never blocks page mutations.
+- Renderer failures are local to a block instance.
+- Published or shared representations can fall back to read-only output.
+
+### Presentation checkpoints
+
+I begin with the user journey: open a page, edit a block, reorder it, search for another page, and view a database.
+
+I trace that journey through route state, page tree, block registry, normalized store, sync coordinator, and view runtime.
+
+I pause on why page content and database rows are separate server-state models even though both appear inside a page.
+
+I close by explaining how block isolation improves ownership and failure recovery without turning every first-party block into an iframe.
+
+### Implementation sequence
+
+1. Build workspace routes, page tree, permissions, and a readable page shell.
+2. Add normalized blocks, a renderer registry, and local error boundaries.
+3. Add block editing, typed mutations, autosave, and version conflicts.
+4. Add progressive page rendering and lazy page-tree expansion.
+5. Add database view queries, cursor pagination, and row virtualization.
+6. Add search cancellation, URL state, presence, and reconnect resync.
+7. Add offline mutation replay or remote block loading only after conflict semantics are proven.
+
+### Design review questions
+
+The first question is whether one malformed embed can crash a whole page. If it can, the block boundary is not real.
+
+The second is whether a database view can fetch only the rows and properties it needs. If it cannot, large or sensitive workspaces will overload the browser.
+
+The third is whether a block mutation can be retried with a stable operation ID. If it cannot, a timeout may create duplicate edits.
+
+The fourth is whether shared page rendering can fall back to read-only content when an editor plugin is unavailable. If it cannot, deployment compatibility is too fragile.
+
+### What I would validate first
+
+I would test a long page with one broken block, a large database view, a search race, and a reconnect during a reorder. The shell should preserve navigation and unrelated content in every case.
+
+The success criteria are first readable content quickly, isolated block failures, cursor-safe view pagination, and mutations that can be retried without duplicating edits.
+
+I would ask whether pages must work offline, whether database rows can contain sensitive fields, and whether embeds are trusted first-party components. Offline mutations and untrusted embeds materially change the sync and isolation choices.
+
+I would also ask whether shared pages need editing or only reading. A read-only representation can be smaller, safer, and more resilient than shipping every editor and block plugin.
+
+The final handoff is a route-oriented shell, a page and block registry, independent view data, versioned mutations, and local failure boundaries. It supports a fast readable page while keeping collaboration, search, and database projections from contaminating one another.
+
+The strongest trade-off is using progressive rendering before aggressive virtualization. It preserves focus and block semantics while measurements are uncertain; virtualization can be introduced for proven long-page hotspots.
+
+The other key trade-off is versioned operations before a full CRDT. It gives explicit conflict behavior now and avoids paying offline synchronization complexity before the product requires it.
+
+### Final interviewer prompts
+
+- What happens when one block fails?
+- How are long pages loaded?
+- Who owns database rows?
+- How is a reorder retried?
+- What does a shared page load?
+
+The answers should consistently point back to block boundaries, independent view data, versioned mutations, and read-only fallbacks.
 
 ## Performance and scaling
 

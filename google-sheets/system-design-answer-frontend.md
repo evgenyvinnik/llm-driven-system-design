@@ -55,22 +55,31 @@ I will not design the full formula language, server-side conflict algorithm, spr
 
 ### High-level diagram
 
-``` 
+```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ Spreadsheet Shell                                                           │
-│ routing · workbook tabs · toolbar · keyboard · selection · accessibility    │
-├──────────────────────────────┬─────────────────────────────────────────────┤
-│ Viewport Controller           │ Grid Renderer                                │
-│ scroll · measured sizes       │ visible rows/columns · cell layers           │
-├──────────────────────────────┴─────────────────────────────────────────────┤
-│ Sparse Document Store                                                       │
-│ cells · formatting · formulas · selections · undo/redo                     │
-├──────────────────────────────┬─────────────────────────────────────────────┤
-│ Formula Worker                │ Sync Coordinator                             │
-│ dependency graph · compute   │ operations · revisions · reconnect           │
-├──────────────────────────────┴─────────────────────────────────────────────┤
-│ Typed API client ─────────── HTTPS / WebSocket ───────── Workbook API        │
-└────────────────────────────────────────────────────────────────────────────┘
+│                         React SPA (Vite + TypeScript)                       │
+│ Routes: /workbooks list · /workbooks/$id/sheets/$sheetId grid              │
+│         /workbooks/$id/share permissions and collaborators                 │
+│                                                                            │
+│ ┌──────────────┐ ┌────────────────┐ ┌────────────────┐ ┌───────────────┐ │
+│ │ authStore    │ │ workbookStore  │ │ gridStore      │ │ formulaStore  │ │
+│ │ session and  │ │ sheets, tabs,  │ │ viewport,      │ │ values, errors│ │
+│ │ permissions  │ │ metadata       │ │ selection      │ │ dependencies  │ │
+│ └──────────────┘ └───────▲────────┘ └──────▲─────────┘ └──────▲────────┘ │
+│                          │ fetch            │ scroll/edit       │ worker   │
+│ ┌────────────────────────┴──────────────────┐ ┌───────────────┴─────────┐ │
+│ │ Viewport and grid renderers                │ │ Sync coordinator        │ │
+│ │ 2D virtualization · cell layers            │ │ operations · revisions  │ │
+│ └────────────────────────────────────────────┘ │ reconnect · presence    │ │
+│                                                └─────────────────────────┘ │
+│ Typed API client: snapshots · operations · resync · permissions             │
+└────────────────────────────────────┬───────────────────────────────────────┘
+                                     │ HTTPS / WebSocket
+                         ┌───────────▼───────────┐
+                         │ Workbook API          │
+                         │ sheets · cells ·      │
+                         │ operations · presence │
+                         └───────────────────────┘
 ```
 
 ### Shell and viewport
@@ -197,6 +206,124 @@ Screen readers need announcements for selection, edit mode, validation errors, a
 | Formula worker fails | stale calculation badge | restart worker and recompute |
 | Socket disconnects | offline/sync banner | reconnect and request missed ops |
 | Browser refresh with queue | recovery prompt | restore queued operations or discard |
+
+### Route lifecycle and sheet loading
+
+The workbook route loads workbook metadata and sheet tabs first, then requests a bounded viewport for the active sheet. This lets the shell show the workbook name, tabs, and permissions while grid data arrives. Switching tabs cancels the old viewport request but can preserve the active cell per sheet.
+
+The URL identifies workbook and sheet, while zoom, scroll position, and selection remain local session state. A shared link opens the right document and sheet without serializing a huge viewport into the URL.
+
+### Paste and bulk edit flow
+
+Paste is normalized into a batch of cell operations before it reaches the sync queue. The client validates size, formulas, and supported types, then applies a local projection so the user sees the result immediately. The server can accept the batch atomically or return per-cell validation errors according to the contract.
+
+Sending one request per cell simplifies individual retries but creates thousands of operations for a large paste. A bounded batch preserves ordering and gives the server a clear unit for authorization and revision checks.
+
+### Formula and formatting boundaries
+
+Raw cell value, formula text, computed value, and display format are separate fields. Formatting should not be inferred from the computed value because a user can intentionally display a number as currency, percentage, or date. The worker calculates derived values, while the document store remains authoritative for content and formatting.
+
+When a formula references a cell outside the loaded viewport, the worker needs either a document snapshot or an explicit dependency fetch. It must not silently treat an unloaded cell as empty. The UI can show calculating or unavailable while the dependency resolves.
+
+### Testing and observability
+
+I would test coordinate transforms, frozen panes, recycled-cell focus, paste batching, formula revision guards, reconnect replay, and undo after a remote edit. Browser performance tests should measure scroll and edit latency with sparse and dense sheets separately.
+
+Telemetry records active-cell latency, viewport render duration, worker queue depth, operation retry rate, resync count, and conflict frequency. It should never include cell contents in ordinary telemetry.
+
+### Capacity assumptions and extension decisions
+
+I would benchmark a workbook with a million logical coordinates, a few thousand populated cells, a dense pasted range, and several collaborators. The logical sheet can be enormous while the browser keeps only a bounded viewport, sparse records, and the dependencies needed for visible formulas.
+
+If users open many sheets, tabs and metadata load independently from cell ranges. If a formula depends on a remote range, the formula service can provide a dependency snapshot without forcing the grid to render that range. This keeps the rendering contract focused on visible coordinates.
+
+The grid, formula engine, and collaboration sync are strong module boundaries, but I would not place each in an iframe. They share selection, focus, keyboard shortcuts, revision state, and render timing. A worker is the right isolation for formula calculation; a module registry is enough for specialized cell renderers. An iframe would be justified only for an untrusted add-on or a separate document security domain.
+
+### Extension and compatibility model
+
+Cell renderers should receive a coordinate, formatted value, edit lifecycle, and accessibility metadata rather than the entire workbook store. This allows date, currency, and custom cell families to evolve without coupling them to synchronization.
+
+The workbook protocol should version operation and snapshot formats. A newer client can reject an unsupported operation with a visible compatibility state instead of applying an incomplete edit. Resync returns a canonical snapshot and revision, so recovery does not depend on replaying an unbounded local history.
+
+### Alternative architecture review
+
+The simplest sheet renders a table of cells and saves the whole document on change. It is acceptable for a small grid but fails on sparse million-cell coordinates, large pastes, and collaboration.
+
+A canvas renderer can reduce DOM count, but it makes editing semantics, selection, and accessibility harder. I would keep the grid coordinate model and use DOM layers or a hybrid renderer where semantics require it. The renderer is an adapter, not the owner of spreadsheet truth.
+
+An iframe per sheet would isolate failures but would break shared workbook tabs, keyboard navigation, formula-bar focus, and operation ordering. A worker is the better boundary for calculation; a module contract is enough for specialized cell renderers. Stronger isolation is reserved for untrusted add-ons.
+
+### API semantics worth making explicit
+
+- Viewport reads identify workbook, sheet, coordinate range, and revision.
+- Cell operations have stable IDs and a base revision.
+- Batches define whether acceptance is atomic or per-cell.
+- Acknowledgements include canonical values and the resulting revision.
+- Resync returns a snapshot plus revision, not only missing UI events.
+- Presence is best effort and never blocks durable edits.
+- Formula results include the document revision that produced them.
+- Permissions are checked again when an operation is accepted.
+
+### Presentation checkpoints
+
+I begin with the user journey: open a large sheet, scroll, edit a cell, paste a range, and see another collaborator’s change.
+
+I trace that journey through route state, viewport calculation, sparse selectors, worker computation, operation queue, and acknowledgement.
+
+I pause on why a two-dimensional viewport and sparse store solve different problems: one bounds rendering, the other bounds memory.
+
+I close by explaining why a worker protects responsiveness while the sync coordinator protects correctness.
+
+### Implementation sequence
+
+1. Build workbook routes, tabs, permissions, and a bounded read-only grid.
+2. Add coordinate-based selection and a stable editing overlay.
+3. Add sparse cell state, viewport reads, and two-dimensional virtualization.
+4. Add local operations, acknowledgements, retries, and revision-aware resync.
+5. Add formula calculation in a worker with document-revision guards.
+6. Add presence as a separate lossy channel.
+7. Add bulk paste, inverse-operation undo, and dense-sheet performance tests.
+
+### Design review questions
+
+The first question is whether the grid can scroll through an empty million-cell sheet without allocating a million cells. If not, virtualization and sparse storage are not truly separated.
+
+The second is whether a slow formula calculation can overwrite a newer edit. If not, worker results need revision metadata.
+
+The third is whether a reconnect can recover from a missing operation without trusting a guessed local sequence. If not, the sync protocol needs a canonical snapshot path.
+
+The fourth is whether a collaborator cursor can disappear without affecting a saved edit. If not, presence and durable operations are coupled incorrectly.
+
+### What I would validate first
+
+I would benchmark scroll and edit latency for a sparse sheet, a dense pasted range, and a formula-heavy region. I would then drop the socket during an edit and verify that the operation queue, worker result, and viewport remain coherent.
+
+The success criteria are stable focus, bounded visible DOM, revision-safe formula results, and an explicit recovery path after a missing operation or expired cursor.
+
+I would ask whether formula evaluation must match a desktop spreadsheet exactly, whether offline editing is required, and whether a single workbook can be edited by thousands of users. Those answers determine worker compatibility, queue semantics, and whether collaboration needs partitioning.
+
+I would also ask whether the server returns viewport data or a full document snapshot. A viewport API favors bounded startup; a snapshot favors offline formulas but requires stronger memory and permission controls.
+
+The final handoff is a route-oriented shell, sparse coordinate state, a bounded grid renderer, revision-aware formula workers, and a durable operation protocol. It keeps visible editing fast without pretending that rendering, calculation, collaboration, and persistence are one problem.
+
+The strongest trade-off is treating a worker as a derived computation boundary rather than a second source of truth. That adds revision checks and message serialization, but prevents a slow formula result from corrupting a newer edit.
+
+The other key trade-off is using a viewport API instead of always downloading a workbook. It complicates dependency fetching, but protects startup time, memory, and permissions for large sheets.
+
+### Final interviewer prompts
+
+- What is authoritative: cell or worker?
+- How is a range pasted?
+- What survives a reconnect?
+- Can presence block edits?
+- How is focus preserved?
+- What is the resync boundary?
+
+The answers should consistently point back to the sparse store, revision metadata, bounded rendering, and durable operation queue.
+
+The architecture is complete when these answers are visible in the interfaces, not only stated in the interview narrative.
+
+That is the standard I would use for the presentation.
 
 ## Performance and scaling
 
