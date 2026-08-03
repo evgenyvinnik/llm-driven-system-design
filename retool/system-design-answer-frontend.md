@@ -1,388 +1,226 @@
-# System Design: No-Code Internal Tool Builder (Frontend Focus)
+# Retool-Style Internal Tool Builder — Frontend System Design
 
-## 🎯 1. Requirements Clarification
+## 45–50 minute interview walkthrough
 
-> "We are designing the frontend for a visual tool builder -- think Retool or Appsmith. Users compose internal applications by dragging components from a palette onto a grid canvas, configuring properties through an inspector panel, writing SQL queries, and binding query results to component props. The core frontend challenges are the drag-and-drop system, grid layout engine, binding UI, and widget rendering."
+## Opening — 2 minutes
 
-**Functional Requirements:**
-- Three-pane editor: component palette, canvas, property inspector
-- Drag-and-drop from palette to canvas with grid snapping
-- Dynamic widget rendering based on component type
-- Binding input with `{{ }}` syntax highlighting
-- Query panel with SQL editor and results table
-- Preview mode rendering all components with resolved bindings
+“I’ll design a visual builder for internal applications. Users drag widgets onto a canvas, configure them in an inspector, bind them to query results, and preview the published app. The defining challenge is keeping editor state, bindings, query execution, and rendered widgets coherent while a user makes rapid layout changes.”
 
-**Non-Functional Requirements:**
-- Smooth drag-and-drop at 60fps
-- Editor loads in < 2s
-- Support apps with 100+ components without jank
-- Auto-save within 500ms of changes
+| RADIO stage | Focus | Time |
+|---|---|---:|
+| Requirements | Builder workflow, personas, correctness, and scale | 4 min |
+| Architecture | Shell, canvas, registry, inspector, query layer | 8 min |
+| Data model | App schema, widget config, bindings, results, drafts | 6 min |
+| Interfaces | API contracts and widget/component contracts | 8 min |
+| Optimizations | Dragging, rendering, query scheduling, resilience | 18–22 min |
+| Wrap-up | Alternatives and scaling limits | 3 min |
 
----
+## R — Requirements — 4 minutes
 
-## 🏗️ 2. Frontend Architecture
+### Clarifying questions
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Editor Layout                                │
-│  ┌────────────┐  ┌──────────────────────────┐  ┌─────────────────┐  │
-│  │ Component   │  │     Canvas Area          │  │  Property       │  │
-│  │ Palette     │  │  ┌─────┐  ┌──────────┐  │  │  Inspector      │  │
-│  │             │  │  │Table│  │ TextInput │  │  │                 │  │
-│  │  Table      │  │  └─────┘  └──────────┘  │  │  [Label]        │  │
-│  │  Button     │  │  ┌─────┐                │  │  [Placeholder]  │  │
-│  │  TextInput  │  │  │Chart│                │  │  [Default Val]  │  │
-│  │  Text       │  │  └─────┘                │  │                 │  │
-│  │  Select     │  │                          │  │  {{ binding }}  │  │
-│  │  Chart      │  │     (12-column grid)     │  │                 │  │
-│  │  ...        │  │                          │  │                 │  │
-│  │             │  │                          │  │                 │  │
-│  └────────────┘  └──────────────────────────┘  └─────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────────────┐│
-│  │                     Query Panel                                  ││
-│  │  [query1] [query2]  │  SQL Editor    │  Results Table            ││
-│  └──────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────┘
-```
+- Is the builder for developers, operations users, or both?
+- Are SQL queries allowed, and how are credentials and permissions represented?
+- Is the app runtime expected to work offline or only while connected to business systems?
+- Can multiple users edit one app concurrently?
+- How many widgets, queries, and rows should one app support?
+- Does published runtime need a different performance and security boundary from the editor?
 
----
+I’ll assume technical internal users, SQL-backed queries through a server gateway, one editor at a time for the first version, up to 100 widgets and dozens of queries per app, and a separate preview/published mode. Arbitrary JavaScript execution and customer-supplied widget code are out of scope for the base product.
 
-## 🧠 3. State Management
+### Functional requirements
 
-> "I chose Zustand over Redux for three reasons: less boilerplate, simpler async handling, and easier TypeScript integration. The state is split into three stores."
+1. Create or open an app with a three-pane editor: palette, canvas, inspector.
+2. Drag, resize, reorder, duplicate, and delete widgets on a grid.
+3. Configure widget properties with typed controls.
+4. Bind widget properties to static values, query results, or other widget state.
+5. Define queries, run them, inspect results, and bind columns into widgets.
+6. Preview the app with resolved bindings and loading/error states.
+7. Save drafts, publish a version, and recover unsaved work after recoverable errors.
 
-### Store Architecture
+### Non-functional requirements
 
-```
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│  Auth Store      │  │  Editor Store    │  │  Data Store      │
-│                  │  │                  │  │                  │
-│  user            │  │  app             │  │  dataSources     │
-│  loading         │  │  isDirty         │  │  queryResults    │
-│  login()         │  │  selectedId      │  │  queryLoading    │
-│  logout()        │  │  addComponent()  │  │  componentValues │
-│  checkAuth()     │  │  updateComponent │  │  executeQuery()  │
-│                  │  │  moveComponent() │  │  getContext()    │
-│                  │  │  selectQuery()   │  │                  │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
-```
+- Dragging remains responsive at 60fps for 100 widgets.
+- Local edits appear immediately and autosave within a bounded debounce window.
+- Query execution cannot freeze canvas interaction.
+- A broken widget or query shows a local error state rather than a blank app.
+- Published apps cannot execute undeclared queries or arbitrary client code.
+- Keyboard users can navigate palette, canvas, inspector, and query results.
 
-**Editor Store**: Owns the app state (components, queries), selection state, and all mutation methods. When a component is added, moved, resized, or its props are updated, the store creates a new immutable app snapshot and marks `isDirty = true`.
+## A — Architecture — 8 minutes
 
-**Data Store**: Owns query results, data source list, and component runtime values. The binding context is derived from this store -- it combines query results (`query1.data`) with component values (`textInput1.value`) into a flat context object.
+### High-level diagram
 
-**Why separate stores?** The editor state changes on every user interaction (drag, select, type). The data state changes on query execution. Keeping them separate prevents unnecessary re-renders -- the canvas does not re-render when a query completes unless a component is bound to that query's data.
-
-### Dirty State and Auto-Save
-
-> "The isDirty flag is the trigger for auto-save. When any mutation occurs -- adding a component, changing a prop, moving a widget -- the editor store sets isDirty to true. A debounced save function watches this flag and sends the full app state to the server after 500ms of inactivity. This ensures frequent saves without flooding the API during rapid editing sessions like dragging components around the canvas."
-
-The auto-save callback sends the entire component tree, queries, and layout in one PUT request. If the save fails, isDirty remains true and the save retries on the next debounce cycle. A visual indicator in the toolbar shows "Saving..." during the API call and "Saved" on success, giving users confidence that their work is persisted.
-
----
-
-## 🖱️ 4. Drag-and-Drop System
-
-> "I chose @dnd-kit/core over react-beautiful-dnd for two reasons: it is actively maintained (react-beautiful-dnd is deprecated), and it supports freeform positioning alongside sortable lists."
-
-### Drag Flow
-
-```
-Palette (Draggable)          Canvas (Droppable)
-┌──────────────┐             ┌──────────────────────┐
-│  [Table]  ───┼── drag ────▶│                      │
-│  [Button]    │             │    drop here          │
-│  [Input]     │             │                      │
-└──────────────┘             └──────────────────────┘
-                                     │
-                              Calculate grid position
-                              from pointer coordinates
-                                     │
-                              addComponent(definition, { x, y })
+``` 
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Builder Shell                                                               │
+│ routing · mode · keyboard · dirty state · permissions · publish controls    │
+├───────────────┬──────────────────────────┬─────────────────────────────────┤
+│ Widget Palette│ Canvas / Layout Engine   │ Property Inspector               │
+│ registry      │ selection · drag · resize │ schema-driven controls          │
+├───────────────┴──────────────────────────┴─────────────────────────────────┤
+│ Binding and Query Layer                                                     │
+│ expression parser · query coordinator · result cache · cancellation        │
+├────────────────────────────────────────────────────────────────────────────┤
+│ Normalized App Store                                                        │
+│ app metadata · widget configs · queries · drafts · published version        │
+├────────────────────────────────────────────────────────────────────────────┤
+│ Typed API client ─────── HTTPS ─────── App/Query/Publish API               │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **DragStart**: Identify which component definition is being dragged. Show a `DragOverlay` with the component's icon and label.
+### Shell responsibilities
 
-2. **DragEnd**: Check if the drop target is the canvas (`over.id === 'canvas'`). Calculate the grid position from the pointer coordinates:
-   - `gridCol = Math.floor((pointerX - canvasLeft) / 80)`
-   - `gridRow = Math.floor((pointerY - canvasTop) / 40)`
+The shell owns route state, editor versus preview mode, selected widget, dirty state, keyboard commands, permission context, and publish controls. It provides the runtime context that widgets consume but does not know how an individual table or chart renders.
 
-3. **Component creation**: Call `editorStore.addComponent(definition, { x: gridCol, y: gridRow })` which creates an `AppComponent` with default props, the calculated position, and auto-generated width/height based on component type.
+### Registry and rendering
 
-### Collision Detection and Overlap Handling
+A widget registry maps a stable type and version to metadata, renderer, editor schema, default configuration, supported bindings, and minimum size. The canvas resolves widgets through the registry. This is preferable to a growing switch once teams add widget families, but I would keep the first local registry in one bundle and introduce remote widgets only after the contract stabilizes.
 
-> "Unlike a typical list-based drag-and-drop, a no-code builder canvas permits overlapping components. A button can sit on top of a container, or a text label can overlay a chart. This means we do not implement collision detection to prevent overlap -- instead, the canvas uses z-index ordering based on component creation time. Later components render on top of earlier ones. If we needed strict no-overlap enforcement, we would maintain a grid occupancy matrix and reject placements that collide with existing components."
+Preview and edit mode use the same renderer with different context. Edit mode supplies selection outlines, placeholder data, and configuration affordances. Preview mode supplies resolved values and hides editing chrome.
 
-### Grid Layout
+### State and data flow
 
-> "The canvas uses a 12-column grid with 80px column width and 40px row height. Components are positioned absolutely within the canvas using CSS."
+The normalized store owns app structure and editor state. The query coordinator owns server state and execution status. A widget subscribes to its own config and the specific binding result it needs. It should not subscribe to the entire app document, because changing one widget would otherwise rerender the canvas.
 
-```
-position: absolute;
-left: component.position.x * 80px;
-top:  component.position.y * 40px;
-width: component.position.w * 80px;
-height: component.position.h * 40px;
-```
-
-**Why absolute positioning over CSS Grid?** Components can overlap in a no-code builder (a button on top of a container). CSS Grid does not support overlapping grid items. Absolute positioning gives us full control over z-ordering and allows components to be placed at any grid coordinate independently.
-
-**Default sizes by component type**:
-
-| Component | Width (cols) | Height (rows) |
-|-----------|-------------|---------------|
-| Table | 12 | 8 |
-| Chart | 6 | 6 |
-| Text Input | 4 | 2 |
-| Button | 4 | 2 |
-| Text | 4 | 2 |
-| Container | 6 | 4 |
-
----
-
-## 🧩 5. Widget Rendering
-
-> "The widget renderer dynamically maps a component's `type` string to a React component. This is the core of the component model -- adding a new widget type requires only a new React component and an entry in the registry."
-
-### Renderer Architecture
-
-```
- WidgetRenderer
-  ├── component.type === 'table'    ──▶ TableWidget
-  ├── component.type === 'button'   ──▶ ButtonWidget
-  ├── component.type === 'textInput'──▶ TextInputWidget
-  ├── component.type === 'text'     ──▶ TextWidget
-  ├── component.type === 'chart'    ──▶ ChartWidget
-  ├── component.type === 'form'     ──▶ FormWidget
-  └── component.type === ???        ──▶ "Unknown" fallback
-```
-
-Each widget receives:
-- `component`: The AppComponent with props, position, and bindings
-- `isEditor`: Boolean flag -- in editor mode, inputs are read-only and buttons do not fire actions
-
-### Widget Data Flow
-
-```
-Query Result                 Binding Engine           Widget
-{ data: [...] }  ──store──▶  {{ query1.data }}  ──▶  TableWidget
-                             resolveBindingValue()     renders rows
-```
-
-Widgets that display data (Table, Chart, Text) read from the data store's binding context. The `resolveBindingValue()` function evaluates binding expressions like `{{ query1.data }}` and returns the raw value (array for tables, string for text).
-
-Widgets that capture input (TextInput, NumberInput, Select) write to the data store's `componentValues` map, making their values available in the binding context as `{{ textInput1.value }}`.
-
-### Component Binding in the Property Inspector
-
-> "The property inspector is where users connect data to components. Each prop in the component's schema gets a corresponding input control in the inspector. String props get text inputs, boolean props get toggle switches, number props get number inputs. But the critical feature is that any prop marked as `bindable` in the registry gets a BindingInput instead of a plain input."
-
-When a user types `{{ query1.data }}` into a bindable prop field, the inspector stores both the raw expression text (in the component's bindings map) and the expression as the prop value. At render time, the widget renderer resolves the binding expression against the current data context and passes the resolved value to the widget. This two-layer approach -- expression storage plus runtime resolution -- means the inspector always shows the expression the user wrote, while the widget always shows the resolved data.
-
----
-
-## 🔧 6. Deep Dive: Binding Input UI
-
-> "The binding input is the most nuanced UI component. It must serve as a regular text input for static values AND highlight `{{ }}` expressions to indicate data bindings."
-
-### Highlighting Approach
-
-```
-Input value: "Hello {{ query1.data[0].name }}"
-
-Parsed segments:
-  [
-    { text: "Hello ",                     isBinding: false },
-    { text: "{{ query1.data[0].name }}", isBinding: true  }
-  ]
-```
-
-The `getBindingSegments()` utility splits the input text using a regex and returns segments tagged as binding or plain text. Binding segments are rendered with a purple color and a light purple background, visually distinguishing them from static text.
-
-**Implementation challenge**: HTML inputs cannot have mixed styling within their value. The approach uses a transparent input layered over a styled div that renders the highlighted segments. The user types in the input; the overlay provides visual feedback.
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Overlay div + transparent input | Simple, standard input behavior | Scroll sync issues on long text |
-| ❌ ContentEditable div | Full styling control | Complex cursor management, XSS risk |
-| ❌ Monaco Editor | Full syntax highlighting | Heavy dependency, overkill for single props |
-| ❌ Color the entire input | Trivial | Cannot distinguish bound vs unbound text |
-
-> "I chose the overlay approach for its simplicity. The input remains a standard HTML input with full keyboard support (selection, copy/paste, undo). The overlay div provides visual feedback. The trade-off is that very long binding expressions may not scroll in sync with the input, but for typical prop values (under 100 characters) this is not an issue."
-
----
-
-## 🔧 7. Deep Dive: Canvas Interaction Design
-
-> "The canvas needs to support selecting, moving, resizing, and deleting components. Each interaction must feel immediate and predictable."
-
-### Selection
-
-Clicking a component selects it (blue ring highlight). Clicking the canvas background deselects. The property inspector shows the selected component's props.
-
-### Move and Resize Controls
-
-When a component is selected, arrow buttons appear below it for movement, and +W/-W/+H/-H buttons for resizing. These modify the component's `position` object in the editor store.
-
-**Why button controls instead of drag handles?** Drag handles would be more intuitive but create a conflict with the palette-to-canvas drag-and-drop. @dnd-kit/core uses a single DndContext, and nested draggable behavior (drag to move a component that is inside a droppable canvas) is complex to coordinate. Button controls are simpler and more precise for grid-based layouts.
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Button controls | Simple, precise, no DnD conflict | Less intuitive, more clicks |
-| ❌ Drag handles | Natural, mouse-driven | Complex DnD nesting, grid snapping math |
-| ❌ CSS resize property | Zero JS for resize | Limited styling, no grid snapping |
-
-> "For a learning project, button controls demonstrate the concept clearly. In production Retool, drag handles with throttled grid snapping provide a better UX, but the underlying state management is identical -- both update `component.position` in the store."
-
-### Delete
-
-A red "x" button appears at the top-right corner of selected components. Clicking it calls `removeComponent(id)`, which filters the component from the app's component array.
-
-### Keyboard Shortcuts
-
-> "Beyond mouse-driven interactions, the editor supports keyboard shortcuts for common operations. Arrow keys move the selected component by one grid unit, Delete/Backspace removes the selected component, and Escape deselects. These shortcuts are registered as global key event listeners that check for a selected component before acting. Keyboard support is especially important for accessibility and for power users who prefer keyboard-driven workflows."
-
----
-
-## 🔧 8. Deep Dive: Query Panel Design
-
-> "The query panel is a mini-IDE at the bottom of the editor. It must support writing SQL, selecting a data source, running queries, and viewing results."
-
-### Layout
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  [query1*] [query2]  │  Name: [query1]  Source: [SampleDB v]    │
-│                      │  Trigger: [Manual v]  [Run]              │
-├──────────────────────┼──────────────────────────────────────────│
-│  query list          │  SQL Editor        │  Results Table      │
-│                      │  SELECT *          │  id | name | email  │
-│  + Add Query         │  FROM customers    │  1  | Alice | ...   │
-│  + Data Source       │  LIMIT 10          │  2  | Bob   | ...   │
-└──────────────────────┴──────────────────────────────────────────┘
-```
-
-The left sidebar lists app queries. The center has a textarea for SQL. The right shows results as a scrollable table.
-
-**Query triggers**: Each query has a trigger mode:
-- `manual`: Runs only when the user clicks "Run" or a button triggers it
-- `on_load`: Runs automatically when the app loads (preview mode)
-- `on_change`: Runs when a bound input value changes
-
-### Live Data Feedback Loop
-
-> "The query panel creates a tight feedback loop for building data-driven apps. A user writes a SELECT query, clicks Run, sees the results in the table, then drags a Table widget onto the canvas and binds its data prop to `{{ query1.data }}`. The table immediately renders the query results. If the user modifies the query and re-runs it, the table updates in real time because the data store's query results change, triggering a re-render of all bound widgets."
-
-This live feedback loop is what makes the no-code builder feel interactive rather than a static form editor. The data store acts as the reactive bridge -- query results flow into it, binding context is derived from it, and widgets subscribe to the slices they need. The entire cycle from query execution to widget re-render happens within a single React render pass after the data store update.
-
----
-
-## 👁️ 9. Preview Mode
-
-> "Preview mode renders the published app with live data. It differs from the editor in three ways: no selection UI, no property inspector, and input widgets are interactive."
-
-### Preview Rendering Flow
-
-1. Load published app version (or fall back to draft)
-2. Load data sources
-3. Execute all `on_load` queries automatically
-4. Render all components using `WidgetRenderer` with `isEditor=false`
-5. Input widgets update `componentValues` in the data store
-6. Bound components re-render when query results change
-
-### Component Lifecycle in Preview
-
-```
-on_load queries ──execute──▶ queryResults updated
-                                  │
-                                  ▼
-Table (bound to query1.data) ── re-renders with data
-Button (onClick: query2)    ── user clicks ── executes query2
-                                  │
-                                  ▼
-Table (bound to query2.data) ── re-renders with new data
-```
-
----
-
-## 🗺️ 10. Routing
-
-```
-/                      ── App dashboard (list of apps)
-/login                 ── Login page
-/register              ── Registration page
-/app/:appId/edit       ── Editor view (three-pane layout)
-/app/:appId/preview    ── Preview mode (published app)
-```
-
-TanStack Router with file-based routing. The editor and preview routes use `$appId` dynamic segment to load the correct app.
-
----
-
-## ⚡ 11. Performance Considerations
-
-**Re-render optimization**: Zustand's selector pattern ensures components only re-render when their slice of state changes. The TableWidget subscribes to `getBindingContext()` and only re-renders when query results change.
-
-**Canvas with 100+ components**: Each component is absolutely positioned, so the browser does not need to reflow the entire grid on changes. React keys ensure efficient DOM reconciliation.
-
-**Query results**: Large result sets (1000+ rows) are paginated client-side. The TableWidget renders only the current page (default 10 rows).
-
-**Bundle size management**: The component widget map uses static imports rather than dynamic imports because all widget types are loaded in the editor. In a production deployment with hundreds of widget types, code-splitting by widget category (data display, input, layout) would reduce initial bundle size. For the current nine widget types, static imports keep the loading waterfall simple.
-
-**Rendering large JSONB documents**: When an app has hundreds of components, parsing and diffing the entire component array on every state update can become expensive. Zustand's immutable update pattern means React only diffs the virtual DOM for components whose props actually changed. The key optimization is that each WidgetRenderer instance reads its own component from the store using a selector keyed by component ID, so adding or modifying one component does not trigger re-renders for unrelated components.
-
-**Drag-and-drop performance**: During a drag operation, the DragOverlay component renders a lightweight preview (icon and label only, not the full widget). This avoids the cost of rendering a complete TableWidget or ChartWidget during every mouse move event. The canvas droppable area uses pointer events for hit detection, which is more performant than tracking mousemove on every child component.
-
-**Memory management for query results**: Query results can be large (thousands of rows with many columns). The data store holds results in memory for all executed queries. To prevent memory bloat when users run many queries during a session, old query results are evicted when a query is re-executed -- only the most recent result per query name is retained. For preview mode, results are cleared when the user navigates away from the app.
-
----
-
-## 🧭 RADIO Data Model and Interfaces
-
-The editor has three distinct data categories. The app definition and query configuration are server-originated and persisted. The selected component, dirty drafts, drag preview, and validation messages are client-only. Query results are server state with freshness and execution status, not part of the widget configuration itself.
+## D — Data Model — 6 minutes
 
 | Entity | Owner | Important fields | Lifecycle |
 |---|---|---|---|
-| `AppDefinition` | App store | app ID, name, components, layout version | persisted server state |
-| `WidgetConfig` | Canvas/widget registry | component ID, type, position, props, bindings | persisted server state |
-| `QueryDefinition` | Query panel/store | query ID, SQL, parameters, trigger policy | persisted server state |
-| `QueryResult` | Data layer | query ID, columns, rows, fetched time, error | cached server state |
-| `BindingExpression` | Binding editor | source path, expression, validation status | draft then persisted |
-| `EditorSession` | Shell | selected ID, dirty state, mode, active panel | ephemeral client state |
+| `AppDefinition` | app store | app ID, name, widgets, queries, version | persisted server state |
+| `WidgetConfig` | widget registry/store | ID, type, version, position, props, bindings | persisted server state |
+| `QueryDefinition` | query layer | ID, SQL/template, parameters, trigger policy | persisted server state |
+| `BindingExpression` | binding editor | source, path, transform, validation | draft then persisted |
+| `QueryResult` | query coordinator | columns, rows, status, fetched time, error | cached server state |
+| `EditorSession` | shell | selected ID, mode, dirty fields, active pane | ephemeral client state |
+| `PublishVersion` | publish flow | version, validation result, created time | immutable server state |
+
+The app definition is persisted as a versioned document. Widget position and configuration are separate enough that layout changes can be debounced without rewriting query results. Query results are never serialized into the app definition; they are runtime data with a freshness policy.
+
+### Binding model
+
+Bindings should be parsed into a constrained expression representation rather than evaluated as arbitrary JavaScript. A binding can refer to a query result, a widget’s public state, a user variable, or a safe transformation such as formatting. The parser returns an AST and validation diagnostics.
+
+The security boundary is important. A text field may bind to a result path. It must not be able to call arbitrary browser APIs, read another app, or exfiltrate credentials. The server independently validates query permissions and published app capabilities.
+
+### Draft and conflict state
+
+The editor keeps a local draft over the last server version. Each autosave includes the base version. A conflict preserves local edits and offers a diff or reload choice. Silent last-write-wins is acceptable for a prototype but dangerous when two people edit the same operational app.
+
+## I — Interfaces — 8 minutes
 
 ### Server-facing API
 
-```
-GET  /api/apps/:appId                         → app definition and widget configs
-PUT  /api/apps/:appId                         → versioned app/layout update
-POST /api/apps/:appId/queries/execute         → execute an authorized query
+``` 
+GET  /api/apps/:appId                         → app definition and version
+PUT  /api/apps/:appId                         → save draft against base version
+POST /api/apps/:appId/queries/execute        → execute an authorized query
 GET  /api/apps/:appId/queries/:queryId        → query metadata and latest result
-POST /api/apps/:appId/publish                 → validate and publish an app version
+POST /api/apps/:appId/validate               → validate bindings and permissions
+POST /api/apps/:appId/publish                → create immutable published version
+GET  /api/apps/:appId/versions/:version      → published runtime definition
 ```
 
-The editor sends a version with layout mutations. A stale version returns a conflict and preserves the local draft. Query execution returns status, columns, rows, elapsed time, and a result version; the client never treats an old result as current merely because it arrived later.
+The save response returns canonical configuration, new version, and validation warnings. Query execution returns columns, rows, elapsed time, result version, and typed errors. A query request accepts cancellation and a request ID so a stale response cannot overwrite a newer run.
 
-### Client-facing interfaces
+### Client interfaces
 
-| Interface | Inputs | Output/event | Boundary |
+| Interface | Inputs | Output/event | Responsibility |
 |---|---|---|---|
-| `WidgetRegistry` | widget type and version | renderer, editor, binding schema | widget code does not own persistence |
-| `WidgetRenderer` | resolved props, dimensions, query state | rendered widget, interaction events | preview and edit modes share rendering |
-| `BindingEditor` | expression, schema, query context | validated expression change | no arbitrary code execution |
-| `QueryCoordinator` | query definition, trigger, cancellation | result or typed error | deduplicates and cancels execution |
-| `Canvas` | widget configs, pointer/keyboard events | layout patch | optimistic local layout, debounced save |
+| `WidgetRegistry` | type, version | renderer, editor, schema | extension and compatibility boundary |
+| `Canvas` | widget configs, pointer/keyboard events | layout patch, selection | immediate local interaction |
+| `Inspector` | selected config and schema | validated property patch | schema-driven editing |
+| `BindingEditor` | expression and available context | AST, diagnostics, binding patch | safe expression authoring |
+| `QueryCoordinator` | query definition, trigger, signal | result, loading, error | dedupe, cancel, cache, retry |
+| `PreviewRuntime` | published definition, context | rendered app and statuses | runtime isolation from editor state |
 
-This makes the key alternative explicit: a single widget switch is easier for nine widgets, while a registry pays off when teams add widget types independently. The registry is also where code splitting, capability checks, and fallback renderers belong.
+The canvas and inspector communicate through store actions rather than direct references. The widget renderer receives resolved props, dimensions, theme, loading status, and a limited action API. It cannot import the raw database client.
 
-## ⚖️ 12. Trade-offs Summary
+### Query lifecycle
+
+1. A widget declares a binding dependency.
+2. The coordinator canonicalizes the query and parameter set.
+3. Equivalent active queries are deduplicated.
+4. The coordinator cancels obsolete runs when parameters change.
+5. Results are validated against expected columns and stored by query key.
+6. Widgets receive loading, stale, empty, success, or error state.
+
+## O — Optimizations and Deep Dives — 18–22 minutes
+
+### Deep dive 1: Drag-and-drop without canvas jank
+
+During a drag, the pointer position changes far more often than the persisted layout needs to change. The canvas keeps a local transform or preview position and renders a lightweight drag overlay. It commits a normalized grid position on drop, then debounces persistence.
+
+The alternative is to write the full app document to the server on every pointer move. That creates network pressure and makes a slow request visible as drag lag. The chosen design separates interaction state, layout commit, and server persistence.
+
+For 100 widgets, each widget subscribes to its own config. The canvas does not rerender every widget when one item moves. Collision detection uses a spatial index or bounded grid calculation rather than comparing every widget against every other widget on every pointer event.
+
+### Deep dive 2: Bindings and query results
+
+Bindings are a dependency graph. A widget depends on a query result, a query may depend on user variables, and a widget may expose controlled state to another widget. The coordinator should schedule dependencies in an explicit graph so it can avoid cycles and explain them to users.
+
+I would allow declarative transformations such as formatting, filtering a bounded result, or selecting a field. I would not allow arbitrary JavaScript in the base runtime because it makes security review, caching, serialization, and preview consistency much harder.
+
+The editor should show a binding preview with sample data and diagnostics. A missing path is a validation error. A temporarily failed query is a runtime error. These must be different states so a user knows whether to fix configuration or retry a dependency.
+
+### Deep dive 3: Query result isolation
+
+Query results can be large and sensitive. Results are scoped to an app, user capability, query version, and parameter set. The client cache should evict old results and avoid persisting sensitive rows to local storage.
+
+Query execution uses a concurrency budget. A user can edit multiple queries, but the browser should not start an unbounded number of database requests. Visible widgets receive priority; preview-only or hidden widgets are deferred. Historical results may be reused longer than live query results, but freshness must be visible.
+
+### Deep dive 4: Widget registry versus one bundle
+
+A local registry in one bundle is the simplest starting point. It gives shared React dependencies, easy debugging, and low runtime risk. A remote registry or Module Federation becomes useful when widget teams need independent deployment, but it adds manifest compatibility, dependency duplication, rollback, and trust concerns.
+
+I would extract widget families, not individual widgets, and require a stable renderer/editor/query contract. Third-party widgets would use a stronger sandbox boundary and capability API rather than receiving the full app store.
+
+### Deep dive 5: Published runtime versus editor
+
+The published app should load an immutable version and a smaller runtime. It should not contain drag controls, unsaved drafts, or editor-only query capabilities. This separation improves startup time and reduces the blast radius of a malformed draft.
+
+The editor can show a preview using the published runtime with draft data overlaid. The trade-off is two runtime modes and a more explicit version model. The benefit is that publishing becomes testable and an app can remain stable while a new draft is being edited.
+
+### Accessibility and resilience
+
+The canvas needs keyboard equivalents for selecting, moving, resizing, duplicating, and deleting widgets. The inspector uses labeled controls and announces validation errors. Dragging should have an alternate command path for users who cannot use a pointer.
+
+A widget error boundary isolates a broken renderer. A query error appears inside dependent widgets while unrelated widgets remain usable. If the app definition fails to load, the shell offers retry and preserves a local draft where safe.
+
+### Failure matrix
+
+| Failure | UI state | Recovery |
+|---|---|---|
+| Widget renderer throws | local widget fallback | retry or disable widget |
+| Query times out | stale/error result | retry, cancel, or inspect query |
+| Binding invalid | editor diagnostic | fix expression before publish |
+| Autosave conflict | draft retained | diff, rebase, or reload |
+| Publish validation fails | blocked publish report | fix listed capabilities/bindings |
+| Browser refresh with draft | recovery prompt | restore or discard local draft |
+
+## Performance and scaling
+
+The first browser bottleneck is drag interaction across many widgets. The second is query result rendering, especially wide tables. The third is app-definition parsing and selector cost as documents grow.
+
+I would virtualize large result tables, keep query results outside the widget configuration store, memoize widget selectors, and use workers for expensive binding transforms or formula-like calculations. Route-level splitting keeps the SQL editor and heavy table renderer out of the initial published runtime.
+
+Metrics should include time to interactive editor, drag frame drops, autosave conflict rate, query cancellation rate, result-render duration, widget error rate, and published runtime startup.
+
+## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| State management | Zustand (3 stores) | Redux, Context | Less boilerplate, selective re-renders |
-| Drag-and-drop | @dnd-kit/core | react-beautiful-dnd | Actively maintained, freeform support |
-| Grid positioning | Absolute CSS | CSS Grid | Supports overlapping, independent placement |
-| Component movement | Button controls | Drag handles | Simpler, no DnD nesting conflicts |
-| Binding highlight | Overlay div | ContentEditable, Monaco | Simple, standard input behavior |
-| Chart rendering | SVG in React | Chart.js, D3 | Zero dependencies, sufficient for demo |
-| Routing | TanStack Router | React Router | File-based, type-safe, integrated devtools |
-| Auto-save | Debounced full-state PUT | Incremental patches | Simpler, no merge logic, idempotent |
+|---|---|---|---|
+| App state | normalized store plus query layer | one serialized document in React state | isolates widget updates and server data |
+| Widget extension | versioned registry | permanent shell switch | supports growth without hiding contracts |
+| Binding language | constrained declarative AST | arbitrary JavaScript | safer, serializable, explainable |
+| Drag persistence | local preview plus debounced commit | write every pointer move | protects frame rate and API |
+| Query transport | typed coordinator | widget-owned fetches | dedupe, cancel, prioritize, and observe |
+| Conflict handling | version check with draft retention | last-write-wins | avoids silently deleting another editor’s work |
+| Published runtime | immutable version | render current draft directly | predictable deployment and rollback |
+| Untrusted extensions | sandbox/capability boundary | full app access | limits data and DOM blast radius |
+
+## Closing — 3 minutes
+
+“The builder is a document editor with a runtime, not just a grid of components. The normalized model separates widget configuration, query results, bindings, and drafts. The interfaces make query execution and widget capabilities explicit. The optimizations protect the two hot paths—dragging and rendering results—while versioning and publish isolation protect correctness.”
+
+If time remains, I would discuss multi-user editing, schema-aware SQL autocomplete, custom widget review, and whether a worker-based runtime is justified for large published apps.

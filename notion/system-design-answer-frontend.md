@@ -1,484 +1,231 @@
-# Design Notion (Frontend Focus)
+# Notion-Style Workspace — Frontend System Design Answer
 
-## 45-Minute Frontend Interview Answer
+## 45–50 minute interview walkthrough
 
-### 1. Requirements Clarification (3 minutes)
+## Opening — 2 minutes
 
-**Interviewer:** Design a block-based collaboration tool like Notion.
+“I’ll design the frontend for a document workspace with nested pages, block editing, database views, search, and collaboration. The key design choice is to separate the persisted block graph from the rendered tree, local editing state, and presence. That lets the editor stay responsive while pages grow and other users make changes.”
 
-**Candidate:** I'll focus on the frontend architecture. Let me clarify the requirements:
+| RADIO stage | Focus | Time |
+|---|---|---:|
+| Requirements | Workspace workflows, editing, collaboration, and scale | 4 min |
+| Architecture | Shell, block store, renderers, sync, search | 8 min |
+| Data model | Pages, blocks, trees, drafts, views, presence | 6 min |
+| Interfaces | Page APIs, block mutations, search, component APIs | 8 min |
+| Optimizations | Block editing, virtualization, views, sync, a11y | 18–22 min |
+| Wrap-up | Trade-offs and scaling limits | 3 min |
 
-**User-Facing Requirements:**
-- Block-based rich text editor with multiple content types
-- Real-time collaborative editing with presence indicators
-- Hierarchical page navigation in sidebar
-- Database views (table, board, list, calendar, gallery)
-- Keyboard shortcuts and slash commands
+## R — Requirements — 4 minutes
 
-**Technical Requirements:**
-- Optimistic updates with instant feedback
-- Virtual scrolling for large documents (10,000+ blocks)
-- Offline-first with local persistence
-- Responsive design for desktop and mobile
-- Accessible to screen readers and keyboard users
+### Clarifying questions
 
-**Key Interactions:**
-- Typing and formatting text
-- Drag-and-drop block reordering
-- Slash command menu for block type conversion
-- Real-time cursor and selection visibility
+- Is the product primarily personal notes, team documentation, or a project workspace?
+- How deeply nested can pages become and how many blocks can a large page contain?
+- Do blocks include databases, embeds, files, and rich text, or only text?
+- Is simultaneous editing required, and does offline editing matter?
+- How should search work across pages, blocks, and database properties?
+- Which actions must be keyboard accessible?
 
----
+I’ll assume team workspaces, nested pages, block types for text, headings, lists, tasks, images, and database views, simultaneous presence, search, and desktop-first editing with responsive reading. Offline editing is a follow-up with a clear migration path.
 
-### 2. Component Architecture (5 minutes)
+### Functional requirements
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                            App Shell                                  │
-├─────────────────────┬────────────────────────────────────────────────┤
-│                     │                                                │
-│      Sidebar        │              Main Content                      │
-│  ┌──────────────┐   │  ┌────────────────────────────────────────┐   │
-│  │ WorkspaceNav │   │  │           PageHeader                   │   │
-│  ├──────────────┤   │  │  (title, icon, cover, breadcrumbs)     │   │
-│  │  PageTree    │   │  ├────────────────────────────────────────┤   │
-│  │  (recursive) │   │  │           BlockEditor                  │   │
-│  ├──────────────┤   │  │  ┌──────────────────────────────────┐  │   │
-│  │ QuickFind    │   │  │  │  VirtualizedBlockList            │  │   │
-│  ├──────────────┤   │  │  │  ┌────────────────────────────┐  │  │   │
-│  │ Favorites    │   │  │  │  │     BlockComponent         │  │  │   │
-│  ├──────────────┤   │  │  │  │  (text/heading/list/...)   │  │  │   │
-│  │ RecentPages  │   │  │  │  └────────────────────────────┘  │  │   │
-│  └──────────────┘   │  │  └──────────────────────────────────┘  │   │
-│                     │  ├────────────────────────────────────────┤   │
-│                     │  │       PresenceIndicators               │   │
-│                     │  └────────────────────────────────────────┘   │
-└─────────────────────┴────────────────────────────────────────────────┘
+1. Navigate workspaces, favorites, recent pages, and a nested page tree.
+2. Open a page and render blocks in order.
+3. Create, edit, reorder, duplicate, and delete blocks.
+4. Support slash commands and rich text editing within a block.
+5. Render table, board, list, and calendar-style database views.
+6. Search pages and blocks with keyboard-friendly navigation.
+7. Show collaborator presence and recover edits after reconnect.
 
-Overlay Components:
-┌────────────────────┐  ┌────────────────────┐  ┌────────────────────┐
-│   SlashCommandMenu │  │  BlockDragOverlay  │  │    ShareModal      │
-└────────────────────┘  └────────────────────┘  └────────────────────┘
-```
+### Non-functional requirements
 
----
+- Typing and block insertion should feel local and not wait on the server.
+- Large pages should render only visible or priority blocks where possible.
+- A single malformed block should not blank the whole page.
+- Page tree navigation should remain responsive with thousands of pages.
+- Durable edits must be ordered, retryable, and visibly conflicted.
+- The app should support keyboard navigation and readable status announcements.
 
-### 3. Block Editor Deep Dive (8 minutes)
+### Out of scope
 
-#### Block Component Architecture
+I will not design the search index, database query engine, or complete CRDT algorithm. I will define their frontend data contracts and the client state needed to integrate them.
 
-**Block Type Delegation Pattern:**
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     BlockComponent                           │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ Focus management (useEffect on isSelected)              │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│                           │                                  │
-│                           v                                  │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │           Switch on block.type                          │ │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐       │ │
-│  │  │  text   │ │ heading │ │  list   │ │  code   │  ...  │ │
-│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘       │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│                           │                                  │
-│                           v                                  │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ Drag handle (visible on hover)                          │ │
-│  │ Child blocks (indented, if present)                     │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+## A — Architecture — 8 minutes
+
+### High-level diagram
+
+``` 
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Workspace Shell                                                            │
+│ routing · workspace switcher · sidebar · commands · accessibility          │
+├──────────────────────┬──────────────────────┬──────────────────────────────┤
+│ Page Tree             │ Block Editor         │ Database View Runtime         │
+│ favorites · nesting  │ block registry       │ table · board · list · filter │
+├──────────────────────┴──────────────────────┴──────────────────────────────┤
+│ Normalized Page / Block Store                                               │
+│ blocks · order · selection · drafts · derived render tree                   │
+├──────────────────────────────┬─────────────────────────────────────────────┤
+│ Sync Coordinator             │ Search Data Layer                            │
+│ mutations · versions · retry │ query · cursor pages · highlights            │
+└──────────────────────────────┴─────────────────────────────────────────────┘
+                               │ HTTPS / WSS
+                    ┌──────────▼──────────┐
+                    │ Workspace API       │
+                    │ pages · blocks      │
+                    │ search · presence   │
+                    └─────────────────────┘
 ```
 
-**Supported Block Types:**
-| Type | Component | Description |
-|------|-----------|-------------|
-| text | TextBlock | Plain paragraph |
-| heading1/2/3 | HeadingBlock | Section headings |
-| bulleted_list | ListBlock | Bullet points |
-| numbered_list | ListBlock | Numbered items |
-| toggle | ToggleBlock | Collapsible content |
-| code | CodeBlock | Syntax highlighted code |
-| quote | QuoteBlock | Block quote |
-| callout | CalloutBlock | Highlighted note |
-| divider | DividerBlock | Horizontal rule |
-| image | ImageBlock | Image upload |
-| database | DatabaseBlock | Inline database |
+### Shell
 
-#### Rich Text Editor
+The shell owns route state, workspace context, sidebar, global command palette, keyboard shortcuts, dialogs, theme, and session capabilities. It provides page context to features but does not own every block’s local editing state.
 
-**RichText Data Structure:**
-| Field | Type | Description |
-|-------|------|-------------|
-| text | string | The actual text content |
-| annotations.bold | boolean | Bold formatting |
-| annotations.italic | boolean | Italic formatting |
-| annotations.underline | boolean | Underline formatting |
-| annotations.strikethrough | boolean | Strikethrough |
-| annotations.code | boolean | Inline code |
-| annotations.color | string | Text color |
-| href | string | Link URL (optional) |
+### Block registry and renderer
 
-**Editor Flow:**
-```
-┌────────────────┐     ┌────────────────┐     ┌────────────────┐
-│ contentEditable│────>│ Convert HTML   │────>│ RichText[]     │
-│ div            │     │ to RichText    │     │ onChange       │
-└────────────────┘     └────────────────┘     └────────────────┘
-        │
-        v
-┌────────────────┐     ┌────────────────┐
-│ "/" keystroke  │────>│ Show Slash     │
-│ detected       │     │ Command Menu   │
-└────────────────┘     └────────────────┘
-```
+A block registry maps type and version to a renderer, editor, schema, default content, and accessibility metadata. A paragraph, database view, image, and embed can evolve independently while the page store remains normalized.
 
-**Keyboard Shortcuts:**
-| Shortcut | Action |
-|----------|--------|
-| Cmd/Ctrl + B | Bold |
-| Cmd/Ctrl + I | Italic |
-| Cmd/Ctrl + U | Underline |
-| / | Open slash command menu |
+Each block is rendered inside a local error boundary. A missing or broken block gets a fallback with its type and ID, while sibling blocks remain usable. Published or shared pages can fall back to a read-only representation if an editor plugin is unavailable.
 
-#### Slash Command Menu
+### Page tree and view runtime
 
-**Available Commands:**
-| Type | Label | Description |
-|------|-------|-------------|
-| text | Text | Just start writing with plain text |
-| heading1 | Heading 1 | Big section heading |
-| heading2 | Heading 2 | Medium section heading |
-| heading3 | Heading 3 | Small section heading |
-| bulleted_list | Bulleted List | Simple bulleted list |
-| numbered_list | Numbered List | List with numbers |
-| toggle | Toggle | Collapsible content |
-| quote | Quote | Capture a quote |
-| code | Code | Code snippet with syntax highlighting |
-| callout | Callout | Make writing stand out |
-| divider | Divider | Visual divider line |
-| image | Image | Upload or embed an image |
-| database | Database | Create a new database |
+The page tree is a separate route-aware feature. It loads names and hierarchy first, then details on expansion. Database views consume a block’s schema and rows through a view data layer. Table, board, and list renderers share query state but own layout-specific presentation.
 
-**Menu Behavior:**
-- Filter commands as user types after "/"
-- Arrow keys navigate selection
-- Enter selects current command
-- Escape closes menu
-- Mouse hover updates selection
+### Sync and search
 
----
+The sync coordinator owns mutations, version checks, retries, and resync. Search results are independent server state; they should not be merged into the block store because search snippets and page blocks have different lifetimes and pagination.
 
-### 4. Virtual Scrolling for Large Documents (6 minutes)
+## D — Data Model — 6 minutes
 
-**Architecture:**
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   VirtualizedBlockList                       │
-├─────────────────────────────────────────────────────────────┤
-│  1. Flatten nested blocks with depth tracking               │
-│                                                              │
-│  2. Configure @tanstack/react-virtual:                       │
-│     - estimateSize based on block type                      │
-│     - measureElement for actual heights                      │
-│     - overscan: 5 items                                      │
-│                                                              │
-│  3. Render only visible items with transforms               │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Height Estimates by Block Type:**
-| Block Type | Estimated Height |
-|------------|-----------------|
-| heading1 | 48px |
-| heading2 | 40px |
-| heading3 | 36px |
-| code | 80px + (lines * 24px) |
-| image | 300px |
-| divider | 24px |
-| default | 32px |
-
-**Keyboard Navigation (in block list):**
-| Key | Action |
-|-----|--------|
-| Enter | Create new block after current |
-| Backspace (empty block) | Delete block, focus previous |
-| Arrow Up | Focus previous block |
-| Arrow Down | Focus next block |
-| Tab | Indent block |
-| Shift + Tab | Outdent block |
-
----
-
-### 5. Database Views (6 minutes)
-
-#### Table View
-
-**Structure:**
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Property Header Row                                          │
-│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌───┐         │
-│  │ Name │ │Status│ │ Date │ │ Tags │ │Person│ │ + │         │
-│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └───┘         │
-├──────────────────────────────────────────────────────────────┤
-│  Data Rows (filtered and sorted)                              │
-│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐               │
-│  │ Task1│ │ Done │ │ 1/15 │ │ Tag1 │ │ @Bob │               │
-│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘               │
-│  ...                                                          │
-├──────────────────────────────────────────────────────────────┤
-│  [+ New]                                                      │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**View Configuration:**
-- Visible properties (column selection)
-- Property widths
-- Sort configurations
-- Filter rules
-
-#### Board View (Kanban)
-
-**Structure:**
-```
-┌───────────────────────────────────────────────────────────────────────┐
-│  Board View                                                            │
-├───────────┬───────────┬───────────┬───────────┬─────────────────────┤
-│  To Do    │  In Prog  │  Review   │  Done     │  [+ Add Group]      │
-│  (3)      │  (2)      │  (1)      │  (5)      │                     │
-├───────────┼───────────┼───────────┼───────────┤                     │
-│ ┌───────┐ │ ┌───────┐ │ ┌───────┐ │ ┌───────┐ │                     │
-│ │ Card  │ │ │ Card  │ │ │ Card  │ │ │ Card  │ │                     │
-│ └───────┘ │ └───────┘ │ └───────┘ │ └───────┘ │                     │
-│ ┌───────┐ │ ┌───────┐ │           │ ┌───────┐ │                     │
-│ │ Card  │ │ │ Card  │ │           │ │ Card  │ │                     │
-│ └───────┘ │ └───────┘ │           │ └───────┘ │                     │
-│ [+ New]   │ [+ New]   │ [+ New]   │ [+ New]   │                     │
-└───────────┴───────────┴───────────┴───────────┴─────────────────────┘
-```
-
-**Features:**
-- Group by select property
-- Drag-and-drop between columns (via @dnd-kit)
-- Drop zone highlighting
-- Column-specific add button (pre-fills group value)
-
-#### List View
-
-**Structure:**
-```
-┌─────────────────────────────────────────────────────────────┐
-│  List View                                                   │
-├─────────────────────────────────────────────────────────────┤
-│  [x] Task 1 Title                   @Alice  Jan 15  High    │
-├─────────────────────────────────────────────────────────────┤
-│  [ ] Task 2 Title                   @Bob    Jan 16  Low     │
-├─────────────────────────────────────────────────────────────┤
-│  [x] Task 3 Title                   @Carol  Jan 17  Medium  │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Features:**
-- Optional checkbox column
-- Title as primary content
-- Preview properties on right
-- Click to open row detail modal
-
----
-
-### 6. State Management with Zustand (5 minutes)
-
-#### Block Store
-
-| Field | Type | Description |
-|-------|------|-------------|
-| blocks | Map<string, Block> | All blocks by ID |
-| selectedBlockId | string or null | Currently selected block |
-| focusedBlockId | string or null | Block with cursor focus |
-
-**Actions:**
-| Action | Description |
-|--------|-------------|
-| setBlocks(blocks) | Initialize blocks from API |
-| updateBlock(id, updates) | Partial update, set updatedAt |
-| deleteBlock(id) | Remove block, clear selection if needed |
-| addBlock(afterId, position) | Create new block with generated position |
-| moveBlock(id, targetId, position) | Reorder or nest block |
-| selectBlock(id) | Set selection |
-| focusBlock(id) | Set cursor focus |
-
-**Uses immer middleware for immutable updates.**
-
-#### Presence Store
-
-| Field | Type | Description |
-|-------|------|-------------|
-| users | Map<string, UserPresence> | Active users |
-
-**UserPresence Structure:**
-| Field | Type | Description |
-|-------|------|-------------|
-| name | string | Display name |
-| color | string | Cursor color |
-| cursor | {blockId, offset} | Current position (optional) |
-
-**Actions:**
-- `setUsers(users)` - Initialize presence list
-- `updateCursor(userId, cursor)` - Update cursor position
-- `removeUser(userId)` - Remove user on disconnect
-
-#### Page Tree Store
-
-| Field | Type | Description |
-|-------|------|-------------|
-| pages | Map<string, Page> | All pages by ID |
-| expandedPages | Set<string> | Expanded page IDs |
-
-**Actions:**
-- `toggleExpanded(pageId)` - Expand/collapse in sidebar
-- `setPages(pages)` - Initialize page tree
-
-**Persisted to localStorage:** expandedPages (survives page reload)
-
----
-
-### 7. Presence and Cursors (4 minutes)
-
-**Remote Cursor Display:**
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Block Content                                               │
-│                                                              │
-│  The quick brown fox jum│ps over the lazy dog.              │
-│                         ↑                                    │
-│                   ┌─────────┐                                │
-│                   │ Alice   │  (colored cursor + label)      │
-│                   └─────────┘                                │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Cursor Positioning Algorithm:**
-1. Find block element by data-block-id attribute
-2. Find contenteditable element within block
-3. Create range at specified offset
-4. Get bounding rect for cursor position
-5. Render fixed-position cursor overlay
-
-**Presence Avatars (in page header):**
-```
-┌────────────────────────────────────────────────────────────┐
-│  Page Title                        [A][B][C][D][E] [+3]   │
-└────────────────────────────────────────────────────────────┘
-```
-
-- Show first 5 users as avatar circles
-- "+N" badge for additional users
-- Hover for name tooltip
-- Color matches cursor color
-
----
-
-### 8. Sidebar Navigation (4 minutes)
-
-**Sidebar Structure:**
-```
-┌──────────────────────────────────────┐
-│  [Workspace Name ▼]                  │  <- Workspace switcher
-├──────────────────────────────────────┤
-│  🔍 Quick Find           Cmd+K      │
-│  ⚙️ Settings                         │
-├──────────────────────────────────────┤
-│  Favorites                           │
-│    📄 Important Doc                  │
-│    📊 Project Dashboard              │
-├──────────────────────────────────────┤
-│  Private                             │  <- Page tree root
-│    ▸ 📁 Project A                    │
-│    ▾ 📁 Project B                    │
-│        📄 Notes                       │
-│        📄 Tasks                       │
-│    📄 Quick Note                     │
-├──────────────────────────────────────┤
-│  [+ New page]                        │
-└──────────────────────────────────────┘
-   ║  <- Resize handle
-```
-
-**Page Tree Item Features:**
-- Expand/collapse toggle (if has children)
-- Page icon (emoji or default)
-- Page title (truncated)
-- Hover actions: Add child, More options
-- Recursive rendering for nested pages
-- Indent based on depth
-
-**Sidebar Features:**
-- Resizable width (drag handle on right edge)
-- Collapsible
-- Quick Find opens search modal
-- Favorites section (starred pages)
-- Page tree with recursive structure
-
----
-
-## RADIO Data Model and Interfaces
-
-The page editor should not treat the rendered block tree as the persistence model. The server stores blocks and relationships; the client derives a render tree, maintains local drafts, and tracks collaboration state separately.
-
-| Entity | Owner | Important fields | Update semantics |
+| Entity | Owner | Important fields | Lifecycle |
 |---|---|---|---|
-| `Page` | Page store | page ID, parent ID, title, permissions, updated time | server state |
-| `Block` | Block store | block ID, type, parent ID, order key, content, version | normalized and persisted |
-| `BlockTree` | Selector layer | ordered visible block IDs and descendants | derived client state |
-| `EditorDraft` | Block editor | active block, selection, composition text, dirty state | ephemeral client state |
-| `Presence` | Presence store | user ID, page ID, cursor/block, last seen | lossy realtime state |
-| `SearchResult` | Search data layer | page/block ID, snippet, score, cursor | paginated server state |
+| `Workspace` | shell/store | ID, name, members, capabilities | server state |
+| `Page` | page store | ID, parent ID, title, icon, permissions | server state |
+| `Block` | normalized block store | ID, type, parent, order key, content, version | operation-backed |
+| `BlockTree` | selector layer | ordered visible IDs and descendants | derived client state |
+| `BlockDraft` | block editor | active block, text, selection, composition, dirty | ephemeral |
+| `DatabaseSchema` | view runtime | properties, types, filters, sorts | server state |
+| `DatabaseRow` | view data layer | row ID, properties, cursor position | paginated server state |
+| `Presence` | presence store | user, page, block/cursor, last seen | lossy realtime state |
+| `SearchResultPage` | search layer | hits, snippets, cursor, total estimate | paginated server state |
+
+Blocks are normalized by ID and ordered by parent plus an order key. The rendered page tree is derived from those relationships. This avoids copying a block into the page, sidebar, search preview, and database view.
+
+The editor draft is separate from the persisted block. During composition, the browser may hold an unfinished IME sequence or selection that should not become a remote operation on every keystroke. A commit converts the draft into a semantic block operation.
+
+Database views are projections over rows and properties. The page block stores the view configuration; the view data layer owns pagination, filtering, sorting, and loading state. A table view must not store an entire database inside the page document.
+
+### Consistency model
+
+Text editing may send debounced operations or use a collaboration protocol optimized for character changes. Block reorder, delete, and property updates need IDs, versions, and conflict semantics. Presence expires and may be dropped. The frontend keeps those classes separate even if they share a WebSocket.
+
+## I — Interfaces — 8 minutes
 
 ### Server-facing API
 
-```
-GET  /api/pages/:pageId                    → page metadata and block snapshot
-POST /api/pages/:pageId/blocks             → create a block
-PATCH /api/blocks/:blockId                 → update content or block properties
-POST /api/pages/:pageId/reorder            → move blocks with an ordering version
-GET  /api/search?q=...&cursor=...           → paginated page/block results
-WSS  /api/pages/:pageId/presence           → collaborator cursors and presence
+``` 
+GET  /api/workspaces/:workspaceId              → workspace and capabilities
+GET  /api/pages/:pageId                       → page metadata and block snapshot
+POST /api/pages/:pageId/blocks                → create block
+PATCH /api/blocks/:blockId                    → update block content/properties
+POST /api/pages/:pageId/reorder               → move blocks with version
+GET  /api/pages/:pageId/database-view         → paginated view rows
+GET  /api/search?q=...&cursor=...             → page/block search results
+WSS  /api/pages/:pageId/presence              → collaborator presence
 ```
 
-Block mutations carry a version or operation ID. A stale reorder response should preserve the user’s draft and ask the page store to reconcile the sibling order; it should not reset the entire editor tree. Search results are independent server state and should not be copied into the page block store.
+Mutations carry operation ID and base version. A response returns canonical block data, accepted revision, and any conflict or permission error. Reorder operations do not replace the whole page tree on conflict; they return the affected siblings so the client can reconcile.
+
+Database-view requests carry filter, sort, selected properties, cursor, and view version. Search requests are abortable and return a cursor so old results cannot overwrite a newer query.
 
 ### Client interfaces
 
 | Interface | Inputs | Output/event | Responsibility |
 |---|---|---|---|
-| `BlockRenderer` | block type, block data, child slot | rendered block | type-specific presentation |
-| `BlockEditor` | block draft, selection, schema | validated block mutation | local editing and validation |
-| `PageStore` | normalized block operations | block/page selectors | shared document state |
-| `SyncCoordinator` | mutations, versions, retry signals | ack, conflict, resync | persistence and reconciliation |
-| `PresenceChannel` | cursor and active-user updates | remote presence | non-authoritative collaboration UI |
+| `BlockRegistry` | block type/version | renderer, editor, schema | extensibility boundary |
+| `BlockRenderer` | block data, children, mode | rendered block | presentation and local events |
+| `BlockEditor` | draft, schema, selection | validated mutation | local editing |
+| `PageStore` | block operations | normalized selectors | document projection |
+| `SyncCoordinator` | mutations, versions | ack, conflict, resync | persistence and retry |
+| `ViewDataLayer` | schema, filters, cursor | rows and status | database view data |
+| `SearchController` | query, filters, abort signal | result pages | cancellation and URL state |
 
-The component registry should resolve block types through a descriptor rather than a single growing switch. That lets new block types add their renderer and editor while the page store, sync coordinator, and accessibility shell remain stable.
+The page shell provides a capability-scoped action API. A block renderer can request “open page,” “update block,” or “set selection,” but it cannot import the raw network client or mutate another workspace.
 
-### 9. Trade-offs and Decisions
+## O — Optimizations and Deep Dives — 18–22 minutes
 
-| Decision | Chosen Approach | Alternative | Rationale |
-|----------|----------------|-------------|-----------|
-| Rich text editing | contentEditable | ProseMirror/Slate | Simpler for MVP, custom control |
-| Block rendering | Component delegation | Single switch | Easier to extend, isolated logic |
-| Virtualization | @tanstack/react-virtual | react-window | Better dynamic height support |
-| State management | Zustand + immer | Redux Toolkit | Simpler API, less boilerplate |
-| Drag and drop | @dnd-kit | react-beautiful-dnd | More flexible, better for nested |
-| Styling | Tailwind CSS | CSS Modules | Faster iteration, consistent design |
+### Deep dive 1: Block editing and render isolation
 
----
+The editor uses one active draft and commits semantic changes. A paragraph block can keep its controlled input local while the page store holds the last committed content. This prevents every keystroke from rerendering unrelated blocks and allows IME composition to work correctly.
 
-### 10. Future Frontend Enhancements
+The block registry gives each type an editor and renderer. A single growing switch is easy initially but becomes a coordination bottleneck and makes one malformed renderer a page-wide failure. The registry adds versioning and fallback complexity but pays off as the product grows beyond a few block types.
 
-1. **Full ProseMirror/Slate integration** - Production-grade rich text editing
-2. **Collaborative cursors with Yjs** - Character-level cursor sync
-3. **Offline with IndexedDB** - Full offline-first with background sync
-4. **Mobile-responsive** - Touch gestures for block manipulation
-5. **Keyboard accessibility** - Full screen reader support
-6. **Animation polish** - Smooth block transitions with Framer Motion
+### Deep dive 2: Large pages and virtualization
+
+Rendering thousands of blocks at once creates DOM, layout, and measurement pressure. I would virtualize long homogeneous page regions or defer below-the-fold blocks while keeping headings and focus targets available. Variable-height blocks make virtualization harder, so I would start with progressive rendering and measure before introducing aggressive recycling.
+
+The page tree also needs lazy expansion. Loading every descendant page on workspace open creates a large payload and makes navigation slow. Names and parent relationships can load first; child details arrive when expanded.
+
+### Deep dive 3: Database views
+
+A database view is a block configuration plus a server-backed row projection. Filters and sorts belong in a normalized view query so table, board, and list presentations share the same result semantics. The client should paginate rows and virtualize the visible table.
+
+The alternative is loading all rows and filtering in the browser. That gives instant local filtering for small tables but transfers sensitive and unbounded data, produces incorrect totals, and blocks the main thread. Server filtering with cursor pagination is the default; local filtering is a cache optimization for bounded pages.
+
+### Deep dive 4: Collaboration and conflicts
+
+Local edits feel immediate because the editor applies a local operation or draft. The sync coordinator keeps operation IDs and base versions. A reconnect requests changes after the last acknowledged revision. A conflict is scoped to the block or sibling order rather than resetting the whole document.
+
+For a first release, version checks plus clear conflict UI can be sufficient. A CRDT or OT protocol is appropriate when offline and concurrent character-level editing are core promises. It adds complexity in memory, testing, garbage collection, and debugging, so I would not choose it solely because collaboration sounds impressive.
+
+### Deep dive 5: Search and navigation
+
+Search state belongs in the URL when a result should be shareable. The search controller debounces suggestions, cancels old requests, and ensures a late response cannot replace newer results. Search results hold snippets and cursors; opening a result loads canonical page data.
+
+The quick-find command should preserve focus, support keyboard selection, and announce result counts. It should not silently navigate when a user is editing a block unless the user explicitly chooses a result.
+
+### Deep dive 6: Offline and sync
+
+Read-only offline mode is straightforward: show cached pages with a stale label. Offline editing requires an operation queue, conflict resolution, attachment handling, and auth renewal. The client can begin with drafts and local recovery, then add queued operations once conflict semantics are proven.
+
+### Accessibility and responsive behavior
+
+The editor provides keyboard navigation between blocks, a clear focus target, slash-command alternatives, and accessible labels for block type and status. The sidebar is a semantic tree with expand/collapse state. Database tables expose headers, row relationships, and non-color status.
+
+On narrow screens, the sidebar becomes a drawer, the properties panel becomes a sheet, and block editing remains the primary flow. Presence cursors can be hidden or summarized on mobile without changing document correctness.
+
+### Failure matrix
+
+| Failure | UI behavior | Recovery |
+|---|---|---|
+| Block renderer fails | local fallback | retry or read-only mode |
+| Block mutation conflicts | retain draft | review/rebase/reload block |
+| Page tree request fails | retry branch | keep current page open |
+| Database view times out | view-local error | retry without losing page edits |
+| Search response is stale | ignore by request ID | keep current result set |
+| Socket disconnects | sync/presence banner | reconnect and resync operations |
+
+## Performance and scaling
+
+The first bottleneck is a long page with expensive block renderers. The second is a large database view. The third is page-tree and search payload size. Progressive block rendering, row virtualization, cursor pagination, and lazy tree expansion address those independently.
+
+I would measure time to first readable block, time to first editable block, block render duration by type, row render cost, search latency, operation queue depth, conflict rate, and memory after an all-day tab session.
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|---|---|---|---|
+| Block model | normalized graph | nested rendered tree as source | one canonical block across features |
+| Extensibility | versioned block registry | growing type switch | independent block families and fallback |
+| Editing | local draft then semantic commit | network request per keystroke | IME support and responsive typing |
+| Database rows | server filters and cursors | fetch all and filter locally | bounded transfer and correct totals |
+| Collaboration | operation/version protocol first | CRDT immediately | staged complexity based on requirements |
+| Search | URL state plus abortable server queries | global search store only | shareability and stale-response safety |
+| Offline | cached read/draft recovery first | full offline sync | conflicts and attachments are costly |
+| Rendering | progressive/virtualized regions | render all blocks eagerly | protects long-page performance |
+
+## Closing — 3 minutes
+
+“The workspace frontend is a normalized document system with multiple projections: page tree, block editor, database views, search, and presence. The block registry isolates rendering, the sync coordinator protects edits, and the data layer keeps view queries separate from page configuration. The result is a responsive editor that can scale its data and collaboration without turning every feature into one global store.”
+
+If time remains, I would discuss comments, permissions, attachment caching, database formulas, mobile editing, and the point at which CRDT complexity becomes justified.

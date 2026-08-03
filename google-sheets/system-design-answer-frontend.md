@@ -1,527 +1,224 @@
-# Google Sheets - System Design Answer (Frontend Focus)
+# Google Sheets Frontend — System Design Answer
 
-*45-minute system design interview format - Frontend Engineer Position*
+## 45–50 minute interview walkthrough
 
----
+## Opening — 2 minutes
 
-## 1. Requirements Clarification (3 minutes)
+“I’ll design a collaborative spreadsheet frontend. The unique challenge is a logically enormous two-dimensional grid where only a tiny viewport is visible, while edits, formulas, selection, presence, and collaboration all need to feel immediate. I’ll separate the sparse document model from viewport rendering and from the lossless operation stream.”
 
-### Functional Requirements
-1. **Spreadsheet Grid Rendering**: Display a large grid with virtualization for 10,000+ rows/columns
-2. **Cell Editing**: Inline editing with formula bar, keyboard navigation, tab/enter behavior
-3. **Real-time Collaboration UI**: Show collaborator cursors, selections, and presence indicators
-4. **Formula Display**: Distinguish between raw formulas and computed values
-5. **Cell Formatting**: Bold, colors, alignment, number formats with immediate visual feedback
+| RADIO stage | Focus | Time |
+|---|---|---:|
+| Requirements | Spreadsheet workflows, scale, collaboration, and correctness | 4 min |
+| Architecture | Grid shell, sparse store, virtualization, worker, sync | 8 min |
+| Data model | Cells, formulas, operations, viewport, presence | 6 min |
+| Interfaces | REST, operation stream, worker, grid contracts | 8 min |
+| Optimizations | Virtualization, formulas, editing, collaboration, a11y | 18–22 min |
+| Wrap-up | Trade-offs and failure modes | 3 min |
 
-### Non-Functional Requirements
-- **Performance**: Smooth scrolling at 60fps for million-row grids via virtualization
-- **Latency**: Sub-50ms for local edits to appear in UI
-- **Accessibility**: Keyboard navigation, screen reader support, ARIA labels
-- **Responsiveness**: Work on tablets and desktops (1024px+ viewports)
+## R — Requirements — 4 minutes
 
-### Out of Scope
-- Mobile native apps
-- Charts and data visualizations
-- Import/export wizards
-- Offline-first architecture
+### Clarifying questions
 
----
+- How large can a sheet be logically and how much data is normally populated?
+- Do we need formulas, ranges, formatting, charts, and import/export in the core flow?
+- Is collaboration simultaneous and character-level, or is row/document locking enough?
+- What are the conflict and offline expectations?
+- Do screen readers and keyboard-only workflows need first-class support?
+- Is the app desktop-first, touch-first, or both?
 
-## 2. Frontend Architecture Overview (5 minutes)
+I’ll assume desktop-first collaborative spreadsheets with million-cell logical dimensions, sparse populated cells, formulas, formatting, multi-user presence, keyboard navigation, and a 10-second reconnect tolerance. Mobile viewing is in scope; full mobile editing is a follow-up.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              SpreadsheetApp                                   │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                              Toolbar                                    │  │
-│  │   [FormatButtons]  [FormulaBar]  [ShareButton]  [UndoRedo]             │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                             SheetTabs                                   │  │
-│  │   [ Sheet1 ]  [ Sheet2 ]  [ + ]                                        │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                          SpreadsheetGrid                                │  │
-│  │  ┌──────────┬───────────────────────────────────────────────────────┐  │  │
-│  │  │  Corner  │                  ColumnHeaders                         │  │  │
-│  │  ├──────────┼───────────────────────────────────────────────────────┤  │  │
-│  │  │   Row    │                                                        │  │  │
-│  │  │ Headers  │              VirtualizedCells                          │  │  │
-│  │  │          │   ┌─────────┬─────────┬─────────┬─────────┐           │  │  │
-│  │  │    1     │   │   A1    │   B1    │   C1    │   D1    │           │  │  │
-│  │  │    2     │   ├─────────┼─────────┼─────────┼─────────┤           │  │  │
-│  │  │    3     │   │   A2    │   B2    │   C2    │   D2    │           │  │  │
-│  │  │    4     │   ├─────────┼─────────┼─────────┼─────────┤           │  │  │
-│  │  │          │   │   A3    │   B3    │   C3    │   D3    │           │  │  │
-│  │  └──────────┴───┴─────────┴─────────┴─────────┴─────────┘           │  │  │
-│  │                                                                      │  │  │
-│  │  ┌─────────────────────┐   ┌──────────────────────────────┐         │  │  │
-│  │  │  SelectionOverlay   │   │    CollaboratorCursors       │         │  │  │
-│  │  └─────────────────────┘   └──────────────────────────────┘         │  │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                             StatusBar                                   │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+### Functional requirements
 
-### Component Responsibilities
+1. Open workbooks and switch between sheets.
+2. Render only the visible grid while preserving arbitrary row and column sizes.
+3. Select cells and ranges, navigate with keyboard, and edit values in place.
+4. Support formulas and update dependent cells after an edit.
+5. Collaborate with remote cursors and remote cell changes.
+6. Undo, redo, copy, paste, and save edits.
+7. Recover from reconnects and surface conflicts clearly.
 
-| Component | Responsibility |
-|-----------|----------------|
-| **SpreadsheetGrid** | Scroll container, coordinate virtualizers, cell positioning |
-| **VirtualizedCells** | Render only visible cells using TanStack Virtual |
-| **Cell** | Memoized cell display, inline editing, selection state |
-| **ColumnHeaders** | Column letters (A, B, C...), resize handles |
-| **RowHeaders** | Row numbers, resize handles |
-| **FormulaBar** | Display active cell formula, handle formula editing |
-| **SelectionOverlay** | Blue selection rectangle, handles multi-cell selection |
-| **CollaboratorCursors** | Colored boxes for other users' cursor positions |
+### Non-functional requirements
 
----
+- Scroll and selection should remain responsive at 60fps.
+- Editing a cell should not rerender the entire grid.
+- Formula recalculation should not block typing or scrolling.
+- Durable operations must not be lost or silently duplicated.
+- Presence may be approximate and lossy.
+- Memory should scale with populated/visible data, not logical sheet dimensions.
 
-## 3. Deep Dive: Virtualization with TanStack Virtual (8 minutes)
+### Out of scope
 
-### The Problem
+I will not design the full formula language, server-side conflict algorithm, spreadsheet file format, or external integration ecosystem. I will define the client model and protocols they require.
 
-Rendering millions of cells is impossible:
-- Excel supports 16,384 columns x 1,048,576 rows = 17 billion cells
-- Even 10,000 DOM nodes cause significant jank
-- Memory consumption would crash browsers
+## A — Architecture — 8 minutes
 
-### Solution: Dual-Axis Virtualization
+### High-level diagram
 
-"I chose dual-axis virtualization because spreadsheets require independent row and column virtualization. Unlike a simple list, both dimensions can be massive."
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Virtualization Concept                             │
-│                                                                              │
-│   ┌───────────────────────────────────────────────────────────────────────┐ │
-│   │                     Logical Grid (1M x 16K)                            │ │
-│   │   ┌─────────────────────────────────────────────────────────────────┐ │ │
-│   │   │                                                                  │ │ │
-│   │   │                                                                  │ │ │
-│   │   │       ┌────────────────────────────────┐                        │ │ │
-│   │   │       │   Visible Viewport             │                        │ │ │
-│   │   │       │   (only ~600 cells rendered)   │                        │ │ │
-│   │   │       │                                │                        │ │ │
-│   │   │       │   overscan: 10 rows above/below│                        │ │ │
-│   │   │       │   overscan: 5 cols left/right  │                        │ │ │
-│   │   │       └────────────────────────────────┘                        │ │ │
-│   │   │                                                                  │ │ │
-│   │   │                                                                  │ │ │
-│   │   └─────────────────────────────────────────────────────────────────┘ │ │
-│   └───────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
+``` 
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Spreadsheet Shell                                                           │
+│ routing · workbook tabs · toolbar · keyboard · selection · accessibility    │
+├──────────────────────────────┬─────────────────────────────────────────────┤
+│ Viewport Controller           │ Grid Renderer                                │
+│ scroll · measured sizes       │ visible rows/columns · cell layers           │
+├──────────────────────────────┴─────────────────────────────────────────────┤
+│ Sparse Document Store                                                       │
+│ cells · formatting · formulas · selections · undo/redo                     │
+├──────────────────────────────┬─────────────────────────────────────────────┤
+│ Formula Worker                │ Sync Coordinator                             │
+│ dependency graph · compute   │ operations · revisions · reconnect           │
+├──────────────────────────────┴─────────────────────────────────────────────┤
+│ Typed API client ─────────── HTTPS / WebSocket ───────── Workbook API        │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Row Virtualizer Configuration:**
-- count: 1,000,000 logical rows
-- estimateSize: returns row height from Map or default (32px)
-- overscan: 10 extra rows above/below viewport
+### Shell and viewport
 
-**Column Virtualizer Configuration:**
-- horizontal: true
-- count: 16,384 columns
-- estimateSize: returns column width from Map or default (100px)
-- overscan: 5 extra columns left/right
+The shell owns workbook navigation, toolbar actions, selection, active cell, formula bar, dialogs, keyboard shortcuts, and accessibility announcements. The viewport controller converts scroll position and measured row/column sizes into a visible coordinate window.
 
-### Variable Row/Column Sizes
+The grid renderer does not create a DOM element for every logical cell. It renders a bounded window with spacer regions and reuses cells as the viewport moves. The row and column headers share the same coordinate system so scrolling does not drift.
 
-Dimension data stored in sparse Maps:
-- columnWidths: Map<number, number> - only stores non-default widths
-- rowHeights: Map<number, number> - only stores non-default heights
+### Sparse store
 
-**Resize Handle Pattern:**
-- Mouse down captures start position and current width
-- Mouse move calculates delta and updates store
-- Mouse up removes listeners
-- Minimum width enforced (50px)
+The document store uses coordinate keys such as sheet, row, and column to store populated cells. A two-dimensional array wastes memory when a sheet has a million possible cells and only a few thousand values. Selectors are keyed by cell so editing A1 does not rerender the visible grid.
 
-### Memory Efficiency
+### Formula worker
 
-| Scenario | DOM Nodes | Without Virtualization |
-|----------|-----------|------------------------|
-| Viewport 30x20 visible | ~600 | ~600 |
-| 1M rows x 1K cols sheet | ~600 | 1,000,000,000 (crash) |
+Formula calculation belongs in a Web Worker when dependency graphs or recalculation batches become large. The worker receives cell operations and a serializable dependency graph, then returns computed values, errors, and dependent-cell updates. It never owns the authoritative document; it owns derived calculation state.
 
----
+### Sync coordinator
 
-## 4. Deep Dive: State Management with Zustand (7 minutes)
+Durable edits are represented as operations with IDs, base revisions, and cell patches. The sync coordinator queues operations, sends them in order, applies acknowledgements, handles conflicts, and resynchronizes after a connection gap. Presence travels through a separate lossy channel.
 
-### Store Structure
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           SpreadsheetStore                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Document State                                                              │
-│  ├── spreadsheetId: string                                                   │
-│  ├── sheets: Sheet[]                                                         │
-│  └── activeSheetId: string                                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Sparse Cell Data                                                            │
-│  └── cells: Map<string, CellData>    Key format: "sheetId-row-col"          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Selection State                                                             │
-│  ├── activeCell: { row, col } | null                                         │
-│  ├── selection: CellRange | null                                             │
-│  ├── isEditing: boolean                                                      │
-│  └── editValue: string                                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Collaborators                                                               │
-│  └── collaborators: Map<string, Collaborator>                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Dimensions (sparse)                                                         │
-│  ├── columnWidths: Map<number, number>                                       │
-│  └── rowHeights: Map<number, number>                                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  History                                                                     │
-│  ├── undoStack: Operation[]                                                  │
-│  ├── redoStack: Operation[]                                                  │
-│  ├── canUndo: boolean                                                        │
-│  └── canRedo: boolean                                                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Actions                                                                     │
-│  ├── setCell(row, col, value)                                                │
-│  ├── setActiveCell(row, col)                                                 │
-│  ├── startEditing(initialValue?)                                             │
-│  ├── commitEdit()                                                            │
-│  ├── cancelEdit()                                                            │
-│  ├── undo() / redo()                                                         │
-│  └── updateCollaborator() / removeCollaborator()                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Sparse Cell Data Pattern
-
-"I use sparse storage because most spreadsheet cells are empty. Storing only non-empty cells reduces memory from O(rows * cols) to O(filled cells)."
-
-**CellData Structure:**
-- rawValue: string | null (what user typed, e.g., "=SUM(A1:A10)")
-- computedValue: any (calculated result, e.g., 42)
-- format?: CellFormat (bold, color, alignment)
-- error?: string (formula errors like "#REF!")
-
-**Cell Key Generation:**
-- Format: `${sheetId}-${row}-${col}`
-- Enables O(1) lookup for any cell
-- Empty cells return null (not stored)
-
-**setCell Logic:**
-1. Generate key from sheetId, row, col
-2. If value is empty/null, delete from Map (sparse)
-3. Otherwise, set value with rawValue and initial computedValue
-4. Send to server via WebSocket for sync
-
-### Selector Optimization
-
-"Fine-grained selectors prevent unnecessary re-renders. Each cell subscribes only to its own data slice."
-
-**Cell Component Subscriptions:**
-- cellData: subscribes to cells.get(key) for this specific cell
-- isActive: subscribes to activeCell comparison with row/col
-- isSelected: subscribes to selection range check
-
-Each selector uses useCallback with [row, col] dependencies to maintain referential stability.
-
----
-
-## 5. Deep Dive: Cell Component and Editing (7 minutes)
-
-### Memoized Cell Rendering
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Cell Component Lifecycle                            │
-│                                                                              │
-│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                   │
-│   │   Render    │────▶│   Click     │────▶│   Active    │                   │
-│   │  (display)  │     │  (select)   │     │  (focused)  │                   │
-│   └─────────────┘     └─────────────┘     └──────┬──────┘                   │
-│                                                   │                          │
-│                              Double-click or type │                          │
-│                                                   ▼                          │
-│                                           ┌─────────────┐                   │
-│                                           │   Editing   │                   │
-│                                           │  (input)    │                   │
-│                                           └──────┬──────┘                   │
-│                                                   │                          │
-│                              Enter, Tab, or blur │                          │
-│                                                   ▼                          │
-│                                           ┌─────────────┐                   │
-│                                           │   Commit    │                   │
-│                                           │  (save)     │                   │
-│                                           └─────────────┘                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Cell Props:**
-- row: number
-- col: number
-- style: React.CSSProperties (position from virtualizer)
-
-**Display Mode:**
-- Shows computedValue or rawValue or empty string
-- Applies format styling (bold, italic, color, alignment)
-- Shows ring border when active
-- Shows light blue background when selected
-
-**Edit Mode (when isEditingThis):**
-- Renders autoFocus input overlay
-- Captures keydown for Enter (commit), Escape (cancel), Tab (commit + move)
-- Commits on blur
-- Value stored in editValue state
-
-**Custom Memo Comparison:**
-Only compares row and col - style changes trigger parent re-render anyway.
-
-### Keyboard Navigation
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Keyboard Navigation Map                              │
-│                                                                              │
-│   Arrow Keys (when not editing):                                             │
-│   ├── ArrowUp    ──▶  Move to row - 1 (min 0)                               │
-│   ├── ArrowDown  ──▶  Move to row + 1                                       │
-│   ├── ArrowLeft  ──▶  Move to col - 1 (min 0)                               │
-│   └── ArrowRight ──▶  Move to col + 1                                       │
-│                                                                              │
-│   Entry Keys:                                                                │
-│   ├── Enter          ──▶  Start editing (or move down if editing)           │
-│   ├── Shift+Enter    ──▶  Move up                                           │
-│   ├── Tab            ──▶  Move right (commit if editing)                    │
-│   ├── Shift+Tab      ──▶  Move left (commit if editing)                     │
-│   └── Any printable  ──▶  Start editing with that character                 │
-│                                                                              │
-│   Destructive Keys:                                                          │
-│   ├── Delete         ──▶  Clear cell content                                │
-│   └── Backspace      ──▶  Clear cell content                                │
-│                                                                              │
-│   Edit Mode Only:                                                            │
-│   └── Escape         ──▶  Cancel edit, restore original value               │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-Navigation is handled by a custom hook that listens to document keydown events and only acts when not editing.
-
----
-
-## 6. Deep Dive: Collaborator Presence UI (5 minutes)
-
-### Cursor Overlay Component
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Collaborator Cursor Display                           │
-│                                                                              │
-│   ┌───────────────────────────────────────────────────────────────────────┐ │
-│   │                           Grid View                                    │ │
-│   │                                                                        │ │
-│   │      ┌─────────┬─────────┬─────────┬─────────┐                        │ │
-│   │      │   A1    │   B1    │   C1    │   D1    │                        │ │
-│   │      ├─────────┼─────────┼─────────┼─────────┤                        │ │
-│   │      │   A2    │ ┌─────┐ │   C2    │   D2    │                        │ │
-│   │      │         │ │Alice│ │         │         │   ◀── Colored border   │ │
-│   │      │         │ └─────┘ │         │         │       + name label     │ │
-│   │      ├─────────┼─────────┼─────────┼─────────┤                        │ │
-│   │      │   A3    │   B3    │ ┌─────┐ │   D3    │                        │ │
-│   │      │         │         │ │ Bob │ │         │                        │ │
-│   │      │         │         │ └─────┘ │         │                        │ │
-│   │      └─────────┴─────────┴─────────┴─────────┘                        │ │
-│   │                                                                        │ │
-│   └───────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**CollaboratorCursor Data Structure:**
-- userId: string
-- name: string (display name)
-- color: string (unique per user, hex color)
-- row: number (current cell row)
-- col: number (current cell column)
-
-**Position Calculation:**
-- Sum column widths from 0 to col for X position
-- Sum row heights from 0 to row for Y position
-- Adjust for scroll offset from container
-
-**Rendering:**
-- Absolute positioned div with pointer-events: none
-- Colored border matching collaborator's assigned color
-- Name label positioned above the cell
-- Smooth transition animation (100ms ease-out)
-
-### Presence Indicator List
-
-Displayed in header/toolbar area:
-- Circular avatars with first letter of name
-- Background color matches cursor color
-- Tooltip shows full name on hover
-- Max display count with "+N more" overflow
-
----
-
-## 7. Deep Dive: Formula Bar and Web Workers (5 minutes)
-
-### Formula Bar Component
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            Formula Bar Layout                                │
-│                                                                              │
-│   ┌──────────┬────────┬─────────────────────────────────────────────────┐   │
-│   │   A1     │   fx   │  =SUM(A1:A10)                                   │   │
-│   │ (cell    │ (icon) │  (formula/value input)                          │   │
-│   │  ref)    │        │                                                 │   │
-│   └──────────┴────────┴─────────────────────────────────────────────────┘   │
-│                                                                              │
-│   Cell Reference: Shows current cell address (A1, B2, etc.)                  │
-│   fx Icon: Indicates formula mode                                            │
-│   Input: Shows rawValue when editing, syncs with cell edit                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**columnIndexToLetter Helper:**
-- 0 -> A, 25 -> Z, 26 -> AA, etc.
-- Uses modulo 26 and character code math
-- Handles arbitrary column numbers
-
-**FormulaBar Behavior:**
-- Displays cell reference for active cell
-- Shows rawValue (formula) not computedValue
-- Focus starts editing mode
-- Enter commits, Escape cancels
-- Syncs with inline cell editing
-
-### Web Worker for Formula Calculation
-
-"I offload formula calculation to a Web Worker to prevent UI blocking. Complex formulas with many dependencies could take 100ms+ to calculate."
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Formula Calculation Architecture                        │
-│                                                                              │
-│   ┌─────────────────────┐                    ┌─────────────────────────┐    │
-│   │     Main Thread     │                    │      Web Worker         │    │
-│   │                     │   postMessage      │                         │    │
-│   │  User edits cell    │ ───────────────▶   │  HyperFormula engine   │    │
-│   │  with formula       │                    │                         │    │
-│   │                     │   SET_CELL         │  - Parse formula        │    │
-│   │  Update store       │ ◀───────────────── │  - Calculate result     │    │
-│   │  with computed      │   CELL_CALCULATED  │  - Find dependents      │    │
-│   │  value              │                    │  - Cascade updates      │    │
-│   │                     │                    │                         │    │
-│   │  UI remains         │                    │  Runs in separate       │    │
-│   │  responsive         │                    │  thread                 │    │
-│   └─────────────────────┘                    └─────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Worker Messages:**
-- SET_CELL: { row, col, value } -> triggers calculation
-- CELL_CALCULATED: { row, col, computed, dependentUpdates } -> results
-- BULK_SET: { cells } -> batch initialization
-
-**HyperFormula Integration:**
-- Open-source spreadsheet formula engine
-- Handles 400+ Excel functions
-- Dependency graph for cascade updates
-- Runs entirely in worker
-
-**FormulaWorkerService Pattern:**
-- Singleton service instantiates worker
-- setCell method posts message
-- onmessage handler updates store with computed values
-- Handles dependent cell cascades
-
----
-
-## RADIO Data Model and Interfaces
-
-The spreadsheet client needs a sparse, coordinate-addressed model rather than a database-shaped array. It also needs to separate committed cells from the local edit buffer and from presence metadata that can disappear without affecting document correctness.
+## D — Data Model — 6 minutes
 
 | Entity | Owner | Important fields | Consistency |
 |---|---|---|---|
-| `Workbook` | Document store | workbook ID, sheet IDs, permissions, revision | server-authoritative |
-| `SheetViewport` | View state | row/column window, scroll offsets, measured sizes | ephemeral client state |
-| `CellValue` | Sparse cell store | sheet ID, row, column, raw value, formatted value | server + local edits |
-| `FormulaDependency` | Formula worker | cell key, dependencies, computed result, error | derived client state |
-| `EditOperation` | Sync queue | operation ID, base revision, cell patch, author | ordered/conflict-aware |
-| `PresenceCursor` | Presence store | user ID, sheet, cell/range, color, last seen | best effort |
+| `Workbook` | workbook store | ID, sheet IDs, permissions, revision | server-authoritative |
+| `Sheet` | workbook store | ID, name, dimensions, row/column metadata | server-authoritative |
+| `CellValue` | sparse store | sheet, row, column, raw value, formatted value | operation-backed |
+| `FormulaDependency` | formula worker | source cell, dependencies, result, error | derived |
+| `EditOperation` | sync queue | operation ID, base revision, cell patch, author | durable and ordered |
+| `SelectionState` | shell | active cell, ranges, editing mode | ephemeral client state |
+| `ViewportState` | viewport controller | scroll offsets, visible bounds, measured sizes | ephemeral client state |
+| `PresenceCursor` | presence store | user, sheet, range, color, last seen | best effort |
+| `UndoEntry` | history manager | forward op, inverse op, revision context | local history |
+
+The grid store should not contain raw WebSocket messages or query response metadata. It contains the canonical client document projection. The sync queue contains operations waiting for acknowledgement. The formula worker contains derived values that can be recomputed.
+
+### Operation semantics
+
+An edit operation identifies its author, command ID, base revision, affected cell keys, and new values. The server acknowledges a new revision or returns a conflict. The client can optimistically display a local edit, but it must retain the operation until acknowledged.
+
+For a first version, cell-level last-write-wins with visible conflict indicators may be enough. For a mature collaborative product, operations may use OT or CRDT semantics. The frontend contract should not depend on the server algorithm; it depends on ordered IDs, revisions, acknowledgements, and resync.
+
+### Formula semantics
+
+Raw input, parsed formula, computed value, and error are separate fields. A formula cell can display its last computed value while a new calculation is pending, but it must expose that state when the result is stale or errored. Circular references are a typed error, not a blank cell.
+
+## I — Interfaces — 8 minutes
 
 ### Server-facing API
 
-```
-GET  /api/workbooks/:id                    → workbook metadata and sheet list
-GET  /api/sheets/:id/viewport              → sparse cells for a visible range
-POST /api/sheets/:id/operations             → ordered cell operations with base revision
-GET  /api/sheets/:id/operations?after=...   → missed operations for resync
-WSS  /api/workbooks/:id/presence            → cursors and collaborator presence
+``` 
+GET  /api/workbooks/:id                       → workbook metadata and sheet list
+GET  /api/sheets/:id/viewport?range=...      → sparse cells for visible range
+POST /api/sheets/:id/operations              → ordered cell operations
+GET  /api/sheets/:id/operations?after=...    → missed operations for resync
+POST /api/sheets/:id/undo                    → server-aware undo command
+WSS  /api/workbooks/:id/collaboration        → operations and presence
 ```
 
-The operation response includes the accepted revision and any rejected/conflicting cell keys. A client must not replace its local edit buffer with an entire server snapshot after one conflict; it rebases unaffected edits and marks the conflicting cells for review.
+The viewport response contains sparse cells, row/column metadata, a document revision, and pagination or continuation information for large ranges. An operations response contains accepted IDs, canonical revision, rebased operations, and conflicts.
+
+The WebSocket protocol separates durable operation messages from presence messages. Operations have sequence and acknowledgement semantics. Presence messages have expiry and may be coalesced because the latest cursor supersedes the previous cursor.
 
 ### Client interfaces
 
-| Interface | Inputs | Output/event | Why |
+| Interface | Inputs | Output/event | Responsibility |
 |---|---|---|---|
-| `ViewportController` | scroll position, measured sizes | visible cell coordinates | drives virtualization |
-| `CellStore` | cell key, value patch | subscribed cell snapshot | prevents whole-grid renders |
-| `FormulaWorker` | edit operation, dependency graph | computed values and errors | keeps calculations off main thread |
-| `SyncQueue` | operation, base revision | accepted, rebased, or conflict | preserves ordering and retry semantics |
-| `PresenceChannel` | cursor and selection updates | remote presence events | deliberately lossy and ephemeral |
+| `ViewportController` | scroll, dimensions, measured sizes | visible coordinates | bounded render window |
+| `CellStore` | cell key, operation projection | cell snapshot | fine-grained subscriptions |
+| `FormulaWorker` | edit batch, dependency graph | computed values/errors | non-blocking calculation |
+| `SyncQueue` | operation, base revision | ack, conflict, resync | durable retry and ordering |
+| `GridRenderer` | visible cells, selection, theme | DOM/canvas layers | presentation only |
+| `PresenceChannel` | cursor, range, user color | remote cursor event | lossy collaboration UI |
 
-The central trade-off is that document edits are lossless and ordered, while presence and cursor updates may be coalesced. Treating both as generic WebSocket messages makes the implementation simpler but makes correctness and backpressure harder to reason about.
+### Cell and grid component APIs
 
-## 8. Trade-offs Summary (3 minutes)
+The grid receives a viewport window, visible cell snapshots, row/column metrics, selection state, and callbacks for pointer and keyboard actions. A cell receives its coordinate, raw/formatted value, edit state, validation status, and narrow callbacks such as begin edit and commit edit.
+
+The cell does not read the entire store. The formula bar reads the active cell and writes an edit command through the shell. The toolbar dispatches commands such as undo, redo, format, and paste through a command layer so keyboard and pointer actions share behavior.
+
+## O — Optimizations and Deep Dives — 18–22 minutes
+
+### Deep dive 1: Two-dimensional virtualization
+
+A normal list virtualizer handles one axis. A spreadsheet needs row and column windows, variable row heights, variable column widths, frozen headers, and a stable coordinate transform. The viewport controller calculates visible row and column ranges, overscans a small buffer, and renders only their intersection.
+
+The alternative is to render every populated cell. It works for a small demo but fails when a user pastes into thousands of cells or opens a wide sheet. Virtualization reduces DOM work, but it introduces measurement complexity and risks focus loss when cells are recycled. The active editing cell therefore receives a stable editor overlay tied to its coordinate rather than relying only on a recycled cell node.
+
+### Deep dive 2: Sparse state versus a two-dimensional array
+
+A two-dimensional array is simple to index but allocates or implies storage for empty space. A sparse map keyed by sheet, row, and column makes memory proportional to populated cells and supports server viewport responses naturally.
+
+The trade-off is more key parsing and slower range iteration. I mitigate it with row/column indexes or a chunked map for the visible region. The invariant is that cell selectors remain stable and updates can be applied by coordinate without copying the entire sheet.
+
+### Deep dive 3: Main thread versus formula worker
+
+Formula evaluation on the main thread is easy to integrate and gives immediate access to the store. It becomes a problem when a paste triggers thousands of dependents or complex functions. A worker keeps typing and scrolling responsive, but messages require serialization and computed results arrive asynchronously.
+
+The worker receives immutable snapshots or operation batches and returns deterministic computed updates. The store accepts a result only if it corresponds to the current document revision. That prevents a slow calculation for an old edit from overwriting a newer value.
+
+### Deep dive 4: Operation sync and collaboration
+
+The client applies local edits immediately, puts operations in a durable queue, and sends them in order. Acknowledgements remove operations from the queue. A reconnect asks for operations after the last confirmed revision. A conflict returns enough information to rebase or show the affected cells.
+
+I would not use one generic event channel for presence and edits. Presence is lossy, expires, and should never block saving. Edits are durable, ordered, and must be retried. One transport may carry both, but the protocol and state machines stay separate.
+
+### Deep dive 5: Undo and redo
+
+Undo should create an inverse operation rather than mutate the store directly. That makes undo collaborative: the inverse is sent through the same revision and permission path as any other edit. The UI can maintain local undo history, but a failed inverse operation must remain visible as a conflict instead of pretending the cell changed.
+
+### Accessibility and editing UX
+
+The grid uses a table/grid semantic model with clear row and column headers. Keyboard navigation moves the active cell without forcing a DOM node for every logical cell. Enter begins editing, Escape cancels, Tab commits and advances, and the formula bar mirrors the active cell.
+
+Screen readers need announcements for selection, edit mode, validation errors, and collaboration changes that affect the active cell. High-frequency remote cursor movement should not be announced. Color-coded collaborator cursors include names or labels.
+
+### Failure matrix
+
+| Failure | UI state | Recovery |
+|---|---|---|
+| Viewport request fails | visible range error | retry range without losing selection |
+| Operation POST times out | pending edit indicator | retry same operation ID |
+| Revision conflict | affected cells marked | rebase or user review |
+| Formula worker fails | stale calculation badge | restart worker and recompute |
+| Socket disconnects | offline/sync banner | reconnect and request missed ops |
+| Browser refresh with queue | recovery prompt | restore queued operations or discard |
+
+## Performance and scaling
+
+The first bottleneck is DOM count when the user opens a wide or tall sheet. Two-dimensional virtualization and fixed overscan protect layout. The second is formula recalculation; worker boundaries and revision checks protect input. The third is operation history and undo memory; history should be bounded and compress repeated local edits where safe.
+
+I would measure scroll frame rate, active-cell latency, visible cell count, formula worker duration, operation acknowledgement latency, queue depth, resync duration, and memory after a long editing session.
+
+## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| **Virtualization** | TanStack Virtual | react-window | Better variable-size support, more recent API |
-| **State Management** | Zustand | Redux/Context | Minimal boilerplate, built-in selector optimization |
-| **Sparse Cell Storage** | Map with string keys | 2D array | 1000x memory efficiency for large sparse grids |
-| **Formula Calculation** | Web Worker + HyperFormula | Main thread | Prevents UI blocking on complex formulas |
-| **Cursor Position** | Absolute positioning | CSS Grid | Works with virtualization, simpler math |
-| **Cell Editing** | Inline input | Modal/sidebar | Familiar Excel-like UX |
+|---|---|---|---|
+| Grid rendering | two-dimensional virtualization | render populated cells | bounded DOM and memory |
+| Cell model | sparse coordinate map | two-dimensional array | empty sheets do not allocate huge structures |
+| Formula execution | worker with revision checks | main thread | protects typing and scrolling |
+| Edit sync | ordered operations | full-document saves | smaller conflicts and safer reconnects |
+| Presence | lossy separate channel | durable operation stream | cursor updates can be dropped |
+| Undo | inverse operation | direct local mutation | collaboration and permissions stay consistent |
+| Editing node | stable overlay | recycled cell only | preserves focus while virtualizing |
+| Mobile | view-first support | full spreadsheet editing | touch editing is a separate interaction design |
 
-### Accessibility Considerations
+## Closing — 3 minutes
 
-1. **Keyboard Navigation**: Full arrow key, Tab, Enter support
-2. **Screen Readers**: ARIA grid role, cell announcements
-3. **Focus Management**: Visible focus indicators, focus trap in modal dialogs
-4. **Color Contrast**: Collaborator colors meet WCAG 2.1 AA
+“The spreadsheet frontend works because the logical document, the visible viewport, the formula engine, and the collaboration stream are separate. Sparse storage prevents memory growth, virtualization bounds rendering, workers protect interaction, and operation IDs make reconnects safe. Presence can be approximate; cell edits cannot.”
 
-### Performance Optimizations
-
-1. **Memoized Cells**: Custom comparison prevents 99% of re-renders
-2. **Selector Granularity**: Each cell subscribes only to its own data
-3. **Virtualization**: Only ~600 DOM nodes regardless of grid size
-4. **Web Workers**: Formula calculation off main thread
-5. **Debounced Saves**: Batch cell updates before network requests
-
----
-
-## 9. Future Frontend Enhancements
-
-1. **Range Selection with Drag**: Implement mouse drag to select cell ranges
-2. **Copy/Paste Support**: Clipboard API integration with Excel-compatible formats
-3. **Undo/Redo UI**: Command pattern with keyboard shortcuts (Ctrl+Z, Ctrl+Y)
-4. **Context Menu**: Right-click menu for insert/delete rows/columns
-5. **Conditional Formatting**: Real-time cell styling based on values
-6. **Mobile Responsiveness**: Touch gestures for scrolling and selection
-
----
-
-## 10. Closing Summary (1 minute)
-
-"We designed a high-performance collaborative spreadsheet frontend with:
-- **Dual-axis virtualization** using TanStack Virtual for million-row grids
-- **Zustand state management** with sparse cell storage and fine-grained selectors
-- **Memoized Cell component** with inline editing and keyboard navigation
-- **Real-time collaboration UI** with colored cursor overlays and presence indicators
-- **Web Worker formula engine** using HyperFormula for non-blocking calculations
-
-Key frontend insight: The sparse data model (Map with string keys) mirrors the backend storage and enables efficient memory usage, while virtualization makes the grid feel instant regardless of logical size."
+If time remains, I would discuss range selection, copy/paste, import/export, formula language compatibility, and whether a CRDT is justified by the required collaboration model.

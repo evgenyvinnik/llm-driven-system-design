@@ -1,447 +1,219 @@
-# Figma - System Design Answer (Frontend Focus)
+# Figma-Style Design Tool — Frontend System Design Answer
 
-## 45-minute system design interview format - Frontend Engineer Position
+## 45–50 minute interview walkthrough
 
-## Opening Statement
+## Opening — 2 minutes
 
-"Today I'll design Figma, a real-time collaborative design platform, focusing on the frontend architecture. The core challenges are building a high-performance WebGL canvas renderer, managing complex editor state with Zustand, implementing real-time collaboration with cursor presence, and creating an intuitive design tool interface with panels for layers and properties."
+“I’ll design the frontend for a collaborative design tool. The central problem is a large, interactive scene: users pan, zoom, select, transform, and draw objects while other users edit the same file. React should orchestrate the application, but a high-performance renderer and an operation-based collaboration layer should own the hot paths.”
 
----
+| RADIO stage | Focus | Time |
+|---|---|---:|
+| Requirements | Personas, editing, collaboration, and scale | 4 min |
+| Architecture | Shell, scene store, renderer, tools, sync | 8 min |
+| Data model | Objects, transforms, operations, presence | 6 min |
+| Interfaces | File APIs, collaboration, renderer/tools | 8 min |
+| Optimizations | Canvas, hit testing, undo, collaboration, a11y | 18–22 min |
+| Wrap-up | Alternatives and scaling limits | 3 min |
 
-## Step 1: Requirements Clarification (3-5 minutes)
+## R — Requirements — 4 minutes
 
-### Functional Requirements
+### Clarifying questions
 
-1. **WebGL Canvas Editor** - Hardware-accelerated vector graphics with pan/zoom
-2. **Shape Tools** - Create rectangles, ellipses, text, frames, groups
-3. **Selection System** - Click, shift-click, marquee selection with resize handles
-4. **Layers Panel** - Hierarchical object list with visibility/lock toggles
-5. **Properties Panel** - Live-updating form for selected object properties
-6. **Real-time Cursors** - See collaborators' cursor positions and selections
-7. **Version History** - Browse and restore previous versions
-8. **File Browser** - Grid view of files with create/delete actions
+- Are we designing a diagram editor, a general vector tool, or a full design system?
+- How many objects can one file contain, and how many are visible at once?
+- Is collaboration simultaneous and cursor-level, or is shared editing the later phase?
+- Do users need comments, version history, offline editing, and export?
+- What latency target applies to local pointer movement and remote operations?
+- Must the canvas be accessible itself, or are layers/properties panels the primary accessible path?
 
-### Non-Functional Requirements
+I’ll assume a vector/design editor with 100,000 possible objects, 10,000–20,000 visible in a typical viewport, multiple collaborators, cursor presence, undo/redo, layers and properties panels, and desktop-first interaction with keyboard support. Export and comments are secondary features.
 
-- **Performance**: 60fps canvas rendering with 10,000+ objects
-- **Latency**: < 50ms for local operations, cursor updates visible within 100ms
-- **Responsiveness**: Usable on 1280px+ screens, graceful degradation on smaller
-- **Accessibility**: Keyboard shortcuts, focus management, screen reader support for panels
+### Functional requirements
 
-### Out of Scope
+1. Open a file and render pages, layers, shapes, text, and images.
+2. Pan and zoom smoothly; select, move, resize, rotate, duplicate, and delete objects.
+3. Provide tools for pointer, frame, shape, text, and drawing.
+4. Show layers and properties panels that edit the selected object.
+5. Support undo/redo and keyboard shortcuts.
+6. Show collaborator cursors, selections, and remote changes.
+7. Recover local edits and resynchronize after a connection interruption.
 
-- Component library management
-- Prototyping/interactions
-- Export functionality
-- Plugin system
+### Non-functional requirements
 
----
+- Local pointer and selection feedback should stay within a frame budget.
+- Large scenes should not create one DOM node per object.
+- The renderer should update only dirty or visible regions where possible.
+- Durable operations must not be lost or duplicated.
+- Remote presence can be coalesced and expired.
+- Keyboard and screen-reader workflows must have accessible paths through layers and properties.
 
-## Step 2: Frontend Architecture Overview (5 minutes)
+### Out of scope
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              App.tsx                                        │
-│                    (Route: FileBrowser <-> Editor)                          │
-└────────────────────────────────┬────────────────────────────────────────────┘
-                                 │
-            ┌────────────────────┴────────────────────┐
-            ▼                                         ▼
-┌──────────────────────┐               ┌───────────────────────────────────────┐
-│    FileBrowser.tsx   │               │              Editor.tsx               │
-│  ┌────────────────┐  │               │  (Main workspace container)           │
-│  │ File grid      │  │               │                                       │
-│  │ Create/Delete  │  │               │  ┌─────────────────────────────────┐  │
-│  └────────────────┘  │               │  │           Toolbar.tsx           │  │
-└──────────────────────┘               │  │  [Select|Hand|Shapes|Zoom|User] │  │
-                                       │  └─────────────────────────────────┘  │
-                                       │                                       │
-                                       │  ┌─────────┬───────────┬───────────┐  │
-                                       │  │ Layers  │  Canvas   │ Properties│  │
-                                       │  │ Panel   │           │  Panel    │  │
-                                       │  │ .tsx    │  .tsx     │  .tsx     │  │
-                                       │  └─────────┴───────────┴───────────┘  │
-                                       │                                       │
-                                       │  ┌─────────────────────────────────┐  │
-                                       │  │    VersionHistory.tsx (Modal)   │  │
-                                       │  └─────────────────────────────────┘  │
-                                       └───────────────────────────────────────┘
-```
+I will treat server persistence, asset storage, permission enforcement, and conflict resolution as API boundaries. I will not design the full WebGL shader pipeline or a complete CRDT algorithm.
 
-### Technology Stack
+## A — Architecture — 8 minutes
 
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| Framework | React 19 | Component architecture, hooks |
-| Build | Vite | Fast HMR, TypeScript |
-| State | Zustand | Global editor state |
-| Rendering | PixiJS (WebGL) | GPU-accelerated canvas |
-| Styling | Tailwind CSS | Utility-first styles |
-| WebSocket | Native API | Real-time sync |
-| Routing | TanStack Router | File browser navigation |
+### High-level diagram
 
----
-
-## Step 3: Deep Dive - PixiJS Canvas Renderer (10 minutes)
-
-### Why PixiJS for Design Tools
-
-PixiJS provides hardware-accelerated 2D rendering via WebGL with a simple API.
-
-### PixiRenderer Class Architecture
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                       PixiRenderer                              │
-├────────────────────────────────────────────────────────────────┤
-│  ┌──────────────────┐  ┌──────────────────┐                    │
-│  │  PIXI.Application │  │  objectMap       │                    │
-│  │  (WebGL context)  │  │  Map<id, DisplayObject>              │
-│  └──────────────────┘  └──────────────────┘                    │
-│                                                                 │
-│  PIXI.Stage                                                     │
-│  ├── objectsContainer    (z-index 0: design objects)           │
-│  ├── selectionContainer  (z-index 1: selection bounds/handles) │
-│  └── presenceContainer   (z-index 2: collaborator cursors)     │
-│                                                                 │
-│  Methods:                                                       │
-│  • render(canvasData, selectedIds, viewport)                   │
-│  • renderPresence(collaborators, viewport)                     │
-│  • hitTest(x, y) → objectId | null                             │
-│  • destroy()                                                    │
-└────────────────────────────────────────────────────────────────┘
+``` 
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Editor Shell                                                               │
+│ routing · tools · keyboard · panels · selection · accessibility             │
+├──────────────────────┬──────────────────────┬──────────────────────────────┤
+│ Scene Store           │ Renderer Adapter     │ Tool Controller              │
+│ normalized objects    │ Pixi/WebGL/canvas    │ pointer → operation intent  │
+│ selectors/history     │ viewport/culling     │ keyboard → command           │
+├──────────────────────┴──────────────────────┴──────────────────────────────┤
+│ Collaboration Sync                                                         │
+│ operation queue · revisions · resync · presence channel                    │
+├────────────────────────────────────────────────────────────────────────────┤
+│ Typed File API ───── HTTPS / WebSocket ───── File and Collaboration API     │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Rendering flow:**
-1. Apply viewport transform (pan + zoom) to objectsContainer
-2. Sync objects: remove deleted, add new, update existing
-3. Apply visibility and opacity to each display object
-4. Update selection overlay for selected objects
+### Shell and scene store
 
-### ShapeFactory for Object Types
+The shell owns document route, toolbar, active tool, selection, panels, zoom controls, keyboard commands, and dialogs. The scene store owns normalized design objects, pages, layers, and operation-derived history. It exposes narrow selectors for selected objects and visible objects.
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    ShapeFactory                      │
-├─────────────────────────────────────────────────────┤
-│  create(obj: DesignObject) → Graphics | Text        │
-│                                                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
-│  │ Rectangle   │  │  Ellipse    │  │   Text      │ │
-│  │ drawRect()  │  │ drawEllipse │  │ PIXI.Text   │ │
-│  │ fill+stroke │  │ fill+stroke │  │ TextStyle   │ │
-│  └─────────────┘  └─────────────┘  └─────────────┘ │
-│                                                      │
-│  update(displayObj, obj) - sync position, rotation  │
-│  colorToHex(cssColor) - convert #hex to 0xhex      │
-└─────────────────────────────────────────────────────┘
-```
+### Renderer adapter
 
-### SelectionOverlay with Resize Handles
+The renderer adapter receives a render snapshot containing visible objects, viewport transform, dirty regions, theme, and selection overlays. PixiJS or another GPU-backed renderer is an implementation choice. React owns its lifecycle and accessibility-adjacent panels; the renderer owns high-frequency drawing.
 
-```
-┌─────────────────────────────────────────────────┐
-│              Selection Overlay                   │
-│                                                  │
-│      [NW]────────[N]────────[NE]                │
-│        │                      │                  │
-│        │    Selection Box     │                  │
-│        │    (blue outline)    │                  │
-│       [W]                    [E]                 │
-│        │                      │                  │
-│        │                      │                  │
-│      [SW]────────[S]────────[SE]                │
-│                                                  │
-│  8 resize handles (8x8 white squares)           │
-│  Cursor changes per handle direction            │
-└─────────────────────────────────────────────────┘
-```
+### Tool controller
 
----
+Tools translate pointer and keyboard events into operation intents. A move gesture produces a preview transform locally, then a commit operation on pointer-up or according to the collaboration model. The controller should not write directly to the renderer or API; it writes through the scene store and sync coordinator.
 
-## Step 4: Deep Dive - Zustand State Management (10 minutes)
+### Collaboration
 
-### Editor Store Design
+Durable operations and presence are separate logical channels. Operations need IDs, ordering, revisions, acknowledgements, and replay. Presence needs expiration and can drop intermediate cursor positions. One socket can carry both, but the state machines stay separate.
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                         EditorStore                                 │
-├────────────────────────────────────────────────────────────────────┤
-│  State:                                                             │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐ │
-│  │ canvasData       │  │ selectedIds[]    │  │ activeTool       │ │
-│  │ { objects: [] }  │  │ string[]         │  │ select|hand|...  │ │
-│  └──────────────────┘  └──────────────────┘  └──────────────────┘ │
-│                                                                     │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐ │
-│  │ viewport         │  │ collaborators[]  │  │ history[]        │ │
-│  │ {x, y, zoom}     │  │ Presence[]       │  │ CanvasData[]     │ │
-│  └──────────────────┘  └──────────────────┘  └──────────────────┘ │
-│                                                                     │
-│  Actions:                                                           │
-│  • setCanvasData(data)      • addObject(obj)                       │
-│  • updateObject(id, patch)  • deleteObjects(ids)                   │
-│  • setSelectedIds(ids)      • setActiveTool(tool)                  │
-│  • setViewport(viewport)    • updateCollaborators(list)            │
-│  • undo() / redo()          • pushHistory()                        │
-└────────────────────────────────────────────────────────────────────┘
-```
+## D — Data Model — 6 minutes
 
-### Immer for Immutable Updates
-
-Using `zustand/middleware/immer` enables direct mutations in reducers while maintaining immutability. This simplifies complex nested updates like `state.canvasData.objects[idx].x = newX`.
-
-### Derived Selectors
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Derived Selectors                     │
-├─────────────────────────────────────────────────────────┤
-│  useSelectedObjects()                                    │
-│  → filters objects by selectedIds                        │
-│                                                          │
-│  useSingleSelectedObject()                               │
-│  → returns object if exactly one selected, else null    │
-│                                                          │
-│  useCanUndo() / useCanRedo()                            │
-│  → boolean based on historyIndex position               │
-│                                                          │
-│  useActiveCollaborators()                                │
-│  → filters out current user from collaborators list     │
-└─────────────────────────────────────────────────────────┘
-```
-
----
-
-## Step 5: Deep Dive - Canvas Component with Event Handling (8 minutes)
-
-### Event Flow Diagram
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                      Canvas Event Handling                          │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  Mouse Down                                                         │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐            │
-│  │ Tool: Hand  │    │ Tool: Select│    │ Tool: Shape │            │
-│  │ → pan mode  │    │ → hit test  │    │ → create obj│            │
-│  └─────────────┘    └──────┬──────┘    └─────────────┘            │
-│                            │                                        │
-│                    ┌───────┴───────┐                               │
-│                    ▼               ▼                                │
-│              Hit Object?     No Hit                                 │
-│              → move mode     → clear selection                     │
-│                                                                     │
-│  Mouse Move (while dragging)                                       │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐            │
-│  │ Pan Mode    │    │ Move Mode   │    │ Draw Mode   │            │
-│  │ → viewport  │    │ → objects   │    │ → resize    │            │
-│  │   offset    │    │   x,y delta │    │   new shape │            │
-│  └─────────────┘    └─────────────┘    └─────────────┘            │
-│                                                                     │
-│  Mouse Up                                                           │
-│  → pushHistory() if move or draw completed                         │
-│                                                                     │
-│  Mouse Wheel                                                        │
-│  → zoom toward cursor position                                     │
-│  → clamp zoom between 0.1 and 5                                    │
-└────────────────────────────────────────────────────────────────────┘
-```
-
-### Coordinate Conversion
-
-```
-screenToCanvas(screenX, screenY):
-  canvasX = (screenX - viewport.x) / viewport.zoom
-  canvasY = (screenY - viewport.y) / viewport.zoom
-```
-
----
-
-## Step 6: Deep Dive - Panels and UI Components (5 minutes)
-
-### Layers Panel Architecture
-
-```
-┌──────────────────────────────────────────┐
-│              Layers Panel                 │
-│  ┌────────────────────────────────────┐  │
-│  │ Header: "Layers"                   │  │
-│  └────────────────────────────────────┘  │
-│  ┌────────────────────────────────────┐  │
-│  │ Layer Item (reversed z-order)      │  │
-│  │ ┌────┬────────────────┬────┬────┐ │  │
-│  │ │Icon│   Object Name   │ 👁 │ 🔒 │ │  │
-│  │ └────┴────────────────┴────┴────┘ │  │
-│  │                                    │  │
-│  │ • Click: select (replace)         │  │
-│  │ • Shift+Click: toggle selection   │  │
-│  │ • Eye icon: toggle visibility     │  │
-│  │ • Lock icon: toggle locked        │  │
-│  └────────────────────────────────────┘  │
-│  (scrollable list)                       │
-└──────────────────────────────────────────┘
-```
-
-### Properties Panel Architecture
-
-```
-┌──────────────────────────────────────────┐
-│           Properties Panel                │
-├──────────────────────────────────────────┤
-│  [No selection: "Select an object..."]   │
-│                                           │
-│  Position Section                         │
-│  ┌──────────┬──────────┐                 │
-│  │ X: [___] │ Y: [___] │                 │
-│  │ W: [___] │ H: [___] │                 │
-│  └──────────┴──────────┘                 │
-│                                           │
-│  Appearance Section                       │
-│  ┌──────────────────────┐                │
-│  │ Fill:   [■] #cccccc  │                │
-│  │ Stroke: [■] #000000  │                │
-│  │ Stroke Width: [___]  │                │
-│  │ Opacity: [___] %     │                │
-│  └──────────────────────┘                │
-│                                           │
-│  Text Section (if type=text)             │
-│  ┌──────────────────────┐                │
-│  │ [textarea for text]  │                │
-│  │ Font Size: [___]     │                │
-│  └──────────────────────┘                │
-│                                           │
-│  Changes trigger updateObject()          │
-│  onBlur triggers pushHistory()           │
-└──────────────────────────────────────────┘
-```
-
----
-
-## Step 7: Real-time Collaboration Hook (3 minutes)
-
-### WebSocket Message Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   WebSocket Communication                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  Client → Server:                                               │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐    │
-│  │ subscribe      │  │ operation      │  │ presence       │    │
-│  │ {fileId,       │  │ {operations:   │  │ {cursor: {x,y},│    │
-│  │  userId,       │  │  [{type,       │  │  selection:    │    │
-│  │  userName}     │  │    objectId,   │  │  [...ids]}     │    │
-│  │                │  │    payload}]}  │  │                │    │
-│  └────────────────┘  └────────────────┘  └────────────────┘    │
-│                                                                  │
-│  Server → Client:                                               │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐    │
-│  │ sync           │  │ operation      │  │ presence       │    │
-│  │ {file: {       │  │ {operations:   │  │ {presence:     │    │
-│  │   canvasData}, │  │  [...]}        │  │  [{userId,     │    │
-│  │  yourColor}    │  │ (broadcast)    │  │    cursor}]}   │    │
-│  └────────────────┘  └────────────────┘  └────────────────┘    │
-│                                                                  │
-│  Reconnection: 2s backoff on close                              │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Operation Types
-
-| Type | Payload | Description |
-|------|---------|-------------|
-| create | Full DesignObject | New shape added |
-| update | Partial properties | Object modified |
-| delete | objectId only | Object removed |
-
----
-
-## RADIO Data Model and Interfaces
-
-The editor has a server-backed document model and a high-frequency client interaction model. The renderer should consume a normalized scene snapshot, while pointer movement, selection rectangles, and hover state remain local and ephemeral.
-
-| Entity | Owner | Important fields | Update semantics |
+| Entity | Owner | Important fields | Consistency |
 |---|---|---|---|
-| `DesignFile` | Document store | file ID, pages, permissions, revision | server-authoritative |
-| `DesignObject` | Normalized scene store | object ID, type, transform, style, parent ID | operation-based updates |
-| `SelectionState` | Editor store | selected IDs, active tool, viewport transform | client-only |
-| `Operation` | Collaboration sync | operation ID, author, base revision, payload | ordered and replayable |
-| `PresenceState` | Presence channel | user ID, cursor, selection, color, last seen | best effort |
-| `RenderSnapshot` | Pixi adapter | visible objects, viewport, dirty regions | derived and disposable |
+| `DesignFile` | file store | file ID, pages, permissions, revision | server-authoritative |
+| `Page` | scene store | page ID, object IDs, order | operation-backed |
+| `DesignObject` | normalized scene store | ID, type, parent, transform, style, content | operation-backed |
+| `SelectionState` | editor store | selected IDs, active handle, tool | client-only |
+| `ViewportState` | renderer controller | pan, zoom, dimensions, dirty regions | client-only |
+| `Operation` | sync queue | ID, author, base revision, payload | durable and replayable |
+| `PresenceState` | presence store | user, cursor, selection, color, last seen | best effort |
+| `RenderSnapshot` | renderer adapter | visible objects, transforms, overlays | derived/disposable |
+| `UndoEntry` | history manager | forward operation, inverse operation, context | local but server-aware |
 
-### Server and collaboration interfaces
+Design objects are normalized by ID so a selection, layer panel, and renderer can reference the same object without duplicating it. Parent-child relationships define the scene tree. Transforms are stored in a consistent coordinate system; the viewport transform is separate from object transforms.
 
-```
-GET  /api/files/:fileId                      → file metadata and initial scene snapshot
-POST /api/files/:fileId/operations          → submit operations with base revision
-GET  /api/files/:fileId/operations?after=…  → recover missed operations
-WSS  /api/files/:fileId/collaboration       → operation and presence channels
+### Operations and versions
+
+An operation describes a semantic change such as create, update, delete, reorder, or group. It carries an operation ID, author, base revision, and payload. The server acknowledges it with a canonical revision or returns a conflict/rebase response.
+
+The client may optimistically apply an operation to the scene store. It keeps the operation until acknowledged. A remote operation is applied to the same store and generates a render invalidation. A stale operation must not silently overwrite a newer object version.
+
+### Rendering state
+
+Render snapshots are disposable. They may include cached geometry, text layout, image handles, and visible-object lists, but they are rebuilt when the scene or viewport changes. The authoritative scene store never depends on Pixi objects or canvas nodes.
+
+## I — Interfaces — 8 minutes
+
+### Server-facing API
+
+``` 
+GET  /api/files/:fileId                       → file metadata and initial scene snapshot
+GET  /api/files/:fileId/operations?after=... → operations missed since revision
+POST /api/files/:fileId/operations           → submit operation batch
+POST /api/files/:fileId/undo                 → server-aware inverse operation
 POST /api/files/:fileId/comments             → create anchored comment
+WSS  /api/files/:fileId/collaboration        → operations and presence
 ```
 
-The collaboration protocol separates durable operations from lossy presence messages. Operations carry IDs and revisions for deduplication and replay; cursor messages can be dropped because the next cursor supersedes them. A revision conflict triggers a rebase or server-authoritative merge, not a blind replacement of the local canvas.
+The file snapshot includes revision, pages, object records, permissions, and asset references. Operation responses include accepted IDs, canonical revision, rebased changes, and conflicts. Asset URLs are capability-scoped and never embedded as unrestricted credentials.
 
 ### Client interfaces
 
 | Interface | Inputs | Output/event | Responsibility |
 |---|---|---|---|
-| `SceneStore` | normalized object operations | selected object slices | canonical client document state |
-| `PixiRenderer` | render snapshot, viewport | draw/update/dispose | GPU rendering, not business state |
-| `ToolController` | pointer/keyboard events | operation intents | translates gestures into domain operations |
-| `SyncClient` | operation queue, revision | ack, conflict, resync | ordered collaboration transport |
-| `PresenceOverlay` | presence events, viewport | cursor/layer overlays | intentionally non-authoritative UI |
+| `SceneStore` | operations and object patches | object selectors, invalidations | canonical client document |
+| `RendererAdapter` | render snapshot, viewport, theme | draw/update/dispose | GPU or canvas rendering |
+| `ToolController` | pointer/keyboard events | operation intents | interaction semantics |
+| `SyncClient` | operation queue, revision | ack, conflict, resync | durable collaboration |
+| `PresenceOverlay` | presence events, viewport | cursor/layer overlays | non-authoritative presence |
+| `PropertiesPanel` | selected object, schema | validated property patch | accessible editing path |
 
-This boundary makes the renderer replaceable. PixiJS is a strong choice for the current scene size, but a WebGL renderer, worker-based renderer, or viewport culling strategy can evolve without changing the document and collaboration contracts.
+### Renderer lifecycle
 
-## Step 8: Trade-offs and Decisions (2 minutes)
+The renderer mounts when the file route is ready, receives dimensions and theme, loads visible assets, and draws a snapshot. A scene update marks objects or regions dirty. The adapter updates or redraws affected objects and disposes resources on unmount. It must not own selection or persist mutations.
 
-### Key Trade-offs
+## O — Optimizations and Deep Dives — 18–22 minutes
 
-| Decision | Trade-off |
-|----------|-----------|
-| PixiJS over raw Canvas 2D | Higher memory, but 60fps with complex scenes |
-| Zustand over Redux | Less boilerplate, simpler for this use case |
-| Full rerender on state change | Simpler logic vs. fine-grained updates |
-| In-memory undo history | Limited to 50 steps to save memory |
-| Immediate property updates | Responsive feel, but more WebSocket traffic |
+### Deep dive 1: PixiJS/canvas versus DOM/SVG
 
-### Alternatives Considered
+DOM or SVG is excellent for semantic UI and a modest number of objects. It becomes expensive when thousands of shapes, text nodes, handles, and images participate in layout and style recalculation. A GPU-backed renderer provides predictable drawing cost and a scene model suited to transforms.
 
-1. **Raw WebGL shaders**
-   - More control but significantly more complex
-   - PixiJS abstracts the shader complexity
+The cost is accessibility, text measurement complexity, debugging, and an imperative bridge. I would keep layers and properties in normal React DOM, expose accessible object summaries there, and use the canvas for visual editing. A canvas-only product is fast but excludes users and makes browser tooling weaker.
 
-2. **Canvas 2D API**
-   - Simpler but slower with many objects
-   - No GPU acceleration
+### Deep dive 2: Viewport culling and hit testing
 
-3. **React-konva**
-   - React integration built-in
-   - Less flexibility than raw PixiJS
+The client should not draw every object when only a viewport subset is visible. A spatial index finds candidates by bounding box. The renderer draws visible objects plus a small overscan region. Hit testing checks topmost candidates in reverse z-order and handles transformed shapes.
 
----
+For small files, a linear scan is simpler and good enough. I would add spatial indexing when profiling shows hit testing or draw preparation exceeding the frame budget, not as a premature abstraction.
 
-## Closing Summary
+### Deep dive 3: Pointer interaction and operation batching
 
-"I've designed the frontend architecture for a Figma-like collaborative design tool with:
+Pointer moves can arrive faster than the server needs updates. The tool controller maintains a local preview transform and commits a semantic operation at a controlled cadence or on pointer-up. The scene feels immediate while the sync layer receives bounded operations.
 
-1. **PixiJS Renderer** - GPU-accelerated canvas with object management, selection overlays, and collaborator cursors
-2. **Zustand State Management** - Centralized store with immer for immutable updates, history for undo/redo
-3. **Canvas Component** - Event handling for selection, moving, drawing, panning, and zooming
-4. **Panels** - Layers panel with visibility/lock, Properties panel with live updates
-5. **WebSocket Hook** - Real-time collaboration with reconnection logic
+The alternative is sending every pointer coordinate as a durable operation. That creates network volume, collaboration noise, and undo history that is impossible to use. Presence may stream cursor movement; document operations should represent meaningful changes.
 
-The key insight is separating rendering (PixiJS) from state (Zustand) and letting React orchestrate the data flow. Happy to dive deeper into any component."
+### Deep dive 4: Collaboration and conflicts
 
----
+The client applies local operations optimistically and sends them with a base revision. Remote operations arrive through the socket and are applied to the normalized store. If a conflict affects a different property, the client can merge. If two users transform the same object, the server’s conflict policy or a CRDT/OT layer decides the result and the UI shows the changed object.
 
-## Future Enhancements
+I would start with operation IDs, version checks, and visible conflict feedback. A full CRDT provides stronger offline and concurrent editing semantics but increases data structure, testing, and debugging complexity. The right choice depends on whether offline and character-level collaboration are core requirements.
 
-1. **Virtual Rendering** - Only render objects in viewport for 100k+ object files
-2. **Web Workers** - Offload hit testing and geometry calculations
-3. **Gesture Support** - Touch events for tablet users
-4. **Keyboard Shortcuts** - Full shortcut system with customization
-5. **Accessibility** - Screen reader support for layer navigation
+### Deep dive 5: Undo/redo
+
+Undo creates an inverse operation and sends it through the same permission and revision path. Directly mutating local state makes undo feel easy but breaks collaboration when another user has changed the object. The history manager should group a drag gesture into one user-facing entry even if the renderer sampled many intermediate positions.
+
+### Deep dive 6: Worker boundaries
+
+Geometry calculations, hit testing, image decoding, and export preparation are candidates for workers. Workers reduce main-thread pressure but require serialization and careful cancellation. The scene store remains the authority; a worker result is accepted only if it matches the scene revision that requested it.
+
+### Accessibility and keyboard path
+
+The layers panel provides a semantic list of objects with names, visibility, lock, and selection controls. The properties panel exposes labeled fields and announces changes. Keyboard shortcuts support select, move, duplicate, delete, group, zoom, and tool switching. Canvas pointer affordances always have a panel or command equivalent.
+
+### Failure matrix
+
+| Failure | UI behavior | Recovery |
+|---|---|---|
+| Render adapter fails | canvas fallback with layer access | retry adapter or continue in inspect mode |
+| Asset load fails | placeholder with alt/status | retry or replace asset |
+| Operation timeout | pending sync indicator | retry same operation ID |
+| Revision conflict | affected object marked | rebase or review |
+| Socket disconnects | offline/sync banner | reconnect and request missed ops |
+| Worker fails | bounded main-thread fallback | restart worker and recompute |
+
+## Performance and scaling
+
+The first bottleneck is draw preparation and hit testing for large scenes. The second is text and image rendering. The third is collaboration operation volume and history memory. Viewport culling, spatial indexes, cached text/image resources, workers, and bounded history address each independently.
+
+I would measure pointer-to-pixel latency, frame drops while transforming, visible-object count, hit-test duration, asset decode time, operation acknowledgement latency, resync duration, and memory over an eight-hour editing session.
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|---|---|---|---|
+| Visual renderer | Pixi/WebGL adapter | DOM/SVG for all objects | scale and transform performance |
+| Semantic UI | React DOM panels | canvas-only controls | accessibility and maintainability |
+| Scene state | normalized objects | nested component tree | shared selection/layers/render access |
+| Collaboration | operation IDs and revisions | full CRDT immediately | incremental correctness with less complexity |
+| Pointer updates | local preview plus semantic commit | durable event per pointer move | bounded sync and useful undo |
+| Hit testing | linear first, spatial index at scale | index everything upfront | profile-driven complexity |
+| Undo | inverse operation | direct local mutation | collaboration and permissions remain valid |
+| Workers | targeted geometry/export work | move whole app off thread | serialize only expensive computations |
+| Presence | lossy separate channel | durable document stream | cursors are replaceable |
+
+## Closing — 3 minutes
+
+“The design separates the scene model, renderer, tools, and collaboration protocol. The renderer can evolve from Pixi to another adapter without changing object ownership. Operations preserve correctness and undo semantics, while presence is deliberately lightweight. React handles controls and accessibility; the canvas handles the high-frequency visual path.”
+
+If time remains, I would discuss comments, multiplayer selections, asset caching, export, plugin tools, and how to test transform operations across reconnects.
