@@ -359,6 +359,43 @@ screenToCanvas(screenX, screenY):
 
 ---
 
+## RADIO Data Model and Interfaces
+
+The editor has a server-backed document model and a high-frequency client interaction model. The renderer should consume a normalized scene snapshot, while pointer movement, selection rectangles, and hover state remain local and ephemeral.
+
+| Entity | Owner | Important fields | Update semantics |
+|---|---|---|---|
+| `DesignFile` | Document store | file ID, pages, permissions, revision | server-authoritative |
+| `DesignObject` | Normalized scene store | object ID, type, transform, style, parent ID | operation-based updates |
+| `SelectionState` | Editor store | selected IDs, active tool, viewport transform | client-only |
+| `Operation` | Collaboration sync | operation ID, author, base revision, payload | ordered and replayable |
+| `PresenceState` | Presence channel | user ID, cursor, selection, color, last seen | best effort |
+| `RenderSnapshot` | Pixi adapter | visible objects, viewport, dirty regions | derived and disposable |
+
+### Server and collaboration interfaces
+
+```
+GET  /api/files/:fileId                      → file metadata and initial scene snapshot
+POST /api/files/:fileId/operations          → submit operations with base revision
+GET  /api/files/:fileId/operations?after=…  → recover missed operations
+WSS  /api/files/:fileId/collaboration       → operation and presence channels
+POST /api/files/:fileId/comments             → create anchored comment
+```
+
+The collaboration protocol separates durable operations from lossy presence messages. Operations carry IDs and revisions for deduplication and replay; cursor messages can be dropped because the next cursor supersedes them. A revision conflict triggers a rebase or server-authoritative merge, not a blind replacement of the local canvas.
+
+### Client interfaces
+
+| Interface | Inputs | Output/event | Responsibility |
+|---|---|---|---|
+| `SceneStore` | normalized object operations | selected object slices | canonical client document state |
+| `PixiRenderer` | render snapshot, viewport | draw/update/dispose | GPU rendering, not business state |
+| `ToolController` | pointer/keyboard events | operation intents | translates gestures into domain operations |
+| `SyncClient` | operation queue, revision | ack, conflict, resync | ordered collaboration transport |
+| `PresenceOverlay` | presence events, viewport | cursor/layer overlays | intentionally non-authoritative UI |
+
+This boundary makes the renderer replaceable. PixiJS is a strong choice for the current scene size, but a WebGL renderer, worker-based renderer, or viewport culling strategy can evolve without changing the document and collaboration contracts.
+
 ## Step 8: Trade-offs and Decisions (2 minutes)
 
 ### Key Trade-offs

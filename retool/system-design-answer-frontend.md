@@ -337,6 +337,43 @@ TanStack Router with file-based routing. The editor and preview routes use `$app
 
 ---
 
+## 🧭 RADIO Data Model and Interfaces
+
+The editor has three distinct data categories. The app definition and query configuration are server-originated and persisted. The selected component, dirty drafts, drag preview, and validation messages are client-only. Query results are server state with freshness and execution status, not part of the widget configuration itself.
+
+| Entity | Owner | Important fields | Lifecycle |
+|---|---|---|---|
+| `AppDefinition` | App store | app ID, name, components, layout version | persisted server state |
+| `WidgetConfig` | Canvas/widget registry | component ID, type, position, props, bindings | persisted server state |
+| `QueryDefinition` | Query panel/store | query ID, SQL, parameters, trigger policy | persisted server state |
+| `QueryResult` | Data layer | query ID, columns, rows, fetched time, error | cached server state |
+| `BindingExpression` | Binding editor | source path, expression, validation status | draft then persisted |
+| `EditorSession` | Shell | selected ID, dirty state, mode, active panel | ephemeral client state |
+
+### Server-facing API
+
+```
+GET  /api/apps/:appId                         → app definition and widget configs
+PUT  /api/apps/:appId                         → versioned app/layout update
+POST /api/apps/:appId/queries/execute         → execute an authorized query
+GET  /api/apps/:appId/queries/:queryId        → query metadata and latest result
+POST /api/apps/:appId/publish                 → validate and publish an app version
+```
+
+The editor sends a version with layout mutations. A stale version returns a conflict and preserves the local draft. Query execution returns status, columns, rows, elapsed time, and a result version; the client never treats an old result as current merely because it arrived later.
+
+### Client-facing interfaces
+
+| Interface | Inputs | Output/event | Boundary |
+|---|---|---|---|
+| `WidgetRegistry` | widget type and version | renderer, editor, binding schema | widget code does not own persistence |
+| `WidgetRenderer` | resolved props, dimensions, query state | rendered widget, interaction events | preview and edit modes share rendering |
+| `BindingEditor` | expression, schema, query context | validated expression change | no arbitrary code execution |
+| `QueryCoordinator` | query definition, trigger, cancellation | result or typed error | deduplicates and cancels execution |
+| `Canvas` | widget configs, pointer/keyboard events | layout patch | optimistic local layout, debounced save |
+
+This makes the key alternative explicit: a single widget switch is easier for nine widgets, while a registry pays off when teams add widget types independently. The registry is also where code splitting, capability checks, and fallback renderers belong.
+
 ## ⚖️ 12. Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |

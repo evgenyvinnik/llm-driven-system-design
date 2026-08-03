@@ -439,6 +439,43 @@ Displayed in header/toolbar area:
 
 ---
 
+## RADIO Data Model and Interfaces
+
+The spreadsheet client needs a sparse, coordinate-addressed model rather than a database-shaped array. It also needs to separate committed cells from the local edit buffer and from presence metadata that can disappear without affecting document correctness.
+
+| Entity | Owner | Important fields | Consistency |
+|---|---|---|---|
+| `Workbook` | Document store | workbook ID, sheet IDs, permissions, revision | server-authoritative |
+| `SheetViewport` | View state | row/column window, scroll offsets, measured sizes | ephemeral client state |
+| `CellValue` | Sparse cell store | sheet ID, row, column, raw value, formatted value | server + local edits |
+| `FormulaDependency` | Formula worker | cell key, dependencies, computed result, error | derived client state |
+| `EditOperation` | Sync queue | operation ID, base revision, cell patch, author | ordered/conflict-aware |
+| `PresenceCursor` | Presence store | user ID, sheet, cell/range, color, last seen | best effort |
+
+### Server-facing API
+
+```
+GET  /api/workbooks/:id                    → workbook metadata and sheet list
+GET  /api/sheets/:id/viewport              → sparse cells for a visible range
+POST /api/sheets/:id/operations             → ordered cell operations with base revision
+GET  /api/sheets/:id/operations?after=...   → missed operations for resync
+WSS  /api/workbooks/:id/presence            → cursors and collaborator presence
+```
+
+The operation response includes the accepted revision and any rejected/conflicting cell keys. A client must not replace its local edit buffer with an entire server snapshot after one conflict; it rebases unaffected edits and marks the conflicting cells for review.
+
+### Client interfaces
+
+| Interface | Inputs | Output/event | Why |
+|---|---|---|---|
+| `ViewportController` | scroll position, measured sizes | visible cell coordinates | drives virtualization |
+| `CellStore` | cell key, value patch | subscribed cell snapshot | prevents whole-grid renders |
+| `FormulaWorker` | edit operation, dependency graph | computed values and errors | keeps calculations off main thread |
+| `SyncQueue` | operation, base revision | accepted, rebased, or conflict | preserves ordering and retry semantics |
+| `PresenceChannel` | cursor and selection updates | remote presence events | deliberately lossy and ephemeral |
+
+The central trade-off is that document edits are lossless and ordered, while presence and cursor updates may be coalesced. Treating both as generic WebSocket messages makes the implementation simpler but makes correctness and backpressure harder to reason about.
+
 ## 8. Trade-offs Summary (3 minutes)
 
 | Decision | Chosen | Alternative | Rationale |

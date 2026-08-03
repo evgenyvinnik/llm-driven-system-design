@@ -298,6 +298,42 @@ A visually hidden status region announces loading state, result count, and error
 
 ---
 
+## RADIO Data Model and Interfaces
+
+The search frontend has three separate data lifecycles: URL-owned query state, server-owned result pages, and ephemeral interaction state. Keeping them separate makes browser navigation, caching, and cancellation predictable.
+
+| Entity | Owner | Important fields | Lifecycle |
+|---|---|---|---|
+| `SearchRequest` | Router/search controller | query, filters, sort, cursor, request ID | URL and in-flight request |
+| `Suggestion` | Suggestion cache | text, type, score, expires at | short-lived server state |
+| `SearchResultPage` | Results store | results, total/has-more, next cursor, highlights | cursor-paginated server state |
+| `SearchHistory` | Local persistence | query, filters, last used | client persisted, user-controlled |
+| `SearchInteraction` | Search UI | focused suggestion/result, loading, error | ephemeral client state |
+
+### Server-facing API
+
+```
+GET /api/search/suggestions?q=...             → ranked suggestions
+GET /api/search/posts?q=...&filters=...       → first result page
+GET /api/search/posts?q=...&cursor=...        → next result page
+POST /api/searches/saved                       → save a query and filters
+GET /api/searches/history                     → recent searches for the user
+```
+
+Every request carries a normalized query and an abort signal. When the user types again, the controller cancels the prior suggestion request; an older response must never overwrite the newer query. Result pages use a cursor rather than a page number so inserts do not reorder the user’s current window unexpectedly.
+
+### Client interfaces
+
+| Interface | Inputs | Output/event | Responsibility |
+|---|---|---|---|
+| `SearchController` | query, filters, debounce policy | request lifecycle and URL update | coordinates cancellation and navigation |
+| `SuggestionList` | suggestions, active index | select, keyboard movement | combobox accessibility |
+| `ResultsStore` | result pages, cursor | merged visible results | deduplicates pages and tracks status |
+| `HighlightRenderer` | server spans, fallback query | safe highlighted text | never injects unsanitized HTML |
+| `VirtualizedResults` | result IDs and measurements | visible cards | bounds DOM work for large result sets |
+
+This makes the central alternative explicit: storing the query and results in one global object is convenient, but it couples URL navigation, server cache, and keyboard state. Separate ownership costs a little coordination and prevents stale responses from corrupting the visible search.
+
 ### 7. Future Enhancements
 
 1. **Voice Search**: Add Web Speech API integration for voice queries

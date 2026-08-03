@@ -138,6 +138,193 @@ Zustand over Redux for footprint and selector-based subscriptions; over Context 
 | Order submission | ✅ Client idempotency key | ❌ Disabled-button-only | Guarantee lives in the protocol, not UI state |
 | Stale connection | ✅ Visible staleness banner | ❌ Silent freeze | Never let users trade a dead number |
 
+## 🧭 RADIO Map
+
+| Stage | Exchange frontend focus |
+|---|---|
+| **R — Requirements** | Latency, precision, authenticated actions, and visible connection health |
+| **A — Architecture** | REST snapshot path, WebSocket market path, stores, worker boundaries, and route-level code splitting |
+| **D — Data model** | Decimal strings, market snapshots, order state machines, and client-only form state |
+| **I — Interfaces** | REST endpoints, WebSocket messages, subscriptions, and order-command idempotency |
+| **O — Optimizations** | Frame conflation, canvas rendering, workers, reconnection, and multi-tab sharing |
+
+## 🗃️ Client Data Model
+
+The client has two correctness classes: market data may be dropped or coalesced for rendering, while order events and balances must be processed in order. The model makes that distinction explicit.
+
+| Source | Entity | Owner | Important fields |
+|---|---|---|---|
+| Server | `MarketSnapshot` | Market store | symbol, bid/ask, sequence, server time, freshness |
+| Server | `CandleSeries` | Chart adapter | symbol, interval, ordered candles, last sequence |
+| Server | `OrderBook` | Book store/worker | bids, asks, sequence, checksum, received time |
+| Server | `Order` | Portfolio store | order ID, symbol, side, status, filled quantity, version |
+| Server | `Balance` | Portfolio store | asset, available, held, decimal-string amounts |
+| Client persisted | `SubscriptionSet` | Socket service | symbols, channels, desired connection state |
+| Client ephemeral | `OrderDraft` | Order form | side, quantity string, price string, validation, submit state |
+| Client derived | `ConnectionHealth` | Shell | connected, reconnecting, stale age, last sequence |
+
+The WebSocket client owns transport state and sequence validation. Zustand or another store owns normalized domain state. React components subscribe to narrow selectors. The chart adapter owns its imperative canvas instance and consumes render-ready numbers only after the precision boundary has been crossed safely.
+
+Order status is a state machine rather than a boolean loading flag: pending, accepted, partially filled, filled, cancelled, rejected, or unknown-after-disconnect. An order event with an older sequence is ignored; a gap triggers a REST resync before the UI presents the book or order as current.
+
+## 🔌 Interface Contracts
+
+### Server-facing API
+
+```
+GET  /api/markets?symbols=...              → initial tickers and market metadata
+GET  /api/candles/:symbol?interval=...     → historical candles and sequence
+GET  /api/order-book/:symbol               → authoritative book snapshot
+GET  /api/orders?status=...                → authenticated order history
+GET  /api/portfolio                        → authenticated balances and holdings
+POST /api/orders                           → place order with idempotency key
+POST /api/orders/:id/cancel                 → cancel an open order
+WSS  /ws                                   → market, book, and private order channels
+```
+
+The WebSocket handshake authenticates private channels separately from public market channels. Every delta carries a channel, symbol, sequence, event time, and payload. The client acknowledges subscriptions but does not treat an acknowledgement as proof that the market snapshot is current; the first snapshot and sequence establish that baseline.
+
+The order API returns a canonical order with server status and accepted quantities. A timeout after submission produces an `unknown` client state and triggers lookup by idempotency key or client command ID. The client never retries a financial mutation with a new key.
+
+### Client-facing interfaces
+
+| Interface | Inputs | Output/event | Main invariant |
+|---|---|---|---|
+| `useMarketSubscription` | symbols, channels | render-ready snapshot stream | reference-counted subscriptions |
+| `OrderBookAdapter` | snapshot, ordered deltas | fixed rows for the view | sequence gaps force resync |
+| `ChartAdapter` | candle snapshot/delta, dimensions | canvas rendering | React does not re-diff every tick |
+| `OrderForm` | pair metadata, balances, draft strings | validated order command | no unsafe floating-point arithmetic |
+| `ConnectionBanner` | connection health | reconnect/resync action | stale data is visible to the user |
+
+This API boundary keeps the socket service independent of the chart and order book implementations. It also allows a SharedWorker to become the transport owner later without changing route components.
+
+## 📈 Scaling and Failure Modes
+
+At 500 symbols, subscribing every visible and hidden route to every channel wastes bandwidth. I would keep a desired subscription set at the application level, reference-count consumers, and subscribe only visible market rows plus the active trading pair. A SharedWorker can share one connection across tabs when browser support and security policy allow it.
+
+At a sequence gap, the client should stop applying deltas, mark the affected view stale, fetch a fresh snapshot, verify its sequence, and resume. Replaying deltas without a verified baseline risks displaying an order book that looks plausible but is financially wrong.
+
+The main-thread budget is protected by three choices: coalesce droppable market ticks per animation frame, move order-book aggregation to a worker when depth grows, and keep order events lossless. The alternative is to render every message immediately, which preserves an event trace but makes the chart and input jank under burst traffic.
+
+## 🧪 Verification Strategy
+
+- Decimal arithmetic tests cover multiplication, rounding policy, step size, and display precision.
+- WebSocket contract tests cover subscription acknowledgements, sequence gaps, duplicate events, and reconnect resync.
+- Order state-machine tests cover out-of-order fills, cancellation races, and unknown-after-timeout recovery.
+- Performance tests measure tick-to-pixel latency, frame drops, heap growth, and worker transfer cost.
+- Browser tests verify that stale prices are announced and that keyboard users can submit or cancel without relying on color.
+
+## 🧭 End-to-End Market and Order Flow
+
+The trading view has one read path and one command path, connected by explicit sequence and freshness rules:
+
+```
+REST snapshot ───────┐
+                      ▼
+                normalized store ──▶ chart / book / ticker views
+                      ▲
+WSS ordered deltas ───┘
+
+Order form ──validated command + idempotency key──▶ REST order API
+                                                       │
+Private order events ◀──────── WSS authenticated channel
+```
+
+On route entry, the client fetches market metadata, a candle snapshot, an order-book snapshot, portfolio data, and open orders according to priority. It records the snapshot sequence before accepting deltas. The socket then applies only messages that extend that sequence. If a gap or checksum failure occurs, the affected stream pauses and resynchronizes.
+
+An order submission is a separate lifecycle from market rendering. The form validates decimal strings and step sizes locally, sends one command ID, and enters an unknown state if the response is lost. A later private order event or idempotent lookup resolves the state. The market chart may continue updating while the order form waits.
+
+## 📡 Transport and Interface Choices
+
+| Data | Transport | Freshness/correctness rule | Why |
+|---|---|---|---|
+| Public ticker | WebSocket | newest value wins | high volume, droppable intermediates |
+| Order book | WebSocket + REST snapshot | sequence and checksum required | deltas need a trusted baseline |
+| Candles | REST snapshot + socket updates | interval boundary and sequence | chart can coalesce within a frame |
+| Portfolio | REST | refetch after order events | authenticated, lower frequency |
+| Order lifecycle | private WebSocket + REST lookup | lossless state transitions | every fill matters |
+
+```
+GET  /api/markets?symbols=...              → public market metadata and ticker snapshot
+GET  /api/candles/:symbol?interval=...     → ordered candle snapshot
+GET  /api/order-book/:symbol               → book snapshot with sequence/checksum
+GET  /api/orders?status=...                → authenticated order history
+GET  /api/portfolio                        → balances and holdings as decimal strings
+POST /api/orders                           → place order with idempotency key
+POST /api/orders/:id/cancel                → cancel an open order
+WSS  /ws                                   → public and private channels
+```
+
+The socket client exposes subscription, snapshot, delta, stale, and resync events. Components do not parse wire messages directly. That interface lets the transport change from a browser WebSocket to a SharedWorker or a server-sent event stream for selected channels without changing the chart or book.
+
+## ♿ Accessibility and Trust Signals
+
+The trading view must communicate more than numbers. A stale banner states which streams are stale and when they were last updated. Order status changes are announced in a polite live region, while high-frequency price changes are not announced on every tick. Keyboard users can switch markets, focus the order form, change side, review validation errors, and reach cancel actions without using the chart canvas.
+
+Color is never the only signal for price movement or order status. Positive/negative movement includes a sign or text label, and order states use status text plus icons. The order book has a tabular alternative for users who cannot interpret depth bars.
+
+## ⚖️ Deep Trade-off: WebSocket, SSE, or Polling
+
+WebSockets are the best default for this exchange because the client needs bidirectional subscriptions and private order events. Polling is simpler and easier to cache, but at sub-second market rates it creates latency and request overhead. SSE is a credible alternative for public server-to-client market streams, but it still needs a separate HTTP command path and is less natural for dynamic channel subscriptions.
+
+The cost of WebSockets is connection lifecycle complexity: reconnect backoff, resubscription, sequence recovery, authentication renewal, and multi-tab coordination. I accept that cost for the trading view because stale prices and delayed fills are product correctness failures, not merely performance problems. For portfolio pages, REST remains simpler and preferable.
+
+## 🚨 Failure Matrix
+
+| Failure | User-visible state | Recovery |
+|---|---|---|
+| Socket disconnects | stale banner and disabled risky actions | reconnect with jitter and resubscribe |
+| Sequence gap | book/chart marked stale | pause deltas, fetch snapshot, verify sequence |
+| Order POST timeout | order status unknown | lookup by idempotency key or private event |
+| Private channel auth expires | market stays public, private data marked stale | renew session and resubscribe |
+| Worker crashes | fallback to bounded main-thread path | restart worker and resync derived state |
+| Tab hidden | reduced subscriptions and refresh rate | restore visible channels on focus |
+
+The key principle is to degrade the least dangerous thing first. A sparkline can freeze briefly; an order book must declare staleness; a financial command must never be replayed with a new identity.
+
+## 🧩 Stream and Order State Machines
+
+### Market stream
+
+| State | Entry event | Allowed actions | Exit event |
+|---|---|---|---|
+| Disconnected | route entry or socket close | connect with backoff | connected or retrying |
+| Connected | verified subscription | apply ordered deltas | stale or gap |
+| Stale | heartbeat timeout or sequence gap | stop affected updates, request snapshot | resynced or disconnected |
+| Resyncing | snapshot request | buffer or discard deltas according to sequence | connected or failed |
+
+### Order command
+
+| State | Meaning | Recovery |
+|---|---|---|
+| Draft | local decimal strings and validation | edit fields |
+| Submitting | command sent with stable idempotency key | wait, cancel if supported |
+| Unknown | response lost after send | lookup or private event |
+| Accepted | server created the order | follow private lifecycle |
+| Rejected | server refused the command | show canonical reason |
+| Partially filled | some quantity executed | process every event |
+| Filled/cancelled | terminal state | refresh balances and history |
+
+Writing these states down keeps market freshness and order correctness from being accidentally handled by the same generic loading flag. A market tick can be replaced. An order fill cannot.
+
+## 🔐 Security and Permission Boundaries
+
+Public market channels and private trading channels should be separate capabilities. The client may hide the order form when unauthenticated, but the server authenticates the private socket channel and validates every order against account permissions, balances, pair rules, and risk limits.
+
+The browser stores no signing secret. An idempotency key identifies a command; it does not authorize it. Decimal strings are validated at the UI boundary, then validated again by the server. The client cache must separate public market data from private balances and orders, and logout must tear down private subscriptions immediately.
+
+The alternative is to let one authenticated WebSocket carry every public and private message. That is operationally convenient, but it increases blast radius during token renewal and makes accidental private-data fan-out easier. Separate channel capabilities give the shell more explicit failure and privacy behavior.
+
+## 📏 Performance Budget
+
+- Tick-to-visible-price latency: under 100ms for the active symbol.
+- Trading view: sustained 60fps during normal book updates.
+- Order-book update: bounded work per animation frame, with aggregation offloaded as depth grows.
+- Initial route: render shell and last safe snapshot before loading non-critical history.
+- Reconnect: show stale state within five seconds and resync without blocking navigation.
+
+The budgets drive the architecture. Canvas, narrow selectors, frame conflation, workers, and route-level code splitting are not generic optimizations here; they directly protect the trading interaction and financial trust.
+
 ## 📈 Scaling the Frontend
 
 What breaks first as the product grows:

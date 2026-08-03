@@ -423,6 +423,44 @@ Overlay Components:
 
 ---
 
+## RADIO Data Model and Interfaces
+
+The page editor should not treat the rendered block tree as the persistence model. The server stores blocks and relationships; the client derives a render tree, maintains local drafts, and tracks collaboration state separately.
+
+| Entity | Owner | Important fields | Update semantics |
+|---|---|---|---|
+| `Page` | Page store | page ID, parent ID, title, permissions, updated time | server state |
+| `Block` | Block store | block ID, type, parent ID, order key, content, version | normalized and persisted |
+| `BlockTree` | Selector layer | ordered visible block IDs and descendants | derived client state |
+| `EditorDraft` | Block editor | active block, selection, composition text, dirty state | ephemeral client state |
+| `Presence` | Presence store | user ID, page ID, cursor/block, last seen | lossy realtime state |
+| `SearchResult` | Search data layer | page/block ID, snippet, score, cursor | paginated server state |
+
+### Server-facing API
+
+```
+GET  /api/pages/:pageId                    → page metadata and block snapshot
+POST /api/pages/:pageId/blocks             → create a block
+PATCH /api/blocks/:blockId                 → update content or block properties
+POST /api/pages/:pageId/reorder            → move blocks with an ordering version
+GET  /api/search?q=...&cursor=...           → paginated page/block results
+WSS  /api/pages/:pageId/presence           → collaborator cursors and presence
+```
+
+Block mutations carry a version or operation ID. A stale reorder response should preserve the user’s draft and ask the page store to reconcile the sibling order; it should not reset the entire editor tree. Search results are independent server state and should not be copied into the page block store.
+
+### Client interfaces
+
+| Interface | Inputs | Output/event | Responsibility |
+|---|---|---|---|
+| `BlockRenderer` | block type, block data, child slot | rendered block | type-specific presentation |
+| `BlockEditor` | block draft, selection, schema | validated block mutation | local editing and validation |
+| `PageStore` | normalized block operations | block/page selectors | shared document state |
+| `SyncCoordinator` | mutations, versions, retry signals | ack, conflict, resync | persistence and reconciliation |
+| `PresenceChannel` | cursor and active-user updates | remote presence | non-authoritative collaboration UI |
+
+The component registry should resolve block types through a descriptor rather than a single growing switch. That lets new block types add their renderer and editor while the page store, sync coordinator, and accessibility shell remain stable.
+
 ### 9. Trade-offs and Decisions
 
 | Decision | Chosen Approach | Alternative | Rationale |
