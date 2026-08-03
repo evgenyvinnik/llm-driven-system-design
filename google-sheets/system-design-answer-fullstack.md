@@ -1,534 +1,353 @@
-# Google Sheets - System Design Answer (Full-Stack Focus)
+# Google Sheets Full-Stack — System Design Answer
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+## 45–50 minute interview walkthrough
 
----
+| Segment | Focus | Time |
+|---|---|---:|
+| Requirements | Editing and collaboration promises | 4 min |
+| Architecture | Grid, sync service, formula workers, storage | 8 min |
+| Data model | Cells, operations, revisions, client viewport | 6 min |
+| Interfaces | REST, WebSocket, batch edits, resync | 8 min |
+| Deep dives | Virtualization, conflicts, formulas, undo | 20 min |
+| Trade-offs and close | Scale and rollout | 4 min |
 
-## 1. Requirements Clarification (3 minutes)
+## Opening — 2 minutes
 
-### Functional Requirements
-1. **Spreadsheet Management**: Create, open, edit, and delete spreadsheets with multiple sheets
-2. **Real-time Collaboration**: Multiple users editing simultaneously with live cursor visibility
-3. **Formula Support**: Excel-compatible formulas with dependency tracking (SUM, VLOOKUP, IF)
-4. **Cell Formatting**: Bold, colors, alignment, number formats
-5. **Grid Operations**: Resize columns/rows, undo/redo
+I am designing a collaborative spreadsheet. Users open a workbook, scroll through a very large grid, edit cells, paste ranges, calculate formulas, and see collaborators’ selections and changes.
 
-### Non-Functional Requirements
-- **Scale**: Support 10,000+ rows/columns per sheet via virtualization
-- **Latency**: Sub-100ms for local edits, <200ms for broadcast to collaborators
-- **Consistency**: Last-write-wins per cell with server as source of truth
-- **Availability**: Graceful degradation (read-only mode if database unavailable)
+The browser must render a bounded viewport and remain responsive while the backend persists operations and coordinates revisions. Formula results are derived state. Durable cell edits and document revisions are authoritative.
 
-### Out of Scope
-- Charts and visualizations
-- Import/export Excel files
-- Mobile native apps
-- Comments and suggestions
+## R — Requirements — 4 minutes
 
----
+### Clarifying questions
 
-## 2. Full-Stack Architecture Overview (5 minutes)
+I would ask whether formulas must match a desktop spreadsheet, whether offline editing is required, and how many collaborators can edit one sheet. I will support common formulas, online collaboration, and saved local drafts before full offline mutation replay.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              Frontend                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                     React + TypeScript + Vite                    │    │
-│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐   │    │
-│  │  │ TanStack    │  │   Zustand    │  │   WebSocket Client   │   │    │
-│  │  │ Virtual     │  │   Store      │  │                      │   │    │
-│  │  │ (Grid)      │  │              │  │                      │   │    │
-│  │  └─────────────┘  └──────────────┘  └──────────────────────┘   │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                  │                                        │
-│                    REST (CRUD)   │   WebSocket (real-time)               │
-│                                  │                                        │
-├──────────────────────────────────┼────────────────────────────────────────┤
-│                              Backend                                      │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                     Node.js + Express + ws                       │    │
-│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐   │    │
-│  │  │ REST API    │  │  WebSocket   │  │   HyperFormula       │   │    │
-│  │  │ Routes      │  │  Server      │  │   (Formula Engine)   │   │    │
-│  │  └─────────────┘  └──────────────┘  └──────────────────────┘   │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                  │                                        │
-├──────────────────────────────────┼────────────────────────────────────────┤
-│                           Data Layer                                      │
-│  ┌──────────────────┐  ┌──────────────────────────────────────────┐    │
-│  │   PostgreSQL     │  │              Redis/Valkey                 │    │
-│  │  - Spreadsheets  │  │  - Session storage                       │    │
-│  │  - Sheets        │  │  - Cell cache                            │    │
-│  │  - Cells (sparse)│  │  - Pub/Sub (multi-server sync)           │    │
-│  │  - Edit history  │  │  - Idempotency keys                      │    │
-│  └──────────────────┘  └──────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+I would ask whether users can share a workbook with different permissions. I will assume viewer, commenter, and editor roles enforced by the server.
 
-### Component Responsibilities
+### Functional requirements
 
-| Layer | Component | Responsibility |
-|-------|-----------|----------------|
-| **Frontend** | TanStack Virtual | Render only visible cells (virtualization) |
-| **Frontend** | Zustand Store | Sparse cell data, selection, collaborators |
-| **Frontend** | WebSocket Client | Real-time sync, reconnection logic |
-| **Backend** | REST API | CRUD operations, initial data load |
-| **Backend** | WebSocket Server | Broadcast edits, presence management |
-| **Backend** | HyperFormula | Server-side formula calculation |
-| **Data** | PostgreSQL | Durable storage, edit history |
-| **Data** | Redis | Cache, pub/sub, sessions |
+- Create workbooks and sheets.
+- Load a bounded viewport from a large logical grid.
+- Edit values, formulas, formatting, rows, and columns.
+- Paste a bounded range as one logical operation batch.
+- Recalculate dependent formulas.
+- Collaborate through durable edits and best-effort presence.
+- Undo and redo through the same revision protocol.
+- Share workbooks with scoped permissions.
 
----
+### Non-functional requirements
 
-## 3. Deep Dive: Data Model and TypeScript Interfaces (7 minutes)
+- Scroll and active-cell editing remain responsive.
+- Empty logical space does not allocate a two-dimensional browser array.
+- A reconnect cannot lose an acknowledged edit or apply an old calculation over a newer one.
+- Presence may be stale or dropped without affecting document correctness.
+- A large workbook opens through bounded reads.
+- Permission checks apply to every durable operation.
 
-### Shared TypeScript Types
+### Out of scope
 
-"I'm defining shared types in a common directory that both frontend and backend import. This ensures type safety across the wire."
+I will not design the full formula language, external integrations, spreadsheet import formats, or a complete CRDT implementation. I will define the operation and calculation boundaries.
+
+## A — Architecture — 8 minutes
+
+### Combined architecture diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     CORE ENTITY TYPES                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Spreadsheet: { id, title, ownerId, createdAt, updatedAt }              │
-│                                                                          │
-│  Sheet: { id, spreadsheetId, name, sheetIndex, frozenRows, frozenCols } │
-│                                                                          │
-│  CellData: { rawValue: string|null, computedValue: any,                 │
-│              format?: CellFormat, error?: string }                       │
-│                                                                          │
-│  CellFormat: { bold?, italic?, color?, backgroundColor?,                │
-│                textAlign?: 'left'|'center'|'right',                      │
-│                fontSize?, numberFormat? }                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Collaborator: { userId, name, color, cursorRow, cursorCol,             │
-│                  selectionRange: CellRange|null }                        │
-│                                                                          │
-│  CellRange: { startRow, startCol, endRow, endCol }                      │
-└─────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│ React SPA                                                                   │
+│ routes: /workbooks · /workbooks/$id/sheets/$sheetId                       │
+│ authStore · workbookStore · sparseCellStore · gridStore · formulaStore     │
+│ viewport controller · virtual grid · formula bar · accessibility layer     │
+└──────────────────────────────┬─────────────────────────────────────────────┘
+                               │ HTTPS / WebSocket
+┌──────────────────────────────▼─────────────────────────────────────────────┐
+│ Workbook API and Collaboration Gateway                                      │
+│ viewport reads · permissions · operation batches · acknowledgements        │
+├───────────────────────┬───────────────────────┬────────────────────────────┤
+│ Document service       │ Sync service           │ Formula service            │
+│ snapshots · revisions │ ordering · replay      │ dependency graph · compute │
+├───────────────────────┴───────────────────────┴────────────────────────────┤
+│ Operation log · document store · snapshot store · presence broker           │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### WebSocket Message Types
+### Frontend responsibilities
+
+The shell owns workbook routing, tabs, toolbar, permissions, formula bar, keyboard commands, and announcements. The viewport controller computes visible rows and columns. The sparse store owns loaded cell records and local projections.
+
+The grid renderer mounts only visible cells plus overscan. A stable editor overlay preserves focus while cells recycle. A formula worker computes derived values but does not own raw document truth.
+
+### Backend responsibilities
+
+The document service stores canonical sheet metadata, cell operations, formatting, and revisions. The sync service broadcasts accepted operations and supports reconnect replay. The formula service or worker fleet calculates dependent values against a revisioned snapshot.
+
+### Edit flow
+
+1. The user edits a cell in a stable overlay.
+2. The client applies a local projection and creates an operation ID.
+3. The sync client sends the operation with base revision and permission context.
+4. The server validates and sequences it.
+5. The acknowledgement includes canonical cell state and new revision.
+6. Collaborators receive the operation through WebSocket.
+7. Formula calculation produces revision-tagged derived updates.
+
+## D — Data Model — 6 minutes
+
+### Server entities
+
+| Entity | Important fields | Authority |
+|---|---|---|
+| `Workbook` | ID, owner, permissions, revision | document service |
+| `Sheet` | ID, workbook, dimensions, metadata | document service |
+| `CellRecord` | sheet, row, column, raw value, formula, format | document service |
+| `Operation` | ID, author, base revision, patch, sequence | operation log |
+| `Snapshot` | workbook, revision, sparse chunks | snapshot store |
+| `FormulaResult` | cell, computed value/error, source revision | formula service |
+| `Presence` | user, cursor, selection, expiry | presence channel |
+
+### Client entities
+
+| Entity | Owner | Lifetime |
+|---|---|---|
+| `ViewportState` | grid controller | route/session |
+| `CellStore` | sparse store | loaded range |
+| `SelectionState` | UI store | current sheet |
+| `PendingOperation` | sync queue | until ack/conflict |
+| `FormulaProjection` | worker/store | revision-scoped |
+| `UndoEntry` | history manager | bounded session/history |
+
+The raw value and formula are separate from computed value and formatting. A blank unloaded cell is not the same as a loaded empty cell. Range reads carry revision and coordinate bounds.
+
+### Operation semantics
+
+Operations have stable IDs, a base revision, an author, a semantic type, and a bounded payload. Accepted operations receive a document sequence. A reconnect can request operations after the last acknowledged sequence or obtain a canonical snapshot when replay is unavailable.
+
+### Formula semantics
+
+Formula results are derived by source revision. A worker result for an old revision cannot overwrite a newer local or server revision. Formula errors are values in the derived model, not mutations to raw content.
+
+## I — Interfaces — 8 minutes
+
+### REST API
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     CLIENT ──▶ SERVER MESSAGES                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  CELL_EDIT:        { sheetId, row, col, value, requestId? }             │
-│  CURSOR_MOVE:      { sheetId, row, col }                                │
-│  SELECTION_CHANGE: { sheetId, range: CellRange }                        │
-│  UNDO:             { sheetId }                                           │
-│  REDO:             { sheetId }                                           │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     SERVER ──▶ CLIENT MESSAGES                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  CELL_UPDATED:  { sheetId, row, col, value, computedValue, userId }     │
-│  CURSOR_MOVED:  { userId, name, color, row, col }                       │
-│  USER_JOINED:   { userId, name, color }                                 │
-│  USER_LEFT:     { userId }                                               │
-│  STATE_SYNC:    { cells: [{row, col, data}], collaborators: [] }        │
-└─────────────────────────────────────────────────────────────────────────┘
+GET  /api/v1/workbooks                         → visible workbooks
+GET  /api/v1/workbooks/:id                    → metadata, sheets, permissions
+GET  /api/v1/workbooks/:id/sheets/:sheetId/range → bounded cell range
+POST /api/v1/workbooks/:id/operations          → batch edit command
+POST /api/v1/workbooks/:id/resync              → snapshot and revision
+POST /api/v1/workbooks/:id/undo                → inverse operation command
+PATCH /api/v1/workbooks/:id/permissions        → share policy
 ```
 
-### PostgreSQL Schema
-
-"I use sparse cell storage - only non-empty cells are stored. This provides massive storage efficiency since most cells are empty."
+### WebSocket API
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     CELLS TABLE (Sparse Storage)                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  id:             UUID PRIMARY KEY                                        │
-│  sheet_id:       UUID REFERENCES sheets(id) ON DELETE CASCADE           │
-│  row_index:      INTEGER NOT NULL                                        │
-│  col_index:      INTEGER NOT NULL                                        │
-│  raw_value:      TEXT                                                    │
-│  computed_value: TEXT                                                    │
-│  format:         JSONB DEFAULT '{}'                                      │
-│  updated_at:     TIMESTAMP DEFAULT NOW()                                 │
-│  updated_by:     UUID REFERENCES users(id)                               │
-│                                                                          │
-│  UNIQUE(sheet_id, row_index, col_index)  ← Enables UPSERT               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  INDEXES:                                                                │
-│    - idx_cells_sheet (sheet_id)                                          │
-│    - idx_cells_position (sheet_id, row_index, col_index)                │
-└─────────────────────────────────────────────────────────────────────────┘
+CONNECT /api/v1/workbooks/:id/stream
+JOIN    sheet:<sheetId>
+EVENT   operation { sequence, operation }
+EVENT   acknowledgement { operationId, revision }
+EVENT   presence { user, cursor, expiresAt }
+EVENT   resync-required { revision, reason }
 ```
 
-### Database Service Layer
+Presence is lossy and expires. Operations are durable, ordered, and replayable. They may share a connection but not a state machine.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     CELL SERVICE FUNCTIONS                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  getCellsBySheet(sheetId) ──▶ Map<string, CellData>                     │
-│    1. SELECT row_index, col_index, raw_value, computed_value, format    │
-│       FROM cells WHERE sheet_id = $1                                     │
-│    2. Build Map with key = "{row}-{col}"                                 │
-│    3. Return cells Map                                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  upsertCell(sheetId, row, col, rawValue, computedValue, userId)         │
-│    IF rawValue is null or empty:                                        │
-│      ──▶ DELETE FROM cells WHERE sheet_id=$1 AND row=$2 AND col=$3      │
-│    ELSE:                                                                 │
-│      ──▶ INSERT INTO cells (...) VALUES (...)                            │
-│          ON CONFLICT (sheet_id, row_index, col_index)                   │
-│          DO UPDATE SET raw_value=$4, computed_value=$5, updated_at=NOW()│
-├─────────────────────────────────────────────────────────────────────────┤
-│  getCellsInViewport(sheetId, startRow, endRow, startCol, endCol)        │
-│    ──▶ SELECT ... WHERE sheet_id=$1                                      │
-│          AND row_index BETWEEN $2 AND $3                                 │
-│          AND col_index BETWEEN $4 AND $5                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### Frontend interfaces
 
----
+| Boundary | Input | Output |
+|---|---|---|
+| Viewport controller | scroll, metrics | visible coordinate window |
+| Grid renderer | cell snapshots, selection | semantic grid and layers |
+| Formula worker | operations, graph, revision | derived values/errors |
+| Sync client | operation batch | ack, remote op, conflict |
+| Cell editor | coordinate, raw value | commit/cancel intent |
+| History manager | operation result | inverse command |
 
-## 4. Deep Dive: WebSocket Real-time Sync (8 minutes)
+### Error contract
 
-### Server-Side WebSocket Handler
+The server distinguishes permission denied, invalid cell operation, stale revision, operation duplicate, resync required, formula unavailable, and transient storage failure. The client preserves local edits for conflicts and never marks a failed operation as acknowledged.
 
-"I'm using the native ws library with Redis pub/sub for multi-server synchronization."
+## O — Optimizations and Deep Dives — 20 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     WEBSOCKET SERVER SETUP                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Data Structures:                                                        │
-│    - rooms: Map<spreadsheetId, Set<ConnectedClient>>                    │
-│    - ConnectedClient: { ws, userId, userName, userColor, spreadsheetId }│
-│                                                                          │
-│  Redis Subscriber:                                                       │
-│    ──▶ Subscribe to 'spreadsheet:updates' channel                        │
-│    ──▶ On message: broadcastToRoom(spreadsheetId, message, null)        │
-│                                                                          │
-│  On Connection:                                                          │
-│    1. Parse spreadsheetId and token from query params                   │
-│    2. Authenticate user (close with 4001 if unauthorized)               │
-│    3. Create ConnectedClient, add to room                               │
-│    4. Broadcast USER_JOINED to others                                   │
-│    5. Send STATE_SYNC with current cells and collaborators              │
-│    6. Set up message handler                                             │
-│                                                                          │
-│  On Close:                                                               │
-│    ──▶ Remove from room, broadcast USER_LEFT                            │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### Deep dive 1: Two-dimensional virtualization
 
-### Message Handler Flow
+The browser calculates visible row and column ranges from scroll position and measured sizes. It renders their intersection plus bounded overscan. Frozen rows and columns use the same coordinate system to avoid scroll drift.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     CELL_EDIT MESSAGE HANDLING                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. Check idempotency                                                    │
-│     ──▶ IF requestId exists AND cached result found: return cached      │
-│                                                                          │
-│  2. Calculate formula if needed                                          │
-│     ──▶ IF value.startsWith('='): computed = formulaEngine.calculate()  │
-│     ──▶ ELSE: computed = value                                           │
-│                                                                          │
-│  3. Persist to database                                                  │
-│     ──▶ upsertCell(sheetId, row, col, value, computed, userId)          │
-│                                                                          │
-│  4. Prepare broadcast message                                            │
-│     ──▶ { type: 'CELL_UPDATED', sheetId, row, col, value,               │
-│           computedValue, userId }                                        │
-│                                                                          │
-│  5. Store idempotency result                                             │
-│     ──▶ IF requestId: setIdempotencyResult(requestId, response)         │
-│                                                                          │
-│  6. Broadcast to room                                                    │
-│     ──▶ broadcastToRoom(spreadsheetId, response, null)                  │
-│                                                                          │
-│  7. Publish to Redis for other servers                                   │
-│     ──▶ redis.publish('spreadsheet:updates', { spreadsheetId, message })│
-└─────────────────────────────────────────────────────────────────────────┘
+Rendering every populated cell still fails when a sheet has a dense million-cell region. A canvas-only grid reduces DOM count but complicates focus and screen readers. I choose a hybrid semantic grid with a bounded DOM and renderer adapters where profiling justifies them.
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     CURSOR_MOVE MESSAGE HANDLING                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ──▶ broadcastToRoom(spreadsheetId, {                                    │
-│        type: 'CURSOR_MOVED', userId, name, color, row, col              │
-│      }, excludeSender)                                                   │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### Deep dive 2: Sparse storage and viewport reads
 
-### Client-Side WebSocket Hook
+A sparse coordinate map stores only populated cells and loaded metadata. The server returns bounded ranges rather than a full workbook. Row and chunk indexes make visible range iteration efficient.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     useWebSocket HOOK                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Props: spreadsheetId                                                    │
-│  Refs:  wsRef, reconnectTimeoutRef                                       │
-│                                                                          │
-│  connect():                                                              │
-│    1. Get token from sessionStorage                                      │
-│    2. Create WebSocket with spreadsheetId and token in query            │
-│    3. onopen: store ws in ref                                           │
-│    4. onmessage: dispatch to store actions based on message.type        │
-│       - CELL_UPDATED  ──▶ applyRemoteCellUpdate(row, col, value, computed)
-│       - CURSOR_MOVED  ──▶ updateCollaborator(userId, name, color, pos)  │
-│       - USER_JOINED   ──▶ updateCollaborator(userId, name, color)       │
-│       - USER_LEFT     ──▶ removeCollaborator(userId)                    │
-│       - STATE_SYNC    ──▶ syncState(cells, collaborators)               │
-│    5. onclose: schedule reconnect with 2s delay                         │
-│    6. onerror: log and close                                            │
-│                                                                          │
-│  useEffect: connect on mount, cleanup on unmount                        │
-│                                                                          │
-│  sendMessage(message): send if ws.readyState === OPEN                   │
-│                                                                          │
-│  Returns: { sendMessage }                                                │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The trade-off is more complicated range lookup and dependency fetch. The alternative full snapshot is easier for offline formulas but creates memory, startup, and permission costs. A snapshot plus viewport chunks can be introduced when offline support requires it.
 
----
+### Deep dive 3: Formula workers and revision guards
 
-## 5. Deep Dive: Frontend Virtualization (6 minutes)
+The worker receives an immutable operation batch or dependency snapshot and returns computed values tagged with the source revision. The client accepts results only when the revision is still current.
 
-### Virtualized Grid Component
+The alternative is calculate on the main thread. It has simpler access to state but freezes typing and scrolling when a paste causes a large dependency cascade. Worker serialization and cancellation are worth the complexity for formula-heavy sheets.
 
-"I use TanStack Virtual for both row and column virtualization. This lets us handle 1 million rows without performance issues."
+### Deep dive 4: Collaboration and conflicts
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     SPREADSHEET GRID COMPONENT                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Constants:                                                              │
-│    MAX_ROWS = 1,000,000                                                  │
-│    MAX_COLS = 16,384                                                     │
-│    DEFAULT_ROW_HEIGHT = 32                                               │
-│    DEFAULT_COL_WIDTH = 100                                               │
-│                                                                          │
-│  Row Virtualizer:                                                        │
-│    useVirtualizer({                                                      │
-│      count: MAX_ROWS,                                                    │
-│      getScrollElement: () => containerRef.current,                       │
-│      estimateSize: (index) => rowHeights.get(index) ?? DEFAULT_HEIGHT,  │
-│      overscan: 10                                                        │
-│    })                                                                    │
-│                                                                          │
-│  Column Virtualizer:                                                     │
-│    useVirtualizer({                                                      │
-│      horizontal: true,                                                   │
-│      count: MAX_COLS,                                                    │
-│      getScrollElement: () => containerRef.current,                       │
-│      estimateSize: (index) => columnWidths.get(index) ?? DEFAULT_WIDTH, │
-│      overscan: 5                                                         │
-│    })                                                                    │
-│                                                                          │
-│  Grid Content (memoized):                                                │
-│    visibleRows.flatMap(virtualRow =>                                    │
-│      visibleCols.map(virtualCol =>                                      │
-│        <Cell row={virtualRow.index} col={virtualCol.index}              │
-│              style={{ position: 'absolute',                              │
-│                      top: virtualRow.start, left: virtualCol.start,     │
-│                      height: virtualRow.size, width: virtualCol.size }} │
-│        />                                                                │
-│      )                                                                   │
-│    )                                                                     │
-│                                                                          │
-│  Render:                                                                 │
-│    <div ref={containerRef} overflow="auto">                             │
-│      <div style={{ height: rowVirtualizer.getTotalSize(),              │
-│                    width: colVirtualizer.getTotalSize() }}>             │
-│        {gridContent}                                                     │
-│        <CollaboratorCursors />                                          │
-│      </div>                                                              │
-│    </div>                                                                │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The server sequences operations per workbook or sheet partition. A client applies a local projection, then reconciles the acknowledgement. A conflict includes canonical state and the rejected base revision. The client can rebase disjoint edits or ask the user to review the affected cells.
 
-### Zustand Store Integration
+Last-write-wins is acceptable for some independent formatting fields but dangerous for a formula or value where the user needs to know an edit was replaced. Operation semantics and visible conflict state are more important than pretending conflicts do not exist.
 
-"I'm using Zustand with a Map for sparse cell storage. Each cell subscribes only to its own data using selectors."
+### Deep dive 5: Undo and redo
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     SPREADSHEET STORE                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  State:                                                                  │
-│    - spreadsheetId: string                                               │
-│    - activeSheetId: string                                               │
-│    - cells: Map<string, CellData>         ← Key: "{row}-{col}"          │
-│    - activeCell: { row, col } | null                                    │
-│    - isEditing: boolean                                                  │
-│    - editValue: string                                                   │
-│    - columnWidths: Map<number, number>    ← Sparse (non-default only)   │
-│    - rowHeights: Map<number, number>                                     │
-│    - collaborators: Map<string, Collaborator>                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Actions:                                                                │
-│                                                                          │
-│  setCell(row, col, value):                                               │
-│    - Create new Map from cells                                           │
-│    - IF value empty: delete key                                          │
-│    - ELSE: set { rawValue, computedValue }                               │
-│    - Return { cells: newCells }                                          │
-│                                                                          │
-│  applyRemoteCellUpdate(row, col, rawValue, computedValue):              │
-│    - Same as setCell but with computed value from server                │
-│                                                                          │
-│  syncState(cellArray, collaboratorArray):                               │
-│    - Build cells Map from array of { row, col, data }                   │
-│    - Build collaborators Map from array                                 │
-│    - Set both in state                                                   │
-│                                                                          │
-│  updateCollaborator(collaborator):                                       │
-│    - Create new Map, set collaborator by userId                         │
-│                                                                          │
-│  removeCollaborator(userId):                                             │
-│    - Create new Map, delete userId                                      │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Undo sends an inverse operation through the normal permission and revision path. It does not directly mutate local state. A drag or paste can group many low-level changes into one user-facing history entry while still recording a bounded batch.
 
----
+If the inverse is stale, the server rejects it and the client marks the history entry conflicted. Direct local mutation would feel fast but could overwrite another collaborator’s work without audit.
 
-## 6. Deep Dive: REST API Endpoints (5 minutes)
+### Deep dive 6: Presence versus durable edits
 
-### API Route Definitions
+Cursor and selection updates are best effort. They use throttling, expiry, and no durable replay. An edit operation carries sequence and must be persisted before the server confirms it.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     REST API ENDPOINTS                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  GET /spreadsheets                                                       │
-│    ──▶ List user's spreadsheets (ordered by updated_at DESC)            │
-│    ──▶ Returns: [{ id, title, created_at, updated_at }]                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│  POST /spreadsheets                                                      │
-│    Body: { title?: string }                                              │
-│    ──▶ Create spreadsheet with one default sheet ("Sheet1")             │
-│    ──▶ Uses CTE: WITH new_spreadsheet, new_sheet                        │
-│    ──▶ Returns: { id, title, sheets: [{ id, name, sheetIndex }] }       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  GET /spreadsheets/:id                                                   │
-│    ──▶ Get spreadsheet with all sheets                                   │
-│    ──▶ Uses json_agg to return sheets as array                          │
-│    ──▶ Returns: { id, title, sheets: [...] }                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│  GET /sheets/:sheetId/cells                                              │
-│    Query: ?startRow=&endRow=&startCol=&endCol= (optional viewport)      │
-│    ──▶ IF viewport params: getCellsInViewport(...)                      │
-│    ──▶ ELSE: getCellsBySheet(...)                                        │
-│    ──▶ Convert Map to array: [{ row, col, data }]                       │
-│    ──▶ Returns: { cells: [...] }                                        │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Combining both as generic events makes a slow presence consumer block edits or makes the system retain too much cursor traffic. Separate channels or message classes preserve the distinct consistency requirements.
 
-### Frontend API Service
+### Deep dive 7: Failure matrix
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     API SERVICE                                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│  fetchWithAuth(url, options):                                            │
-│    - Get token from sessionStorage                                       │
-│    - Add Content-Type: application/json                                  │
-│    - Add Authorization: Bearer {token}                                   │
-│    - Throw on non-ok response                                            │
-│    - Return response.json()                                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│  api.spreadsheets:                                                       │
-│    - list()    ──▶ GET /spreadsheets                                    │
-│    - create(title?) ──▶ POST /spreadsheets                              │
-│    - get(id)   ──▶ GET /spreadsheets/{id}                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  api.sheets:                                                             │
-│    - getCells(sheetId, viewport?)                                        │
-│        ──▶ GET /sheets/{sheetId}/cells                                  │
-│        ──▶ IF viewport: append ?startRow=&endRow=&startCol=&endCol=     │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Failure | Backend behavior | Frontend behavior |
+|---|---|---|
+| Range read fails | bounded retryable error | preserve selection |
+| Operation timeout | command remains queryable | pending edit state |
+| Revision conflict | reject with canonical state | review/rebase |
+| Formula worker fails | recompute or mark unavailable | formula status badge |
+| Socket gap | request resync | stale collaboration banner |
+| Presence loss | expire cursor | durable edits continue |
+| Permission revoked | reject future operations | read-only route |
 
----
+## Capacity, rollout, and review checkpoints
 
-## 7. Trade-offs Summary (3 minutes)
+### Capacity assumptions
+
+I would test a sparse million-coordinate sheet, a dense pasted range, a formula-heavy region, several collaborators, and a reconnect during editing. The full-stack budget includes viewport latency, DOM work, operation sequencing, formula fan-out, snapshot recovery, and presence bandwidth.
+
+### What I would measure
+
+- Scroll frame rate and active-cell latency.
+- Range-read latency and visible cell count.
+- Operation acknowledgement and conflict rate.
+- Formula worker queue and server recalculation duration.
+- Socket lag, replay, and resync duration.
+- Snapshot age and recovery time.
+- Presence update rate and dropped messages.
+
+### Rollout sequence
+
+1. Ship workbook metadata and bounded read-only range reads.
+2. Add sparse cell store, selection, and stable editing overlay.
+3. Add ordered operations and acknowledgements.
+4. Add formula worker with revision guards.
+5. Add collaboration replay and separate presence.
+6. Add paste batches, inverse undo, and offline drafts.
+
+### Alternative architecture review
+
+Rendering every cell is simple but fails on large sheets. A canvas-only renderer bounds DOM cost but makes focus and accessibility difficult. A hybrid virtual grid keeps semantics while allowing specialized render layers.
+
+Full-document saves simplify the server but create large writes and coarse conflicts. Operation batches cost protocol and snapshot work but support collaboration, undo, and bounded recovery.
+
+An iframe per sheet isolates crashes but breaks workbook-level keyboard and formula-bar coordination. A worker is the right boundary for formulas; a module contract is enough for cell renderers.
+
+### Full-stack interview checkpoints
+
+I trace a paste from the stable editor through batch validation, operation sequencing, formula recalculation, acknowledgement, and collaborator broadcast.
+
+I explain why a worker result carries revision and why presence can be dropped without affecting the edit.
+
+I close by returning to bounded rendering, exact revision semantics, and permission checks on every operation.
+
+## Scalability and operations
+
+Partition operation streams by workbook or hot sheet. Snapshot periodically so recovery does not replay unlimited history. Use chunked storage for sparse cells and analytical storage for version history or audit queries.
+
+The first browser bottleneck is visible cell rendering. The first backend bottleneck is hot-sheet operation sequencing and formula fan-out. The first operational risk is snapshot and log divergence. Metrics must measure all three.
+
+## Security and observability
+
+Every range read and operation checks workbook permissions. Shared links are scoped and revocable. Formula functions are allowlisted; external fetches or scripts are not executed by the calculation worker.
+
+Metrics include range latency, visible cell count, active-cell latency, operation acknowledgement, queue depth, formula duration, conflict rate, resync duration, and snapshot age. Logs carry workbook and operation IDs without cell contents.
+
+## Testing and correctness review
+
+I would test coordinate virtualization, stable editor focus, large paste batching, formula revision races, operation retry, reconnect replay, undo after a remote edit, and permission downgrade.
+
+Backend tests verify operation ordering, snapshot recovery, formula result revision, and presence isolation. Browser tests verify scroll performance, keyboard navigation, stale calculation suppression, and visible conflict state.
+
+The acceptance criteria are bounded DOM work, no lost acknowledged operations, no old formula result overwriting a new edit, and presence that never blocks saving.
+
+## Implementation sequence
+
+1. Build bounded workbook and viewport reads.
+2. Add sparse client state, selection, and stable editing overlays.
+3. Add operation IDs, revisions, acknowledgements, and retries.
+4. Add formula worker results tagged by revision.
+5. Add WebSocket replay and separate presence.
+6. Add paste batches, inverse undo, and offline drafts.
+
+The sequence protects the main thread and document correctness before introducing broader collaboration or formula compatibility.
+
+## Interview walkthrough: one collaborative paste
+
+The stable editor normalizes a range into one bounded operation batch. The client applies a local projection and sends operation ID plus base revision. The server authorizes, sequences, persists, and acknowledges it.
+
+The formula worker receives the new revision and returns derived values tagged with that revision. Collaborators receive the durable operation; presence remains separate. A reconnect requests operations or a canonical snapshot.
+
+This scenario demonstrates why viewport rendering, sparse storage, formulas, collaboration, and undo cannot share one undifferentiated state model.
+
+## Further design decisions
+
+The client keeps raw input, computed value, formatting, and remote revision separate. A formula error is a derived result, not a destructive cell mutation.
+
+The server can return a viewport range with a revision and dependency hints. The client never treats an unloaded cell as an empty value when a formula depends on it.
+
+The operation queue uses stable IDs through retries. An acknowledgement includes canonical state so local projections converge without rewriting unrelated visible cells.
+
+The grid, formula worker, and sync client are separate module boundaries but share workbook context and keyboard focus. An iframe would damage those interactions without adding useful trust isolation.
+
+The production review asks whether every old revision is rejected safely, whether snapshots can rebuild a sheet, and whether a presence outage leaves editing unaffected.
+
+### Final questions
+
+- What is raw versus derived?
+- What survives a reconnect?
+- Can formula results be stale?
+- How is undo authorized?
+- Can presence block edits?
+
+The answers should point to revision-tagged formulas, durable operations, snapshots, and an ephemeral presence path.
+
+### Launch gate
+
+The launch gate is bounded viewport work, stable editor focus, revision-safe calculations, durable operation retry, and presence that never blocks edits.
+
+I would not launch full offline collaboration until snapshot and operation replay are proven under reconnect tests.
+
+### Final handoff
+
+- Viewport state bounds browser work.
+- Operations and revisions protect document truth.
+- Formula results are derived and revision-tagged.
+- Presence never blocks a durable edit.
+
+## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| **Conflict Resolution** | Last-write-wins | OT/CRDT | Much simpler, good enough for cell-level edits |
-| **Cell Storage** | Sparse (Map) | Dense 2D array | 1000x storage efficiency for large sheets |
-| **Formula Engine** | HyperFormula (both ends) | Server-only | Client-side for responsiveness, server for authority |
-| **Real-time Protocol** | WebSocket | SSE | Bidirectional needed for edits and cursors |
-| **Multi-server Sync** | Redis Pub/Sub | Kafka | Lower latency, simpler for this use case |
-| **Virtualization** | TanStack Virtual | react-window | Better variable-size support, modern API |
-| **State Management** | Zustand | Redux | Less boilerplate, built-in selectors |
+|---|---|---|---|
+| Rendering | bounded hybrid grid | render every cell | protects DOM and memory |
+| Storage | sparse records | two-dimensional array | empty space is cheap |
+| Calculation | revisioned worker | main thread | protects interaction |
+| Sync | ordered operations | full document saves | smaller conflicts |
+| Presence | lossy channel | durable event stream | cursors can expire |
+| Undo | inverse operation | local mutation | collaboration and audit |
+| Reads | viewport ranges | full snapshot always | bounded startup |
 
-### Full-Stack Integration Points
+## Closing — 3 minutes
 
-1. **Shared Types**: TypeScript interfaces in `/shared/types.ts` ensure type safety across frontend and backend
-2. **WebSocket Protocol**: Strongly-typed messages prevent serialization errors
-3. **Sparse Storage Pattern**: Both frontend Map and backend PostgreSQL use sparse cell storage
-4. **Formula Sync**: HyperFormula runs on both ends - client for immediate feedback, server for authoritative results
+The full-stack design keeps raw document state, derived formulas, visible rendering, durable operations, and presence separate. The browser provides immediate local interaction, while the server provides revision, permission, and replay guarantees.
 
----
-
-## 8. Caching and Performance (3 minutes)
-
-### Redis Caching Layer
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     CELL CACHE FUNCTIONS                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│  CACHE_TTL = 1800 (30 minutes)                                          │
-│  Key pattern: "sheet:{sheetId}:cells" (Hash)                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│  getCachedCells(sheetId) ──▶ Map<string, CellData> | null               │
-│    ──▶ HGETALL sheet:{sheetId}:cells                                    │
-│    ──▶ IF empty: return null                                            │
-│    ──▶ Parse JSON values, build Map                                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│  setCachedCell(sheetId, row, col, data):                                │
-│    ──▶ HSET sheet:{sheetId}:cells "{row}-{col}" {JSON.stringify(data)} │
-│    ──▶ EXPIRE sheet:{sheetId}:cells CACHE_TTL                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  invalidateCellCache(sheetId, row, col):                                │
-│    ──▶ HDEL sheet:{sheetId}:cells "{row}-{col}"                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Frontend Optimizations
-
-1. **Memoized Cells**: React.memo with custom comparator
-2. **Fine-grained Selectors**: Each cell subscribes only to its data
-3. **Debounced Network**: Batch edits before sending
-4. **Web Workers**: Formula calculation off main thread
-
----
-
-## 9. Future Enhancements
-
-### Backend
-1. **Undo/Redo API**: Edit history with forward/inverse operations
-2. **Batch Operations**: Handle large pastes efficiently
-3. **Cross-sheet References**: Support `=Sheet2!A1` formulas
-
-### Frontend
-1. **Range Selection**: Drag to select multiple cells
-2. **Copy/Paste**: Clipboard API with Excel-compatible formats
-3. **Conditional Formatting**: Style cells based on values
-
-### Full-Stack
-1. **Offline Support**: Service Worker + IndexedDB with sync on reconnect
-2. **Conflict Visualization**: Show when edits are overwritten
-3. **Version History**: Time travel to previous states
-
----
-
-## 10. Closing Summary (1 minute)
-
-"We designed a collaborative spreadsheet with:
-- **Shared TypeScript types** ensuring type safety across the full stack
-- **WebSocket real-time sync** with Redis pub/sub for multi-server support
-- **Sparse storage pattern** on both frontend (Zustand Map) and backend (PostgreSQL UPSERT)
-- **Virtualized grid** using TanStack Virtual for million-row performance
-- **HyperFormula integration** on both client (immediate) and server (authoritative)
-
-Key full-stack insight: The sparse data model flows seamlessly from database (only non-empty rows) through API (cell arrays) to frontend (Map), enabling consistent behavior and efficient memory usage at every layer."
+I would ship bounded viewport reads, cell operations, revision-aware sync, and a small formula subset first. Then I would add large-sheet optimizations, richer formulas, offline replay, and stronger conflict resolution based on measured workloads.

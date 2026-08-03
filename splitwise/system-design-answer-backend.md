@@ -1,176 +1,351 @@
-# Design Splitwise — Backend Focus
+# Splitwise Backend — System Design Answer
 
-> A 45–60 minute system-design walkthrough emphasizing service architecture, the data model, the balance/simplification engine, and how it scales and fails. I'll keep it conversational and lead with the reasoning behind each choice.
+## 45–50 minute interview walkthrough
 
-## 📋 Problem & Scope
+| Segment | Focus | Time |
+|---|---|---:|
+| Requirements | Expense, balance, settlement promises | 4 min |
+| Architecture | API, ledger, balance projection, jobs | 8 min |
+| Data model | Groups, expenses, splits, settlements | 6 min |
+| Interfaces | REST commands, pagination, events | 8 min |
+| Deep dives | Money math, balances, idempotency, simplification | 20 min |
+| Scaling and close | Bottlenecks, trade-offs, rollout | 4 min |
 
-Splitwise lets groups of people track shared expenses. One person pays for something; the cost is split among several; the system remembers who owes whom and, when people want to settle up, tells them the fewest payments that clear the group.
+## Opening — 2 minutes
 
-"The single most important framing I'd establish up front: **balances are not stored data, they're a computed view over an immutable ledger.** Almost every backend decision falls out of that."
+I am designing the backend for a shared-expense product. Users create groups, record expenses, assign shares, inspect who owes whom, and optionally settle debts. The system must preserve exact amounts and make a balance explainable from the underlying expense history.
 
-**In scope:** groups & membership, expenses with four split strategies (equal / exact / percentage / shares), settlements, per-group and per-friend balances, debt simplification, an activity feed, idempotent writes.
+The central design choice is to treat expenses and settlements as durable facts, then derive balances from them. A cached balance is a read optimization, not the only source of truth. This makes retries and reconciliation safer.
 
-**Out of scope for this session:** actually moving money (Splitwise integrates with payment providers; we only *record* that a payment happened), multi-currency FX, receipt OCR, notifications delivery.
+## R — Requirements — 4 minutes
 
-## 🎯 Requirements
+### Clarifying questions
 
-**Functional**
-- Create groups, add members, add/delete expenses, record settlements.
-- Split an expense equally, by exact amounts, by percentage, or by shares.
-- Show each member's net balance in a group and the simplified transfers to settle.
-- Show a personal dashboard (owed / owe / net, per friend) and an activity feed.
+I would ask whether one expense can use multiple currencies, whether groups can be very large, whether users can edit history, and whether payments are in scope. I will support one currency per group initially, expense edits with audit history, and an optional settlement command.
 
-**Non-functional**
-| Concern | Target | Why |
-|---------|--------|-----|
-| Correctness | Σ(splits)=total; Σ(group nets)=0 — always | Money bugs destroy trust |
-| Balance read p99 | < 50 ms | It's on every screen |
-| Idempotency | Retried write ⇒ exactly one effect | Mobile clients retry |
-| Availability | 99.95% reads | Degrade, don't fail |
+I would ask whether offline expense capture is required. I will support saved drafts and safe read caching first. Offline mutation replay is a separate feature because it needs conflict and duplicate semantics.
 
-## 🧮 Back-of-envelope
+### Functional requirements
 
-"Let me size it to justify the storage choice." ~10M MAU, ~60M expenses/month ≈ **~23 writes/sec** average, ~230/sec peak. Reads dominate maybe 50:1 — opening the app loads a dashboard and a group. Expenses are ~720M rows/year, splits 2–4× that (~2B/year).
+- Create groups and manage membership.
+- Add expenses with equal, exact, percentage, or share-based splits.
+- Validate that allocations sum exactly to the expense total.
+- Show paginated ledger history and activity.
+- Derive balances and suggested settlements.
+- Edit or delete expenses with authorization and audit history.
+- Record settlements idempotently.
+- Support cursor pagination and group-level permissions.
+- Expose explainable balance details.
 
-"Two conclusions. First, this is a **relational ledger** — bounded per-group reads, strong consistency on writes, no need for a wide-column store. Second, **reads of balances vastly outnumber writes of expenses**, so the balance aggregation is the thing to cache."
+### Non-functional requirements
 
-## 🏗️ Architecture
+- No fractional-cent loss or rounding drift.
+- Duplicate requests must not create duplicate expenses or settlements.
+- Balance reads should be fast without hiding stale or rebuilding state silently.
+- A failed projection refresh must not lose the canonical expense.
+- Group data must remain isolated by membership and authorization.
+- Read history should scale beyond an unbounded client payload.
 
-```
-   Client ──▶ API Gateway ──▶ Splitwise API (stateless, horizontally scaled)
-                                  │
-        ┌─────────────────────────┼──────────────────────────┐
-        ▼                         ▼                          ▼
-  ┌───────────┐            ┌──────────────┐          ┌───────────────┐
-  │ PostgreSQL│            │ Redis/Valkey │          │ Event stream  │
-  │  ledger    │            │ sessions      │          │ (Kafka)       │
-  │ sharded by │◀── inval ──│ balance cache │          │ ⇒ activity /  │
-  │ group_id   │            │ idempotency   │          │   notifications│
-  └───────────┘            └──────────────┘          └───────────────┘
-```
+### Out of scope
 
-The API is stateless — sessions live in Redis, so any instance serves any request. Writes go to Postgres in a transaction and emit an event; balance reads are served from Redis when warm.
+I will not design payment processor settlement, bank verification, tax reporting, debt collection, or a multi-currency exchange engine. I will define where those services attach to the expense and settlement boundaries.
 
-## 💾 Data Model
+## A — Architecture — 8 minutes
 
-I'll describe tables as prose rather than DDL. Money is **integer cents** in every column.
-
-| Table | Key columns | Notes |
-|-------|-------------|-------|
-| `users` | id (UUID PK), email (unique), password_hash, name | bcrypt hashes |
-| `groups` | id, name, group_type, avatar_color, created_by | type ∈ home/trip/couple/other |
-| `group_members` | (group_id, user_id) PK, role | membership = authorization boundary |
-| `expenses` | id, group_id, amount_cents, paid_by, split_type, created_by, idempotency_key, deleted_at | soft delete; partial unique on (created_by, idempotency_key) |
-| `expense_splits` | (expense_id, user_id) PK, owed_cents, share_units, percentage | INVARIANT: Σ owed_cents = expense.amount_cents |
-| `settlements` | id, group_id, from_user, to_user, amount_cents, idempotency_key | records a payment, doesn't make one |
-| `activity_log` | id, group_id, actor_id, type, summary | the feed |
-
-**Why this shape.** The `expenses` + `expense_splits` pair is the entire ledger. An expense says "Bob paid $84"; the splits say "Alice owes 28, Bob owes 28, Carol owes 28." Nothing stores "Alice's balance" — that's derived. Indexes that matter: `expenses(group_id, created_at DESC)` for the ledger view, `expense_splits(user_id)` for cross-group friend balances, and the partial unique indexes for durable idempotency.
-
-## 🔌 API
+### High-level diagram
 
 ```
-POST /api/expenses                 Add expense        (Idempotency-Key)
-GET  /api/expenses/group/:groupId  Group ledger
-DELETE /api/expenses/:id           Soft-delete
-POST /api/settlements              Record a payment   (Idempotency-Key)
-GET  /api/groups/:id/balances      Net balances + simplified transfers
-GET  /api/dashboard                Owed / owe / net + per-friend balances
-GET  /api/activity                 Cross-group feed
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         Splitwise API Layer                                │
+│ auth · membership · idempotency · validation · pagination                   │
+├───────────────────────┬───────────────────────┬────────────────────────────┤
+│ Group and Expense API │ Balance Query Service  │ Settlement Service          │
+│ commands · history    │ projections · explain  │ commands · payment boundary │
+├───────────────────────┴───────────────────────┴────────────────────────────┤
+│ Expense Ledger and Group Version Store                                      │
+│ expenses · splits · settlements · audit entries                             │
+├──────────────────────────────┬─────────────────────────────────────────────┤
+│ Projection Workers            │ Cache and Event Bus                         │
+│ balances · activity · totals  │ invalidation · notifications · rebuilds     │
+├──────────────────────────────┴─────────────────────────────────────────────┤
+│ PostgreSQL source of truth · Valkey cache · durable job/event storage       │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-No request/response bodies here — the interesting logic is behind `/expenses` and `/balances`, which I'll deep-dive.
+### Request flow
 
-## 🔧 Deep Dive 1: Deriving balances instead of storing them
+The API authenticates the user, checks group membership and role, validates the expense shape, and assigns an idempotency key. It writes the expense, split rows, audit record, and an outbox event in one transaction.
 
-**The decision:** store only the immutable ledger; compute every balance on read.
+A worker consumes the event and refreshes the group balance projection. The expense response can return the canonical expense immediately while the balance query reports its current projection version and freshness.
 
-**Why the stored-balance alternative fails.** The obvious design keeps a `balance` column per (group, user) and adjusts it on each write. It's a great read — O(1). But it introduces a *second source of truth*. The moment an expense is edited, an expense is soft-deleted, a settlement is voided, or any handler has a bug, the stored balance and the ledger disagree — and now you genuinely cannot tell which one is correct without recomputing anyway. In a money product, "the number might be wrong and we can't prove it" is fatal. You'd bolt on nightly reconciliation jobs to detect drift, which is complexity that only exists because you stored a derivative.
+The balance service can derive a result synchronously for small groups or read a projection for common requests. Both paths use the same money and ordering rules and expose the source version used.
 
-**Why deriving works here.** A group is bounded — tens to low-thousands of expenses. Computing a group's balances is three aggregate queries (sum paid per payer, sum owed per participant, apply settlements) — single-digit milliseconds. Correctness is *structural*: net balances always sum to zero because they're the same split rows summed with opposite signs for payer and participant. There's no drift to reconcile because there's nothing to drift.
+### Group isolation
 
-**What I give up, and how I buy it back.** A cold read scans the group's expenses. So I cache the computed balance payload in Redis keyed by `group_balance:{groupId}`, and **invalidate it on every write to that group**. Hot groups (the ones people actually open) serve from cache; the cache has a short TTL as a safety net if an invalidation is ever missed. The trade: balances are strongly consistent with the *ledger* on cold read and at most one write stale on warm read — perfectly acceptable, because a stale-by-one-expense balance self-corrects on the next read and the ledger (the truth) is never wrong.
+Every group-scoped query includes the group ID and authorization context. Membership is checked in the service, not inferred from a client-provided list. Cache keys include group and authorization scope, and logout or membership changes invalidate affected entries.
 
-> "I'll pay a recomputation cost on cache miss to guarantee I never serve a balance that disagrees with the ledger. In a money app, correctness beats a cheaper read."
+### Event and cache path
 
-## 🔧 Deep Dive 2: Money-safe splits with exact remainder distribution
+The outbox prevents a committed expense from losing its invalidation event. Consumers are idempotent by event ID. Cache invalidation is best effort because the database remains authoritative; a cache miss or stale entry triggers a refresh.
 
-**The decision:** integer cents everywhere, and split via the **largest-remainder method**.
+## D — Data Model — 6 minutes
 
-**Why floats fail.** `0.1 + 0.2 = 0.30000000000000004`. Store money as float and, over thousands of expenses, sums drift and balances stop reconciling to zero. So every amount is an integer number of cents.
+| Entity | Key fields | Authority | Notes |
+|---|---|---|---|
+| `User` | user ID, status, locale | identity service | not group data |
+| `Group` | group ID, currency, version, status | group service | version for conflicts |
+| `Membership` | group, user, role, status | group service | authorization boundary |
+| `Expense` | ID, group, payer, amount, currency, version | expense ledger | immutable history plus revisions |
+| `ExpenseSplit` | expense, member, exact amount, share metadata | expense ledger | sums to total |
+| `Settlement` | ID, group, from, to, amount, command key | settlement service | idempotent command |
+| `AuditEntry` | actor, action, entity, before/after reference | audit store | explainable edits |
+| `BalanceProjection` | group, member pair, amount, source version | read model | rebuildable |
 
-**The rounding problem integers create.** $10.00 split three ways is 333.33¢ each. Floor to 333 and you've allocated 999¢ — one penny has vanished, and now Σ(splits) ≠ total, which breaks the core invariant. Naively rounding each share can *over*-allocate instead. Either way the parts don't sum to the whole.
+### Expense invariants
 
-**The fix.** For any weighted split (equal is just equal weights; percentage and shares are weighted), I floor every share, then distribute the leftover pennies one at a time to the participants with the largest fractional remainder, breaking ties by position. This guarantees Σ = total, and it's **deterministic** — re-deriving the same expense always yields the same cents, which matters because balances are recomputed constantly. Exact splits are validated to sum to the total up front and rejected with a 400 otherwise.
+All split amounts use integer minor units or a decimal representation with group currency scale. The sum of split amounts equals the expense total exactly. The payer is a group member, every split participant is authorized, and the currency matches the group.
 
-"$10 three ways becomes 334 + 333 + 333 — the extra cent goes to the first person, every time, reproducibly."
+An edit creates a new canonical revision or an audit-linked replacement. It does not silently mutate historical data used by a previous settlement without recording the consequence.
 
-## 🔧 Deep Dive 3: Debt simplification (min-cash-flow)
+### Balance derivation
 
-**The decision:** collapse a group's net balances into a minimal set of transfers using greedy max-creditor/max-debtor matching.
+For each expense, the payer receives a credit for the total and each participant receives a debit for their share. The net directed graph is aggregated by member pair. Settlements reduce the corresponding outstanding amount.
 
-**The problem.** After a trip, six people have a mess of pairwise IOUs — up to n(n−1)/2 = 15 little debts. Nobody wants to make 15 Venmo payments. We want the *fewest* payments that settle everyone.
+The projection stores the result for fast reads, but a rebuild can replay expense and settlement facts in group order. A response includes the source version or computed-at timestamp so the client can label freshness.
 
-**The algorithm.** From the ledger I compute each person's single net number (sum of what they paid minus what they owe, adjusted by settlements). Positives are creditors, negatives are debtors, and — because money is conserved — they sum to zero. Then, greedily: take the person owed the most and the person who owes the most, transfer the smaller of the two amounts between them, and repeat. Each step zeroes out at least one person, so the result has **at most n−1 transfers**.
+### Idempotency records
 
-**The honest caveat.** Finding the true global minimum number of transfers is NP-hard — it's a partition problem. Greedy isn't always optimal, but it's optimal in the common case and always within a small factor, it's O(n log n), and it produces obviously-correct results a user can trust. For a UI that must feel instant on a phone, that's the right trade over an exact solver that could be exponential. I record a `debt_simplify_duration` metric so I'd notice if a pathological group ever got slow.
+The command key is unique per user intent and operation type. The stored result includes success or rejection, canonical entity ID, and a response hash. A retry returns the original result rather than executing a second command.
 
-> "Six roommates with fifteen tangled IOUs collapse to five clean payments. That single feature is most of why people use the product."
+## I — Interfaces — 8 minutes
 
-## ⏱️ Consistency & Idempotency
-
-Mobile clients retry. If a user taps *Add expense*, the request times out mid-flight, and the app retries, we must not create the $84 dinner twice.
-
-- The client generates an **Idempotency-Key** (UUID) at tap time and sends it.
-- Layer 1 — **Redis `SET NX`**: the first request wins a lock and records `processing`; a concurrent retry sees it and either waits (409) or replays the stored result.
-- Layer 2 — **Postgres partial `UNIQUE(created_by, idempotency_key)`**: if Redis was cold and a duplicate slips through, the DB throws a unique violation, which we translate to a 409 with the original result.
-
-"Two layers because they cover different failures: Redis catches near-simultaneous retries fast; the DB index catches retries that arrive after the cache forgot the key. Together: exactly-once, even if Redis is down."
-
-Expense creation is a **single transaction** — the expense row, all split rows, and the activity row commit together, so no reader ever sees a half-written expense.
-
-## 🚀 Scalability
+### REST API
 
 ```
-   Shard key = group_id
-   ┌───────────┐  ┌───────────┐  ┌───────────┐
-   │  shard 0   │  │  shard 1   │  │  shard 2   │   a group + all its
-   │ groups g%3=0│  │ groups g%3=1│  │ groups g%3=2│   expenses/splits/
-   └───────────┘  └───────────┘  └───────────┘   settlements co-locate
+POST /api/v1/groups                         → create group
+GET  /api/v1/groups                         → groups visible to user
+GET  /api/v1/groups/:id                     → group, members, permissions
+GET  /api/v1/groups/:id/expenses?cursor=    → expense page
+POST /api/v1/groups/:id/expenses             → idempotent expense command
+PATCH /api/v1/expenses/:id                  → authorized revision
+DELETE /api/v1/expenses/:id                 → audited deletion
+GET  /api/v1/groups/:id/balances             → balance projection and freshness
+GET  /api/v1/groups/:id/balances/explain     → contributing expenses
+POST /api/v1/groups/:id/settlements          → idempotent settlement command
+GET  /api/v1/commands/:key                   → resolve unknown command
 ```
 
-- **Ledger shards by `group_id`.** A group is a self-contained unit — its expenses, splits, settlements, and balance math all live on one shard, so per-group reads and writes never cross shards. This is the clean scaling axis.
-- **The one cross-shard query is the dashboard's per-friend balance**, which fans across every group two users share. At scale I'd stop computing it on read and instead maintain a per-user `(friend → net_cents)` aggregate updated on each write via the event stream — turning a fan-out read into an O(1) lookup.
-- **Balance reads scale horizontally** behind the Redis cache; add read replicas for cold-cache recomputes.
-- **Writes** are small transactions bounded by DB write capacity; the event stream absorbs notification/feed fan-out asynchronously.
+Expense creation accepts payer, total, currency, split mode, participant inputs, note, and command key. The server returns canonical split amounts, group version, expense ID, projection freshness, and audit reference.
 
-**What breaks first:** the cross-group dashboard query, well before the sharded per-group paths. That's why it's the first thing to denormalize.
+### Error contract
 
-## 🛡️ Failure Handling & Observability
+Errors distinguish validation, membership, authorization, duplicate command, version conflict, unavailable projection, expired session, and payment-provider failure. A client may retry an unavailable read, but it should not retry a conflict without reloading or merging.
 
-| Failure | Behavior |
-|---------|----------|
-| Redis down | Idempotency falls back to the PG unique index; balances recompute from Postgres. Product stays up. |
-| Duplicate write race | PG `23505` → 409 with the original result |
-| Invalid split | 400 before any write (amounts don't sum, bad percentage) |
-| Non-member access | 403 — every group read re-checks membership |
+### Internal contracts
 
-Observability: Prometheus metrics (request latency, expenses/settlements by type, balance cache hit/miss, idempotency hits, simplify duration), Pino structured logs with sensitive-field redaction, and `/health/detailed` that pings Postgres and Redis.
+| Boundary | Input | Output | Guarantee |
+|---|---|---|---|
+| Expense command | authenticated draft | canonical expense | atomic ledger write |
+| Projection worker | expense/settlement event | balance version | idempotent rebuild |
+| Balance query | group and viewer | pair balances | scoped source version |
+| Settlement command | group, parties, amount | settlement state | stable command key |
+| Audit service | entity event | audit reference | immutable history |
 
-## ⚖️ Trade-offs Summary
+### Pagination and ordering
+
+Expense history uses an opaque cursor based on canonical created order and stable ID. The server may return a next cursor and projection version. Clients do not infer offsets or fetch all history to calculate a balance.
+
+## O — Optimizations and Deep Dives — 20 minutes
+
+### Deep dive 1: Derive balances versus store mutable balances
+
+I choose immutable expense and settlement facts plus a rebuildable balance projection. Derived balances are explainable: every number can link back to expense splits and settlement events.
+
+The alternative is a mutable balance row updated directly for every expense. It is fast for reads and simple at low scale, but a retry, partial transaction, or manual correction can make the balance impossible to audit. A projection adds worker lag and rebuild complexity, but those costs buy correctness and repairability.
+
+The projection worker uses event IDs and group versions. If it processes an event twice, it does not double-count. If it falls behind, the API reports stale source version instead of pretending the latest expense is reflected.
+
+### Deep dive 2: Money-safe split allocation
+
+Equal splits divide integer minor units and distribute remainder units according to a deterministic participant order. Exact splits must sum to the total. Percentages must sum to the configured precision before conversion to minor units.
+
+The server performs the final allocation because it knows currency scale, membership, and policy. A frontend preview improves interaction but is provisional. The response returns canonical allocations so every client agrees.
+
+The trade-off is duplicating preview logic in the client and server. Server-only allocation adds round trips and makes forms feel slow. Duplicated deterministic rules require shared tests and versioned behavior, but preserve usability without weakening authority.
+
+### Deep dive 3: Expense mutation and idempotency
+
+The command transaction inserts an idempotency record, expense, splits, audit entry, and outbox event. A unique command key prevents duplicate execution. If the network fails after commit, lookup returns the original expense.
+
+The alternative is relying on disabled buttons or client-generated timestamps. Those controls fail on refresh, multiple tabs, mobile retries, and proxy retries. Idempotency belongs in the server protocol and database constraint.
+
+Updates use group or expense versions. A stale edit returns conflict with enough information to retain the user’s draft and show the canonical server revision. Silent last-write-wins can erase another member’s expense correction.
+
+### Deep dive 4: Debt simplification
+
+The raw balance graph describes who owes whom. A settlement suggestion computes each member’s net balance, places creditors and debtors into queues, and transfers the smaller absolute amount until all residuals are zero.
+
+This algorithm minimizes the number of transfers for the net amounts but does not optimize fees, trust, or payment routes. It should be a read-side suggestion, not a mutation of expense facts.
+
+If a user accepts a suggestion, the settlement command checks the current group version and records the chosen transfer. The server revalidates because another expense may have changed the balance after the suggestion was displayed.
+
+### Deep dive 5: Cache-aside and invalidation
+
+Group summaries, balance projections, and recent activity are cacheable by group and source version. An expense mutation invalidates ledger pages, balances, totals, and activity. The outbox publishes invalidation reliably after commit.
+
+The alternative is cache every query independently without an invalidation graph. That improves hit rate initially but leaves stale totals and balance panels disagreeing. Explicit invalidation groups are more work and easier to test.
+
+### Deep dive 6: Settlement integration
+
+If payment processing is in scope, the settlement service creates a payment intent with the provider and records provider IDs. The internal settlement remains pending until the provider webhook confirms it. Webhooks are idempotent and authenticated.
+
+The product must distinguish “recorded that Alice owes Bob” from “money moved successfully.” Conflating those states makes failed payment retries look like duplicate debt. The ledger of expenses remains separate from external payment status.
+
+### Failure matrix
+
+| Failure | Backend behavior | User-visible state |
+|---|---|---|
+| Expense request timeout | command lookup | checking or recovered expense |
+| Projection lag | preserve expense | stale balance timestamp |
+| Version conflict | reject stale revision | review and resubmit |
+| Cache unavailable | read source or degrade | slower but correct response |
+| Outbox delayed | retry publisher | activity may lag |
+| Payment webhook delayed | pending settlement | no false paid state |
+| Membership revoked | deny scoped request | access removed |
+
+## Capacity, rollout, and review checkpoints
+
+### Capacity assumptions
+
+I would begin with ordinary groups of a few dozen members, a paginated expense history, and a smaller number of very hot groups. The workload is dominated by writes to hot groups, balance reads, activity reads, and occasional full explanations.
+
+### What I would measure
+
+- Expense command latency and duplicate-command rate.
+- Projection lag by group.
+- Balance rebuild duration and mismatch count.
+- Cache hit rate and invalidation age.
+- Version conflict rate for edits.
+- Outbox age and worker retry count.
+- Settlement provider latency and webhook delay.
+- Authorization denials by group and operation.
+
+### Rollout sequence
+
+1. Ship group membership, one-currency expenses, and exact splits.
+2. Add idempotency records and audited revisions.
+3. Add balance projections and explain endpoints.
+4. Add cursor history and cache invalidation groups.
+5. Add settlements as explicit records.
+6. Add payment providers, offline writes, and group partitioning only after conflict behavior is proven.
+
+### Alternative architecture review
+
+A mutable balance table gives cheap reads, but it makes corrections and retries difficult to audit. Facts plus projections cost worker capacity and temporary staleness, but every number remains explainable.
+
+Synchronous balance derivation is acceptable for small groups and useful as a rebuild path. It becomes too expensive for hot groups or long histories, so the projection is the default read path with source version metadata.
+
+An offline command queue can improve capture, but it requires resolving membership, edits, and duplicates after reconnect. Persisted drafts provide much of the user value without claiming an uncommitted financial fact.
+
+### Backend interview checkpoints
+
+I trace an expense from authorization to atomic facts, outbox event, projection, cache invalidation, and balance explanation.
+
+I explain why a duplicate command returns the original result and why a stale edit becomes a conflict.
+
+I distinguish “recorded debt” from “payment completed.”
+
+I close by returning to exact money, rebuildable balances, and scoped authorization.
+
+## Scalability and operations
+
+The first bottleneck is unbounded expense history and balance recomputation. Cursor pagination and projections address both. The second is hot groups with many concurrent edits. Group versions, serialized command processing where needed, and partitioned events prevent lost updates.
+
+Scale API nodes horizontally. Partition event work by group ID so ordering is stable. Keep recent projections in cache with source versions. Archive old audit and expense records without removing the facts required for balance reconstruction.
+
+## Security and observability
+
+Authorization is checked for every group-scoped command and query. Roles distinguish member, admin, and settlement capabilities. Cache keys include group and viewer scope. Logs avoid expense notes and amounts unless explicitly protected diagnostics require them.
+
+Metrics include command latency, duplicate-command rate, projection lag, balance rebuild duration, conflict rate, cache hit rate, outbox age, settlement provider latency, and authorization denials.
+
+## Testing and correctness review
+
+I would test equal splits with remainder cents, percentages at precision limits, duplicate commands, concurrent edits, projection replay, cache invalidation, membership revocation, and settlement provider retries.
+
+The acceptance criteria are exact totals, idempotent expense and settlement commands, explainable balances, visible projection freshness, and no unauthorized group data in cache or responses.
+
+## Implementation sequence
+
+1. Define group membership, currency, expense, split, and settlement invariants.
+2. Add atomic expense commands with stable idempotency keys.
+3. Add exact balance derivation and a rebuildable projection.
+4. Add cursor ledger reads and explain endpoints.
+5. Add outbox invalidation and cache versioning.
+6. Add audited edits, settlements, and provider status.
+7. Add hot-group partitioning only after conflict metrics are known.
+
+The sequence makes the source of truth explicit before adding speed-focused caches. It also makes a rebuild path available before operational scale increases.
+
+## Interview walkthrough: one expense
+
+The API authenticates the member, validates exact split amounts, and writes expense, splits, audit, idempotency, and outbox records in one transaction. The response contains canonical amounts.
+
+A worker updates the group balance projection. A cache invalidation refreshes ledger, balances, totals, and activity. If the request times out, the command key returns the original result.
+
+If another member edits the group before a retry, the version conflict is explicit. The user reviews the canonical state rather than silently overwriting it.
+
+This scenario demonstrates why the ledger is authoritative while projections and caches are optimizations.
+
+## Further design decisions
+
+Group versioning protects edits and settlement suggestions from stale reads. A version conflict is preferable to silently changing another member’s expense.
+
+Balance explanations are a first-class API because support and users need to understand a number. They can be generated from projection references rather than scanning every expense on every request.
+
+The cache key includes group, viewer scope, currency, and source version where useful. Membership removal invalidates cached group data immediately.
+
+The expense ledger, projection worker, and settlement service can be independently deployed only after their event and version contracts are stable. An iframe boundary is irrelevant to this backend ownership problem.
+
+The production review asks whether a balance can be rebuilt, whether a retry can duplicate a fact, and whether an unauthorized user can infer group data through timing or cache behavior.
+
+### Final questions
+
+- Can every balance be explained?
+- What happens after a timeout?
+- How are stale edits rejected?
+- Which projection is stale?
+- What does settlement mean?
+
+The answers should point to facts, versions, idempotency, and scoped authorization.
+
+### Launch gate
+
+The launch gate is exact allocation, atomic expense writes, projection replay, group authorization, and a balance response that identifies its source version.
+
+I would not launch settlement payments until provider webhook idempotency and reconciliation are tested independently from expense recording.
+
+### Final handoff
+
+- Facts are immutable and projections are rebuildable.
+- Commands are idempotent and versions are explicit.
+- Authorization is enforced at every group boundary.
+- Stale data is visible rather than silently corrected.
+
+## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Balances | Derived + cached | Stored running total | Single source of truth; no drift |
-| Money | Integer cents | Float/decimal | Exactness |
-| Rounding | Largest-remainder | Round each | Σ = total, deterministic |
-| Simplify | Greedy min-cash-flow | Exact optimum | O(n log n) vs NP-hard; ≤ n−1 |
-| Idempotency | Redis NX + PG unique | One layer | Fast + durable |
-| Store | Sharded PostgreSQL | Wide-column | Relational ledger, bounded reads |
-| Settlement | Record only | Move money | Splitwise tracks money movement |
+|---|---|---|---|
+| Balance truth | facts plus projection | mutable balance only | explainability and repair |
+| Money | integer minor units | floating point | exact totals |
+| Retry | server idempotency key | disabled button | survives transport retries |
+| History | cursor pagination | full group download | bounded reads |
+| Updates | versioned conflict | silent last-write-wins | protects shared edits |
+| Suggestions | read-side graph algorithm | mutate balances | facts remain authoritative |
+| Cache | explicit invalidation groups | independent TTL only | consistent panels |
 
-## 🔮 Follow-ups I'd expect
+## Closing — 3 minutes
 
-- **Multi-currency:** store currency per expense, keep balances per-currency, convert only for display at a snapshotted rate.
-- **Expense edits:** version the expense; since balances are derived, an edit just changes the rows and the next read is correct — no balance surgery.
-- **"Simplify off" mode:** real Splitwise lets groups keep raw pairwise IOUs; I'd store the pairwise ledger and make simplification a view toggle (which is exactly how the UI already presents it).
+The system treats expenses and settlements as durable facts, derives balances through idempotent projections, and exposes canonical amounts and versions through typed APIs. The frontend can preview splits and display pending state, but the backend owns authorization, money math, and final balance truth.
+
+I would ship group membership, one-currency expenses, exact allocation, cursor history, balance projection, and idempotent commands first. Then I would add settlement provider integration, offline mutation replay, multi-currency support, and group partitioning only after their consistency contracts are explicit.
