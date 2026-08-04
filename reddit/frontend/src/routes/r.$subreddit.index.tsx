@@ -7,7 +7,7 @@ import { SortTabs } from '../components/SortTabs';
 import { formatNumber } from '../utils/format';
 import { useAuthStore } from '../stores/authStore';
 
-export const Route = createFileRoute('/r/$subreddit')({
+export const Route = createFileRoute('/r/$subreddit/')({
   component: SubredditPage,
   validateSearch: (search: Record<string, unknown>): { sort?: SortType } => ({
     sort: (search.sort as SortType) || 'hot',

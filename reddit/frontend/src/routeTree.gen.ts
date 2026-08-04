@@ -16,7 +16,7 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as UUsernameRouteImport } from './routes/u.$username'
 import { Route as SubredditsCreateRouteImport } from './routes/subreddits/create'
-import { Route as RSubredditRouteImport } from './routes/r.$subreddit'
+import { Route as RSubredditIndexRouteImport } from './routes/r.$subreddit.index'
 import { Route as RSubredditCommentsPostIdRouteImport } from './routes/r.$subreddit.comments.$postId'
 
 const SubmitRoute = SubmitRouteImport.update({
@@ -54,16 +54,16 @@ const SubredditsCreateRoute = SubredditsCreateRouteImport.update({
   path: '/subreddits/create',
   getParentRoute: () => rootRouteImport,
 } as any)
-const RSubredditRoute = RSubredditRouteImport.update({
-  id: '/r/$subreddit',
-  path: '/r/$subreddit',
+const RSubredditIndexRoute = RSubredditIndexRouteImport.update({
+  id: '/r/$subreddit/',
+  path: '/r/$subreddit/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const RSubredditCommentsPostIdRoute =
   RSubredditCommentsPostIdRouteImport.update({
-    id: '/comments/$postId',
-    path: '/comments/$postId',
-    getParentRoute: () => RSubredditRoute,
+    id: '/r/$subreddit/comments/$postId',
+    path: '/r/$subreddit/comments/$postId',
+    getParentRoute: () => rootRouteImport,
   } as any)
 
 export interface FileRoutesByFullPath {
@@ -72,9 +72,9 @@ export interface FileRoutesByFullPath {
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/submit': typeof SubmitRoute
-  '/r/$subreddit': typeof RSubredditRouteWithChildren
   '/subreddits/create': typeof SubredditsCreateRoute
   '/u/$username': typeof UUsernameRoute
+  '/r/$subreddit/': typeof RSubredditIndexRoute
   '/r/$subreddit/comments/$postId': typeof RSubredditCommentsPostIdRoute
 }
 export interface FileRoutesByTo {
@@ -83,9 +83,9 @@ export interface FileRoutesByTo {
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/submit': typeof SubmitRoute
-  '/r/$subreddit': typeof RSubredditRouteWithChildren
   '/subreddits/create': typeof SubredditsCreateRoute
   '/u/$username': typeof UUsernameRoute
+  '/r/$subreddit': typeof RSubredditIndexRoute
   '/r/$subreddit/comments/$postId': typeof RSubredditCommentsPostIdRoute
 }
 export interface FileRoutesById {
@@ -95,9 +95,9 @@ export interface FileRoutesById {
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/submit': typeof SubmitRoute
-  '/r/$subreddit': typeof RSubredditRouteWithChildren
   '/subreddits/create': typeof SubredditsCreateRoute
   '/u/$username': typeof UUsernameRoute
+  '/r/$subreddit/': typeof RSubredditIndexRoute
   '/r/$subreddit/comments/$postId': typeof RSubredditCommentsPostIdRoute
 }
 export interface FileRouteTypes {
@@ -108,9 +108,9 @@ export interface FileRouteTypes {
     | '/register'
     | '/search'
     | '/submit'
-    | '/r/$subreddit'
     | '/subreddits/create'
     | '/u/$username'
+    | '/r/$subreddit/'
     | '/r/$subreddit/comments/$postId'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -119,9 +119,9 @@ export interface FileRouteTypes {
     | '/register'
     | '/search'
     | '/submit'
-    | '/r/$subreddit'
     | '/subreddits/create'
     | '/u/$username'
+    | '/r/$subreddit'
     | '/r/$subreddit/comments/$postId'
   id:
     | '__root__'
@@ -130,9 +130,9 @@ export interface FileRouteTypes {
     | '/register'
     | '/search'
     | '/submit'
-    | '/r/$subreddit'
     | '/subreddits/create'
     | '/u/$username'
+    | '/r/$subreddit/'
     | '/r/$subreddit/comments/$postId'
   fileRoutesById: FileRoutesById
 }
@@ -142,9 +142,10 @@ export interface RootRouteChildren {
   RegisterRoute: typeof RegisterRoute
   SearchRoute: typeof SearchRoute
   SubmitRoute: typeof SubmitRoute
-  RSubredditRoute: typeof RSubredditRouteWithChildren
   SubredditsCreateRoute: typeof SubredditsCreateRoute
   UUsernameRoute: typeof UUsernameRoute
+  RSubredditIndexRoute: typeof RSubredditIndexRoute
+  RSubredditCommentsPostIdRoute: typeof RSubredditCommentsPostIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -198,34 +199,22 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SubredditsCreateRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/r/$subreddit': {
-      id: '/r/$subreddit'
+    '/r/$subreddit/': {
+      id: '/r/$subreddit/'
       path: '/r/$subreddit'
-      fullPath: '/r/$subreddit'
-      preLoaderRoute: typeof RSubredditRouteImport
+      fullPath: '/r/$subreddit/'
+      preLoaderRoute: typeof RSubredditIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/r/$subreddit/comments/$postId': {
       id: '/r/$subreddit/comments/$postId'
-      path: '/comments/$postId'
+      path: '/r/$subreddit/comments/$postId'
       fullPath: '/r/$subreddit/comments/$postId'
       preLoaderRoute: typeof RSubredditCommentsPostIdRouteImport
-      parentRoute: typeof RSubredditRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
-
-interface RSubredditRouteChildren {
-  RSubredditCommentsPostIdRoute: typeof RSubredditCommentsPostIdRoute
-}
-
-const RSubredditRouteChildren: RSubredditRouteChildren = {
-  RSubredditCommentsPostIdRoute: RSubredditCommentsPostIdRoute,
-}
-
-const RSubredditRouteWithChildren = RSubredditRoute._addFileChildren(
-  RSubredditRouteChildren,
-)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
@@ -233,9 +222,10 @@ const rootRouteChildren: RootRouteChildren = {
   RegisterRoute: RegisterRoute,
   SearchRoute: SearchRoute,
   SubmitRoute: SubmitRoute,
-  RSubredditRoute: RSubredditRouteWithChildren,
   SubredditsCreateRoute: SubredditsCreateRoute,
   UUsernameRoute: UUsernameRoute,
+  RSubredditIndexRoute: RSubredditIndexRoute,
+  RSubredditCommentsPostIdRoute: RSubredditCommentsPostIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

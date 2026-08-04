@@ -46,6 +46,11 @@ Schema-present but not wired as features: **bill splitting** (`splits` / `split_
 - **Seed password normalization (repo-wide):** demo users `alice / bob / charlie / diana / admin` all log in with **`password123`**; README table matches. `bcryptjs` is the verify path (not native `bcrypt`).
 - **Answer-file depth pass:** `system-design-answer-backend.md` was ~232 lines (under the 300 floor); added grounded sections for the request/approval and cashout flows, security/auth, capacity estimation, an exactly-once recap, and a metrics table to bring it into range without diluting the existing (strong) deep dives.
 - **Doc drift fixes (this pass):** the old CLAUDE.md used banned Phase-1/2/3/4 checklists and referred to `transfer.js` — the code is TypeScript (`backend/src/services/transfer.ts`). Rewritten to real architecture + decisions; file references corrected. Verified `architecture.md` already frames RabbitMQ/Cassandra correctly as *production* extensions while the local build does synchronous Postgres fan-out — left as-is.
+- **2026-08-03 — 1 of 5 screens captured; the seed never ran and login could never succeed.** Three faults:
+  1. **48 seed UUID literals carried a mnemonic prefix** (`pm-`, `tr-`, `pr-`, `tc-`, `co-` glued onto a UUID), making them three characters too long and non-hex. Postgres rejected them outright. Folded each prefix into the first group as a distinct hex tag so values stay unique and every foreign-key reference rewrites identically.
+  2. **12 more were not UUID-shaped at all** — `fi-01-alice` and friends sitting in UUID columns. Mapped each to an md5-derived UUID so the mapping is stable across re-seeds and all references agree.
+  3. **The login form is a single "Username or Email" `type="text"` field**, but the screenshot config searched for `input[name='email'], input[type='email']` — which matched nothing, so every authenticated screen failed on a selector timeout. Config corrected, and the inputs were given proper `name`/`autoComplete` attributes (`Input` spreads props, so this is free and makes the form autofill-friendly as well as testable).
+- **Screenshots:** 1 → 5 (login, social feed with likes/comments, pay, request, wallet).
 - **CI note (repo-wide):** the GitHub Actions smoke-test workflow was removed; don't treat it as active.
 
 ## Open Questions

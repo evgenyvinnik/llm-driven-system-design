@@ -31,13 +31,23 @@
       "delay": 1500
     },
     {
-      "name": "03-search",
+      "name": "03-post-comments",
+      "path": "/r/programming/comments/1",
+      "delay": 2500
+    },
+    {
+      "name": "04-subreddit",
+      "path": "/r/javascript",
+      "delay": 2200
+    },
+    {
+      "name": "05-search",
       "path": "/search?q=programming",
       "waitFor": "main",
       "delay": 500
     },
     {
-      "name": "04-submit",
+      "name": "06-submit",
       "path": "/submit",
       "waitFor": "main",
       "delay": 500

@@ -114,17 +114,26 @@ const seed = async (): Promise<void> => {
       { subreddit: 'technology', author: 'charlie', title: 'AI coding assistants - helpful or harmful?', content: 'I\'ve been using Copilot for 6 months now. It\'s great for boilerplate but you still need to understand what it generates.' },
     ];
 
-    for (const post of posts) {
-      const now = new Date();
-      // Calculate initial hot score
+    // Hours since posting, one per entry above. Seeding everything at NOW()
+    // makes every post read "just now" and — more importantly — gives them all
+    // the same time term in the hot formula, so the ranking this project is
+    // built around has nothing to distinguish. Spreading the ages lets the
+    // decay actually order the feed.
+    const postAgesHours = [3, 26, 1, 9, 52, 30, 5];
+
+    for (const [i, post] of posts.entries()) {
+      const ageHours = postAgesHours[i] ?? 1;
+      const createdAt = new Date(Date.now() - ageHours * 3600 * 1000);
+      // Reddit's hot formula: the time term is fixed at insert, so it has to be
+      // computed from the post's real created_at rather than from "now".
       const epochSeconds = 1134028003;
-      const seconds = Math.floor(now.getTime() / 1000) - epochSeconds;
+      const seconds = Math.floor(createdAt.getTime() / 1000) - epochSeconds;
       const hotScore = seconds / 45000;
 
       await query(
-        `INSERT INTO posts (subreddit_id, author_id, title, content, hot_score)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [subMap[post.subreddit], userMap[post.author], post.title, post.content, hotScore]
+        `INSERT INTO posts (subreddit_id, author_id, title, content, hot_score, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [subMap[post.subreddit], userMap[post.author], post.title, post.content, hotScore, createdAt]
       );
     }
     console.log('Created sample posts');

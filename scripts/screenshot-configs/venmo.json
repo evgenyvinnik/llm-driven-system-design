@@ -8,10 +8,10 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "alice@example.com",
+      "username": "alice",
       "password": "password123"
     },
-    "usernameSelector": "input[name='email'], input[type='email']",
+    "usernameSelector": "input[name='username'], input[type='text']",
     "passwordSelector": "input[name='password'], input[type='password']",
     "submitSelector": "button[type='submit']",
     "successIndicator": "main"
