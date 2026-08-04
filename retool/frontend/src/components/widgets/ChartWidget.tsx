@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import type { AppComponent } from '../../types';
-import { useDataStore } from '../../stores/dataStore';
+import { useBindingContext } from '../../stores/dataStore';
 import { resolveBindingValue, hasBindings } from '../../utils/bindings';
 
 interface ChartWidgetProps {
@@ -10,8 +10,7 @@ interface ChartWidgetProps {
 
 /** Renders a chart widget with configurable chart type and data bindings. */
 export function ChartWidget({ component }: ChartWidgetProps) {
-  const getBindingContext = useDataStore((s) => s.getBindingContext);
-  const context = getBindingContext();
+  const context = useBindingContext();
 
   const chartType = (component.props.type as string) || 'bar';
   const title = (component.props.title as string) || '';

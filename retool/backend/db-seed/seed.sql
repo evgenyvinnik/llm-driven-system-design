@@ -15,6 +15,12 @@ INSERT INTO data_sources (id, name, type, config, owner_id) VALUES
 ON CONFLICT DO NOTHING;
 
 -- Sample app: Customer Dashboard
+-- NOTE: bindings resolve against a query's NAME, not its id. Both QueryPanel
+-- and PreviewRenderer store results under `query.name` (see
+-- frontend/src/stores/dataStore.ts), so the table below binds to
+-- `getCustomers.data`. It previously referenced `query1` — the query's *id* —
+-- which resolved to nothing, and the table rendered "No data" in both the
+-- editor and preview even though the query itself returned five rows.
 INSERT INTO apps (id, name, description, owner_id, components, layout, queries, status) VALUES
   ('e1111111-1111-1111-1111-111111111111',
    'Customer Dashboard',
@@ -25,7 +31,7 @@ INSERT INTO apps (id, name, description, owner_id, components, layout, queries, 
        "id": "table1",
        "type": "table",
        "props": {
-         "data": "{{ query1.data }}",
+         "data": "{{ getCustomers.data }}",
          "columns": [
            {"key": "id", "label": "ID"},
            {"key": "name", "label": "Name"},
@@ -37,7 +43,7 @@ INSERT INTO apps (id, name, description, owner_id, components, layout, queries, 
          "searchable": true
        },
        "position": {"x": 0, "y": 2, "w": 12, "h": 8},
-       "bindings": {"data": "query1.data"}
+       "bindings": {"data": "getCustomers.data"}
      },
      {
        "id": "text1",

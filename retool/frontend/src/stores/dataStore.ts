@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { create } from 'zustand';
 import type { DataSource, QueryResult } from '../types';
 import { dataSourcesApi, queriesApi } from '../services/api';
@@ -137,3 +138,30 @@ export const useDataStore = create<DataState>((set, get) => ({
     return context;
   },
 }));
+
+/**
+ * Subscribes to the binding context and recomputes it when the underlying data changes.
+ *
+ * Widgets used to do `const getBindingContext = useDataStore(s => s.getBindingContext)`
+ * and then call it during render. That looks equivalent and is not: Zustand
+ * re-renders only when the *selected value* changes, and the selected value there
+ * is a function whose reference is stable for the life of the store. So a widget
+ * subscribed to nothing that ever changes — it computed the context once, on first
+ * render, while `queryResults` was still empty, and never recomputed. The visible
+ * symptom was a table that showed "No data" forever even though the query had
+ * returned rows and the store held them.
+ *
+ * Selecting the state slices instead means the widget re-renders when they are
+ * replaced, and the `useMemo` keeps the context object identity stable between
+ * those updates — returning a freshly built object straight from a selector would
+ * make the snapshot never compare equal and loop forever.
+ */
+export function useBindingContext(): Record<string, unknown> {
+  const queryResults = useDataStore((s) => s.queryResults);
+  const componentValues = useDataStore((s) => s.componentValues);
+  const getBindingContext = useDataStore((s) => s.getBindingContext);
+  return useMemo(
+    () => getBindingContext(),
+    [queryResults, componentValues, getBindingContext],
+  );
+}

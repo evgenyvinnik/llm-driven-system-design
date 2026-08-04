@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { AppComponent } from '../../types';
-import { useDataStore } from '../../stores/dataStore';
+import { useBindingContext } from '../../stores/dataStore';
 import { resolveBindingValue, hasBindings } from '../../utils/bindings';
 
 interface TableWidgetProps {
@@ -10,11 +10,10 @@ interface TableWidgetProps {
 
 /** Renders a data table widget with sortable columns and row selection. */
 export function TableWidget({ component }: TableWidgetProps) {
-  const getBindingContext = useDataStore((s) => s.getBindingContext);
   const [page, setPage] = useState(0);
   const [search, setSearch] = useState('');
 
-  const context = getBindingContext();
+  const context = useBindingContext();
 
   // Resolve data binding
   const rawData = useMemo(() => {

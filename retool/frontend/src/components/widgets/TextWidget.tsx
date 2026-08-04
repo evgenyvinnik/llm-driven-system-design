@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import type { AppComponent } from '../../types';
-import { useDataStore } from '../../stores/dataStore';
+import { useBindingContext } from '../../stores/dataStore';
 import { resolveBindings, hasBindings } from '../../utils/bindings';
 
 interface TextWidgetProps {
@@ -10,8 +10,7 @@ interface TextWidgetProps {
 
 /** Renders a text display widget with binding-resolved content. */
 export function TextWidget({ component }: TextWidgetProps) {
-  const getBindingContext = useDataStore((s) => s.getBindingContext);
-  const context = getBindingContext();
+  const context = useBindingContext();
 
   const rawValue = (component.props.value as string) || '';
   const fontSize = (component.props.fontSize as number) || 14;
