@@ -82,6 +82,7 @@ Simulated or omitted: `custom_fields` and `custom_field_values` exist in the sch
 - **`dev:server2` / `dev:server3` are no-ops:** written as `PORT=3002 npm run dev`, but `dev` itself starts with `PORT=3001`, so the inner assignment wins and every variant lands on 3001. Same defect as retool and supabase-dashboard, which share this backend scaffold.
 - **Stage validation lives only in the route layer:** `opportunities.stage` is a bare `VARCHAR` with no CHECK constraint, so `VALID_STAGES` in `routes/opportunities.ts` is the sole guard. Any write that bypasses the route (a seed edit, a psql session) can create a stage that silently vanishes from every report's `GROUP BY`.
 - **Lead conversion guard is a read-then-write:** the `converted_at IS NULL` check inside the transaction has no `FOR UPDATE`, so simultaneous conversions of one lead can both pass. Narrow in practice — leads are single-owner — but it is a genuine race, not a guarantee.
+- **2026-08-04 — screenshot coverage missed the two most distinctive screens.** The app itself was healthy (dashboard KPIs, pipeline bars, and all list views rendered real seeded data), but the config only captured dashboard/leads/accounts/contacts — not the **kanban opportunities board**, which is the headline UI and the subject of decision 4, nor the reports page that decision 5's CSS charts exist for. Both added; 5 → 7 screenshots.
 - **CI:** the repo-wide smoke-test workflow was removed; a runner can't provide Postgres and Valkey for these paths. Verification is local (`npm run triage salesforce`).
 
 ## Open Questions
