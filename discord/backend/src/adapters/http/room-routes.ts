@@ -74,9 +74,22 @@ export function createRoomRoutes(): Router {
       const history = historyBuffer.getHistory(roomName);
       historyBufferHits.labels({ instance: server.instanceId }).inc();
 
+      // The history buffer stores the sender as `nickname`, but every live
+      // message published by `message-router` carries it as `user` — and the
+      // client reads `message.user`. Serving the buffer's shape verbatim meant
+      // history messages arrived with `user` undefined, and `MessageList`'s
+      // `message.user.charAt(0)` threw, taking down the whole app the moment
+      // any room with history was opened. Normalise to the wire format the
+      // rest of the system already uses.
+      const messages = history.map((m) => ({
+        ...m,
+        user: (m as { user?: string; nickname?: string }).user
+          ?? (m as { nickname?: string }).nickname,
+      }));
+
       res.json({
         success: true,
-        data: { messages: history },
+        data: { messages },
       } as ApiResponse);
     } catch (error) {
       httpLogger.error({ err: error }, 'Get history error');

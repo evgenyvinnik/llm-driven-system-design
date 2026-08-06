@@ -30,28 +30,27 @@
       "delay": 1500
     },
     {
-      "name": "03-general-channel",
-      "path": "/channels/general",
-      "waitFor": ".font-semibold, [class*='MessageList'], .flex-1",
-      "delay": 2000
-    },
-    {
-      "name": "04-tech-talk-channel",
+      "name": "03-tech-talk-channel",
       "path": "/channels/tech-talk",
       "waitFor": ".font-semibold",
       "delay": 1500
     },
     {
-      "name": "05-gaming-channel",
+      "name": "04-gaming-channel",
       "path": "/channels/gaming",
       "waitFor": ".font-semibold",
       "delay": 1500
     },
     {
-      "name": "06-random-channel",
+      "name": "05-random-channel",
       "path": "/channels/random",
       "waitFor": ".font-semibold",
       "delay": 1500
+    },
+    {
+      "name": "06-music-channel",
+      "path": "/channels/music",
+      "delay": 2200
     }
   ],
   "viewport": {
