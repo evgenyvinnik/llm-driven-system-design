@@ -109,6 +109,43 @@ apiV1Router.get('/me', requireAuth, (req: Request, res: Response) => {
   });
 });
 
+// External-service demo.
+//
+// This route exists at the gateway, not only on the api-server. The dashboard's
+// "Test External Service" button calls `/api/v1/external`, and the gateway does
+// not proxy unmatched paths through to the load balancer — so the api-server's
+// copy of this handler was unreachable, the button returned 404 ("Not found"),
+// and the Circuit Breakers panel read "No circuit breakers registered" forever
+// because nothing ever exercised a breaker in this process.
+apiV1Router.get('/external', async (req: Request, res: Response) => {
+  const breaker = circuitBreakerRegistry.get('external-service', {
+    failureThreshold: 3,
+    resetTimeout: 30000,
+  });
+
+  try {
+    const result = await breaker.execute(async () => {
+      // Fails ~10% of the time on purpose, so the breaker actually trips
+      // occasionally rather than sitting closed forever.
+      if (Math.random() < 0.1) {
+        throw new Error('External service temporarily unavailable');
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 200));
+      return {
+        data: 'External service response',
+        timestamp: new Date().toISOString(),
+      };
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(503).json({
+      error: 'External service unavailable',
+      message: error instanceof Error ? error.message : String(error),
+      circuitState: breaker.getState().state,
+    });
+  }
+});
+
 // Demo resource endpoints
 apiV1Router.get('/resources', async (req: Request, res: Response) => {
   const cacheKey = 'resources:list';

@@ -84,6 +84,7 @@ export function ActionsCard() {
               <p className="text-xs text-gray-500">{action.description}</p>
             </div>
             <button
+              data-testid={`action-${action.id}`}
               onClick={() => handleAction(action.label, action.action)}
               disabled={loading !== null}
               className={`btn text-xs py-1 px-3 ${

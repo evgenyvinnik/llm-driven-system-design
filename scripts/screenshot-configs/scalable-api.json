@@ -30,6 +30,29 @@
       "path": "/",
       "waitFor": "header, main",
       "delay": 1500
+    },
+    {
+      "name": "03-cache-populated",
+      "path": "/",
+      "delay": 2000,
+      "click": [
+        "[data-testid='action-fetchResources']",
+        "[data-testid='action-fetchResources']",
+        "[data-testid='action-fetchResources']"
+      ],
+      "clickDelay": 900
+    },
+    {
+      "name": "04-circuit-breaker",
+      "path": "/",
+      "delay": 2000,
+      "click": [
+        "[data-testid='action-testExternal']",
+        "[data-testid='action-testExternal']",
+        "[data-testid='action-testExternal']",
+        "[data-testid='action-testExternal']"
+      ],
+      "clickDelay": 900
     }
   ],
   "viewport": {
