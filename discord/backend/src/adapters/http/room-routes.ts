@@ -74,18 +74,28 @@ export function createRoomRoutes(): Router {
       const history = historyBuffer.getHistory(roomName);
       historyBufferHits.labels({ instance: server.instanceId }).inc();
 
-      // The history buffer stores the sender as `nickname`, but every live
-      // message published by `message-router` carries it as `user` — and the
-      // client reads `message.user`. Serving the buffer's shape verbatim meant
-      // history messages arrived with `user` undefined, and `MessageList`'s
-      // `message.user.charAt(0)` threw, taking down the whole app the moment
-      // any room with history was opened. Normalise to the wire format the
-      // rest of the system already uses.
-      const messages = history.map((m) => ({
-        ...m,
-        user: (m as { user?: string; nickname?: string }).user
-          ?? (m as { nickname?: string }).nickname,
-      }));
+      // Normalise the buffer's internal shape to the wire format the rest of
+      // the system already speaks (`message-router.formatMessageJson`: `user`
+      // + `timestamp`). The buffer stores the DB row, which names these
+      // `nickname` and `createdAt`, and serving that verbatim broke the client
+      // twice over: `MessageList` does `message.user.charAt(0)`, so history
+      // threw and took down the whole app the moment any populated room was
+      // opened; and `new Date(message.timestamp)` on an absent field rendered
+      // "Invalid Date" against every message.
+      const messages = history.map((m) => {
+        const raw = m as {
+          user?: string;
+          nickname?: string;
+          timestamp?: Date | string;
+          createdAt?: Date | string;
+        };
+        const ts = raw.timestamp ?? raw.createdAt;
+        return {
+          ...m,
+          user: raw.user ?? raw.nickname,
+          timestamp: ts instanceof Date ? ts.toISOString() : ts,
+        };
+      });
 
       res.json({
         success: true,

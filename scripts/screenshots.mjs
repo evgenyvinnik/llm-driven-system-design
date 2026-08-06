@@ -930,6 +930,37 @@ async function captureWithPlaywright(config, outputDir) {
         }
       }
 
+      // Type into inputs before capturing. Some UI is driven by a store fed
+      // from a text field rather than by the URL — a search page whose results
+      // live in component state has no route to navigate to, so without this it
+      // can only ever be screenshotted in its empty state.
+      //
+      // `fill` is an object of { selector: value }, applied in order. Pressing
+      // Enter afterwards is left to `click`/`pressEnter` so forms that submit on
+      // a button and forms that submit on Enter are both expressible.
+      if (screen.fill) {
+        for (const [selector, value] of Object.entries(screen.fill)) {
+          try {
+            await page.waitForSelector(selector, { timeout: 5000 });
+            await page.fill(selector, String(value));
+            await page.waitForTimeout(screen.fillDelay || 400);
+          } catch {
+            logWarning(`Fill target not found: ${selector}`);
+          }
+        }
+      }
+
+      // Press Enter in a field, for forms that submit on keypress rather than
+      // via a clickable button.
+      if (screen.pressEnter) {
+        try {
+          await page.press(screen.pressEnter, 'Enter');
+          await page.waitForTimeout(screen.pressEnterDelay || 1500);
+        } catch {
+          logWarning(`pressEnter target not found: ${screen.pressEnter}`);
+        }
+      }
+
       // Click a selector before capturing. Needed for UI that lives in local
       // component state rather than a route (modals, slide-over detail panels),
       // which otherwise can never be screenshotted.

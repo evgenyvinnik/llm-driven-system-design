@@ -8,11 +8,11 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "alice@example.com",
+      "username": "alice",
       "password": "password123"
     },
-    "usernameSelector": "input[name='email'], input[type='email']",
-    "passwordSelector": "input[name='password'], input[type='password']",
+    "usernameSelector": "input[name='username'], #username",
+    "passwordSelector": "input[name='password'], #password",
     "submitSelector": "button[type='submit']",
     "successIndicator": "main"
   },
@@ -38,10 +38,29 @@
       "delay": 1000
     },
     {
-      "name": "04-admin",
+      "name": "04-search-results",
+      "path": "/",
+      "delay": 1800,
+      "fill": {
+        "input[placeholder='Search posts...']": "coffee"
+      },
+      "pressEnter": "input[placeholder='Search posts...']",
+      "pressEnterDelay": 2500
+    },
+    {
+      "name": "05-hashtag-search",
+      "path": "/",
+      "delay": 1500,
+      "fill": {
+        "input[placeholder='Search posts...']": "#tech"
+      },
+      "pressEnter": "input[placeholder='Search posts...']",
+      "pressEnterDelay": 2500
+    },
+    {
+      "name": "06-admin",
       "path": "/admin",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 2200
     }
   ],
   "viewport": {
