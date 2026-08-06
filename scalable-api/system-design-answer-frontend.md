@@ -266,6 +266,25 @@ The polling hook tracks consecutive failures. After three failures (15 seconds o
 
 ---
 
+## 🔧 Deep Dive: A Dashboard That Can Lie by Omission
+
+The hardest UI problem here isn't rendering numbers — it's that several *distinct* system states produce the same-looking dashboard, and an operator has to be able to tell them apart.
+
+| What the operator sees | Could mean | Also could mean |
+|------------------------|------------|-----------------|
+| Request rate drops to zero | Traffic genuinely stopped | The dashboard's own polling died |
+| Allow rate jumps to 100% | Abuse stopped | The limiter is **failing open** and enforcing nothing |
+| Cache hit rate 0% | Cold cache | Redis is unreachable and every lookup is silently missing |
+| All instances "healthy" | They are | Health checks pass while the gateway sends them no traffic |
+
+Every row on the right is worse than the row on the left, and none of them is distinguishable from the metrics alone. That's why the dashboard renders **dependency state next to the counters** — Redis connectivity, circuit-breaker state per dependency, and per-instance health — rather than treating them as a separate "system" page. A number without its dependency's status is not interpretable.
+
+> "The specific failure I'd design against is the second row. A rate limiter that's failing open looks *better* than one that's working — rejections drop to zero, everything turns green. If the only thing on screen is the allow rate, the operator concludes the system is healthy at exactly the moment it has stopped protecting anything. Showing breaker state beside it is what makes the difference visible."
+
+**The polling interval is part of this, not just a performance knob.** At a 5-second refresh, a counter that stops moving is ambiguous for 5 seconds — is it idle or is the poll failing? So the UI stamps "last updated" and treats a failed refresh as a visible state rather than silently keeping the previous render, which would show a frozen dashboard indistinguishable from a quiet one.
+
+**What we give up** by polling at all is that the dashboard is always a few seconds behind, and every connected operator multiplies the load on the very API they're inspecting — an observability tool that degrades the thing it observes. That's acceptable here because the audience is one or two operators, and it's the first thing that would flip to a server-sent stream if the dashboard were ever put in front of a team.
+
 ## ⚖️ Trade-offs Summary
 
 | Decision | Approach | Pros | Cons |
@@ -302,6 +321,25 @@ The polling hook tracks consecutive failures. After three failures (15 seconds o
 > If the dashboard evolves to need advanced visualizations, I would incrementally introduce D3 for those specific charts while keeping Recharts for the standard ones, rather than migrating everything."
 
 ---
+
+## 🧭 Making the Actions Panel Safe
+
+The dashboard exposes destructive controls — Clear Cache, Reset Metrics — alongside read-only ones, and they run against the live system with no confirmation step.
+
+That's a deliberate simplification with a real edge. "Clear Cache" on a production API tier is a thundering-herd trigger: every subsequent read misses, and the database absorbs the full uncached load at once. It is a one-click action sitting directly beside a harmless "Fetch Resources" button, distinguished only by colour.
+
+| Guard | Protects against | Cost |
+|-------|------------------|------|
+| ✅ Colour + grouping (current) | Nothing, really — it's a hint | Free |
+| Confirmation dialog | The misclick | One extra step on a rarely-used control |
+| Typed confirmation | Misclick *and* muscle memory | Annoying enough that people script around it |
+| Role gating | The wrong person entirely | Needs a permission model this project doesn't have |
+
+> "I'd add the confirmation and stop there. The typed-confirmation pattern is right for irreversible things — dropping a database — and cache clearing isn't irreversible, it's just briefly expensive. Matching the friction to the actual blast radius matters, because a guard that's disproportionate is a guard people route around, and then you've spent the annoyance and bought nothing."
+
+The related gap is that these actions have no visible consequence beyond a toast. Clearing the cache should visibly drive hit rate to zero and then watch it climb back — which the panel is well positioned to show, since it already renders hit rate live. Making an action's *effect* observable in the same view is what turns a control panel into a teaching tool rather than a set of buttons that report success.
+
+> "The through-line for this whole UI: it is the only window onto a system whose defining property — that three instances behave identically — is invisible by construction. Every panel earns its place by making one otherwise-unobservable thing visible, and the ones that don't are just decoration."
 
 ## 🚀 Future Improvements
 

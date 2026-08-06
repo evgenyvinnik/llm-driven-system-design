@@ -226,6 +226,26 @@ A **batch update job** runs every 5 minutes: it identifies users whose content r
 
 ---
 
+## 6b. Deep Dive: The Comment Tree
+
+Comments are the second data structure here that fights the relational model, and the choice of representation decides what a thread costs to read.
+
+**Storage is a materialized path** — each comment carries a `path` like `"12.47.103"` plus a denormalized `depth`, with the column indexed using `varchar_pattern_ops` so `WHERE path LIKE '12.47.%'` is a range scan rather than a sequential filter. Fetching any subtree at any depth is one query.
+
+| Approach | Fetching a 15-deep thread | Cost |
+|----------|---------------------------|------|
+| ✅ Materialized path | One indexed range scan | Insert takes two statements; depth capped by the column width |
+| ❌ Adjacency list + recursive CTE | 15 sequential index probes | Latency scales with depth — the exact dimension that makes a thread interesting |
+| ❌ Nested sets | One range scan | Every insert rewrites half the tree's bounds |
+
+> "The reason adjacency list loses isn't that a recursive CTE is slow in the abstract — it's that the levels are inherently sequential. Each level's ids are the input to the next, so you cannot parallelize them and cannot batch them. A deep thread is precisely the one people want to read, and it's the one that gets slower."
+
+**What the path costs is real.** `VARCHAR(255)` caps depth at roughly 40–60 levels depending on how wide the ids get. Creating a comment takes two statements inside a transaction — insert with an empty path, then update once the serial id is known — because the path contains the row's own id. And moving a subtree would mean rewriting every descendant's path, which is only acceptable because comments are never re-parented here.
+
+**The assembly step is the honest weak point.** The API loads every comment on a post and builds the tree in Node. Materialized path makes *partial* subtree fetches cheap, so that's leaving the main advantage on the table — a post with 5,000 comments serialises all 5,000 to render a screen showing perhaps forty. The right unit of pagination is the open question: top-level comments with collapsed replies, or a depth cap with explicit "load more" per branch.
+
+**Sorting is a per-request SQL expression, not a stored column.** "Best" is an inlined Wilson lower bound, which is the correct statistic for the question a comment sort actually asks: not "what is the average rating" but "what is the lowest plausible true rating given this many votes." A comment at 5 upvotes and 0 downvotes should not outrank one at 400 and 20, and a raw ratio says it does. That's the same reasoning as the hot score — except Wilson has no time term, so unlike `hot_score` it needs no materialization and no sweeper. It is correct the instant the row is written.
+
 ## 7. Trade-offs Summary
 
 | Decision | Choice | Trade-off | Alternative |
@@ -237,6 +257,25 @@ A **batch update job** runs every 5 minutes: it identifies users whose content r
 | Karma | Background batch | Stale by minutes | Real-time (expensive) |
 
 ---
+
+## 7b. Deep Dive: Why Only "Hot" Gets a Materialized Column
+
+Four feed sorts exist and exactly one of them needs background machinery. The asymmetry is the point, not an oversight.
+
+| Sort | Formula depends on | Needs a sweeper? |
+|------|--------------------|------------------|
+| top | `score` — a stored column | No |
+| controversial | `(ups+downs) × min/max` — inline SQL over stored columns | No |
+| new | `created_at` | No |
+| **hot** | `log₁₀(score)` **+ a term in elapsed time** | **Yes** |
+
+`top` and `controversial` are pure functions of columns that change only when a vote arrives. The write that changes the inputs is the same write that makes the new ordering correct — there is nothing to recompute later, so they can be inline expressions and remain exactly right.
+
+`hot` is different in kind because it has a time term. **Its correct ordering changes even when nobody touches anything.** A post's rank drifts downward while the server is idle, and no write exists to hang that recomputation off. That's the entire reason a sweeper exists, and it's why the sweep is bounded to posts from the last 7 days: for anything older, the log term would have to move by a full order of magnitude to reorder it against the elapsed-time term, which effectively never happens.
+
+> "The generalisable rule I'd take from this: materialize a ranking only when its inputs include something that changes without a write. Everything else should be computed from stored columns at query time, because a stored copy of a pure function of other columns is just a cache you now have to invalidate. Time is the one input you can't get a write notification for."
+
+**What we give up** is that rank is stale by up to the sweep interval for posts whose only change is the passage of time, and the sweep is a row-at-a-time `UPDATE` rather than a batched statement — fine at seed scale, and the first thing to fix under real volume. The alternative that removes the sweeper entirely is a Redis sorted set the API reads directly, which trades the staleness for keeping two stores in agreement.
 
 ## 8. Database Partitioning Strategy
 
@@ -255,6 +294,20 @@ The archival worker handles partitions older than a configurable threshold (defa
 
 ---
 
+## 8b. Vote Uniqueness Belongs in the Schema
+
+Preventing a user from voting twice looks like handler logic and isn't. The read-then-write version — check for an existing vote, insert if absent — is a textbook race: two concurrent requests from the same user both see nothing, both insert, and the user has now voted twice with no error raised anywhere and no log line to find later.
+
+So it's a constraint: `UNIQUE(user_id, post_id)`, `UNIQUE(user_id, comment_id)`, plus a `CHECK` that exactly one of the two target columns is non-null. That makes the bad state unrepresentable regardless of concurrency, request ordering, or how many API instances are running — which is the property application logic cannot give you.
+
+| Guard | Survives concurrent duplicate requests? | Survives a second API instance? |
+|-------|----------------------------------------|--------------------------------|
+| ✅ Unique constraint | Yes — one insert wins, the other errors | Yes |
+| ❌ Read-then-write in the handler | No | No |
+| ❌ Application-level lock | Yes | Only with a *distributed* lock, which is a new dependency |
+
+> "The trade I'd name is that this makes 'change my vote' awkward. Because the mutual-exclusion `CHECK` forbids setting both target columns, the insert needs a dynamically chosen column, and switching an upvote to a downvote becomes a SELECT-then-UPDATE rather than a clean upsert. That's uglier code in exchange for an invariant the database enforces. For something that directly determines content ranking, I'll take the ugly code."
+
 ## 9. Metrics and Observability
 
 We track four Prometheus metrics:
@@ -265,6 +318,17 @@ We track four Prometheus metrics:
 - **reddit_comment_tree_depth** (Histogram) — observed nesting depth of comments, with buckets from 1 to 50
 
 ---
+
+## 9b. What Breaks First
+
+Ordered by what I'd actually expect to hit, given the decisions above:
+
+1. **A hot post's `UPDATE posts SET score`.** Synchronous aggregation means every voter on one post serializes on that row. This is the first thing to bind, and the fix — Redis `INCR` counters flushed periodically — is deliberately not built, because feeling the contention is the point of the exercise.
+2. **The 60-second ranking sweep**, updating every post from the last 7 days one row at a time. Batching into a single `UPDATE … FROM (VALUES …)` buys a lot before the sweeper needs to go away entirely.
+3. **`buildCommentTree` loading whole threads into Node.** Materialized path already makes partial fetches cheap; this is unrealized headroom rather than a design flaw.
+4. **Karma recomputation on every vote**, which puts two extra queries on the hot path to keep a number second-accurate that nobody needs second-accurate. A periodic rollup is the obvious trade.
+
+> "The pattern worth noticing is that three of those four are the *same* decision — do the work synchronously so the response is correct on write — and that decision was right for the user experience in each case. They don't fail independently; they'll all start hurting at roughly the same traffic level, which is when this system stops being one Postgres and starts needing a counter store."
 
 ## 10. Future Enhancements
 

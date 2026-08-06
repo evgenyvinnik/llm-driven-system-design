@@ -42,20 +42,20 @@
       "path": "/",
       "delay": 1800,
       "fill": {
-        "input[placeholder='Search posts...']": "coffee"
+        "input[placeholder='Search posts...']": "code"
       },
       "pressEnter": "input[placeholder='Search posts...']",
-      "pressEnterDelay": 2500
+      "pressEnterDelay": 7000
     },
     {
       "name": "05-hashtag-search",
       "path": "/",
       "delay": 1500,
       "fill": {
-        "input[placeholder='Search posts...']": "#tech"
+        "input[placeholder='Search posts...']": "#programming"
       },
       "pressEnter": "input[placeholder='Search posts...']",
-      "pressEnterDelay": 2500
+      "pressEnterDelay": 7000
     },
     {
       "name": "06-admin",

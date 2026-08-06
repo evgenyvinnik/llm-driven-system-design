@@ -38,87 +38,44 @@
 ## 2. High-Level Architecture (5 minutes)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Client Layer                            │
-│                    React + Tanstack Router                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
-│  │  Zustand    │  │  API Layer  │  │  Optimistic Updates     │ │
-│  │  Store      │  │  (fetch)    │  │  (vote, comment)        │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        API Gateway                              │
-│                    Node.js + Express                            │
-│   ┌──────────────────────────────────────────────────────────┐ │
-│   │  Session Middleware  │  Auth  │  Rate Limiting  │  CORS  │ │
-│   └──────────────────────────────────────────────────────────┘ │
-│                              │                                  │
-│   ┌──────────────────────────┴────────────────────────────┐    │
-│   │     /api/r/:subreddit    │    /api/posts/:id          │    │
-│   │     /api/vote            │    /api/comments           │    │
-│   │     /api/auth/*          │    /api/users/:username    │    │
-│   └───────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  PostgreSQL   │    │    Valkey     │    │   Workers     │
-│  - All data   │    │  - Sessions   │    │  - Vote agg   │
-│  - Source of  │    │  - Vote cache │    │  - Ranking    │
-│    truth      │    │  - Hot scores │    │  - Karma      │
-└───────────────┘    └───────────────┘    └───────────────┘
+┌──────────────── Client (React + TanStack Router) ──────────────┐
+│  Zustand store  │  fetch layer  │  optimistic vote/comment     │
+└────────────────────────────┬───────────────────────────────────┘
+                             ▼
+┌──────────────── API (Node + Express) ──────────────────────────┐
+│  session · auth · rate limiting · CORS                         │
+│  /api/auth/*   /api/r/:subreddit   /api/posts/:id              │
+│  /api/vote     /api/comments       /api/users/:username        │
+└──────┬─────────────────────┬──────────────────────┬────────────┘
+       ▼                     ▼                      ▼
+┌──────────────┐   ┌──────────────────┐   ┌────────────────────┐
+│ PostgreSQL   │   │ Valkey           │   │ Workers            │
+│ source of    │   │ sessions +       │   │ ranking sweep,     │
+│ truth, incl. │   │ per-user vote    │   │ vote-drift repair  │
+│ sessions     │   │ cache            │   │                    │
+└──────────────┘   └──────────────────┘   └────────────────────┘
 ```
+
+One thing worth flagging in this diagram: **sessions live in Postgres, not Valkey.** Valkey holds only a per-user vote cache. That's unusual for this repo — most projects here put sessions in Redis — and it means an auth check is a database round trip rather than a sub-millisecond lookup. The upside is that a Redis restart doesn't log everyone out; the cost is that the busiest read in the system (every authenticated request) lands on the same database serving the feed.
 
 ### 🔄 Request Flow Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Voting Flow                                  │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   User clicks upvote                                            │
-│          │                                                      │
-│          ▼                                                      │
-│   ┌──────────────────┐                                          │
-│   │ Optimistic UI    │ ◀── Immediate score +1 in Zustand        │
-│   │ Update           │                                          │
-│   └────────┬─────────┘                                          │
-│            │                                                    │
-│            ▼                                                    │
-│   ┌──────────────────┐                                          │
-│   │ POST /api/vote   │ ◀── Async request to server              │
-│   └────────┬─────────┘                                          │
-│            │                                                    │
-│            ▼                                                    │
-│   ┌──────────────────┐                                          │
-│   │ Insert to votes  │ ◀── No contention, just insert           │
-│   │ table            │                                          │
-│   └────────┬─────────┘                                          │
-│            │                                                    │
-│            ▼                                                    │
-│   ┌──────────────────┐                                          │
-│   │ Return success   │ ◀── Confirm optimistic update            │
-│   └────────┬─────────┘                                          │
-│            │                                                    │
-│       (background)                                              │
-│            │                                                    │
-│            ▼                                                    │
-│   ┌──────────────────┐                                          │
-│   │ Aggregation      │ ◀── Every 5-30 seconds                   │
-│   │ worker runs      │                                          │
-│   └────────┬─────────┘                                          │
-│            │                                                    │
-│            ▼                                                    │
-│   ┌──────────────────┐                                          │
-│   │ Posts.score      │ ◀── Denormalized count updated           │
-│   │ updated          │                                          │
-│   └──────────────────┘                                          │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+click upvote ──▶ optimistic +1 in Zustand ──▶ POST /api/vote
+                                                    │
+                                            insert/update votes row
+                                                    │
+                                    aggregateVotesForTarget() — inline
+                                    SUM(CASE…) then UPDATE posts.score
+                                                    │
+                                         response carries the true score
 ```
+
+**Note that this is synchronous, not the async pattern it's tempting to draw.** `castVote` re-tallies and writes `posts.score` inside the same request, so the response carries a correct score and the client never has to reconcile its optimistic update against a later refetch.
+
+The async alternative — insert the vote, return immediately, let a worker tally every few seconds — removes the contended `UPDATE` from the write path. It's the better answer at scale and it's genuinely worse here: the user upvotes, the counter doesn't move for up to five seconds, and they reasonably conclude the click was lost. Patching that with a client-side optimistic increment then puts the client and server in disagreement whenever someone else voted in the same window.
+
+What synchronous aggregation costs is exactly what async would have bought: every voter on a hot post serializes on `UPDATE posts SET … WHERE id = $1`. A background sweeper still runs every 5 seconds over recently-voted targets, but it repairs drift from failed writes — it does nothing for contention. The real fix at scale is Redis `INCR` counters flushed periodically, deliberately not built here.
 
 ---
 

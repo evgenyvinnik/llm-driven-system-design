@@ -211,6 +211,23 @@ Two more details that matter:
 
 The cost I accept: **privacy changes are not retroactive.** If a user flips a transaction from public to private after the fact, the rows are already fanned out. That's handled with a tombstone check on read for the rare edit — the one place I deliberately pay a small read cost, because "leaked after I made it private" is the kind of bug that ends up on the news.
 
+## 🔧 Deep Dive 4: The Ledger Is the Product, the Balance Is a Cache
+
+Every balance change writes paired debit/credit rows in `ledger_entries` inside the same transaction that mutates the wallet. The invariant that makes the system auditable is that `SUM(credits) − SUM(debits)` for a wallet must equal `wallets.balance_cents`.
+
+The obvious alternative is to skip the ledger and just `UPDATE wallets SET balance = balance ± amount`. It's one write instead of three, and it is wrong for a reason that only shows up after you already have a bug:
+
+| Model | Cost per transfer | What happens after a balance bug ships |
+|-------|-------------------|----------------------------------------|
+| ✅ Ledger + derived balance | 3 writes | Replay the entries, find the divergent one, correct forward — the history says what happened |
+| ❌ Mutable balance only | 1 write | The wrong number is the only number. There is no record of how it got there and nothing to reconcile against |
+
+> "A mutable balance can't answer 'why is this number what it is', and that question is the entire job when money is involved. The ledger costs 2× write amplification to keep an answer available — and the reason I'd defend that price is that you don't get to add it retroactively. If the entries were never written, the history doesn't exist and no amount of later engineering recovers it."
+
+**Not every movement is two-sided, and the invariant is written accordingly.** A transfer debits one wallet and credits another, so its entries cancel. A deposit has no internal counterparty — money arrives from a bank outside the system — so it produces a credit alone; a withdrawal is the mirror. That's why the check is *per wallet* rather than per transaction. Writing it per-transaction would fail on deposits, and the tempting workaround is to invent an internal account standing in for the bank. That's a legitimate model — it's what you'd build to reconcile against bank statements — but it adds an account and a reconciliation surface to solve a problem this system doesn't have yet.
+
+**Integer cents everywhere is the other half.** Floating point cannot represent most decimal fractions, and the operation this system performs constantly is summing many values. Float balances mean the ledger total and the wallet balance disagree by fractions of a cent, drifting further with volume — and the error lives in the stored data, so it isn't fixable after the fact. Integers make a fractional cent structurally unrepresentable rather than merely discouraged.
+
 ## 🔁 Requests, Approvals, and Cashout
 
 Two flows sit around the core transfer and share its consistency machinery without duplicating it.
@@ -279,6 +296,22 @@ Every money movement writes an immutable audit entry (actor, action, resource, I
 3. **The single PostgreSQL primary for transfers.** Fix: shard wallets/ledger by user_id. This is genuinely hard, because a transfer touches two users who may live on different shards, and now you need distributed-transaction semantics. The ledger design pays off here: settle each side as an independent idempotent ledger entry coordinated by the transfer record, then reconcile asynchronously — rather than a two-phase commit that would double the latency and add a coordinator failure mode.
 4. **Feed reads** — solvable with read replicas long before the above, since feeds tolerate replica lag by definition.
 
+## 🔒 Deadlock Is the Failure Mode Unique to Transfers
+
+Deposits and withdrawals touch one wallet. A transfer touches two, and that is the only place in this system where a deadlock is possible.
+
+Two users paying each other at the same instant is the textbook case: A locks its own wallet then reaches for B's, B locks its own then reaches for A's, and neither can proceed until the database kills one. The fix is not a longer timeout or a coarser lock — it's **acquiring both locks in a consistent order** (here, by user id), so two transactions wanting the same pair always take them in the same sequence and a cycle cannot form.
+
+| Approach | Concurrent A→B and B→A | Cost |
+|----------|------------------------|------|
+| ✅ `FOR UPDATE` in a consistent order | One waits a few ms; both succeed | Transfers touching a shared wallet serialize |
+| ❌ Lock in request order | Deadlock — the database aborts one | A valid transfer fails, visibly, for no reason the user can understand |
+| ❌ Optimistic version checks on both | No deadlock, frequent conflicts on a hot wallet | Every conflict becomes a retry the *user* absorbs |
+
+> "Optimistic locking is usually my default, and the reason I'd reach past it here is what a retry *means* for a transfer. Retrying a deposit is invisible — same amount, same intent. Retrying a transfer isn't a repeat of the same operation: by the time you retry, the balance may no longer cover it, so what looked like a retry is actually a new decision the user has to make. Serializing on the row costs milliseconds. Making someone re-confirm a payment costs their confidence in the product."
+
+The ceiling this creates is a hot *receiver* — a business taking thousands of payments serializes everyone behind its own row. The escape hatch is an append-only ledger with an asynchronously projected balance, at which point "what's my balance" becomes eventually consistent. That is a much harder thing to explain to someone looking at their own money, which is why it isn't the starting point.
+
 ## ⚖️ Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
@@ -291,6 +324,32 @@ Every money movement writes an immutable audit entry (actor, action, resource, I
 | Idempotency | ✅ Redis + DB unique constraint | ❌ Either alone | Fast path plus durable backstop; they fail differently |
 | External charges | ✅ Credit receiver immediately, bear ACH-return risk | ❌ Hold until settled | Preserves the product; bounded by trust tiers + velocity limits |
 | Failure posture (money) | ✅ Fail closed | ❌ Queue and retry | Never promise money we cannot source |
+
+## 🧾 Where This Design Is Knowingly Incomplete
+
+Worth naming rather than leaving for the interviewer to find:
+
+- **Idempotency keys live in Postgres, in the payment's own transaction.** That's the opposite of the usual Redis-cache instinct, and it's deliberate: if the transaction rolls back, the key rolls back with it, so a stored key without a completed payment is unrepresentable. Redis would be faster and would leave a window where a crash between "payment committed" and "Redis SET" lets the next retry re-execute the charge.
+- **External funding credits the receiver before ACH settles.** That's a credit-risk decision wearing the costume of a routing decision. Real Venmo does the same thing, and it only works with fraud and velocity scoring behind it — neither of which is built here.
+- **Fan-out is synchronous and inside the request.** It's bounded because Venmo is a friend graph rather than a follower graph, so the pattern that kills Twitter can't occur. But a failed fan-out is caught and logged, never rolled back — the money is right and the feed may be incomplete, which is the correct priority and still an inconsistency.
+- **Privacy is resolved at fan-out time.** One decision point, so the read path can't leak — but a later public→private edit isn't retroactive without a tombstone check.
+
+> "If I had to pick the one to fix first, it's fraud scoring — not because it's the most interesting, but because fronting money before settlement is already a decision the system has made, and right now nothing bounds the loss."
+
+## 💸 Money Requests Are Not Transfers
+
+A request is a *proposal*, and modelling it as one is what keeps the money path clean. `transfer_requests` carries its own lifecycle — pending → paid / declined / cancelled — and paying one **executes a real transfer**, linked back by `transfers.id`.
+
+The shortcut would be to treat approval as a direct debit of the payer. That fails on authorization: the requester would be initiating a movement out of someone else's wallet, and the only thing standing between a request and a withdrawal is application logic remembering to check consent. Making the payment a separate, payer-initiated transfer means the debit is always authorized by the account being debited — a property of the model rather than of a code path.
+
+| Model | Who authorizes the debit | Failure mode |
+|-------|--------------------------|--------------|
+| ✅ Request → payer executes a transfer | The payer, at execution time | Requests can pile up unanswered |
+| ❌ Approval directly debits the payer | Whoever wrote the handler | One missed check is an unauthorized withdrawal |
+
+> "The tell is that a request has no financial effect at all until the payer acts. It's a message with a state machine attached. The moment you let it move money on its own, you've built a pull payment — which is a genuinely different product with genuinely different fraud exposure."
+
+**What's missing is expiry.** A pending request lives forever, so the requester's expectation and the payer's inbox drift apart indefinitely, and there's no point at which the system declares the proposal stale. That's a reconciliation smell more than a correctness bug, but it's the obvious next thing.
 
 ## 🚀 Closing
 

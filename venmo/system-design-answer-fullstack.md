@@ -198,63 +198,25 @@ The frontend API client provides typed methods for all endpoints:
 ### Sequence Diagram
 
 ```
-User          Frontend              Backend                PostgreSQL      Redis
-  │               │                    │                       │             │
-  │ Click "Pay"   │                    │                       │             │
-  ├──────────────►│                    │                       │             │
-  │               │ Generate idempotency key                   │             │
-  │               │ (crypto.randomUUID())                      │             │
-  │               │                    │                       │             │
-  │               │ POST /api/transfers│                       │             │
-  │               ├───────────────────►│                       │             │
-  │               │                    │                       │             │
-  │               │                    │ Check idempotency     │             │
-  │               │                    ├──────────────────────────────────►│
-  │               │                    │◄──────────────────────────────────┤
-  │               │                    │ (cache miss)          │             │
-  │               │                    │                       │             │
-  │               │                    │ BEGIN TRANSACTION     │             │
-  │               │                    ├──────────────────────►│             │
-  │               │                    │                       │             │
-  │               │                    │ SELECT wallet FOR UPDATE            │
-  │               │                    ├──────────────────────►│             │
-  │               │                    │◄──────────────────────┤             │
-  │               │                    │ (row locked)          │             │
-  │               │                    │                       │             │
-  │               │                    │ Check balance, determine funding    │
-  │               │                    │                       │             │
-  │               │                    │ UPDATE sender balance │             │
-  │               │                    ├──────────────────────►│             │
-  │               │                    │                       │             │
-  │               │                    │ UPDATE receiver balance             │
-  │               │                    ├──────────────────────►│             │
-  │               │                    │                       │             │
-  │               │                    │ INSERT transfer record│             │
-  │               │                    ├──────────────────────►│             │
-  │               │                    │                       │             │
-  │               │                    │ COMMIT                │             │
-  │               │                    ├──────────────────────►│             │
-  │               │                    │◄──────────────────────┤             │
-  │               │                    │                       │             │
-  │               │                    │ Invalidate cache      │             │
-  │               │                    ├──────────────────────────────────►│
-  │               │                    │                       │             │
-  │               │                    │ Store idempotency     │             │
-  │               │                    ├──────────────────────────────────►│
-  │               │                    │                       │             │
-  │               │                    │ Queue feed fanout (async)          │
-  │               │                    │ Queue notification (async)         │
-  │               │                    │                       │             │
-  │               │◄───────────────────┤                       │             │
-  │               │ { transfer, newBalance }                   │             │
-  │               │                    │                       │             │
-  │               │ Update Zustand store                       │             │
-  │               │ (wallet.balance = newBalance)              │             │
-  │               │                    │                       │             │
-  │◄──────────────┤                    │                       │             │
-  │ Show success  │                    │                       │             │
-  │ screen        │                    │                       │             │
+User          Frontend            Backend              Postgres        Redis
+ │  click Pay ──▶ mint idempotency key (crypto.randomUUID)
+ │               POST /api/transfers ──▶
+ │                                   check idempotency ─────────────────▶
+ │                                   ◀── hit? return stored result, done
+ │                                   BEGIN
+ │                                     SELECT … FOR UPDATE (both wallets,
+ │                                       ordered by user_id — no deadlock)
+ │                                     determine funding source
+ │                                     insert transfer + paired ledger rows
+ │                                     write idempotency key
+ │                                   COMMIT
+ │                                   fan out to feed_items (after commit,
+ │                                     failure logged, never rolled back)
+ │  ◀── 201 with the transfer ───────
+ │               invalidate balance cache ─────────────────────────────▶
 ```
+
+Two orderings in that sequence carry the design: the idempotency key is written **inside** the transaction, so it cannot exist without a completed payment; and fan-out happens **after** commit, so a feed failure can never roll back money.
 
 ### Frontend Payment Flow Component
 

@@ -9,7 +9,9 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from './config/index.js';
-import { initializeElasticsearch } from './config/elasticsearch.js';
+import { initializeElasticsearch, esClient, POSTS_INDEX } from './config/elasticsearch.js';
+import { query } from './config/database.js';
+import { updatePostIndex } from './services/indexingService.js';
 import routes from './routes/index.js';
 import {
   logger,
@@ -194,6 +196,7 @@ async function start() {
       try {
         await initializeElasticsearch();
         logger.info('Elasticsearch initialized');
+        await backfillIndexIfEmpty();
         break;
       } catch (error) {
         if (attempt === 10) {
@@ -233,3 +236,40 @@ process.on('SIGINT', () => {
 });
 
 start();
+
+/**
+ * Indexes any posts that exist in Postgres but not in Elasticsearch.
+ *
+ * Indexing normally happens synchronously inside post-create and there is no
+ * re-indexing job, so a SQL fixture that inserts posts directly leaves the
+ * index empty and every search returns nothing while the database looks
+ * correctly populated. Doing this at boot — rather than at seed time — is what
+ * makes it reliable: Elasticsearch is slow to accept connections on a cold
+ * start, so a seeder racing it silently skips, and the backend then creates a
+ * fresh empty index over the top.
+ *
+ * It is a no-op whenever the index already has documents, so it costs one count
+ * query per boot and never fights a real indexing path.
+ */
+async function backfillIndexIfEmpty(): Promise<void> {
+  try {
+    const { count } = await esClient.count({ index: POSTS_INDEX });
+    if (count > 0) return;
+
+    const posts = await query<{ id: string }>('SELECT id FROM posts ORDER BY created_at');
+    if (posts.length === 0) return;
+
+    let indexed = 0;
+    for (const post of posts) {
+      try {
+        await updatePostIndex(post.id);
+        indexed++;
+      } catch (error) {
+        logger.warn({ error, postId: post.id }, 'Failed to index seeded post');
+      }
+    }
+    logger.info({ indexed, total: posts.length }, 'Backfilled empty search index');
+  } catch (error) {
+    logger.warn({ error }, 'Index backfill skipped');
+  }
+}
