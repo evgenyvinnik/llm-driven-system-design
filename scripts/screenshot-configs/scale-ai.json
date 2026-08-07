@@ -5,27 +5,47 @@
   "dbName": "scaleai",
   "dbUser": "scaleai",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/#admin",
+    "credentials": {
+      "email": "admin@scaleai.local",
+      "password": "admin123"
+    },
+    "usernameSelector": "input[name='email'], #email",
+    "passwordSelector": "input[name='password'], #password",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": ".admin-dashboard, main"
   },
   "screens": [
     {
       "name": "01-drawing-game",
       "path": "/",
-      "waitFor": "canvas, main",
-      "delay": 1000
-    },
-    {
-      "name": "02-admin",
-      "path": "/#admin",
-      "waitFor": "main, .admin-dashboard",
       "skipAuth": true,
-      "delay": 500
+      "delay": 2000
     },
     {
-      "name": "03-implement",
+      "name": "02-admin-dashboard",
+      "path": "/#admin",
+      "delay": 2800
+    },
+    {
+      "name": "03-test-model",
       "path": "/#implement",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 2200
+    },
+    {
+      "name": "04-admin-drawings",
+      "path": "/#admin",
+      "delay": 2200,
+      "click": "button:has-text('Drawings')",
+      "clickDelay": 2000
+    },
+    {
+      "name": "05-admin-training",
+      "path": "/#admin",
+      "delay": 2000,
+      "click": "button:has-text('Training')",
+      "clickDelay": 1800
     }
   ],
   "viewport": {

@@ -110,6 +110,8 @@ export function AdminLogin({ onLogin }: AdminLoginProps) {
             <label htmlFor="email">Email</label>
             <input
               id="email"
+              name="email"
+              autoComplete="username"
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
@@ -124,6 +126,8 @@ export function AdminLogin({ onLogin }: AdminLoginProps) {
             <label htmlFor="password">Password</label>
             <input
               id="password"
+              name="password"
+              autoComplete="current-password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
