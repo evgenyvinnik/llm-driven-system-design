@@ -143,3 +143,12 @@ RABBITMQ_URL=amqp://scaleai:scaleai123@localhost:5672
 - **Batch submission**: REST on completion rather than WebSocket streaming for simplicity
 - **PyTorch for training**: Worker processes jobs from RabbitMQ, saves models to MinIO
 - **Session-based admin auth**: Redis-backed sessions, avoids JWT complexity
+
+## Iteration & Repair Log
+
+- **2026-08-07 — the platform demonstrated nothing, though everything was built.** Implementation was verified against this file and matches it: three services start together via `concurrently` (collection/admin/inference), stroke data really does go to MinIO, and `training/worker.py` exists as documented. The problem was entirely that nothing had ever been submitted:
+  1. **The seed created shapes and an admin user and nothing else** — no drawings. The game read "0 total", the admin dashboard had no data to label, filter or flag, and there were no training jobs. Added `db/seed-drawings.ts` (chained into `db:seed`), which generates real stroke geometry per shape, uploads it to MinIO through the project's own `uploadDrawing`, and inserts the matching rows. A drawing is *two* things — a Postgres row and a JSON object at `stroke_data_path` — so a SQL fixture can only ever write half of one, and the half it writes fails the moment an admin opens it.
+  2. The corpus is deliberately **imbalanced** (line 14, heart 6) with a few low-quality flagged samples, because a uniformly clean, evenly distributed dataset is exactly what a labeling platform's dashboard exists to detect the absence of.
+  3. **The screenshot config had `auth: false`**, so `#admin` only ever captured the login form and the dashboard behind it was never seen. Enabled admin auth (`admin@scaleai.local` / `admin123`); the login inputs gained `name`/`autoComplete` attributes, which they lacked.
+- **Screenshots:** 3 (one of which was a login form) → 5, including the Drawings tab rendering actual hand-drawn strokes fetched from MinIO — which is what proves the object-storage half of the pipeline works, not just the metadata rows.
+- **Known and honest:** "Active Model: None". No model exists locally because producing one means running the PyTorch worker against RabbitMQ; the completed training job is seeded, its output artifact is not. The Test Model page therefore has nothing to infer with.

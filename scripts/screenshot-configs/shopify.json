@@ -8,7 +8,7 @@
     "enabled": true,
     "loginUrl": "/login",
     "credentials": {
-      "email": "admin@shopify-demo.local",
+      "email": "merchant@example.com",
       "password": "password123"
     },
     "usernameSelector": "input[name='email'], input[type='email']",
@@ -20,21 +20,28 @@
     {
       "name": "01-login",
       "path": "/login",
-      "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "waitFor": "form",
+      "delay": 600
     },
     {
-      "name": "02-home",
+      "name": "02-merchant-stores",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1500
+      "delay": 2200
     },
     {
       "name": "03-storefront",
-      "path": "/storefront",
-      "waitFor": "main",
-      "delay": 500
+      "path": "/store/demo",
+      "delay": 2500
+    },
+    {
+      "name": "04-platform-admin",
+      "path": "/admin",
+      "delay": 2200,
+      "loginAs": {
+        "email": "admin@shopify-demo.local",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {
