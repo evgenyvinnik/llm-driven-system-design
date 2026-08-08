@@ -339,20 +339,42 @@ export function generateSampleRoute(
   let altitude = 100 + Math.random() * 50;
   const startTime = new Date();
 
-  // Speed in degrees per point (roughly)
-  const speed = activityType === 'ride' ? 0.0005 : 0.0002;
+  // Metres per second by sport, so the derived metrics land in a believable
+  // range. The previous version advanced a fixed 0.0005 degrees (~55m) every
+  // 2s for a ride, which is ~99 km/h — the activity cards were reporting
+  // motorway speeds for a bike.
+  const metresPerSecond: Record<string, number> = {
+    ride: 6.9,   // ~25 km/h
+    run: 3.1,    // ~11 km/h, a 5:20/km pace
+    hike: 1.3,   // ~4.7 km/h
+    walk: 1.4,   // ~5 km/h
+  };
+  const sampleIntervalMs = activityType === 'ride' ? 2000 : 5000;
+  const speedMs = metresPerSecond[activityType] ?? 3.0;
+
+  // One degree of latitude is ~111,320m everywhere; longitude shrinks by
+  // cos(latitude), which matters at San Francisco's 37.8° (~12% narrower).
+  const metresPerDegreeLat = 111_320;
+  const metresPerDegreeLng = 111_320 * Math.cos((startLat * Math.PI) / 180);
+  const metresPerPoint = speedMs * (sampleIntervalMs / 1000);
+
+  // Heading drifts by a small random amount per point instead of being redrawn
+  // in a fixed north-east arc every time. A constant north-easterly bias from a
+  // downtown San Francisco start walks the route straight out into the bay;
+  // a drifting heading produces a curving course that stays in the area.
+  let heading = Math.random() * Math.PI * 2;
 
   for (let i = 0; i < numPoints; i++) {
-    // Add some variation to the path
-    const angle = Math.random() * Math.PI / 4 + Math.PI / 4; // Mostly northeast
-    lat += Math.cos(angle) * speed + (Math.random() - 0.5) * 0.0001;
-    lng += Math.sin(angle) * speed + (Math.random() - 0.5) * 0.0001;
+    heading += (Math.random() - 0.5) * 0.4;
+    const jitter = 0.00002;
+    lat += (Math.cos(heading) * metresPerPoint) / metresPerDegreeLat + (Math.random() - 0.5) * jitter;
+    lng += (Math.sin(heading) * metresPerPoint) / metresPerDegreeLng + (Math.random() - 0.5) * jitter;
 
     // Vary altitude
     altitude += (Math.random() - 0.4) * 3; // Slight uphill bias
     altitude = Math.max(0, altitude);
 
-    const timestamp = new Date(startTime.getTime() + i * (activityType === 'ride' ? 2000 : 5000));
+    const timestamp = new Date(startTime.getTime() + i * sampleIntervalMs);
 
     points.push({
       latitude: parseFloat(lat.toFixed(7)),

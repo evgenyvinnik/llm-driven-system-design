@@ -2,7 +2,7 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## Introduction (2 minutes)
+## 🎯 Introduction (2 minutes)
 
 "Thank you for the opportunity. Today I'll design Stripe, a payment processing platform. As a backend engineer, I'm particularly excited about the unique challenges that financial systems present:
 
@@ -15,7 +15,7 @@ Let me clarify the requirements."
 
 ---
 
-## Requirements Clarification (5 minutes)
+## ✅ Requirements Clarification (5 minutes)
 
 ### Functional Requirements
 
@@ -42,7 +42,7 @@ The accuracy requirement is absolute. Unlike social media where losing a post is
 
 ---
 
-## High-Level Design (8 minutes)
+## 🏗️ High-Level Design (8 minutes)
 
 ### Architecture Overview
 
@@ -101,7 +101,7 @@ The accuracy requirement is absolute. Unlike social media where losing a post is
 
 ---
 
-## Deep Dive: Idempotency System (10 minutes)
+## 🔑 Deep Dive 1: Idempotency System (10 minutes)
 
 ### Why Idempotency is Critical
 
@@ -143,7 +143,7 @@ Requests without an idempotency key pass through normally (for GET requests, etc
 
 ---
 
-## Deep Dive: Double-Entry Ledger (10 minutes)
+## 📒 Deep Dive 2: Double-Entry Ledger (10 minutes)
 
 ### Why Double-Entry Accounting?
 
@@ -183,7 +183,7 @@ Before inserting, the service programmatically verifies that total debits equal 
 
 ---
 
-## Deep Dive: Circuit Breaker for Card Networks (5 minutes)
+## ⚡ Deep Dive 3: Circuit Breaker for Card Networks (5 minutes)
 
 ### Protecting Against Card Network Outages
 
@@ -211,7 +211,7 @@ Each call includes a 10-second timeout using Promise.race - if the card network 
 
 ---
 
-## Deep Dive: Webhook Delivery System (5 minutes)
+## 🔔 Deep Dive 4: Webhook Delivery System (5 minutes)
 
 ### Guaranteed Delivery with Retry
 
@@ -233,7 +233,92 @@ This ensures merchants eventually receive every event, even if their endpoint is
 
 ---
 
-## Trade-offs and Alternatives (2 minutes)
+## 🛡️ Failure Handling and Reconciliation (6 minutes)
+
+Everything above describes the happy path and the retry path. The case that
+actually defines a payments system is the one where we don't know what happened.
+
+### The in-doubt transaction
+
+We send an authorization to the card network and the connection times out. The
+network may have authorized the card and lost the response, or never received
+the request at all. We cannot tell the difference, and the two outcomes differ
+by real money on a real cardholder's statement.
+
+```
+   our side                          card network
+   ────────                          ────────────
+   authorize ─────────────────────▶  [ authorized? ]
+        │                                   │
+        │        ✗ timeout / reset          │
+        ◀───────── (no response) ───────────┘
+
+   state = requires_action, NOT failed
+        │
+        ├──▶ retry with the SAME network reference
+        │      network replies "already authorized" → adopt that result
+        │
+        └──▶ no answer after N attempts → mark for reconciliation,
+               settle against the network's daily file
+```
+
+> "The wrong move here is to treat a timeout as a decline. If the network did
+> authorize, the customer has a hold on their funds, and telling them the
+> payment failed invites them to try again — now you've authorized twice.
+> Equally wrong is treating it as a success, because you'd be shipping goods
+> against money that may not exist. So a timeout gets its own state. The
+> payment is neither succeeded nor failed; it's *unresolved*, and it stays that
+> way until something authoritative resolves it."
+
+Retries carry the same network-level reference we sent originally, which is what
+lets the network recognize the retry as the same authorization rather than a new
+one. This is the same idempotency principle as our own API keys, applied one hop
+downstream — and it's why the reference has to be generated and persisted
+*before* the first attempt, not derived from the response.
+
+### Reconciliation is the backstop, not the exception
+
+Networks publish a settlement file on a daily cycle. That file is the
+authoritative record, and reconciliation compares it against our ledger:
+
+| Discrepancy | Meaning | Resolution |
+|-------------|---------|------------|
+| In our ledger, not in the file | We recorded an authorization the network never took | Reverse the ledger entries; the customer was never charged |
+| In the file, not in our ledger | A timed-out request did authorize | Write the missing entries; the money is real |
+| Amounts differ | Partial capture, or an FX or fee adjustment | Post an adjusting entry; never edit the original |
+
+The key discipline is the last one: **ledger entries are append-only**. A wrong
+entry is corrected by a compensating entry, not an `UPDATE`. That's what keeps
+the audit trail truthful — an auditor can see that we got it wrong and when we
+fixed it, which is exactly what an overwrite destroys.
+
+### Failure matrix
+
+| Failure | Behavior | Money at risk? |
+|---------|----------|----------------|
+| **Redis (idempotency) down** | Fail closed — reject new payments rather than process without duplicate protection | No, but availability drops |
+| **PostgreSQL down** | Reject; nothing can be authorized without a durable ledger write | No |
+| **Card network down** | Circuit breaker opens, fail fast with a retryable error | No |
+| **Network timeout mid-auth** | `requires_action`, retry with the same reference, then reconcile | Yes — this is the dangerous one |
+| **Webhook endpoint down** | Queue retries with exponential backoff; events survive in the queue | No |
+| **Process crash after auth, before ledger write** | Reconciliation catches it against the settlement file | Yes, until the daily cycle |
+
+> "Note that Redis being down fails *closed*. That's unusual — a cache outage
+> normally means degraded performance, not rejected requests. Here the
+> idempotency store isn't a cache, it's a correctness mechanism, and processing
+> payments without it means a client retry becomes a second charge. Rejecting
+> the payment costs a lost sale; processing it costs a duplicate charge, a
+> chargeback, and a customer who no longer trusts the merchant. Refusing to
+> operate is the cheaper failure."
+
+The theme across all of these: for a payments system, **losing availability is
+recoverable and losing correctness is not**. Every one of these choices spends
+uptime to protect the ledger.
+
+---
+
+
+## ⚖️ Trade-offs Summary (2 minutes)
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
@@ -246,7 +331,7 @@ This ensures merchants eventually receive every event, even if their endpoint is
 
 ---
 
-## Capacity Planning
+## 🧮 Capacity Planning
 
 ### Traffic Estimates
 
@@ -275,7 +360,7 @@ Vacuum: Daily at 3 AM for ledger_entries table
 
 ---
 
-## Future Enhancements
+## 🚀 Future Enhancements
 
 1. **Multi-currency support**: FX rate service, settlement in local currency
 2. **3D Secure flow**: Redirect-based authentication for high-risk payments
@@ -286,7 +371,7 @@ Vacuum: Daily at 3 AM for ledger_entries table
 
 ---
 
-## Summary
+## 📌 Summary
 
 "I've designed Stripe's backend with:
 

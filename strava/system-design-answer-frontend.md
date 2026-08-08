@@ -2,13 +2,13 @@
 
 *45-minute system design interview format - Frontend Engineer Position*
 
-## Introduction (2 minutes)
+## 🎯 Introduction (2 minutes)
 
 "Thanks for this problem. I'll be designing a fitness tracking platform like Strava, focusing on the frontend systems that handle GPS route visualization, activity feeds, interactive maps, and real-time leaderboards. This involves map rendering with Leaflet, efficient list virtualization, and responsive mobile-first design. Let me clarify requirements."
 
 ---
 
-## 1. Requirements Clarification (5 minutes)
+## ✅ 1. Requirements Clarification (5 minutes)
 
 ### Functional Requirements (Frontend Perspective)
 
@@ -35,7 +35,7 @@
 
 ---
 
-## 2. Technology Stack (3 minutes)
+## 🛠️ 2. Technology Stack (3 minutes)
 
 | Layer | Technology | Rationale |
 |-------|------------|-----------|
@@ -49,7 +49,7 @@
 
 ---
 
-## 3. Application Architecture (5 minutes)
+## 🏗️ 3. Application Architecture (5 minutes)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -97,7 +97,7 @@
 
 ---
 
-## 4. Component Architecture (8 minutes)
+## 🧩 4. Component Architecture (8 minutes)
 
 ### Activity Feed Component
 
@@ -216,7 +216,7 @@
 
 ---
 
-## 5. State Management (5 minutes)
+## 🗃️ 5. State Management (5 minutes)
 
 ### Zustand Store Structure
 
@@ -279,7 +279,7 @@
 
 ---
 
-## 6. Deep Dive: Activity Upload Flow (8 minutes)
+## 🔧 6. Deep Dive: Activity Upload Flow (8 minutes)
 
 ### Upload Component Architecture
 
@@ -362,7 +362,7 @@
 
 ---
 
-## 7. Accessibility Considerations (3 minutes)
+## ♿ 7. Accessibility Considerations (3 minutes)
 
 ### Keyboard Navigation
 
@@ -414,7 +414,7 @@
 
 ---
 
-## 8. Performance Optimizations (5 minutes)
+## ⚡ 8. Performance Optimizations (5 minutes)
 
 ### Map Tile Caching
 
@@ -501,7 +501,7 @@
 
 ---
 
-## 9. Trade-offs and Alternatives
+## ⚖️ 9. Trade-offs Summary
 
 | Decision | Choice | Trade-off | Alternative |
 |----------|--------|-----------|-------------|
@@ -514,31 +514,18 @@
 
 ---
 
-## 10. Future Enhancements
+## 🚀 10. Future Enhancements
 
-1. **Offline Support**
-   - Service Worker for feed caching
-   - IndexedDB for offline activity viewing
-   - Background sync for kudos/comments
-
-2. **Real-time Updates**
-   - WebSocket for live kudos notifications
-   - Server-Sent Events for feed updates
-   - Optimistic UI updates
-
-3. **Elevation Profile Chart**
-   - D3.js or Chart.js integration
-   - Synchronized hover with map
-   - Gradient analysis visualization
-
-4. **Mobile App Shell**
-   - PWA with install prompt
-   - Native-like navigation
-   - Push notifications for achievements
+| Enhancement | What it adds | Why it's next |
+|-------------|--------------|---------------|
+| **Offline support** | Service Worker feed cache, IndexedDB for offline viewing, background sync for kudos | Athletes record in places with no signal — the one context where the app is guaranteed to be needed and guaranteed to be offline |
+| **Real-time updates** | WebSocket kudos notifications, SSE feed updates | Kudos are the core social loop; a refresh-to-see-them feed blunts it |
+| **Elevation profile chart** | Charted gradient synchronized with map hover | The most-requested missing view for cyclists, and the data is already in the GPS stream |
+| **Mobile app shell** | PWA install prompt, native-like navigation, achievement push | Recording is inherently a phone activity |
 
 ---
 
-## Summary
+## 📌 Summary
 
 "To summarize the frontend architecture:
 

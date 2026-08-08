@@ -5,7 +5,15 @@
   "dbName": "stripe_db",
   "dbUser": "stripe",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/",
+    "credentials": {
+      "username": "sk_test_demo_merchant_key_12345"
+    },
+    "usernameSelector": "input[placeholder='sk_test_...']",
+    "passwordSelector": false,
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main, nav, table"
   },
   "screens": [
     {

@@ -35,6 +35,34 @@
       "path": "/explore",
       "waitFor": "main",
       "delay": 500
+    },
+    {
+      "name": "04-activity-detail",
+      "path": "/",
+      "delay": 1500,
+      "click": [
+        "a[href^='/activity/'] >> nth=0"
+      ],
+      "clickDelay": 3000
+    },
+    {
+      "name": "05-segments",
+      "path": "/segments",
+      "delay": 2000
+    },
+    {
+      "name": "06-segment-leaderboard",
+      "path": "/segments",
+      "delay": 1500,
+      "click": [
+        "a[href^='/segment/'] >> nth=0"
+      ],
+      "clickDelay": 2500
+    },
+    {
+      "name": "07-stats",
+      "path": "/stats",
+      "delay": 2200
     }
   ],
   "viewport": {
