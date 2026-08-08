@@ -25,7 +25,14 @@ export async function resolveStore(
   next: NextFunction
 ): Promise<void> {
   const host = req.get('host') || '';
-  const subdomain = (req.query.subdomain as string) || req.headers['x-store-subdomain'] as string;
+  // Storefront routes are mounted as /api/storefront/:subdomain/*, so the path
+  // param is the primary signal locally — there is no real subdomain on
+  // localhost, and without this every tenant-scoped storefront query resolves
+  // to no store and returns "Store not found".
+  const subdomain =
+    (req.params.subdomain as string) ||
+    (req.query.subdomain as string) ||
+    (req.headers['x-store-subdomain'] as string);
 
   let storeId: number | null = null;
 

@@ -935,9 +935,29 @@ async function captureWithPlaywright(config, outputDir) {
       // live in component state has no route to navigate to, so without this it
       // can only ever be screenshotted in its empty state.
       //
+      // Click a selector before capturing. Needed for UI that lives in local
+      // component state rather than a route (modals, slide-over detail panels),
+      // which otherwise can never be screenshotted.
+      //
+      // This runs BEFORE `fill`: the field you want to type into is very often
+      // inside the thing the click opens (a search modal, a filter popover), so
+      // filling first would just miss it and warn.
+      if (screen.click) {
+        const clicks = Array.isArray(screen.click) ? screen.click : [screen.click];
+        for (const selector of clicks) {
+          try {
+            await page.waitForSelector(selector, { timeout: 5000 });
+            await page.click(selector);
+            await page.waitForTimeout(screen.clickDelay || 600);
+          } catch {
+            logWarning(`Click target not found: ${selector}`);
+          }
+        }
+      }
+
       // `fill` is an object of { selector: value }, applied in order. Pressing
-      // Enter afterwards is left to `click`/`pressEnter` so forms that submit on
-      // a button and forms that submit on Enter are both expressible.
+      // Enter afterwards is left to `pressEnter` so forms that submit on a
+      // button and forms that submit on Enter are both expressible.
       if (screen.fill) {
         for (const [selector, value] of Object.entries(screen.fill)) {
           try {
@@ -958,22 +978,6 @@ async function captureWithPlaywright(config, outputDir) {
           await page.waitForTimeout(screen.pressEnterDelay || 1500);
         } catch {
           logWarning(`pressEnter target not found: ${screen.pressEnter}`);
-        }
-      }
-
-      // Click a selector before capturing. Needed for UI that lives in local
-      // component state rather than a route (modals, slide-over detail panels),
-      // which otherwise can never be screenshotted.
-      if (screen.click) {
-        const clicks = Array.isArray(screen.click) ? screen.click : [screen.click];
-        for (const selector of clicks) {
-          try {
-            await page.waitForSelector(selector, { timeout: 5000 });
-            await page.click(selector);
-            await page.waitForTimeout(screen.clickDelay || 600);
-          } catch {
-            logWarning(`Click target not found: ${selector}`);
-          }
         }
       }
 

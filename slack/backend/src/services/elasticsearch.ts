@@ -7,6 +7,7 @@
 import { Client } from '@elastic/elasticsearch';
 import type { QueryDslQueryContainer } from '@elastic/elasticsearch/lib/api/types.js';
 import dotenv from 'dotenv';
+import { pool } from '../db/index.js';
 
 dotenv.config();
 
@@ -67,6 +68,49 @@ export async function initializeElasticsearch(): Promise<void> {
   } catch (error) {
     console.error('Failed to initialize Elasticsearch:', error);
     // Don't throw - search will be unavailable but app should still work
+  }
+}
+
+/**
+ * Bulk-indexes every message already in Postgres, but only when the index is
+ * empty.
+ *
+ * Messages are indexed on the send path, so anything loaded straight into
+ * Postgres by the SQL seed exists only in the source of truth and is invisible
+ * to search. The Postgres FTS fallback does not cover this: it triggers when
+ * Elasticsearch is *unreachable*, whereas a seeded database leaves ES perfectly
+ * reachable and simply empty — so search returns zero hits rather than falling
+ * back, and the whole search tier looks broken.
+ *
+ * Runs at boot rather than at seed time because the index has to exist first,
+ * and on a cold start ES is usually still coming up when the seed runs.
+ */
+export async function backfillIndexIfEmpty(): Promise<void> {
+  try {
+    const { count } = await esClient.count({ index: MESSAGES_INDEX });
+    if (count > 0) return;
+
+    const { rows } = await pool.query<{
+      id: number;
+      workspace_id: string;
+      channel_id: string;
+      user_id: string;
+      content: string;
+      created_at: Date;
+    }>(
+      'SELECT id, workspace_id, channel_id, user_id, content, created_at FROM messages ORDER BY id'
+    );
+    if (rows.length === 0) return;
+
+    for (const row of rows) {
+      await indexMessage(row);
+    }
+    // Search is near-real-time; force a refresh so results are queryable
+    // immediately rather than after the next automatic refresh interval.
+    await esClient.indices.refresh({ index: MESSAGES_INDEX });
+    console.log(`Backfilled ${rows.length} seeded messages into the search index`);
+  } catch (error) {
+    console.error('Search index backfill skipped:', error);
   }
 }
 

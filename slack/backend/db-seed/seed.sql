@@ -143,3 +143,34 @@ ON CONFLICT DO NOTHING;
 
 -- Update message sequence
 SELECT setval('messages_id_seq', (SELECT MAX(id) FROM messages));
+
+-- Messages in design and leadership.
+-- Both channels were seeded with members but no messages, and the workspace
+-- opens on the alphabetically-first channel — which is `design`. So the very
+-- first thing anyone saw was "No messages yet" in a workspace that actually had
+-- 21 messages elsewhere. Every channel a user can open needs content.
+INSERT INTO messages (id, workspace_id, channel_id, user_id, thread_ts, content, reply_count) VALUES
+    (22, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', NULL, 'Posted the v2 design system in Figma — new color tokens, spacing scale, and the updated component library. Would love feedback before we lock it for the Q1 launch.', 3),
+    (23, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '55555555-5555-5555-5555-555555555555', 22, 'The spacing scale is a big improvement. One question: are we keeping the 14px body size or moving to 15px?', 0),
+    (24, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', 22, 'Moving to 15px. We tested both and 15 tested measurably better for readability on the density we use.', 0),
+    (25, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111', 22, 'This looks great Carol. Let''s get it in front of the eng team before it ships.', 0),
+    (26, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '55555555-5555-5555-5555-555555555555', NULL, 'Quick accessibility pass on the new palette: the secondary button fails AA contrast on white at 4.1:1. Bumping it to #4A5568 gets us to 7.2:1.', 2),
+    (27, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', 26, 'Good catch — updating the token now.', 0),
+    (28, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111', 26, 'Can we get contrast checks into CI so this stops being a manual review step?', 0),
+    (29, 'ae111111-1111-1111-1111-111111111111', 'c0444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', NULL, 'Design review is Thursday at 2pm. Agenda: onboarding flow, empty states, and the mobile nav pattern.', 0),
+    (30, 'ae111111-1111-1111-1111-111111111111', 'c0555555-5555-5555-5555-555555555555', '11111111-1111-1111-1111-111111111111', NULL, 'Q1 planning: we''re tracking ahead on the launch but engineering headcount is the constraint. Let''s discuss priorities Monday.', 1),
+    (31, 'ae111111-1111-1111-1111-111111111111', 'c0555555-5555-5555-5555-555555555555', '22222222-2222-2222-2222-222222222222', 30, 'Agreed. I''ll bring a breakdown of what slips if we don''t backfill the two open roles.', 0),
+    (32, 'ae111111-1111-1111-1111-111111111111', 'c0555555-5555-5555-5555-555555555555', '11111111-1111-1111-1111-111111111111', NULL, 'Board deck draft is ready for review — focus on the retention numbers slide, that''s where the questions will be.', 0)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO reactions (message_id, user_id, emoji) VALUES
+    (22, '11111111-1111-1111-1111-111111111111', 'heart'),
+    (22, '55555555-5555-5555-5555-555555555555', 'heart'),
+    (22, '44444444-4444-4444-4444-444444444444', 'eyes'),
+    (26, '33333333-3333-3333-3333-333333333333', 'thumbsup'),
+    (26, '11111111-1111-1111-1111-111111111111', 'thumbsup'),
+    (29, '55555555-5555-5555-5555-555555555555', 'calendar'),
+    (30, '22222222-2222-2222-2222-222222222222', 'thumbsup')
+ON CONFLICT DO NOTHING;
+
+SELECT setval('messages_id_seq', (SELECT MAX(id) FROM messages));

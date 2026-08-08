@@ -35,13 +35,30 @@
       "delay": 2500
     },
     {
-      "name": "04-platform-admin",
-      "path": "/admin",
-      "delay": 2200,
-      "loginAs": {
-        "email": "admin@shopify-demo.local",
-        "password": "password123"
-      }
+      "name": "04-merchant-dashboard",
+      "path": "/admin/1",
+      "delay": 2600
+    },
+    {
+      "name": "05-merchant-products",
+      "path": "/admin/1",
+      "delay": 1200,
+      "click": ["button:has-text('Products')"],
+      "clickDelay": 1800
+    },
+    {
+      "name": "06-merchant-orders",
+      "path": "/admin/1",
+      "delay": 1200,
+      "click": ["button:has-text('Orders')"],
+      "clickDelay": 1800
+    },
+    {
+      "name": "07-merchant-customers",
+      "path": "/admin/1",
+      "delay": 1200,
+      "click": ["button:has-text('Customers')"],
+      "clickDelay": 1800
     }
   ],
   "viewport": {

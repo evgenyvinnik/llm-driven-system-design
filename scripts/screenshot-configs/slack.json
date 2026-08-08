@@ -34,7 +34,32 @@
       "name": "03-workspace",
       "path": "/",
       "waitFor": "main, aside",
-      "delay": 1500
+      "delay": 2000
+    },
+    {
+      "name": "04-channel-general",
+      "path": "/",
+      "delay": 1800,
+      "click": ["text=general"],
+      "clickDelay": 2000
+    },
+    {
+      "name": "05-thread",
+      "path": "/",
+      "delay": 1800,
+      "click": ["text=general", "button:has-text('replies')"],
+      "clickDelay": 2000
+    },
+    {
+      "name": "06-search",
+      "path": "/",
+      "delay": 1800,
+      "click": ["button:has-text('Search messages')"],
+      "clickDelay": 900,
+      "fill": { "input[placeholder='Search messages...']": "design system" },
+      "fillDelay": 500,
+      "pressEnter": "input[placeholder='Search messages...']",
+      "pressEnterDelay": 2200
     }
   ],
   "viewport": {

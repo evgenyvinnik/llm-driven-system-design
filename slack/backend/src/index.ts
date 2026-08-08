@@ -22,7 +22,7 @@ import messageRoutes from './routes/messages.js';
 import searchRoutes from './routes/search.js';
 
 import { setupWebSocket, getConnectedUsersCount } from './services/websocket.js';
-import { initializeElasticsearch } from './services/elasticsearch.js';
+import { initializeElasticsearch, backfillIndexIfEmpty } from './services/elasticsearch.js';
 import { redis } from './services/redis.js';
 import { logger, createRequestLogger } from './services/logger.js';
 import {
@@ -279,10 +279,14 @@ async function start(): Promise<void> {
     await pool.query('SELECT 1');
     logger.info({ msg: 'PostgreSQL connected' });
 
-    // Initialize Elasticsearch (non-blocking)
-    initializeElasticsearch().catch((err) => {
-      logger.warn({ err, msg: 'Elasticsearch initialization failed - search may be unavailable' });
-    });
+    // Initialize Elasticsearch (non-blocking), then index anything the SQL seed
+    // loaded straight into Postgres — those messages never went through the
+    // send path, so they are absent from the index until backfilled.
+    initializeElasticsearch()
+      .then(() => backfillIndexIfEmpty())
+      .catch((err) => {
+        logger.warn({ err, msg: 'Elasticsearch initialization failed - search may be unavailable' });
+      });
 
     server.listen(PORT, () => {
       logger.info({
