@@ -2,13 +2,13 @@
 
 *45-minute system design interview format - Full-Stack Engineer Position*
 
-## Introduction (2 minutes)
+## 🎯 Introduction (2 minutes)
 
 "Thanks for this problem. I'll be designing a fitness tracking platform like Strava, focusing on the end-to-end integration between GPS data capture, backend processing, and frontend visualization. This involves the complete activity upload flow, segment matching pipeline, and real-time leaderboard updates. Let me clarify requirements."
 
 ---
 
-## 1. Requirements Clarification (5 minutes)
+## ✅ 1. Requirements Clarification (5 minutes)
 
 ### Functional Requirements (Full-Stack Perspective)
 
@@ -35,7 +35,7 @@
 
 ---
 
-## 2. Technology Stack (3 minutes)
+## 🛠️ 2. Technology Stack (3 minutes)
 
 | Layer | Technology | Rationale |
 |-------|------------|-----------|
@@ -48,7 +48,7 @@
 
 ---
 
-## 3. System Architecture (5 minutes)
+## 🏗️ 3. System Architecture (5 minutes)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -95,83 +95,49 @@
 
 ---
 
-## 4. Shared Type Definitions (5 minutes)
+## 🧩 4. Shared Contract Between Client and Server (5 minutes)
 
-### Core Domain Types
+"I define the domain types once, as Zod schemas in a shared directory both sides
+import. That gives runtime validation on the server and inferred TypeScript
+types on the client from a single declaration."
 
-"I'm using Zod schemas in a shared directory that both frontend and backend can import. This gives us runtime validation plus TypeScript inference."
+### Core domain objects
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     ACTIVITY TYPE SCHEMA (Zod)                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ActivityType: 'run' | 'ride' | 'hike' | 'walk'                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  GpsPoint: {                                                             │
-│    index: number, latitude: number, longitude: number,                   │
-│    altitude?: number, timestamp: datetime,                               │
-│    speed?: number, heartRate?: number                                    │
-│  }                                                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Activity: {                                                             │
-│    id: uuid, userId: uuid, type: ActivityType, name: string,            │
-│    startTime: datetime, elapsedTime: number, movingTime: number,        │
-│    distance: number (meters), elevationGain: number,                    │
-│    avgSpeed: number, maxSpeed: number, avgHeartRate?: number,           │
-│    polyline: string (encoded), startLat/Lng, endLat/Lng,                │
-│    kudosCount: number, commentCount: number, hasKudos?: boolean         │
-│  }                                                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ActivityWithUser: Activity + { user: { id, username, profilePhoto } }  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Type | Key fields | Notes |
+|------|-----------|-------|
+| `ActivityType` | `run` \| `ride` \| `hike` \| `walk` | Drives pace vs speed display and which segments are eligible |
+| `GpsPoint` | index, lat, lng, timestamp; optional altitude, speed, heartRate | The raw stream; optional fields reflect that not every device records them |
+| `Activity` | id, userId, type, name, startTime, elapsedTime, movingTime, distance, elevationGain, avg/max speed, encoded polyline, start/end coordinates, kudos and comment counts | Everything the feed card needs without a join |
+| `ActivityWithUser` | `Activity` plus a nested `{ id, username, profilePhoto }` | The feed's wire shape — see the note on denormalization below |
+| `Segment` | id, creatorId, name, activityType, distance, elevationGain, polyline, start/end coordinates, effortCount, athleteCount | Created once, matched against forever |
+| `SegmentEffort` | id, segmentId, activityId, userId, elapsedTime, movingTime, prRank, createdAt | One row per traversal; `prRank` is 1/2/3 or null |
+| `LeaderboardEntry` | rank, user summary, elapsedTime, formattedTime, isPR | Built for rendering, not storage |
 
-### Segment Types
+### Envelope types
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     SEGMENT SCHEMAS                                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Segment: {                                                              │
-│    id: uuid, creatorId: uuid, name: string,                             │
-│    activityType: ActivityType, distance: number, elevationGain: number, │
-│    polyline: string, startLat/Lng, endLat/Lng,                          │
-│    effortCount: number, athleteCount: number                            │
-│  }                                                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  SegmentEffort: {                                                        │
-│    id: uuid, segmentId: uuid, activityId: uuid, userId: uuid,           │
-│    elapsedTime: number, movingTime: number,                             │
-│    prRank: 1|2|3|null, createdAt: datetime                              │
-│  }                                                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  LeaderboardEntry: {                                                     │
-│    rank: number, user: { id, username, profilePhoto },                  │
-│    elapsedTime: number, formattedTime: string, isPR?: boolean           │
-│  }                                                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Pagination is cursor-based everywhere: `{ items, nextCursor, hasMore }`. The
+upload endpoint returns a richer envelope — the created activity, the segment
+efforts it produced, and a `newPRs` list carrying segment name, new rank, and
+previous time — because the client needs all three to render the
+"You set a PR!" celebration without a second round trip.
 
-### API Response Types
+> "Two decisions are embedded in these shapes. First, `Activity` carries
+> denormalized `kudosCount` and `commentCount` rather than the client counting
+> rows — a feed of 50 activities would otherwise mean 100 aggregate queries.
+> Second, `ActivityWithUser` nests only three user fields rather than the whole
+> user object. That's deliberate: it's the exact set the feed card renders, and
+> keeping it minimal means a user's bio or email never accidentally ships to
+> every follower's feed."
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     API RESPONSE SCHEMAS                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│  PaginatedResponse<T>: { items: T[], nextCursor: string|null,           │
-│                          hasMore: boolean }                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│  FeedResponse: { activities: ActivityWithUser[],                        │
-│                  nextCursor: string|null }                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│  UploadResponse: { activity: Activity, segmentEfforts: SegmentEffort[], │
-│    newPRs: [{ segmentId, segmentName, rank, previousTime, newTime }] }  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The cost of a shared schema package is coupling — a breaking change to
+`Activity` breaks both deploys at once, so the two have to ship together or the
+change has to be additive. For a single team that's a fair trade for never
+having the client and server disagree about a field's nullability.
 
 ---
 
-## 5. Deep Dive: Activity Upload Flow (10 minutes)
+
+## 🔧 5. Deep Dive: Activity Upload Flow (10 minutes)
 
 ### End-to-End Upload Sequence
 
@@ -321,7 +287,7 @@
 
 ---
 
-## 6. Deep Dive: Leaderboard Sync (8 minutes)
+## 🏆 6. Deep Dive: Leaderboard Sync (8 minutes)
 
 ### Backend Leaderboard Update
 
@@ -400,7 +366,7 @@
 
 ---
 
-## 7. Activity Feed Integration (5 minutes)
+## 📰 7. Activity Feed Integration (5 minutes)
 
 ### Backend Feed Generation
 
@@ -489,88 +455,46 @@
 
 ---
 
-## 8. Shared Utilities (4 minutes)
+## 🧮 8. Shared Utilities (4 minutes)
 
-### Geospatial Calculations
+"A handful of pure functions live in the shared package because both sides need
+the identical answer — if the client and server compute distance differently,
+the number on the activity card won't match the number in the leaderboard."
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     HAVERSINE DISTANCE                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  haversineDistance(point1, point2) ──▶ meters                            │
-│                                                                          │
-│  R = 6371000 (Earth's radius in meters)                                  │
-│                                                                          │
-│  Convert to radians:                                                     │
-│    lat1, lat2 = toRad(point1.lat), toRad(point2.lat)                    │
-│    deltaLat = toRad(point2.lat - point1.lat)                            │
-│    deltaLng = toRad(point2.lng - point1.lng)                            │
-│                                                                          │
-│  Haversine formula:                                                      │
-│    a = sin(deltaLat/2)^2 + cos(lat1)*cos(lat2)*sin(deltaLng/2)^2        │
-│    c = 2 * atan2(sqrt(a), sqrt(1-a))                                    │
-│    distance = R * c                                                      │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Utility | Input → Output | Why it's shared |
+|---------|----------------|-----------------|
+| `haversineDistance` | two lat/lng points → metres | Great-circle distance over a spherical Earth (R = 6,371 km). The server uses it to total an activity; the client uses it for live distance during recording |
+| `formatDuration` | seconds → `H:MM:SS` or `M:SS` | Drops the hour component under an hour, which is what runners expect |
+| `formatDistance` | metres → `X.XX km` or `X m` | Switches unit at 1 km |
+| `formatPace` | metres + seconds → `M:SS /km` | Pace, not speed, for foot sports — the inverse of what cycling shows |
+| `encodePolyline` / `decodePolyline` | point array ⇄ string | Google's encoded-polyline format |
 
-### Duration & Distance Formatting
+### Why polyline encoding matters here
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     FORMAT UTILITIES                                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│  formatDuration(seconds) ──▶ "H:MM:SS" or "M:SS"                        │
-│    hours = floor(seconds / 3600)                                        │
-│    minutes = floor((seconds % 3600) / 60)                               │
-│    secs = seconds % 60                                                  │
-│    IF hours > 0: return "{hours}:{minutes:02}:{secs:02}"                │
-│    ELSE: return "{minutes}:{secs:02}"                                   │
-│                                                                          │
-│  formatDistance(meters) ──▶ "X.XX km" or "X m"                          │
-│    IF meters >= 1000: return "{meters/1000:.2f} km"                     │
-│    ELSE: return "{round(meters)} m"                                     │
-│                                                                          │
-│  formatPace(distanceMeters, timeSeconds) ──▶ "M:SS /km"                 │
-│    paceSecondsPerKm = (timeSeconds / distanceMeters) * 1000             │
-│    minutes = floor(paceSecondsPerKm / 60)                               │
-│    seconds = round(paceSecondsPerKm % 60)                               │
-│    return "{minutes}:{seconds:02} /km"                                  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+An hour-long run at 1 Hz is ~3,600 GPS points. Sent as JSON objects with full
+float precision that's roughly 300 KB per activity — and a feed page of 20
+activities would be 6 MB of coordinates for maps rendered a few hundred pixels
+wide.
 
-### Polyline Encoding/Decoding
+Encoding fixes this with two ideas: store each coordinate as a **delta** from
+the previous one rather than an absolute, and round to five decimal places
+(~1 metre). Deltas between consecutive GPS samples are tiny, and small numbers
+encode to fewer characters, so the string lands around 10× smaller than the raw
+array.
 
-"Polyline encoding compresses GPS coordinates by ~10x by using delta encoding and variable-length encoding."
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     POLYLINE ENCODING                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  encodePolyline(points: [lat, lng][]) ──▶ string                        │
-│                                                                          │
-│  1. Track previous lat/lng (start at 0, 0)                               │
-│  2. FOR EACH [lat, lng]:                                                 │
-│       - Scale to 5 decimal places: latE5 = round(lat * 1e5)              │
-│       - Compute delta: delta = latE5 - prevLat                           │
-│       - Encode delta as variable-length chars                            │
-│       - Repeat for longitude                                             │
-│       - Update prev values                                               │
-│  3. Return encoded string                                                │
-│                                                                          │
-│  decodePolyline(encoded: string) ──▶ [lat, lng][]                       │
-│                                                                          │
-│  1. Initialize lat = 0, lng = 0, index = 0                               │
-│  2. WHILE index < encoded.length:                                        │
-│       - Decode lat delta, add to lat                                     │
-│       - Decode lng delta, add to lng                                     │
-│       - Push [lat/1e5, lng/1e5] to points                                │
-│  3. Return points array                                                  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+> "The trade-off is precision loss and opacity. Five decimals means roughly a
+> metre of error, which is well inside consumer GPS noise, so it costs nothing
+> real. The bigger cost is that the polyline is opaque — you cannot query it. I
+> can't ask the database 'which activities passed through this bounding box'
+> against an encoded string, which is exactly why `Activity` also carries
+> explicit `startLat/Lng` and `endLat/Lng` columns and why segment matching
+> works off the separate GPS-point stream rather than the polyline. The
+> polyline is a *rendering* artifact, and I keep it strictly in that role."
 
 ---
 
-## 9. Trade-offs and Alternatives
+
+## ⚖️ 9. Trade-offs Summary
 
 | Decision | Choice | Trade-off | Alternative |
 |----------|--------|-----------|-------------|
@@ -583,7 +507,7 @@
 
 ---
 
-## 10. Future Enhancements
+## 🚀 10. Future Enhancements
 
 1. **Real-time Updates**
    - WebSocket for live kudos/comments
@@ -607,7 +531,7 @@
 
 ---
 
-## Summary
+## 📌 Summary
 
 "To summarize the full-stack architecture:
 

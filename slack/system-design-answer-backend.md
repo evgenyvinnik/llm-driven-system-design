@@ -40,6 +40,27 @@ Design the backend for a team messaging platform:
 - **Read multiplier:** 100:1 read:write. History scrolls, unread-count recomputation, and search dwarf writes, so the read path gets replicas and aggressive caching.
 - **Connections per gateway:** ~10K sockets/box → ~10K gateways at peak. They must be stateless and cheap to add.
 
+Two numbers here drive most of the design. The first is the **fan-out
+amplification**: 50K sends/s against an average of 50 recipients is ~2.5M
+deliveries/s, and a single 1,000-member channel turns one write into a thousand
+pushes. That ratio is why the interesting engineering sits in the delivery
+layer rather than the database — 50K writes/s is a sharding problem with a
+known answer, while 2.5M/s of push is what dictates the pub/sub topology.
+
+The second is the **100:1 read multiplier**. Almost none of that read traffic is
+novel: it's the same recent messages, the same channel-member lists, and the
+same unread computations requested over and over. That shape is what makes
+cache-aside effective here — a 2-minute TTL on channel members absorbs a large
+fraction of reads because membership changes far more slowly than it's read.
+If reads were mostly deep history scrolls with no locality, caching would buy
+much less and I'd lean harder on read replicas instead.
+
+> "I'd flag one thing about these estimates: 1B users is the whole-internet
+> number, and no real deployment looks like that. What matters for the design
+> isn't the absolute figure but the *shape* — heavy fan-out, read-dominated,
+> and cleanly partitionable by workspace. Those three properties hold at 10K
+> users and at 100M, and they're what I'm actually designing against."
+
 ## 🏗️ High-Level Architecture
 
 ```
@@ -160,6 +181,95 @@ Reading a thread: fetch the parent by id, then `SELECT * FROM messages WHERE thr
 ### Direct messages
 DMs are a `direct_messages` conversation plus a `direct_message_members` join. Creating a DM is idempotent — "create or get existing" — so re-opening a conversation never forks it. Delivery reuses the same `user:{id}:messages` pub/sub path, so no separate real-time channel is needed for DMs vs channel messages.
 
+## 🔎 Deep Dive 4: Search — Elasticsearch Primary, Postgres Fallback
+
+Search is the feature most likely to be treated as an afterthought and most
+likely to embarrass you in production, so I want to be specific about how it
+fails, not just how it works.
+
+```
+              ┌──────────────────────────────────────────────┐
+  send ──────▶│ 1. INSERT INTO messages          (Postgres)  │──▶ durable, ordered
+              │ 2. enqueue index job             (async)     │
+              └──────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                        ┌──────────────────┐
+                        │  Elasticsearch   │  BM25 + highlighting
+                        └──────────────────┘
+                                  │
+   GET /api/search ───────────────┤
+                                  │  on transport error
+                                  ▼
+                        ┌──────────────────┐
+                        │ Postgres GIN FTS │  to_tsvector / plainto_tsquery
+                        └──────────────────┘
+```
+
+### Why two systems instead of one
+
+> "Postgres full-text search alone would be simpler to operate — one datastore,
+> no index lag, no second thing to monitor. I rejected it because ranking is the
+> whole product here. A search for 'deploy' in a workspace with five years of
+> history returns thousands of matches, and `ts_rank` scores them by term
+> frequency in a single document. It has no corpus-level view, so a message
+> that says 'deploy deploy deploy' outranks the actual deploy runbook.
+> Elasticsearch's BM25 accounts for document length and inverse document
+> frequency, which is what makes the top five results usable. I also get
+> highlighting for free, and highlighting is what lets someone scan results
+> without opening each one."
+
+> "Elasticsearch alone was the other option, and it's the one I'd push back on
+> hardest in review. ES is a search index, not a database — it has no
+> transactions, and a lost shard means lost messages. Keeping Postgres as the
+> source of truth means the worst ES failure is 'search is degraded', never
+> 'messages are gone'. That's the entire reason indexing is asynchronous: the
+> send path must not be able to fail because a search cluster is unhealthy."
+
+### What indexing asynchronously actually costs
+
+The index is a few seconds behind the database. Concretely: someone posts a
+message and immediately searches for it, and it isn't there. That's a real,
+user-visible inconsistency, and it's the price of never letting the search tier
+add latency to a send. I consider it the right trade because sends outnumber
+searches by a wide margin and a slow send is felt by everyone in the channel,
+while a two-second index lag is felt only by the rare person who searches for
+something they just wrote.
+
+### The fallback covers less than it looks like it does
+
+This is the part worth being honest about in an interview. The fallback
+triggers on a **transport error** — ES unreachable, connection refused, timeout.
+It does not trigger when Elasticsearch is reachable but its index is **empty or
+stale**, because from the caller's perspective that's a perfectly successful
+query that returned zero hits.
+
+| ES state | Query result | Fallback fires? | User sees |
+|----------|--------------|-----------------|-----------|
+| Healthy, current | Ranked hits | — | Correct results |
+| Unreachable | Transport error | ✅ Yes | Correct results, unranked |
+| Reachable, empty index | `0 hits`, HTTP 200 | ❌ No | "No results found" |
+| Reachable, lagging | Partial hits | ❌ No | Recent messages missing |
+
+> "The empty-index case is the one that actually bites, and it's more common
+> than a cluster outage — it happens after any restore, reindex, or fresh
+> environment where messages were loaded into Postgres by a path that didn't go
+> through the send handler. The system reports total health while silently
+> answering every query with nothing."
+
+Two mitigations, and I'd want both. First, **reconcile at startup**: on boot,
+compare the index document count against the message count and backfill if the
+index is empty, so a restored database becomes searchable without manual
+intervention. Second, **treat a zero-hit response as suspicious rather than
+authoritative** when the corpus is known to be non-empty — a zero-result query
+against a workspace with a million messages should fall through to Postgres
+rather than being reported as a confident "no results". The general lesson is
+that health checks which only test reachability will call an empty index
+healthy; the check has to assert on content.
+
+---
+
+
 ## 🔒 Consistency, Idempotency, and Rate Limiting
 
 ### Idempotent sends
@@ -214,6 +324,22 @@ WS     /ws?userId=&workspaceId=   (ping / typing / presence up; message / reacti
 2. **Redis pub/sub node** saturates next under fan-out. Move to Redis Cluster and shard by a hash of the user id so a user's subscription always resolves to one node.
 3. **Gateway connection count** — each box holds ~10K sockets; scale horizontally, they're stateless. Sticky routing isn't required because any gateway can serve any user.
 4. **Elasticsearch indexing lag** grows under write spikes; because indexing is async off a queue, this surfaces as "search is a few seconds behind," never as slower sends. Add index nodes / shards to catch up.
+
+### Why not Kafka for the fan-out itself?
+
+Kafka is in this design for notifications, webhooks, and search indexing — the
+async work that happens *after* a message is durable. It is deliberately not on
+the delivery path.
+
+> "Kafka gives you durability and replay, which sounds like exactly what you'd
+> want for message delivery. But consumers pull from partitions, and a chat
+> gateway needs a push to a specific socket right now. I'd have to map 100M
+> connections onto a partition scheme, and partition count is not something you
+> change cheaply — repartitioning to add gateway capacity would be an outage.
+> Redis pub/sub is the weaker primitive on purpose: no durability, no replay,
+> but the semantics I actually need, which are 'deliver to whoever is listening
+> on this channel, immediately.' Durability is Postgres's job, and the reconnect
+> backfill is what bridges the two."
 
 ## ⚖️ Trade-offs Summary
 

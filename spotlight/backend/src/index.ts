@@ -95,9 +95,11 @@ export const pool = new Pool({
   password: process.env.PG_PASSWORD || 'spotlight_password',
 });
 
-export const esClient = new Client({
-  node: process.env.ES_URL || 'http://localhost:9200',
-});
+// Re-exported for existing importers; the client itself now lives in
+// services/esClient.ts so non-server entry points (seed.ts) can use it without
+// importing this module and starting the HTTP server.
+import { esClient } from './services/esClient.js';
+export { esClient };
 
 // Routes
 app.use('/api/search', searchRoutes);

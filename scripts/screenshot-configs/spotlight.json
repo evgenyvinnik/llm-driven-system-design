@@ -13,6 +13,49 @@
       "path": "/",
       "waitFor": "h1",
       "delay": 1000
+    },
+    {
+      "name": "02-suggestions",
+      "path": "/",
+      "delay": 900,
+      "click": ["text=Click here or press"],
+      "clickDelay": 1500
+    },
+    {
+      "name": "03-file-search",
+      "path": "/",
+      "delay": 900,
+      "click": ["text=Click here or press"],
+      "clickDelay": 700,
+      "fill": { "input[placeholder='Spotlight Search']": "meeting notes" },
+      "fillDelay": 1800
+    },
+    {
+      "name": "04-app-search",
+      "path": "/",
+      "delay": 900,
+      "click": ["text=Click here or press"],
+      "clickDelay": 700,
+      "fill": { "input[placeholder='Spotlight Search']": "saf" },
+      "fillDelay": 1800
+    },
+    {
+      "name": "05-calculator",
+      "path": "/",
+      "delay": 900,
+      "click": ["text=Click here or press"],
+      "clickDelay": 700,
+      "fill": { "input[placeholder='Spotlight Search']": "47*1.08" },
+      "fillDelay": 1500
+    },
+    {
+      "name": "06-unit-conversion",
+      "path": "/",
+      "delay": 900,
+      "click": ["text=Click here or press"],
+      "clickDelay": 700,
+      "fill": { "input[placeholder='Spotlight Search']": "12 km to miles" },
+      "fillDelay": 1500
     }
   ],
   "viewport": {

@@ -1,5 +1,5 @@
 import { Client } from '@elastic/elasticsearch';
-import { esClient } from '../index.js';
+import { esClient } from './esClient.js';
 
 export interface IndexConfig {
   name: string;
@@ -50,7 +50,15 @@ export async function initializeElasticsearch(client: Client): Promise<void> {
           content: { type: 'text', analyzer: 'standard' },
           type: { type: 'keyword' },
           size: { type: 'long' },
+          // The cross-index function_score scores decay on modified_at,
+          // last_used and usage_count. Elasticsearch parses that query against
+          // *every* index it searches, and an unmapped field in any one of them
+          // is a hard parsing_exception — not a skipped function. So all four
+          // mappings declare all three fields even where they carry no data;
+          // a mapped-but-absent field makes the decay neutral instead of fatal.
           modified_at: { type: 'date' },
+          last_used: { type: 'date' },
+          usage_count: { type: 'integer' },
           indexed_at: { type: 'date' },
           metadata: { type: 'object', enabled: false }
         }
@@ -93,8 +101,15 @@ export async function initializeElasticsearch(client: Client): Promise<void> {
           },
           path: { type: 'keyword' },
           category: { type: 'keyword' },
+          // The cross-index function_score scores decay on modified_at,
+          // last_used and usage_count. Elasticsearch parses that query against
+          // *every* index it searches, and an unmapped field in any one of them
+          // is a hard parsing_exception — not a skipped function. So all four
+          // mappings declare all three fields even where they carry no data;
+          // a mapped-but-absent field makes the decay neutral instead of fatal.
           usage_count: { type: 'integer' },
-          last_used: { type: 'date' }
+          last_used: { type: 'date' },
+          modified_at: { type: 'date' }
         }
       },
       settings: {
@@ -135,7 +150,16 @@ export async function initializeElasticsearch(client: Client): Promise<void> {
           email: { type: 'keyword' },
           phone: { type: 'keyword' },
           company: { type: 'text' },
-          notes: { type: 'text' }
+          notes: { type: 'text' },
+          // The cross-index function_score scores decay on modified_at,
+          // last_used and usage_count. Elasticsearch parses that query against
+          // *every* index it searches, and an unmapped field in any one of them
+          // is a hard parsing_exception — not a skipped function. So all four
+          // mappings declare all three fields even where they carry no data;
+          // a mapped-but-absent field makes the decay neutral instead of fatal.
+          modified_at: { type: 'date' },
+          last_used: { type: 'date' },
+          usage_count: { type: 'integer' }
         }
       },
       settings: {
@@ -176,7 +200,16 @@ export async function initializeElasticsearch(client: Client): Promise<void> {
           },
           description: { type: 'text' },
           visited_count: { type: 'integer' },
-          last_visited: { type: 'date' }
+          last_visited: { type: 'date' },
+          // The cross-index function_score scores decay on modified_at,
+          // last_used and usage_count. Elasticsearch parses that query against
+          // *every* index it searches, and an unmapped field in any one of them
+          // is a hard parsing_exception — not a skipped function. So all four
+          // mappings declare all three fields even where they carry no data;
+          // a mapped-but-absent field makes the decay neutral instead of fatal.
+          modified_at: { type: 'date' },
+          last_used: { type: 'date' },
+          usage_count: { type: 'integer' }
         }
       },
       settings: {
@@ -213,6 +246,25 @@ export async function initializeElasticsearch(client: Client): Promise<void> {
         }
       });
       console.log(`Created index: ${index.name}`);
+    } else {
+      // An index can exist without our mapping. Anything that writes a document
+      // before this function runs — the seed script, a bulk import — makes
+      // Elasticsearch auto-create the index with a *dynamic* mapping inferred
+      // from that document. Fields absent from the sample (last_used on a
+      // contact, modified_at on a bookmark) then never get mapped at all, and
+      // because the cross-index function_score references them, every search
+      // fails with `unknown field` rather than degrading.
+      //
+      // Mapping updates are additive and idempotent, so re-PUTting on every
+      // boot costs nothing and makes a mis-ordered startup self-healing.
+      try {
+        await client.indices.putMapping({
+          index: index.name,
+          properties: index.mappings.properties
+        } as Parameters<typeof client.indices.putMapping>[0]);
+      } catch (error) {
+        console.error(`Could not reconcile mapping for ${index.name}:`, error);
+      }
     }
   }
 }

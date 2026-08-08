@@ -2,7 +2,7 @@
 
 *45-minute system design interview format - Frontend Engineer Position*
 
-## Problem Statement
+## 📋 Problem Statement
 
 Design the frontend architecture for a team messaging platform that allows users to:
 - Send and receive messages in real-time across channels
@@ -10,7 +10,7 @@ Design the frontend architecture for a team messaging platform that allows users
 - See presence status and typing indicators
 - Search across message history
 
-## Requirements Clarification
+## ✅ Requirements Clarification
 
 ### Functional Requirements
 1. **Workspace Switcher**: Navigate between multiple workspaces
@@ -34,7 +34,7 @@ Design the frontend architecture for a team messaging platform that allows users
 
 ---
 
-## High-Level Architecture
+## 🏗️ High-Level Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -75,7 +75,7 @@ Design the frontend architecture for a team messaging platform that allows users
 
 ---
 
-## Deep Dive: State Management with Zustand
+## 🗃️ Deep Dive 1: State Management with Zustand
 
 ### Store Design
 
@@ -136,7 +136,7 @@ The Zustand store manages all client-side state for the Slack application:
 
 ---
 
-## Deep Dive: Virtualized Message List
+## 🔧 Deep Dive 2: Virtualized Message List
 
 ### The Problem
 
@@ -227,7 +227,7 @@ A busy channel can have 10,000+ messages. Rendering all of them would be extreme
 
 ---
 
-## Deep Dive: WebSocket Integration
+## 🔌 Deep Dive 3: WebSocket Integration
 
 ### Connection Manager
 
@@ -292,165 +292,87 @@ A busy channel can have 10,000+ messages. Rendering all of them would be extreme
 
 ---
 
-## Deep Dive: Message Composer
+## 🔧 Deep Dive 4: Optimistic Sends, Threads, and the Sidebar
 
-### Rich Text Composer Flow
+These three surfaces share one problem: the server is the authority, but the UI
+cannot wait for it. I'll take the send path first because it's the one where
+getting it wrong is most visible.
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                      Message Composer                               │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌────────────────────────────────────────────────────────────┐    │
-│  │ [+]  │  Message input (auto-resize textarea)  │ [emoji][send]│   │
-│  │      │  ────────────────────────────────────  │              │   │
-│  │ Add  │  Placeholder: "Message #channel-name"  │   Submit     │   │
-│  │ File │  Max height: 200px                     │   Button     │   │
-│  └────────────────────────────────────────────────────────────┘    │
-│                                                                     │
-└────────────────────────────────────────────────────────────────────┘
-```
-
-### Optimistic Update Flow
+### Optimistic message send
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                   Optimistic Message Send                           │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  User Types ──▶ Content State ──▶ Debounced Typing (1s)            │
-│       │                                   │                         │
-│       │                                   ▼                         │
-│       │                         Send "typing" via WS                │
-│       │                                                             │
-│       ▼                                                             │
-│  Submit (Enter)                                                     │
-│       │                                                             │
-│       ├────────────────────────────────────────────────────────┐   │
-│       │                                                        │   │
-│       ▼                                                        ▼   │
-│  ┌──────────────────┐                              ┌───────────────┐
-│  │ Create Optimistic│                              │  API Request  │
-│  │ Message          │                              │  sendMessage  │
-│  │ ─────────────────│                              │  ─────────────│
-│  │ id: temp-{ts}    │                              │  POST /msg    │
-│  │ pending: true    │                              │               │
-│  │ Add to store     │                              │               │
-│  │ Clear input      │                              │               │
-│  └──────────────────┘                              └───────────────┘
-│                                                            │
-│                              ┌──────────────────────────────┤
-│                              │                              │
-│                              ▼                              ▼
-│                    ┌──────────────────┐          ┌──────────────────┐
-│                    │    Success       │          │    Failure       │
-│                    │    ────────      │          │    ────────      │
-│                    │ Replace temp msg │          │ Mark as failed   │
-│                    │ with real msg    │          │ pending: false   │
-│                    │                  │          │ failed: true     │
-│                    └──────────────────┘          └──────────────────┘
-│                                                                     │
-└────────────────────────────────────────────────────────────────────┘
+User presses Enter
+   │
+   ├──▶ Create temp message  { id: "temp-1712…", pending: true }
+   │      append to store, clear the input immediately
+   │
+   └──▶ POST /api/channels/:id/messages   (idempotency key = temp id)
+            │
+            ├── 200 ──▶ replace temp row with the server row (real id, real ts)
+            │
+            └── error ─▶ mark { pending: false, failed: true }
+                          render inline "Failed to send — Retry"
 ```
 
-**Keyboard Handling:**
-- Enter (no shift): Submit message
-- Shift+Enter: New line in textarea
-- Auto-resize: Textarea grows up to 200px max
+> "I render the message before the server has acknowledged it because a chat
+> input that freezes for 200ms feels broken — users type the next sentence while
+> the last one is still in flight. The temp id is what makes this safe to
+> reconcile: it's also the idempotency key, so a retry after a timeout can't
+> produce two messages. The cost is that I now have three message states in the
+> store instead of one — pending, confirmed, failed — and every component that
+> renders a message has to handle all three. I accept that because the
+> alternative, a spinner on every send, makes the product feel slower than the
+> network actually is."
 
----
+The subtle case is **ordering**. An optimistic message is appended locally at
+the moment of send, but the server assigns the real timestamp and id. If two
+people send simultaneously, my local ordering can briefly disagree with
+everyone else's. I reconcile on the server row rather than trying to predict
+ordering client-side — the message may visibly jump position once, which is
+better than showing a different history than the person next to you.
 
-## Deep Dive: Thread Panel
+**Keyboard handling:** Enter submits, Shift+Enter inserts a newline, and the
+textarea auto-grows to a 200px cap. Typing is debounced 1s before emitting a
+`typing` event, so a fast typist produces one event per second rather than one
+per keystroke.
 
-### Slide-Out Thread View
+### Thread panel
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Main View                                          │ Thread Panel (w-96)     │
-├────────────────────────────────────────────────────┼─────────────────────────┤
-│                                                    │ ┌─────────────────────┐ │
-│                                                    │ │ Thread    [X Close] │ │
-│                                                    │ └─────────────────────┘ │
-│ ┌────────────────────────────────────────────────┐ │ ┌─────────────────────┐ │
-│ │                                                │ │ │ Parent Message      │ │
-│ │  Channel Messages                              │ │ │ ─────────────────   │ │
-│ │  (virtualized list)                            │ │ │ Avatar │ Original   │ │
-│ │                                                │ │ │        │ content    │ │
-│ │  ┌────────────────────────────────────────┐   │ │ └─────────────────────┘ │
-│ │  │ Message with [5 replies] ──────────────┼───┼─┼──▶ Opens thread panel  │
-│ │  └────────────────────────────────────────┘   │ │ ┌─────────────────────┐ │
-│ │                                                │ │ │ 5 replies           │ │
-│ │                                                │ │ └─────────────────────┘ │
-│ │                                                │ │ ┌─────────────────────┐ │
-│ │                                                │ │ │ Reply 1             │ │
-│ │                                                │ │ │ Reply 2             │ │
-│ │                                                │ │ │ Reply 3             │ │
-│ │                                                │ │ │ (scrollable)        │ │
-│ │                                                │ │ └─────────────────────┘ │
-│ └────────────────────────────────────────────────┘ │ ┌─────────────────────┐ │
-│                                                    │ │ Thread Composer     │ │
-│ ┌────────────────────────────────────────────────┐ │ │ [Reply to thread]   │ │
-│ │ Message Composer                               │ │ └─────────────────────┘ │
-│ └────────────────────────────────────────────────┘ │                         │
-└────────────────────────────────────────────────────┴─────────────────────────┘
-```
+Threads open as a fixed-width right-hand panel rather than a route. That's a
+deliberate choice: a thread is read *in the context of* its channel, and a
+route change would unmount the virtualized channel list and lose its scroll
+position. The panel holds `activeThreadId` in the store; closing sets it to
+null. The parent message renders at the top in a variant style, followed by a
+scrollable reply list and a dedicated reply composer that posts with
+`thread_ts` set.
 
-**Thread Panel Behavior:**
-- Opens when clicking thread indicator on a message
-- Displays parent message at top (isThreadParent variant)
-- Shows reply count with proper pluralization
-- Scrollable reply list (flex-1 overflow-auto)
-- Separate composer for thread replies
-- Close button returns activeThreadId to null
+Replies arrive over the same WebSocket as channel messages, so a thread open in
+the panel updates live without its own subscription — the reducer just routes
+any message carrying a `thread_ts` to both the thread and the parent's reply
+count.
 
----
-
-## Deep Dive: Channel Sidebar
-
-### Channel List with Unread Indicators
-
-```
-┌───────────────────────────────────┐
-│ ┌───────────────────────────────┐ │
-│ │ Workspace Header              │ │
-│ │ [Team Name] [dropdown]        │ │
-│ └───────────────────────────────┘ │
-│ ┌───────────────────────────────┐ │
-│ │ [Search...]                   │ │
-│ └───────────────────────────────┘ │
-│                                   │
-│ ▼ Channels                        │
-│   # general                       │
-│   # engineering        [3]  ◀── Unread badge
-│   # random                        │
-│                                   │
-│ ▼ Private                         │
-│   🔒 leadership                   │
-│   🔒 hiring           [12]        │
-│                                   │
-│ ▼ Direct Messages                 │
-│   ● Alice             [5]   ◀── Online indicator
-│   ○ Bob                     ◀── Offline indicator
-│   ● Carol, Dave                   │
-│                                   │
-└───────────────────────────────────┘
-```
-
-**Channel Section Component:**
+### Channel sidebar
 
 | Element | Behavior |
 |---------|----------|
 | Chevron | Toggles section expansion |
-| # icon | Public channel |
-| Lock icon | Private channel |
-| Presence dot | Online (green) / Offline (hollow) |
+| `#` / lock icon | Public / private channel |
+| Presence dot | Online (green) / offline (hollow) |
 | Unread badge | Red pill with count |
-| Active state | Blue background when selected |
-| Bold text | Indicates unread messages |
+| Bold text | Unread messages present |
+| Blue background | Currently selected channel |
+
+Unread counts are derived from each channel's `last_read_at` cursor against the
+latest message id, computed once per channel in a selector rather than stored
+as a separate counter. A stored counter would need to be decremented on read,
+incremented on receive, and reconciled on reconnect — three places to drift.
+Deriving it means the badge is always consistent with the messages actually in
+the store, at the cost of recomputing on every message arrival, which is cheap
+relative to the render it triggers anyway.
 
 ---
 
-## Performance Optimizations
+## ⚡ Performance Optimizations
 
 ### 1. Selective Store Subscriptions
 
@@ -501,7 +423,7 @@ Messages are wrapped in React.memo with custom comparison:
 
 ---
 
-## Accessibility (a11y)
+## ♿ Accessibility (a11y)
 
 ### Keyboard Navigation
 
@@ -543,7 +465,7 @@ Messages are wrapped in React.memo with custom comparison:
 
 ---
 
-## Trade-offs Summary
+## ⚖️ Trade-offs Summary
 
 | Decision | Pros | Cons |
 |----------|------|------|
@@ -555,7 +477,7 @@ Messages are wrapped in React.memo with custom comparison:
 
 ---
 
-## Future Frontend Enhancements
+## 🚀 Future Frontend Enhancements
 
 1. **Rich Text Editor**: WYSIWYG with markdown support
 2. **Drag & Drop Files**: Upload by dropping anywhere

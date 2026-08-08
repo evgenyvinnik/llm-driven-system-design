@@ -615,7 +615,10 @@ async function startBackend(projectDir, config) {
   // the only symptom the harness otherwise shows is "may not be fully ready" followed
   // by Vite proxy errors, which says nothing about the actual cause — the stack trace
   // scrolls past in a stream we were filtering for the word "error".
-  const backendLogPath = path.join(projectDir, 'screenshots', 'backend-startup.log');
+  // Kept out of screenshots/ deliberately: that directory is committed documentation,
+  // and writing a debug log there left a stray backend-startup.log in every project
+  // the harness had ever run against.
+  const backendLogPath = path.join(projectDir, '.screenshot-logs', 'backend-startup.log');
   fs.mkdirSync(path.dirname(backendLogPath), { recursive: true });
   const backendLog = fs.createWriteStream(backendLogPath, { flags: 'w' });
   child.stdout.on('data', (data) => backendLog.write(data));

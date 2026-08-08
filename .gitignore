@@ -71,3 +71,4 @@ pnpm-lock.yaml
 playwright-report/
 test-results/
 .playwright/
+.screenshot-logs/

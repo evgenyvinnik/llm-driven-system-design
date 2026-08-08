@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { Client } from '@elastic/elasticsearch';
+import { initializeElasticsearch } from './services/elasticsearch.js';
 
 const { Pool } = pg;
 
@@ -43,6 +44,11 @@ const pool = new Pool({
 const esClient = new Client({
   node: process.env.ES_URL || 'http://localhost:9200',
 });
+
+// Index definitions are owned by the search service, not duplicated here — the
+// seed must create indices with exactly the mappings and analyzer settings the
+// search path expects.
+
 
 // Sample data
 const sampleApps: SampleApp[] = [
@@ -102,6 +108,18 @@ async function seed(): Promise<void> {
   console.log('Seeding database...');
 
   try {
+    // Create the indices before writing a single document.
+    //
+    // Indexing into an index that doesn't exist makes Elasticsearch auto-create
+    // it with a dynamic mapping and *default settings* — which means no
+    // edge_ngram_analyzer, because analyzers live in index settings and settings
+    // can only be set at creation. The seed normally runs before the API server
+    // boots, so without this the analyzer the whole prefix-search design depends
+    // on silently never exists, and the ranking fields the cross-index
+    // function_score references go unmapped, failing every search outright.
+    console.log('Ensuring Elasticsearch indices exist...');
+    await initializeElasticsearch(esClient);
+
     // Seed applications
     console.log('Seeding applications...');
     for (const app of sampleApps) {
