@@ -143,3 +143,16 @@ headers: {
 3. **Settlement Engine**: Batch payout processing
 4. **Currency Conversion**: Real-time FX rates
 5. **PCI Compliance**: Card vault isolation
+
+---
+
+## Iteration & Repair Log
+
+- **2026-08-07 — the dashboard had never been screenshotted logged in.** All five screenshots were the API-key sign-in page. Two causes:
+  1. **The seed crashed partway through on invalid UUIDs.** `db-seed/seed.sql` used Stripe-style prefixed identifiers — `pi-11111111-…`, `ch-…`, `pm-…`, `we-…` — as values for `uuid` columns. Postgres rejects `pi-11111111-1111-1111-1111-111111111111` with `invalid input syntax for type uuid`, so the merchant rows landed but everything after the payment-methods insert did not. Rewrote 59 identifiers to encode the type in the leading hex nibble instead (`pi`→`e`, `ch`→`c`, `pm`→`d`, `we`→`f`), which keeps them valid UUIDs, keeps them unique, and keeps them readable at a glance. The prefixed form belongs on the *API-facing* object id (`pi_abc123`), not on the database primary key — conflating the two is what broke it.
+  2. **The screenshot config had `auth.enabled: false`.** This app authenticates with a single merchant API key rather than email + password, so the harness's default two-field login didn't apply and had simply been switched off. The harness already supports `passwordSelector: false` for single-credential forms; the config now uses it with the seeded `sk_test_demo_merchant_key_12345`.
+- **Harness false negative worth knowing about:** the run still prints "Login form still present after submit — login may have failed" and writes `debug-login-failed.png`. That debug capture shows a fully authenticated dashboard. The warning is wrong for this app, and the run is reported as successful, so treat that message as advisory here rather than as a failure signal.
+- **Screenshots:** 5 (all sign-in pages) → 5 real ones — dashboard with balance and fee breakdown, payments with mixed statuses (succeeded / failed / requires-payment), customers, balance, and webhooks.
+- **2026-08-07 (answer doc):** `system-design-answer-backend.md` was 299 lines, under the repo's 350–550 band, and had **no failure-handling section at all** — a conspicuous gap for a payments system, where the defining case is the in-doubt transaction rather than the happy path. Added a Failure Handling and Reconciliation deep dive covering the network timeout that may or may not have authorized, retrying with a persisted network reference, settlement-file reconciliation with append-only compensating entries, and a failure matrix noting that the idempotency store fails *closed*. Also added emoji section headers and renamed "Trade-offs and Alternatives" to the repo-standard "Trade-offs Summary" → 384 lines.
+
+**Note on this file's format:** the checklist sections above predate the repo's current CLAUDE.md convention (prose covering architecture, key design decisions with trade-offs, current state, and this log). They are also partly stale — "Audit logging" is listed unchecked under Phase 4 while the answer docs describe it as implemented. Worth a rewrite in the style of `slack/CLAUDE.md` or `spotlight/CLAUDE.md`.

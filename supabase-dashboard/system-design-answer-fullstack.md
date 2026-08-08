@@ -195,6 +195,85 @@ Supabase's real auth is GoTrue: JWT issuance, OAuth, email flows, MFA. Building 
 
 At the low end, this is invisible to the frontend. At the high end, it isn't: a cold project (not touched in hours) pays full connection setup on its first query of the day, which is squarely inside the frontend's job to communicate as a loading state rather than let a user believe the app is frozen.
 
+## 🔐 Deep Dive 6: Executing Arbitrary SQL Is the Product
+
+Every other system I'd design treats "user-supplied SQL reaches the database" as
+the thing to prevent. Here it's the feature. That inverts the usual security
+posture and it's worth being explicit about what replaces it.
+
+### Why the normal defence doesn't apply
+
+Parameterized queries stop injection by separating code from data. That works
+because in a normal application the *code* is ours and only the *data* is the
+user's. In a SQL editor the user supplies the code. There is no parameter
+boundary to enforce, no allowlist of statements that would leave the feature
+intact, and no parser we could write that distinguishes "legitimate `DROP
+TABLE`" from "malicious `DROP TABLE`" — because on your own database, dropping
+your own table is legitimate.
+
+> "So I stopped trying to make the SQL safe and made the *connection* safe
+> instead. The question isn't 'is this query dangerous' — many are, and that's
+> allowed. The question is 'can this query affect anything outside the project
+> it was submitted against.' That's answerable, and it's answerable in one
+> place rather than per-statement."
+
+### Where the boundary actually sits
+
+```
+   user's SQL ──▶ [ our API: authz + rate limit + timeout ]
+                            │
+                            │  connection belongs to exactly one project
+                            ▼
+                  ┌──────────────────────┐
+                  │  target database     │   ← user's own data, their blast radius
+                  │  (their credentials) │
+                  └──────────────────────┘
+
+   our metadata DB  ← never reachable from this path, separate pool, separate creds
+```
+
+Four properties carry the whole model:
+
+| Control | What it prevents |
+|---------|------------------|
+| **Connection is project-scoped** | A query can only ever touch the database the caller is authorized for — there is no connection object in that path that can reach another tenant |
+| **Separate pool and credentials for metadata** | No user SQL can read our `projects`, `users`, or stored connection secrets, because that database isn't on the other end of this socket |
+| **Statement timeout** | A runaway or deliberately expensive query burns the user's own database, then gets cut — it can't hold our worker indefinitely |
+| **Authorization before execution** | Project membership is checked against metadata before a target connection is even acquired |
+
+### What we're accepting
+
+A user can absolutely destroy their own data through this editor, and I'm
+choosing not to prevent that. Adding confirmation dialogs for destructive
+statements would mean parsing SQL to classify it, which is both unreliable
+(comments, CTEs, `DO` blocks, dynamic SQL) and a false comfort — a tool that
+warns on 90% of destructive statements teaches people to trust warnings that
+sometimes don't come.
+
+The more subtle acceptance is **resource exhaustion of the target**. A user's
+own bad query can lock their tables or exhaust their connections, and our
+per-project pool limit means they can only do it to themselves. That's the
+containment goal: blast radius equals one tenant, and that tenant is the one who
+typed the query.
+
+> "The one thing I would not ship without is the credential-storage story. We
+> hold connection passwords for databases we don't own, which makes our
+> metadata database a far more attractive target than any single tenant's data.
+> Those need envelope encryption with a KMS-held key rather than sitting in a
+> column — and notably, that risk is created entirely by the convenience of
+> saving connections, not by the SQL editor everyone worries about first."
+
+### The SSRF connection
+
+This is also why the SSRF mitigation noted below matters more than it first
+appears. "Add a project" and "run SQL" compose: if an attacker can point a
+project at an internal host, the SQL editor becomes an interactive client for
+it. Neither feature is dangerous alone; validating the host at connection-add
+time is what keeps them from combining.
+
+---
+
+
 ## 🎨 Perceived Performance Details
 
 A handful of UX choices exist specifically to make backend latency (introspection round trips, connection setup, query execution) feel smaller than it measures:

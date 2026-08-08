@@ -29,6 +29,34 @@
       "path": "/",
       "waitFor": "main, h2",
       "delay": 1000
+    },
+    {
+      "name": "03-table-editor",
+      "path": "/project/9a000001-0000-0000-0000-000000000001/tables",
+      "delay": 2000,
+      "click": [
+        "text=products"
+      ],
+      "clickDelay": 2200
+    },
+    {
+      "name": "04-sql-editor",
+      "path": "/project/9a000001-0000-0000-0000-000000000001/sql",
+      "delay": 2500,
+      "click": [
+        "button:has-text('Run')"
+      ],
+      "clickDelay": 2500
+    },
+    {
+      "name": "05-auth-users",
+      "path": "/project/9a000001-0000-0000-0000-000000000001/auth",
+      "delay": 2500
+    },
+    {
+      "name": "06-project-settings",
+      "path": "/project/9a000001-0000-0000-0000-000000000001/settings",
+      "delay": 2200
     }
   ],
   "viewport": {
