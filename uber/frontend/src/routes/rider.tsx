@@ -22,6 +22,7 @@ import { FareEstimate } from '../types';
  */
 function RiderPage() {
   const user = useAuthStore((state) => state.user);
+  const authResolved = useAuthStore((state) => state.authResolved);
   const logout = useAuthStore((state) => state.logout);
   const navigate = useNavigate();
 
@@ -52,10 +53,14 @@ function RiderPage() {
 
   // Check authentication
   useEffect(() => {
+    // Only the token is persisted, so `user` is null on every page load until
+    // checkAuth resolves. Redirecting before then bounces authenticated
+    // users to /login on any reload or deep link.
+    if (!authResolved) return;
     if (!user || user.userType !== 'rider') {
       navigate({ to: '/login' });
     }
-  }, [user, navigate]);
+  }, [user, authResolved, navigate]);
 
   // Simulate getting current location
   useEffect(() => {

@@ -485,21 +485,15 @@ Idempotency Cache (String with TTL):
 
 ### 💵 Fare Calculation
 
-```
-Base Fare Components:
-├─▶ Base fee (varies by vehicle type)
-├─▶ Per-km rate × distance
-├─▶ Per-minute rate × duration
-└─▶ Multiply total by surge multiplier
+Fare is base fee + (per-km rate × distance) + (per-minute rate × duration), with
+the whole subtotal multiplied by surge. An economy ride of 5km over 15 minutes
+at 1.5× comes to $12.38 from an $8.25 base.
 
-Example (Economy):
-├─▶ Base: $2.00
-├─▶ Distance: 5km × $0.80 = $4.00
-├─▶ Duration: 15min × $0.15 = $2.25
-├─▶ Subtotal: $8.25
-├─▶ Surge: 1.5x
-└─▶ Final: $12.38
-```
+> "Surge multiplies the *total* rather than only the base fee, because the point
+> is to move the whole price signal — a multiplier that only touched a $2 base
+> fee wouldn't change anyone's behaviour. The rider sees the multiplier before
+> confirming, which matters more than the arithmetic: an opaque surge is
+> indistinguishable from a bug."
 
 ---
 
@@ -515,25 +509,13 @@ Example (Economy):
 | WebSocket | Client polls every 5 seconds |
 | RabbitMQ | Queue in Redis, process later |
 
-### 📊 Graceful Degradation Matrix
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  Failure → Mitigation                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  Redis Cluster Down:                                         │
-│  └─▶ Fall back to PostgreSQL geo queries (10x slower)       │
-│                                                              │
-│  Payment Gateway Timeout:                                    │
-│  └─▶ Mark payment "pending", queue for retry, allow rider   │
-│      to exit vehicle                                         │
-│                                                              │
-│  WebSocket Servers Down:                                     │
-│  └─▶ Clients automatically fall back to HTTP polling        │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
+> "The pattern across that table: every dependency failure costs a feature, not
+> the ride. Redis going down makes matching slower, not impossible. A payment
+> timeout still lets the rider get out of the car — we'd rather chase the money
+> asynchronously than hold someone in a vehicle over a gateway blip. The one I'd
+> defend hardest is completing the ride on payment failure: the alternative
+> couples a physical event we don't control to a network call we don't control,
+> and that's a worse failure than a retry queue."
 
 ---
 

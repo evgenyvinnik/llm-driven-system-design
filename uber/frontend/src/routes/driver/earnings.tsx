@@ -16,18 +16,23 @@ import { useDriverStore } from '../../stores/driverStore';
  */
 function DriverEarningsPage() {
   const user = useAuthStore((state) => state.user);
+  const authResolved = useAuthStore((state) => state.authResolved);
   const navigate = useNavigate();
   const { earnings, fetchEarnings, isLoading } = useDriverStore();
   const [period, setPeriod] = useState('today');
 
   useEffect(() => {
+    // Only the token is persisted, so `user` is null on every page load until
+    // checkAuth resolves. Redirecting before then bounces authenticated
+    // users to /login on any reload or deep link.
+    if (!authResolved) return;
     if (!user || user.userType !== 'driver') {
       navigate({ to: '/login' });
       return;
     }
 
     fetchEarnings(period);
-  }, [user, navigate, fetchEarnings, period]);
+  }, [user, authResolved, navigate, fetchEarnings, period]);
 
   /**
    * Format cents as USD currency string.

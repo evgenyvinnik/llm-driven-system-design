@@ -17,6 +17,15 @@ interface AuthState {
   isLoading: boolean;
   /** Error message from the last failed authentication attempt */
   error: string | null;
+  /**
+   * Whether the initial session-restore attempt has finished.
+   *
+   * Only the token is persisted, so `user` is always null on a fresh page load
+   * until `checkAuth` resolves. Route guards must wait for this flag rather
+   * than reading `user` directly, or they redirect authenticated users to
+   * /login on every reload and deep link.
+   */
+  authResolved: boolean;
 
   /**
    * Authenticate user with email and password.
@@ -95,6 +104,7 @@ export const useAuthStore = create<AuthState>()(
       token: null,
       isLoading: false,
       error: null,
+      authResolved: false,
 
       login: async (email: string, password: string) => {
         set({ isLoading: true, error: null });
@@ -104,7 +114,7 @@ export const useAuthStore = create<AuthState>()(
           const token = result.token;
 
           localStorage.setItem('token', token);
-          set({ user, token, isLoading: false });
+          set({ user, token, isLoading: false, authResolved: true });
 
           // Connect WebSocket for real-time updates
           wsService.connect(token).catch(console.error);
@@ -163,21 +173,21 @@ export const useAuthStore = create<AuthState>()(
       checkAuth: async () => {
         const token = localStorage.getItem('token');
         if (!token) {
-          set({ user: null, token: null });
+          set({ user: null, token: null, authResolved: true });
           return;
         }
 
         try {
           const result = await api.auth.me();
           const user = result.user as User;
-          set({ user, token });
+          set({ user, token, authResolved: true });
 
           // Reconnect WebSocket with existing token
           wsService.connect(token).catch(console.error);
         } catch {
           // Token invalid or expired - clear session
           localStorage.removeItem('token');
-          set({ user: null, token: null });
+          set({ user: null, token: null, authResolved: true });
         }
       },
 

@@ -2,7 +2,7 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## 1. Requirements Clarification (3 minutes)
+## ✅ 1. Requirements Clarification (3 minutes)
 
 ### Functional Requirements
 - **Tweet**: Post 280-character messages with media references
@@ -25,7 +25,7 @@
 
 ---
 
-## 2. High-Level Architecture (5 minutes)
+## 🏗️ 2. High-Level Architecture (5 minutes)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -77,7 +77,88 @@
 
 ---
 
-## 3. The Fanout Problem and Hybrid Solution (10 minutes)
+## 🧮 Capacity Estimation
+
+Two numbers decide the whole architecture, so I want them on the table before
+the design.
+
+| Metric | Estimate | Derivation |
+|--------|----------|------------|
+| Daily active users | 200M | — |
+| Tweets/day | 200M | ~1 per DAU |
+| Tweet write rate | **2.3K/s** avg, ~12K/s peak | 200M ÷ 86,400, ×5 for peak |
+| Timeline reads | **230K/s** | 100:1 read:write |
+| Avg followers | ~200 | long-tail distribution |
+| Fanout writes | **~460K/s** average | write rate × avg followers |
+| Tweet storage | ~60 GB/day raw | 200M × ~300 bytes |
+
+The ratio that matters isn't the tweet rate — 2.3K writes/s is unremarkable and
+a single Postgres node would manage it. It's the **fanout amplification**: each
+of those writes becomes ~200 timeline insertions, so the system is really doing
+half a million writes per second, and that's the *average*. The distribution is
+what breaks it.
+
+> "Average followers is a useless statistic here, and saying so is half the
+> design. The distribution is extremely long-tailed — the median user has a few
+> hundred followers, and a handful have tens of millions. If I size fanout
+> against the average I'll be right for 99.9% of tweets and catastrophically
+> wrong for the ones that matter most, because the accounts with 50M followers
+> are also the ones whose tweets people are waiting for. Any architecture that
+> treats all users the same is choosing to fail on the visible cases."
+
+### Read path
+
+At 230K timeline reads/s, the timeline cannot be a query. Assembling a timeline
+by joining follows to tweets and sorting means touching hundreds of partitions
+per request, at a rate three orders of magnitude above the write rate. The
+timeline has to be a **precomputed list** that a read simply slices — which is
+what makes fanout-on-write attractive, and what makes the celebrity case a
+genuine dilemma rather than a detail.
+
+### Memory for cached timelines
+
+Holding ~800 tweet IDs per active user, at 8 bytes each plus overhead, is
+roughly 10 KB per user. For 200M DAU that's ~2 TB of Redis — real money, and
+the reason timelines are capped rather than unbounded, and why inactive users
+are evicted rather than maintained.
+
+---
+
+## 📈 Scalability: What Breaks First
+
+1. **Celebrity fanout** is the first and most visible failure. A 50M-follower
+   account at 10K writes/s takes 83 minutes to fan out — the tweet is stale
+   before most followers receive it. This is why the design is hybrid rather
+   than pure push: above a follower threshold, we stop pushing and let readers
+   pull. The threshold is the tuning knob, and it's a genuine trade — lower it
+   and read cost rises for everyone following those accounts; raise it and
+   fanout latency spikes.
+
+2. **Redis memory for timelines** goes next, at ~2 TB for the active set. Fixes
+   in order of cost: cap timeline length (800 entries covers any realistic
+   scroll), evict inactive users and rebuild lazily on their return, then shard
+   the timeline cache by user ID.
+
+3. **The tweets table** — 60 GB/day of raw tweets, before indexes and
+   replication. Partition by time so recent data stays hot and old partitions
+   can move to cheaper storage; a timeline read almost never reaches back past
+   the newest partition.
+
+4. **Trend computation** is last and least urgent, because it degrades
+   gracefully: trends that are five minutes stale are still useful, whereas a
+   timeline that's five minutes stale is broken. That asymmetry is why trends
+   run off a sampled stream rather than every tweet.
+
+> "The ordering matters as much as the list. Celebrity fanout breaks first *and*
+> it's the one users notice, so it gets architectural treatment — a whole second
+> code path — rather than a tuning parameter. Trend staleness breaks last and
+> nobody notices, so it gets sampling. I'd rather spend complexity where the
+> failure is visible."
+
+---
+
+
+## 🔧 3. Deep Dive: The Fanout Problem and Hybrid Solution (10 minutes)
 
 This is Twitter's defining backend challenge: When a user tweets, all followers must see it.
 
@@ -135,7 +216,7 @@ Celebrity status is automatically managed via a database trigger on the follows 
 
 ---
 
-## 4. Database Schema and Indexing (8 minutes)
+## 💾 4. Database Schema and Indexing (8 minutes)
 
 ### Core Tables
 
@@ -164,7 +245,7 @@ A single trigger function fires after every INSERT or DELETE on the follows tabl
 
 ---
 
-## 5. Redis Caching Strategy (5 minutes)
+## ⚡ 5. Deep Dive: Redis Caching Strategy (5 minutes)
 
 ### Data Structures
 
@@ -191,7 +272,7 @@ To check if user A follows user B, we first check the Redis set `following:{user
 
 ---
 
-## 6. Real-Time Trend Detection (5 minutes)
+## 📈 6. Deep Dive: Real-Time Trend Detection (5 minutes)
 
 ### Sliding Window Algorithm
 
@@ -209,7 +290,7 @@ To generate the trending list, we query PostgreSQL for all distinct hashtags app
 
 ---
 
-## 7. Failure Handling and Resilience (5 minutes)
+## 🛡️ 7. Failure Handling and Resilience (5 minutes)
 
 ### Idempotency Keys for Tweet Creation
 
@@ -235,7 +316,7 @@ The home timeline endpoint implements a fallback chain: it first attempts to rea
 
 ---
 
-## 8. Summary (3 minutes)
+## 📌 8. Summary (3 minutes)
 
 ### Key Backend Decisions
 

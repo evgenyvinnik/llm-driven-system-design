@@ -162,35 +162,24 @@ User types "wea"
 
 ## 🔍 Deep Dive
 
-### Deep Dive 1: API Contract and Type Sharing
+### Supporting Decision: API Contract
 
-"The API contract is the critical integration point. Let me discuss how we share types between frontend and backend."
+Shared TypeScript types in a monorepo rather than OpenAPI codegen or GraphQL —
+one TypeScript client means codegen buys nothing, and OpenAPI can be generated
+from the same types later if a mobile client appears.
 
-**Trade-off: Shared TypeScript Types vs OpenAPI Codegen**
+The transport choice matters more than the type-sharing one:
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Shared TypeScript Types (Monorepo)** | Simple setup, instant IDE support, refactor-friendly | Only works for TypeScript clients, requires monorepo |
-| **OpenAPI/Swagger Codegen** | Multi-language clients, formal contract, API documentation | More tooling, generated code can be verbose |
-| **GraphQL Schema** | Strong typing, introspection, single endpoint | Overkill for simple suggest API, learning curve |
+> "REST with query parameters, specifically because the URL becomes the cache
+> key. `/api/v1/suggestions?q=wea&limit=5` is cacheable by the browser, a
+> service worker, and any CDN in between, with no configuration. GraphQL posts
+> to a single endpoint with the query in the body, so every intermediary sees
+> the same URL and none of them can cache it. For a system whose entire
+> performance story rests on an 80%+ cache hit rate before the request ever
+> reaches us, giving that up for field-selection flexibility we don't need
+> would be trading the main thing for a minor thing."
 
-**Decision: Shared TypeScript Types**
-
-> "Since we're a TypeScript monorepo with one frontend client, I'd use shared types in a common package. This gives us instant type safety with zero codegen overhead. If we later need mobile clients, we can add OpenAPI generation from those same types."
-
-**Trade-off: REST vs GraphQL for Suggestions API**
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| **REST with query params** | Simple, CDN-cacheable with URL as key, widely understood | Less flexible for complex queries |
-| **GraphQL** | Flexible field selection, single endpoint, introspection | Harder to cache at CDN, more complex setup |
-| **gRPC** | High performance, streaming support | Not browser-friendly without proxy |
-
-**Decision: REST with Query Parameters**
-
-> "For typeahead, REST is ideal because the CDN can cache based on the URL. A request like `/api/v1/suggestions?q=wea&limit=5` becomes a simple cache key. GraphQL's POST requests make CDN caching much harder, and we need that 80%+ cache hit rate."
-
-### Deep Dive 2: Multi-Layer Caching Architecture
+### Deep Dive 1: Multi-Layer Caching Architecture
 
 "Achieving sub-50ms latency requires caching at every layer. Let me walk through the cache hierarchy."
 
@@ -232,7 +221,7 @@ User types --> [Frontend Memory] --> [Service Worker] --> [CDN Edge]
 
 > "For typeahead, multi-layer is worth the complexity because users expect instant responses. Memory cache gives 0ms for repeated prefixes. Service worker enables stale-while-revalidate. IndexedDB provides offline. CDN reduces origin load. Redis prevents trie pressure. Each layer serves a purpose."
 
-### Deep Dive 3: Trie with Pre-computed Top-K
+### Deep Dive 2: Trie with Pre-computed Top-K
 
 "The core data structure is a trie with pre-computed suggestions at each node."
 
@@ -277,7 +266,7 @@ Trie Structure with Pre-computed Top-K
 
 > "I'd pre-compute top-10 suggestions at each node. With 1 billion phrases and average 10-character prefixes, we're storing roughly 10 billion node-suggestion pairs. That's a lot of memory, but lookup is O(prefix_length) which is typically 3-5 characters. For a latency-critical system, I'll trade memory for speed."
 
-### Deep Dive 4: Sharding Strategy
+### Supporting Decision: Sharding Strategy
 
 "With 1 billion phrases, we need to shard the trie across multiple servers."
 
@@ -310,7 +299,7 @@ Letter 's' is hot --> Sub-shard by second character
 
 > "I'd shard by first character because all prefixes starting with 's' go to the same shard - no scatter-gather needed. The downside is letters like 's' and 'a' are hotter than 'x' or 'z'. I'd handle this with sub-sharding: if 's' is overloaded, split it into 's-a-m' and 's-n-z'. This maintains prefix locality while addressing hot spots."
 
-### Deep Dive 5: Request Reduction Strategy
+### Deep Dive 3: Request Reduction Strategy
 
 "We need to minimize requests at every layer to hit our latency targets."
 
@@ -352,7 +341,7 @@ When user backspaces "wea" -> "we":
 
 > "I'd use 150ms debounce with immediate first character. User types 'w' - immediate request. Types 'we' within 150ms - debounced. Pauses - request fires. This balances responsiveness with request reduction. Combined with prefix caching, we often serve from memory cache anyway."
 
-### Deep Dive 6: Multi-Factor Ranking
+### Supporting Decision: Multi-Factor Ranking
 
 "Ranking combines multiple signals. The backend does heavy lifting, frontend adds personalization."
 
@@ -393,7 +382,7 @@ Final: [weather, wear, wealth, weapon, weave]
 
 > "I'd start with a weighted formula because it's explainable - we can debug why 'weather' ranked above 'wealth'. We tune weights through A/B testing on click-through rate. If we hit a ceiling, we can add ML to learn optimal weights or introduce neural ranking. Don't over-engineer on day one."
 
-### Deep Dive 7: Real-Time Aggregation Pipeline
+### Supporting Decision: Real-Time Aggregation Pipeline
 
 "To surface trending topics within 5 minutes, we need a real-time aggregation pipeline."
 
@@ -441,7 +430,7 @@ User selects      Query Log        Kafka Topic     Stream Processor
 
 > "For logging completed searches, I'd use `navigator.sendBeacon`. It's non-blocking - the user clicks a result, we log it, they navigate away. The beacon still sends. If sendBeacon isn't available, fall back to fetch with keepalive. We don't need the response, so fire-and-forget is perfect."
 
-### Deep Dive 8: Error Handling and Graceful Degradation
+### Supporting Decision: Error Handling and Graceful Degradation
 
 "The system must degrade gracefully when components fail."
 
@@ -477,46 +466,20 @@ Fallback 3: Empty response (frontend shows history)
 
 > "I'd implement circuit breakers around the trie service and ranking service. After 5 failures in 30 seconds, the circuit opens and we fail fast to fallback. This prevents a struggling trie from taking down the whole system. For transient network blips, we retry once with 50ms delay before tripping the breaker."
 
-### Deep Dive 9: Frontend Offline Support
+### Supporting Decision: Offline Support
 
-"Users should get suggestions even without network."
+The service worker keeps API responses in a cache separate from static assets,
+and the client persists popular prefixes plus the user's own history so a
+keystroke offline still produces a list.
 
-```
-Offline Architecture
-====================
-
-Online:
-  API Response --> Memory Cache --> IndexedDB (background sync)
-                                         |
-                                         v
-                              Serialize popular prefixes
-                              + local trie subset
-
-Offline:
-  User types --> Memory Cache --> IndexedDB Trie --> Local History
-     |               |                |                  |
-     v               v                v                  v
-  [Check]         [HIT?]          [Lookup]           [Merge]
-     |               |                |                  |
-     +---------------+----------------+------------------+
-                               |
-                               v
-                       Render suggestions
-```
-
-**Trade-off: Full Trie Download vs Popular Prefixes Only**
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Full trie download** | Complete offline | Massive download (GBs) |
-| **Top 10K queries** | Small download, covers 80% | Long-tail queries fail |
-| **User-personalized subset** | Relevant to user | Requires user model |
-
-**Decision: Popular Prefixes + User History**
-
-> "I'd sync the top 10,000 queries covering 80% of searches - that's maybe 500KB compressed. Plus the user's own search history. This gives good offline coverage for common queries and personal queries. For rare queries offline, we show 'no suggestions' gracefully."
-
----
+> "We cache popular prefixes rather than shipping the whole trie. A full
+> download would make offline results as good as online ones, but the corpus is
+> the entire query log — it isn't a payload you can put on a phone. Popular
+> prefixes plus personal history covers what someone actually retypes, which is
+> the realistic offline case: they're re-running a search they've run before,
+> not exploring the long tail. The honest limitation is that offline results
+> can't include trending, because trending is a *rate* measured over the last
+> hour and an offline client has no way to know what the last hour looked like."
 
 ## ⚖️ Trade-offs Summary
 

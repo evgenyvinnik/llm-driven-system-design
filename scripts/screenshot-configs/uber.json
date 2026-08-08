@@ -35,6 +35,47 @@
       "path": "/driver",
       "waitFor": "main",
       "delay": 500
+    },
+    {
+      "name": "04-fare-estimates",
+      "path": "/rider",
+      "delay": 2000,
+      "steps": [
+        {
+          "fill": "input[placeholder='Enter pickup address']",
+          "value": "350 5th Ave, New York",
+          "delay": 500
+        },
+        {
+          "click": "button:has-text('Set')",
+          "nth": 0,
+          "delay": 900
+        },
+        {
+          "fill": "input[placeholder='Enter destination']",
+          "value": "1 World Trade Center, New York",
+          "delay": 500
+        },
+        {
+          "click": "button:has-text('Set')",
+          "nth": 1,
+          "delay": 2800
+        }
+      ]
+    },
+    {
+      "name": "05-rider-history",
+      "path": "/rider/history",
+      "delay": 2500
+    },
+    {
+      "name": "06-driver-earnings",
+      "path": "/driver/earnings",
+      "delay": 2500,
+      "loginAs": {
+        "email": "driver1@test.com",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {

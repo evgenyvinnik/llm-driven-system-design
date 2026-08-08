@@ -35,6 +35,27 @@
       "path": "/orders",
       "waitFor": "main",
       "delay": 500
+    },
+    {
+      "name": "04-seat-map",
+      "path": "/",
+      "delay": 2000,
+      "click": [
+        "a[href^='/events/'] >> nth=1"
+      ],
+      "clickDelay": 3000
+    },
+    {
+      "name": "05-seat-selected",
+      "path": "/",
+      "delay": 2000,
+      "click": [
+        "a[href^='/events/'] >> nth=1",
+        "text=Block A1",
+        "button[title^='Row'] >> nth=4"
+      ],
+      "clickDelay": 2000,
+      "fullPage": true
     }
   ],
   "viewport": {

@@ -2,13 +2,13 @@
 
 *45-minute system design interview format - Backend Engineer Position*
 
-## Introduction (2 minutes)
+## 🎯 Introduction (2 minutes)
 
 "Thanks for this challenge. I'll be designing an event ticketing platform like Ticketmaster, with a focus on the backend systems that handle extreme traffic spikes during high-demand on-sales. The core challenges are distributed locking for seat reservation, queue management for fairness, and ensuring zero overselling through proper database design."
 
 ---
 
-## 1. Requirements Clarification (5 minutes)
+## ✅ 1. Requirements Clarification (5 minutes)
 
 ### Functional Requirements
 
@@ -36,7 +36,7 @@
 
 ---
 
-## 2. Scale Estimation (3 minutes)
+## 🧮 2. Scale Estimation (3 minutes)
 
 ### Traffic Patterns
 
@@ -70,7 +70,7 @@ Expected concurrent seat locks: 10,000 during peak
 
 ---
 
-## 3. High-Level Architecture (5 minutes)
+## 🏗️ 3. High-Level Architecture (5 minutes)
 
 ```
                             ┌─────────────────┐
@@ -102,7 +102,7 @@ Expected concurrent seat locks: 10,000 during peak
 
 ---
 
-## 4. Database Schema Design (8 minutes)
+## 💾 4. Database Schema Design (8 minutes)
 
 ### Core Tables
 
@@ -130,7 +130,7 @@ Expected concurrent seat locks: 10,000 during peak
 
 ---
 
-## 5. Deep Dive: Two-Phase Distributed Locking (10 minutes)
+## 🔒 5. Deep Dive: Two-Phase Distributed Locking (10 minutes)
 
 ### Problem Statement
 
@@ -183,7 +183,7 @@ The full reservation combines both phases with rollback handling:
 
 ---
 
-## 6. Deep Dive: Virtual Waiting Room Queue (8 minutes)
+## 🚪 6. Deep Dive: Virtual Waiting Room Queue (8 minutes)
 
 ### Queue Data Structures in Redis
 
@@ -205,7 +205,7 @@ A background worker runs every 5 seconds, polling for all high-demand events cur
 
 ---
 
-## 7. Idempotent Checkout (5 minutes)
+## 💳 7. Idempotent Checkout (5 minutes)
 
 ### Idempotency Key Strategy
 
@@ -225,7 +225,7 @@ If the transaction fails, it rolls back and the error propagates. The idempotenc
 
 ---
 
-## 8. Background Jobs and Cleanup (3 minutes)
+## 🧹 8. Background Jobs and Cleanup (3 minutes)
 
 ### Expired Hold Cleanup Worker
 
@@ -248,7 +248,7 @@ When the breaker opens, it logs a critical error with the failure count for aler
 
 ---
 
-## 9. Caching Strategy (3 minutes)
+## ⚡ 9. Caching Strategy (3 minutes)
 
 ### Dynamic TTL Based on Event Status
 
@@ -271,7 +271,72 @@ The read path follows cache-aside: check Redis first, on miss query PostgreSQL f
 
 ---
 
-## 10. Observability (2 minutes)
+## 🛡️ Failure Handling and What Breaks First
+
+An on-sale is the one moment this system is under real load, so I want to be
+specific about which component gives way first and what the user sees when it
+does.
+
+### Failure matrix
+
+| Failure | Behavior | User impact |
+|---------|----------|-------------|
+| **Redis down** | Seat locks unavailable; reservations rejected outright | Cannot buy — browsing and order history still work |
+| **Postgres down** | Everything write-path fails | Hard outage; this is the source of truth |
+| **Payment provider down** | Circuit breaker opens, fails fast | "Payment unavailable, your seats are still held" — the hold outlives the outage |
+| **Lock contention on a hot seat** | `NOWAIT` returns immediately | "That seat just went — pick another", instantly, not a spinner |
+| **API instance dies mid-hold** | Hold survives in `event_seats.held_until` | Nothing; the sweeper releases it on schedule |
+| **Redis flushed mid-sale** | Locks vanish, but DB rows still say `held` | No overselling — the transaction re-verifies under `FOR UPDATE NOWAIT` |
+
+The pattern: **the durable state is in Postgres and the fast state is in Redis,
+so every Redis failure costs availability and none of them cost correctness.**
+Losing Redis stops sales; it never sells the same seat twice.
+
+> "The one I'd flag in review is Redis being a hard dependency for reservations.
+> There's an advisory-lock fallback written and it isn't wired into the main
+> path. I'd argue that's defensible — refusing to sell is a *safe* failure, and
+> a half-tested fallback engaging for the first time during the highest-stakes
+> ten minutes of the year is how you turn an outage into an overselling
+> incident. But it should be a deliberate choice, not an accident."
+
+### What breaks first, in order
+
+1. **The waiting-room admission rate, under horizontal scaling.** The queue
+   processor is an in-process interval. Run three API instances and three
+   processors admit from the same sorted set, so the effective rate is 3× the
+   configured one — and the `maxConcurrent` check is a `SCARD` followed by a
+   `ZRANGE` as separate round-trips, so instances race and the active set
+   overshoots. This is the first thing that breaks and it breaks *quietly*:
+   admission control that admits too many looks fine until the seat map falls
+   over. The fix is a single Lua script for the admit decision plus a
+   leader-elected or dedicated worker.
+
+2. **Cache invalidation.** Every reservation calls `KEYS availability:{id}:*`,
+   which is O(keyspace) and blocks Redis while it runs. At seed scale it's
+   invisible; during an on-sale it means the hottest write path takes a global
+   lock on the component every other path depends on. A per-event version
+   counter folded into the cache key removes the scan entirely.
+
+3. **The expiry sweeper.** It issues one `UPDATE` per expired seat in a loop.
+   When a 20,000-seat event's holds lapse together, that's 20,000 statements on
+   a 60-second timer. Set-based, it's one statement.
+
+4. **Lock acquisition order.** `acquireSeatLocks` takes locks in whatever order
+   the client sent the seat IDs, so two buyers requesting {A,B} and {B,A} can
+   each hold one. That isn't a deadlock only because acquisition is bounded —
+   three retries with jittered backoff, then release everything. It's
+   livelock-free by fail-fast rather than by discipline; sorting the IDs before
+   acquiring makes it correct by construction and costs nothing.
+
+> "Notice that three of those four only appear under load or under horizontal
+> scaling — which is exactly the condition this product exists for. A ticketing
+> system that works fine on one instance with ten users has not been tested at
+> all."
+
+---
+
+
+## 📊 10. Observability (2 minutes)
 
 ### Key Metrics
 
@@ -295,7 +360,7 @@ We track four Prometheus metrics:
 
 ---
 
-## Summary
+## 📌 Summary
 
 "I've designed a backend system for high-traffic event ticketing with:
 

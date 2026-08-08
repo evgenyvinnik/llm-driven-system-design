@@ -984,6 +984,51 @@ async function captureWithPlaywright(config, outputDir) {
         }
       }
 
+      // `steps` is the general form: an ordered list of interactions applied
+      // exactly as written. `click`/`fill`/`pressEnter` above each run as a
+      // whole block, which cannot express a flow that alternates between them —
+      // fill an address, click Set, fill another, click Set again. Anything
+      // reachable only through such a sequence was previously uncapturable.
+      //
+      //   "steps": [
+      //     { "fill": "#pickup", "value": "100 Main St" },
+      //     { "click": "button:has-text('Set')" },
+      //     { "press": "#pickup", "key": "Enter" },
+      //     { "wait": 1500 }
+      //   ]
+      //
+      // Each step takes an optional "delay" (ms) applied after it.
+      if (Array.isArray(screen.steps)) {
+        for (const step of screen.steps) {
+          try {
+            if (step.wait) {
+              await page.waitForTimeout(step.wait);
+              continue;
+            }
+            // Locators rather than page.fill/click by selector string, because
+            // locators support .nth() — several of these forms have repeated
+            // controls (two "Set" buttons, one per address field) that a bare
+            // selector cannot disambiguate.
+            const target = step.fill ?? step.click ?? step.press;
+            const locator = step.nth === undefined
+              ? page.locator(target).first()
+              : page.locator(target).nth(step.nth);
+            await locator.waitFor({ state: 'visible', timeout: 8000 });
+            if (step.fill !== undefined) {
+              await locator.fill(String(step.value ?? ''));
+            } else if (step.click !== undefined) {
+              await locator.click();
+            } else if (step.press !== undefined) {
+              await locator.press(step.key || 'Enter');
+            }
+            await page.waitForTimeout(step.delay || 600);
+          } catch {
+            const target = step.fill || step.click || step.press;
+            logWarning(`Step target not found: ${target}`);
+          }
+        }
+      }
+
       // Additional delay if specified
       if (screen.delay) {
         await page.waitForTimeout(screen.delay);

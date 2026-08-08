@@ -2,13 +2,13 @@
 
 *45-minute system design interview format - Full-Stack Engineer Position*
 
-## Introduction (2 minutes)
+## 🎯 Introduction (2 minutes)
 
 "Thanks for this challenge. I'll be designing an event ticketing platform like Ticketmaster, covering both the backend systems for handling traffic spikes and preventing overselling, and the frontend experience for seat selection and checkout. The key is designing the end-to-end flow where fast Redis locks enable responsive seat selection while PostgreSQL transactions ensure no double-selling."
 
 ---
 
-## 1. Requirements Clarification (5 minutes)
+## ✅ 1. Requirements Clarification (5 minutes)
 
 ### Functional Requirements
 
@@ -35,7 +35,7 @@
 
 ---
 
-## 2. High-Level Architecture (5 minutes)
+## 🏗️ 2. High-Level Architecture (5 minutes)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -69,66 +69,60 @@
 
 ---
 
-## 3. Shared Type Definitions (5 minutes)
+## 🧩 3. The Shared Contract (5 minutes)
 
-### Core Types
+Frontend and backend import the same type definitions, so a field that changes
+shape breaks the build rather than a customer's checkout.
 
-The system uses shared TypeScript types between frontend and backend to ensure consistency:
+### Core domain objects
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        SHARED TYPES (types.ts)                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐     │
-│  │     Venue       │    │     Event       │    │     Seat        │     │
-│  ├─────────────────┤    ├─────────────────┤    ├─────────────────┤     │
-│  │ id: string      │    │ id: string      │    │ id: string      │     │
-│  │ name: string    │◀───│ venueId: string │    │ eventId: string │     │
-│  │ capacity: number│    │ eventDate: Date │    │ section: string │     │
-│  │ sectionConfig[] │    │ onSaleDate: Date│    │ row: string     │     │
-│  │                 │    │ status: enum    │    │ price: number   │     │
-│  │                 │    │ highDemand: bool│    │ status: enum    │     │
-│  └─────────────────┘    └─────────────────┘    └─────────────────┘     │
-│                                                                          │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐     │
-│  │   Reservation   │    │  QueuePosition  │    │     Order       │     │
-│  ├─────────────────┤    ├─────────────────┤    ├─────────────────┤     │
-│  │ sessionId       │    │ position: number│    │ id: string      │     │
-│  │ eventId         │    │ estimatedWait   │    │ userId: string  │     │
-│  │ seatIds[]       │    │ status: enum    │    │ status: enum    │     │
-│  │ totalAmount     │    │ - queued        │    │ totalAmount     │     │
-│  │ expiresAt: Date │    │ - active        │    │ paymentId       │     │
-│  │ status: enum    │    │ - not_in_queue  │    │ seats[]         │     │
-│  └─────────────────┘    └─────────────────┘    └─────────────────┘     │
-│                                                                          │
-│  SeatStatus: 'available' | 'held' | 'sold'                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Type | Key fields | Notes |
+|------|-----------|-------|
+| `Venue` | id, name, capacity, section config | Section templates are what per-event seat rows get materialized *from* |
+| `Event` | id, venueId, eventDate, onSaleDate, status, highDemand | `onSaleDate` drives the promotion job; `highDemand` decides whether the waiting room engages |
+| `Seat` | id, eventId, section, row, price, status | One row per physical seat per event — the unique inventory the whole design exists to protect |
+| `Reservation` | sessionId, eventId, seatIds, totalAmount, **expiresAt**, status | `expiresAt` is server-authoritative and drives the client countdown |
+| `QueuePosition` | position, estimatedWait, status (`queued` / `active` / `not_in_queue`) | The waiting room's entire client-facing surface |
+| `Order` | id, userId, status, totalAmount, paymentId, seats | Written only after payment succeeds |
 
-### API Request/Response Types
+`SeatStatus` is the three-state enum everything hinges on: `available` → `held`
+→ `sold`, with expiry returning `held` to `available`.
 
-```
-┌──────────────────────────────┐    ┌──────────────────────────────┐
-│    ReserveSeatsRequest       │    │    ReserveSeatsResponse      │
-├──────────────────────────────┤    ├──────────────────────────────┤
-│ eventId: string              │───▶│ reservation: Reservation     │
-│ seatIds: string[]            │    │ unavailableSeats: string[]   │
-└──────────────────────────────┘    └──────────────────────────────┘
+### Request and response envelopes
 
-┌──────────────────────────────┐    ┌──────────────────────────────┐
-│    CheckoutRequest           │    │    ApiResponse<T>            │
-├──────────────────────────────┤    ├──────────────────────────────┤
-│ idempotencyKey: string       │    │ success: boolean             │
-│ paymentMethod: CardDetails   │    │ data?: T                     │
-└──────────────────────────────┘    │ error?: string               │
-                                    └──────────────────────────────┘
-```
+| Endpoint | Request carries | Response carries |
+|----------|-----------------|------------------|
+| Reserve seats | eventId, seatIds | the reservation, **plus `unavailableSeats`** |
+| Checkout | idempotency key, payment method | the order |
+| All endpoints | — | `{ success, data?, error? }` |
+
+Two details in that table are load-bearing.
+
+> "`unavailableSeats` comes back as a list rather than the whole request
+> failing. During an on-sale a buyer picks four seats and loses one of them by
+> milliseconds — returning a blanket error means they start over and lose the
+> other three too, to someone else, while they're re-picking. Returning the
+> three we *did* hold plus a named list of what slipped lets the UI say 'we got
+> you A-12, A-13, A-15; A-14 just went' and keep them in the flow. Partial
+> success is the honest shape of this operation, so the type reflects it."
+
+> "`expiresAt` is an absolute server timestamp, not a duration. If I sent
+> 'expires in 600 seconds' the client would start counting from whenever the
+> response arrived, and clock skew plus network latency means their timer and
+> the server's sweeper disagree — the seat can be released while the user still
+> sees ninety seconds left, which reads as the site stealing their tickets. An
+> absolute instant lets the client render a countdown that converges on the
+> same moment the server will act."
+
+The cost of a shared type package is that the two deploys are coupled: a
+breaking change to `Seat` has to ship on both sides together, or be additive.
+For one team on one release train that's cheaper than the class of bug it
+eliminates.
 
 ---
 
-## 4. End-to-End Seat Reservation Flow (12 minutes)
+
+## 🔒 4. Deep Dive: End-to-End Seat Reservation (12 minutes)
 
 ### Sequence Diagram
 
@@ -249,33 +243,21 @@ The system uses shared TypeScript types between frontend and backend to ensure c
 
 ### Frontend: Reservation Countdown Timer
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      ReservationTimer Component                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Props: expiresAt: Date                                                  │
-│                                                                          │
-│  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐   │
-│  │ Calculate       │────▶│ Display         │────▶│ When expired    │   │
-│  │ remaining time  │     │ mm:ss           │     │ - Toast error   │   │
-│  │ every 1 second  │     │                 │     │ - Clear select  │   │
-│  └─────────────────┘     └─────────────────┘     │ - Navigate home │   │
-│                                                  └─────────────────┘   │
-│                                                                          │
-│  Visual States:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ timeRemaining >= 120s  │  Blue background, normal text          │   │
-│  ├────────────────────────┼────────────────────────────────────────┤   │
-│  │ timeRemaining < 120s   │  Red background, animate-pulse         │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The timer takes the server's absolute `expiresAt`, recomputes the remaining
+seconds once per second, and renders `mm:ss`. Under two minutes it switches to a
+red, pulsing treatment; at zero it toasts an error, clears the selection, and
+returns the user to the event.
+
+> "Recomputing from an absolute timestamp rather than decrementing a counter is
+> what keeps it honest — a decrementing timer drifts if the tab is backgrounded
+> and `setInterval` is throttled, so the user sees time remaining after the
+> server has already swept the hold. The two-minute threshold isn't cosmetic
+> either: it's the point where we want someone to either finish or release the
+> seats, and a pulsing red timer measurably moves people to decide."
 
 ---
 
-## 5. Virtual Waiting Room Flow (8 minutes)
+## 🚪 5. Deep Dive: Virtual Waiting Room (8 minutes)
 
 ### Queue Architecture
 
@@ -385,7 +367,7 @@ The system uses shared TypeScript types between frontend and backend to ensure c
 
 ---
 
-## 6. Checkout with Idempotency (8 minutes)
+## 💳 6. Deep Dive: Checkout with Idempotency (8 minutes)
 
 ### Idempotent Checkout Flow
 
@@ -444,49 +426,25 @@ The system uses shared TypeScript types between frontend and backend to ensure c
 
 ### Frontend: Checkout Page
 
-"The frontend generates a unique idempotency key when the checkout page mounts (via useRef), and reuses it for retries. This prevents double-charges even if the user clicks 'Pay' multiple times."
+The page mints one idempotency key when it mounts and holds it in a ref, so
+every retry from that page — a double-click on Pay, a resubmit after a network
+blip — carries the same key. The button disables while in flight, but the key is
+what actually guarantees safety.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       CheckoutPage Component                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Initialization:                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ idempotencyKeyRef = useRef(crypto.randomUUID())                  │   │
-│  │ (Generated once, reused for retries)                             │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  Layout:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  ┌─────────────────────────────────────────────────────────┐    │   │
-│  │  │ ReservationTimer                         [ 8:45 ]       │    │   │
-│  │  └─────────────────────────────────────────────────────────┘    │   │
-│  │                                                                 │   │
-│  │  ┌─────────────────────┐  ┌─────────────────────────────────┐  │   │
-│  │  │ Order Summary       │  │ Payment Form                    │  │   │
-│  │  │ ─────────────────── │  │ ───────────────────────────     │  │   │
-│  │  │ Section A, Row 12   │  │ Card Number: [____________]     │  │   │
-│  │  │   Seat 5   $125.00  │  │ Expiry:      [____] [____]      │  │   │
-│  │  │   Seat 6   $125.00  │  │ CVC:         [___]              │  │   │
-│  │  │ ─────────────────── │  │                                 │  │   │
-│  │  │ Subtotal:  $250.00  │  │ [        Pay $262.50        ]   │  │   │
-│  │  │ Fees:       $12.50  │  │                                 │  │   │
-│  │  │ Total:     $262.50  │  └─────────────────────────────────┘  │   │
-│  │  └─────────────────────┘                                        │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  Error Handling:                                                         │
-│  - 402: "Payment declined. Please try a different card."               │
-│  - Other: "Checkout failed. Please try again."                         │
-│  - Same idempotency key for retry (safe to re-submit)                  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+> "Generating the key on mount rather than per click is the whole trick. Per
+> click, a double-click produces two keys and two charges — the disabled button
+> is a race, not a guarantee, because the second click can land before React
+> re-renders. Minting it once ties the key to the *purchase intent* rather than
+> to a UI event.
+>
+> The backend doesn't trust this anyway: when no key arrives it derives one from
+> (session, event, sorted seat IDs), so a client that knows nothing about
+> idempotency still can't double-charge. The client key is an optimization for
+> the honest case; the derived key is the actual defense."
 
 ---
 
-## 7. Real-Time Availability Sync (5 minutes)
+## 🔄 7. Real-Time Availability Sync (5 minutes)
 
 ### Backend: Availability Endpoint
 
@@ -523,76 +481,45 @@ The system uses shared TypeScript types between frontend and backend to ensure c
 
 ### Frontend: Availability Polling Hook
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                  useAvailabilityPolling Hook                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Poll Interval:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ isOnSale = true   ──▶  5 seconds (high frequency)               │   │
-│  │ isOnSale = false  ──▶  30 seconds (low frequency)               │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  Conflict Detection:                                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ For each selectedSeat:                                           │   │
-│  │   if (prev[seatId] === 'available' &&                            │   │
-│  │       current[seatId] !== 'available') {                         │   │
-│  │     removeSeat(seatId);                                          │   │
-│  │     toast.warning('A selected seat was just taken');             │   │
-│  │   }                                                              │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  Returns: { seats, availability }                                        │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The seat map polls availability on an interval that tightens when the event is
+live — a few seconds during an on-sale, much slower otherwise — and merges the
+response into the store rather than replacing it, so a seat the user has
+selected locally isn't yanked out from under their cursor by a refresh.
+
+> "Polling rather than a WebSocket is a deliberate downgrade. A push channel
+> would be strictly fresher, but it means holding a socket per shopper for the
+> exact event where shoppers arrive by the hundred thousand — the connection
+> count becomes the scaling problem before the data does. Polling a cached
+> endpoint is absorbed by the cache layer, degrades gracefully under load, and
+> the staleness it introduces is already bounded by the same few-second TTL the
+> backend chose for correctness reasons. Reservation is what's authoritative
+> anyway: the seat map is a hint, and the reserve call is the truth."
 
 ---
 
-## 8. Background Cleanup (3 minutes)
+## 🧹 8. Background Cleanup (3 minutes)
 
 ### Expired Hold Cleanup Worker
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    cleanupExpiredHolds Worker                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Runs every 60 seconds:                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 1. UPDATE seats                                                  │   │
-│  │    SET status = 'available',                                     │   │
-│  │        held_by_session = NULL,                                   │   │
-│  │        held_until = NULL                                         │   │
-│  │    WHERE status = 'held' AND held_until < NOW()                  │   │
-│  │    RETURNING id, event_id, held_by_session                       │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 2. For each expired seat:                                        │   │
-│  │    DEL lock:seat:{event_id}:{seat_id}                            │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 3. For each affected event:                                      │   │
-│  │    DEL availability:{event_id}                                   │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 4. Log: { count: expired.length, events: eventIds.length }       │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+A job runs every 60 seconds, finds `event_seats` rows whose `held_until` has
+passed, returns them to `available`, and re-derives the event's available count
+with a `COUNT(*)` rather than incrementing a counter.
+
+> "Recomputing the count instead of decrementing is the important part. A
+> counter that's incremented and decremented by several code paths — reserve,
+> release, expire, checkout, cancel — will drift, and the drift is silent until
+> an event shows seats it can't sell or hides seats it can. Recomputing is more
+> expensive and cannot be wrong.
+>
+> The 60-second interval is the honest cost: a seat can be expired but still
+> displayed as held for up to a minute. I'd rather have that lag than make the
+> Redis key's TTL the mechanism, because when that key expires nothing tells
+> Postgres, and the row stays held forever — the seat silently vanishes from
+> the event and nobody finds out until the show."
 
 ---
 
-## 9. Trade-offs and Alternatives
+## ⚖️ 9. Trade-offs Summary
 
 | Decision | Chosen Approach | Alternative | Rationale |
 |----------|-----------------|-------------|-----------|
@@ -605,7 +532,7 @@ The system uses shared TypeScript types between frontend and backend to ensure c
 
 ---
 
-## Summary
+## 📌 Summary
 
 "I've designed a full-stack event ticketing platform with:
 

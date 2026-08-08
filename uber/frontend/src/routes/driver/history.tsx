@@ -31,11 +31,16 @@ interface TripHistoryItem {
  */
 function DriverHistoryPage() {
   const user = useAuthStore((state) => state.user);
+  const authResolved = useAuthStore((state) => state.authResolved);
   const navigate = useNavigate();
   const [trips, setTrips] = useState<TripHistoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    // Only the token is persisted, so `user` is null on every page load until
+    // checkAuth resolves. Redirecting before then bounces authenticated
+    // users to /login on any reload or deep link.
+    if (!authResolved) return;
     if (!user || user.userType !== 'driver') {
       navigate({ to: '/login' });
       return;
@@ -53,7 +58,7 @@ function DriverHistoryPage() {
     };
 
     fetchHistory();
-  }, [user, navigate]);
+  }, [user, authResolved, navigate]);
 
   /**
    * Format cents as USD currency string.

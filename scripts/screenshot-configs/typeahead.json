@@ -11,14 +11,48 @@
     {
       "name": "01-home",
       "path": "/",
-      "waitFor": "main",
-      "delay": 1000
+      "delay": 1500
     },
     {
-      "name": "02-admin",
+      "name": "02-suggestions",
+      "path": "/",
+      "delay": 1200,
+      "fill": {
+        "input[placeholder='Start typing to search...']": "how to"
+      },
+      "fillDelay": 2000
+    },
+    {
+      "name": "03-suggestions-weather",
+      "path": "/",
+      "delay": 1200,
+      "fill": {
+        "input[placeholder='Start typing to search...']": "weat"
+      },
+      "fillDelay": 2000
+    },
+    {
+      "name": "04-admin-overview",
       "path": "/admin",
-      "waitFor": "main",
-      "delay": 500
+      "delay": 2200
+    },
+    {
+      "name": "05-admin-analytics",
+      "path": "/admin",
+      "delay": 1500,
+      "click": [
+        "button:has-text('Analytics')"
+      ],
+      "clickDelay": 2200
+    },
+    {
+      "name": "06-admin-management",
+      "path": "/admin",
+      "delay": 1500,
+      "click": [
+        "button:has-text('Management')"
+      ],
+      "clickDelay": 2200
     }
   ],
   "viewport": {

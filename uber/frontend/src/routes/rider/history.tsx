@@ -31,11 +31,16 @@ interface RideHistoryItem {
  */
 function RiderHistoryPage() {
   const user = useAuthStore((state) => state.user);
+  const authResolved = useAuthStore((state) => state.authResolved);
   const navigate = useNavigate();
   const [rides, setRides] = useState<RideHistoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    // Only the token is persisted, so `user` is null on every page load until
+    // checkAuth resolves. Redirecting before then bounces authenticated
+    // users to /login on any reload or deep link.
+    if (!authResolved) return;
     if (!user || user.userType !== 'rider') {
       navigate({ to: '/login' });
       return;
@@ -53,7 +58,7 @@ function RiderHistoryPage() {
     };
 
     fetchHistory();
-  }, [user, navigate]);
+  }, [user, authResolved, navigate]);
 
   /**
    * Format cents as USD currency string.
