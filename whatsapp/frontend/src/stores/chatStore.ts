@@ -82,7 +82,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const { messages } = await messagesApi.list(conversationId, 50);
       const oldestId = messages.length > 0 ? messages[0].id : null;
+
+      // Reactions have to be fetched with the thread. `messageReactions` was
+      // otherwise only ever written by this client's own add/remove calls and by
+      // live WebSocket events, so any reaction added before this session — or
+      // before a page reload — was invisible.
+      let reactions: Record<string, ReactionSummary[]> = {};
+      try {
+        ({ reactions } = await reactionsApi.getForConversation(conversationId));
+      } catch (error) {
+        // A reaction fetch failure must not blank the thread itself.
+        console.error('Failed to load reactions:', error);
+      }
+
       set((state) => ({
+        messageReactions: {
+          ...state.messageReactions,
+          ...reactions,
+        },
         messages: {
           ...state.messages,
           [conversationId]: messages,

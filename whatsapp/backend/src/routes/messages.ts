@@ -10,6 +10,7 @@ import {
   getMessageConversationId,
   isValidEmoji,
   getAllowedEmojis,
+  getReactionsForConversation,
 } from '../services/reactionService.js';
 import { isUserInConversation } from '../services/conversationService.js';
 import { requireAuth } from '../middleware/auth.js';
@@ -66,6 +67,29 @@ router.post('/:conversationId/read', requireAuth, async (req: Request, res: Resp
     res.json({ messageIds });
   } catch (error) {
     console.error('Mark read error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/messages/:conversationId/reactions
+ * Returns every message's reaction summaries for a conversation, keyed by
+ * message ID. Must be declared before the `/:messageId/reactions` route below,
+ * or Express matches "reactions" as a message ID.
+ */
+router.get('/:conversationId/reactions', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { conversationId } = req.params;
+
+    const isParticipant = await isUserInConversation(req.session.userId!, conversationId);
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Not a participant in this conversation' });
+    }
+
+    const reactions = await getReactionsForConversation(conversationId, req.session.userId!);
+    res.json({ reactions, allowedEmojis: getAllowedEmojis() });
+  } catch (error) {
+    console.error('Get conversation reactions error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -224,7 +224,9 @@ export function ConversationList({ onSelectConversation, onNewChat }: Conversati
                     >
                       {typingText || conversation.last_message?.content || 'No messages yet'}
                     </span>
-                    {conversation.unread_count && conversation.unread_count > 0 && (
+                    {/* Coerce to boolean: `count && ...` renders a literal 0 when the
+                        count is zero, because 0 is a valid React child. */}
+                    {(conversation.unread_count ?? 0) > 0 && (
                       <span className="ml-2 min-w-[20px] h-5 px-1.5 bg-whatsapp-green text-white text-xs rounded-full flex items-center justify-center flex-shrink-0">
                         {conversation.unread_count}
                       </span>

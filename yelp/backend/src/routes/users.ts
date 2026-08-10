@@ -111,7 +111,11 @@ router.get('/:id/reviews', async (req: Request, res: Response): Promise<void> =>
       JOIN businesses b ON r.business_id = b.id
       LEFT JOIN review_photos rp ON r.id = rp.review_id
       WHERE r.user_id = $1
-      GROUP BY r.id, b.name, b.slug, b.city, b.rating
+      -- b.id must be grouped because the business_photo subquery above correlates
+      -- on it; without it Postgres rejects the whole statement with "subquery uses
+      -- ungrouped column". Grouping by the two primary keys also makes every other
+      -- selected r.* / b.* column functionally dependent, so they need not be listed.
+      GROUP BY r.id, b.id
       ORDER BY r.created_at DESC
       LIMIT $2 OFFSET $3
     `,

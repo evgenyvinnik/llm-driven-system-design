@@ -139,6 +139,12 @@ export interface ReactionSummary {
  * Handles adding, removing, and fetching reactions for messages.
  */
 export const reactionsApi = {
+  /** All reactions for a conversation, keyed by message ID — one request per thread load. */
+  getForConversation: (conversationId: string) =>
+    request<{ reactions: Record<string, ReactionSummary[]>; allowedEmojis: string[] }>(
+      `/messages/${conversationId}/reactions`
+    ),
+
   get: (conversationId: string, messageId: string) =>
     request<{ reactions: ReactionSummary[]; allowedEmojis: string[] }>(
       `/messages/${conversationId}/${messageId}/reactions`

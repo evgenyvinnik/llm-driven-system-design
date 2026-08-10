@@ -50,48 +50,34 @@ The politeness constraint is critical - we must be good citizens or risk getting
 ### Architecture Overview
 
 ```
-+------------------------------------------------------------------+
-|                      SEED URL INGESTION                          |
-|              (Admin API, Sitemaps, External Sources)             |
-+------------------------------------------------------------------+
-                               |
-                               v
-+------------------------------------------------------------------+
-|                        URL FRONTIER                              |
-|  +------------------------------------------------------------+  |
-|  |              FRONT QUEUES (Priority-Based)                 |  |
-|  |         HIGH ---------> MEDIUM ---------> LOW              |  |
-|  +------------------------------------------------------------+  |
-|                               |                                  |
-|                               v                                  |
-|  +------------------------------------------------------------+  |
-|  |             BACK QUEUES (Per-Domain Politeness)            |  |
-|  |   [Domain A] | [Domain B] | [Domain C] | ... | [Domain N]  |  |
-|  +------------------------------------------------------------+  |
-+------------------------------------------------------------------+
-                               |
-           +-------------------+-------------------+
-           |                   |                   |
-           v                   v                   v
-    +-----------+       +-----------+       +-----------+
-    | WORKER 1  |       | WORKER 2  |       | WORKER N  |
-    |  - Fetch  |       |  - Fetch  |       |  - Fetch  |
-    |  - Parse  |       |  - Parse  |       |  - Parse  |
-    | - Extract |       | - Extract |       | - Extract |
-    +-----------+       +-----------+       +-----------+
-           |                   |                   |
-           +-------------------+-------------------+
-                               |
-                               v
-+------------------------------------------------------------------+
-|                       STORAGE LAYER                              |
-+------------------+------------------+----------------------------+
-|   PostgreSQL     |      Redis       |      Object Store          |
-| - URL frontier   | - Bloom filter   |    - Page content          |
-| - Crawl state    | - Rate limits    |    - Robots.txt cache      |
-| - Domain meta    | - URL dedup      |    - Screenshots           |
-+------------------+------------------+----------------------------+
+        ┌──────────────────────────────────────────────────────┐
+        │   SEED INGESTION  (Admin API · sitemaps · discovery)  │
+        └───────────────────────────┬──────────────────────────┘
+                                    ▼
+        ┌──────────────────────────────────────────────────────┐
+        │                     URL FRONTIER                     │
+        │  Front queues (priority):  HIGH ─▶ MEDIUM ─▶ LOW     │
+        │  Back queues (politeness): one claim per domain      │
+        └───────────────────────────┬──────────────────────────┘
+                ┌───────────────────┼───────────────────┐
+                ▼                   ▼                   ▼
+          ┌───────────┐       ┌───────────┐       ┌───────────┐
+          │ WORKER 1  │       │ WORKER 2  │  ...  │ WORKER N  │
+          │ fetch     │       │ fetch     │       │ fetch     │
+          │ parse     │       │ parse     │       │ parse     │
+          │ extract   │       │ extract   │       │ extract   │
+          └─────┬─────┘       └─────┬─────┘       └─────┬─────┘
+                └───────────────────┼───────────────────┘
+                                    ▼
+        ┌──────────────┬──────────────────┬────────────────────┐
+        │  PostgreSQL  │      Redis       │   Object store     │
+        │  frontier    │  dedup set       │   page content     │
+        │  crawl state │  domain locks    │   robots.txt cache │
+        │  domain meta │  live counters   │                    │
+        └──────────────┴──────────────────┴────────────────────┘
 ```
+
+The two-level frontier is the structure to notice: **front queues order by priority, back queues enforce politeness.** Separating them is what lets the system say "this URL is the most important thing left" and "but its domain is rate-limited, so take the next one" without either concern corrupting the other.
 
 ### Two-Level Queue Design
 

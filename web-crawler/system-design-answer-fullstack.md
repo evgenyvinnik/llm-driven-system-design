@@ -80,6 +80,18 @@ I'll focus on end-to-end data flow and technology choices for the integration la
 
 ---
 
+## 🧭 Where the Complexity Lives (2 minutes)
+
+Before the deep dives, the honest summary of where the difficulty actually is in this system — because it is not distributed evenly.
+
+The **frontend is straightforward**: five read-mostly pages, a polling store, and a handful of admin actions. There is no optimistic UI, no offline mode, no collaborative editing. That is not a gap; a crawler's dashboard is an observability surface, and the right amount of cleverness in it is very little.
+
+The **backend is where every hard decision is**, and almost all of them are about one thing: which store owns which fact, and what happens when they disagree. Postgres owns the frontier's truth; Redis owns its ordering. Postgres owns domain settings; Redis owns the copy workers actually read. Postgres owns crawled-page records; Redis owns the visited-set membership test. Each pairing is a deliberate split of durability from speed, and each one needs an answer to "what if the fast side is wrong?"
+
+The three answers this system gives are worth stating together, because they're the same answer: **re-check against Postgres on dequeue**, **rebuild the cache from Postgres on boot**, and **let the durable write win when a dual write is interrupted**. Different mechanisms, one principle — the fast store may be stale or missing, never authoritative.
+
+---
+
 ## 🕸️ Deep Dive: The URL Frontier (10 minutes)
 
 Everything else in a crawler is plumbing around one data structure. The frontier is a queue that must simultaneously be **prioritized** (crawl important pages first), **deduplicated** (never fetch the same URL twice), **polite** (never hammer one host), and **crash-safe** (a worker dying must not lose or permanently strand work). Those four requirements pull against each other, and how you split them across stores is the design.
@@ -229,6 +241,14 @@ Dashboard                API Server               Redis              PostgreSQL
 
 "Workers check rate limits on every URL fetch. Hitting PostgreSQL every time would add latency and load. Redis gives us microsecond reads. We write to both - Redis for immediate effect, PostgreSQL for durability across restarts."
 
+### The ordering question nobody asks
+
+A dual write has an order, and the order determines the failure mode. Writing **Redis first, then Postgres** means a crash between them leaves workers honoring a delay that won't survive a restart — the setting silently reverts, and the operator who set it has no idea. Writing **Postgres first, then Redis** means a crash leaves the setting durable but not yet in effect — the operator's change appears saved and workers ignore it until something repopulates the cache.
+
+Neither is "safe"; they fail in opposite directions. Postgres-first is the better default because the divergence is *self-correcting* — any process that repopulates the cache from the database converges on the right answer, whereas Redis-first requires someone to notice the loss and redo the change. That's the same principle as the frontier's status re-check and the geo/index backfills elsewhere in this system: **make the durable store authoritative and the fast store rebuildable, so recovery is a refresh rather than an investigation.**
+
+The version that avoids the choice is an outbox — write the setting and an event in one transaction, and let a relay update Redis — which buys real atomicity for the cost of a relay process and end-to-end latency measured in the relay's poll interval, not milliseconds.
+
 ### Handling Dual-Write Failures
 
 | Scenario | Handling |
@@ -238,6 +258,22 @@ Dashboard                API Server               Redis              PostgreSQL
 | Both succeed | Ideal path |
 
 "We accept eventual consistency. If PostgreSQL fails after Redis succeeds, the worker has the new rate limit but it won't survive a restart. A background job can reconcile periodically."
+
+---
+
+## 🧯 Operating It: What the Dashboard Is Actually For (4 minutes)
+
+The admin surface looks like CRUD and isn't — each control exists because of a specific way crawls go wrong.
+
+**Add seed URLs** is the entry point for the whole system; a crawler with an empty frontier does nothing, and there is no other way in.
+
+**Recover stale URLs** is the manual trigger for the lease sweep described above. It exists because the automatic sweep runs on a timer measured in minutes, and an operator who just restarted three workers doesn't want to wait for it.
+
+**Clear frontier** is genuinely dangerous and is presented that way — it's the escape hatch for the situation where a crawl has gone somewhere it shouldn't (a calendar generating infinite URLs, a session-ID parameter defeating dedup) and the fastest fix is to stop and reseed.
+
+**The stats themselves are the diagnostic.** Pending versus in-progress versus completed is how you tell the difference between the three ways a crawl stalls: pending high with in-progress at zero means workers are dead or every domain is politeness-locked; in-progress stuck non-zero with completed flat means workers are hung mid-fetch and the lease sweep hasn't fired; pending at zero means the crawl is genuinely finished and needs new seeds. Those three states look identical if you only watch "pages crawled," which is why the dashboard breaks the frontier out by status rather than showing a single progress number.
+
+> "The number I'd add first is per-worker last-heartbeat. 'No active workers' currently means the crawl produces nothing and the dashboard looks calm — a stalled system and an idle one are indistinguishable, and that's the failure I'd most want alerted on."
 
 ---
 

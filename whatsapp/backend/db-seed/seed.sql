@@ -171,3 +171,22 @@ INSERT INTO message_status (message_id, recipient_id, status, delivered_at, read
     ('e0000001-0000-0000-0000-000000000002', '22222222-2222-2222-2222-222222222222', 'read', NOW() - INTERVAL '5 hours 40 minutes', NOW() - INTERVAL '5 hours 35 minutes'),
     ('e0000001-0000-0000-0000-000000000003', '44444444-4444-4444-4444-444444444444', 'read', NOW() - INTERVAL '5 hours 25 minutes', NOW() - INTERVAL '5 hours 20 minutes')
 ON CONFLICT (message_id, recipient_id) DO NOTHING;
+
+-- ============================================================================
+-- MESSAGE REACTIONS
+-- ============================================================================
+-- Reactions are fully implemented (message_reactions table, MessageReactions
+-- and ReactionPicker components, WebSocket broadcast) and the seed had none, so
+-- the feature was invisible in every screenshot and on first launch.
+INSERT INTO message_reactions (message_id, user_id, emoji) VALUES
+    -- "Anyone up for hiking this weekend?" — several people react
+    ('d0000001-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', '👍'),
+    ('d0000001-0000-0000-0000-000000000001', '55555555-5555-5555-5555-555555555555', '👍'),
+    ('d0000001-0000-0000-0000-000000000001', '66666666-6666-6666-6666-666666666666', '🎉'),
+    -- "Count me in too! How about the mountain trail?"
+    ('d0000001-0000-0000-0000-000000000003', '22222222-2222-2222-2222-222222222222', '❤️'),
+    -- Project Team kickoff
+    ('c0000001-0000-0000-0000-000000000005', '22222222-2222-2222-2222-222222222222', '👍'),
+    ('c0000001-0000-0000-0000-000000000005', '33333333-3333-3333-3333-333333333333', '👍'),
+    ('c0000001-0000-0000-0000-000000000005', '44444444-4444-4444-4444-444444444444', '🚀')
+ON CONFLICT (message_id, user_id, emoji) DO NOTHING;

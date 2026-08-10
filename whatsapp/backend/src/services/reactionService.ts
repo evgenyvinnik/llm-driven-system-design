@@ -87,6 +87,49 @@ export async function getReactionsForMessage(
 }
 
 /**
+ * Gets reaction summaries for every reacted-to message in a conversation, keyed
+ * by message ID.
+ *
+ * The per-message endpoint exists, but loading a thread that way is one request
+ * per message. Without a bulk read the client had no way to show reactions it
+ * did not itself observe arriving, so reactions were invisible after a reload
+ * and on any message reacted to before the session started.
+ *
+ * @param conversationId - Conversation whose messages to summarize
+ * @param userId - Viewer, used to compute `userReacted`
+ * @returns Map of message ID to its reaction summaries
+ */
+export async function getReactionsForConversation(
+  conversationId: string,
+  userId: string
+): Promise<Record<string, ReactionSummary[]>> {
+  const result = await pool.query(
+    `SELECT
+       r.message_id,
+       r.emoji,
+       COUNT(*) as count,
+       bool_or(r.user_id = $2) as user_reacted,
+       MIN(r.created_at) as first_reacted_at
+     FROM message_reactions r
+     JOIN messages m ON m.id = r.message_id
+     WHERE m.conversation_id = $1
+     GROUP BY r.message_id, r.emoji
+     ORDER BY r.message_id, first_reacted_at ASC`,
+    [conversationId, userId]
+  );
+
+  const byMessage: Record<string, ReactionSummary[]> = {};
+  for (const row of result.rows) {
+    (byMessage[row.message_id] ||= []).push({
+      emoji: row.emoji,
+      count: parseInt(row.count, 10),
+      userReacted: row.user_reacted,
+    });
+  }
+  return byMessage;
+}
+
+/**
  * Gets the conversation ID for a message.
  * Used to determine which users to notify of reaction updates.
  * @param messageId - The message ID

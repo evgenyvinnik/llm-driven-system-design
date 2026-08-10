@@ -36,6 +36,47 @@
       "click": "[data-testid='conversation-item']",
       "clickDelay": 2500,
       "delay": 1200
+    },
+    {
+      "name": "04-direct-message",
+      "path": "/",
+      "waitFor": "[data-testid='conversation-item']",
+      "steps": [
+        {
+          "click": "[data-testid='conversation-item']",
+          "nth": 3,
+          "delay": 2500
+        }
+      ],
+      "delay": 1000
+    },
+    {
+      "name": "05-reaction-picker",
+      "path": "/",
+      "waitFor": "[data-testid='conversation-item']",
+      "steps": [
+        {
+          "click": "[data-testid='conversation-item']",
+          "delay": 2500
+        },
+        {
+          "click": "button[title='React to message']",
+          "delay": 1200
+        }
+      ],
+      "delay": 600
+    },
+    {
+      "name": "06-new-chat",
+      "path": "/",
+      "waitFor": "[data-testid='conversation-item']",
+      "steps": [
+        {
+          "click": "button[title='New Chat']",
+          "delay": 1200
+        }
+      ],
+      "delay": 600
     }
   ],
   "viewport": {
