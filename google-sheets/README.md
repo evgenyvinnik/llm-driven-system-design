@@ -6,13 +6,13 @@ A real-time collaborative spreadsheet application with virtualized rendering, fo
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 5,794 |
-| Source Files | 31 |
-| .ts | 2,920 |
-| .md | 1,569 |
-| .tsx | 848 |
+| Total SLOC | 6,844 |
+| Source Files | 47 |
+| .ts | 4,059 |
+| .md | 1,401 |
+| .tsx | 852 |
 | .sql | 212 |
-| .json | 129 |
+| .json | 147 |
 
 
 ## Features

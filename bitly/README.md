@@ -6,12 +6,12 @@ A full-stack URL shortening service with analytics tracking, custom short codes,
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 7,451 |
-| Source Files | 63 |
-| .ts | 3,992 |
-| .md | 1,682 |
+| Total SLOC | 7,510 |
+| Source Files | 64 |
+| .ts | 4,007 |
+| .md | 1,750 |
 | .tsx | 1,152 |
-| .sql | 257 |
+| .sql | 258 |
 | .json | 165 |
 
 ## Features

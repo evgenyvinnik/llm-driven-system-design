@@ -2,6 +2,19 @@
 
 A peer-to-peer payment platform with double-entry bookkeeping, idempotent payment processing, optimistic locking for wallet balances, and money request workflows.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,178 |
+| Source Files | 69 |
+| .ts | 1,881 |
+| .tsx | 1,467 |
+| .md | 1,384 |
+| .json | 160 |
+| .sql | 141 |
+
+
 ## Features
 
 - **Wallet Management** -- Deposit, withdraw, and view balance

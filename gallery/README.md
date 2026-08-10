@@ -2,6 +2,19 @@
 
 A frontend-only image gallery showcasing three different display modes: Slideshow, Masonry, and Tiles. Uses [picsum.photos](https://picsum.photos) for placeholder images.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 2,266 |
+| Source Files | 28 |
+| .md | 1,625 |
+| .tsx | 397 |
+| .ts | 125 |
+| .json | 89 |
+| .js | 14 |
+
+
 ## Features
 
 - **Slideshow View**: Full-screen carousel with navigation arrows, thumbnail strip, and auto-play

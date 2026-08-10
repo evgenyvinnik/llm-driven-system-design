@@ -1,5 +1,18 @@
 # Retool - No-Code Internal Tool Builder
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,954 |
+| Source Files | 84 |
+| .ts | 2,618 |
+| .tsx | 2,318 |
+| .md | 1,435 |
+| .sql | 196 |
+| .json | 163 |
+
+
 ## Overview
 
 A simplified Retool clone that lets users visually build internal tools by dragging components onto a canvas, connecting to databases, writing queries, and binding data to UI widgets. This project demonstrates a **meta-problem** in system design: building a tool that builds tools.

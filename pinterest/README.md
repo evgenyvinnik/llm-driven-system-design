@@ -1,5 +1,18 @@
 # Pinterest - Image Pinning Platform
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,487 |
+| Source Files | 73 |
+| .ts | 3,547 |
+| .tsx | 1,609 |
+| .md | 1,532 |
+| .sql | 293 |
+| .json | 162 |
+
+
 ## Setup
 
 ### Prerequisites

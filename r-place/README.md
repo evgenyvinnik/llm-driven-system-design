@@ -6,13 +6,13 @@ A collaborative real-time pixel art canvas where users can place colored pixels 
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 5,785 |
-| Source Files | 43 |
-| .ts | 3,592 |
-| .md | 1,333 |
-| .tsx | 594 |
-| .json | 125 |
-| .yml | 47 |
+| Total SLOC | 6,848 |
+| Source Files | 54 |
+| .ts | 4,127 |
+| .md | 1,780 |
+| .tsx | 596 |
+| .json | 147 |
+| .js | 74 |
 
 ## Features
 

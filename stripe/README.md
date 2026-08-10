@@ -6,13 +6,13 @@ A Stripe-like payment processing platform demonstrating payment APIs, financial 
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 11,800 |
-| Source Files | 61 |
-| .js | 5,388 |
-| .tsx | 2,193 |
-| .md | 2,128 |
-| .ts | 1,499 |
-| .sql | 363 |
+| Total SLOC | 13,738 |
+| Source Files | 79 |
+| .ts | 8,696 |
+| .tsx | 2,191 |
+| .md | 2,094 |
+| .sql | 367 |
+| .json | 164 |
 
 ## Features
 

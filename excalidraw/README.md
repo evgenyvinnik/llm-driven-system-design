@@ -2,6 +2,19 @@
 
 A collaborative whiteboard application inspired by [Excalidraw](https://excalidraw.com/), built to explore real-time collaboration, canvas rendering, and shape-level CRDT conflict resolution.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,963 |
+| Source Files | 65 |
+| .ts | 3,667 |
+| .tsx | 1,475 |
+| .md | 1,340 |
+| .json | 155 |
+| .sql | 148 |
+
+
 ## Key Learning Goals
 
 - **Canvas rendering**: HTML5 Canvas API with pan/zoom transforms

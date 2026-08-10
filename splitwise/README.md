@@ -10,11 +10,11 @@ Built as a full-stack demo — **React + TypeScript** front end (the split edito
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 5,579 |
-| Source Files | 80 |
-| .ts | 2,711 |
-| .tsx | 1,763 |
-| .md | 652 |
+| Total SLOC | 5,975 |
+| Source Files | 81 |
+| .ts | 2,772 |
+| .tsx | 1,709 |
+| .md | 1,041 |
 | .sql | 143 |
 | .json | 140 |
 

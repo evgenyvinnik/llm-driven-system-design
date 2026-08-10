@@ -2,6 +2,19 @@
 
 A customer relationship management system modeled after Salesforce, featuring accounts, contacts, opportunities pipeline (kanban), leads with conversion, activities, and reporting dashboards.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,767 |
+| Source Files | 79 |
+| .ts | 2,585 |
+| .tsx | 2,157 |
+| .md | 1,500 |
+| .sql | 185 |
+| .json | 163 |
+
+
 ## Features
 
 - **Dashboard** - KPI cards (revenue, pipeline, deals, leads) and pipeline bar chart

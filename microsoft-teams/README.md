@@ -2,6 +2,19 @@
 
 A system design study implementing an enterprise chat platform with organizations, teams, channels, threaded messaging, file sharing, emoji reactions, and presence indicators.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 5,878 |
+| Source Files | 81 |
+| .ts | 2,521 |
+| .md | 1,445 |
+| .tsx | 1,331 |
+| .sql | 220 |
+| .json | 163 |
+
+
 ## Architecture
 
 See [architecture.md](./architecture.md) for the full system design documentation.

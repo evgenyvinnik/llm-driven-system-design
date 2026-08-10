@@ -2,6 +2,19 @@
 
 A full-stack implementation of a wiki/knowledge base system inspired by Atlassian Confluence. Features space-based organization, hierarchical page trees, version history with diffs, full-text search, macro system, threaded comments, and content approval workflows.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,706 |
+| Source Files | 82 |
+| .ts | 3,128 |
+| .tsx | 1,967 |
+| .md | 1,884 |
+| .sql | 251 |
+| .json | 163 |
+
+
 ## Features
 
 - **Spaces**: Organize content into team/project spaces with key identifiers

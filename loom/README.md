@@ -2,6 +2,19 @@
 
 A video recording and sharing platform inspired by Loom. Record your screen or camera directly in the browser, share via link, and track engagement with analytics.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,280 |
+| Source Files | 75 |
+| .ts | 2,308 |
+| .tsx | 1,824 |
+| .md | 1,576 |
+| .sql | 213 |
+| .json | 164 |
+
+
 ## Features
 
 - **Browser Recording** -- Screen, camera, or both via MediaRecorder API with pause/resume

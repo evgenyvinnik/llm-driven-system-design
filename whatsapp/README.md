@@ -6,13 +6,13 @@ A WhatsApp-inspired messaging application with real-time WebSocket communication
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 8,347 |
-| Source Files | 51 |
-| .ts | 4,332 |
-| .md | 2,188 |
-| .tsx | 1,250 |
-| .sql | 222 |
-| .json | 150 |
+| Total SLOC | 10,342 |
+| Source Files | 74 |
+| .ts | 5,993 |
+| .md | 1,985 |
+| .tsx | 1,720 |
+| .sql | 244 |
+| .json | 171 |
 
 ## Features
 

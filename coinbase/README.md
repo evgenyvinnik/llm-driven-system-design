@@ -2,6 +2,19 @@
 
 A cryptocurrency exchange platform with real-time price feeds, order matching engine, candlestick charts, and portfolio management. Built to explore 24/7 market operations, DECIMAL precision accounting, and order book data structures.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,216 |
+| Source Files | 79 |
+| .ts | 3,506 |
+| .md | 1,657 |
+| .tsx | 1,431 |
+| .sql | 251 |
+| .json | 151 |
+
+
 ## Screenshots
 
 _Run the application to see the dark-themed exchange UI with live price charts, order book depth visualization, and trading interface._

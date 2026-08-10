@@ -6,13 +6,13 @@ A simplified Slack-like platform demonstrating workspace isolation, message thre
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 8,521 |
-| Source Files | 58 |
-| .ts | 5,125 |
-| .md | 1,554 |
-| .tsx | 1,408 |
-| .json | 144 |
-| .sql | 132 |
+| Total SLOC | 9,417 |
+| Source Files | 68 |
+| .ts | 5,164 |
+| .md | 2,156 |
+| .tsx | 1,407 |
+| .sql | 280 |
+| .json | 166 |
 
 ## Key Features
 

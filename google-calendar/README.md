@@ -2,6 +2,19 @@
 
 A full-stack calendar application with Month, Week, and Day views, event scheduling with conflict detection, and a clean UI inspired by Google Calendar.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 4,416 |
+| Source Files | 54 |
+| .md | 1,509 |
+| .tsx | 1,416 |
+| .ts | 1,191 |
+| .json | 154 |
+| .sql | 68 |
+
+
 ## Features
 
 - **Multiple Views**: Month, Week, and Day views with smooth navigation

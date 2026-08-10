@@ -1,7 +1,17 @@
 # Zoom (Video Conferencing)
 
-## SLOC Stats
-*Run `npm run sloc zoom` from repository root to generate.*
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,514 |
+| Source Files | 75 |
+| .ts | 2,653 |
+| .tsx | 1,738 |
+| .md | 1,698 |
+| .json | 146 |
+| .sql | 117 |
+
 
 ## Overview
 

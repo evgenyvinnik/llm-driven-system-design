@@ -6,13 +6,13 @@ A full-stack stock trading platform with real-time quotes, portfolio tracking, o
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 9,953 |
-| Source Files | 63 |
-| .ts | 5,951 |
-| .tsx | 1,880 |
-| .md | 1,576 |
-| .sql | 249 |
-| .json | 133 |
+| Total SLOC | 10,914 |
+| Source Files | 78 |
+| .ts | 6,634 |
+| .tsx | 1,885 |
+| .md | 1,845 |
+| .sql | 178 |
+| .json | 151 |
 
 ## Features
 

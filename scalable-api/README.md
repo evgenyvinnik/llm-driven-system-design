@@ -6,13 +6,13 @@ A scalable API system capable of serving millions of concurrent users with low l
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 7,541 |
-| Source Files | 48 |
-| .js | 3,188 |
-| .md | 2,460 |
-| .tsx | 826 |
-| .sql | 397 |
-| .ts | 271 |
+| Total SLOC | 7,863 |
+| Source Files | 60 |
+| .ts | 4,177 |
+| .md | 1,855 |
+| .tsx | 836 |
+| .sql | 445 |
+| .yml | 234 |
 
 ## Architecture Overview
 

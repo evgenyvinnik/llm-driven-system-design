@@ -2,6 +2,19 @@
 
 An email client system design project featuring thread-based messaging, per-user state management, full-text search with Elasticsearch, and draft conflict detection via optimistic locking.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 8,121 |
+| Source Files | 73 |
+| .ts | 4,202 |
+| .tsx | 1,687 |
+| .md | 1,592 |
+| .sql | 308 |
+| .json | 152 |
+
+
 ## Features
 
 - **Thread-based email**: Messages grouped into conversation threads

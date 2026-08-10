@@ -6,13 +6,13 @@ A minimalist text editor where **everything is a plugin**. The core application 
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 7,330 |
-| Source Files | 102 |
-| .ts | 2,897 |
-| .tsx | 1,762 |
-| .md | 1,577 |
-| .json | 620 |
-| .sh | 146 |
+| Total SLOC | 7,748 |
+| Source Files | 93 |
+| .ts | 2,940 |
+| .md | 2,097 |
+| .tsx | 1,877 |
+| .json | 514 |
+| .sql | 118 |
 
 
 ## Overview

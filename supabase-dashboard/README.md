@@ -2,6 +2,19 @@
 
 A BaaS (Backend-as-a-Service) management dashboard inspired by Supabase Studio. Features dynamic schema introspection, an SQL editor, and auth user management, built on a two-database architecture where a metadata database tracks projects while dynamically connecting to target databases for introspection and query execution.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 6,524 |
+| Source Files | 80 |
+| .ts | 2,688 |
+| .tsx | 1,893 |
+| .md | 1,440 |
+| .sql | 170 |
+| .json | 160 |
+
+
 ## Features
 
 - **Project Management** - Create and manage database projects with connection settings

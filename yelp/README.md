@@ -6,13 +6,13 @@ A local business review and discovery platform inspired by Yelp, built with mode
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 11,510 |
-| Source Files | 73 |
-| .tsx | 4,458 |
-| .js | 3,906 |
-| .md | 1,851 |
-| .ts | 579 |
-| .sql | 475 |
+| Total SLOC | 14,100 |
+| Source Files | 91 |
+| .ts | 6,828 |
+| .tsx | 4,466 |
+| .md | 1,988 |
+| .sql | 431 |
+| .json | 169 |
 
 ## Features
 

@@ -6,13 +6,13 @@ A distributed task scheduling system with cron-like scheduling, priority queues,
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 9,262 |
-| Source Files | 53 |
-| .ts | 5,351 |
-| .md | 1,876 |
-| .tsx | 1,644 |
-| .yml | 178 |
-| .json | 143 |
+| Total SLOC | 11,626 |
+| Source Files | 73 |
+| .ts | 6,833 |
+| .md | 2,080 |
+| .tsx | 1,781 |
+| .sql | 435 |
+| .yml | 196 |
 
 ## Features
 

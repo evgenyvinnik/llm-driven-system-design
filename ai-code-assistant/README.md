@@ -18,10 +18,10 @@ A terminal-based AI coding assistant similar to Claude Code, GeminiCLI, or openc
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 6,144 |
-| Source Files | 26 |
+| Total SLOC | 5,446 |
+| Source Files | 28 |
 | .ts | 3,513 |
-| .md | 2,558 |
+| .md | 1,860 |
 | .json | 73 |
 
 
