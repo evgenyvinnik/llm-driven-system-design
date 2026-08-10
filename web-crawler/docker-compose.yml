@@ -35,7 +35,19 @@ services:
       retries: 5
 
   # API Server (main backend)
+  #
+  # Application containers (api, the three workers, frontend) sit behind the
+  # `app` profile so that a bare `docker-compose up -d` starts infrastructure
+  # only — Postgres and Redis. The repo's local-dev pattern is to run the API
+  # and frontend from source (`npm run dev`) so edits are live; with this
+  # container also publishing 3001, whichever process bound first won and the
+  # other died with EADDRINUSE, silently serving stale code against a UI that
+  # looked fine.
+  #
+  #   docker-compose up -d                    # infra only (default)
+  #   docker-compose --profile app up -d      # everything containerized
   api:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -65,6 +77,7 @@ services:
 
   # Crawler Worker 1
   crawler-worker-1:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile.worker
@@ -88,6 +101,7 @@ services:
 
   # Crawler Worker 2
   crawler-worker-2:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile.worker
@@ -111,6 +125,7 @@ services:
 
   # Crawler Worker 3
   crawler-worker-3:
+    profiles: ["app"]
     build:
       context: ./backend
       dockerfile: Dockerfile.worker
@@ -134,6 +149,7 @@ services:
 
   # Frontend
   frontend:
+    profiles: ["app"]
     build:
       context: ./frontend
       dockerfile: Dockerfile
