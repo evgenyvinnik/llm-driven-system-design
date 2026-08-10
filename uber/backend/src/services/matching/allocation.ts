@@ -165,7 +165,10 @@ export async function acceptRide(rideId: string, driverId: string): Promise<Acce
     return { success: false, error: 'Ride no longer available' };
   }
 
-  // Update ride status with optimistic locking (version check)
+  // Compare-and-swap on status: only a ride still in 'requested' can be matched,
+  // so a second driver accepting the same offer gets zero rows back rather than
+  // silently overwriting the first driver's assignment. (Not a version column —
+  // status is the invariant being protected.)
   const updateResult = await query<RideRow>(
     `UPDATE rides SET driver_id = $1, status = 'matched', matched_at = NOW()
      WHERE id = $2 AND status = 'requested'

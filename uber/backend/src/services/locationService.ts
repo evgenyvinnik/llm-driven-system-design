@@ -67,6 +67,47 @@ interface DriverMetricsRow {
 }
 
 class LocationService {
+  /**
+   * Repopulates the Redis geo index from PostgreSQL for drivers marked online.
+   *
+   * The geo index is in-memory and deliberately ephemeral — decision 1 accepts
+   * that a Redis flush loses it, with PostgreSQL holding a lagging persisted
+   * copy written by `persistLocation`. What was missing is the other half of
+   * that bargain: nothing ever read the persisted copy back. After any Redis
+   * restart, or on a freshly seeded database, `drivers:available` is empty and
+   * every fare estimate reports "No drivers nearby" for all vehicle types —
+   * supply is invisible until each driver's app reconnects and streams a new
+   * location.
+   *
+   * Running this at boot makes the durable copy actually load-bearing rather
+   * than merely written. It is a recovery floor, not a substitute for the live
+   * 3-second location stream.
+   *
+   * @returns Number of drivers added to the geo index
+   */
+  async restoreGeoIndexFromDatabase(): Promise<number> {
+    const result = await query<{ user_id: string; current_lat: string; current_lng: string }>(
+      `SELECT user_id, current_lat, current_lng
+       FROM drivers
+       WHERE is_online = TRUE
+         AND current_lat IS NOT NULL
+         AND current_lng IS NOT NULL`
+    );
+
+    if (result.rows.length === 0) return 0;
+
+    const multi = redis.multi();
+    for (const row of result.rows) {
+      const lat = parseFloat(row.current_lat);
+      const lng = parseFloat(row.current_lng);
+      multi.geoadd(DRIVERS_GEO_KEY, lng, lat, row.user_id);
+      multi.set(`${DRIVER_STATUS_PREFIX}${row.user_id}`, 'available');
+    }
+    await multi.exec();
+
+    return result.rows.length;
+  }
+
   // Update driver location in Redis
   async updateDriverLocation(driverId: string, lat: number, lng: number): Promise<{ success: boolean }> {
     const startTime = Date.now();

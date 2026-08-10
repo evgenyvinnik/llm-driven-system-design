@@ -4,6 +4,7 @@ import type { IncomingMessage } from 'http';
 import config from './config/index.js';
 import { app } from './app.js';
 import matchingService from './services/matching/index.js';
+import locationService from './services/locationService.js';
 import authService from './services/authService.js';
 import { connectRabbitMQ, closeRabbitMQ } from './utils/queue.js';
 import { createLogger } from './utils/logger.js';
@@ -49,7 +50,6 @@ wss.on('connection', async (ws: WebSocket, req: IncomingMessage): Promise<void> 
         case 'location_update':
           // Driver location update
           if (userId && data.lat !== undefined && data.lng !== undefined) {
-            const locationService = (await import('./services/locationService.js')).default;
             await locationService.updateDriverLocation(userId, data.lat, data.lng);
           }
           break;
@@ -123,6 +123,20 @@ async function start(): Promise<void> {
     } catch (error) {
       const err = error as Error;
       appLogger.warn({ error: err.message }, 'RabbitMQ connection failed - running without queue support');
+    }
+
+    // Rebuild the Redis driver geo index from PostgreSQL before serving. Without
+    // it, a cold Redis means zero visible supply and every fare estimate reads
+    // "No drivers nearby". Non-fatal: a failure here degrades matching, and the
+    // live location stream repopulates the index as drivers reconnect.
+    try {
+      const restored = await locationService.restoreGeoIndexFromDatabase();
+      appLogger.info({ drivers: restored }, 'Driver geo index restored from database');
+    } catch (error) {
+      appLogger.warn(
+        { error: (error as Error).message },
+        'Geo index restore failed - supply will populate from live location updates only'
+      );
     }
 
     // Start HTTP server

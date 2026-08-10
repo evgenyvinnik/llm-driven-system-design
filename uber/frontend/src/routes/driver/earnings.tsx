@@ -118,7 +118,7 @@ function DriverEarningsPage() {
                         })}
                       </span>
                       <span>
-                        {hour.rides} rides · {formatCurrency(hour.earnings)}
+                        {hour.rides} {hour.rides === 1 ? 'ride' : 'rides'} · {formatCurrency(hour.earnings)}
                       </span>
                     </div>
                   ))}

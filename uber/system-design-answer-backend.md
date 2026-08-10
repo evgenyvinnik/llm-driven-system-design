@@ -393,15 +393,9 @@ Prevent concurrent state updates with optimistic locking:
 
 Mobile networks cause retries. Without idempotency, riders get charged twice.
 
-```
-Request Flow:
-├─▶ Check Redis for key: idempotency:{userId}:{requestKey}
-├─▶ HIT?  → Return cached response immediately
-├─▶ MISS? → Acquire lock (SET ... NX EX 60)
-├─▶ Process request
-├─▶ Cache response (TTL: 24 hours)
-└─▶ Return response
-```
+A request carrying an idempotency key is looked up under `idempotency:{userId}:{key}`. A hit returns the cached response verbatim; a miss takes a 60-second `SET NX EX` lock, processes the request, caches the response for 24 hours, and returns it.
+
+The lock is the part that is easy to omit and matters most. Caching the response alone protects against a retry that arrives *after* the first request finished — but the retry that actually happens is the one sent while the first is still in flight, because the client gave up waiting. Without the lock, both execute, and "request a ride" becomes two rides.
 
 ---
 
@@ -411,42 +405,45 @@ Request Flow:
 
 | Table | Key Columns | Purpose |
 |-------|-------------|---------|
-| **users** | id, email, type (rider/driver), rating | User account |
-| **drivers** | user_id, vehicle_type, is_available, is_online | Driver status |
-| **rides** | id, rider_id, driver_id, status, version | Ride with optimistic lock |
-| **rides** | pickup_lat/lng, dropoff_lat/lng | Location data |
-| **rides** | estimated_fare, final_fare, surge_multiplier | Pricing data |
+| **users** | id, email, user_type (rider/driver), rating, rating_count | Account and reputation |
+| **drivers** | user_id (PK/FK), vehicle_type, is_online, is_available, current_lat/lng | Driver status and last known position |
+| **rides** | id, rider_id, driver_id, status, vehicle_type | Ride identity and lifecycle state |
+| **rides** | pickup_lat/lng + address, dropoff_lat/lng + address | Endpoints, kept denormalized on the ride |
+| **rides** | estimated_fare_cents, final_fare_cents, surge_multiplier, distance_meters, duration_seconds | Pricing, with the inputs that produced it |
+| **rides** | requested_at, matched_at, driver_arrived_at, picked_up_at, completed_at, cancelled_at | One timestamp per lifecycle transition |
+
+The timestamps deserve a note. Storing a column per transition rather than a single `updated_at` means the ride row *is* its own audit log: time-to-match, time-to-pickup, and trip duration are all differences between columns already on the row, with no event table to join. The cost is a wide, mostly-NULL row — a cancelled ride has four NULL timestamps — and a schema change every time a new state is added.
 
 ### 📇 Index Strategy
 
-```
-Rides Table Indexes:
-├── PRIMARY KEY (id)
-├── BTREE (rider_id, requested_at DESC)    ← Rider history
-├── BTREE (driver_id, requested_at DESC)   ← Driver history
-├── PARTIAL (status) WHERE status NOT IN ('completed', 'cancelled')  ← Active rides
-└── BTREE (requested_at DESC)              ← Recent ride queries
+| Index | Serves |
+|-------|--------|
+| `rides (rider_id, requested_at DESC)` | Rider history, newest first |
+| `rides (driver_id, requested_at DESC)` | Driver history and the earnings rollup |
+| `rides (status)` partial, WHERE status NOT IN ('completed','cancelled') | Active rides — the small hot set the dispatcher scans |
+| `drivers (is_available, is_online)` partial, WHERE is_available | Available-driver lookups that bypass Redis |
 
-Drivers Table Indexes:
-├── PRIMARY KEY (user_id)
-└── PARTIAL (is_available, is_online) WHERE is_available = true  ← Available drivers
-```
+The partial indexes are the interesting ones. Almost every ride in the table is eventually terminal, so an index over all statuses would be dominated by rows no query cares about; restricting it to in-flight rides keeps it proportional to concurrent demand rather than to history. The same argument applies to the driver index.
 
 ### 🔴 Redis Data Structures
 
-```
-Geospatial (Sorted Set with geohash):
-├─▶ drivers:available:{vehicleType}  →  GeoSet of driver locations
+| Key | Type | Purpose |
+|-----|------|---------|
+| `drivers:available` | GEO (sorted set) | The live driver index — one set for all vehicle types, queried with `GEORADIUS ... WITHDIST COUNT 20 ASC` |
+| `driver:location:{id}` | Hash, 60s TTL | Last reported lat/lng and timestamp |
+| `driver:status:{id}` | String | Availability, so a driver mid-ride is not offered another |
+| `demand:{geohash}` | Counter, 5-min TTL | Requests per ~5km cell; the numerator of the surge ratio |
+| `ride:{id}` | Hash | Cached ride state for the status endpoint |
 
-Driver Metadata (Hash):
-├─▶ driver:location:{id}  →  { lat, lng, timestamp, heading }
+One choice worth defending: a **single** geo set rather than one per vehicle type. Partitioning by vehicle type would make each radius query smaller and let a premium request skip economy drivers entirely. It also multiplies the write path — a driver who serves multiple tiers must be added to and removed from several sets atomically — and it fragments the supply signal that surge depends on, since demand is measured per area, not per tier. With filtering by tier happening after the radius query on at most 20 candidates, the extra work is negligible and the write path stays a single `GEOADD`.
 
-Surge Data (String with TTL):
-├─▶ surge:{geohash}  →  "1.5"  (TTL: 120s)
+### 🔒 What actually protects the ride lifecycle
 
-Idempotency Cache (String with TTL):
-└─▶ idempotency:{userId}:{key}  →  { status, body }  (TTL: 86400s)
-```
+This is worth being precise about, because "we use optimistic locking" is easy to say and this system does something narrower.
+
+Only one transition is guarded: accepting an offer runs `UPDATE rides SET driver_id = $1, status = 'matched' WHERE id = $2 AND status = 'requested' RETURNING *`, and treats an empty result as "someone else got there first." That is a **compare-and-swap on the status column** — not a version counter — and status is the right thing to compare, since the invariant being protected is "a ride is matched exactly once." It is the transition that genuinely races: the same offer can be outstanding to a driver whose acceptance crosses with a timeout-driven reoffer to the next candidate.
+
+The later transitions — `driver_arrived`, `picked_up`, `completed` — are unguarded `UPDATE ... WHERE id = $1`. In practice they are driven sequentially by one driver's app, so the race window is small. But unguarded means a duplicate or out-of-order request will happily move a ride backwards, and a retried "complete" will overwrite `final_fare_cents` and `completed_at`. Adding the expected status to each `WHERE` clause costs nothing and makes every transition idempotent; the only reason it is not there is that nobody hit the bug.
 
 ---
 
@@ -454,34 +451,27 @@ Idempotency Cache (String with TTL):
 
 ### 📊 Zone-Based Calculation
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  Surge Pricing Logic                         │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  Using 5-character geohash (~5km × 5km cells):              │
-│                                                              │
-│  1. Get zone: geohash.encode(lat, lng, precision=5)         │
-│                                                              │
-│  2. Calculate supply/demand ratio:                           │
-│     ratio = available_drivers / (pending_requests + 1)       │
-│                                                              │
-│  3. Map ratio to multiplier:                                 │
-│     ┌───────────────────┬─────────────┐                     │
-│     │ Supply/Demand     │ Multiplier  │                     │
-│     ├───────────────────┼─────────────┤                     │
-│     │ > 2.0             │ 1.0x        │                     │
-│     │ 1.5 - 2.0         │ 1.1x        │                     │
-│     │ 1.0 - 1.5         │ 1.2x        │                     │
-│     │ 0.75 - 1.0        │ 1.5x        │                     │
-│     │ 0.5 - 0.75        │ 1.8x        │                     │
-│     │ < 0.5             │ 2.0-2.5x    │                     │
-│     └───────────────────┴─────────────┘                     │
-│                                                              │
-│  4. Cache result (TTL: 2 minutes)                           │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
+Surge is computed per ~5km geohash cell (precision 5), on demand, from two numbers:
+
+- **Demand** — each ride request `INCR`s `demand:{geohash}`, a counter with a 5-minute TTL.
+- **Supply** — a `GEORADIUS` count of available drivers within 3km of the pickup point.
+
+The ratio `supply / (demand + 1)` maps through a fixed table:
+
+| Supply / demand | Multiplier | Reading |
+|-----------------|-----------|---------|
+| > 2.0 | 1.0× | Drivers idle; no signal needed |
+| 1.5 – 2.0 | 1.1× | Comfortable |
+| 1.0 – 1.5 | 1.2× | Tightening |
+| 0.75 – 1.0 | 1.5× | More requests than drivers |
+| 0.5 – 0.75 | 1.8× | Scarce |
+| < 0.5 | 2.0 – 2.5× | Starved |
+
+Two details carry the design. The **TTL is the window** — because the demand counter expires on its own, the system has a rolling five-minute view of demand with no background job to age it out and nothing to reconcile if a worker dies. That is a genuinely nice property: the data structure enforces the time semantics.
+
+And **the `+1` in the denominator** is not defensive coding — it defines behaviour in the case that matters most. With zero demand the ratio would be undefined; with the increment, an empty cell reports maximum supply ratio and therefore no surge, which is the correct answer for an area nobody is requesting rides in.
+
+**Why geohash rather than H3.** Geohash cells are rectangles on a lat/lng grid, so they are not equal-area — cells narrow toward the poles — and, worse, adjacent cells meet along straight boundaries where a rider crossing the street can see a different multiplier. Uber uses H3 hexagons precisely because hexagons have uniform adjacency: every neighbour shares an edge, so interpolation across neighbours is well-defined. The reason to accept geohash here is that Redis speaks it natively — the same encoding backs `GEOADD` — so the surge zone and the driver index share a coordinate system for free. The honest mitigation for the boundary discontinuity is to blend a cell's multiplier with its neighbours', which needs neighbour enumeration that hexagons make trivial and rectangles make fiddly.
 
 ### 💵 Fare Calculation
 
