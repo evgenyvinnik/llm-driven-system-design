@@ -39,7 +39,77 @@ export const elasticsearch = new ElasticsearchClient({
 });
 
 /**
- * Initializes the Elasticsearch 'users' index with appropriate mappings.
+ * Waits for Elasticsearch to answer a ping, retrying with a fixed backoff.
+ * ES 8 with a small heap routinely needs 30-60s to become useful, which is far
+ * longer than Postgres or Redis. Everything that touches ES at startup has to
+ * tolerate that window rather than assume the cluster is up.
+ * @param attempts - Maximum ping attempts before giving up
+ * @param delayMs - Delay between attempts
+ * @returns true once ES responds, false if it never did
+ */
+async function waitForElasticsearch(attempts = 30, delayMs = 2000): Promise<boolean> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await elasticsearch.ping();
+      return true;
+    } catch {
+      if (i === attempts) return false;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  return false;
+}
+
+/**
+ * Rebuilds the Elasticsearch 'users' index from PostgreSQL, which is the system
+ * of record. Runs at every boot so the index is correct no matter how the
+ * database was populated — the SQL seed (`backend/db-seed/seed.sql`) writes rows
+ * directly and knows nothing about Elasticsearch, so without this the discovery
+ * query matches zero documents and the deck is silently empty.
+ * @returns Number of users indexed
+ */
+export async function backfillElasticsearchIndex(): Promise<number> {
+  const result = await pool.query(
+    `SELECT u.id, u.name, u.gender, u.latitude, u.longitude, u.last_active,
+            calculate_age(u.birthdate) AS age,
+            COALESCE(p.show_me, true) AS show_me,
+            COALESCE(p.interested_in, ARRAY['male', 'female']) AS interested_in
+     FROM users u
+     LEFT JOIN user_preferences p ON p.user_id = u.id
+     WHERE u.latitude IS NOT NULL AND u.longitude IS NOT NULL`
+  );
+
+  if (result.rows.length === 0) return 0;
+
+  const operations = result.rows.flatMap((row) => [
+    { index: { _index: 'users', _id: row.id } },
+    {
+      id: row.id,
+      name: row.name,
+      gender: row.gender,
+      age: row.age,
+      location: { lat: row.latitude, lon: row.longitude },
+      last_active: row.last_active,
+      show_me: row.show_me,
+      interested_in: row.interested_in,
+    },
+  ]);
+
+  // refresh: true so the very next discovery query sees these documents; without
+  // it the index is only searchable after the default 1s refresh interval, which
+  // is exactly the window the screenshot harness hits.
+  const response = await elasticsearch.bulk({ refresh: true, operations });
+  if (response.errors) {
+    const firstError = response.items.find((item) => item.index?.error)?.index?.error;
+    console.error('Elasticsearch backfill had errors:', firstError);
+  }
+
+  return result.rows.length;
+}
+
+/**
+ * Initializes the Elasticsearch 'users' index with appropriate mappings, then
+ * backfills it from PostgreSQL.
  * Creates geo_point field for location-based queries and keyword fields for filtering.
  * Called once at server startup to ensure the index exists with correct schema.
  * @returns Promise that resolves when initialization is complete
@@ -48,6 +118,11 @@ export async function initElasticsearchIndex(): Promise<void> {
   const indexName = 'users';
 
   try {
+    if (!(await waitForElasticsearch())) {
+      console.warn('Elasticsearch never became reachable; discovery will use the PostGIS fallback');
+      return;
+    }
+
     const indexExists = await elasticsearch.indices.exists({ index: indexName });
 
     if (!indexExists) {
@@ -74,6 +149,9 @@ export async function initElasticsearchIndex(): Promise<void> {
       });
       console.log('Elasticsearch index created: users');
     }
+
+    const indexed = await backfillElasticsearchIndex();
+    console.log(`Elasticsearch backfill complete: ${indexed} users indexed`);
   } catch (error) {
     console.error('Error initializing Elasticsearch index:', error);
   }

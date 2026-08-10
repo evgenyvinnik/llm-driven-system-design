@@ -28,29 +28,48 @@
       "name": "02-home",
       "path": "/",
       "waitFor": "main",
-      "delay": 1500
+      "delay": 2000
     },
     {
-      "name": "03-portraits-gallery",
+      "name": "03-match-modal",
+      "path": "/",
+      "waitFor": "[data-testid='swipe-like']",
+      "delay": 2000,
+      "click": [
+        "[data-testid='swipe-like']"
+      ],
+      "clickDelay": 2000
+    },
+    {
+      "name": "04-matches",
+      "path": "/matches",
+      "waitFor": "main",
+      "delay": 1000
+    },
+    {
+      "name": "05-chat",
+      "path": "/matches",
+      "delay": 1500,
+      "click": [
+        "a:has-text('Bob')"
+      ],
+      "clickDelay": 2000
+    },
+    {
+      "name": "06-portraits-gallery",
       "path": "/portraits",
       "waitFor": "main",
       "skipAuth": true,
       "delay": 1000
     },
     {
-      "name": "04-matches",
-      "path": "/matches",
-      "waitFor": "main",
-      "delay": 500
-    },
-    {
-      "name": "05-profile",
+      "name": "07-profile",
       "path": "/profile",
       "waitFor": "main",
       "delay": 500
     },
     {
-      "name": "06-preferences",
+      "name": "08-preferences",
       "path": "/preferences",
       "waitFor": "main",
       "delay": 500

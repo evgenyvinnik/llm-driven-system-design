@@ -65,10 +65,13 @@ export function AuthModal({ mode, onClose, onSwitchMode }: AuthModalProps) {
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-sm font-semibold text-gray-300 mb-1">
+            <label htmlFor="auth-username" className="block text-sm font-semibold text-gray-300 mb-1">
               Username
             </label>
             <input
+              id="auth-username"
+              name="username"
+              autoComplete="username"
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
@@ -80,10 +83,13 @@ export function AuthModal({ mode, onClose, onSwitchMode }: AuthModalProps) {
           {mode === 'register' && (
             <>
               <div>
-                <label className="block text-sm font-semibold text-gray-300 mb-1">
+                <label htmlFor="auth-email" className="block text-sm font-semibold text-gray-300 mb-1">
                   Email
                 </label>
                 <input
+                  id="auth-email"
+                  name="email"
+                  autoComplete="email"
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
@@ -92,10 +98,12 @@ export function AuthModal({ mode, onClose, onSwitchMode }: AuthModalProps) {
                 />
               </div>
               <div>
-                <label className="block text-sm font-semibold text-gray-300 mb-1">
+                <label htmlFor="auth-display-name" className="block text-sm font-semibold text-gray-300 mb-1">
                   Display Name (optional)
                 </label>
                 <input
+                  id="auth-display-name"
+                  name="displayName"
                   type="text"
                   value={displayName}
                   onChange={(e) => setDisplayName(e.target.value)}
@@ -106,10 +114,13 @@ export function AuthModal({ mode, onClose, onSwitchMode }: AuthModalProps) {
           )}
 
           <div>
-            <label className="block text-sm font-semibold text-gray-300 mb-1">
+            <label htmlFor="auth-password" className="block text-sm font-semibold text-gray-300 mb-1">
               Password
             </label>
             <input
+              id="auth-password"
+              name="password"
+              autoComplete="current-password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}

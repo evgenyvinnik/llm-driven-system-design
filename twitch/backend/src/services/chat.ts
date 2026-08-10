@@ -208,6 +208,30 @@ interface RecentMessage {
   avatar_url: string;
 }
 
+/**
+ * Resolves the viewer count to report for a channel.
+ *
+ * The obvious value — `channelClients.get(channelId).size` — is the number of
+ * sockets *this process* holds, which is not the channel's audience. With the
+ * `dev:server1/2/3` pattern each instance would report its own slice, so the
+ * number shown in chat depended on which instance the viewer happened to hit,
+ * and on a single instance it read "1 viewers" beside a player captioned
+ * "42,000 watching". `channels.current_viewers` is at least the same figure the
+ * rest of the UI shows. A genuinely accurate concurrent count needs a presence
+ * service (or per-instance Redis counters with reconciliation); this is the
+ * honest approximation, not that.
+ * @param channelId - Channel to count viewers for
+ * @returns Viewer count from the channel record, falling back to local sockets
+ */
+async function getChannelViewerCount(channelId: string): Promise<number> {
+  const result = await query<{ current_viewers: number }>(
+    'SELECT current_viewers FROM channels WHERE id = $1',
+    [channelId]
+  );
+  const stored = result.rows[0]?.current_viewers;
+  return stored && stored > 0 ? stored : (channelClients.get(channelId)?.size ?? 0);
+}
+
 async function handleJoin(ws: WebSocket, info: ClientInfo, message: ChatMessage): Promise<void> {
   const { channelId } = message;
   if (!channelId) return;
@@ -234,18 +258,20 @@ async function handleJoin(ws: WebSocket, info: ClientInfo, message: ChatMessage)
     LIMIT 50
   `, [channelId]);
 
+  const viewerCount = await getChannelViewerCount(channelId);
+
   ws.send(JSON.stringify({
     type: 'joined',
     channelId,
     recentMessages: recentMessages.rows.reverse(),
-    viewerCount: channelClients.get(channelId)!.size
+    viewerCount
   }));
 
   // Notify room of new viewer
   broadcastToChannel(channelId, {
     type: 'viewer_update',
     channelId,
-    viewerCount: channelClients.get(channelId)!.size
+    viewerCount
   });
 
   logChatEvent('join', channelId, { user_id: info.userId, username: info.username });
@@ -268,7 +294,7 @@ async function handleLeave(ws: WebSocket, info: ClientInfo, message: ChatMessage
       broadcastToChannel(channelId, {
         type: 'viewer_update',
         channelId,
-        viewerCount: clients.size
+        viewerCount: await getChannelViewerCount(channelId)
       });
     }
   }

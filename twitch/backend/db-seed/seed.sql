@@ -44,3 +44,79 @@ INSERT INTO channels (user_id, name, stream_key, title, category_id, follower_co
   (2, 'pokimane', 'sk_poki_xyz789', 'Just Chatting with Poki', 1, 9200000, 38000, TRUE, 35000),
   (3, 'xqc', 'sk_xqc_123456', 'xQc is LIVE - Variety Gaming', 1, 11000000, 62000, TRUE, 78000),
   (4, 'ninja', 'sk_ninja_abcdef', 'Fortnite Champion', 2, 18000000, 85000, FALSE, 0);
+
+-- ============================================================================
+-- CHAT HISTORY, FOLLOWS, SUBSCRIPTIONS, MODERATION
+-- ============================================================================
+-- Chat is the half of this project that is actually implemented rather than
+-- simulated, and the seed carried none of it: every channel opened to an empty
+-- panel reading "Say hello to shroud", and no badge, moderator, or ban path had
+-- any data behind it. `handleJoin` serves the most recent 50 rows as scrollback,
+-- so these rows are what a viewer sees the instant they open a channel.
+
+-- Extra chatters so a channel's chat isn't four streamers talking to themselves.
+INSERT INTO users (username, email, password_hash, display_name, avatar_url, bio) VALUES
+  ('mod_jess', 'jess@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'Jess', 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150', 'Moderator for shroud'),
+  ('clutchking', 'clutch@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'ClutchKing', 'https://images.unsplash.com/photo-1492562080023-ab3db95bfbce?w=150', 'CS2 enjoyer'),
+  ('nadeking', 'nade@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'NadeKing', 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=150', 'Smoke lineups only'),
+  ('lurkerlisa', 'lisa@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'LurkerLisa', 'https://images.unsplash.com/photo-1487412720507-e7ab37603c6f?w=150', 'Mostly lurking'),
+  ('spamguy', 'spam@example.com', '$2b$10$KvyL.xiSRBiXVY1iP4L7B.vghE/SDLNJX2gHIOjaS707KBZnUcIom', 'SpamGuy', 'https://images.unsplash.com/photo-1547425260-76bcadfb4f2c?w=150', 'Banned in chat');
+
+-- Moderator and subscriber records. These are what `handleChat` reads to build
+-- the badge array, so without them every message renders badge-less.
+INSERT INTO channel_moderators (channel_id, user_id, added_by)
+SELECT 1, u.id, 1 FROM users u WHERE u.username = 'mod_jess'
+ON CONFLICT DO NOTHING;
+
+INSERT INTO subscriptions (user_id, channel_id, tier, expires_at)
+SELECT u.id, 1, s.tier, NOW() + INTERVAL '30 days'
+FROM (VALUES ('clutchking', 3), ('nadeking', 1), ('lurkerlisa', 2)) AS s(uname, tier)
+JOIN users u ON u.username = s.uname
+ON CONFLICT DO NOTHING;
+
+-- A ban with no expiry, so the hot-path ban check in `handleChat` has something
+-- to reject and the moderation UI has a row to display.
+INSERT INTO channel_bans (channel_id, user_id, banned_by, reason)
+SELECT 1, u.id, 1, 'Repeated spam in chat' FROM users u WHERE u.username = 'spamguy'
+ON CONFLICT DO NOTHING;
+
+-- Follows drive the /following page, which was empty for every logged-in user.
+INSERT INTO followers (user_id, channel_id)
+SELECT u.id, c.id
+FROM users u
+JOIN channels c ON c.name IN ('pokimane', 'xqc', 'ninja')
+WHERE u.username = 'shroud'
+ON CONFLICT DO NOTHING;
+
+INSERT INTO followers (user_id, channel_id)
+SELECT u.id, 1 FROM users u WHERE u.username IN ('clutchking', 'nadeking', 'lurkerlisa', 'mod_jess')
+ON CONFLICT DO NOTHING;
+
+-- Scrollback. `badges` is stored denormalized on the row exactly as `handleChat`
+-- writes it, so the history renders identically to a live message.
+INSERT INTO chat_messages (channel_id, user_id, username, message, badges, created_at)
+SELECT 1, u.id, m.username, m.message, m.badges::jsonb, NOW() - (m.mins_ago || ' minutes')::interval
+FROM (VALUES
+  ('nadeking',   'yo just got here, what map are we on',                  '[{"type":"subscriber","tier":1}]', 14),
+  ('clutchking', 'mirage, hes been popping off all stream',               '[{"type":"subscriber","tier":3}]', 13),
+  ('mod_jess',   'welcome in, keep it civil in here please',              '[{"type":"mod","label":"Mod"}]', 12),
+  ('lurkerlisa', 'that AWP flick was insane PogChamp',                    '[{"type":"subscriber","tier":2}]', 11),
+  ('nadeking',   'chat what sens does he play on',                        '[{"type":"subscriber","tier":1}]', 9),
+  ('clutchking', '400 edpi, its in the panel below',                      '[{"type":"subscriber","tier":3}]', 8),
+  ('admin',      'stream quality looking clean tonight',                  '[{"type":"admin","label":"Admin"}]', 7),
+  ('lurkerlisa', 'KEKW he whiffed the entire spray',                      '[{"type":"subscriber","tier":2}]', 5),
+  ('mod_jess',   'slow mode is on for the next few minutes, chill out',   '[{"type":"mod","label":"Mod"}]', 4),
+  ('nadeking',   'W stream',                                              '[{"type":"subscriber","tier":1}]', 3),
+  ('clutchking', 'one more round then sleep, promise',                    '[{"type":"subscriber","tier":3}]', 2),
+  ('lurkerlisa', 'EZ Clap',                                               '[{"type":"subscriber","tier":2}]', 1)
+) AS m(username, message, badges, mins_ago)
+JOIN users u ON u.username = m.username;
+
+INSERT INTO chat_messages (channel_id, user_id, username, message, badges, created_at)
+SELECT 3, u.id, m.username, m.message, m.badges::jsonb, NOW() - (m.mins_ago || ' minutes')::interval
+FROM (VALUES
+  ('clutchking', 'the reaction content is unmatched',   '[]', 6),
+  ('nadeking',   'juicer moment',                       '[]', 4),
+  ('lurkerlisa', 'LUL',                                 '[]', 2)
+) AS m(username, message, badges, mins_ago)
+JOIN users u ON u.username = m.username;

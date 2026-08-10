@@ -1,9 +1,12 @@
 import { useState, useRef, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useAuthStore } from '../stores/authStore';
+import { emoteApi } from '../services/api';
 import type { ChatMessage, Emote } from '../types';
 
-// Demo emotes (in production, fetch from API)
+// Fallback used only if /api/emotes/global is unreachable. The real list comes
+// from the database, where the URLs point at actual images — these local paths
+// do not exist, which is why an unfetched emote renders as a text placeholder.
 const DEMO_EMOTES: Emote[] = [
   { id: 1, code: 'Kappa', imageUrl: '/emotes/kappa.png', tier: 0, isGlobal: true },
   { id: 2, code: 'PogChamp', imageUrl: '/emotes/pogchamp.png', tier: 0, isGlobal: true },
@@ -20,7 +23,7 @@ interface ChatProps {
 /** Renders the live chat panel with messages, emote picker, and message input for a channel. */
 export function Chat({ channelId, channelName }: ChatProps) {
   const { user } = useAuthStore();
-  const { messages, viewerCount, sendMessage, connected } = useChatStore();
+  const { messages, viewerCount, sendMessage, connected, emotes, setEmotes } = useChatStore();
   const [inputValue, setInputValue] = useState('');
   const [showEmotePicker, setShowEmotePicker] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -30,6 +33,18 @@ export function Chat({ channelId, channelName }: ChatProps) {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // The emote table, the /emotes/global route, the API client and the store slice
+  // all existed; nothing ever connected them, so chat fell back to a hardcoded
+  // list whose image paths 404 and every emote rendered as "[Kappa]" text.
+  useEffect(() => {
+    if (emotes.length > 0) return;
+    emoteApi.getGlobal()
+      .then((res) => setEmotes(res.emotes))
+      .catch(() => setEmotes(DEMO_EMOTES));
+  }, [emotes.length, setEmotes]);
+
+  const activeEmotes = emotes.length > 0 ? emotes : DEMO_EMOTES;
 
   const handleSend = (e: React.FormEvent) => {
     e.preventDefault();
@@ -49,12 +64,16 @@ export function Chat({ channelId, channelName }: ChatProps) {
     // Parse emotes in message
     const parts = message.message.split(/\s+/);
     const renderedParts = parts.map((part, i) => {
-      const emote = DEMO_EMOTES.find((e) => e.code === part);
+      const emote = activeEmotes.find((e) => e.code === part);
       if (emote) {
         return (
-          <span key={i} className="emote inline-block align-middle mx-0.5" title={emote.code}>
-            [{emote.code}]
-          </span>
+          <img
+            key={i}
+            src={emote.imageUrl}
+            alt={emote.code}
+            title={emote.code}
+            className="emote inline-block align-middle mx-0.5"
+          />
         );
       }
       return <span key={i}>{part} </span>;
@@ -126,14 +145,14 @@ export function Chat({ channelId, channelName }: ChatProps) {
       {showEmotePicker && (
         <div className="border-t border-gray-800 p-2 bg-surface-light">
           <div className="flex flex-wrap gap-2">
-            {DEMO_EMOTES.map((emote) => (
+            {activeEmotes.map((emote) => (
               <button
                 key={emote.id}
                 onClick={() => insertEmote(emote.code)}
-                className="px-2 py-1 bg-surface-darker rounded hover:bg-gray-700 text-sm"
+                className="p-1 bg-surface-darker rounded hover:bg-gray-700"
                 title={emote.code}
               >
-                {emote.code}
+                <img src={emote.imageUrl} alt={emote.code} className="emote" />
               </button>
             ))}
           </div>

@@ -148,17 +148,32 @@ export class DiscoveryService {
       });
 
       const hits = result.hits.hits;
+      if (hits.length === 0) return [];
+
+      // Elasticsearch is the candidate *filter* — it decides who is eligible and
+      // how far away they are. The profile text a card actually renders is read
+      // back from Postgres, which is the system of record. Mirroring bio/job/
+      // school into the index would mean every profile edit needs a synchronous
+      // reindex to avoid showing stale text; one keyed lookup avoids that entirely.
+      const ids = hits.map((hit: any) => hit._source.id as string);
+      const profiles = await pool.query(
+        `SELECT id, bio, job_title, company, school FROM users WHERE id = ANY($1)`,
+        [ids]
+      );
+      const profileById = new Map<string, any>(profiles.rows.map((row) => [row.id, row]));
+
       return hits.map((hit: any) => {
         const source = hit._source;
-        const distance = hit.sort?.[0] as number || 0;
+        const distance = (hit.sort?.[0] as number) || 0;
+        const profile = profileById.get(source.id);
         return {
           id: source.id,
           name: source.name,
           age: source.age,
-          bio: null,
-          job_title: null,
-          company: null,
-          school: null,
+          bio: profile?.bio ?? null,
+          job_title: profile?.job_title ?? null,
+          company: profile?.company ?? null,
+          school: profile?.school ?? null,
           distance: this.formatDistance(distance),
           photos: [],
         };

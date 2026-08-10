@@ -802,6 +802,13 @@ async function captureWithPlaywright(config, outputDir) {
     try {
       await page.goto(`${baseUrl}${auth.loginUrl}`, { waitUntil: 'networkidle', timeout: 30000 });
 
+      // Some apps have no login *route* — the form lives in a modal opened from a
+      // header button (twitch). Click it open before looking for the fields.
+      if (auth.openSelector) {
+        await page.click(auth.openSelector, { timeout: 10000 });
+        await page.waitForTimeout(500);
+      }
+
       // Wait for and fill username/email field
       const usernameSelector = auth.usernameSelector || 'input[name="username"], input[name="email"], input[type="email"], input[type="text"]';
       await page.waitForSelector(usernameSelector, { timeout: 10000 });

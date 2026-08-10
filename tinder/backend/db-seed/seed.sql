@@ -112,7 +112,7 @@ INSERT INTO messages (id, match_id, sender_id, content, sent_at, read_at)
 VALUES
   -- Alice & Bob conversation
   ('b0000001-0000-0000-0000-000000000001', 'a0000001-1112-2220-0000-000000000000', '22222222-2222-2222-2222-222222222222', 'Hey Alice! Love your hiking pics. Which trails do you recommend?', NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days'),
-  ('b0000001-0000-0000-0000-000000000002', 'a0000001-1112-2220-0000-000000000000', '11111111-1111-1111-1111-111111111111', 'Hi Bob! Thanks! I love Lands End and the Dipsea Trail. Have you been?', NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days'),
+  ('b0000001-0000-0000-0000-000000000002', 'a0000001-1112-2220-0000-000000000000', '11111111-1111-1111-1111-111111111111', 'Hi Bob! Thanks! I love Lands End and the Dipsea Trail. Have you been?', NOW() - INTERVAL '4 days 22 hours', NOW() - INTERVAL '4 days 22 hours'),
   ('b0000001-0000-0000-0000-000000000003', 'a0000001-1112-2220-0000-000000000000', '22222222-2222-2222-2222-222222222222', 'Ive done Lands End but not Dipsea. Would you want to go together sometime?', NOW() - INTERVAL '4 days', NOW() - INTERVAL '4 days'),
   ('b0000001-0000-0000-0000-000000000004', 'a0000001-1112-2220-0000-000000000000', '11111111-1111-1111-1111-111111111111', 'That sounds fun! How about this weekend?', NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days'),
   ('b0000001-0000-0000-0000-000000000005', 'a0000001-1112-2220-0000-000000000000', '22222222-2222-2222-2222-222222222222', 'Perfect! Saturday morning works for me. Ill bring coffee', NOW() - INTERVAL '1 hour', NOW()),
@@ -124,6 +124,61 @@ VALUES
 
   -- Bob & Diana conversation
   ('b0000001-0000-0000-0000-000000000009', 'a0000002-2224-4440-0000-000000000000', '44444444-4444-4444-4444-444444444444', 'Hey! Your bio made me laugh. What kind of music do you play?', NOW() - INTERVAL '4 days', NOW() - INTERVAL '4 days'),
-  ('b0000001-0000-0000-0000-000000000010', 'a0000002-2224-4440-0000-000000000000', '22222222-2222-2222-2222-222222222222', 'Thanks! I play guitar and a bit of piano. Mostly indie and folk. Do you have a favorite genre?', NOW() - INTERVAL '4 days', NOW() - INTERVAL '3 days'),
+  ('b0000001-0000-0000-0000-000000000010', 'a0000002-2224-4440-0000-000000000000', '22222222-2222-2222-2222-222222222222', 'Thanks! I play guitar and a bit of piano. Mostly indie and folk. Do you have a favorite genre?', NOW() - INTERVAL '3 days 20 hours', NOW() - INTERVAL '3 days'),
   ('b0000001-0000-0000-0000-000000000011', 'a0000002-2224-4440-0000-000000000000', '44444444-4444-4444-4444-444444444444', 'I love anything I can flow to during yoga! Would love to hear you play sometime', NOW() - INTERVAL '6 hours', NOW())
+ON CONFLICT DO NOTHING;
+
+-- ============================================================================
+-- ADDITIONAL DISCOVERY CANDIDATES
+-- ============================================================================
+-- Alice (the demo login) had swiped every man the original seed created, so her
+-- deck was empty on first launch — the swipe screen, which is the whole product,
+-- showed "No more profiles". These profiles are unswiped by Alice and sit inside
+-- her filters (male, 25-38, within 25km of 37.7749,-122.4194, active this week),
+-- so the deck has cards. Two of them have already liked her, which exercises the
+-- +200 reciprocity boost in ranking and turns a right-swipe into a real match.
+INSERT INTO users (id, email, password_hash, name, birthdate, gender, bio, job_title, company, school, latitude, longitude, last_active, is_admin)
+VALUES
+  ('c0000001-0000-4000-8000-000000000001', 'ivan@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Ivan', '1994-06-11', 'male', 'Rock climber and weekend baker. I will absolutely talk your ear off about sourdough starters', 'Structural Engineer', 'Arup', 'Cal Poly', 37.7810, -122.4110, NOW() - INTERVAL '15 minutes', false),
+  ('c0000002-0000-4000-8000-000000000002', 'jack@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Jack', '1997-02-19', 'male', 'Bike commuter, board game hoarder, terrible at karaoke but enthusiastic about it', 'Data Scientist', 'Stripe', 'Carnegie Mellon', 37.7690, -122.4290, NOW() - INTERVAL '4 hours', false),
+  ('c0000003-0000-4000-8000-000000000003', 'kevin@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Kevin', '1991-10-05', 'male', 'Ex-bartender turned physical therapist. Ask me about the best dive bars in the Mission', 'Physical Therapist', 'UCSF Health', 'Boston University', 37.7930, -122.4020, NOW() - INTERVAL '45 minutes', false),
+  ('c0000004-0000-4000-8000-000000000004', 'liam@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Liam', '1998-04-27', 'male', 'Surf at dawn, ship code by ten. Looking for someone who thinks 6am is a reasonable hour', 'iOS Developer', 'Notion', 'UC Santa Cruz', 37.7480, -122.4180, NOW() - INTERVAL '2 days', false),
+  ('c0000005-0000-4000-8000-000000000005', 'marcus@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Marcus', '1989-12-14', 'male', 'Documentary nerd, mediocre chess player, very good dog uncle', 'Cinematographer', 'Freelance', 'NYU Tisch', 37.8010, -122.4350, NOW() - INTERVAL '6 hours', false),
+  ('c0000006-0000-4000-8000-000000000006', 'nina@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Nina', '1995-08-09', 'female', 'Ceramicist with a caffeine problem. I will make you a mug and expect you to use it', 'Ceramic Artist', 'Studio Ninth', 'RISD', 37.7720, -122.4160, NOW() - INTERVAL '3 hours', false),
+  ('c0000007-0000-4000-8000-000000000007', 'olivia@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Olivia', '1993-03-21', 'female', 'ER nurse, trail runner, aggressively competitive at trivia night', 'Registered Nurse', 'Zuckerberg SF General', 'Johns Hopkins', 37.7580, -122.4050, NOW() - INTERVAL '1 hour', false)
+ON CONFLICT (email) DO NOTHING;
+
+INSERT INTO user_preferences (user_id, interested_in, age_min, age_max, distance_km, show_me)
+VALUES
+  ('c0000001-0000-4000-8000-000000000001', ARRAY['female'], 26, 38, 30, true),
+  ('c0000002-0000-4000-8000-000000000002', ARRAY['female'], 25, 34, 25, true),
+  ('c0000003-0000-4000-8000-000000000003', ARRAY['female'], 27, 40, 40, true),
+  ('c0000004-0000-4000-8000-000000000004', ARRAY['female'], 24, 33, 20, true),
+  ('c0000005-0000-4000-8000-000000000005', ARRAY['female'], 28, 42, 35, true),
+  ('c0000006-0000-4000-8000-000000000006', ARRAY['male'], 27, 40, 30, true),
+  ('c0000007-0000-4000-8000-000000000007', ARRAY['male'], 28, 42, 25, true)
+ON CONFLICT (user_id) DO NOTHING;
+
+INSERT INTO photos (id, user_id, url, position, is_primary)
+VALUES
+  ('d0000001-0000-4000-8000-000000000001', 'c0000001-0000-4000-8000-000000000001', 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=600', 0, true),
+  ('d0000002-0000-4000-8000-000000000002', 'c0000002-0000-4000-8000-000000000002', 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=600', 0, true),
+  ('d0000003-0000-4000-8000-000000000003', 'c0000003-0000-4000-8000-000000000003', 'https://images.unsplash.com/photo-1521119989659-a83eee488004?w=600', 0, true),
+  ('d0000004-0000-4000-8000-000000000004', 'c0000004-0000-4000-8000-000000000004', 'https://images.unsplash.com/photo-1547425260-76bcadfb4f2c?w=600', 0, true),
+  ('d0000005-0000-4000-8000-000000000005', 'c0000005-0000-4000-8000-000000000005', 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=600', 0, true),
+  ('d0000006-0000-4000-8000-000000000006', 'c0000006-0000-4000-8000-000000000006', 'https://images.unsplash.com/photo-1487412720507-e7ab37603c6f?w=600', 0, true),
+  ('d0000007-0000-4000-8000-000000000007', 'c0000007-0000-4000-8000-000000000007', 'https://images.unsplash.com/photo-1502378735452-bc7d86632805?w=600', 0, true)
+ON CONFLICT DO NOTHING;
+
+-- Ivan and Kevin have already liked Alice. Neither appears in Alice's swipes, so
+-- both stay in her deck and rank first via the reciprocity boost; a right-swipe
+-- on either produces an immediate mutual match rather than a one-sided like.
+INSERT INTO swipes (id, swiper_id, swiped_id, direction)
+VALUES
+  ('e0000001-0000-4000-8000-000000000001', 'c0000001-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111', 'like'),
+  ('e0000002-0000-4000-8000-000000000002', 'c0000003-0000-4000-8000-000000000003', '11111111-1111-1111-1111-111111111111', 'like'),
+  ('e0000003-0000-4000-8000-000000000003', 'c0000001-0000-4000-8000-000000000001', 'c0000006-0000-4000-8000-000000000006', 'like'),
+  ('e0000004-0000-4000-8000-000000000004', 'c0000002-0000-4000-8000-000000000002', 'c0000006-0000-4000-8000-000000000006', 'like'),
+  ('e0000005-0000-4000-8000-000000000005', 'c0000005-0000-4000-8000-000000000005', 'c0000007-0000-4000-8000-000000000007', 'like'),
+  ('e0000006-0000-4000-8000-000000000006', 'c0000004-0000-4000-8000-000000000004', '55555555-5555-5555-5555-555555555555', 'pass')
 ON CONFLICT DO NOTHING;

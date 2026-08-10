@@ -5,7 +5,17 @@
   "dbName": "twitch_db",
   "dbUser": "twitch",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/",
+    "openSelector": "button:has-text('Log In')",
+    "credentials": {
+      "username": "shroud",
+      "password": "password123"
+    },
+    "usernameSelector": "#auth-username",
+    "passwordSelector": "#auth-password",
+    "submitSelector": "form button[type='submit']",
+    "successIndicator": "main"
   },
   "screens": [
     {
@@ -30,19 +40,25 @@
       "name": "04-channel-shroud",
       "path": "/shroud",
       "waitFor": "main",
-      "delay": 1500
+      "delay": 2500
     },
     {
-      "name": "05-following",
+      "name": "05-channel-xqc",
+      "path": "/xqc",
+      "waitFor": "main",
+      "delay": 2500
+    },
+    {
+      "name": "06-following",
       "path": "/following",
       "waitFor": "main",
       "delay": 1000
     },
     {
-      "name": "06-dashboard",
+      "name": "07-dashboard",
       "path": "/dashboard",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 1500
     }
   ],
   "viewport": {

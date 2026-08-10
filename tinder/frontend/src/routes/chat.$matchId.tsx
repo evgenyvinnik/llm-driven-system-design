@@ -13,6 +13,28 @@ import { useMatchStore } from '../stores/matchStore';
 import { useEffect, useState, useRef } from 'react';
 import ReignsAvatar from '../components/ReignsAvatar';
 
+/**
+ * Formats a message timestamp for a bubble.
+ * A bare clock time is only unambiguous for today's messages — rendering
+ * "05:06 PM" on a five-day-old message reads as if it just arrived. Older
+ * messages get a date prefix so the conversation's timeline is legible.
+ * @param sentAt - ISO timestamp the message was sent
+ * @returns Time for today, weekday + time within the last week, date + time beyond that
+ */
+function formatMessageTime(sentAt: string): string {
+  const sent = new Date(sentAt);
+  const time = sent.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const now = new Date();
+  const isToday = sent.toDateString() === now.toDateString();
+  if (isToday) return time;
+
+  const daysAgo = (now.getTime() - sent.getTime()) / 86_400_000;
+  if (daysAgo < 7) {
+    return `${sent.toLocaleDateString([], { weekday: 'short' })} ${time}`;
+  }
+  return `${sent.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+}
+
 function ChatPage() {
   const { matchId } = Route.useParams();
   const { isAuthenticated } = useAuthStore();
@@ -149,10 +171,7 @@ function ChatPage() {
                       message.is_mine ? 'text-white/70' : 'text-gray-400'
                     }`}
                   >
-                    {new Date(message.sent_at).toLocaleTimeString([], {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    })}
+                    {formatMessageTime(message.sent_at)}
                   </p>
                 </div>
               </div>

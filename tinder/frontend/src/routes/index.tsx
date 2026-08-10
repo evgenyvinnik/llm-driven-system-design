@@ -148,6 +148,8 @@ function HomePage() {
           <button
             onClick={() => handleSwipe('pass')}
             disabled={!!swipeAnimation}
+            aria-label="Pass"
+            data-testid="swipe-pass"
             className="swipe-button bg-white border-2 border-red-400 text-red-400 hover:bg-red-50"
           >
             <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -162,6 +164,8 @@ function HomePage() {
           <button
             onClick={() => handleSwipe('like')}
             disabled={!!swipeAnimation}
+            aria-label="Like"
+            data-testid="swipe-like"
             className="swipe-button bg-tinder-gradient text-white shadow-lg shadow-pink-500/30"
           >
             <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 24 24">
