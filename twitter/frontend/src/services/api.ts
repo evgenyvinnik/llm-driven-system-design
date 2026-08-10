@@ -50,6 +50,13 @@ export const authApi = {
 // Users API
 /** Users API client for profiles, follow/unfollow, and user search. */
 export const usersApi = {
+  async getSuggestions(limit = 3) {
+    const response = await fetch(`${API_BASE}/users/suggestions?limit=${limit}`, {
+      credentials: 'include',
+    });
+    return handleResponse<{ users: import('../types').User[] }>(response);
+  },
+
   async getUser(username: string) {
     const response = await fetch(`${API_BASE}/users/${username}`, {
       credentials: 'include',

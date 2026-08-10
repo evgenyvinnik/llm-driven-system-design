@@ -4,9 +4,9 @@
  */
 import { createFileRoute, useNavigate, Link } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
-import { useAuthStore } from '../stores/authStore';
-import { useRideStore } from '../stores/rideStore';
-import { FareEstimate } from '../types';
+import { useAuthStore } from '../../stores/authStore';
+import { useRideStore } from '../../stores/rideStore';
+import { FareEstimate } from '../../types';
 
 /**
  * Main rider interface for the ride-hailing experience.
@@ -263,18 +263,20 @@ function RiderPage() {
 
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                  <label htmlFor="pickup-address" className="block text-sm font-medium text-gray-700 mb-1">
                     Pickup location
                   </label>
                   <div className="flex gap-2">
                     <input
+                      id="pickup-address"
+                      name="pickup"
                       type="text"
                       value={pickupInput}
                       onChange={(e) => setPickupInput(e.target.value)}
                       placeholder="Enter pickup address"
                       className="input flex-1"
                     />
-                    <button onClick={handleSetPickup} className="btn btn-secondary">
+                    <button onClick={handleSetPickup} data-testid="set-pickup" className="btn btn-secondary">
                       Set
                     </button>
                   </div>
@@ -286,18 +288,20 @@ function RiderPage() {
                 </div>
 
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                  <label htmlFor="dropoff-address" className="block text-sm font-medium text-gray-700 mb-1">
                     Dropoff location
                   </label>
                   <div className="flex gap-2">
                     <input
+                      id="dropoff-address"
+                      name="dropoff"
                       type="text"
                       value={dropoffInput}
                       onChange={(e) => setDropoffInput(e.target.value)}
                       placeholder="Enter destination"
                       className="input flex-1"
                     />
-                    <button onClick={handleSetDropoff} className="btn btn-secondary">
+                    <button onClick={handleSetDropoff} data-testid="set-dropoff" className="btn btn-secondary">
                       Set
                     </button>
                   </div>
@@ -378,6 +382,6 @@ function RiderPage() {
   );
 }
 
-export const Route = createFileRoute('/rider')({
+export const Route = createFileRoute('/rider/')({
   component: RiderPage,
 });

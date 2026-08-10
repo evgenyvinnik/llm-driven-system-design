@@ -1,6 +1,7 @@
 import { Outlet } from '@tanstack/react-router';
 import { Sidebar } from './Sidebar';
 import { TrendingSidebar } from './TrendingSidebar';
+import { WhoToFollow } from './WhoToFollow';
 
 /** Renders the three-column Twitter layout with sidebar, main feed, and trending panel. */
 export function Layout() {
@@ -31,11 +32,7 @@ export function Layout() {
 
             <TrendingSidebar />
 
-            {/* Who to follow section placeholder */}
-            <div className="bg-twitter-background rounded-2xl p-4">
-              <h2 className="text-xl font-extrabold text-twitter-dark">Who to follow</h2>
-              <p className="text-twitter-gray text-[15px] mt-4">Suggestions will appear here</p>
-            </div>
+            <WhoToFollow />
 
             {/* Footer links */}
             <div className="px-4 text-[13px] text-twitter-gray">

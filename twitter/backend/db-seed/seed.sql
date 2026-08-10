@@ -27,23 +27,28 @@ VALUES
 ON CONFLICT DO NOTHING;
 
 -- Sample tweets
-INSERT INTO tweets (id, author_id, content, hashtags, like_count, retweet_count, reply_count)
+-- Explicit created_at values. Every tweet previously took the NOW() default, so
+-- the whole timeline shared one timestamp: nothing to order by, every tweet
+-- rendered the same relative age, and the trend window (60 minutes) either held
+-- all fifteen or none. Spreading them gives the timeline real ordering and puts
+-- a handful inside the trending window so the decay scoring has something to rank.
+INSERT INTO tweets (id, author_id, content, hashtags, like_count, retweet_count, reply_count, created_at)
 VALUES
-  (1, 1, 'Just started learning about distributed systems! The CAP theorem is fascinating. #coding #learning #distributed', ARRAY['coding', 'learning', 'distributed'], 45, 12, 8),
-  (2, 2, 'Weekend gaming session was epic! Finally beat that boss after 50 tries. #gaming #weekend #victory', ARRAY['gaming', 'weekend', 'victory'], 89, 23, 15),
-  (3, 3, 'New album dropping next week! Stay tuned for some fresh beats. #music #newrelease #producer', ARRAY['music', 'newrelease', 'producer'], 234, 89, 45),
-  (4, 4, 'Exploring the beautiful streets of Tokyo. The cherry blossoms are incredible this time of year! #travel #japan #photography', ARRAY['travel', 'japan', 'photography'], 567, 156, 34),
-  (5, 5, 'Excited to announce our Series A funding! Thanks to everyone who believed in our vision. #startup #tech #announcement', ARRAY['startup', 'tech', 'announcement'], 1234, 456, 123),
-  (6, 1, 'Coffee and code - the perfect morning combo. Whos else up early shipping features? #developer #coffee #morning', ARRAY['developer', 'coffee', 'morning'], 78, 15, 12),
-  (7, 2, 'Anyone else excited for the new game release? The graphics look insane! #gaming #hype', ARRAY['gaming', 'hype'], 156, 45, 34),
-  (8, 6, 'What a match last night! The comeback was incredible. This team never gives up. #sports #live #basketball', ARRAY['sports', 'live', 'basketball'], 345, 89, 67),
-  (9, 7, 'Just tried the new restaurant downtown. Amazing sushi - definitely 5 stars! #food #review #sushi', ARRAY['food', 'review', 'sushi'], 189, 45, 23),
-  (10, 4, 'Sunset at Mount Fuji - absolutely breathtaking. Some moments you just have to experience. #travel #nature #japan', ARRAY['travel', 'nature', 'japan'], 890, 234, 56),
-  (11, 5, 'Building the future one line of code at a time. Who else is grinding today? #tech #innovation #startup', ARRAY['tech', 'innovation', 'startup'], 234, 67, 34),
-  (12, 1, 'Finally deployed my first microservice! Kubernetes is a game changer. #kubernetes #devops #learning', ARRAY['kubernetes', 'devops', 'learning'], 156, 45, 23),
-  (13, 3, 'Thank you all for 100k streams! You are amazing. More music coming soon! #music #milestone #grateful', ARRAY['music', 'milestone', 'grateful'], 456, 123, 89),
-  (14, 7, 'Recipe of the day: homemade pasta with truffle sauce. Link in bio! #cooking #recipe #pasta', ARRAY['cooking', 'recipe', 'pasta'], 234, 78, 45),
-  (15, 2, 'Pro tip: always save your game before boss fights. Learned this the hard way today. #gaming #tips #protip', ARRAY['gaming', 'tips', 'protip'], 267, 89, 56)
+  (1, 1, 'Just started learning about distributed systems! The CAP theorem is fascinating. #coding #learning #distributed', ARRAY['coding', 'learning', 'distributed'], 45, 12, 8, NOW() - INTERVAL '2 hours 40 minutes'),
+  (2, 2, 'Weekend gaming session was epic! Finally beat that boss after 50 tries. #gaming #weekend #victory', ARRAY['gaming', 'weekend', 'victory'], 89, 23, 15, NOW() - INTERVAL '1 day 3 hours'),
+  (3, 3, 'New album dropping next week! Stay tuned for some fresh beats. #music #newrelease #producer', ARRAY['music', 'newrelease', 'producer'], 234, 89, 45, NOW() - INTERVAL '6 hours'),
+  (4, 4, 'Exploring the beautiful streets of Tokyo. The cherry blossoms are incredible this time of year! #travel #japan #photography', ARRAY['travel', 'japan', 'photography'], 567, 156, 34, NOW() - INTERVAL '22 minutes'),
+  (5, 5, 'Excited to announce our Series A funding! Thanks to everyone who believed in our vision. #startup #tech #announcement', ARRAY['startup', 'tech', 'announcement'], 1234, 456, 123, NOW() - INTERVAL '8 minutes'),
+  (6, 1, 'Coffee and code - the perfect morning combo. Whos else up early shipping features? #developer #coffee #morning', ARRAY['developer', 'coffee', 'morning'], 78, 15, 12, NOW() - INTERVAL '2 days 4 hours'),
+  (7, 2, 'Anyone else excited for the new game release? The graphics look insane! #gaming #hype', ARRAY['gaming', 'hype'], 156, 45, 34, NOW() - INTERVAL '31 hours'),
+  (8, 6, 'What a match last night! The comeback was incredible. This team never gives up. #sports #live #basketball', ARRAY['sports', 'live', 'basketball'], 345, 89, 67, NOW() - INTERVAL '3 hours 20 minutes'),
+  (9, 7, 'Just tried the new restaurant downtown. Amazing sushi - definitely 5 stars! #food #review #sushi', ARRAY['food', 'review', 'sushi'], 189, 45, 23, NOW() - INTERVAL '46 minutes'),
+  (10, 4, 'Sunset at Mount Fuji - absolutely breathtaking. Some moments you just have to experience. #travel #nature #japan', ARRAY['travel', 'nature', 'japan'], 890, 234, 56, NOW() - INTERVAL '14 minutes'),
+  (11, 5, 'Building the future one line of code at a time. Who else is grinding today? #tech #innovation #startup', ARRAY['tech', 'innovation', 'startup'], 234, 67, 34, NOW() - INTERVAL '4 minutes'),
+  (12, 1, 'Finally deployed my first microservice! Kubernetes is a game changer. #kubernetes #devops #learning', ARRAY['kubernetes', 'devops', 'learning'], 156, 45, 23, NOW() - INTERVAL '5 hours 10 minutes'),
+  (13, 3, 'Thank you all for 100k streams! You are amazing. More music coming soon! #music #milestone #grateful', ARRAY['music', 'milestone', 'grateful'], 456, 123, 89, NOW() - INTERVAL '2 hours'),
+  (14, 7, 'Recipe of the day: homemade pasta with truffle sauce. Link in bio! #cooking #recipe #pasta', ARRAY['cooking', 'recipe', 'pasta'], 234, 78, 45, NOW() - INTERVAL '19 hours'),
+  (15, 2, 'Pro tip: always save your game before boss fights. Learned this the hard way today. #gaming #tips #protip', ARRAY['gaming', 'tips', 'protip'], 267, 89, 56, NOW() - INTERVAL '38 minutes')
 ON CONFLICT DO NOTHING;
 
 -- Likes

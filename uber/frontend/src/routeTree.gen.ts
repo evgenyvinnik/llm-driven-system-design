@@ -9,20 +9,15 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as RiderRouteImport } from './routes/rider'
 import { Route as RegisterRouteImport } from './routes/register'
 import { Route as LoginRouteImport } from './routes/login'
-import { Route as DriverRouteImport } from './routes/driver'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as RiderIndexRouteImport } from './routes/rider/index'
+import { Route as DriverIndexRouteImport } from './routes/driver/index'
 import { Route as RiderHistoryRouteImport } from './routes/rider/history'
 import { Route as DriverHistoryRouteImport } from './routes/driver/history'
 import { Route as DriverEarningsRouteImport } from './routes/driver/earnings'
 
-const RiderRoute = RiderRouteImport.update({
-  id: '/rider',
-  path: '/rider',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const RegisterRoute = RegisterRouteImport.update({
   id: '/register',
   path: '/register',
@@ -33,113 +28,114 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const DriverRoute = DriverRouteImport.update({
-  id: '/driver',
-  path: '/driver',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const RiderIndexRoute = RiderIndexRouteImport.update({
+  id: '/rider/',
+  path: '/rider/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DriverIndexRoute = DriverIndexRouteImport.update({
+  id: '/driver/',
+  path: '/driver/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const RiderHistoryRoute = RiderHistoryRouteImport.update({
-  id: '/history',
-  path: '/history',
-  getParentRoute: () => RiderRoute,
+  id: '/rider/history',
+  path: '/rider/history',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const DriverHistoryRoute = DriverHistoryRouteImport.update({
-  id: '/history',
-  path: '/history',
-  getParentRoute: () => DriverRoute,
+  id: '/driver/history',
+  path: '/driver/history',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const DriverEarningsRoute = DriverEarningsRouteImport.update({
-  id: '/earnings',
-  path: '/earnings',
-  getParentRoute: () => DriverRoute,
+  id: '/driver/earnings',
+  path: '/driver/earnings',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/driver': typeof DriverRouteWithChildren
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/rider': typeof RiderRouteWithChildren
   '/driver/earnings': typeof DriverEarningsRoute
   '/driver/history': typeof DriverHistoryRoute
   '/rider/history': typeof RiderHistoryRoute
+  '/driver/': typeof DriverIndexRoute
+  '/rider/': typeof RiderIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/driver': typeof DriverRouteWithChildren
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/rider': typeof RiderRouteWithChildren
   '/driver/earnings': typeof DriverEarningsRoute
   '/driver/history': typeof DriverHistoryRoute
   '/rider/history': typeof RiderHistoryRoute
+  '/driver': typeof DriverIndexRoute
+  '/rider': typeof RiderIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/driver': typeof DriverRouteWithChildren
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/rider': typeof RiderRouteWithChildren
   '/driver/earnings': typeof DriverEarningsRoute
   '/driver/history': typeof DriverHistoryRoute
   '/rider/history': typeof RiderHistoryRoute
+  '/driver/': typeof DriverIndexRoute
+  '/rider/': typeof RiderIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
-    | '/driver'
     | '/login'
     | '/register'
-    | '/rider'
     | '/driver/earnings'
     | '/driver/history'
     | '/rider/history'
+    | '/driver/'
+    | '/rider/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
-    | '/driver'
     | '/login'
     | '/register'
-    | '/rider'
     | '/driver/earnings'
     | '/driver/history'
     | '/rider/history'
+    | '/driver'
+    | '/rider'
   id:
     | '__root__'
     | '/'
-    | '/driver'
     | '/login'
     | '/register'
-    | '/rider'
     | '/driver/earnings'
     | '/driver/history'
     | '/rider/history'
+    | '/driver/'
+    | '/rider/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  DriverRoute: typeof DriverRouteWithChildren
   LoginRoute: typeof LoginRoute
   RegisterRoute: typeof RegisterRoute
-  RiderRoute: typeof RiderRouteWithChildren
+  DriverEarningsRoute: typeof DriverEarningsRoute
+  DriverHistoryRoute: typeof DriverHistoryRoute
+  RiderHistoryRoute: typeof RiderHistoryRoute
+  DriverIndexRoute: typeof DriverIndexRoute
+  RiderIndexRoute: typeof RiderIndexRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/rider': {
-      id: '/rider'
-      path: '/rider'
-      fullPath: '/rider'
-      preLoaderRoute: typeof RiderRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/register': {
       id: '/register'
       path: '/register'
@@ -154,13 +150,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/driver': {
-      id: '/driver'
-      path: '/driver'
-      fullPath: '/driver'
-      preLoaderRoute: typeof DriverRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
@@ -168,59 +157,53 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/rider/': {
+      id: '/rider/'
+      path: '/rider'
+      fullPath: '/rider/'
+      preLoaderRoute: typeof RiderIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/driver/': {
+      id: '/driver/'
+      path: '/driver'
+      fullPath: '/driver/'
+      preLoaderRoute: typeof DriverIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/rider/history': {
       id: '/rider/history'
-      path: '/history'
+      path: '/rider/history'
       fullPath: '/rider/history'
       preLoaderRoute: typeof RiderHistoryRouteImport
-      parentRoute: typeof RiderRoute
+      parentRoute: typeof rootRouteImport
     }
     '/driver/history': {
       id: '/driver/history'
-      path: '/history'
+      path: '/driver/history'
       fullPath: '/driver/history'
       preLoaderRoute: typeof DriverHistoryRouteImport
-      parentRoute: typeof DriverRoute
+      parentRoute: typeof rootRouteImport
     }
     '/driver/earnings': {
       id: '/driver/earnings'
-      path: '/earnings'
+      path: '/driver/earnings'
       fullPath: '/driver/earnings'
       preLoaderRoute: typeof DriverEarningsRouteImport
-      parentRoute: typeof DriverRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
 
-interface DriverRouteChildren {
-  DriverEarningsRoute: typeof DriverEarningsRoute
-  DriverHistoryRoute: typeof DriverHistoryRoute
-}
-
-const DriverRouteChildren: DriverRouteChildren = {
-  DriverEarningsRoute: DriverEarningsRoute,
-  DriverHistoryRoute: DriverHistoryRoute,
-}
-
-const DriverRouteWithChildren =
-  DriverRoute._addFileChildren(DriverRouteChildren)
-
-interface RiderRouteChildren {
-  RiderHistoryRoute: typeof RiderHistoryRoute
-}
-
-const RiderRouteChildren: RiderRouteChildren = {
-  RiderHistoryRoute: RiderHistoryRoute,
-}
-
-const RiderRouteWithChildren = RiderRoute._addFileChildren(RiderRouteChildren)
-
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  DriverRoute: DriverRouteWithChildren,
   LoginRoute: LoginRoute,
   RegisterRoute: RegisterRoute,
-  RiderRoute: RiderRouteWithChildren,
+  DriverEarningsRoute: DriverEarningsRoute,
+  DriverHistoryRoute: DriverHistoryRoute,
+  RiderHistoryRoute: RiderHistoryRoute,
+  DriverIndexRoute: DriverIndexRoute,
+  RiderIndexRoute: RiderIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

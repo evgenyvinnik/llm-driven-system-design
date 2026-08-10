@@ -28,50 +28,62 @@
       "name": "02-rider",
       "path": "/rider",
       "waitFor": "main",
-      "delay": 1500
+      "delay": 1200
     },
     {
-      "name": "03-driver",
-      "path": "/driver",
-      "waitFor": "main",
-      "delay": 500
-    },
-    {
-      "name": "04-fare-estimates",
+      "name": "03-fare-estimates",
       "path": "/rider",
-      "delay": 2000,
+      "waitFor": "#pickup-address",
+      "delay": 1200,
       "steps": [
         {
-          "fill": "input[placeholder='Enter pickup address']",
-          "value": "350 5th Ave, New York",
-          "delay": 500
+          "fill": "#pickup-address",
+          "value": "1 Market St, San Francisco"
         },
         {
-          "click": "button:has-text('Set')",
-          "nth": 0,
-          "delay": 900
+          "click": "[data-testid='set-pickup']"
         },
         {
-          "fill": "input[placeholder='Enter destination']",
-          "value": "1 World Trade Center, New York",
-          "delay": 500
+          "fill": "#dropoff-address",
+          "value": "Fisherman's Wharf, San Francisco"
         },
         {
-          "click": "button:has-text('Set')",
-          "nth": 1,
-          "delay": 2800
+          "click": "[data-testid='set-dropoff']",
+          "delay": 2000
         }
       ]
     },
     {
-      "name": "05-rider-history",
+      "name": "04-rider-history",
       "path": "/rider/history",
-      "delay": 2500
+      "waitFor": "main",
+      "delay": 1200
+    },
+    {
+      "name": "05-driver",
+      "path": "/driver",
+      "waitFor": "main",
+      "delay": 1500,
+      "loginAs": {
+        "email": "driver1@test.com",
+        "password": "password123"
+      }
     },
     {
       "name": "06-driver-earnings",
       "path": "/driver/earnings",
-      "delay": 2500,
+      "waitFor": "main",
+      "delay": 1500,
+      "loginAs": {
+        "email": "driver1@test.com",
+        "password": "password123"
+      }
+    },
+    {
+      "name": "07-driver-history",
+      "path": "/driver/history",
+      "waitFor": "main",
+      "delay": 1200,
       "loginAs": {
         "email": "driver1@test.com",
         "password": "password123"

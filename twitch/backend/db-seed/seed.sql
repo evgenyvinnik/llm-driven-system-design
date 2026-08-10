@@ -18,7 +18,7 @@ INSERT INTO categories (name, slug, image_url) VALUES
 -- Insert global emotes (using emoji characters as placeholder)
 INSERT INTO emotes (channel_id, code, image_url, tier, is_global) VALUES
   (NULL, 'Kappa', 'https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/2.0', 0, TRUE),
-  (NULL, 'PogChamp', 'https://static-cdn.jtvnw.net/emoticons/v2/88/default/dark/2.0', 0, TRUE),
+  (NULL, 'PogChamp', 'https://static-cdn.jtvnw.net/emoticons/v2/305954156/default/dark/2.0', 0, TRUE),  -- emote 88 was the retired original and now 404s
   (NULL, 'LUL', 'https://static-cdn.jtvnw.net/emoticons/v2/425618/default/dark/2.0', 0, TRUE),
   (NULL, 'KEKW', 'https://cdn.betterttv.net/emote/5e9c6c187e090362f8b0b9e8/2x', 0, TRUE),
   (NULL, 'monkaS', 'https://cdn.betterttv.net/emote/56e9f494fff3cc5c35e5287e/2x', 0, TRUE),

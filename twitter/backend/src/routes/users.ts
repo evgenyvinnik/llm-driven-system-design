@@ -9,6 +9,47 @@ interface FollowStatus {
   [key: number]: boolean;
 }
 
+// GET /api/users/suggestions
+// NOTE: must be registered before '/:username', or Express matches this path as
+// a username lookup for a user called "suggestions".
+router.get('/suggestions', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.session.userId;
+    const limit = Math.min(parseInt(req.query.limit as string) || 3, 20);
+
+    // Rank by follower_count: the cheapest useful signal, and the one already
+    // maintained by a trigger so no aggregate has to be computed here. It is
+    // popularity, not relevance — a real recommender would use follow-graph
+    // overlap ("followed by people you follow"), which needs a join against the
+    // follows table twice and is the obvious next step.
+    const result = await pool.query(
+      `SELECT id, username, display_name, bio, avatar_url, follower_count
+       FROM users u
+       WHERE u.id <> $1
+         AND NOT EXISTS (
+           SELECT 1 FROM follows f
+           WHERE f.follower_id = $1 AND f.following_id = u.id
+         )
+       ORDER BY u.follower_count DESC
+       LIMIT $2`,
+      [userId, limit]
+    );
+
+    res.json({
+      users: result.rows.map((user) => ({
+        id: user.id,
+        username: user.username,
+        displayName: user.display_name,
+        bio: user.bio,
+        avatarUrl: user.avatar_url,
+        followerCount: user.follower_count,
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // GET /api/users/:username
 router.get('/:username', async (req: Request, res: Response, next: NextFunction) => {
   try {

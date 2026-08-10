@@ -4,8 +4,8 @@
  */
 import { createFileRoute, useNavigate, Link } from '@tanstack/react-router';
 import { useEffect, useState, useCallback } from 'react';
-import { useAuthStore } from '../stores/authStore';
-import { useDriverStore } from '../stores/driverStore';
+import { useAuthStore } from '../../stores/authStore';
+import { useDriverStore } from '../../stores/driverStore';
 
 /**
  * Main driver interface for the ride-hailing experience.
@@ -363,6 +363,6 @@ function DriverPage() {
   );
 }
 
-export const Route = createFileRoute('/driver')({
+export const Route = createFileRoute('/driver/')({
   component: DriverPage,
 });

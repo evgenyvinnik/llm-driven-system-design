@@ -33,8 +33,8 @@ CREATE TABLE IF NOT EXISTS users (
   tweet_count INTEGER DEFAULT 0,
   is_celebrity BOOLEAN DEFAULT FALSE,
   role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Tweets table
@@ -54,10 +54,10 @@ CREATE TABLE IF NOT EXISTS tweets (
   retweet_count INTEGER DEFAULT 0,
   reply_count INTEGER DEFAULT 0,
   is_deleted BOOLEAN DEFAULT FALSE,
-  deleted_at TIMESTAMP DEFAULT NULL,
-  archived_at TIMESTAMP DEFAULT NULL,
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  archived_at TIMESTAMPTZ DEFAULT NULL,
   archive_location TEXT DEFAULT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Follows table (social graph)
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS tweets (
 CREATE TABLE IF NOT EXISTS follows (
   follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (follower_id, following_id)
 );
 
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS follows (
 CREATE TABLE IF NOT EXISTS likes (
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   tweet_id BIGINT REFERENCES tweets(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (user_id, tweet_id)
 );
 
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS likes (
 CREATE TABLE IF NOT EXISTS retweets (
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   tweet_id BIGINT REFERENCES tweets(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (user_id, tweet_id)
 );
 
@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS hashtag_activity (
   id BIGSERIAL PRIMARY KEY,
   hashtag VARCHAR(100) NOT NULL,
   tweet_id BIGINT REFERENCES tweets(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- ============================================================================

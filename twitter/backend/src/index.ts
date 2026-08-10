@@ -13,6 +13,7 @@ import pool from './db/pool.js';
 // Import shared modules
 import logger from './shared/logger.js';
 import { validateRetentionConfig, logRetentionConfig } from './shared/retention.js';
+import { backfillTrendBucketsSafely } from './services/trendBackfill.js';
 
 const PORT = process.env.PORT || 3000;
 
@@ -62,6 +63,10 @@ const gracefulShutdown = async (signal: string): Promise<void> => {
 // ============================================================================
 server = app.listen(PORT, () => {
   logger.info({ port: PORT }, 'Twitter API server running');
+
+  // Rebuild Redis trend buckets from Postgres after the port is bound, so a
+  // slow or empty Redis never delays the API. See services/trendBackfill.ts.
+  void backfillTrendBucketsSafely();
 });
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

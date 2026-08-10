@@ -4,8 +4,11 @@ export function formatRelativeTime(date: string | Date): string {
   const past = new Date(date);
   const diffInSeconds = Math.floor((now.getTime() - past.getTime()) / 1000);
 
+  // A timestamp ahead of the client's clock is possible from clock skew alone,
+  // and rendering the raw difference produces "-25190s" rather than degrading to
+  // something sensible. Anything in the future reads as just-posted.
   if (diffInSeconds < 60) {
-    return `${diffInSeconds}s`;
+    return `${Math.max(diffInSeconds, 0)}s`;
   }
 
   const diffInMinutes = Math.floor(diffInSeconds / 60);

@@ -12,7 +12,9 @@ export function TrendingSidebar() {
   useEffect(() => {
     const fetchTrends = async () => {
       try {
-        const { trends } = await trendsApi.getTrends();
+        // Real Twitter shows a handful; the API defaults to 10, which makes the
+        // sidebar taller than the timeline it sits beside.
+        const { trends } = await trendsApi.getTrends(6);
         setTrends(trends);
       } catch (error) {
         console.error('Failed to fetch trends:', error);
@@ -68,7 +70,7 @@ export function TrendingSidebar() {
                 <p className="text-[13px] text-twitter-gray">{index + 1} · Trending</p>
                 <p className="font-bold text-twitter-dark text-[15px]">#{trend.hashtag}</p>
                 <p className="text-[13px] text-twitter-gray">
-                  {formatNumber(trend.tweetCount)} tweets
+                  {formatNumber(trend.tweetCount)} {trend.tweetCount === 1 ? 'tweet' : 'tweets'}
                 </p>
               </div>
               {trend.isRising && (
