@@ -75,8 +75,24 @@ app.get('/metrics', metricsHandler);
 // Apply global rate limiting to all API routes
 app.use('/api/v1', rateLimit());
 
-// API Routes with appropriate rate limiting
-app.use('/api/v1/auth', rateLimit('auth'), authRoutes);
+// API Routes with appropriate rate limiting.
+//
+// The strict `auth` bucket (10/minute, then a 5-minute block) exists to slow
+// credential guessing on login and register. `GET /auth/me` is a different
+// animal: the client calls it on every page load to re-establish the session, so
+// counting it against the same bucket means ordinary browsing exhausts the limit
+// — and because the client treats a failed /auth/me as "not signed in", the user
+// gets silently logged out part-way through a session. Session checks fall back
+// to the global limiter; only the credential-accepting routes get the strict one.
+const strictAuthLimiter = rateLimit('auth');
+app.use(
+  '/api/v1/auth',
+  (req, res, next) =>
+    req.method === 'GET' && req.path === '/me'
+      ? next()
+      : strictAuthLimiter(req, res, next),
+  authRoutes
+);
 app.use('/api/v1/uploads', rateLimit('upload'), uploadRoutes);
 app.use('/api/v1/videos', videoRoutes);
 app.use('/api/v1/channels', channelRoutes);

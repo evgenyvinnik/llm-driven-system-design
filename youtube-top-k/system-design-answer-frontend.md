@@ -113,56 +113,20 @@
 
 ## Deep Dive: SSE Connection Hook (8 minutes)
 
-### Robust SSE Hook with Reconnection
+### Reconnection is the whole hook
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         useSSE Hook                                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Options:                                                                │
-│  ├── url: string                                                        │
-│  ├── onMessage?: (data: unknown) => void                                │
-│  ├── onError?: (error: Event) => void                                   │
-│  ├── reconnectInterval?: number (default: 3000)                         │
-│  └── maxReconnectAttempts?: number (default: 10)                        │
-│                                                                          │
-│  Lifecycle:                                                              │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  useEffect ──▶ connect()                                         │    │
-│  │                   │                                              │    │
-│  │                   ▼                                              │    │
-│  │    new EventSource(url)                                          │    │
-│  │         │                                                        │    │
-│  │         ├── onopen ──▶ setConnected(true)                        │    │
-│  │         │              reset reconnectAttempts                   │    │
-│  │         │                                                        │    │
-│  │         ├── onmessage ──▶ parse JSON                             │    │
-│  │         │                 setLastEventTime(now)                  │    │
-│  │         │                 setTrending(data)                      │    │
-│  │         │                                                        │    │
-│  │         └── onerror ──▶ setConnected(false)                      │    │
-│  │                        close connection                          │    │
-│  │                        schedule reconnect                        │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Reconnection Strategy:                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  if attempts < maxAttempts:                                      │    │
-│  │    delay = reconnectInterval * 2^attempts                        │    │
-│  │    delay = min(delay, 30000)  // cap at 30 seconds              │    │
-│  │    setTimeout(connect, delay)                                    │    │
-│  │  else:                                                           │    │
-│  │    stop trying, show "Reconnect" button                          │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Return:                                                                 │
-│  ├── isConnected: boolean                                               │
-│  ├── reconnectAttempts: number                                          │
-│  ├── lastEventTime: Date | null                                         │
-│  └── reconnect: () => void  (manual reconnect trigger)                  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+`EventSource` already reconnects on its own, which is the main reason to prefer SSE over WebSocket here. The hook exists to add the parts the browser's default doesn't give you: connection state the UI can render, a bound on how long it keeps trying, and a manual escape hatch.
+
+| Concern | Behavior | Why |
+|---------|----------|-----|
+| Connection state | `isConnected` flips on `onopen` / `onerror` | A dashboard that silently stops updating is worse than one that says "Disconnected" — the numbers look current and aren't |
+| Backoff | 3s, doubling per attempt, capped at 30s | A fixed 3s retry from every open tab turns a brief server blip into a synchronized retry storm at exactly the moment the server is least able to absorb it |
+| Attempt cap | Stop after ~10, surface a "Reconnect" button | Unlimited retries from a tab left open overnight is a slow-motion DoS against your own server |
+| Freshness | Track `lastEventTime` | This is the signal that actually matters — a *connected* stream that hasn't delivered in two minutes is also broken, and connection state alone can't tell you |
+
+The last row is the one people leave out. Connection status answers "is the socket open", but the question a viewer has is "am I looking at current data". Those diverge exactly when a server stops pushing while holding the connection open — so the UI derives staleness from the last event timestamp, not from `isConnected`.
+
+**The cap has a real cost:** a user whose laptop slept through a deploy comes back to a dead stream and a button, rather than a dashboard that quietly recovered. The alternative — retry forever — trades that annoyance for unbounded background load from abandoned tabs, and abandoned tabs vastly outnumber sleeping laptops.
 
 > "Exponential backoff is essential for SSE reconnection. Starting at 3 seconds and doubling each attempt (capped at 30s) prevents hammering the server while still recovering quickly from transient failures. The manual reconnect button gives users control when auto-reconnect is exhausted."
 
@@ -194,46 +158,14 @@
 
 ### Trending Store Structure
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         TrendingStore                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  State:                                                                  │
-│  ├── isConnected: boolean                                               │
-│  ├── lastEventTime: Date | null                                         │
-│  ├── trending: Record<category, CategoryTrending>                       │
-│  │   └── CategoryTrending: { videos: Video[], computedAt: Date }       │
-│  ├── previousTrending: Record<category, CategoryTrending>              │
-│  ├── selectedCategory: string (default: 'all')                         │
-│  └── isLoading: boolean                                                 │
-│                                                                          │
-│  Video Shape:                                                            │
-│  ├── videoId: string                                                    │
-│  ├── title: string                                                      │
-│  ├── viewCount: number                                                  │
-│  ├── rank: number                                                       │
-│  ├── previousRank?: number  (calculated on update)                      │
-│  ├── thumbnail?: string                                                 │
-│  └── category?: string                                                  │
-│                                                                          │
-│  Key Action: setTrending(data)                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  For each category in data:                                      │    │
-│  │    1. Get previous videos for this category                      │    │
-│  │    2. For each video in new data:                                │    │
-│  │       - Find matching video in previous                          │    │
-│  │       - Set previousRank = old video's rank                      │    │
-│  │    3. Store enriched data                                        │    │
-│  │                                                                  │    │
-│  │  set({                                                           │    │
-│  │    previousTrending: currentTrending,                            │    │
-│  │    trending: enrichedData,                                       │    │
-│  │    isLoading: false                                              │    │
-│  │  })                                                              │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Selector | Returns | Why it's a selector, not a prop |
+|----------|---------|--------------------------------|
+| `useCategoryVideos()` | Videos for the selected category only | A component re-renders only when *its* slice changes; without this, every 5-second push re-renders all seven category lists |
+| `useVideoRankChange(id)` | `{ current, previous, change, isNew }` | Rank movement is derived, not stored — keeping the previous snapshot lets the UI animate a delta instead of just swapping numbers |
+
+Keeping `previousTrending` alongside the current data is what makes this feel like a live ranking rather than a list that flickers. The comparison is the product: a video at #3 is not interesting; a video that moved from #9 to #3 is.
+
+**The subtlety is what "previous" means.** It has to be the previous *pushed snapshot*, not the previous render — otherwise React's own re-renders reset the comparison and the animation never fires. And because pushes arrive every 5 seconds regardless of whether anything changed, an unchanged ranking must produce `change: 0` rather than a spurious animation, which means comparing by video ID rather than by array position.
 
 ### Selectors for Performance
 

@@ -271,6 +271,27 @@ React ErrorBoundary component:
 
 ---
 
+## Deep Dive: Why Three Algorithms Ship and None Serve Traffic (6 minutes)
+
+This codebase contains an exact min-heap top-K, a Count-Min Sketch, and Space-Saving — and the live path uses none of them. It uses a Redis sorted set. That is worth defending, because "we implemented the textbook algorithm and then didn't use it" sounds like waste and isn't.
+
+**A sorted set is already the right data structure at this cardinality.** `ZINCRBY` maintains ordering incrementally on every increment, so extracting the top K is a range read over a structure that is *already sorted* — no separate pass, no second piece of state to keep coherent with the counts, and it works across processes. An in-process heap gives none of that: two API instances would each maintain their own heap over their own slice of traffic and disagree.
+
+**Approximate algorithms buy memory savings that this workload doesn't need.** Count-Min Sketch and Space-Saving both trade accuracy for refusing to store one counter per distinct key. That is the correct trade when distinct keys exceed what memory can hold — IP addresses, URLs, search terms. A video catalog does not. Paying an accuracy cost to solve a memory problem you don't have is a strictly worse deal.
+
+| Approach | Space | Accuracy | Cross-process | Right when |
+|----------|-------|----------|---------------|-----------|
+| ✅ Redis sorted set | O(distinct keys) | Exact | Yes | Cardinality fits in memory — the case here |
+| ❌ In-process min-heap | O(K) | Exact for the top K | No | Single process, and you only ever need the top K |
+| ❌ Count-Min Sketch | O(width × depth) | Overestimates, never under | Needs shared state anyway | Cardinality is unbounded and overcounting is safe |
+| ❌ Space-Saving | O(k) counters | Guarantees items above n/k | Needs shared state anyway | Same, and you need per-item error bounds |
+
+So why keep the implementations? Because the threshold at which the answer flips is a real engineering question, and the code makes it measurable — the heap operations are instrumented with Prometheus histograms specifically so someone can observe when cardinality has grown enough to justify switching. The honest state is that nobody has measured it yet, which is exactly the kind of thing worth saying out loud rather than implying the choice was validated.
+
+There is also a wart in the unused code worth knowing about, because it illustrates why unused code decays: `TopK.update()` on an existing item rebuilds the whole heap instead of sifting in place — O(K) where it should be O(log K). It's flagged in a comment and unfixed, because nothing depends on it. Code that serves no traffic gets no pressure to be correct.
+
+---
+
 ## Trade-offs and Alternatives (3 minutes)
 
 | Decision | Choice | Trade-off | Alternative |

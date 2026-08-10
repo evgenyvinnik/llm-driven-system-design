@@ -22,32 +22,43 @@
       "path": "/login",
       "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "delay": 600
     },
     {
-      "name": "02-register",
-      "path": "/register",
-      "waitFor": "form",
-      "skipAuth": true,
-      "delay": 500
-    },
-    {
-      "name": "03-dashboard",
+      "name": "02-dashboard",
       "path": "/",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 1500
     },
     {
-      "name": "04-schedule",
+      "name": "03-schedule",
       "path": "/schedule",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 1200
     },
     {
-      "name": "05-history",
+      "name": "04-history",
       "path": "/history",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 1500
+    },
+    {
+      "name": "05-meeting-lobby",
+      "path": "/meeting/abc-defg-hij",
+      "waitFor": "main",
+      "delay": 2500
+    },
+    {
+      "name": "06-in-meeting",
+      "path": "/meeting/abc-defg-hij",
+      "waitFor": "button:has-text('Join Meeting')",
+      "delay": 2500,
+      "steps": [
+        {
+          "click": "button:has-text('Join Meeting')",
+          "delay": 4000
+        }
+      ]
     }
   ],
   "viewport": {

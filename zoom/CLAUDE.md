@@ -92,6 +92,11 @@ Seeded logins (all `password123`): `alice` (Alice Johnson), `bob` (Bob Smith), `
 - **Schema applies via `npm run db:migrate`** (`backend/src/db/migrate.ts`) — run it before seeding on a fresh clone.
 - **CI:** the repo-wide smoke-test workflow was removed (a CI runner can't provide the Docker services these tests need).
 
+- **2026-08-10 — "Meeting History" was empty for everyone who wasn't the organizer, and the in-meeting UI had never been captured.**
+  1. **`getUserMeetings` filtered on `host_id` alone.** Alice attended the seeded "Project Review" as a participant — her attendance is recorded in `meeting_participants`, a table nothing read — so her history page showed "No past meetings" while the row sat right there. A history view that only shows meetings you organized is wrong for the common case: most people attend far more meetings than they schedule. Now a `LEFT JOIN` on `meeting_participants` with `DISTINCT` (a host also has a participant row for their own meeting).
+  2. **Screenshots 5 → 6, and the two new ones are the point of the project.** The old set was login/register/dashboard/schedule/history — entirely the scheduling shell, with nothing from the meeting itself. Added the **pre-join lobby** (camera/mic preview, device selection, display-name entry) and the **in-meeting view** reached by actually clicking Join: the adaptive video grid with a labeled tile, the full control bar (mute, camera, screen share, raise hand, chat, participant list with count badge, layout toggle), the meeting code, and Leave. Note the device dropdowns read `videoinput (...)` — headless WebKit exposes no real capture devices, so the labels are empty. That is the capture environment, not a defect.
+- **Answer docs verified, not rewritten:** 354/363/427 lines, all inside the 350–550 band, no labeled code fences, and the claims match the implementation — including the honest ones (simulated SFU, query-param WebSocket identity, single-server in-process maps).
+
 ## Open Questions
 
 1. WebSocket identity comes from query params, so the socket trusts whatever the client claims. The session cookie is already sent on the upgrade request — is validating it in the `verifyClient` hook sufficient, or does this need a short-lived signed token issued by the REST API so the WS layer never touches session storage?

@@ -9,10 +9,50 @@
   },
   "screens": [
     {
-      "name": "01-home",
+      "name": "01-empty-state",
       "path": "/",
       "waitFor": "main",
       "delay": 1500
+    },
+    {
+      "name": "02-trending",
+      "path": "/",
+      "waitFor": "button:has-text('Simulate Views')",
+      "delay": 1500,
+      "steps": [
+        {
+          "click": "button:has-text('Simulate Views')",
+          "delay": 2500
+        },
+        {
+          "click": "button:has-text('Simulate Views')",
+          "delay": 2500
+        },
+        {
+          "click": "button:has-text('Simulate Views')",
+          "delay": 4000
+        }
+      ]
+    },
+    {
+      "name": "03-category-gaming",
+      "path": "/",
+      "waitFor": "button:has-text('Simulate Views')",
+      "delay": 1500,
+      "steps": [
+        {
+          "click": "button:has-text('Simulate Views')",
+          "delay": 2500
+        },
+        {
+          "click": "button:has-text('Simulate Views')",
+          "delay": 3500
+        },
+        {
+          "click": "button:has-text('Gaming')",
+          "delay": 2000
+        }
+      ]
     }
   ],
   "viewport": {

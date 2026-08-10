@@ -36,7 +36,7 @@ interface AuthState {
 /** Authentication state with login, register, logout, and channel management. */
 export const useAuthStore = create<AuthState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       user: null,
       isLoading: false,
       error: null,
@@ -78,12 +78,23 @@ export const useAuthStore = create<AuthState>()(
       },
 
       checkAuth: async () => {
+        // Snapshot the user before the request. `checkAuth` runs on mount, and a
+        // login can complete while its /auth/me is still in flight — if the
+        // in-flight probe then 401s (it was sent before the session cookie
+        // existed) and unconditionally clears state, it silently logs the user
+        // back out a moment after a successful sign-in. Only clear if nobody
+        // signed in while we were waiting.
+        const userBefore = get().user;
         set({ isLoading: true });
         try {
           const response = await api.get<{ user: User }>('/auth/me');
           set({ user: response.user, isLoading: false });
         } catch {
-          set({ user: null, isLoading: false });
+          if (get().user === userBefore) {
+            set({ user: null, isLoading: false });
+          } else {
+            set({ isLoading: false });
+          }
         }
       },
 

@@ -61,8 +61,17 @@ export async function getMeetingById(id: string) {
 
 /** Returns all meetings hosted by a user, ordered by most recent. */
 export async function getUserMeetings(userId: string) {
+  // Meetings the user hosted OR attended. Filtering on host_id alone made
+  // "Meeting History" empty for every participant who wasn't the organizer —
+  // their attendance is recorded in meeting_participants, which nothing read.
+  // DISTINCT because a host also has a participant row for their own meeting.
   const result = await pool.query(
-    `SELECT * FROM meetings WHERE host_id = $1 ORDER BY created_at DESC LIMIT 50`,
+    `SELECT DISTINCT m.*
+     FROM meetings m
+     LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $1
+     WHERE m.host_id = $1 OR p.user_id = $1
+     ORDER BY m.created_at DESC
+     LIMIT 50`,
     [userId]
   );
   return result.rows;
