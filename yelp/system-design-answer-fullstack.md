@@ -22,7 +22,10 @@
 - **Latency**: API p95 < 300ms, FCP < 2s
 - **Consistency**: Strong for reviews, eventual for search index
 - **Reliability**: Idempotent mutations, retry-safe
-- **Type Safety**: Shared types between frontend and backend
+- **Integrity**: Ratings must be expensive to manipulate — see §8b
+- **Type Safety**: A contract both sides honor — see §3, where this is the weakest link
+
+The consistency line is the one that shapes the architecture, so it is worth stating precisely rather than as a slogan. **A review must be durable the instant the user is told it was posted** — that is money and reputation, and "we lost your review" is unrecoverable trust damage. **A review becoming findable by search seconds later is invisible**, because nobody posts a review and then immediately searches for it. Splitting the requirement that way is what licenses the async indexing in §3b; treating both halves as "strong" would put a search cluster in the write path for no user-visible benefit.
 
 ---
 
@@ -33,20 +36,20 @@
 │                              FRONTEND                                        │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
 │  │ SearchBar   │  │ FilterPanel │  │ MapView     │  │ ReviewForm  │         │
-│  │ (debounce)  │  │ (URL sync)  │  │ (Mapbox)    │  │ (optimistic)│         │
+│  │ (debounce)  │  │ (URL sync)  │  │ (list view) │  │ (optimistic)│         │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
 │         │                │                │                │                 │
 │         └────────────────┴────────────────┴────────────────┘                 │
 │                                   │                                          │
 │                          ┌────────▼────────┐                                 │
-│                          │   API Service   │  (Axios + types)                │
+│                          │   API Service   │  (fetch + typed helpers)        │
 │                          └────────┬────────┘                                 │
 └───────────────────────────────────┼─────────────────────────────────────────┘
                                     │ HTTP/REST
 ┌───────────────────────────────────┼─────────────────────────────────────────┐
 │                              BACKEND                                         │
 │                          ┌────────▼────────┐                                 │
-│                          │   API Routes    │  (Express + Zod validation)     │
+│                          │   API Routes    │  (Express + handler validation) │
 │                          └────────┬────────┘                                 │
 │                                   │                                          │
 │         ┌─────────────────────────┼─────────────────────────┐               │
@@ -69,6 +72,12 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+Two things about this topology are worth calling out before the deep dives.
+
+**Postgres is both the source of truth and one of the two search indexes.** It isn't merely the durable store with search bolted on beside it — the `nearby` path queries PostGIS directly and never consults Elasticsearch, so the "database" and the "geo index" are the same box on the diagram. That is why an Elasticsearch outage degrades one feature rather than the product.
+
+**The index worker is the only component that may lag.** Everything else on the write path is synchronous and transactional; the queue exists specifically to hold the one piece of work whose delay a user cannot perceive.
+
 ### Technology Stack
 
 | Layer | Frontend | Backend |
@@ -77,8 +86,8 @@
 | Framework | React 19 + TanStack Router | Express.js |
 | Styling | Tailwind CSS | - |
 | State | Zustand | - |
-| Validation | Zod | Zod |
-| HTTP | Axios | - |
+| Validation | HTML constraints + handler checks | Handler-level checks |
+| HTTP | `fetch` wrapper with `credentials: 'include'` | - |
 | Database | - | PostgreSQL + PostGIS |
 | Search | - | Elasticsearch |
 | Cache | - | Redis |
@@ -86,23 +95,68 @@
 
 ---
 
-## 🔍 3. Deep Dive: Shared Type System (4-5 minutes)
+## 🔍 3. Deep Dive: The API Contract Between Two TypeScript Codebases (4-5 minutes)
 
-"I'm choosing a shared types package that both frontend and backend import. This ensures the API contract is enforced at compile time. We define Business, Review, SearchRequest, and SearchResponse types once, along with Zod schemas for runtime validation."
+Frontend and backend are both TypeScript, which makes it tempting to say the contract is type-checked. It is not, unless something deliberately makes it so.
 
-### Key Shared Types
+Each side declares its own `Business`, `Review`, and search-response shapes. They agree today because a person kept them in agreement. Nothing in the build would notice if the backend renamed a column and passed the row straight through — both sides would compile, and the field would arrive `undefined` at runtime. This is not hypothetical: it is the single most common way these two-package repos break, and the symptom is always a UI rendering `undefined` rather than an error anyone can trace.
 
-**Business**: id, name, description, address, city, state, zipCode, phone, website, location (Coordinates), categories, hours, amenities, averageRating, reviewCount, priceLevel, photoUrls, isActive, createdAt, updatedAt
+| Option | What it actually guarantees | Cost |
+|--------|----------------------------|------|
+| Duplicated interfaces (status quo) | Nothing — two independent claims about one contract | Silent drift |
+| Shared types package | Both sides name the same fields | Monorepo build wiring; still doesn't check that the *handler* returns that shape |
+| Types generated from the DB schema | The contract tracks the real source of truth | Codegen step; regenerate on every migration |
+| Runtime schema validation at the edge | Catches violations in production, not at build | Per-request cost; schemas to maintain |
 
-**Review**: id, userId, businessId, rating, title, content, photoUrls, helpfulCount, isVerified, createdAt, updatedAt, user (optional nested)
+The honest answer is that the first two are weaker than they look. A shared type still doesn't stop a handler from returning a raw `pg` row — `pool.query` yields `any`, so the compiler has nothing to check against. What closes the gap is an **explicit mapping layer**: the handler constructs the response object field by field, typed against the shared definition, so the row→DTO translation is the thing the compiler verifies.
 
-**SearchRequest**: q (optional), lat, lng, radius (default 10km), category, minRating, priceLevel, openNow, sort (relevance/rating/distance/reviews), page, limit
+**The rule I'd enforce: never return a database row directly.** Not for casing, but because a raw row makes the database schema the public API — a column rename becomes a breaking change nobody noticed, and every column added is published to clients whether or not it should be. Three boring lines of mapping make the contract a decision instead of a leak.
 
-**SearchResponse**: businesses (BusinessSummary[]), facets (categories, priceLevels), pagination, meta (tookMs, cacheHit)
+Runtime validation still earns its place at exactly two boundaries: request bodies (an operator's typo) and anything user-submitted that reaches the database (a review's length, a photo's size). Inside those boundaries, types are enough.
 
-### Zod Validation Schemas
+---
 
-Shared Zod schemas validate coordinates (lat -90 to 90, lng -180 to 180), search parameters (radius 0.1-50km, page/limit constraints), and review creation (rating 1-5, title 3-200 chars, content 50-5000 chars, max 5 photos). Both frontend forms and backend routes use these same schemas.
+## 🔍 3b. Deep Dive: Two Indexes for One Search Box (6-7 minutes)
+
+"Find me a good taco place nearby" is two queries in one sentence, and they want opposite index structures.
+
+*Taco* is relevance: tokenize, stem, boost a name match over a description match, tolerate "tacoo". *Nearby* is geometry: points within a radius, ordered by distance. An inverted index has no notion of a kilometer; an R-tree has no notion of a taco.
+
+So both stay live, and the query shape decides which leads. Text search goes to Elasticsearch — `multi_match` across name/description/categories, optionally narrowed by a `geo_distance` filter, ranked by relevance. "Browse what's near me," which carries no text at all, never touches Elasticsearch: it runs `ST_DWithin` against a GIST index in PostGIS and orders by `ST_Distance`.
+
+**Why not collapse to one?** Each direction fails specifically. Postgres-only means implementing relevance with `ILIKE` or `tsvector`: no per-field boosting, no fuzziness, no completion suggester — and a match on the business *name* ranking the same as one buried in a description is a visibly worse product. Elasticsearch-only means a pure geometry question, over data Postgres already holds exactly and authoritatively, now depends on a search cluster's availability *and its index freshness*.
+
+**What this costs is a sync problem**, and it is the price of the whole design: two indexes over the same entities, which can disagree about what exists during an indexing lag. A newly created business is immediately findable by ID and by "nearby," and invisible to text search until the indexer catches up.
+
+That is also why indexing goes through a durable queue rather than happening inline. Synchronous indexing puts a second datastore's availability into the write path of *posting a review* — a slow cluster makes submission slow, an unreachable one makes it fail, and the failure is nonsensical to the user because their review was valid and Postgres accepted it. Queuing inverts the priority correctly: the write always succeeds, search catches up. The accepted consequence is that with the queue down, the lag is unbounded, which is why a reconciliation job is a requirement rather than a nicety.
+
+**And the subtlest line in the search path: fallback results are never cached.** When the circuit breaker opens and search degrades to Postgres, those results are returned but not written to Redis. Without that condition, an Elasticsearch outage doesn't just degrade search for its duration — it poisons the cache, so relevance-free results keep being served for the full TTL *after* ES recovers, and the cache keeps repopulating with degraded results the whole time the breaker is open. Refusing to cache them makes recovery immediate. The cost is that the fallback path gets zero cache relief exactly when the system is under the most stress.
+
+---
+
+## 🔍 3c. Deep Dive: Who Owns the Star Rating (4-5 minutes)
+
+Every business card in every search result shows a rating. Computing `AVG(rating)` at render time means aggregating a business's whole review history on every impression — so it has to be denormalized, and the moment it is, someone has to own keeping it correct.
+
+The column that makes this work is not the average. It's **`rating_sum` stored alongside `review_count`**, with `rating` derived from the two. Storing only the average and trying to update it incrementally is the trap: you cannot back one contribution out of a mean without knowing both the count and the total. With the sum, an edited review is `sum - old + new` in a single statement — exact, not approximate, and no recomputation.
+
+It lives in a **database trigger** rather than application code for the same reason aggregates usually should: the trigger runs inside the transaction that changed the review, so a crash cannot leave a business with 47 reviews and a rating computed from 46. Application-level maintenance is a second statement that can fail independently, and nothing reconciles it afterwards.
+
+What I give up: the logic is invisible to anyone reading the TypeScript, it can't be unit-tested with the rest of the app, and a bulk import fires it per row.
+
+**The deeper problem it doesn't solve** is that an unweighted mean is a bad ranking signal. A business with one 5-star review outranks one with two hundred at 4.8, which is exactly backwards as a recommendation. The standard fix is a Bayesian prior — shrink toward the global mean in proportion to how few reviews there are — and the reason not to reach for it immediately is explainability: users understand "4.5 stars from 200 reviews" and cannot verify a shrunk score against the reviews they can see. My inclination is to keep the displayed average honest and apply the shrinkage only to *ranking*, so the sort order is statistically sane while the number on the card remains something a user can check.
+
+---
+
+## 🔎 3d. Deep Dive: URL as the Search State (3-4 minutes)
+
+Search state lives in the URL — query, location, every filter, and the page number — not in a store.
+
+The pull toward a store is real: filters are a form, forms are component state, and syncing to the URL on every keystroke is extra work. It's still wrong for this surface, for three reasons that only show up after launch. **A shared link has to reproduce what the sender saw** — "check out these tacos near me" is one of the primary ways a discovery product spreads, and it silently doesn't work if the results depend on invisible state. **The back button has to behave**, and if filters live in a store, backing out of a business page restores the route but not the filters the user spent thirty seconds setting. **And reload has to be non-destructive**, which store-held state only survives if you also persist it, at which point you've reimplemented the URL badly.
+
+The two details that make it workable: filter changes use `replace` rather than `push`, so adjusting four filters leaves one history entry instead of four and the back button goes where the user expects; and the URL is the single source of truth, with components reading from it rather than mirroring it into local state, because a mirror is a second copy that can disagree during navigation.
+
+What it costs is that every filter change is a navigation, so the results component must handle rapid successive updates without flashing empty — and long filter combinations make ugly URLs, which matters exactly as much as it sounds like it does.
 
 ---
 
@@ -201,6 +255,27 @@ A React ErrorBoundary component catches rendering errors, logs them (with error 
 
 ---
 
+## 🛡️ 8b. Deep Dive: Rate Limiting as an Integrity Mechanism (4-5 minutes)
+
+On most products rate limiting is a politeness feature protecting the servers. Here it is the *product's* integrity mechanism, because ratings drive revenue for the businesses being rated — which means there is a real adversary with a financial motive, and the thing being protected is the trustworthiness of the score, not the CPU.
+
+That changes the design. A single global cap can't express what abuse looks like, because the abusive pattern and the legitimate one differ in shape, not volume. Four independent limits, all as atomic Redis operations:
+
+| Limit | Bound | The attack it addresses |
+|-------|-------|------------------------|
+| Reviews per user | 10 / hour | Bulk posting from one account |
+| Reviews per user **per business** | 2 / day | One account grinding down one competitor indefinitely — well inside any global cap |
+| Review actions per IP | 20 / hour | Many fresh accounts from one source, which per-user limits are blind to by construction |
+| Votes per user | 5 / minute | Vote-brigading a review into invisibility, which is cheaper than writing one |
+
+The per-user-per-business limit is the one worth defending in an interview, because it's the one a global limit cannot substitute for: a prolific honest reviewer covering fifty different businesses is unaffected, while the single-target pattern is stopped at two per day. The per-IP limit exists because per-user limits assume accounts are expensive, and they aren't.
+
+**What this costs:** four counters per action, four ways to be wrong, and a false-positive surface a single limit wouldn't have — a shared office or campus NAT hits the per-IP bound with entirely legitimate traffic. The mitigation is that the IP limit is deliberately the loosest of the four and applies to actions rather than reviews, so it degrades a shared network's experience rather than blocking it.
+
+**And the honest limitation: these bound volume, not coordination.** A campaign of thirty real accounts, each posting one review from a different address, stays under every limit here and is exactly the attack that matters. Catching it needs a different class of signal — account age at time of review, text similarity across reviews, or the timing correlation between accounts that otherwise share nothing. Rate limits are the floor, not the defense.
+
+---
+
 ## ⚖️ 9. Trade-offs and Alternatives (3-4 minutes)
 
 ### API Design
@@ -238,6 +313,22 @@ Web Vitals collection (CLS, FID, FCP, LCP, TTFB) using the web-vitals library. M
 ### Backend Request Tracing
 
 A tracing middleware generates/propagates request IDs (X-Request-ID header), logs method, path, status, duration, and userId on response finish. Prometheus metrics track HTTP request duration histograms with labels for method, path, and status code.
+
+---
+
+## 🧵 11. What Breaks First (3 minutes)
+
+Asked to operate this, the order things fail is more useful than a scaling diagram.
+
+**Search and Postgres disagree.** Indexing is async through a queue, and nothing schedules reconciliation. A broker outage leaves the two permanently divergent — businesses that exist and are reachable by URL but cannot be found by searching for them. This is the failure users report as "your search is broken" and operators can't reproduce, because the record is right there in the database. It needs a drift metric before it needs a fix: count rows in Postgres against documents in the index, and alert on the delta.
+
+**The search cache fragments.** The cache key includes the caller's exact coordinates, so two users a hundred metres apart never share an entry. Hit rate collapses precisely in dense areas where load is highest and results would be nearly identical. Snapping coordinates to a grid before keying fixes it — and the grid size is a real trade-off, because coarse enough to be useful is also coarse enough to make "0.2 miles away" wrong.
+
+**Ratings stop meaning anything at the low end.** Covered in §3c: the unweighted mean makes one review outrank two hundred. This degrades quietly as the long tail of businesses grows, and it is a ranking-quality failure with no error message attached.
+
+**Review abuse outgrows rate limits.** The limits bound volume per identity; a coordinated campaign is under all of them. This is the failure with an actual adversary behind it, so it gets worse specifically as the platform becomes worth attacking.
+
+Note what is *not* on this list: request throughput. Nothing here is CPU- or connection-bound at any plausible scale for this product. Every real failure is a consistency, ranking, or integrity problem — which is a fair summary of what local-discovery systems are actually about.
 
 ---
 

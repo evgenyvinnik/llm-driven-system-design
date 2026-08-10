@@ -827,6 +827,20 @@ async function captureWithPlaywright(config, outputDir) {
       // field actually belongs to: press Enter inside it (triggers that form's
       // submit handler), and fall back to a scoped/global button click only if the
       // field isn't in a form.
+      // Watch the auth traffic. Every silent-login failure in this repo has looked
+      // identical from the outside — the modal closes, the credential field goes
+      // away, the check below reports success, and every screenshot is logged out.
+      // Recording the actual response status is the only thing that distinguishes
+      // "logged in" from "the form vanished for some other reason".
+      const authResponses = [];
+      const authListener = (response) => {
+        const url = response.url();
+        if (/\/(auth|login|session)\b/.test(url) || url.includes('/login')) {
+          authResponses.push({ status: response.status(), url });
+        }
+      };
+      page.on('response', authListener);
+
       const submitSelector = auth.submitSelector || 'button[type="submit"]';
       const passwordForSubmit = creds.password && auth.passwordSelector !== false
         ? (auth.passwordSelector || 'input[name="password"], input[type="password"]')
@@ -869,6 +883,14 @@ async function captureWithPlaywright(config, outputDir) {
       // without navigating — the login form is a panel on the page (r-place), or
       // loginUrl is "/" which every URL trivially "includes" (scalable-api). The
       // reliable signal is that the credential field is gone once we're authenticated.
+      page.off('response', authListener);
+      const failedAuth = authResponses.filter((r) => r.status >= 400);
+      if (failedAuth.length > 0) {
+        logError(
+          `Auth request failed: ${failedAuth.map((r) => `${r.status} ${r.url}`).join(', ')}`
+        );
+      }
+
       const currentUrl = page.url();
       const passwordSelector = auth.passwordSelector || 'input[name="password"], input[type="password"]';
       const credentialFieldGone =

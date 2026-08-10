@@ -10,6 +10,7 @@ export interface AuthUser {
   avatar_url: string | null;
   role: 'user' | 'business_owner' | 'admin';
   review_count: number;
+  created_at?: string;
 }
 
 // Extended request with user
@@ -44,7 +45,9 @@ export async function authenticate(
 
     // Get user from database
     const result = await pool.query<AuthUser>(
-      'SELECT id, email, name, avatar_url, role, review_count FROM users WHERE id = $1',
+      // created_at is included because the profile page renders "Member Since" from
+      // req.user; without it the field read "Unknown" for every account.
+      'SELECT id, email, name, avatar_url, role, review_count, created_at FROM users WHERE id = $1',
       [session.userId]
     );
 
@@ -76,7 +79,9 @@ export async function optionalAuth(
       const session = await sessions.get(token);
       if (session) {
         const result = await pool.query<AuthUser>(
-          'SELECT id, email, name, avatar_url, role, review_count FROM users WHERE id = $1',
+          // created_at is included because the profile page renders "Member Since"
+          // from req.user; without it the field read "Unknown" for every account.
+          'SELECT id, email, name, avatar_url, role, review_count, created_at FROM users WHERE id = $1',
           [session.userId]
         );
         if (result.rows.length > 0) {

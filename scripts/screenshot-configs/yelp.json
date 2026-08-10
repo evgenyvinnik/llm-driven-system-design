@@ -22,31 +22,63 @@
       "path": "/login",
       "waitFor": "form",
       "skipAuth": true,
-      "delay": 500
+      "delay": 600
     },
     {
       "name": "02-home",
       "path": "/",
       "waitFor": "main",
-      "delay": 1500
+      "delay": 2000
     },
     {
-      "name": "03-dashboard",
+      "name": "03-search",
+      "path": "/search?q=tacos",
+      "waitFor": "main",
+      "delay": 2500
+    },
+    {
+      "name": "04-business",
+      "path": "/business/sakura-sushi",
+      "waitFor": "main",
+      "delay": 2500
+    },
+    {
+      "name": "05-dashboard-reviews",
       "path": "/dashboard",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1500,
+      "steps": [
+        {
+          "click": "text=My Reviews",
+          "delay": 1500
+        }
+      ]
     },
     {
-      "name": "04-profile",
+      "name": "06-profile",
       "path": "/profile",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1800
     },
     {
-      "name": "05-admin",
+      "name": "07-owner-dashboard",
+      "path": "/dashboard",
+      "waitFor": "main",
+      "delay": 2000,
+      "loginAs": {
+        "email": "diana@example.com",
+        "password": "password123"
+      }
+    },
+    {
+      "name": "08-admin",
       "path": "/admin",
       "waitFor": "main",
-      "delay": 500
+      "delay": 2000,
+      "loginAs": {
+        "email": "admin@yelp-clone.local",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {

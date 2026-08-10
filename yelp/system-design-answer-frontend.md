@@ -282,45 +282,19 @@
 
 "I'm using React Hook Form with Zod validation for the review form. The idempotency key prevents duplicate submissions on retry, and photo uploads use FileReader for instant previews before actual upload."
 
-**Review Form Flow:**
+| Step | Constraint | Why it's a client-side concern |
+|------|-----------|-------------------------------|
+| Rating | 1–5, each with a word label ("Not good" … "Great") | The label is what makes ratings comparable between users; a bare star count invites everyone's private scale |
+| Title | 3–200 chars | Cheap guard against empty submissions |
+| Body | 50–5000 chars | The 50-char floor is anti-abuse, not formatting — one-word reviews are the cheapest possible attack on a rating |
+| Photos | ≤5, ≤5MB each, `FileReader` preview | Previewing locally means the user sees their photo before any byte is uploaded |
+| Submit | Client-generated UUID sent as an idempotency key | The retry problem below |
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                           Review Form Flow                                     │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                                │
-│  1. Rating Selection                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │   ★ ★ ★ ★ ★    "Great!"                                                 │  │
-│  │   Labels: 1="Not good", 2="Could be better", 3="OK", 4="Good", 5="Great"│  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                │
-│  2. Form Fields                                                                │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │   Title:   [_________________________] min 3, max 200 chars             │  │
-│  │   Review:  [_________________________] min 50, max 5000 chars           │  │
-│  │            [_________________________]                                   │  │
-│  │            [_________________________]                                   │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                │
-│  3. Photo Upload (max 5, each max 5MB)                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │   ┌──────┐ ┌──────┐ ┌──────┐ ┌─ ─ ─ ┐                                   │  │
-│  │   │ img1 │ │ img2 │ │ img3 │ │  +   │ ◀─── FileReader instant preview  │  │
-│  │   │  ✕   │ │  ✕   │ │  ✕   │ │ add  │                                   │  │
-│  │   └──────┘ └──────┘ └──────┘ └─ ─ ─ ┘                                   │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                │
-│  4. Submit Flow                                                                │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │   Generate UUID ──▶ Upload Photos ──▶ Submit Review with Idempotency Key│  │
-│  │                                                                          │  │
-│  │   Error 409 (Conflict) = "You have already reviewed this business"      │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                │
-│  Validation: Zod schema with custom error messages                             │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+Two things here are load-bearing rather than cosmetic.
+
+**Photos upload before the review, not with it.** The alternative — one multipart request carrying text and images — is simpler and fails badly on mobile: a 20MB upload that dies at 95% loses the written review too, and the user has to retype it. Uploading photos first means the review submission is a small JSON request that is fast and safely retryable, and a failed photo upload can be retried on its own without touching the text.
+
+**The idempotency key is generated when the form mounts, not when it is submitted.** Generating at submit time defeats the purpose: a user who taps Submit twice produces two keys and two reviews. Minted at mount, the key is stable across every retry of that one composition, so the server can recognize the second attempt as the same review. A `409` then has an unambiguous meaning the UI can render honestly — "you have already reviewed this business" — rather than a generic failure the user will respond to by trying again.
 
 ---
 
@@ -390,43 +364,16 @@
 
 "I'm using Zustand with the persist middleware to remember recent searches and last location. The partialize option ensures we only persist non-sensitive, useful data to localStorage."
 
-**Search Store Structure:**
+| Slice | Holds | Persisted? |
+|-------|-------|-----------|
+| `query`, `location` | The current text and place ("pizza", "San Francisco, CA") | No — belongs to the URL |
+| `coordinates` | Resolved lat/lng for the location | Last one only |
+| `filters` | minRating, price, distance, openNow, categories[] | No |
+| `recentSearches` | Last 10, de-duplicated | Yes |
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                           searchStore (Zustand)                                │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                                │
-│  State:                                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  query: string              "pizza"                                      │  │
-│  │  location: string           "San Francisco, CA"                          │  │
-│  │  coordinates: {lat, lng}    { lat: 37.7749, lng: -122.4194 }            │  │
-│  │  filters: {                                                              │  │
-│  │    minRating: number | null     4                                        │  │
-│  │    price: number | null         2                                        │  │
-│  │    distance: number | null      5                                        │  │
-│  │    openNow: boolean             true                                     │  │
-│  │    categories: string[]         ["Italian"]                              │  │
-│  │  }                                                                       │  │
-│  │  recentSearches: string[]   ["sushi", "tacos", "coffee"]                │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                │
-│  Actions:                                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  setQuery(query)            Update search query                          │  │
-│  │  setLocation(location)      Update location string                       │  │
-│  │  setCoordinates(coords)     Update lat/lng coordinates                   │  │
-│  │  updateFilter(key, value)   Update single filter                         │  │
-│  │  clearFilters()             Reset filters to defaults                    │  │
-│  │  addRecentSearch(search)    Add to recent, max 10, no duplicates        │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                │
-│  Persist (localStorage "yelp-search"):                                         │
-│    - recentSearches                                                            │
-│    - location                                                                  │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+The interesting decision is **what is deliberately not in the store: the results.** Search results live with the query that produced them, keyed by the URL, so a shared link reproduces exactly what the sender saw and the back button works without any restoration logic. Putting results in a global store makes both of those things something you have to implement by hand, and makes "which query do these results belong to?" a question the UI can get wrong during a race between two in-flight searches.
+
+`partialize` persists only `recentSearches` and the last coordinates. That split is a privacy decision as much as a technical one: recent searches are a convenience the user can see and clear, whereas persisting every filter combination silently rebuilds a profile of someone's browsing in localStorage for no product benefit. Filters also *should* reset between sessions — a "open now, under $" filter set at 11pm is actively wrong the next morning.
 
 ---
 

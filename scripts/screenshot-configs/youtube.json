@@ -5,38 +5,60 @@
   "dbName": "youtube",
   "dbUser": "youtube",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/",
+    "openSelector": "button:has-text('Sign in')",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "#auth-username",
+    "passwordSelector": "#auth-password",
+    "submitSelector": ".modal-overlay button[type='submit']",
+    "successIndicator": "main, aside"
   },
   "screens": [
     {
       "name": "01-home",
       "path": "/",
       "waitFor": "main",
-      "delay": 1500
+      "delay": 2000
     },
     {
-      "name": "02-trending",
+      "name": "02-watch",
+      "path": "/watch/abc123xyz01",
+      "waitFor": "main",
+      "delay": 3000
+    },
+    {
+      "name": "03-trending",
       "path": "/trending",
       "waitFor": "main",
-      "delay": 1000
+      "delay": 1800
     },
     {
-      "name": "03-subscriptions",
+      "name": "04-subscriptions",
       "path": "/subscriptions",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1800
     },
     {
-      "name": "04-history",
+      "name": "05-history",
       "path": "/history",
       "waitFor": "main",
-      "delay": 500
+      "delay": 1800
     },
     {
-      "name": "05-studio",
+      "name": "06-channel",
+      "path": "/channel/11111111-1111-1111-1111-111111111111",
+      "waitFor": "main",
+      "delay": 2000
+    },
+    {
+      "name": "07-studio",
       "path": "/studio",
       "waitFor": "main",
-      "delay": 500
+      "delay": 2000
     }
   ],
   "viewport": {

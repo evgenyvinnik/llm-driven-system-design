@@ -11,6 +11,30 @@ import { ReviewWithUser, CountRow } from './types.js';
  */
 export const router = Router();
 
+/** Matches a canonical UUID, used to tell an ID apart from a slug. */
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolves a business identifier that may be either a UUID or a slug.
+ *
+ * `GET /businesses/:idOrSlug` accepts both, and the frontend routes business
+ * pages by slug — but the review endpoints passed the raw parameter straight
+ * into `WHERE business_id = $1`, so every slug-based page load failed with
+ * "invalid input syntax for type uuid" and reviews silently never rendered.
+ *
+ * @param idOrSlug - Business UUID or URL slug
+ * @returns The business UUID, or null when no business matches
+ */
+async function resolveBusinessId(idOrSlug: string): Promise<string | null> {
+  if (UUID_PATTERN.test(idOrSlug)) return idOrSlug;
+  const result = await pool.query<{ id: string }>(
+    'SELECT id FROM businesses WHERE slug = $1',
+    [idOrSlug]
+  );
+  return result.rows[0]?.id ?? null;
+}
+
 /**
  * Retrieves reviews for a specific business.
  *
@@ -22,7 +46,7 @@ export const router = Router();
  *
  * @route GET /:id/reviews
  *
- * @param req.params.id - Business UUID
+ * @param req.params.id - Business UUID or slug
  * @param req.query.page - Page number (default: 1)
  * @param req.query.limit - Results per page (default: 10)
  * @param req.query.sort - Sort order: 'recent' (default), 'rating_high', 'rating_low', or 'helpful'
@@ -49,7 +73,11 @@ router.get(
   '/:id/reviews',
   async (req: Request, res: Response): Promise<void> => {
     try {
-      const { id } = req.params;
+      const businessId = await resolveBusinessId(String(req.params.id));
+      if (!businessId) {
+        res.status(404).json({ error: { message: 'Business not found' } });
+        return;
+      }
       const {
         page = '1',
         limit = '10',
@@ -82,14 +110,14 @@ router.get(
     `;
 
       const result = await pool.query<ReviewWithUser>(query, [
-        id,
+        businessId,
         parseInt(limit, 10),
         offset,
       ]);
 
       const countResult = await pool.query<CountRow>(
         'SELECT COUNT(*) FROM reviews WHERE business_id = $1',
-        [id]
+        [businessId]
       );
 
       res.json({

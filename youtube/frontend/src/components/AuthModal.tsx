@@ -92,6 +92,9 @@ export default function AuthModal({ onClose }: AuthModalProps) {
           <div>
             <label className="block text-sm text-yt-text-secondary-dark mb-2">Username</label>
             <input
+              id="auth-username"
+              name="username"
+              autoComplete="username"
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
@@ -133,6 +136,9 @@ export default function AuthModal({ onClose }: AuthModalProps) {
           <div>
             <label className="block text-sm text-yt-text-secondary-dark mb-2">Password</label>
             <input
+              id="auth-password"
+              name="password"
+              autoComplete="current-password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
