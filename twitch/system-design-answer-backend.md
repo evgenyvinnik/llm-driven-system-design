@@ -90,25 +90,16 @@
 
 ### Redis Data Structures
 
-```
-# Viewer tracking per channel
-viewers:{channelId}              -> Counter (INCR/DECR on join/leave)
+| Key | Type | Purpose |
+|-----|------|---------|
+| `viewers:{channelId}` | Counter | Viewer tracking, incremented/decremented on join and leave |
+| `ratelimit:chat:{channelId}:{userId}` | String + TTL | Per-user chat cooldown |
+| `chat_dedup:{channelId}` | Set (5-min window) | Message-ID dedup for client retries |
+| `stream_lock:{channelId}` | String, 10s TTL | Prevents a duplicate go-live from a reconnecting encoder |
+| `idempotency:{key}` | JSON, 24h TTL | Cached subscription result for safe retries |
+| `chat:{channelId}` | Pub/Sub channel | Cross-instance chat fan-out |
 
-# Chat rate limiting
-ratelimit:chat:{channelId}:{userId} -> Counter with TTL
-
-# Chat deduplication (5 min window)
-chat_dedup:{channelId}           -> Set of message IDs
-
-# Stream start lock (prevent duplicate go-live)
-stream_lock:{channelId}          -> String with 10s TTL
-
-# Idempotency cache for subscriptions
-idempotency:{key}                -> JSON result with 24h TTL
-
-# Pub/Sub channels
-chat:{channelId}                 -> Pub/Sub for chat messages
-```
+Note that Redis is carrying four unrelated responsibilities here — cooldowns, dedup, locking, and the message bus. That is convenient and it concentrates risk: an outage takes out rate limiting, dedup, and fan-out simultaneously, which is the reason the publish path needs the circuit breaker described in §5 while the others simply fail.
 
 ---
 
@@ -185,23 +176,52 @@ The transcoder takes the RTMP input and produces multi-quality HLS output using 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Message Flow with Deduplication
+### The message pipeline, and why its order is the design
 
-Each incoming chat message goes through a six-step pipeline:
+Every chat message runs a gauntlet before it is allowed to exist, and the *sequence* carries more design weight than any individual step:
 
-1. **Rate limit check**: Increment a per-user counter in Redis (`ratelimit:chat:{channelId}:{userId}`) with a 1-second TTL. If the count exceeds 1 (or the channel's configured slow mode threshold), reject the message with a "RATE_LIMITED" error and tell the client how many seconds to wait.
+1. **Deduplicate.** Resolve the message ID (client-supplied, or generated) and check it against a short-lived Redis window. A duplicate is dropped silently — no response at all.
+2. **Rate limit.** Read the per-user cooldown key for this channel; reject if the user is inside the window.
+3. **Ban check.** Query `channel_bans` with an `expires_at IS NULL OR expires_at > NOW()` predicate, so permanent and timed bans are one query.
+4. **Resolve badges.** Role, active subscription tier, channel-moderator status.
+5. **Persist to Postgres.**
+6. **Publish to Redis**, which fans out to every instance holding sockets in this channel — including the publishing instance, which then writes to its own local sockets.
 
-2. **Ban check**: Look up whether the user is banned in this channel. If banned, return a "BANNED" error immediately.
+**Dedup must come before rate limiting.** This looks like a micro-optimization and is actually a correctness requirement. A phone on a flaky connection sends a message, loses the ack, and resends. With rate limiting first, the retry is rejected as "Slow down!" — the user sees an error for a message that already succeeded, and the client now has no way to determine which is true. With dedup first, the retry is a silent no-op and the user's state stays consistent. The retry must not consume budget it already paid.
 
-3. **Deduplication**: Use a Redis set (`chat_dedup:{channelId}`) with a 5-minute expiry window. Attempt to add the message ID -- if it already exists, the message is a client retry and is silently dropped.
+The silence is deliberate too: returning an error on a duplicate would tell the client the message failed. The cost is that a genuine duplicate looks identical to a bug in the logs, which is why the drop is logged at debug with the message ID attached.
 
-4. **Enrich the message**: Build the full message object with the user's display name, subscriber/mod/admin badges, and a server-side timestamp.
+**Persist before publish, not after.** This is the trade-off I would expect to be challenged on, because writing to Postgres synchronously puts the slowest operation in the pipeline directly in the latency path of the highest-volume write in the system. The argument for reversing it is real: publish first and the perceived latency drops to a Redis round trip.
 
-5. **Publish via Redis Pub/Sub**: Publish the enriched message to the `chat:{channelId}` channel. All chat pods subscribed to this channel receive it and broadcast to their local WebSocket connections.
+It is still wrong here, because the two failure modes are not symmetric. Publish-then-crash means viewers saw a message that no longer exists — it is absent from the scrollback the next viewer receives on join, and it cannot be moderated after the fact because there is no row to act on. A moderator who saw something and goes to remove it finds nothing there. Write-then-crash produces the opposite: a durable message nobody saw live, which the next join surfaces. For a system that has to answer "what was said in this channel?", *durable but undelivered* is recoverable and *delivered but not durable* is not.
 
-6. **Store asynchronously**: Write the message to PostgreSQL for moderation replay and chat history, but do this asynchronously so it does not block the real-time path.
+There is an asymmetry worth flagging: guests can chat, but the insert is guarded on having a user ID, so guest messages are live-only and vanish from scrollback. That is a defensible product decision and an easy one to make accidentally.
 
-**Chat Pod Setup**: Each chat pod creates a dedicated Redis subscriber connection. It subscribes to `chat:{channelId}` for every active channel it handles. When a message arrives on any subscribed channel, the pod parses it and broadcasts to all WebSocket connections in that channel's room.
+### Fan-out: pub/sub over a direct mesh
+
+Broadcasting to the local socket set works perfectly on one instance and breaks silently on two — viewers on instance A see each other, viewers on B see each other, and neither group sees the other. No error is raised anywhere; there are simply two parallel realities in the same chat room. That failure is invisible in every single-instance test, which is why the fan-out has to go through a shared bus from the start rather than being retrofitted.
+
+Instances subscribe **per channel, on demand** — the first client to join a channel triggers the subscribe, the last to leave triggers the unsubscribe. A wildcard subscription would be simpler and would mean every instance receives the message volume of every channel on the platform in order to discard almost all of it.
+
+**What pub/sub gives up is delivery guarantees.** Redis pub/sub is fire-and-forget: a message published while a subscriber is momentarily disconnected is gone, with no backlog and no replay. That is only tolerable because durability is Postgres's job, and it is precisely why step 5 precedes step 6. Kafka would give ordered, replayable delivery — at the cost of consumer-group coordination and a broker to operate, for a payload whose value expires in about two seconds.
+
+**The publish is circuit-broken with a local-broadcast fallback.** Without it, a Redis stall means every chat message awaits a doomed publish; that is not a chat outage but a process outage, because thousands of concurrent chatters each hold a pending promise and an open socket while the event loop fills with retries. The breaker converts a hang into a fast failure, and the fallback converts the fast failure into a partial feature — viewers on your instance still see each other. Chat visibly fractures across instances during the outage, which is bad, and still much better than chat stopping.
+
+### One detail that fails at runtime, not compile time
+
+Each instance needs a *dedicated* Redis subscriber connection, separate from the client it uses for cooldown keys and dedup sets. A connection in subscriber mode accepts nothing but subscribe/unsubscribe commands, so sharing a single client means every other Redis operation starts failing the moment the first channel is joined. Nothing in the type system catches it, and it works fine right up until someone opens a chat.
+
+### Counting viewers is harder than it looks
+
+The obvious viewer count is the size of the local socket set, and it is wrong in a specific way: it counts the sockets *one process* holds. Across instances each reports its own slice, so the number a viewer sees depends on which instance they were balanced onto. The count that is actually correct — distinct concurrent viewers across all instances — is a presence problem, not a chat problem: per-instance Redis counters with periodic reconciliation get close, and true accuracy needs a dedicated presence service with heartbeat expiry, because a process that dies without cleaning up leaves its viewers counted forever.
+
+### Rate limiting: a cooldown key, not a sliding window
+
+The limiter is one Redis key per user per channel: read the stored timestamp, compare against the cooldown, re-set with an expiry equal to the cooldown. One GET and one SET per message.
+
+This is deliberately weaker than the sorted-set sliding windows used for API rate limiting, and it is the right weakness here. A sliding window stores one member per request — in a channel with 100K viewers, that is an enormous churn of short-lived sorted-set entries whose only purpose is to enforce a rule expressible as "not more often than every N seconds." The cooldown collapses the entire window into one self-cleaning key.
+
+What it gives up is burst tolerance. A sliding window lets someone send three messages quickly and then wait, which is how people actually type; the cooldown enforces strict spacing and will reject the second half of a legitimate double-post. For chat that is arguably correct — strict spacing is exactly what slow mode *is*, so the limiter and the product feature are the same mechanism at different settings.
 
 ### Rate Limiting Strategies
 
@@ -212,6 +232,12 @@ Each incoming chat message goes through a six-step pipeline:
 | Subscribers Only | N/A | Reduce spam during events |
 | Follower Mode | 10min+ follow age | Only followers can chat |
 | Emote Only | N/A | Special events |
+
+### Bans are enforced on the hot path, not at connection time
+
+The ban check runs per message rather than once at join. Checking at join is one query instead of thousands and is what a naive implementation does — and it means a user banned *during* a stream keeps chatting until they voluntarily reconnect, which is precisely the moment the ban matters. A moderator banning someone mid-argument expects it to take effect on their next message, not their next page load.
+
+The cost is a database read on the highest-volume write in the system. It is affordable because the query is a composite-primary-key lookup on `(channel_id, user_id)` and the predicate `expires_at IS NULL OR expires_at > NOW()` covers permanent and timed bans in the same statement, so timeouts need no expiry job — they simply stop matching. A per-channel ban set in Redis, invalidated on moderation events, would remove the read entirely and is the obvious next step if this becomes hot.
 
 ### Chat Pod Scaling
 
@@ -293,30 +319,35 @@ We track both infrastructure and business metrics:
 
 ---
 
-## 9. Trade-offs and Alternatives (2 minutes)
+## 9. Trade-offs Summary (2 minutes)
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Video protocol | HLS | WebRTC | Scalability over latency |
-| Chat transport | WebSocket + Pub/Sub | Kafka | Simplicity for learning |
-| VOD storage | Segment archive | Re-encode | Instant availability |
-| Transcoding | Per-stream workers | Shared pool | Isolation |
-| Stream key auth | Database lookup | JWT | Simpler revocation |
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Video protocol | HLS | WebRTC | Scales over commodity CDN; WebRTC's sub-second latency needs per-viewer connection state |
+| Chat transport | WebSocket + Redis pub/sub | Kafka | At-most-once is acceptable when Postgres holds durability; a broker is not worth operating for a 2-second-lived payload |
+| Chat ordering | Persist, then publish | Publish, then persist | "Delivered but not durable" is unrecoverable for a moderated system; the reverse is not |
+| Dedup position | Before rate limiting | After | A retry must not consume rate-limit budget it already paid |
+| Rate limiting | Per-user cooldown key | Sorted-set sliding window | One key with a self-cleaning TTL instead of one member per message at chat volume |
+| Fan-out subscription | Per channel, on demand | Wildcard subscribe | An instance should not receive every channel's traffic to discard it |
+| Publish failure | Circuit breaker + local broadcast | Fail the message | Partial delivery beats a stalled event loop holding thousands of promises |
+| VOD storage | Archive live segments | Re-encode after stream | Instant availability, no second encode, resumable per segment |
+| Stream key auth | Database lookup | JWT | Revocation is immediate; a leaked key must die the moment it is rotated |
+
+### What breaks first
+
+**Chat history.** `chat_messages` grows without bound, and every join reads the most recent 50 rows from it. Monthly range partitioning makes the read touch one partition and makes retention a `DROP PARTITION` rather than a mass `DELETE`. The alternative worth considering is serving scrollback from a capped Redis list per channel and keeping Postgres purely for moderation history — faster joins, at the cost of two sources of truth for the same messages.
+
+**Badge resolution.** Up to three extra queries per message (role, subscription, moderator) on the highest-volume write path, for data that changes rarely. Resolving them once at authentication and caching them on the connection removes almost all of it — but then a ban or a mod promotion does not take effect until the user reconnects, which is exactly wrong for the moderation actions that most need to be immediate. The compromise is to cache badges and invalidate on moderation events specifically.
+
+**The WebSocket authentication seam.** The connection currently trusts the user ID the client sends in its auth frame rather than deriving it from the HTTP session. That is fine on a laptop and disqualifying anywhere else: any client can claim any user ID and inherit their badges and moderator powers. The fix is to read the session cookie during the upgrade handshake, which is the single most important change on this list.
 
 ---
 
 ## 10. Summary
 
-This backend architecture handles Twitch's core systems:
+Four decisions carry this design:
 
-1. **Video Pipeline**: RTMP ingest with stream key auth, FFmpeg transcoding to HLS, CDN delivery with >99% cache hit ratio
-
-2. **Chat System**: WebSocket pods with Redis Pub/Sub fan-out, deduplication, rate limiting, and circuit breakers for graceful degradation
-
-3. **VOD Recording**: Parallel segment archival during live for instant availability
-
-4. **Reliability**: Idempotency keys for payments, distributed locks for stream start, circuit breakers for dependencies
-
-5. **Observability**: Prometheus metrics for streams, chat, connections with alerting thresholds
-
-The system scales horizontally with dedicated transcoders per stream and partitioned chat pods per channel size.
+1. **The video path and the chat path are different problems.** Video is bandwidth with a latency budget and almost no application logic; chat is fan-out with a moderation gauntlet on the hot path. They share a page and nothing else, and the interesting distributed-systems content is all on the chat side.
+2. **Ordering in the chat pipeline is the design.** Dedup before rate limiting keeps retries honest; persist before publish makes every delivered message moderatable. Both are one-line reorderings that are very hard to diagnose after the fact if they are wrong.
+3. **Durability and delivery are separate systems with separate failure modes.** Redis moves messages, Postgres remembers them. Losing the bus degrades the product; losing the record corrupts it.
+4. **Degradation is designed, not incidental.** The circuit breaker's local-broadcast fallback, the per-dependency health tiering, and the choice to let chat fracture rather than stop are all the same judgment applied consistently: prefer a visibly partial feature to a stalled one.
