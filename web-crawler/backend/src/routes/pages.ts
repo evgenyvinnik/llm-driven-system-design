@@ -68,13 +68,29 @@ router.get('/', async (req: Request, res: Response) => {
         ' WHERE ' +
         conditions.join(' AND ').replace(/\$(\d+)/g, (_, n) => `$${n}`);
     }
-    const countResult = await pool.query(
-      countQuery,
-      params.slice(0, conditions.length > 0 ? (domain ? 1 : 0) + (search ? 1 : 0) : 0)
-    );
+    // The count query reuses the filter params but not LIMIT/OFFSET, which are
+    // always the last two pushed. Slicing them off is exact; recomputing the
+    // filter count separately would drift the moment a third filter is added.
+    const countResult = await pool.query(countQuery, params.slice(0, params.length - 2));
 
+    // Postgres returns snake_case; the API contract (and `CrawledPage` in the
+    // frontend types) is camelCase. Returning `result.rows` verbatim meant every
+    // one of these fields arrived undefined, which the UI rendered as
+    // "undefined B", a bare "ms", and "Invalid Date" on every row.
     res.json({
-      pages: result.rows,
+      pages: result.rows.map((row) => ({
+        id: row.id,
+        url: row.url,
+        domain: row.domain,
+        title: row.title,
+        description: row.description,
+        statusCode: row.status_code,
+        contentType: row.content_type,
+        contentLength: row.content_length,
+        linksCount: row.links_count,
+        crawledAt: row.crawled_at,
+        crawlDurationMs: row.crawl_duration_ms,
+      })),
       total: parseInt(countResult.rows[0].count),
       limit,
       offset,
@@ -139,7 +155,17 @@ router.get('/domain/:domain', async (req: Request, res: Response) => {
       [domain, limit]
     );
 
-    res.json(result.rows);
+    // Same camelCase contract as the list endpoint above.
+    res.json(
+      result.rows.map((row) => ({
+        id: row.id,
+        url: row.url,
+        title: row.title,
+        statusCode: row.status_code,
+        crawledAt: row.crawled_at,
+        crawlDurationMs: row.crawl_duration_ms,
+      }))
+    );
   } catch (error) {
     console.error('Error getting domain pages:', error);
     res.status(500).json({ error: 'Failed to get domain pages' });

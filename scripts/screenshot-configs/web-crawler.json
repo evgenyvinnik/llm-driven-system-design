@@ -10,9 +10,9 @@
   "screens": [
     {
       "name": "01-dashboard",
-      "path": "/dashboard",
-      "waitFor": "main",
-      "delay": 1000
+      "path": "/",
+      "waitFor": "main, h1",
+      "delay": 1500
     },
     {
       "name": "02-domains",

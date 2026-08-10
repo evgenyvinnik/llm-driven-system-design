@@ -47,8 +47,17 @@ router.get('/', async (req: Request, res: Response) => {
 
     const countResult = await pool.query('SELECT COUNT(*) as count FROM domains');
 
+    // camelCase to match the `Domain` type the frontend declares; raw rows would
+    // leave pageCount/crawlDelay/isAllowed undefined in the table.
     res.json({
-      domains: result.rows,
+      domains: result.rows.map((row) => ({
+        domain: row.domain,
+        pageCount: row.page_count,
+        crawlDelay: row.crawl_delay,
+        isAllowed: row.is_allowed,
+        robotsFetchedAt: row.robots_fetched_at,
+        createdAt: row.created_at,
+      })),
       total: parseInt(countResult.rows[0].count),
       limit,
       offset,
