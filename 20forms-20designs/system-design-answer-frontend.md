@@ -1,678 +1,369 @@
-# 20 Forms, 40 Designs - System Design Answer (Frontend Focus)
+# Form Library Comparison — Frontend System Design
 
-*45-minute system design interview format - Frontend Engineer Position*
+*A 45-minute interview discussion. This is a proposed design; the current source
+and its limitations are documented in [architecture.md](./architecture.md).*
 
----
+## 🎯 Clarify the problem — 5 minutes
 
-## 📋 Problem Statement
+> “I want to help a developer compare how several component libraries implement
+> the same form. The comparison is only useful if each library looks and behaves
+> as it would in a standalone application. I would start with that requirement,
+> because it determines where I put the rendering boundary.”
 
-Design the frontend architecture for a platform that renders identical forms across 41 React design systems for comparison. Key challenges include:
-- Complete CSS isolation between competing design systems
-- Efficient iframe-based architecture for side-by-side comparison
-- Responsive preview grid with lazy loading
-- Theme synchronization across isolated applications
+I would clarify three things with the interviewer before drawing the system:
 
----
+1. Are the examples maintained by our team, or can users upload arbitrary code?
+2. Are people comparing appearances, interactive behavior, or both?
+3. Must a shared link recreate the exact comparison on another person's browser?
 
-## 🎯 Requirements Clarification
+For this discussion, I will assume curated, interactive examples and exact sharing.
+The product supports twenty forms and roughly fifty comparison entries, including
+an unstyled reference. Users select several forms and libraries, group the results,
+and switch themes where the library supports them.
 
-### Functional Requirements
+Login and checkout are demonstrations. We are not creating accounts, processing
+payments, or storing what users type into the examples. Those requirements would
+change both the data model and the trust boundary.
 
-1. **Form Comparison Grid**: Display multiple design system forms side-by-side
-2. **Library Selection**: Toggle visibility of any library combination
-3. **Form Selection**: Switch between 20 different form types
-4. **Theme Toggle**: Light/dark mode for supported libraries
-5. **Deep Linking**: Shareable URLs to specific comparisons
+The main user journey is simple: select a login form, choose two libraries, compare
+their controls, try a validation error, switch theme, and share the result.
 
-### Non-Functional Requirements
+### What success means
 
-| Requirement | Target | Rationale |
-|-------------|--------|-----------|
-| CSS Isolation | Complete | Zero style bleed between design systems |
-| Performance | Smooth scrolling | With 41 potential iframes |
-| Responsive | Desktop + tablet | Grid adapts to viewport |
-| Accessibility | WCAG 2.1 AA | Keyboard navigation, screen reader |
+| Requirement | Why it matters |
+|-------------|----------------|
+| Independent styling | A comparison corrupted by another library is misleading |
+| Responsive controls | A heavy preview must not make selection feel stuck |
+| Reproducible links | The recipient should see the sender's intended comparison |
+| Keyboard access | Each preview is an interactive document, not an image |
+| Visible limitations | Unsupported themes and unavailable previews must be clear |
 
-### UI/UX Requirements
+I would propose a shell interaction target around 200 ms and then agree on a device
+and network profile. I would measure preview readiness separately: downloading an
+iframe document does not prove that its React app has rendered successfully.
 
-- Clean control panel for form/library selection
-- Visual feedback for selected libraries
-- Loading states for iframe content
-- Graceful handling of libraries without dark mode
+I would not promise that a thousand active frames will perform well. Twenty forms
+across fifty entries produce a thousand possible previews, so controlling how much
+of that matrix is alive is part of the design.
 
----
+## 🏗️ Draw the architecture — 5 minutes
 
-## 🏗️ High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Shell Application (Host)                              │
-│                                                                          │
-│  ┌────────────────────────────────────────────────────────────────────┐ │
-│  │                         Header / Controls                          │ │
-│  │  ┌─────────────────┐ ┌──────────────────────┐ ┌─────────────────┐ │ │
-│  │  │  FormSelector   │ │  LibraryMultiSelect  │ │  ThemeToggle    │ │ │
-│  │  │  [Login ▼]      │ │  [✓ MUI ✓ Chakra...] │ │  [🌙 / ☀️]      │ │ │
-│  │  └─────────────────┘ └──────────────────────┘ └─────────────────┘ │ │
-│  └────────────────────────────────────────────────────────────────────┘ │
-│                                                                          │
-│  ┌────────────────────────────────────────────────────────────────────┐ │
-│  │                         Preview Grid                               │ │
-│  │  ┌──────────────────────┐  ┌──────────────────────┐               │ │
-│  │  │    PreviewCard       │  │    PreviewCard       │               │ │
-│  │  │  ┌────────────────┐  │  │  ┌────────────────┐  │               │ │
-│  │  │  │ Library: MUI   │  │  │  │ Library: Chakra│  │               │ │
-│  │  │  └────────────────┘  │  │  └────────────────┘  │               │ │
-│  │  │  ┌────────────────┐  │  │  ┌────────────────┐  │               │ │
-│  │  │  │    <iframe>    │  │  │  │    <iframe>    │  │               │ │
-│  │  │  │ /mui/?form=    │  │  │  │ /chakra/?form= │  │               │ │
-│  │  │  │  login&theme=  │  │  │  │  login&theme=  │  │               │ │
-│  │  │  │  dark          │  │  │  │  dark          │  │               │ │
-│  │  │  └────────────────┘  │  │  └────────────────┘  │               │ │
-│  │  └──────────────────────┘  └──────────────────────┘               │ │
-│  └────────────────────────────────────────────────────────────────────┘ │
-│                                                                          │
-│  ┌────────────────────────────────────────────────────────────────────┐ │
-│  │                       Zustand Store                                │ │
-│  │  selectedForm | selectedLibraries[] | theme | isLoading           │ │
-│  └────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔧 Deep Dive: CSS Isolation Problem
-
-### Why This Is the Core Challenge
-
-When multiple design systems coexist in one React app, their styles collide catastrophically:
+I would draw the shell and two representative previews. More library boxes would
+repeat the same boundary without explaining another decision.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Single SPA (Style Collision)                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  <div>                                                          │    │
-│  │    <MuiThemeProvider>                                           │    │
-│  │      └── MuiButton                                              │    │
-│  │    </MuiThemeProvider>                                          │    │
-│  │    <ChakraProvider>                                             │    │
-│  │      └── ChakraButton     ← Styles broken by MUI's CssBaseline  │    │
-│  │    </ChakraProvider>                                            │    │
-│  │  </div>                                                         │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Conflicts:                                                              │
-│  ├── MUI's CssBaseline resets Chakra's default styles                   │
-│  ├── Chakra's global styles override MUI's typography                   │
-│  ├── CSS custom properties (--chakra-colors-blue-500) clash             │
-│  └── Both libraries fight over body and html styles                     │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│ Shell                                    │
+│ Controls ──▶ Comparison state ──▶ Cards  │
+│                    ▲                     │
+│                    │ URL + preferences   │
+└───────────┬──────────────────┬───────────┘
+            │                  │
+            ▼                  ▼
+    ┌──────────────┐   ┌──────────────┐
+    │ Library A    │   │ Library B    │
+    │ Own document │   │ Own document │
+    │ Native forms │   │ Native forms │
+    └──────────────┘   └──────────────┘
 ```
 
-### Isolation Strategies Evaluated
+The shell is responsible for selection, grouping, navigation, and preview lifecycle.
+Each library app owns its form components, theme provider, styles, and input state.
+Both are static applications served through the same delivery system.
 
-| Approach | Isolation Level | Why It Fails |
-|----------|-----------------|--------------|
-| Single SPA | None | Styles clash immediately |
-| CSS Modules | Class names only | Doesn't isolate resets, CSS variables |
-| Shadow DOM | Partial | CSS custom properties leak through, React context breaks |
-| **Iframe** | **Complete** | True separate browsing contexts |
+I would use React for the shell and a small store such as Zustand for comparison
+settings shared by the controls and cards. Ordinary React state remains appropriate
+for a selector's open/closed state or a card's local display details.
 
-### The Iframe Solution
+Choosing a store is not the main performance solution. Every mounted iframe still
+creates another document and application instance. Avoiding an unnecessary shell
+render cannot compensate for hundreds of expensive previews.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Iframe Architecture (Complete Isolation)             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─────────────────────────┐    ┌─────────────────────────┐             │
-│  │   Iframe: /mui/         │    │   Iframe: /chakra/      │             │
-│  │   ?form=login&theme=dark│    │   ?form=login&theme=dark│             │
-│  │                         │    │                         │             │
-│  │  ┌───────────────────┐  │    │  ┌───────────────────┐  │             │
-│  │  │ Separate document │  │    │  │ Separate document │  │             │
-│  │  │ Separate <head>   │  │    │  │ Separate <head>   │  │             │
-│  │  │ Own stylesheets   │  │    │  │ Own stylesheets   │  │             │
-│  │  │ Own CSS cascade   │  │    │  │ Own CSS cascade   │  │             │
-│  │  │ Own JS runtime    │  │    │  │ Own JS runtime    │  │             │
-│  │  │ Own React tree    │  │    │  │ Own React tree    │  │             │
-│  │  └───────────────────┘  │    │  └───────────────────┘  │             │
-│  │                         │    │                         │             │
-│  │  Cannot affect ─────────┼────┼── Cannot be affected by │             │
-│  └─────────────────────────┘    └─────────────────────────┘             │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### State ownership
 
-> "Iframes provide true browser-level isolation. Each library runs in its own browsing context with independent document, styles, and JavaScript runtime. The overhead is acceptable for this comparison use case."
+| State | Owner | Persistence |
+|-------|-------|-------------|
+| Selected form and library IDs | Shell comparison state | URL and optional saved preferences |
+| Requested theme and grouping | Shell comparison state | URL and optional saved preferences |
+| Library metadata and form labels | Static catalog | Build artifact |
+| Preview readiness and last use | Preview manager | Memory only |
+| Typed form fields and validation | Individual library app | Transient within its document |
 
----
+I would store stable IDs and derive the selected catalog entries. Storing another
+copy of the filtered catalog creates an unnecessary synchronization problem.
 
-## 🗂️ Deep Dive: State Management with Zustand
+The first request loads the shell. The shell parses the comparison, constructs
+preview descriptors, and starts the nearby frames. Each frame loads its library
+app and renders the requested form.
 
-### Store Architecture
+## 🔧 Deep dive 1: preserve native styling — 8 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Zustand Comparison Store                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                          State                                     │  │
-│  │  ├── selectedForm: string           ("login", "signup", etc.)     │  │
-│  │  ├── selectedLibraries: Set<string> ({"mui", "chakra", ...})      │  │
-│  │  ├── theme: "light" | "dark"                                      │  │
-│  │  ├── forms: Form[]                  (Static form definitions)     │  │
-│  │  └── libraries: Library[]           (Static library metadata)     │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                          Actions                                   │  │
-│  │  ├── setForm(formId)                 Select which form to show    │  │
-│  │  ├── toggleLibrary(libraryId)        Add/remove from comparison   │  │
-│  │  ├── selectAllLibraries()            Show all 41 libraries        │  │
-│  │  ├── clearAllLibraries()             Clear selection              │  │
-│  │  └── toggleTheme()                   Switch light/dark            │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                       Computed Selectors                           │  │
-│  │  ├── getSelectedLibraryList()        Returns Library[] for grid   │  │
-│  │  └── getIframeUrl(libraryId)         Builds /{lib}/?form=&theme=  │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                       Persistence Layer                            │  │
-│  │  persist() middleware ──▶ localStorage                            │  │
-│  │  Serializes: selectedForm, selectedLibraries[], theme             │  │
-│  │  Survives page refresh                                            │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+> “I would use a separate iframe document for each active preview. The extra
+> document is a real cost, but preserving native library behavior is the product's
+> central requirement. I would spend the complexity budget on controlling those
+> documents rather than adapting every library's styling internals.”
 
-### Why Zustand Over React Context?
+Consider two libraries that both reset body margins, choose default fonts, and
+inject styles for overlays. In a shared document, stylesheet order can change what
+the comparison shows. A developer might reject a library because our integration
+altered its controls rather than because of the library itself.
 
-| Factor | Zustand | React Context |
-|--------|---------|---------------|
-| Boilerplate | Minimal | Significant (Provider, reducer, actions) |
-| Re-renders | Selective via selectors | All consumers re-render |
-| Persistence | Built-in plugin | Manual localStorage sync |
-| Devtools | Built-in support | Requires setup |
-| URL Sync | Easy integration | Complex coordination |
+CSS Modules help with class-name collisions in code we own. They do not automatically
+contain global resets or third-party stylesheets. Rewriting every selector also
+creates maintenance work whenever a library changes its CSS.
 
-> "Zustand's selector pattern means each component only re-renders when its specific slice changes. With 41 preview cards, this prevents cascade re-renders when toggling a single library."
+Shadow DOM is a more serious alternative. It can contain selectors, but inherited
+properties, style injection, and menus rendered outside the shadow root need
+intentional integration. Some libraries support that well; others assume a global
+document and portal target.
 
----
+I would avoid saying that React context inherently stops at a shadow boundary.
+Context follows the React component tree; a portal can preserve it even when DOM
+placement changes. The integration concern is how the library uses styles and DOM
+APIs, not an automatic failure of React context.
 
-## 🎨 Deep Dive: Preview Grid Component
+An iframe gives the library its own document, stylesheet cascade, and React root.
+Its reset applies to its own example. We can open that document directly to inspect
+whether a problem belongs to the library app or the surrounding shell.
 
-### Responsive Grid Layout Strategy
+### What the choice costs
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Responsive Grid Behavior                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Selection Count ──▶ Grid Configuration                                 │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  1 library selected:                                            │    │
-│  │  ┌─────────────────────────────────────────────────────────┐    │    │
-│  │  │                    Single card                          │    │    │
-│  │  │                   max-width: 2xl                         │    │    │
-│  │  │                    mx-auto                               │    │    │
-│  │  └─────────────────────────────────────────────────────────┘    │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  2 libraries selected:                                          │    │
-│  │  ┌───────────────────────┐  ┌───────────────────────┐           │    │
-│  │  │                       │  │                       │           │    │
-│  │  │       Card 1          │  │       Card 2          │           │    │
-│  │  │                       │  │                       │           │    │
-│  │  └───────────────────────┘  └───────────────────────┘           │    │
-│  │  grid-cols-1 md:grid-cols-2                                     │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  3+ libraries selected:                                         │    │
-│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐                    │    │
-│  │  │   Card 1  │  │   Card 2  │  │   Card 3  │                    │    │
-│  │  └───────────┘  └───────────┘  └───────────┘                    │    │
-│  │  grid-cols-1 md:grid-cols-2 lg:grid-cols-3                      │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  6+ libraries selected: xl:grid-cols-4                          │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Approach | Benefit | Cost for this product |
+|----------|---------|-----------------------|
+| ✅ Separate iframe documents | Native document-level styling and independent debugging | More memory, initialization, and focus boundaries |
+| ❌ Shared document with CSS Modules | Fewer application roots | Third-party global styles remain a compatibility problem |
+| ❌ Shadow DOM integration for every library | Potentially lighter previews | Ongoing work for styles, inherited values, and overlays |
 
-### Preview Card Structure
+Separate documents do not guarantee separate operating-system processes or that
+CPU-heavy code cannot affect perceived responsiveness. I would measure the real
+browser behavior instead of describing frames as free execution isolation.
+
+We also pay for some duplicated assets. Caching may reuse a library's bytes across
+multiple forms, but the runtime state is still separate. Sharing a single React
+runtime across documents would add coupling and would not remove the DOM cost.
+
+### Keep comparison semantics consistent
+
+The visual boundary alone does not produce a fair comparison. We need a small form
+specification describing labels, required fields, and expected validation behavior.
+For login, that might be an identifier, password, remember-me option, and an invalid
+submission state.
+
+Each library implements that behavior with its native controls. A universal wrapper
+that flattens every library into identical markup could hide the differences users
+came to evaluate.
+
+I would test representative behaviors as well as screenshots. A screenshot can show
+that a field exists; it cannot establish keyboard interaction or when an error is
+announced. Library-specific behavior should be explained when exact parity is not
+possible.
+
+### Define the trust boundary
+
+These are curated examples, so style fidelity is the immediate requirement. If the
+interviewer changes the scope to arbitrary uploaded code, I would revisit origins,
+sandbox permissions, and resource limits before accepting that feature.
+
+Same-origin frames with scripts and same-origin access enabled do not provide a
+strong hostile-code sandbox. That distinction matters even though this design does
+not require a full plugin-security architecture.
+
+## 🔧 Deep dive 2: bound browser work — 9 minutes
+
+> “The first scaling limit is likely to be the user's browser. I would load previews
+> near the viewport and keep a bounded set of recently used documents. Loading
+> everything eventually is still a memory problem if nothing is ever released.”
+
+I would begin with a modest default selection. A new visitor should see a useful
+comparison immediately rather than wait for the entire catalog.
+
+For planning, suppose six nearby frames need 150 KB of compressed JavaScript each.
+That is roughly 900 KB before the shell, CSS, and fonts. This is an illustrative
+transfer estimate, not a measured bundle size or a prediction of interactive time.
+
+More importantly, selecting fifty libraries and twenty forms can create a thousand
+application instances if we render the entire matrix eagerly. The same asset might
+come from cache many times while initialization and layout still overwhelm the page.
+
+### Preview lifecycle
+
+I would describe the lifecycle with five states:
+
+1. A selected preview starts as a placeholder with reserved dimensions.
+2. Near the viewport, it becomes eligible for loading.
+3. A limited number of eligible previews begin loading at once.
+4. A readiness signal marks the application usable.
+5. A far-away, unfocused preview can be evicted when the retention budget is full.
+
+Intersection Observer can detect proximity. A small loading queue limits bursts
+when several cards become visible together. Scrolling a little farther should not
+start dozens of expensive documents simultaneously.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         PreviewCard Component                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Header Bar (bg-gray-50, border-bottom)                           │  │
-│  │  ┌──────────────────────────────────────────────────────────────┐ │  │
-│  │  │  [Library Name]                      [Light only] [Docs →]   │ │  │
-│  │  │   Font-medium                         Badge if no            │ │  │
-│  │  │                                       dark mode              │ │  │
-│  │  └──────────────────────────────────────────────────────────────┘ │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  Iframe Container (height: 400px)                                 │  │
-│  │  ┌──────────────────────────────────────────────────────────────┐ │  │
-│  │  │                                                              │ │  │
-│  │  │  Loading State (while !isLoaded):                           │ │  │
-│  │  │    Centered spinner with bg-gray-100                        │ │  │
-│  │  │                                                              │ │  │
-│  │  │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │ │  │
-│  │  │                                                              │ │  │
-│  │  │  Loaded State:                                               │ │  │
-│  │  │    <iframe src="/{library}/?form={form}&theme={theme}" />   │ │  │
-│  │  │    Transitions from opacity-0 to opacity-100 on load        │ │  │
-│  │  │                                                              │ │  │
-│  │  └──────────────────────────────────────────────────────────────┘ │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│ Placeholder │──▶│ Loading     │──▶│ Ready       │
+└──────▲──────┘   └──────┬──────┘   └──────┬──────┘
+       │                ▼                 │
+       │          Unavailable             │ far away + over budget
+       └──────────────────────────────────┘
 ```
 
-### Lazy Loading with Intersection Observer
+A load timeout should make the card actionable, with retry and standalone-open
+options. It should not leave an endless spinner or disable unrelated previews.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Lazy Loading Flow                                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Initial Render ──▶ No iframes loaded                                   │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Viewport                                                        │    │
-│  │  ┌───────────────────────────────────────────────────────────┐  │    │
-│  │  │  Card 1: IntersectionObserver fires ──▶ setVisible(true)  │  │    │
-│  │  │          ──▶ Iframe loads                                  │  │    │
-│  │  │  Card 2: IntersectionObserver fires ──▶ setVisible(true)  │  │    │
-│  │  │          ──▶ Iframe loads                                  │  │    │
-│  │  │  Card 3: IntersectionObserver fires ──▶ setVisible(true)  │  │    │
-│  │  │          ──▶ Iframe loads                                  │  │    │
-│  │  └───────────────────────────────────────────────────────────┘  │    │
-│  │                                                                  │    │
-│  │  rootMargin: "100px" ← Load slightly before visible            │    │
-│  │                                                                  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Below Viewport (not loaded yet)                                        │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Card 4: Placeholder only                                        │    │
-│  │  Card 5: Placeholder only                                        │    │
-│  │  ...                                                             │    │
-│  │  Card 41: Placeholder only                                       │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+I would reserve a sensible size by form category and allow scrolling for longer
+forms. Automatic child resizing is possible, but introduces another cross-document
+protocol and can create layout shifts. It is not necessary for the first version.
 
-### Performance Impact of Lazy Loading
+### Retention versus state preservation
 
-| Metric | Without Lazy Loading | With Lazy Loading |
-|--------|---------------------|-------------------|
-| Initial network | 41 × 150KB = 6MB | 3 × 150KB = 450KB |
-| React hydrations | 41 simultaneous | 3 simultaneous |
-| Time to interactive | 5-8 seconds | 1-2 seconds |
-| Memory usage | 41 React apps | ~6 React apps |
+Keeping every visited frame alive makes revisiting convenient. It also means that
+one long browsing session can retain the whole catalog. Hiding a frame with CSS
+is not the same as releasing its document.
 
-> "Intersection Observer with a 100px rootMargin provides a smooth experience. Iframes start loading just before they enter the viewport, so users rarely see loading states."
+Eviction bounds memory, but a remounted form loses its transient input. For a
+comparison playground, that can be acceptable if we preserve the focused preview
+and make the lifecycle predictable. I would not extract passwords or billing fields
+into a global persistence layer merely to preserve a demo.
 
----
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Nearby loading with bounded retention | Predictable resource use and useful revisits | Some evicted forms reset on return |
+| ❌ Keep all visited frames alive | Stronger transient input preservation | Memory grows throughout the session |
+| ❌ Immediately destroy every offscreen frame | Lowest retained document count | Repeated loads and lost input during small scrolls |
 
-## 🔄 Deep Dive: Library Application Architecture
+I would tune the budget after profiling a heavier library and a long form on a
+representative laptop and lower-powered device. There is no universally correct
+number of retained documents.
 
-### URL-Based Configuration
+### Avoid avoidable remounts
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                  Library App Configuration Flow                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Shell Application                                                       │
-│       │                                                                  │
-│       │  Constructs URL: /{libraryId}/?form={form}&theme={theme}        │
-│       │                                                                  │
-│       ▼                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Iframe loads library app                                        │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│       │                                                                  │
-│       ▼                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Library App Entry Point                                         │    │
-│  │                                                                  │    │
-│  │  1. Parse URLSearchParams                                        │    │
-│  │     ├── formId = params.get('form') || 'login'                  │    │
-│  │     └── themeMode = params.get('theme') || 'light'              │    │
-│  │                                                                  │    │
-│  │  2. Initialize Theme Provider                                    │    │
-│  │     └── Pass themeMode to library's theme system                 │    │
-│  │                                                                  │    │
-│  │  3. Render Form                                                  │    │
-│  │     └── FormRouter selects component based on formId            │    │
-│  │                                                                  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+A preview's identity is its library/form pair. Its React key should not change just
+because the user requests another theme. A stable key helps only while the component
+remains in a compatible parent position; moving it between different grouping
+containers can still remount it.
 
-### Form Router Pattern
+If preserving drafts across regrouping becomes important, I would keep a stable
+preview layer and change layout metadata. Otherwise, I would accept and explain a
+reset on regrouping rather than build complex DOM caching prematurely.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Form Router                                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  formId parameter ──▶ Dynamic import ──▶ Render with Suspense           │
-│                                                                          │
-│  Form Registry:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  "login"     ──▶ lazy(() => import('./forms/LoginForm'))        │    │
-│  │  "signup"    ──▶ lazy(() => import('./forms/SignupForm'))       │    │
-│  │  "checkout"  ──▶ lazy(() => import('./forms/CheckoutForm'))     │    │
-│  │  "contact"   ──▶ lazy(() => import('./forms/ContactForm'))      │    │
-│  │  "payment"   ──▶ lazy(() => import('./forms/PaymentForm'))      │    │
-│  │  ... (16 more forms)                                            │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Benefits:                                                               │
-│  ├── Code splitting: Only requested form bundle loads                  │
-│  ├── Fallback: FormSkeleton during chunk fetch                         │
-│  └── Default: Falls back to login if unknown formId                    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Selective store subscriptions and memoized descriptors can reduce shell work after
+that lifecycle is under control. I would profile first; splitting a small context
+can also be adequate, so Zustand is a practical choice rather than a prerequisite.
 
-### Form Standardization Across Libraries
+## 🔧 Deep dive 3: make sharing and theme changes reliable — 8 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Shared Form Interface                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  All 41 implementations share this interface:                           │
-│                                                                          │
-│  LoginFormProps:                                                         │
-│  ├── onSubmit: (data: { email: string; password: string }) => void     │
-│                                                                          │
-│  SignupFormProps:                                                        │
-│  ├── onSubmit: (data: { name, email, password, confirmPassword }) =>   │
-│                                                                          │
-│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─    │
-│                                                                          │
-│  Same Fields, Different Implementations:                                │
-│                                                                          │
-│  MUI LoginForm:           Chakra LoginForm:       Ant LoginForm:        │
-│  ├── TextField            ├── FormControl         ├── Form.Item         │
-│  │   type="email"         │   └── Input           │   └── Input         │
-│  ├── TextField            ├── FormControl         ├── Form.Item         │
-│  │   type="password"      │   └── Input           │   └── Input.Password│
-│  └── Button               └── Button              └── Button            │
-│      variant="contained"      colorScheme="blue"      type="primary"    │
-│                                                                          │
-│  Result: Identical structure, library-native styling                    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+> “I would use URLs to reconstruct a comparison and messages to update a loaded
+> preview. A theme toggle should not erase an example the user is interacting with.
+> A copied link should not depend on the recipient's previous preferences.”
 
----
+The shell URL contains form IDs, library IDs, theme, and grouping. A direct preview
+URL contains one form and the initial theme. These are related interfaces with
+different purposes.
 
-## 🎛️ Deep Dive: Control Panel Components
+For example, a shell link can request the login form in MUI and Chakra. The shell
+then constructs one child URL for each library. Each child can also be opened by
+itself, which makes debugging and sharing an individual example straightforward.
 
-### Component Architecture
+### Resolve state deterministically
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       Control Panel Layout                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌────────────────────────────────────────────────────────────────────┐ │
-│  │                         Header Row                                  │ │
-│  │  ┌─────────────────────────────────────────────────────────────┐  │ │
-│  │  │  ┌─────────────┐  ┌────────────────────────┐  ┌──────────┐  │  │ │
-│  │  │  │FormSelector │  │   LibrarySelector      │  │ThemeToggle│ │  │ │
-│  │  │  │             │  │                        │  │          │  │  │ │
-│  │  │  │ Dropdown    │  │ Multi-select chips     │  │ Icon btn │  │  │ │
-│  │  │  │ 20 forms    │  │ 41 toggleable items    │  │ 🌙 / ☀️   │  │  │ │
-│  │  │  │             │  │ Select All / Clear     │  │          │  │  │ │
-│  │  │  └─────────────┘  └────────────────────────┘  └──────────┘  │  │ │
-│  │  └─────────────────────────────────────────────────────────────┘  │ │
-│  └────────────────────────────────────────────────────────────────────┘ │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+On first load I would apply a documented order:
 
-### Form Selector Behavior
+1. Validate explicitly supplied URL values against the catalog.
+2. For fields absent from an ordinary visit, consider validated saved preferences.
+3. Use stable defaults for anything still missing.
+4. Serialize all comparison-defining fields when producing a share link.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        FormSelector Component                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  State Subscription:                                                     │
-│  └── Only subscribes to selectedForm (prevents unnecessary re-renders)  │
-│                                                                          │
-│  Render:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Label: "Form Type"                                              │    │
-│  │  ┌───────────────────────────────────────────────────────────┐  │    │
-│  │  │  <select>                                                  │  │    │
-│  │  │    ├── Login                                               │  │    │
-│  │  │    ├── Sign Up                                             │  │    │
-│  │  │    ├── Checkout                                            │  │    │
-│  │  │    ├── Contact                                             │  │    │
-│  │  │    └── ... (16 more options)                               │  │    │
-│  │  └───────────────────────────────────────────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  On Change:                                                              │
-│  └── setForm(value) ──▶ All iframe URLs update ──▶ Forms reload         │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+An empty list, an all-selected list, and an omitted parameter are different states.
+If we omit the all-selected list, a recipient might see their saved three libraries
+instead of the sender's fifty. Omitting light theme can similarly restore a saved
+dark preference.
 
-### Library Multi-Select Behavior
+Unknown IDs should produce a helpful message or a documented fallback. Persisted
+preferences can outlive catalog entries, so they need validation too. If storage is
+unavailable, the URL and in-memory state are sufficient to keep the product usable.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     LibrarySelector Component                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Header:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  "Libraries (N selected)"           [Select All] [Clear]        │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Chip Grid (scrollable, max-height: 128px):                             │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐   │    │
-│  │  │   MUI   │ │ Chakra  │ │  Ant D  │ │Blueprint│ │Semantic │   │    │
-│  │  │  ✓ ON   │ │  ✓ ON   │ │   OFF   │ │   OFF   │ │  ✓ ON   │   │    │
-│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘   │    │
-│  │  ... (36 more libraries)                                        │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Visual States:                                                          │
-│  ├── Selected: bg-blue-500 text-white border-blue-500                   │
-│  └── Unselected: bg-white text-gray-700 border-gray-300                 │
-│                                                                          │
-│  On Click:                                                               │
-│  └── toggleLibrary(id) ──▶ Set add/remove ──▶ Grid re-renders           │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+I would replace the current history entry while the user adjusts filters. If product
+requirements include stepping through saved comparisons with Back, I would add
+explicit history entries and handle browser navigation. Debouncing is a separate
+optimization; replacing history does not append an entry for every click.
 
----
+### Keep a loaded preview synchronized
 
-## ⚡ Performance Optimizations
+The child reads its initial theme before rendering, then signals readiness. The
+parent replies with the latest absolute theme value. If the user toggled twice
+while the child loaded, it receives the current value rather than replaying two
+possibly stale toggles.
 
-### 1. Selective Store Subscriptions
+An absolute “set dark” message is safe to apply repeatedly. A “toggle theme” message
+is not: duplicate delivery would reverse the user's intent.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Zustand Selector Pattern                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Anti-Pattern (re-renders on any state change):                         │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  const store = useComparisonStore()  ← Subscribes to entire store  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Correct Pattern (re-renders only when slice changes):                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  const selectedForm = useComparisonStore(s => s.selectedForm)   │    │
-│  │  const theme = useComparisonStore(s => s.theme)                 │    │
-│  │                                                                  │    │
-│  │  Theme toggle ──▶ Only ThemeToggle re-renders                   │    │
-│  │  Form change ──▶ Only FormSelector + PreviewCards re-render     │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+Both sides validate the sending origin, window, and allowed message values. Messages
+need not include typed form data. A small theme protocol is easier to reason about
+than a general remote component-control interface.
 
-### 2. Iframe Caching Strategy
+The parent must also avoid changing the loaded frame's `src` when sending the theme.
+Otherwise the browser can navigate the document despite the message, resetting
+input and negating the reason to use live updates.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Iframe DOM Preservation                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Naive: Unmount iframes when deselected (loses state, causes reload)    │
-│                                                                          │
-│  Optimized: Keep all iframes in DOM, toggle visibility                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  allLibraries.map(library => (                                   │    │
-│  │    <div className={selected ? 'block' : 'hidden'}>              │    │
-│  │      <PreviewCard library={library} />                          │    │
-│  │    </div>                                                        │    │
-│  │  ))                                                              │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Benefits:                                                               │
-│  ├── Form state preserved when re-selecting library                    │
-│  ├── No network request to reload                                       │
-│  └── Instant visibility toggle                                          │
-│                                                                          │
-│  Trade-off: Higher memory usage (all 41 iframes in DOM if visited)     │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ URL bootstrap plus live theme updates | Standalone links and better input continuity | Readiness and validation protocol |
+| ❌ Reload the frame for every theme change | Very simple lifecycle | Can erase input and repeat initialization |
+| ❌ Messaging as the only configuration | Flexible live control | Standalone loads still need another initialization contract |
 
-### 3. Debounced URL Updates
+A library marked light-only should remain light with a clear badge. A dark theme
+request does not justify applying a generic inversion filter that misrepresents
+what that library actually supports.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       URL Sync with Debouncing                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Problem: Rapid library toggles create history spam                     │
-│                                                                          │
-│  Solution: 300ms debounce before updating URL                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  User clicks 5 library chips in 1 second                        │    │
-│  │       │                                                          │    │
-│  │       ▼                                                          │    │
-│  │  Each click resets 300ms timer                                   │    │
-│  │       │                                                          │    │
-│  │       ▼                                                          │    │
-│  │  After 300ms of no clicks:                                       │    │
-│  │  window.history.replaceState(                                    │    │
-│  │    ?form=login&theme=dark&libs=mui,chakra,antd,blueprint,semantic│    │
-│  │  )                                                               │    │
-│  │       │                                                          │    │
-│  │       ▼                                                          │    │
-│  │  Result: 1 history entry instead of 5                            │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+## ♿ Accessibility and failure behavior — 5 minutes
 
----
+The shell should use labeled form controls and ordinary document navigation.
+Each iframe needs a descriptive title containing the library and form name, and
+each comparison group needs a meaningful heading.
 
-## ♿ Accessibility (a11y)
+I would keep a predictable tab order and a route back to the comparison controls.
+I would not add an application role or a spreadsheet-style ARIA grid simply because
+cards are visually arranged in columns. Those roles imply keyboard behavior that
+this browsing interface does not need.
 
-### Semantic Structure
+Focus also constrains virtualization: do not remove a document while someone is
+typing in it. Global shortcuts must not steal typing or selection gestures from
+form fields inside a preview.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Semantic HTML Structure                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  <main role="application" aria-label="Design System Comparison">       │
-│    │                                                                     │
-│    ├── <header>                                                         │
-│    │     └── <nav aria-label="Comparison controls">                     │
-│    │           ├── FormSelector (with label)                            │
-│    │           ├── LibrarySelector (with fieldset legend)               │
-│    │           └── ThemeToggle (with aria-label)                        │
-│    │                                                                     │
-│    └── <section aria-label="Form previews">                             │
-│          └── <div role="grid" aria-label="Library comparison grid">    │
-│                ├── <article role="gridcell" aria-label="MUI form">     │
-│                │     └── <iframe title="MUI login form">               │
-│                ├── <article role="gridcell" aria-label="Chakra form">  │
-│                │     └── <iframe title="Chakra login form">            │
-│                └── ...                                                   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The shell's accessibility is only half the product. I would test keyboard and
+screen-reader behavior inside representative library forms, especially errors,
+menus, and dialogs. We can report observed behavior without claiming that every
+library automatically conforms to an accessibility standard.
 
-### Keyboard Navigation
+A failed frame should display its library/form identity and a recovery action.
+An empty selection should explain how to add a preview. A storage failure should
+not make the whole shell fail to initialize.
 
-| Key | Action | Context |
-|-----|--------|---------|
-| `t` | Toggle theme | Global |
-| `Ctrl/Cmd+A` | Select all libraries | Global |
-| `Escape` | Clear all selections | Global |
-| `Tab` | Navigate controls | Standard |
-| `Enter/Space` | Activate control | Standard |
+## 📊 Validation and closing discussion — 5 minutes
 
----
+I would verify a small set of user journeys before adding more optimizations:
 
-## ⚖️ Trade-offs Summary
+- Share a comparison into a clean browser with different saved preferences.
+- Change theme while a preview loads and after entering form data.
+- Scroll through a large selection and confirm mounted document count is bounded.
+- Deselect or regroup while a preview has keyboard focus.
+- Fail one library asset and confirm the other previews remain usable.
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Iframe isolation | Complete CSS isolation | Heavier than shared app, duplicated React |
-| Lazy loading iframes | Fast initial load | Scroll jank possible during load |
-| URL query params | Deep linking, history works | Limited to simple data types |
-| Zustand with persistence | Survives refresh | localStorage sync complexity |
-| CSS Grid layout | Responsive, flexible | IE11 not supported |
-| Keep iframes in DOM | Instant toggle, state preserved | Higher memory usage |
-| Debounced URL updates | Clean history | 300ms delay to shareable URL |
+For performance, I would separate network transfer, application readiness, shell
+interaction latency, and retained memory. Cache hits alone cannot demonstrate that
+the comparison remains responsive.
 
----
+For visual correctness, I would compare a preview opened alone with the same preview
+inside a mixed-library selection. That directly tests the reason for the isolation
+boundary rather than just asserting that an iframe element exists.
 
-## 🔮 Future Frontend Enhancements
+If the interviewer asks what breaks first, I would point to browser resources and
+catalog maintenance. CDN traffic can grow independently; more servers do not solve
+hundreds of live documents in one user's tab.
 
-| Enhancement | Complexity | Value |
-|-------------|------------|-------|
-| Drag & drop ordering | Medium | Customize comparison layout |
-| Side-by-side diff view | High | Highlight visual differences |
-| Screenshot export | Medium | Generate comparison images |
-| Mobile preview mode | Medium | Show forms at mobile breakpoints |
-| Accessibility audit | High | Display WCAG compliance per library |
-| Animation comparison | Low | Show transition behavior differences |
-
----
-
-## 🎤 Interview Wrap-up
-
-> "We've designed a frontend architecture that achieves complete CSS isolation through iframes, with each of the 41 design systems running in its own browsing context. The Zustand store manages comparison state with selective subscriptions to prevent cascade re-renders. Lazy loading with Intersection Observer ensures fast initial loads despite the potential for 41 iframes. URL-based configuration enables deep linking and makes each library app independently deployable. The main trade-off is memory usage from keeping iframes in DOM, but this provides instant toggling and preserves form state."
+> “My design keeps the shell small and makes each library responsible for its own
+> faithful preview. Iframes give us document-level style isolation, bounded loading
+> keeps that choice affordable, and a deterministic URL plus a small theme protocol
+> makes the comparison reproducible. The main concession is that an evicted preview
+> can lose transient input; I would accept that before retaining the entire catalog.”

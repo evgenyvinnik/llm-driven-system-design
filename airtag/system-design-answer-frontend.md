@@ -1,581 +1,383 @@
-# AirTag Find My - System Design Answer (Frontend Focus)
+# AirTag — Frontend System Design
 
-*45-minute system design interview format - Frontend Engineer Position*
+*A 45-minute discussion of location evidence, private client state and safety actions.*
 
----
+This answer proposes an item-finding client with owner-side decryption. The local
+React demo instead receives server-decrypted locations; its actual capabilities and
+gaps are mapped in [architecture.md](./architecture.md).
 
-## 📋 Problem Statement
+## 📋 Clarify what “find my item” means — 4 minutes
 
-Design the frontend experience for Apple's Find My app for AirTag, enabling users to locate their items through a privacy-preserving crowd-sourced network.
+> “I would start with the owner selecting an item and seeing the best available
+> observation. The interface must explain how old that observation is and what
+> the user can do next. A marker on a map is not proof the item is there now.”
 
-**Core Frontend Challenges:**
-- Interactive map with real-time location updates
-- Privacy-preserving decryption in the browser/app
-- Anti-stalking detection UI and notifications
-- Precision finding with UWB directional guidance
-- Offline-capable device management
+The core screens are an item list, selected-item map, observation details, lost-mode
+settings and notifications. Nearby finding and sound playback are available only
+through supported hardware/platform capabilities.
 
----
+I would ask whether we are building a web dashboard, a native mobile client or both.
+For this answer, I use a web presentation layer and a platform adapter for capabilities
+that require a native app. I would not promise background radio scanning from an
+ordinary browser tab.
 
-## 🎯 Requirements
+Unwanted-tracker alerts are also in scope. Their audience is the person who may be
+carrying an unknown item, which is a different role from the item's owner.
+The two flows must not expose each other's private observations.
 
-### Functional Requirements
-1. **Device Map**: Display all registered devices on an interactive map
-2. **Location History**: Show location trail with timestamps
-3. **Lost Mode**: Enable/disable with custom contact message
-4. **Precision Finding**: UWB-based directional guidance when nearby
-5. **Anti-Stalking**: Alert users about unknown trackers with action options
-6. **Notifications**: Real-time alerts for device found and safety warnings
+I would keep family sharing, AR overlays and a full historical playback editor out
+of the first design. The priority is a clear, reliable transition from last known
+location to an appropriate next action.
 
-### Non-Functional Requirements
-1. **Performance**: Map loads in < 2 seconds, smooth 60fps interactions
-2. **Privacy**: Client-side decryption of location data
-3. **Offline**: View last known locations without network
-4. **Accessibility**: Screen reader support, high contrast mode
-5. **Cross-Platform**: iOS, Android, macOS, web
+The experience should distinguish four situations:
 
-### User Experience Goals
-- Minimal steps to find a lost item
-- Clear visual feedback for precision finding
-- Non-alarming anti-stalking notifications (avoid false panic)
-- Simple device registration flow
+- A recent approximate observation is available.
+- Only an older observation is available.
+- The client cannot currently refresh or decrypt.
+- No valid observation is known for the selected time window.
 
----
+These are not interchangeable “offline” states. In particular, no report does not
+prove that the item is unreachable or that an unknown tracker is absent.
 
-## 🏗️ High-Level Architecture
-
-### App Shell Architecture
+## 🏗️ Draw the client boundaries — 5 minutes
 
 ```
-+------------------------------------------------------------------+
-|                      Find My Application                          |
-|                                                                   |
-|  +-------------------------------------------------------------+  |
-|  |                       App Shell                              |  |
-|  |   +----------+  +---------+  +---------+  +--------+        |  |
-|  |   | Devices  |  |   Map   |  | People  |  |   Me   |        |  |
-|  |   +----------+  +---------+  +---------+  +--------+        |  |
-|  +-------------------------------------------------------------+  |
-|                               |                                   |
-|  +----------------------------v--------------------------------+  |
-|  |                      Main View                               |  |
-|  |  +-------------------------------------------------------+  |  |
-|  |  |                 Interactive Map                        |  |  |
-|  |  |                                                        |  |  |
-|  |  |    +------+       +------+       +--------+           |  |  |
-|  |  |    | Keys |       | Bag  |       | Wallet |           |  |  |
-|  |  |    +------+       +------+       +--------+           |  |  |
-|  |  |                                                        |  |  |
-|  |  +-------------------------------------------------------+  |  |
-|  |                                                              |  |
-|  |  +-------------------------------------------------------+  |  |
-|  |  |            Device Card (Selected)                      |  |  |
-|  |  |   Name  |  Last Seen  |  Play Sound  |  Directions    |  |  |
-|  |  +-------------------------------------------------------+  |  |
-|  +--------------------------------------------------------------+  |
-+--------------------------------------------------------------------+
+┌─────────────────────┐       ┌────────────────────────────┐
+│ Item list / map     │◀─────▶│ Observation data layer     │
+│ Time, accuracy,     │       │ Identity, merge, freshness │
+│ selected item       │       └────────────┬───────────────┘
+└─────────────────────┘                    │
+                                  ┌───────▼──────────────┐
+┌─────────────────────┐           │ Owner key / decrypt  │
+│ Lost mode / alerts  │           │ boundary             │
+└──────────┬──────────┘           └───────┬───────────────┘
+           │                             ▼
+           └───────────────────▶┌────────────────────────┐
+                                │ Auth / report APIs    │
+┌─────────────────────┐         └────────────────────────┘
+│ Native capability   │
+│ adapter / safety UI │
+└─────────────────────┘
 ```
 
-### Component Structure
-
-The app follows a standard shell pattern with bottom navigation between Devices, Map, People, and Settings tabs. The main content area contains the interactive map with device markers, a device list overlay, and a detail panel showing location info and actions (Play Sound, Lost Mode, Precision Find).
-
----
-
-## 🔍 Deep Dive: Key Components
-
-### Map Component Design
-
-**User Interaction Flow:**
-
-```
-User Opens App
-      |
-      v
-+------------------+
-| Load Device List |-----> Fetch from cache if offline
-+------------------+
-      |
-      v
-+----------------------+
-| Decrypt Locations    |-----> Client-side WebCrypto
-| (locally)            |
-+----------------------+
-      |
-      v
-+------------------+
-| Render Map with  |
-| Device Markers   |
-+------------------+
-      |
-      v
-User Taps Marker
-      |
-      v
-+------------------+
-| Show Device Card |
-| with Actions     |
-+------------------+
-      |
-      +-----> Play Sound
-      |
-      +-----> Get Directions
-      |
-      +-----> Enable Lost Mode
-      |
-      +-----> Start Precision Find (if nearby)
-```
-
-**Marker State Visualization:**
-
-```
-+-------------+     +-------------+     +-------------+
-|   Recent    |     |    Stale    |     |   Offline   |
-|  (< 15 min) |     |  (> 15 min) |     |  (no data)  |
-+-------------+     +-------------+     +-------------+
-      |                   |                   |
-      v                   v                   v
-  Green ring         Gray ring           Dashed ring
-  + Pulse animation  + Time label        + "?" icon
-```
-
-### Map Library Trade-off
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Leaflet | Cross-platform, open source, extensive plugins, one codebase | Not native look, bundle size (~40KB) |
-| ❌ Native MapKit | Native iOS experience, system integration, best performance | iOS only, need separate Android/web implementations |
-| ❌ Google Maps | Rich features, familiar UI, Street View | Licensing costs, privacy concerns, vendor lock-in |
-
-> "I'm choosing Leaflet because Find My needs to work across iOS, macOS, and web. While MapKit provides the best native iOS experience, we'd need three different map implementations. Leaflet gives us one codebase with consistent behavior. The react-leaflet wrapper integrates well with our React stack, and the plugin ecosystem covers our needs."
-
----
-
-### Client-Side Decryption Architecture
-
-**Privacy Flow:**
-
-```
-+-------------------+      +-------------------+      +-------------------+
-|    AirTag         |      |   Finder iPhone   |      |   Apple Servers   |
-| (broadcasts keys) |----->| (encrypts loc)    |----->| (stores blobs)    |
-+-------------------+      +-------------------+      +-------------------+
-                                                               |
-                                                               | Encrypted
-                                                               | location
-                                                               | reports
-                                                               v
-                           +-------------------+      +-------------------+
-                           |   Owner Device    |<-----|   Query by hash   |
-                           | (decrypts local)  |      +-------------------+
-                           +-------------------+
-                                    |
-                                    v
-                           +-------------------+
-                           |   Display on Map  |
-                           +-------------------+
-```
-
-**Decryption Sequence:**
-
-```
-1. Generate period keys
-   |
-   +---> Master Secret + Period Number
-         |
-         +---> HKDF Derivation
-               |
-               +---> Private Key (per 15-min period)
-
-2. Query encrypted reports
-   |
-   +---> Hash(Public Key) --> Server
-         |
-         +---> Encrypted blobs returned
-
-3. Decrypt each report
-   |
-   +---> ECDH shared secret
-         |
-         +---> AES-GCM decrypt
-               |
-               +---> Latitude, Longitude, Timestamp
-```
-
-### Decryption Approach Trade-off
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ WebCrypto client-side | Privacy preserved, server never sees locations, user controls keys | Slower decryption, complex key management |
-| ❌ Server-side decryption | Faster, simpler client, easier debugging | Privacy violation, single point of failure |
-| ❌ Hybrid (server assists) | Balance of speed and privacy | Still exposes keys to server |
-
-> "I'm choosing client-side decryption because privacy is the core value proposition. Users trust Find My because Apple cannot see their locations. WebCrypto API provides hardware-backed cryptography on modern devices. Yes, decryption is slower, but we can show progress UI and batch operations. The privacy guarantee is non-negotiable for this product."
-
----
-
-### Precision Finding UI (UWB)
-
-**Directional Interface:**
-
-```
-+------------------------------------------+
-|                                          |
-|              Direction Arrow             |
-|                                          |
-|                   ^                      |
-|                  /|\                     |
-|                 / | \                    |
-|                /  |  \                   |
-|               /___|___\                  |
-|                                          |
-|           Distance: 2.3m                 |
-|                                          |
-|    [|||||||||||||.........]  Signal      |
-|                                          |
-|         "Move forward"                   |
-|                                          |
-|         [ Play Sound ]                   |
-|                                          |
-+------------------------------------------+
-```
-
-**Distance-Based Feedback:**
-
-```
-Distance        Visual              Haptic              Audio
---------        ------              ------              -----
-> 10m           Blue arrow          None                None
-5-10m           Blue arrow          Light pulse         None
-3-5m            Yellow arrow        Medium pulse        Optional
-1-3m            Yellow, larger      Strong pulse        Chirp
-< 1m            Green, pulsing      Continuous          Found!
-```
-
-### Precision Technology Trade-off
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ UWB (Ultra-Wideband) | Centimeter accuracy, directional, works through walls | Requires UWB hardware, higher power |
-| ❌ Bluetooth RSSI | All devices support it, lower power, longer range | Meter-level accuracy, no direction |
-| ❌ Bluetooth AoA/AoD | Better than RSSI, direction capable | Complex antenna arrays, not widely deployed |
-
-> "I'm choosing UWB as the primary precision finding technology because it provides actual direction, not just proximity. Users can see an arrow pointing exactly where to go. For devices without UWB support, we fall back to Bluetooth RSSI with a simpler 'warmer/colder' interface."
-
-### Feedback Approach Trade-off
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Multi-sensory (Haptic + Visual + Audio) | Works in all contexts, accessibility | Battery drain, complexity |
-| ❌ Audio only | Everyone hears it, simple | Social situations, noisy environments |
-| ❌ Visual only | Clear, precise information | Requires screen focus |
-
-> "I'm choosing a multi-sensory approach because users search in different contexts - a quiet office vs a loud concert venue. Haptic feedback lets you keep the phone in your pocket while walking toward the item. Visual provides precise information when you can look. Audio is optional for those who want it."
-
----
-
-### Anti-Stalking Detection UI
-
-**Alert Flow with Progressive Disclosure:**
-
-```
-Initial Alert (non-alarming)
-      |
-      v
-+--------------------------------------+
-| "Unknown AirTag Found"               |
-| Traveling with you for 2 hours       |
-|                                      |
-| [View Locations]  [Play Sound]       |
-+--------------------------------------+
-      |
-      | User taps "Learn More"
-      v
-+--------------------------------------+
-| What This Means                      |
-|                                      |
-| - May be in borrowed item            |
-| - May be placed by someone           |
-| - Tap Play Sound to locate           |
-|                                      |
-| [How to Disable]  [Report to Police] |
-+--------------------------------------+
-      |
-      | User taps "How to Disable"
-      v
-+--------------------------------------+
-| Disable Unknown AirTag               |
-|                                      |
-| 1. Play sound to locate              |
-| 2. Remove battery (twist bottom)     |
-| 3. Scan with NFC for owner info      |
-|                                      |
-| [I Found It]  [Can't Find It]        |
-+--------------------------------------+
-```
-
-**Tracker Path Visualization:**
-
-```
-+------------------------------------------------+
-|                    Map                          |
-|                                                 |
-|        Home *-----------------------+           |
-|             \                       |           |
-|              \                      |           |
-|               * Cafe                |           |
-|                \                    |           |
-|                 \                   |           |
-|                  * Grocery          |           |
-|                   \                 |           |
-|                    *----------------+ Work      |
-|                                                 |
-| Legend:  * = Tracker sighting                   |
-|          --- = Your path with tracker           |
-+------------------------------------------------+
-```
-
-### Anti-Stalking UI Trade-off
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Progressive disclosure | Reduces panic, user-controlled depth | May delay critical information |
-| ❌ Full information upfront | Immediate awareness | Can cause unnecessary alarm |
-| ❌ Dismissable minimal alert | Least intrusive | May be ignored, safety risk |
-
-> "I'm choosing progressive disclosure because anti-stalking alerts have a high false positive rate - borrowed items, family members' AirTags, etc. Showing 'STALKER DETECTED' causes panic when it's often a false alarm. By starting with neutral language and letting users drill down, we give control without causing unnecessary fear."
-
----
-
-### State Management
-
-**Store Structure:**
-
-```
-FindMyStore
-|
-+-- devices: Map<deviceId, Device>
-|   +-- id, name, emoji, lostMode
-|
-+-- locations: Map<deviceId, Location[]>
-|   +-- latitude, longitude, timestamp, accuracy
-|
-+-- selectedDeviceId: string | null
-|
-+-- notifications: Notification[]
-|   +-- type: "found" | "tracker_alert" | "low_battery"
-|   +-- isRead: boolean
-|
-+-- ui
-|   +-- isDecrypting: boolean
-|   +-- decryptionProgress: number (0-100)
-|   +-- isOffline: boolean
-|
-+-- actions
-    +-- selectDevice(id)
-    +-- refreshDevices()
-    +-- fetchLocations(deviceId, timeRange)
-    +-- markNotificationRead(id)
-```
-
-### State Management Trade-off
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Zustand | Simple API, less boilerplate, small bundle | Less ecosystem |
-| ❌ Redux + RTK | Mature ecosystem, middleware, time-travel debugging | Verbose, larger bundle |
-| ❌ React Context | No dependencies, built-in | Performance issues with frequent updates |
-
-> "I'm choosing Zustand because Find My has moderate state complexity - a dozen devices, their locations, and UI state. Redux would add boilerplate without proportional benefit. The store is easy to test and if we grow to hundreds of devices, we can migrate."
-
----
-
-### Offline Support
-
-**Caching Strategy:**
-
-```
-+-------------------+     +-------------------+     +-------------------+
-|   App Launches    |---->| Check Network     |---->| Online?           |
-+-------------------+     +-------------------+     +-------------------+
-                                                           |
-                          +--------------------------------+
-                          |                                |
-                          v                                v
-                   +-------------+                  +-------------+
-                   |   ONLINE    |                  |   OFFLINE   |
-                   +-------------+                  +-------------+
-                          |                                |
-                          v                                v
-                   +-------------+                  +-------------+
-                   | Fetch fresh |                  | Load cache  |
-                   | from API    |                  | from SW     |
-                   +-------------+                  +-------------+
-                          |                                |
-                          v                                v
-                   +-------------+                  +-------------+
-                   | Update      |                  | Show stale  |
-                   | cache       |                  | indicator   |
-                   +-------------+                  +-------------+
-                          |                                |
-                          +--------------------------------+
-                                         |
-                                         v
-                                  +-------------+
-                                  | Render map  |
-                                  | with data   |
-                                  +-------------+
-```
-
-**Cached Assets:**
-
-```
-Service Worker Cache
-|
-+-- Static assets (shell, icons, fonts)
-|
-+-- Map tiles (frequently viewed areas)
-|
-+-- Device list (names, emojis, last known location)
-|
-+-- Recent location history (last 7 days)
-|
-+-- Offline fallback page
-```
-
-### Offline Strategy Trade-off
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Service Worker + IndexedDB | Works offline, fine-grained control, background sync | Complex to debug, cache invalidation |
-| ❌ localStorage only | Simple, synchronous | 5MB limit, no asset caching |
-| ❌ No offline support | Simpler implementation | Useless when you need it most |
-
-> "I'm choosing Service Worker caching because offline support is critical for Find My. Users often search for lost items in areas with poor connectivity - basements, rural areas. The cache-then-network strategy ensures the app works immediately. This is exactly the scenario where offline matters most."
-
----
-
-### Auto-Refresh Strategy
-
-**Polling Approach:**
-
-```
-+------------------+
-| App in Foreground|
-+------------------+
-        |
-        v
-+------------------+
-| Start 60s Timer  |
-+------------------+
-        |
-        | (60 seconds)
-        v
-+------------------+       +------------------+
-| Fetch New        |------>| Decrypt New      |
-| Reports          |       | Locations        |
-+------------------+       +------------------+
-        |                          |
-        v                          v
-+------------------+       +------------------+
-| Merge with       |       | Update Map       |
-| Existing         |       | Markers          |
-+------------------+       +------------------+
-        |
-        | (repeat)
-        v
-+------------------+
-| Wait 60s         |
-+------------------+
-```
-
-### Refresh Interval Trade-off
-
-| Interval | Pros | Cons |
-|----------|------|------|
-| ✅ 60 seconds | Balanced freshness, reasonable battery, matches broadcast | May feel slow |
-| ❌ 10 seconds | Near real-time | Battery drain, excessive API calls |
-| ❌ 5 minutes | Low battery/network use | Frustrating when actively searching |
-
-> "I'm choosing 60 seconds because it matches AirTag's broadcast cycle. The tracker rotates keys every 15 minutes and broadcasts continuously, but finder devices batch reports. Refreshing faster than 60 seconds rarely yields new data. When actively precision finding, we switch to continuous UWB ranging which is real-time."
-
----
-
-## 📡 Data Flow
-
-### Location Update Flow
-
-```
-[AirTag]                [Finder iPhone]           [Apple Servers]          [Owner Device]
-    |                         |                          |                       |
-    |  BLE Advertisement      |                          |                       |
-    |------------------------>|                          |                       |
-    |                         |                          |                       |
-    |                         |  Encrypt(location)       |                       |
-    |                         |------------------------->|                       |
-    |                         |                          |                       |
-    |                         |                          |  Query(hash)          |
-    |                         |                          |<----------------------|
-    |                         |                          |                       |
-    |                         |                          |  Encrypted blobs      |
-    |                         |                          |---------------------->|
-    |                         |                          |                       |
-    |                         |                          |    Local decrypt      |
-    |                         |                          |        |              |
-    |                         |                          |        v              |
-    |                         |                          |    Display on map     |
-```
-
-### Anti-Stalking Detection Flow
-
-```
-[Unknown Tracker]         [User's iPhone]          [Frontend]
-       |                        |                      |
-       |  BLE detected          |                      |
-       |----------------------->|                      |
-       |                        |                      |
-       |  (tracks sightings)    |                      |
-       |----------------------->|                      |
-       |                        |                      |
-       |  3+ sightings          |                      |
-       |  >500m distance        |                      |
-       |  >1 hour duration      |                      |
-       |----------------------->|                      |
-       |                        |                      |
-       |                        |  Push notification   |
-       |                        |--------------------->|
-       |                        |                      |
-       |                        |                      |  Show alert UI
-       |                        |                      |  (progressive)
-       |                        |                      |
-       |                        |  User: Play Sound    |
-       |                        |<---------------------|
-       |                        |                      |
-       |  *BEEP*                |                      |
-       |<-----------------------|                      |
-```
-
----
-
-## 📊 Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Map library | ✅ Leaflet | ❌ Native MapKit | Cross-platform, single codebase |
-| Decryption | ✅ WebCrypto client-side | ❌ Server-side | Privacy preservation is core |
-| State management | ✅ Zustand | ❌ Redux | Simpler for moderate complexity |
-| Precision finding | ✅ UWB primary | ❌ Bluetooth only | Directional guidance matters |
-| Anti-stalking UI | ✅ Progressive disclosure | ❌ Full info upfront | Reduce false alarm panic |
-| Offline support | ✅ Service Worker | ❌ None | Critical for lost device scenarios |
-| Refresh interval | ✅ 60 seconds | ❌ 10 seconds | Matches broadcast cycle, battery |
-| Haptic feedback | ✅ Distance-based patterns | ❌ None | Multi-sensory guidance |
-
----
-
-## 🚀 Future Enhancements
-
-With more time I'd add AR precision finding (a camera overlay with a directional arrow), a home-screen widget for at-a-glance device status, a family-sharing UI with per-device permission controls, and a history-playback scrubber to replay a device's movement. Longer term: a full WCAG 2.1 AA accessibility audit, system-aware dark mode with map-style switching, and ML-driven "likely at home/work" location hints.
-
-## 💡 Summary
-
-The through-line of this frontend: **client-side decryption keeps the server blind, progressive disclosure keeps the anti-stalking flow calm, and offline support works precisely when a device is lost and the network isn't there.** Leaflet gives one cross-platform map, WebCrypto does hardware-backed decryption in the owner's session, Zustand keeps state pragmatic, and UWB-with-Bluetooth-fallback drives precision finding. The hardest judgment call is the anti-stalking UI — surfacing a real threat without triggering panic over a friend's tag riding along — which progressive disclosure solves by letting users reveal detail at their own pace.
+I would use React and TypeScript for the web UI. A small store can hold selected
+item identity and shared UI state. A data layer handles request keys, cancellation,
+response validation and observation merging.
+
+Cryptographic operations live behind a narrow interface rather than inside map
+components. The key manager can report locked, available, unavailable or recovery
+required. The UI cannot interpret every decryption failure as an empty result.
+
+The native adapter reports capabilities and progress for nearby finding, sound and
+safety actions. Unsupported hardware gets an honest unavailable state, not a fake
+arrow or successful command acknowledgement.
+
+For the web map, Leaflet is a reasonable starting point for markers and simple
+history. Native clients may use platform maps. I would choose each based on actual
+platform requirements rather than assume one web library supplies native radio access.
+
+I would draw only these boundaries initially. The interview should focus on where
+truth and authority come from, not an exhaustive component tree.
+
+## 💾 Own state and request identity — 4 minutes
+
+| State | Owner | Important boundary |
+|-------|-------|--------------------|
+| Selected item and time window | Route or explicit client navigation state | Restorable without putting secrets in the URL |
+| Device metadata | Authenticated data layer | Scoped to current account and ownership |
+| Ciphertext reports | Report cache | Stable report IDs and bounded retention |
+| Decrypted observations | Protected client state | Do not send to analytics or generic server caches |
+| Keys | Dedicated key boundary | Never ordinary persisted UI state |
+| Lost-mode draft | Form state | Separate unsaved edits from accepted settings |
+| Safety alert | Nearby platform's safety state | Independent of the owner's item list |
+
+Every request belongs to an account generation, item and time window. A response
+must match those identities before it changes the visible screen. This also applies
+to a decryption worker finishing after a user changes accounts.
+
+| API or adapter operation | UI contract |
+|--------------------------|-------------|
+| List items | Stable IDs, display metadata and authorization state |
+| Query reports | Envelopes, report IDs, continuation and processing status |
+| Decrypt batch | Valid observations plus per-report failure information |
+| Update lost mode | Accepted version or a conflict; explicit contact disclosure |
+| Nearby action | Capability, progress and observed result |
+| Read safety alert | Evidence summary and supported next actions |
+
+The server and client should distinguish transport success from a useful new
+observation. An HTTP 200 with old reports does not mean the item was just seen.
+
+## 🔧 Deep dive: Show location evidence without inventing movement — 8 minutes
+
+> “The hardest map bug is often a state bug. A delayed response can put one item's
+> coordinates under another item's name, and a late old report can make the marker
+> appear to move backward.”
+
+### Separate observation time from refresh time
+
+A finder may observe an item at 10:00, upload at 10:20 and have the owner retrieve
+it at 10:21. The item was last observed at 10:00. “Updated just now” would be misleading
+unless it clearly refers only to the refresh operation.
+
+I would store observation time, receipt time where available, and the client's last
+successful refresh separately. The visible location label leads with observation age
+and accuracy. Network status is an additional indicator.
+
+A successful refresh with no new reports preserves the older observation and its
+age. A failed refresh also preserves it, but says that new information could not be
+retrieved. Neither outcome should move the marker or reset its timestamp to now.
+
+### Merge by identity and guard selection changes
+
+Reports have stable identities. Decrypt and validate them independently, then merge
+by ID so retries do not duplicate points in the history. Select the latest credible
+observation by observation time, with a deterministic tie-breaker.
+
+If an older report arrives late, add it to the history where it belongs. Do not use
+arrival order alone to choose the main marker. An implausible future timestamp needs
+an explicit policy rather than remaining “latest” indefinitely.
+
+When the user switches from keys to luggage, clear or retain data only under the
+correct item key. Cancel old requests when possible and reject old response identities
+when they return. The same rule applies to work already running in a background thread.
+
+Account changes invalidate all relevant generations. Clearing a store at logout is
+insufficient if an earlier request can immediately repopulate it with private data.
+
+### Keep the map stable and accessible
+
+Center the map when an item is first selected or when the user chooses Recenter.
+Do not automatically drag the viewport away from someone inspecting history on every
+poll. Selecting another item should reset the relevant centering state deliberately.
+
+Show an accuracy region when supported by the observation. The marker is an estimate,
+not a precise doorway. Sparse history points can be connected to show order, but the
+line must not imply the item was measured continuously along that route.
+
+Keep a text alternative with item name, time and location/accuracy description.
+Keyboard users need access to selection and details without operating the map.
+Do not make color the only difference between recent, stale and unavailable states.
+
+### Choose a refresh strategy
+
+Start with polling while the item view is active, plus an explicit refresh action.
+Pause or reduce work when hidden, avoid overlapping requests, and back off after
+failures with a clear retry affordance.
+
+The interval is a product and resource decision. Key rotation does not establish a
+required polling interval; reports can arrive during or after a key period. Measure
+how often refreshes produce useful information and their battery/network cost.
+
+A push hint can trigger an incremental query, but reconnecting must still recover
+reports from durable history. The hint is not the only record of a location update.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Identity-based incremental refresh with observation age | Stable maps and honest freshness | Merge logic and more explicit states |
+| ❌ Replace one global array after each request | Easy initial implementation | Cross-item races, duplicate history and misleading latest points |
+
+I would take the additional state modeling because a wrong item/location association
+is much worse than a small delay. The interface can remain fast while retaining
+uncertainty; it should not manufacture certainty to look responsive.
+
+## 🔧 Deep dive: Owner-side keys and useful offline behavior — 8 minutes
+
+> “Client-side decryption moves a privacy boundary, but it also makes key lifecycle
+> part of the user experience. A login session alone does not guarantee this device
+> can read location history.”
+
+### Keep cryptographic capability separate
+
+The owner obtains keys through secure pairing or encrypted synchronization from an
+authorized device. The report server returns ciphertexts. The client derives the
+necessary lookup tokens and decrypts reports locally.
+
+I would use a reviewed protocol and supported crypto implementation rather than
+designing elliptic-curve details in the UI. The interface exposes bounded operations:
+unlock, derive query tokens, decrypt a batch and clear active material.
+
+Browser crypto APIs do not promise hardware-backed storage on every platform.
+Non-extractable keys can reduce accidental export, but malicious same-origin code
+may still invoke operations or read decrypted output. Script integrity and dependency
+control remain part of the privacy design.
+
+Decryption can run in bounded batches off the main rendering path when needed.
+Return progress for large histories, keep a cancellation generation, and render useful
+valid observations without waiting for every malformed report to finish.
+
+A failed envelope should not discard the entire batch. Separate unsupported version,
+authentication failure and absent key states so the client can recover appropriately
+without exposing raw cryptographic errors as confusing user messages.
+
+### Define recovery honestly
+
+If the user has no key on this device, show the supported transfer or recovery flow.
+If recovery was never designed and all key copies are lost, the report server cannot
+reconstruct plaintext from the account password alone.
+
+Sharing an item also means distributing decryption capability. Removing a user from
+an account list does not erase keys or plaintext they already received. The product
+needs explicit future-access and key-rotation semantics rather than a misleading
+instant-revocation claim.
+
+The web client should never put key material into URLs, crash reports or general
+Zustand persistence. Decrypted location history also needs a clear retention boundary
+on shared devices, including logout and account switching.
+
+### Make offline state useful without overstating it
+
+Cache the application shell and a deliberately bounded set of report data. If keys
+are available locally, the client can decrypt previously retrieved reports offline.
+It cannot receive a new remote observation without a network path.
+
+A last-known view should show both the observation's age and that refresh is currently
+unavailable. Missing map tiles should not hide the text details or the selected item.
+Plan tile access according to the chosen provider's supported caching policy.
+
+I would start with opt-in or short-lived location persistence, especially for a web
+client on a shared computer. Keeping unlimited plaintext history for convenience
+creates a second location database outside the service's privacy controls.
+
+Lost-mode edits made offline remain a draft. Do not display the setting as active
+on the server until it is accepted. On reconnection, compare versions and preserve
+conflicting drafts for the user to review.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Owner-side decryption and bounded protected offline data | Keeps report contents outside the service | Key recovery, client security and retention complexity |
+| ❌ Server decryption with unrestricted browser persistence | Simple map API and easy reloads | Server and shared-device caches gain location access |
+
+The choice is justified if excluding the report service from location contents is
+an actual requirement. If the product chooses server-trusted tracking instead, the
+documentation should say so. Merely naming a payload “encrypted” does not decide
+which parties can read it.
+
+## 🔧 Deep dive: Safety alerts and capability-aware actions — 8 minutes
+
+> “An unwanted-tracker alert needs clear evidence and immediate useful actions.
+> It should neither accuse a person from a heuristic nor reassure someone that a
+> lack of alerts proves they are safe.”
+
+### Separate the safety role from the owner role
+
+An owner asks where their belongings were observed. A potentially affected person
+asks why an unknown item appears to be moving with them. These are distinct data and
+authorization contexts even when they share map components.
+
+The nearby platform provides safety signals and a protected observation history.
+I would not derive a stranger's full location history from the owner's tracking API
+or upload every user's movements merely to simplify alert rendering.
+
+Rotating identifiers complicate recognizing repeated proximity. The UI consumes a
+reviewed platform/protocol result; it cannot assume all sightings with different
+hashes are the same item, or that one hash remains stable for hours.
+
+### Present evidence and actions together
+
+An alert states that an unknown item was observed moving with the user, with relevant
+time information and the source of that assessment. Essential help is visible at
+first presentation; deeper technical detail can be disclosed separately.
+
+A history map shows where observations occurred. It does not prove where another
+person travelled or when an owner opened their tracking app. Avoid captions that
+make those unsupported inferences.
+
+Offer supported actions such as identifying the item, playing a sound when available,
+viewing maintained disabling guidance and obtaining help. If the item can no longer
+be reached, explain the unavailable action rather than claiming it was disabled.
+
+Use platform-maintained guidance for specific devices. The application should not
+substitute its own universal hardware instructions across different accessory models.
+[Apple's unwanted-tracking guidance](https://support.apple.com/en-us/119874)
+
+### Distinguish command acceptance from action completion
+
+For sound, the states are request sent, connecting, command accepted, observed
+completion where supported, and failure/unknown. A backend acknowledgement alone
+cannot prove a physical accessory made a sound.
+
+Nearby finding likewise needs a supported ranging signal and confidence. If direction
+is unavailable, show that state instead of retaining an old arrow. A coarse radio
+signal can support proximity feedback without proving an exact distance or bearing.
+
+Haptic, visual and optional audio feedback can make supported finding more usable.
+Each channel needs user control and accessible alternatives. Avoid requiring someone
+to stare at a moving arrow while navigating an unsafe environment.
+
+A Disable action in a demo that only changes a database flag must be labelled as
+such. It cannot stand in for verified hardware disablement or stop a real tracker
+from participating in another network.
+
+### Balance alert fatigue and missed information
+
+Do not suppress safety alerts solely because a user dismissed a prior notification.
+Maintain a deliberate policy for repeat evidence and cooldown, with access to prior
+alerts and clear limits on any acknowledgement.
+
+Measure false positives, missed scenarios and time to useful warning with appropriate
+consented evaluation. A fixed count/distance threshold is a starting heuristic,
+not evidence that the system is calibrated for personal safety.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Clear evidence, visible help and verified capability states | Supports action without unsupported claims | More states and platform-specific integration |
+| ❌ Minimal generic alert plus always-successful buttons | Compact UI and simple mocks | Hides useful help and can falsely imply protection |
+
+I would keep language calm and direct while making the significance and next steps
+clear. The design goal is informed action, not reducing concern by minimizing what
+the system observed.
+
+## ⚡ Performance, privacy and accessible controls — 4 minutes
+
+Most owners have a small item list, so I would first bound network fan-out and report
+history. Bulk latest summaries or bounded concurrency avoid launching hundreds of
+independent requests if shared or organizational use expands.
+
+Render the selected item's recent observations first. Older history can load on
+demand. Cluster or simplify large point sets for display without modifying the
+underlying evidence or using a smoothed line as a claim of an exact route.
+
+Map tiles and external directions reveal a viewed area to another service. Make
+external navigation deliberate and use the selected observation's actual coordinates.
+Do not send location values to analytics merely to measure a button click.
+
+Use labelled buttons for item selection, sound and notifications. Modal dialogs
+need focus management, Escape behavior and focus restoration. A clickable card made
+only from an unlabelled generic container is insufficient keyboard navigation.
+
+Safety status changes need meaningful announcements, with enough restraint to avoid
+re-reading every polling update. Color, animation and sound all require a text or
+other accessible equivalent.
+
+Protect form drafts from asynchronous replacement. Loading lost-mode settings after
+opening a form must not silently overwrite user edits, and switching items must
+not carry one item's contact message into another item's settings.
+
+## 🧪 Validate the states that can mislead a user — 4 minutes
+
+I would prioritize these scenarios over a test that merely finds a map container:
+
+1. An old item's request completes after another item is selected.
+2. Logout occurs while decryption and requests are still running.
+3. A late upload contains an older observation than the current marker.
+4. A request fails while useful cached history remains available.
+5. Keys are unavailable, one envelope is invalid, or a protocol version is unsupported.
+6. Lost-mode settings change in another session while a draft is open.
+7. A nearby command is accepted but the accessory cannot be reached.
+
+Use deterministic observation fixtures and controlled response ordering. Test keyboard
+and screen-reader flows for the map alternative and safety actions. Real hardware
+validation is required before claiming ranging, background scanning or sound behavior.
+
+Measure time to useful observation, stale-view age, failed refresh recovery, main-thread
+work and successful safety-action completion. Keep those measurements free of raw
+location histories or key material.
+
+The local project currently decrypts on the backend, polls selected history and
+simulates actions. It lacks client key custody, offline storage, native safety
+integration and several response-identity guards. Those are implementation limits,
+not reasons to describe the proposed frontend as already built.
+
+> “The map should preserve the difference between what was observed, what is known
+> now and what the device can actually do. That distinction makes the product useful
+> even when location data is delayed, connectivity is poor or a safety action fails.”

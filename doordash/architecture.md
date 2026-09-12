@@ -1,266 +1,145 @@
-# Design DoorDash - Architecture
+# DoorDash: architecture and implementation
 
 ## System Overview
 
-DoorDash is a three-sided marketplace connecting customers, restaurants, and delivery drivers. Core challenges involve real-time logistics, optimal driver matching, accurate ETA computation, and coordinating order state transitions across three independent actors. The system must handle high write throughput for location updates, maintain strong consistency for financial operations, and deliver sub-second real-time updates to all parties.
-
-**Learning Goals:**
-- Design real-time location tracking with geospatial indexing
-- Build optimal order-driver matching algorithms
-- Calculate accurate ETAs with multiple contributing factors
-- Handle three-sided marketplace dynamics with complex authorization
-- Implement event-driven architecture for decoupled order lifecycle management
-
----
+Design a food-delivery marketplace in which customers place orders, restaurants prepare them, and drivers complete delivery. The central problem is coordinating scarce driver capacity and authoritative order state while tracking positions that may already be stale. This document proposes a production architecture, reproduces the actual local schema, and closes with source-verified implementation notes. Production components and targets are proposals, not claims about DoorDash's internal systems or this demo's measured performance.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed production scope
 
-1. **Browse & Search**: Customers discover restaurants by location, cuisine, rating, and delivery time
-2. **Order**: Customers build carts, place orders with delivery address and tip
-3. **Restaurant Management**: Owners manage menus, hours, open/close status, and order acceptance
-4. **Order Lifecycle**: Order flows through PLACED -> CONFIRMED -> PREPARING -> READY_FOR_PICKUP -> PICKED_UP -> DELIVERED
-5. **Driver Matching**: Automatically assign the best available driver when an order is confirmed
-6. **Real-Time Tracking**: Live driver location and order status updates for all parties
-7. **ETA Calculation**: Multi-factor delivery time estimates that update as conditions change
-8. **Ratings & Reviews**: Customers rate both restaurant and driver after delivery
-9. **Payment**: Customer charge (subtotal + tax + delivery fee + tip), restaurant payout, driver pay
+- Discover open restaurants and available menus in a service area; retain a single-restaurant cart.
+- Quote a delivery total, get customer agreement, and create one durable order for one checkout operation.
+- Let authorized restaurants confirm, prepare, and mark orders ready; assign one active order per driver initially.
+- Deliver expiring offers to eligible drivers, accept them online, and enforce pickup/delivery transitions.
+- Show order status, last known driver position, freshness, and an ETA range to authorized participants.
+- Support cancellation according to explicit state/actor policy and keep an attributable history for support.
 
-### Non-Functional Requirements
+Payments, refunds, and driver payouts require a separate provider workflow if added. This design concentrates on ordering and dispatch; a stored total or fee statistic does not represent money movement. Multi-order batching, chat, recommendations, and global dispatch optimization are outside the initial scope.
 
-| Requirement | Target |
-|---|---|
-| Order API p99 latency | < 200ms |
-| Location update latency (p95) | < 50ms |
-| Driver match time (p95) | < 30 seconds |
-| Availability (peak hours) | 99.99% |
-| Scale | 1M orders/day, 100K concurrent drivers |
-| Location update frequency | Every 10 seconds per active driver |
-| WebSocket connection success | > 99.5% |
+### Non-functional requirements — proposed targets
 
----
+| Requirement | Target and boundary |
+|-------------|---------------------|
+| Availability | 99.9% monthly for regional order reads/writes, excluding an external payment workflow |
+| Checkout | p95 under 500 ms for the local order transaction after an accepted quote |
+| Order visibility | p95 committed changes visible within 2 s to connected, authorized clients |
+| Location intake | p95 under 200 ms; nominal 10 s cadence while tracking is active |
+| Freshness | Exclude positions older than 30 s from dispatch; display observation age to clients |
+| Correctness | One receipt per checkout operation; one live assignment per order and driver; authorized, serialized state changes |
+| Recovery | Durable order/outbox records survive process loss; stale location can be discarded |
+
+A ten-second GPS interval is an initial load/battery assumption, not an accuracy guarantee. Mobile background delivery needs a suitable native client and permissions; the local browser app cannot promise continuous tracking with its screen off.
 
 ## Capacity Estimation
 
-### Production Scale
+Assume one million orders per day, 100,000 simultaneously reporting drivers at the busiest time, and 200,000 WebSocket connections across the three personas. These figures describe a hypothetical fleet spread across markets, not one local database.
 
-| Metric | Estimate |
-|---|---|
-| Daily orders | 1M |
-| Peak orders per second | ~30 (lunch/dinner rush) |
-| Concurrent active drivers | 100K |
-| Location updates per second | 10K (100K drivers / 10s interval) |
-| Active WebSocket connections | 200K (customers + drivers + restaurant tablets) |
-| Restaurant catalog | 500K restaurants, 50M menu items |
-| Order event throughput | ~150K events/day (5-6 status transitions per order) |
+| Workload | Calculation | Consequence |
+|----------|-------------|-------------|
+| Checkout | 1,000,000 / 86,400 ≈ 11.6/s average; budget 10× peak ≈ 116/s | Transactions are modest compared with telemetry; meal peaks concentrate by market |
+| Location ingress | 100,000 / 10 s = 10,000 updates/s at peak | Keep telemetry off the transactional order write path |
+| Durable lifecycle events | Assume 6/order = 6 million/day ≈ 69/s average | Includes a simplified mix of creation, transitions, and dispatch; real counts vary |
+| Core order data | Assume 2 KiB/order including lines = 1.9 GiB/day, 696 GiB/year | Excludes indexes, replicas, backups, images, receipts, and audit overhead |
+| Lifecycle event payloads | 6 million × 1 KiB ≈ 5.7 GiB/day | Set retention and replication explicitly |
+| Location retention upper bound | 10,000/s sustained × 200 bytes × 86,400 ≈ 161 GiB/day | A constant-peak bound, not a daily forecast; sample history and expire it |
+| Position fan-out | At most 2 viewers/update in this model ≈ 20,000 deliveries/s at peak | Subscription count and slow clients matter as much as input throughput |
 
-### Storage Estimates
+A latest-position record of 200 bytes for 100,000 drivers is about 19 MiB of payload; Redis object, index, and replication overhead must be measured separately. Location publications add up to 10,000 events/s if all are retained, so Kafka traffic cannot be estimated from lifecycle events alone.
 
-| Data | Size | Retention |
-|---|---|---|
-| Orders (1M/day) | ~1KB each = 1GB/day, 365GB/year | Indefinite |
-| Location history (10K/s) | ~100B each = 86GB/day | 30 days hot, 1 year cold |
-| Menu data | ~500GB total | Indefinite |
-| Audit logs | ~200B each = 30GB/day | 1 year |
+### Local Development Scale
 
----
+The seed contains four users, five restaurants, 25 menu items, one driver, and one sample order. Compose starts four infrastructure containers; one API and one Vite process run on the host. No benchmark or demonstrated memory ceiling accompanies the project. Start one application instance for the ordinary demo.
 
 ## High-Level Architecture
 
+Proposed production layout; each market has an authoritative order/assignment database:
+
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          Client Layer                                   │
-│     Customer App     │    Restaurant Tablet    │     Driver App          │
-│  (React/Mobile)      │    (React/Tablet)       │   (React/Mobile)       │
-└─────────┬────────────┴────────────┬────────────┴──────────┬─────────────┘
-          │                         │                        │
-          ▼                         ▼                        ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          CDN / Edge                                      │
-│   Static assets, menu images, restaurant photos (TTL: 1 hour)           │
-└─────────────────────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        API Gateway / Load Balancer                       │
-│   Rate limiting, authentication, request routing, TLS termination       │
-└───────┬──────────┬──────────┬──────────┬──────────┬─────────────────────┘
-        │          │          │          │          │
-        ▼          ▼          ▼          ▼          ▼
-┌───────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ ┌──────────────┐
-│  Order    │ │Restaurant│ │ Driver   │ │Delivery│ │   Payment    │
-│  Service  │ │ Service  │ │ Service  │ │Service │ │   Service    │
-│           │ │          │ │          │ │        │ │              │
-│ - Create  │ │ - Menus  │ │ - Onboard│ │- Match │ │ - Charge     │
-│ - Status  │ │ - Hours  │ │ - Location││- Batch │ │ - Payout     │
-│ - History │ │ - Search │ │ - Status │ │- Route │ │ - Tips       │
-│ - Cancel  │ │ - Ratings│ │ - Stats  │ │- ETA   │ │ - Refund     │
-└─────┬─────┘ └────┬─────┘ └────┬─────┘ └───┬────┘ └──────┬───────┘
-      │            │            │            │             │
-      ▼            ▼            ▼            ▼             ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Event Bus (Kafka)                                 │
-│  Topics: order-events, location-updates, dispatch-events,               │
-│          payment-events, notification-events                            │
-└─────────────────────────────────────────────────────────────────────────┘
-      │            │            │            │             │
-      ▼            ▼            ▼            ▼             ▼
-┌───────────┐ ┌──────────┐ ┌──────────────┐ ┌────────────────────────────┐
-│WebSocket  │ │Notifica- │ │  Analytics   │ │    Surge Pricing           │
-│Gateway    │ │tion Svc  │ │  Service     │ │    Service                 │
-│           │ │          │ │              │ │                            │
-│- Order    │ │- Push    │ │- Delivery    │ │- Demand-based fees         │
-│  updates  │ │- SMS     │ │  metrics     │ │- Driver incentives         │
-│- Driver   │ │- Email   │ │- ETA tuning  │ │- Zone-based multipliers    │
-│  location │ │          │ │- Dashboards  │ │                            │
-└───────────┘ └──────────┘ └──────────────┘ └────────────────────────────┘
-      │            │            │
-      ▼            ▼            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Data Layer                                       │
-├──────────────┬──────────────┬───────────────────────────────────────────┤
-│  PostgreSQL  │  Redis/Valkey│       Object Storage (S3)                 │
-│              │              │                                           │
-│ - Orders     │ - Driver     │ - Menu images                             │
-│ - Users      │   locations  │ - Restaurant photos                       │
-│ - Restaurants│   (GEOSEARCH)│ - Receipt PDFs                            │
-│ - Menu items │ - Sessions   │                                           │
-│ - Reviews    │ - Cache      │                                           │
-│ - Payments   │ - Idempotency│                                           │
-│ - Audit logs │   keys       │                                           │
-└──────────────┴──────────────┴───────────────────────────────────────────┘
+┌─────────────────────┐    ┌─────────────────────┐
+│ Three client apps   │───▶│ CDN + API gateway   │
+└─────────────────────┘    └──────────┬──────────┘
+                                     │
+           ┌─────────────────────────┼──────────────────────┐
+           ▼                         ▼                      ▼
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────┐
+│ Catalog + orders    │  │ Dispatch + ETA      │  │ Location intake │
+└──────────┬──────────┘  └──────────┬──────────┘  └────────┬────────┘
+           │                       │                      │
+           ▼                       ▼                      ▼
+┌───────────────────────────────────────┐       ┌─────────────────┐
+│ Market SQL: orders, claims, outbox    │       │ Fresh geo index │
+└───────────────────┬───────────────────┘       └────────┬────────┘
+                    ▼                                    │
+          ┌───────────────────┐                          │
+          │ Outbox → event bus│                          │
+          └─────────┬─────────┘                          │
+                    ▼                                    ▼
+          ┌────────────────────────────────────────────────┐
+          │ Authorized socket gateways + notification jobs │
+          └────────────────────────────────────────────────┘
 ```
 
----
+Dispatch reads fresh geo candidates and writes assignment claims in the same market database as orders. Telemetry feeds a coalescing fan-out path; committed lifecycle events take the durable outbox path. Notification jobs must recheck whether an action is still relevant before sending an old offer. Each socket gateway needs events for its connected subscribers; a single consumer group that distributes events arbitrarily across gateways is insufficient without another routing layer.
 
-## Core Components
+## Core Components / Request Flows
 
-### 1. Order Flow
+### Catalog, quote, and checkout
 
-The complete lifecycle of an order involves coordination across all three sides of the marketplace:
+Discovery can use cached public restaurant/menu data. In production, a spatial index narrows the service area before sorting and pagination. At checkout, the server checks opening status, item availability, quantity bounds, delivery coverage, and money in integer minor units or an exact decimal representation. A quote binds item revisions, delivery address, fees, currency, expiry, and total; changed terms require customer agreement.
 
-1. **Customer places order** (PLACED): Order created with items, delivery address, tip. Idempotency key prevents duplicate charges on retry. Restaurant notified via WebSocket.
-2. **Restaurant confirms** (CONFIRMED): Restaurant acknowledges the order. Triggers automatic driver matching.
-3. **Restaurant prepares** (PREPARING): Restaurant starts cooking. Prep time countdown begins for ETA.
-4. **Food ready** (READY_FOR_PICKUP): Restaurant marks food as ready. Driver notified to head to restaurant.
-5. **Driver picks up** (PICKED_UP): Driver confirms pickup. ETA recalculated based on delivery distance only.
-6. **Driver delivers** (DELIVERED): Driver confirms delivery. Driver marked available for new orders. Delivery metrics recorded.
+The accepted checkout operation is scoped to the actor and quote. In one database transaction, claim its unique operation ID, validate the agreed revisions, insert the order and line snapshots, save the result receipt, and append an outbox event. If validation fails, return an explicit changed-quote response rather than silently charging a new amount. A lost response can be recovered using the same operation ID. Payments, if added, need a durable provider operation and reconciliation; do not hold this SQL transaction across a provider request.
 
-Each transition is protected by a state machine that validates allowed transitions and authorization (customers can only cancel in PLACED status, restaurant owners control CONFIRMED through READY_FOR_PICKUP, drivers control PICKED_UP and DELIVERED).
+Locally, the cart persists complete menu objects. Creation rereads prices and checks item membership/availability and the restaurant minimum, but does not check opening status or quote agreement. Order and line inserts are separate autocommits; no money is charged.
 
-### 2. Driver Location Tracking
+### Restaurant workflow and driver dispatch
 
-Drivers send GPS coordinates every 10 seconds while online. This data serves three purposes:
+A restaurant confirmation transaction verifies ownership and the current state, records the transition, and writes a dispatch event. A worker finds geographically nearby candidates, rejects expired/offline/busy records, and ranks by estimated pickup suitability. Start with a simple score and measure pickup delay and driver distribution before adding optimization.
 
-**Real-time geospatial indexing** (Redis GEOSEARCH): The primary query path for finding nearby available drivers. Redis GEOADD stores each driver's position, and GEOSEARCH finds drivers within a radius sorted by distance. Sub-millisecond query latency is critical since matching happens on every confirmed order.
+To offer a job, atomically reserve the order and driver in the market database with an expiring claim ID. Serialize assignment, acceptance, timeout, cancellation, and delivery against those same records in a consistent locking order. Enforce uniqueness of live driver/order claims; a worker that loses a claim retries a different candidate. Acceptance checks the exact claim and deadline. A timeout releases only its matching claim, so a delayed worker cannot release a replacement assignment.
 
-**Customer tracking** (WebSocket broadcast): When a driver has an active order, every location update is broadcast to the customer tracking that order. This enables the live map experience.
+The local matcher automatically assigns one candidate without offers or a claim transaction. It runs once on confirmation, uses a fixed 5 km radius, and does not expand or retry if no driver is found.
 
-**Location history** (PostgreSQL, async): Location history is written asynchronously to PostgreSQL for ETA model training and dispute resolution. This is partitioned by time for efficient cleanup.
+### Order lifecycle
 
-If Redis is unavailable, the system falls back to a PostgreSQL query with Haversine distance calculation -- slower but functional.
+The intended local transition vocabulary is:
 
-### 3. Driver Matching Algorithm
+| Current state | Allowed next state | Intended actor |
+|---------------|--------------------|----------------|
+| `PLACED` | `CONFIRMED`, `CANCELLED` | Restaurant/admin; customer may cancel their own placed order |
+| `CONFIRMED` | `PREPARING`, `CANCELLED` | Restaurant/admin |
+| `PREPARING` | `READY_FOR_PICKUP` | Restaurant/admin |
+| `READY_FOR_PICKUP` | `PICKED_UP` | Assigned driver/admin |
+| `PICKED_UP` | `DELIVERED` | Assigned driver/admin |
+| `DELIVERED` | `COMPLETED` | System |
+| `COMPLETED`, `CANCELLED` | None | Terminal |
 
-When an order is confirmed, the matching service finds the best driver:
+In production, one transition service enforces actor, expected version, assignment identity, state update, audit entry, and outbox write in a short transaction. Repeated delivery operations return their original receipt instead of incrementing counters twice. Cancellation also releases an associated claim. `COMPLETED` is an internal closeout step, not evidence of settled payment.
 
-1. **Find candidates**: Query Redis GEOSEARCH for active, available drivers within 5km of the restaurant (limit 20)
-2. **Score each driver** using a weighted formula:
-   - Distance to restaurant (highest weight): `100 - distance * 10` -- closer drivers mean faster pickup
-   - Driver rating: `rating * 5` -- higher-rated drivers provide better service
-   - Experience: `min(total_deliveries / 10, 20)` -- more experienced drivers are more reliable
-3. **Assign highest-scoring driver**: Update the order with driver_id, mark driver unavailable
-4. **Calculate ETA**: Compute multi-factor ETA based on driver-to-restaurant distance, remaining prep time, and restaurant-to-customer distance
-5. **Notify driver**: Push order details and ETA via WebSocket
+The local CHECK constraint limits status values only. Handlers validate a prior read and later update by ID alone. They neither serialize competing transitions nor enforce the system-only completion actor; the separate driver endpoints have different side effects.
 
-The entire matching process is protected by a circuit breaker (10s timeout, 50% error threshold, 30s reset). If matching fails, the order remains in CONFIRMED status and can be retried.
+### Position intake and tracking
 
-### 4. Dispatch Optimization
+A proposed position report includes driver identity from the session, tracking-session ID, sequence, observation time, receipt time, accuracy, and coordinates. Reject malformed/out-of-range points and obsolete sequences. A freshness threshold excludes silent drivers even when a geo member remains. Update the index and freshness metadata consistently; cleanup is an efficiency measure, while the query-time age check is the correctness boundary.
 
-At production scale, naive one-order-per-driver matching leaves significant efficiency on the table:
+Keep only the newest pending point for a slow consumer. A newer authoritative order revision can terminate tracking independently of any GPS message. On reconnect, fetch a current authorized snapshot and reconcile revisions; location sequence and order version are different counters. Display data age even when the socket is connected.
 
-**Order batching**: When multiple orders are ready at the same restaurant or nearby restaurants, a single driver can pick up 2-3 orders if the combined route adds minimal delay. The batching algorithm calculates combined route efficiency and only batches when the additional delivery time is under 5 minutes per order.
+Locally, every location report first updates SQL synchronously, then Redis GEO, then a metadata hash with a 300 s TTL. Only the hash expires. It publishes to Kafka and pushes positions to process-local order channels; no freshness or sequence check exists.
 
-**Multi-stop deliveries**: For batched orders, the routing engine optimizes the delivery sequence to minimize total distance. The driver sees a multi-stop route with navigation instructions for each delivery.
+### ETA
 
-**Demand-based rebalancing**: During peak hours, the dispatch system can suggest drivers reposition to high-demand zones where they are more likely to receive orders quickly.
+Before pickup, travel to the restaurant and food preparation overlap. An illustrative estimate is the larger of those remaining durations, plus restaurant-to-customer travel and handoff buffers. After pickup, use the driver's current location to the customer, remove completed pickup work, and show a confidence range. Dispatch delay must be included before an assignment exists. Traffic and kitchen uncertainty should be observable inputs, not invented explanations for every delay.
 
-### 5. Restaurant Management
-
-Restaurants have two distinct operational concerns:
-
-**Menu management**: Restaurant owners create, update, and disable menu items with name, description, price, and category. Menu data is cached in Redis with a 5-minute TTL using cache-aside pattern. Updates immediately invalidate the cache so customers see fresh data.
-
-**Order throttling**: When a restaurant is overwhelmed (too many active orders), the system can temporarily increase estimated prep times or pause new order acceptance. This prevents quality degradation and inaccurate ETAs.
-
-**Open/close toggle**: Restaurants can instantly go offline, which removes them from search results and prevents new orders.
-
-### 6. Real-Time Tracking
-
-The system uses WebSocket connections for bidirectional real-time communication:
-
-**Channel-based subscriptions**: Clients subscribe to specific channels (e.g., `order:123`, `driver:456:orders`, `restaurant:789:orders`). The server only sends messages to subscribers of relevant channels.
-
-**Order status updates**: Every status transition broadcasts the updated order to the customer, restaurant, and driver channels simultaneously.
-
-**Driver location updates**: Every 10-second GPS update from a driver broadcasts to the customer tracking that driver's active order. The update includes latitude, longitude, and timestamp.
-
-**Connection management**: Heartbeat/ping-pong mechanism detects stale connections. On reconnect, clients re-subscribe and fetch current state to avoid missing updates during disconnection.
-
-### 7. ETA Calculation
-
-ETA computation combines multiple time components, some of which overlap:
-
-**Time to restaurant**: Haversine distance from driver's current position to restaurant, converted to drive time using average city driving speed (25 km/h for cars), multiplied by a traffic factor based on time of day (1.5x during rush hours 7-9 AM and 5-7 PM, 1.3x during lunch rush 11 AM-1 PM, 1.1x on weekends).
-
-**Preparation time**: Restaurant's configured prep time minus elapsed time since the order was confirmed. If the driver arrives before food is ready, they wait.
-
-**Delivery time**: Haversine distance from restaurant to customer's delivery address, converted using the same traffic-adjusted route time calculation.
-
-**Buffer**: 3 minutes for pickup handoff + 2 minutes for delivery handoff.
-
-**Total**: `max(time_to_restaurant, prep_time) + pickup_buffer + delivery_time + dropoff_buffer`. The `max()` reflects that driver travel and food preparation happen in parallel.
-
-ETAs are recalculated at every status transition and driver location update, giving customers progressively more accurate estimates.
-
-### 8. Payment
-
-Payment involves three financial flows:
-
-**Customer charge**: subtotal (sum of item prices) + tax (percentage of subtotal) + delivery fee (restaurant-configured, potentially surge-adjusted) + tip (customer-specified). Charged at order placement with idempotency protection.
-
-**Restaurant payout**: subtotal minus platform commission. Settled on a daily or weekly cadence depending on restaurant agreement.
-
-**Driver pay**: delivery fee + tip + any surge/incentive bonuses. Tips are passed through to drivers in full.
-
-### 9. Surge / Dynamic Pricing
-
-When demand exceeds driver supply in a zone, delivery fees increase:
-
-- Monitor order-to-driver ratio per geo zone in real-time
-- When ratio exceeds threshold (e.g., 3:1), apply a multiplier to delivery fees (1.2x-2.5x)
-- Show surge indicator to customers before they place orders
-- Simultaneously offer bonuses to drivers in nearby zones to increase supply
-- Surge decays automatically as supply-demand rebalances
-
-### 10. Search and Discovery
-
-Restaurant search combines multiple signals:
-
-**Geo filtering**: Only show restaurants that deliver to the customer's location. Use Redis GEOSEARCH or PostGIS for radius queries.
-
-**Filters**: Cuisine type, minimum rating, maximum delivery time, price range, currently open.
-
-**Ranking**: Combine relevance (text match), rating (weighted by rating count), delivery time estimate, and platform-specific signals (conversion rate, completion rate).
-
-**Text search**: ILIKE queries for name/description matching in the local implementation. At production scale, Elasticsearch with analyzers for typo tolerance and synonym matching.
-
----
+The local formula uses straight-line distance, fixed vehicle speeds, clock-based multipliers, and a five-minute combined buffer. It does not call a road-routing service or train a model. Its exact limitations are listed below.
 
 ## Database Schema
 
+The following SQL is the **actual local schema** from [backend/src/db/init.sql](./backend/src/db/init.sql), including its existing indexes and constraints. It is not a production migration and does not implement the proposed claims/receipts/outbox. In particular, there is no PostGIS column, version field, positive-quantity check, location-history table, or uniqueness constraint preventing multiple active orders per driver.
+
 ```sql
+-- DoorDash Database Schema
+-- Initialize the database with all required tables
+
 -- Users table (customers, restaurant owners, drivers)
 CREATE TABLE users (
   id SERIAL PRIMARY KEY,
@@ -268,8 +147,7 @@ CREATE TABLE users (
   password_hash VARCHAR(255) NOT NULL,
   name VARCHAR(200) NOT NULL,
   phone VARCHAR(20),
-  role VARCHAR(20) DEFAULT 'customer'
-    CHECK (role IN ('customer', 'restaurant_owner', 'driver', 'admin')),
+  role VARCHAR(20) DEFAULT 'customer' CHECK (role IN ('customer', 'restaurant_owner', 'driver', 'admin')),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -313,8 +191,7 @@ CREATE TABLE menu_items (
 CREATE TABLE drivers (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE UNIQUE,
-  vehicle_type VARCHAR(50) DEFAULT 'car'
-    CHECK (vehicle_type IN ('car', 'bike', 'scooter', 'walk')),
+  vehicle_type VARCHAR(50) DEFAULT 'car' CHECK (vehicle_type IN ('car', 'bike', 'scooter', 'walk')),
   license_plate VARCHAR(20),
   is_active BOOLEAN DEFAULT FALSE,
   is_available BOOLEAN DEFAULT TRUE,
@@ -333,9 +210,10 @@ CREATE TABLE orders (
   customer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   restaurant_id INTEGER REFERENCES restaurants(id) ON DELETE SET NULL,
   driver_id INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
-  status VARCHAR(30) DEFAULT 'PLACED'
-    CHECK (status IN ('PLACED', 'CONFIRMED', 'PREPARING',
-      'READY_FOR_PICKUP', 'PICKED_UP', 'DELIVERED', 'COMPLETED', 'CANCELLED')),
+  status VARCHAR(30) DEFAULT 'PLACED' CHECK (status IN (
+    'PLACED', 'CONFIRMED', 'PREPARING', 'READY_FOR_PICKUP',
+    'PICKED_UP', 'DELIVERED', 'COMPLETED', 'CANCELLED'
+  )),
   subtotal DECIMAL(10, 2) NOT NULL,
   delivery_fee DECIMAL(10, 2) NOT NULL,
   tax DECIMAL(10, 2) NOT NULL,
@@ -388,21 +266,20 @@ CREATE TABLE sessions (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Audit logs
+-- Audit logs for tracking critical business events
 CREATE TABLE audit_logs (
   id SERIAL PRIMARY KEY,
   event_type VARCHAR(50) NOT NULL,
   entity_type VARCHAR(50) NOT NULL,
   entity_id INTEGER NOT NULL,
-  actor_type VARCHAR(20) NOT NULL
-    CHECK (actor_type IN ('customer', 'driver', 'restaurant', 'admin', 'system')),
+  actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('customer', 'driver', 'restaurant', 'admin', 'system')),
   actor_id INTEGER,
   changes JSONB,
   metadata JSONB,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Performance indexes
+-- Indexes for performance
 CREATE INDEX idx_restaurants_location ON restaurants(lat, lon);
 CREATE INDEX idx_restaurants_cuisine ON restaurants(cuisine_type);
 CREATE INDEX idx_restaurants_is_open ON restaurants(is_open);
@@ -419,563 +296,173 @@ CREATE INDEX idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX idx_audit_entity ON audit_logs(entity_type, entity_id);
 CREATE INDEX idx_audit_created ON audit_logs(created_at);
 CREATE INDEX idx_audit_actor ON audit_logs(actor_type, actor_id);
+
+-- Seed data is in db-seed/seed.sql
 ```
 
----
+For the production design, add scoped operation receipts, order versions, quote revisions, durable dispatch claims with uniqueness for live claims, and an outbox with stable event IDs and per-order versions. Add explicit nonnegative monetary/positive quantity checks and a validated address/coordinate contract. Store instants with timezone semantics. Introduce spatial indexes for bounded discovery and retention partitions for optional telemetry history; these are proposed changes, not present tables.
+
+Nullable foreign keys use `SET NULL` for several order relationships, but existing inner joins can then hide an order whose customer or restaurant was deleted. A production retention/deletion policy needs immutable order snapshots and queries that remain valid after identity removal. Audit rows are ordinary mutable records, not a tamper-proof ledger.
 
 ## API Design
 
-### Customer APIs
+### Existing HTTP surface
 
-```
-GET    /api/restaurants                        → Browse restaurants (filters: cuisine, search, lat/lon/radius)
-GET    /api/restaurants/:id                    → Get restaurant with menu (cache-aside, 5min TTL)
-GET    /api/restaurants/meta/cuisines          → Get cuisine types for filter pills (cached 10min)
-POST   /api/orders                             → Place order (requires X-Idempotency-Key header)
-GET    /api/orders                             → List customer's order history
-GET    /api/orders/:id                         → Get order details with items, driver, ETA
-PATCH  /api/orders/:id/status                  → Cancel order (status=CANCELLED, PLACED only)
-```
+All paths below are local APIs. Authentication uses the `session` cookie; there is no bearer-token requirement.
 
-### Restaurant Owner APIs
+| Method | Path | Behavior |
+|--------|------|----------|
+| POST | `/api/auth/register`, `/api/auth/login`, `/api/auth/logout` | Account/session lifecycle |
+| GET | `/api/auth/me` | Current user; driver profile included only for role `driver` |
+| POST | `/api/auth/become-driver` | Create a driver profile; does not change user role |
+| GET | `/api/restaurants` | Open restaurants; optional cuisine/search/lat/lon/radius |
+| GET | `/api/restaurants/meta/cuisines` | Cached cuisine list |
+| GET | `/api/restaurants/owner/my-restaurants` | Restaurants owned by this user, including for admins |
+| GET | `/api/restaurants/:id` | Restaurant and available menu grouped by category |
+| POST, PUT | `/api/restaurants`, `/api/restaurants/:id` | Create/update restaurant with owner/admin checks |
+| POST | `/api/restaurants/:id/menu` | Add menu item |
+| PUT, DELETE | `/api/restaurants/:id/menu/:itemId` | Update/remove menu item |
+| POST | `/api/orders` | Create order; requires `X-Idempotency-Key` |
+| GET | `/api/orders` | Current user's orders; optional status/limit/offset, default 20 |
+| GET | `/api/orders/:id` | Full order for participant/admin |
+| GET | `/api/orders/restaurant/:restaurantId` | Restaurant order queue; default limit 50 |
+| PATCH | `/api/orders/:id/status` | Request a status transition |
+| POST | `/api/drivers/status`, `/api/drivers/location` | Availability and position for current user's driver profile |
+| GET | `/api/drivers/orders`, `/api/drivers/stats` | Assigned order list and profile/daily statistics |
+| POST | `/api/drivers/orders/:orderId/pickup`, `/api/drivers/orders/:orderId/deliver` | Dedicated driver actions |
 
-```
-GET    /api/restaurants/owner/my-restaurants   → List owned restaurants
-POST   /api/restaurants                        → Create restaurant
-PUT    /api/restaurants/:id                    → Update restaurant details
-POST   /api/restaurants/:id/menu               → Add menu item
-PUT    /api/restaurants/:restaurantId/menu/:itemId → Update menu item
-DELETE /api/restaurants/:restaurantId/menu/:itemId → Remove menu item
-GET    /api/orders/restaurant/:restaurantId    → Get restaurant's active orders
-PATCH  /api/orders/:id/status                  → Confirm/Prepare/Ready transitions
-```
+A local creation request:
 
-### Driver APIs
-
-```
-POST   /api/drivers/location                   → Update GPS location (every 10s)
-POST   /api/drivers/status                     → Go online/offline
-GET    /api/drivers/orders                     → Get active deliveries
-GET    /api/drivers/stats                      → Today's stats (deliveries, fees, tips)
-POST   /api/drivers/orders/:orderId/pickup     → Confirm pickup
-POST   /api/drivers/orders/:orderId/deliver    → Confirm delivery
-```
-
-### Auth APIs
-
-```
-POST   /api/auth/register                      → Create account (customer/driver/restaurant_owner)
-POST   /api/auth/login                         → Session-based login (cookie)
-POST   /api/auth/logout                        → Destroy session
-GET    /api/auth/me                            → Get current user
+```json
+{
+  "restaurantId": 1,
+  "items": [{ "menuItemId": 1, "quantity": 1 }],
+  "deliveryAddress": { "address": "Demo address", "lat": 37.7849, "lon": -122.4094 },
+  "deliveryInstructions": "Ring the bell",
+  "tip": 3
+}
 ```
 
-### System APIs
+The response is `{ "order": ... }` with HTTP 201; totals come from SQL prices, restaurant fee, a flat demo tax of 8.75%, and tip. SQL numeric fields usually arrive as strings. Create-time item objects use camelCase without database item IDs; later reads use stored snake_case rows. TypeScript interfaces do not normalize this difference or validate incoming JSON.
 
-```
-GET    /health                                 → Comprehensive health check (Postgres, Redis, Kafka)
-GET    /health/live                            → Liveness probe
-GET    /health/ready                           → Readiness probe (Postgres + Redis connectivity)
-GET    /metrics                                → Prometheus metrics endpoint
-WS     /ws                                     → WebSocket (subscribe/unsubscribe to channels)
-```
+A local status request is `{ "status": "PREPARING" }`, not an action name or versioned command. A restaurant open-state edit expects `{ "isOpen": false }`. No quote endpoint, operation lookup, offer acceptance, location-history API, or payment endpoint is implemented.
 
----
+### Existing WebSocket surface
 
-## Frontend Architecture
+`/ws` accepts messages such as `{ "type": "subscribe", "channel": "order:123" }`. Current channel names are `order:<orderId>`, `customer:<userId>:orders`, `restaurant:<restaurantId>:orders`, and `driver:<userId>:orders`. Driver channels use the **user ID**, not the driver-table ID.
 
-The frontend is a React + TypeScript application built with Vite, using TanStack Router for file-based routing and Zustand for global state management. The application serves three distinct personas (customer, restaurant owner, driver) within a single codebase, with role-based dashboards and real-time order tracking via WebSocket.
-
-### Component Hierarchy
-
-```
-__root.tsx (Header with role-based nav + Outlet)
-├── index.tsx               → Customer home: restaurant discovery with cuisine filters
-├── restaurant.$restaurantId.tsx → Restaurant detail with categorized menu
-├── cart.tsx                 → Shopping cart with delivery address, tip, and checkout
-├── orders.index.tsx         → Customer order history with status filters
-├── orders.$orderId.tsx      → Order detail with real-time tracking and ETA
-├── login.tsx / register.tsx → Authentication with role selection
-├── restaurant-dashboard.tsx → Restaurant owner: order management, menu CRUD
-├── driver-dashboard.tsx     → Driver: availability toggle, active deliveries, stats
-```
-
-Reusable components include `RestaurantCard` (grid display), `MenuItemCard` (add-to-cart interaction), `OrderCard` (status display with action buttons), and `Header` (role-adaptive navigation showing different links for customers, owners, and drivers).
-
-### Routing with TanStack Router
-
-File-based routing maps files to URL paths. Dynamic segments use the `$` prefix: `restaurant.$restaurantId.tsx` handles `/restaurant/123` and `orders.$orderId.tsx` handles `/orders/456`. The router provides type-safe access to these parameters within the component.
-
-The root layout (`__root.tsx`) provides the `Header` component and an `Outlet` for child routes. There are no explicit route guards -- each page checks `useAuthStore().user` and conditionally renders or redirects. The `fetchUser` method on the auth store is called on mount to restore the session.
-
-### State Management (Zustand Stores)
-
-Two Zustand stores manage global state, both using the `persist` middleware to survive page refreshes:
-
-**`authStore`** -- Manages user session with localStorage persistence. Provides `login`, `register`, `logout`, and `fetchUser` actions. The store persists only the `user` object to localStorage, so the app can show cached user info immediately while verifying the session with the server in the background.
-
-**`cartStore`** -- Manages the shopping cart with full localStorage persistence. The cart is tied to a single restaurant -- if the customer switches restaurants, the cart is cleared to prevent mixed-restaurant orders (DoorDash does not support multi-restaurant orders in a single delivery). The store tracks the restaurant, cart items (with quantities and special instructions), delivery address, and tip amount. Derived values (`subtotal()` and `itemCount()`) are computed on demand using `get()` rather than stored as state, ensuring they never become stale.
-
-The cart uses immutable update patterns throughout: `addItem` creates a new array via spread/map rather than mutating the existing one. This ensures React detects the state change and re-renders components that subscribe to the store.
-
-### Data Fetching Pattern
-
-Data flows through: **Component -> API Service -> Backend -> Component state update**.
-
-The API service layer (`services/api.ts`) is organized into four domain modules: `authAPI`, `restaurantAPI`, `orderAPI`, and `driverAPI`. Each module exposes typed methods that call the generic `fetchAPI<T>()` wrapper. The wrapper attaches `credentials: 'include'` for session cookie authentication, serializes request bodies as JSON, and extracts error messages from non-200 responses.
-
-Components fetch data in `useEffect` hooks on mount and store results in local `useState`. For example, the restaurant page fetches the restaurant and its categorized menu on mount, storing both in component state. There is no frontend caching layer -- cache-aside happens on the backend in Redis.
-
-**Idempotent order creation**: The `orderAPI.create` method attaches an `X-Idempotency-Key` header with `crypto.randomUUID()` to every order creation request. This prevents double-ordering if the customer taps "Place Order" and the network is slow -- the server recognizes the duplicate key and returns the original order instead of creating a new one. This is the only frontend API call that uses idempotency keys, because order creation involves financial transactions.
-
-### Real-Time Updates via WebSocket
-
-The `useWebSocket` hook (`hooks/useWebSocket.ts`) manages WebSocket connections for real-time order tracking. Unlike Uber's singleton service pattern, DoorDash uses a React hook pattern where each component that needs real-time updates creates its own connection scoped to specific channels.
-
-**Channel-based subscriptions**: On connection open, the hook subscribes to specified channels by sending `{type: "subscribe", channel: "order:123"}` messages. This allows targeted updates -- the order tracking page subscribes to `order:{orderId}`, the driver dashboard subscribes to `driver:{driverId}:orders`, and the restaurant dashboard subscribes to `restaurant:{restaurantId}:orders`.
-
-**Reconnection**: When the WebSocket disconnects, the hook automatically reconnects after a fixed 3-second delay. This is simpler than exponential backoff but sufficient for a food delivery use case where a few seconds of delay is acceptable.
-
-**Message handling**: Incoming messages are JSON-parsed and passed to a callback function provided by the consuming component. The component handles different message types (e.g., `order_status_update`, `driver_location_update`) and updates its local state accordingly.
-
-### Driver Location Tracking
-
-The `useDriverLocation` hook (`hooks/useDriverLocation.ts`) manages GPS location tracking for drivers. It uses the browser's Geolocation API with high-accuracy mode and periodically sends location updates to the server via the HTTP API.
-
-**Tracking lifecycle**: The hook provides `startTracking()` and `stopTracking()` controls. When tracking is active, it reads the current position every 10 seconds (configurable via `intervalMs`) and sends it to the server via `driverAPI.updateLocation()`. The hook uses `enableHighAccuracy: true` for GPS precision (important for delivery ETA calculations), with a 5-second timeout and no caching (`maximumAge: 0`).
-
-**Error handling**: Geolocation errors (permission denied, position unavailable) are captured and exposed via the hook's `error` state. Location update API failures are logged but do not block subsequent updates -- a missed update is recovered on the next interval.
-
-### Key UI Patterns
-
-**Restaurant discovery with cuisine filters**: The home page fetches all restaurants and available cuisine types on mount. Clicking a cuisine filter re-fetches with the `cuisine` query parameter. A search input filters by restaurant name.
-
-**Categorized menu display**: The restaurant detail page receives the menu organized by category (e.g., "Appetizers", "Entrees", "Drinks") from the API. Each category renders as a section with its items. The `MenuItemCard` component has an "Add to Cart" button that calls `cartStore.addItem()`, incrementing the quantity if the item already exists.
-
-**Order state machine visualization**: The `OrderCard` component renders different action buttons based on the order status and the user's role. For restaurant owners: "Confirm" and "Reject" on PLACED orders, "Mark Ready" on PREPARING orders. For drivers: "Pick Up" on READY_FOR_PICKUP orders, "Deliver" on PICKED_UP orders. For customers: "Cancel" on PLACED orders, and real-time status display for all other states.
-
-**Cart with restaurant lock**: When the customer adds an item from a different restaurant, the cart store detects the restaurant ID mismatch and clears the existing cart before adding the new item. This prevents confusion from mixed-restaurant carts.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern used in the architecture, what problem it solves, and how it works in this system.
-
-### Redis Geospatial Indexing for Driver Locations
-
-**The problem**: When an order is confirmed, the system needs to find the nearest available driver. Drivers are constantly moving, sending location updates every 10 seconds. Storing these ephemeral locations in PostgreSQL would mean constant UPDATE queries on the drivers table, creating write contention and slow reads for proximity searches.
-
-**How it works**: Redis provides native geospatial commands. `GEOADD driver_locations longitude latitude driverId` stores a driver's location in a geo-indexed sorted set. `GEOSEARCH driver_locations FROMLONLAT lng lat BYRADIUS 10 km COUNT 20 ASC WITHDIST` finds the 20 nearest drivers within 10km, sorted by distance. Redis encodes coordinates as 52-bit geohash scores in the sorted set, enabling efficient range queries in sub-millisecond time.
-
-**Why Redis over PostGIS**: Driver locations are hot, ephemeral data -- overwritten every 10 seconds and only relevant while the driver is active. Redis operates entirely in memory with no disk I/O overhead. PostGIS is better for static spatial data (restaurant locations, delivery zones) that changes infrequently and benefits from ACID guarantees.
-
-### Idempotency Keys for Order Creation
-
-**The problem**: A customer taps "Place Order" on a slow mobile connection. The request is sent but no response arrives within 5 seconds. The app times out and shows an error. The customer taps again. Without protection, the system creates two identical orders and charges the customer twice.
-
-**How it works** (`backend/src/shared/idempotency.ts`): The frontend generates a UUID via `crypto.randomUUID()` and attaches it as the `X-Idempotency-Key` header. The backend middleware follows this flow:
-
-1. Check Redis for `idempotency:order:create:{key}`
-2. If found with a completed response: return the cached response (the order was already created)
-3. If found as "in_progress": return 409 Conflict (the first request is still processing)
-4. If not found: set an "in_progress" marker with NX (only-set-if-not-exists) and 60s TTL
-5. Process the order creation
-6. Cache the completed response with a 24-hour TTL
-
-The NX flag on the Redis SET prevents a race condition where two identical requests arrive simultaneously -- only the first succeeds in setting the marker. If the request fails, `clearIdempotencyKey` removes the marker so the client can retry.
-
-**Why the frontend generates the key**: The server cannot detect duplicates without a client-provided identifier, because two identical request bodies could be intentional (the customer genuinely wants to order the same meal twice) or accidental (a network retry). The UUID ties the idempotency to the user's intent, not the request content.
-
-### Circuit Breaker Pattern
-
-**The problem**: If Redis becomes slow, every driver matching request waits for the timeout (e.g., 3 seconds). At 50 requests/second, 150 requests pile up waiting for Redis. These blocked requests consume connection pool slots and memory, causing the entire API to become unresponsive -- even for endpoints that do not use Redis (like restaurant browsing).
-
-**How it works** (`backend/src/shared/circuit-breaker.ts`): The circuit breaker wraps calls to external dependencies and tracks failure rates:
-
-- **CLOSED**: Normal operation. Requests pass through. Failures are counted over a rolling window.
-- **OPEN**: When failures exceed the threshold (e.g., 50% of 5+ requests), the circuit opens. All requests fail immediately with a fallback response instead of waiting for a timeout. For driver search, the fallback returns an empty list. The order proceeds without driver assignment -- matching is retried when the circuit recovers.
-- **HALF-OPEN**: After a reset timeout, one probe request is allowed through. Success closes the circuit; failure reopens it.
-
-Each state transition emits a Prometheus metric, enabling dashboards and alerts when dependencies degrade.
-
-### Structured Logging (Pino)
-
-**The problem**: When debugging why an order was assigned to the wrong driver at 2 AM, you need to trace the matching decision through millions of log lines. `console.log("Order assigned")` provides no searchable context -- which order? which driver? what was the matching score?
-
-**How it works** (`backend/src/shared/logger.ts`): Pino outputs JSON-formatted log lines where every piece of context is a structured field: `{"level":"info","service":"matching","orderId":456,"driverId":"abc","score":87.3,"msg":"Driver assigned to order"}`. Log aggregation systems (ELK, Datadog) can index these fields for fast searching: "show all orders where driverId = abc" or "show all matching decisions with score < 50."
-
-Log levels (trace, debug, info, warn, error, fatal) allow filtering by severity. Production runs at `info` level, omitting verbose debug logs. When investigating an issue, you can temporarily lower the level to `debug` for more detail.
-
-### Prometheus Metrics
-
-**The problem**: You need real-time visibility into system health. How many orders are being placed per minute? What is the average matching latency? How many drivers are online? Logs answer "what happened to this specific request" but not "what is the system doing right now."
-
-**How it works** (`backend/src/shared/metrics.ts`): Three metric types:
-- **Counter**: `doordash_orders_total{status}` -- counts orders by status. The rate of change gives orders/second.
-- **Histogram**: `doordash_matching_duration_seconds` -- tracks matching latency distribution. Prometheus derives percentiles (p50, p95, p99) from buckets.
-- **Gauge**: `doordash_active_drivers` -- current number of online drivers. Useful for supply monitoring.
-
-The `/metrics` endpoint serves all metrics in Prometheus text format. Grafana dashboards visualize these metrics, and alerting rules fire when values deviate from baselines (e.g., matching latency p99 > 5 seconds).
-
-### Session-Based Authentication
-
-**The problem**: The server needs to identify who is making each request. Two approaches exist: session tokens (server stores state in Redis) and JWTs (client carries a self-contained token).
-
-**How it works**: When a user logs in, the server creates a session in Redis (random token -> user ID + role), sets an HTTP-only cookie with the token, and returns the user profile. On subsequent requests, the browser sends the cookie automatically, and the auth middleware (`backend/src/middleware/auth.ts`) looks up the session in Redis.
-
-**Why sessions over JWTs**: In a three-sided marketplace, a restaurant owner might need to be immediately deactivated (food safety violation). With session auth, deleting the Redis key instantly invalidates their access. With JWTs, the token remains valid until expiration -- even a short 15-minute JWT means the owner could continue accepting orders for 15 minutes after deactivation. For food delivery, this is unacceptable.
-
-### Role-Based Access Control (RBAC)
-
-**The problem**: DoorDash has three user roles (customer, restaurant_owner, driver) with different permissions. A customer should not be able to confirm an order. A driver should not be able to modify a restaurant's menu. Without access control, any authenticated user could perform any action.
-
-**How it works**: Each user has a `role` column in the database. The auth middleware attaches the user object (including role) to the request. Route-level middleware checks the role before allowing access:
-- Customer routes (`/api/orders` POST): require `role = 'customer'`
-- Restaurant routes (`/api/restaurants/:id/menu` POST): require `role = 'restaurant_owner'` AND ownership of the restaurant
-- Driver routes (`/api/drivers/orders/:id/pickup` POST): require `role = 'driver'` AND assignment to the order
-
-This is a simple flat RBAC model (users have one role, each role has fixed permissions). A more complex system would use role-permission mapping tables, but for three well-defined roles, a role column check is sufficient and easier to reason about.
-
-### Multi-Factor ETA Calculation
-
-**The problem**: A customer wants to know when their food will arrive, but the answer depends on many independent factors: how far is the driver from the restaurant? how long will the restaurant take to prepare the food? how far is the restaurant from the delivery address? what is traffic like right now?
-
-**How it works**: The ETA combines four components:
-1. **Driver to restaurant**: Distance from driver's current location to restaurant, divided by average speed, adjusted for traffic conditions (rush hour multiplier: 1.5x for 7-9 AM and 5-7 PM, 1.3x for lunch rush)
-2. **Preparation time**: The restaurant's estimated prep time for this order (restaurants set this per-order or use a default)
-3. **Restaurant to customer**: Distance from restaurant to delivery address, adjusted for traffic
-4. **Buffer**: Fixed 5-minute buffer for parking, walking to door, and finding the customer
-
-The ETA updates dynamically as conditions change: when the driver's location changes, when the restaurant marks the order as ready (prep time becomes 0), or when traffic conditions change.
-
-### Order State Machine
-
-**The problem**: An order progresses through multiple states (PLACED -> CONFIRMED -> PREPARING -> READY_FOR_PICKUP -> PICKED_UP -> DELIVERED) with different actors triggering transitions. Without strict state management, race conditions could lead to invalid states (e.g., marking an order as DELIVERED before it is PICKED_UP).
-
-**How it works**: State transitions use optimistic locking with a WHERE clause on the expected current status:
-
-```sql
-UPDATE orders SET status = 'CONFIRMED' WHERE id = $1 AND status = 'PLACED' RETURNING *;
-```
-
-If zero rows are updated, the transition is rejected -- someone else already changed the status. Each transition is validated: only the restaurant can CONFIRM, only the driver can PICKED_UP, and you can only transition to the next state in sequence.
-
-The state machine also triggers side effects: CONFIRMED triggers driver matching, PICKED_UP starts the delivery timer, DELIVERED calculates the final payment breakdown.
-
----
+Events include `new_order`, `order_assigned`, `order_status_update`, and `driver_location`; there is a client-requested ping/pong response but no server heartbeat loop. The server does not authenticate connections or authorize channel ownership. The production protocol needs both, plus versioned snapshots, bounded subscription counts, payload validation, backpressure, and a documented reconnect contract.
 
 ## Key Design Decisions
 
-### 1. Redis GEOSEARCH for Driver Locations vs PostGIS
+### Durable order commits versus a cache-only retry marker
 
-**Decision**: Store real-time driver locations in Redis with geo indexing, not PostgreSQL PostGIS.
+Choose a unique operation receipt in the same database transaction as order lines and an outbox entry. Checkout changes durable commercial intent; a retry after a lost response must locate that intent even after a Redis restart. Redis NX is useful for suppressing concurrent work, but its lease can expire while SQL is still running, and a cached response written after commit can be lost in a process crash. It cannot by itself prove whether an order exists.
 
-**Why Redis works**: Driver location updates arrive at 10K/second (100K active drivers, every 10 seconds). Each update needs to be both written and queryable within milliseconds. Redis GEOADD/GEOSEARCH provides sub-millisecond spatial queries with O(N+log(M)) complexity. The data is inherently ephemeral -- if a driver stops sending updates, their position is stale within 30 seconds.
+The cost of the SQL choice is a write per operation, retention rules, and a short contention point for repeated IDs. Scope keys by user and operation, bind them to the agreed payload, and return conflicts for changed payloads. Keep external provider work outside the transaction and reconcile its independent receipt if payments are added.
 
-**Why PostGIS fails here**: PostgreSQL handles 10K writes/second fine, but every write contends for index updates on the spatial index. More critically, the GEOSEARCH query during driver matching would compete with the write load, introducing latency spikes during peak matching. PostGIS is excellent for static or slowly-changing spatial data (restaurant locations), but not for high-frequency updates.
+### Fast candidate discovery versus authoritative assignment
 
-**What we give up**: Redis is single-threaded and in-memory. A Redis failure means losing all driver positions until drivers send their next update (10 seconds). We mitigate this by also writing positions to PostgreSQL asynchronously for the fallback query path.
+Choose an ephemeral geo index for candidate discovery and SQL claims for exclusivity. A candidate list is necessarily stale: two dispatchers can see the same available driver simultaneously. Updating a Redis availability flag and an order row separately creates an interval where either side can disagree; even a perfect ranking score cannot repair that double booking.
 
-### 2. Score-Based Matching vs Auction-Based Matching
+A SQL claim transaction makes the winner explicit. The trade-off is local serialization and additional timeout/acceptance states. Keep a driver's live claims and the order in one market database; route cross-market cases to an explicit handoff instead of pretending a global transaction is free. Measure contention before introducing a more distributed assignment protocol.
 
-**Decision**: Use a deterministic scoring algorithm rather than an auction where drivers bid on orders.
+### Durable lifecycle events versus replaceable telemetry
 
-**Why scoring works**: The scoring formula (distance 60%, rating 25%, experience 15%) produces predictable, explainable assignments. When a customer complains about a slow delivery, we can show exactly why a specific driver was chosen. The algorithm runs in under 100ms because it only evaluates the 20 nearest drivers.
+Choose durable, versioned events for accepted business actions and latest-value delivery for positions. Losing `DELIVERED` changes what the parties can do; losing one GPS sample can be repaired by the next fresh observation. Putting every sample in every client's reliable queue causes an offline phone to replay a long route before learning where the driver is now.
 
-**Why auction fails here**: An auction requires drivers to actively bid, introducing 10-30 seconds of latency per match while waiting for bids. During peak hours with 30 orders/second, this creates a backlog. Drivers might also game the system by selectively bidding on high-tip orders, leaving low-tip customers waiting. Uber tried auction-based matching early on and abandoned it for similar reasons.
-
-**What we give up**: Scoring doesn't account for driver preferences (maybe a driver knows a neighborhood well, or prefers certain restaurant types). A hybrid approach where drivers can set preferences that influence scoring would be a future improvement.
-
-### 3. Kafka for Event Streaming vs Direct Push
-
-**Decision**: Publish all order and location events to Kafka topics rather than making synchronous calls between services.
-
-**Why Kafka works**: Order lifecycle events (created, confirmed, picked up, delivered) need to reach multiple consumers: the notification service (push/SMS), the analytics pipeline (ETA model training), the payment service (charge/payout triggers), and the real-time WebSocket gateway. Kafka's consumer group model lets each consumer process events independently at its own pace. If the notification service goes down, order processing continues and notifications catch up when it recovers.
-
-**Why direct push fails**: A synchronous call chain (Order Service -> Notification Service -> Analytics Service) means a slow notification service blocks order confirmation. With 1M orders/day generating 5-6 events each, that is 5-6M inter-service calls that all need to succeed. Any single failure in the chain cascades.
-
-**What we give up**: Kafka adds operational complexity (ZooKeeper, broker management, topic configuration) and introduces eventual consistency for downstream consumers. A notification might arrive 1-2 seconds after the status change rather than instantly. For a food delivery app, this latency is acceptable.
-
-### 4. Multi-Factor ETA vs ML-Based Prediction
-
-**Decision**: Use a deterministic multi-factor ETA (distance, prep time, traffic multiplier, buffer) rather than a machine learning model.
-
-**Why deterministic works**: The formula is transparent and debuggable. When ETAs are consistently 5 minutes late, we can identify the specific factor (prep time underestimated, traffic multiplier too low) and adjust it. The calculation takes microseconds with no model serving infrastructure needed.
-
-**Why ML fails initially**: An ML model needs months of historical delivery data to train on, and the model's predictions are opaque -- when ETAs are wrong, it is hard to know why. ML models also require serving infrastructure (model registry, feature store, inference endpoints) that adds significant operational cost before the data exists to justify it.
-
-**What we give up**: The deterministic approach cannot capture complex patterns (this restaurant is always 5 minutes late on Friday nights, this neighborhood has construction delays). Once sufficient delivery history accumulates, an ML model trained on historical data can progressively replace or augment the deterministic approach. The `eta_accuracy_minutes` metric tracks accuracy to inform this decision.
-
----
+The cost is two recovery models. Status reconciles against durable snapshots/versions; position reconciles against observation age/session sequence. Sampled telemetry history may help investigate ETA error, but it requires explicit retention and access controls. Neither an open socket nor a Kafka producer's connection flag establishes that the client has the newest relevant state.
 
 ## Consistency and Idempotency
 
-### Write Consistency Model
+Production checkout, assignment, cancellation, acceptance, pickup, and delivery must share the authoritative transition rules. Acquire related records in a consistent order and recheck the actor and expected state while holding the transaction guard. Attach unique event IDs to the resulting outbox records; consumers deduplicate by effect and record completion with their own state changes. This gives recoverable at-least-once processing, not a universal exactly-once guarantee.
 
-| Operation | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Order placement | Strong (PostgreSQL transaction) | Payment tied to order creation, no duplicates allowed |
-| Order status transitions | Strong with optimistic locking | State machine integrity requires atomic transition from expected state |
-| Driver location updates | Eventual (Redis primary, PostgreSQL async) | High frequency, 10-second staleness acceptable |
-| Menu/price updates | Eventual with explicit cache invalidation | Restaurant can tolerate brief inconsistency during invalidation |
-| Driver matching | Optimistic with conflict detection | Race conditions handled: if driver becomes unavailable between query and assignment, retry with next candidate |
+The local implementation has a Redis response cache only for checkout. A 60-second NX marker precedes work and responses are cached for 24 hours. Errors are also cached because the middleware wraps every `res.json`; clearing the key in the error branch does not prevent the wrapper from storing the error afterward. Keys are not bound to actor or request body. Redis errors permit processing, and the frontend creates a new UUID on every invocation. No durable receipt resolves an ambiguous checkout result.
 
-### Idempotency Keys
+## Security / Auth
 
-All mutating API endpoints require client-generated idempotency keys via the `X-Idempotency-Key` header. The flow:
+Production must restrict privileged account provisioning, authorize all HTTP commands and socket subscriptions, validate money/coordinates/quantities, and rate-limit authentication and location ingestion. Use secure cookies and origin/CSRF protections appropriate to the deployment. Minimize delivery address, phone, and precise location data in events; authorization should end when a participant's access ends.
 
-1. Client generates a UUID for each action (e.g., placing an order)
-2. Server checks Redis for existing response cached under that key
-3. If found, return the cached response (cache hit)
-4. If not found, process the request, cache the response with 24-hour TTL
-5. On validation errors or server errors, the key is cleared so the client can retry with corrected data
-
-This prevents duplicate charges when network issues cause request retries.
-
-### Order State Machine Conflict Resolution
-
-Status transitions use optimistic locking: the UPDATE query includes `WHERE status = $expected_status`. If the row was already modified by another actor (e.g., restaurant cancels while driver tries to pick up), the update affects zero rows and the caller receives a conflict error with the current status.
-
-### Kafka Consumer Deduplication
-
-Kafka provides at-least-once delivery. Consumers use event-id-based deduplication: before processing, check Redis for `processed:{eventId}`. If present, skip. If absent, set the key with 7-day TTL and process.
-
----
-
-## Caching and Edge Strategy
-
-### Cache Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            CDN Edge                                      │
-│   Static assets, menu images, restaurant photos                         │
-│   TTL: 1 hour, purge on update via versioned URLs                       │
-└─────────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Application Cache (Redis/Valkey)                     │
-│   Menu data, restaurant info, sessions, geospatial, idempotency keys   │
-└─────────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     PostgreSQL (Source of Truth)                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Cache Strategy by Data Type
-
-| Data | Pattern | TTL | Invalidation |
-|------|---------|-----|-------------|
-| Restaurant + menu | Cache-aside | 5 min | Explicit purge on restaurant/menu update |
-| Cuisine list | Cache-aside | 10 min | Background refresh |
-| Driver locations | Write-through | 30s auto-expire | Overwrite on every update |
-| Order status | No cache | N/A | Real-time via WebSocket |
-| User sessions | Write-through | 24 hours | Delete on logout |
-| Idempotency keys | Write-through | 24 hours | Clear on validation/server error |
-| Nearby restaurants | Cache-aside (by geohash cell) | 2 min | Background refresh |
-
-Cache hit/miss rates are tracked via Prometheus counters (`cache_hits_total`, `cache_misses_total`) per cache type.
-
----
+Locally, bcrypt uses cost 10. Sessions are UUIDs stored in PostgreSQL and Redis with a seven-day expiry, plus an HTTP-only SameSite=Lax cookie that is not marked Secure. Authentication checks Redis first and SQL on a miss; a Redis error does not fall back successfully, and the middleware treats the user as unauthenticated. Logout deletes SQL before Redis, so a failed Redis deletion may leave a cached session usable. Registration accepts the supplied role, including `admin`; the UI's limited role buttons are not a server restriction.
 
 ## Observability
 
-### Metrics (Prometheus)
+Proposed service-level indicators are checkout outcome/latency, receipt conflicts, dispatch queue age, offer acceptance/expiry, duplicate-assignment violations, order-event lag, stale driver fraction, and ETA error by delivery stage and market. Use low-cardinality labels and trace IDs spanning HTTP, outbox, workers, and notifications. Reconcile active-order/driver counts from authority rather than trusting accumulated increments forever.
 
-Key metrics exposed at `/metrics`:
-
-**HTTP metrics**: `http_request_duration_seconds` (histogram by method/route/status), `http_requests_total` (counter)
-
-**Order metrics**: `orders_total` (counter by status/restaurant), `orders_active` (gauge by status), `order_status_transitions_total` (counter by from/to status), `order_placement_duration_seconds` (histogram)
-
-**Delivery metrics**: `delivery_duration_minutes` (histogram of actual delivery times), `eta_accuracy_minutes` (histogram of estimated vs actual, positive = late)
-
-**Driver metrics**: `drivers_active` (gauge), `drivers_available` (gauge), `driver_match_duration_seconds` (histogram), `driver_assignments_total` (counter by result: success/no_drivers/error), `driver_location_updates_total` (counter)
-
-**Infrastructure metrics**: `cache_hits_total` / `cache_misses_total` (by cache type), `circuit_breaker_state` (gauge: 0=closed, 1=open, 2=half-open), `circuit_breaker_failures_total`, `idempotency_hits_total`
-
-### SLI/SLO Definitions
-
-| SLI | Target SLO | Alert Threshold |
-|-----|------------|-----------------|
-| Order API p99 latency | < 200ms | > 500ms for 5 min |
-| Order placement success rate | > 99.9% | < 99% for 2 min |
-| Driver location update p95 | < 50ms | > 100ms for 5 min |
-| Driver match time p95 | < 30s | > 60s for 5 min |
-| WebSocket connection success | > 99.5% | < 98% for 5 min |
-| Kafka consumer lag | < 1000 messages | > 5000 for 5 min |
-
-### Structured Logging (Pino)
-
-Every log entry includes structured fields: `level`, `time`, `service`, `requestId`, `msg`. Business events add contextual fields (orderId, customerId, restaurantId, driverId, status transitions). Request logging middleware assigns a unique requestId per request and logs completion with status code, duration, and user ID.
-
-### Audit Logging
-
-Critical business events are recorded in the `audit_logs` table with:
-- `event_type`: ORDER_CREATED, ORDER_STATUS_CHANGED, ORDER_CANCELLED, DRIVER_ASSIGNED
-- `actor_type` + `actor_id`: Who performed the action (customer, driver, restaurant, admin, system)
-- `changes`: JSON before/after state diff
-- `metadata`: IP address, user agent, idempotency key
-
-This provides an immutable record for dispute resolution in the three-sided marketplace.
-
----
+The local entry point exposes `/metrics`, `/health`, `/health/ready`, and `/health/live`. PostgreSQL and Redis determine readiness; Kafka unavailability is informational. Pino request/business logging, HTTP histograms, matching duration, assignment counters, and several gauges are wired, but gauge updates differ across the generic and dedicated driver paths. Values start at zero per process, can become negative, and do not reconcile from SQL. Restaurant-ID metric labels and unmatched raw paths also need cardinality review. Kafka health records connection state without resetting it on every failed send; no consumer-lag metric exists because there are no consumers.
 
 ## Failure Handling
 
-### Circuit Breakers (Opossum)
-
-| Operation | Timeout | Error Threshold | Reset |
-|-----------|---------|-----------------|-------|
-| Driver matching | 10s | 50% | 30s |
-| Payment processing | 5s | 30% | 60s |
-
-When a circuit opens, the operation returns a fallback immediately (driver matching: `{ matched: false, queued: true }`). Circuit state is tracked as a Prometheus gauge for dashboard visibility.
-
-### Graceful Degradation
-
-- **Redis down**: Driver location falls back to PostgreSQL query with Haversine calculation. Menu caching disabled, every request hits PostgreSQL.
-- **Kafka down**: Events are skipped (fire-and-forget). Order flow continues without event publishing. Logged as warnings. Analytics and notifications degrade but core order flow is unaffected.
-- **WebSocket disconnected**: Clients poll REST endpoints for status updates until reconnected.
-
-### Graceful Shutdown
-
-On SIGTERM: stop accepting new connections, finish in-flight requests (30s timeout), close PostgreSQL pool, close Redis connection, disconnect Kafka producer, then exit. Forced exit after 30 seconds.
-
----
+| Failure | Proposed production behavior | Current local behavior |
+|---------|------------------------------|------------------------|
+| Checkout response lost | Retry same operation; return committed receipt | New frontend UUID may create another order |
+| Item insert fails | Roll back order, lines, receipt, and outbox | Earlier inserts remain committed |
+| Redis unavailable | Suspend fresh matching; serve bounded catalog fallback; explicit auth dependency policy | Cache helpers catch errors; auth fails and startup awaits Redis; matcher can use stale SQL coordinates after a geo error |
+| No driver available | Durable dispatch backlog with bounded retries and visible delay | One matching attempt; no rematching worker |
+| Matcher times out | Worker relinquishes/renews a fenced claim; reconcile outcome | Opossum returns a queued-shaped fallback without creating a queue job; underlying work can continue |
+| Kafka unavailable | Outbox retains work; relay retries with lag monitoring | Producer methods return false/log; request paths do not durably retain events |
+| Socket disconnect | Authorized snapshot catch-up and version reconciliation | Client reconnects but has no snapshot catch-up, replay, or polling fallback |
+| Cancellation races assignment | Same order/claim transaction determines a winner | Matcher can assign after cancellation; assigned driver is not reliably released |
 
 ## Scalability Considerations
 
-### What Breaks First
+First remove SQL writes from the high-frequency location path and add freshness validation; 10,000 GPS writes/s plus per-order lookups are a different workload from roughly 116 peak checkouts/s. Discovery currently fetches all matching rows and computes distances in JavaScript, so move bounding/filtering and pagination into an indexed query. Batch candidate metadata reads instead of issuing per-driver queries.
 
-1. **Driver location writes** (10K/s): Redis single-node handles this comfortably (~100K ops/s). Beyond 500K concurrent drivers, shard driver locations across multiple Redis instances by driver ID hash.
-
-2. **PostgreSQL order writes** (30 orders/s peak): A single PostgreSQL instance handles this easily. At 10x scale, read replicas for order history queries. At 100x, partition the orders table by month.
-
-3. **WebSocket connections** (200K): A single server handles ~50K connections. Use a WebSocket gateway cluster (4+ nodes) with Redis Pub/Sub to fan out messages across nodes.
-
-4. **Driver matching** (30 matches/s): CPU-bound scoring of 20 drivers per match. A single node handles hundreds of matches/second. Shard by geographic region for independent scaling.
-
-### Horizontal Scaling Path
-
-- **API servers**: Stateless, scale behind load balancer. Session state in Redis.
-- **WebSocket gateway**: Scale independently from API servers. Use Redis Pub/Sub for cross-node message routing.
-- **Kafka**: Add partitions per topic. Partition `order-events` by order ID, `location-updates` by driver ID.
-- **PostgreSQL**: Read replicas for analytics and order history. Vertical scaling first, then sharding by region if needed.
-- **Redis**: Cluster mode for driver locations if needed. Separate Redis instances for cache vs geo vs sessions.
-
-### Geographic Sharding
-
-At continental scale, shard the entire system by metropolitan area. Each metro has its own:
-- Order/Restaurant/Driver databases
-- Redis instances for locations
-- Kafka clusters for local events
-- API server fleet
-
-Cross-metro operations (user traveling to another city) route to the appropriate shard via the API gateway.
-
----
+Partition by market when measured database or dispatch contention warrants it. Keep transactional ownership local, and cache public catalog reads independently. Scale socket gateways with shared event routing, subscription authorization, output bounds, and draining connections on deploy. Redis Pub/Sub alone cannot replay missed events; a snapshot recovery contract remains necessary. Kafka topics require deliberate partitioning, retention, replication, stable event IDs, and consumer operations rather than relying on auto-creation defaults.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Location store | Redis GEOSEARCH | PostGIS | Sub-ms latency for 10K updates/s; ephemeral data fits in-memory model |
-| Driver matching | Score-based algorithm | Auction-based bidding | Deterministic, < 100ms, no driver wait time; auction adds 10-30s latency |
-| ETA computation | Multi-factor formula | ML model | Transparent, debuggable, zero training data needed; ML added later with data |
-| Event streaming | Kafka | Synchronous RPC | Decoupled consumers, replay capability, no cascade failures |
-| Session auth | Redis + cookie | JWT | Immediate revocation on logout, simpler token management |
-| Cache invalidation | Explicit purge + TTL | Event-driven invalidation | Simpler, sufficient for menu update frequency |
-| Order state machine | Optimistic locking | Pessimistic row locks | Concurrent actors rarely conflict; retries cheaper than lock waits |
-
----
+| Checkout receipt | SQL transaction with order/lines/outbox | Redis response cache only | Recover a committed order after cache/process failure |
+| Driver exclusivity | SQL claim, geo index for candidates | Independent availability/order writes | Stale candidates cannot authorize double assignment |
+| Tracking transport | Durable status, coalesced position | Reliable queue for every GPS sample | Recover business state without replaying stale movement |
+| Dispatch policy | One live order per driver initially | Multi-order batching | Establish assignment correctness before route optimization |
+| ETA | Stage-aware formula and uncertainty range | Immediate ML pipeline | Explain baseline error before adding training infrastructure |
+| Distribution | Market-local authority | Global writable order state | Limit transaction scope and failure propagation |
 
 ## Implementation Notes
 
-This section documents the mapping between the production architecture above and what is actually built in the local implementation.
+### Patterns actually connected
 
-### Local Architecture
+- **Cache-aside:** [shared/cache.ts](./backend/src/shared/cache.ts) serves full restaurant/menu entries for five minutes and cuisine lists for ten. Restaurant/menu updates purge relevant detail keys. Nearby/list helper caches are not used by discovery, and cuisine invalidation is missing. Invalidation also uses `KEYS` for patterns; there is no background refresh or request coalescing.
+- **Idempotency marker:** [shared/idempotency.ts](./backend/src/shared/idempotency.ts) uses the following admission pattern. It reduces overlapping requests while the marker exists; it does not make the downstream writes atomic or durable.
 
-```
-┌───────────────────────┐        ┌───────────────────────────────┐
-│   React Frontend      │        │    Express Backend             │
-│   (Vite, port 5173)   │───────▶│    (single process, port 3000)│
-│                       │  HTTP  │                               │
-│ - Home (browse)       │  + WS  │ Routes:                       │
-│ - Restaurant page     │        │   /api/auth                   │
-│ - Cart + checkout     │        │   /api/restaurants             │
-│ - Order tracking      │        │   /api/orders                  │
-│ - Driver dashboard    │        │   /api/drivers                 │
-│ - Restaurant dashboard│        │                               │
-│                       │        │ WebSocket: /ws                 │
-└───────────────────────┘        └──────┬───────┬───────┬────────┘
-                                        │       │       │
-                                        ▼       ▼       ▼
-                                 ┌──────────┐ ┌─────┐ ┌─────┐
-                                 │PostgreSQL│ │Redis│ │Kafka│
-                                 │port 5432 │ │6379 │ │9092 │
-                                 └──────────┘ └─────┘ └─────┘
+```typescript
+await redisClient.set(fullKey, JSON.stringify({ inProgress: true }), { NX: true, EX: 60 });
 ```
 
-### Production-Grade Patterns Actually Implemented
+- **Circuit breaker:** [shared/circuit-breaker.ts](./backend/src/shared/circuit-breaker.ts) wraps matching with a 10 s timeout, 50% error threshold, 30 s reset, and minimum request volume of five. Its fallback returns `queued: true`, but there is no queue insertion or retry worker. The separate payment breaker wraps an unused simulator; it is not part of checkout. A timeout does not cancel the matching function's later SQL writes.
+- **Audit/metrics/logging:** [shared/audit.ts](./backend/src/shared/audit.ts), [shared/metrics.ts](./backend/src/shared/metrics.ts), and [shared/logger.ts](./backend/src/shared/logger.ts) record selected order/assignment events. These help diagnose local behavior, but audit writes occur after effects and swallow errors; they are not transactional, append-only, or guaranteed complete. Some modules still log directly to the console.
+- **Producer integration:** [shared/kafka.ts](./backend/src/shared/kafka.ts) produces `order-events`, `location-updates`, and `dispatch-events`, keyed by order or driver. Initialization is optional to app readiness. There is no outbox, consumer, notification service, or analytics materialization; WebSocket broadcasts are separate in-process calls.
+- **Health/shutdown:** [index.ts](./backend/src/index.ts) registers probes and handles SIGTERM/SIGINT with a 30 s forced-exit timer. It attempts HTTP/dependency shutdown but does not explicitly drain WebSockets, and probes have no application-level deadline. Global authentication runs before probes, so cookies can introduce session dependency work.
 
-**Idempotency for order placement** -- The `X-Idempotency-Key` header is required on POST /api/orders. Keys are stored in Redis with 24-hour TTL. Validation and server errors clear the key to allow retry. This prevents duplicate charges when network issues cause retries. See `backend/src/shared/idempotency.ts`.
+### Correctness and integration limits
 
-**Cache-aside for restaurant/menu data** -- Restaurant details with full menus are cached in Redis under `cache:restaurant_full:{id}` with 5-minute TTL. Cache is explicitly invalidated on restaurant update, menu item add/update/delete. Cuisine list cached under `cache:cuisines` with 10-minute TTL. Cache hits and misses tracked via Prometheus counters. See `backend/src/shared/cache.ts` and `backend/src/routes/restaurants.ts`.
+**Checkout and retry.** [create.ts](./backend/src/routes/orders/create.ts) does not begin a transaction. A failed later line insert leaves an order and earlier lines. It accepts closed restaurants, rejects valid zero-valued coordinates through truthiness checks, and does not enforce positive integer quantities, nonnegative tips, or geofenced delivery. Current-price validation has no quote/revision agreement; floating-point arithmetic is rounded independently for persisted totals. [api.ts](./frontend/src/services/api.ts) mints a fresh checkout key per call. The Redis cache key has no actor/payload binding, and failure responses can be reused across users sharing a key.
 
-**Circuit breaker for driver matching** -- Driver matching uses Opossum with 10-second timeout and 50% error threshold. When the circuit opens, matching returns a fallback result immediately instead of hanging. Circuit state transitions are logged and tracked as Prometheus gauges. See `backend/src/shared/circuit-breaker.ts`.
+**Transition authority.** [status.ts](./backend/src/routes/orders/status.ts) uses the pattern below after an earlier read. No expected status/version is part of its predicate:
 
-**Prometheus metrics** -- 20+ metrics covering HTTP latency, order lifecycle, delivery duration, ETA accuracy, driver operations, cache performance, and circuit breaker state. All exposed at `/metrics` in Prometheus exposition format. See `backend/src/shared/metrics.ts`.
+```sql
+UPDATE orders SET status = $2, updated_at = NOW() WHERE id = $1;
+```
 
-**Structured logging with Pino** -- All log output is structured JSON with service name, request ID, and contextual business fields. Request logging middleware tracks duration and status code per request. See `backend/src/shared/logger.ts`.
+An unrelated authenticated user can request `DELIVERED → COMPLETED`: the `system` transition has no actor check. Generic delivery does not perform the dedicated endpoint's driver-release/counter work. [drivers.ts](./backend/src/routes/drivers.ts) separately reads then updates pickup/delivery; concurrent deliveries can increment `total_deliveries` twice. Going online sets `is_available` true even with an assigned order, and cancellation does not consistently free a driver. Fee/tip stats include only `DELIVERED` rows, so `COMPLETED` rows disappear from today's totals; these are not payout records.
 
-**Audit logging** -- Every order creation, status change, and driver assignment writes to the `audit_logs` table with actor type/ID, before/after state diff, IP address, and user agent. See `backend/src/shared/audit.ts`.
+**Matching.** [driver-matching.ts](./backend/src/routes/orders/driver-matching.ts) assigns the highest score: `100 − 10 × distanceKm + 5 × rating + min(totalDeliveries / 10, 20)`. There are no percentage weights, active-order penalty, earnings goal, batching, or offer timeout. It updates order assignment and driver availability independently, without rechecking order status or taking an exclusive claim.
 
-**Health check endpoints** -- Three tiers: `/health/live` (process running), `/health/ready` (Postgres + Redis connected), `/health` (comprehensive with latency measurements, memory usage, Kafka status). See `backend/src/index.ts`.
+The installed node-redis 4.7.1 / client 1.6.1 `geoSearch` emits member IDs; its options transformer ignores `WITHDIST`. This caller casts results to `{member, distance}` objects anyway. Nonempty replies therefore produce an invalid driver ID and normally trigger the SQL fallback; an empty reply simply returns no candidates. The distance-returning API is separate (`geoSearchWith`). The [Redis command reference](https://redis.io/docs/latest/commands/geosearch/) describes how `WITHDIST` changes the wire reply, but passing an unsupported JavaScript option does not send it. Independently, limiting to 20 geo members before filtering availability can miss eligible drivers outside that candidate window.
 
-**Kafka event streaming** -- Three topics (`order-events`, `location-updates`, `dispatch-events`) with KafkaJS producer. Kafka initialization is non-blocking; if Kafka is unavailable, events are skipped with warnings but order flow continues. See `backend/src/shared/kafka.ts`.
+**Location and ETA.** The 300 s hash TTL does not remove members from `driver_locations`; neither matching path rejects old SQL/Redis coordinates. No timestamp/sequence validation prevents an older request overwriting a newer point. GPS completion can still send after the client stops tracking. The fallback scans all active/available SQL drivers. [geo.ts](./backend/src/utils/geo.ts) uses speeds of 25/15/20/5 km/h for car/bike/scooter/walk, weekday rush/lunch multipliers and a weekend multiplier, all based on server-local time. Matching and dedicated pickup omit vehicle type and default to car. Starting preparation resets the prep reference to `preparing_at`; post-pickup ETA still uses the full restaurant-to-customer leg and all five buffer minutes. Location updates and order reads do not refresh ETA. Pickup saves a new estimate after reading its response object, so the nested order may still contain the previous estimate.
 
-**WebSocket real-time updates** -- Channel-based pub/sub with subscribe/unsubscribe/ping messages. Order status changes, driver location updates, and new order notifications broadcast to relevant channels. See `backend/src/websocket.ts`.
+**Subscriptions and recovery.** [websocket.ts](./backend/src/websocket.ts) keeps an unauthenticated map of channels to sockets, accepts arbitrary subscriptions, and sends participant details without membership checks. There is no cross-instance bus, replay, per-socket output bound, or server heartbeat. Generic status/pickup/delivery events reach order/customer/restaurant channels, but not the driver-dashboard channel. The browser [useWebSocket hook](./frontend/src/hooks/useWebSocket.ts) depends on array identity while callers pass new arrays each render; cleanup closes a socket whose `onclose` schedules an uncancelled three-second reconnect. This can churn/leak connections across renders and navigation. No reconnect snapshot restores missed orders.
 
-**Redis GEOSEARCH for driver matching** -- Drivers' GPS positions stored with GEOADD, queried with GEOSEARCH for nearest-driver matching. Falls back to PostgreSQL with Haversine distance calculation if Redis is unavailable. See `backend/src/routes/orders/driver-matching.ts`.
+**Frontend state and contracts.** React route components fetch directly into local state; only auth/cart use persisted Zustand stores. `fetchUser` exists but is not called at startup, so cached identity can outlive the session. Cart/address data persists across logout; merely opening another restaurant replaces the cart restaurant and clears items. There is no quote reconciliation or ambiguous-checkout recovery. The owner toggle sends snake_case to a camelCase API; driver stats have the reverse mismatch. The restaurant dashboard ignores the successful transition response and waits for a socket event. Order-detail events can replace a driver-expanded order with a driver-endpoint response that omits that expansion. Fetches have no abort/generation guard, and connection status/data age are absent. There is no map, native background tracker, audio alert workflow, list virtualization, offline command queue, or user-facing menu editor.
 
-**Multi-factor ETA calculation** -- Haversine distance, traffic-adjusted route times (rush hour 1.5x, lunch 1.3x, weekend 1.1x), restaurant prep time, and handoff buffers. Driver travel and prep time run in parallel via `max()`. Recalculated at every status transition. See `backend/src/utils/geo.ts`.
+### Local substitutions, omissions, and verification
 
-**Graceful shutdown** -- SIGTERM handler closes HTTP server, waits for in-flight requests, then closes PostgreSQL pool, Redis connection, and Kafka producer in order. 30-second forced shutdown timeout. See `backend/src/index.ts`.
+The single Express process hosts all API/dispatch/WebSocket logic. PostgreSQL is unsharded; Valkey serves sessions, caches, and current geo data; Kafka is a single optional producer destination. Vite proxies host port 3000. Running the alternate API ports adds independent socket maps, not a functioning shared gateway tier. There is no CDN, API gateway/rate limiter, replicated event pipeline, payment provider, PostGIS, trained ETA model, durable dispatch worker, native driver app, or operational admin console.
 
-### What Was Simplified
+The SQL seed's sample `PREPARING` order uses an incompatible address shape, inconsistent item totals, and a driver still available despite assignment. It is for screenshots, not an integrity fixture. The Playwright smoke file uses an unseeded `alice@example.com` and broad visibility assertions; screenshot configuration uses the correct persona accounts. Backend/frontend builds and a full stack were not run during this documentation review.
 
-| Production | Local Implementation |
-|---|---|
-| Separate microservices (Order, Restaurant, Driver, Delivery, Payment) | Single Express process with route modules |
-| API Gateway with rate limiting and TLS | Direct HTTP to Express |
-| Payment service (Stripe/PayPal integration) | Pricing calculated but no actual payment processing |
-| PostGIS with `GEOGRAPHY` type | Lat/lon stored as DECIMAL columns with Haversine in application code |
-| CDN for images | `image_url` column stores URLs, no actual image hosting |
-| Elasticsearch for restaurant search | PostgreSQL ILIKE queries |
-| Redis Cluster for high availability | Single Redis/Valkey instance |
-| WebSocket gateway cluster with Redis Pub/Sub fan-out | Single WebSocket server in-process |
-| Kafka consumer services (notifications, analytics) | Producer-only; no consumers implemented |
-| OAuth/SSO authentication | Session-based auth with bcrypt passwords |
-| Map integration for driver tracking | Lat/lon coordinates displayed as text |
-| Surge pricing engine | Static delivery fees per restaurant |
-
-### What Was Omitted
-
-- CDN and edge caching
-- Multi-region deployment
-- Kubernetes orchestration
-- Database sharding and read replicas
-- Push notifications (mobile/browser)
-- Route optimization and navigation
-- Order batching for multi-stop deliveries
-- Driver incentive/bonus system
-- Restaurant commission management
-- Refund and dispute resolution
-- ML-based ETA prediction
-- A/B testing infrastructure
-- Fraud detection
+Isolated execution of the actual TypeScript modules with mocked SQL/Redis/transport reproduced cached errors across actors, partial order creation at a closed restaurant, unauthorized completion, assignment of cancelled orders, and assigning the same candidate to two orders. The installed Redis argument transformer and seeded bcrypt password were also checked. These are bounded source checks, not throughput measurements or end-to-end validation. See [README.md](./README.md) for runnable setup and the existing demo constraints.

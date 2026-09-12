@@ -1,494 +1,404 @@
-# System Design: Confluence Wiki (Frontend Focus)
+# Design a team wiki — frontend interview
 
-## 🎯 1. Requirements Clarification
+## 🎯 Frame the problem — 3 minutes
 
-> "I will design the frontend for a Confluence-like wiki platform. The key frontend challenges are: rendering a recursive page tree in the sidebar with drag-and-drop reordering, building a rich text editor with contentEditable and a formatting toolbar, rendering structured macros as interactive React components, displaying version diffs in a side-by-side viewer, and managing complex page state. I will scope out real-time collaborative editing and file attachments."
+> “I would design the experience around three tasks: finding a trustworthy page, editing
+> without losing work, and understanding which revision other people can read. The page
+> tree and toolbar matter, but the hardest frontend problem is keeping those tasks
+> consistent when requests finish late or another author changes the page.”
 
-**Functional Requirements:**
-- Space dashboard showing recent pages and spaces
-- Sidebar page tree with expandable/collapsible nodes and drag-and-drop reordering
-- Page viewer rendering wiki-styled HTML content with macros
-- Rich text editor with formatting toolbar (bold, italic, headings, lists, links, macros)
-- Version history timeline with side-by-side diff viewer
-- Threaded comment section with resolve/unresolve
-- Content approval banner with request/approve/reject actions
-- Full-text search with highlighted result snippets
-- Breadcrumb navigation reflecting page hierarchy
+I would clarify whether we need simultaneous live typing. For this interview, assume
+asynchronous collaboration: people save revisions, leave comments, and review changes.
+We preserve disconnected drafts, but do not promise automatic offline merging.
+Attachments, arbitrary plugins, and live cursor synchronization are outside the first
+version.
 
-**Non-Functional Requirements:**
-- Instant page tree expand/collapse (< 50ms)
-- Editor input latency < 16ms (60fps typing)
-- Smooth diff rendering for pages with 1000+ lines
-- Page tree rendering for spaces with 500+ pages
-- Responsive layout for desktop and tablet viewports
+Spaces provide the main access boundary. Some allow authors to publish directly; others
+require approval of a specific revision. A draft can be saved successfully while readers
+still see an earlier published revision. That distinction should be visible in both the
+data contract and the interface.
 
----
+This is a proposed production frontend. The repository provides useful components and
+API examples, with limitations described at the end. I would not present every proposed
+behavior as already implemented.
 
-## 🧩 2. Component Architecture
+| Discussion | Time |
+|------------|------|
+| Scope and user contract | 3 min |
+| Layout, architecture, and state | 7 min |
+| Deep dive: editing and recovery | 12 min |
+| Deep dive: navigation and identity | 8 min |
+| Deep dive: search and safe rendering | 8 min |
+| History, review, and comments | 4 min |
+| Verification and trade-offs | 3 min |
+| Total | 45 min |
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                      App Shell                           │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │                    Router                          │  │
-│  │  ┌──────────┬────────────┬───────────┬─────────┐  │  │
-│  │  │Dashboard │ Space View │ Page View │ Search  │  │  │
-│  │  │          │            │           │ Results │  │  │
-│  │  └──────────┴────────────┴───────────┴─────────┘  │  │
-│  └───────────────────────────────────────────────────┘  │
-│                                                         │
-│  Layout Components:                                     │
-│  ┌──────────────┐  ┌──────────────────────────────┐    │
-│  │   Sidebar    │  │       Main Content Area       │    │
-│  │  ┌────────┐  │  │  ┌────────────────────────┐  │    │
-│  │  │PageTree│  │  │  │  Breadcrumbs           │  │    │
-│  │  │(recurs)│  │  │  │  PageViewer / Editor   │  │    │
-│  │  │        │  │  │  │  CommentSection        │  │    │
-│  │  │        │  │  │  │  VersionHistory        │  │    │
-│  │  └────────┘  │  │  └────────────────────────┘  │    │
-│  └──────────────┘  └──────────────────────────────┘    │
-│                                                         │
-│  State Layer:                                           │
-│  ┌──────────┐  ┌───────────┐  ┌──────────────┐        │
-│  │AuthStore │  │ SpaceStore│  │  EditorStore  │        │
-│  │(Zustand) │  │ (Zustand) │  │  (Zustand)   │        │
-│  └──────────┘  └───────────┘  └──────────────┘        │
-│                                                         │
-│  Service Layer:                                         │
-│  ┌──────────────┐  ┌────────────────┐                  │
-│  │  API Client  │  │  Search Client │                  │
-│  │  (REST/fetch)│  │  (debounced)   │                  │
-│  └──────────────┘  └────────────────┘                  │
-└─────────────────────────────────────────────────────────┘
-```
+## 🏗️ Layout, architecture, and state — 7 minutes
 
-### State Management
-
-| Store | Update Frequency | Contents |
-|-------|-----------------|----------|
-| **AuthStore** | Rarely (login/logout) | Current user, loading state |
-| **SpaceStore** | On navigation | Current space, page tree, selected page, breadcrumbs |
-| **EditorStore** | On every keystroke | Editor content, dirty flag, format state, macro list |
-
-> "I chose Zustand over Redux because wiki editing state changes on every keystroke. Zustand's selector-based subscriptions mean that typing in the editor only re-renders the editor component, not the sidebar tree or the breadcrumbs. With Redux, achieving this granularity requires careful memoization that is easy to get wrong."
-
----
-
-## 🔧 3. Deep Dive: Rich Text Editor Architecture
-
-> "The editor is the core interactive component. Users expect formatting shortcuts, toolbar buttons, macro insertion, and immediate visual feedback. The fundamental choice is between contentEditable and a structured editor framework like ProseMirror or Tiptap."
-
-### contentEditable Approach
+I would draw one application shell with a space sidebar and a routed content area. The
+content area can show a page, an editor, history, or search results. The reader should
+not download the editor bundle simply to open a short document.
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Formatting Toolbar                              │
-│  [B] [I] [U] [H1] [H2] [H3] [UL] [OL] [Link]  │
-│  [Info] [Warning] [Note] [Code] [TOC]            │
-├─────────────────────────────────────────────────┤
-│                                                  │
-│  contentEditable div                             │
-│  ┌──────────────────────────────────────────┐   │
-│  │ <h1>Page Title</h1>                      │   │
-│  │ <p>Some paragraph text with <b>bold</b>  │   │
-│  │ and <i>italic</i> formatting.</p>         │   │
-│  │                                           │   │
-│  │ <div class="macro macro-info">            │   │
-│  │   ℹ️ This is an info callout              │   │
-│  │ </div>                                    │   │
-│  │                                           │   │
-│  │ <p>More text after the macro.</p>         │   │
-│  └──────────────────────────────────────────┘   │
-│                                                  │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ App shell: account, space, search                    │
+├───────────────────┬──────────────────────────────────┤
+│ Page navigation   │ Reader / editor / history        │
+│ Metadata only     │ Route + revision context         │
+└─────────┬─────────┴─────────────────────┬────────────┘
+          │                               │
+          ▼                               ▼
+┌──────────────────────┐     ┌─────────────────────────┐
+│ Resource cache       │     │ Editor session          │
+│ Server snapshots     │     │ Base + draft + request  │
+└─────────┬────────────┘     └────────────┬────────────┘
+          │                               │
+          └────────────────┬──────────────┘
+                           ▼
+            ┌────────────────────────────┐
+            │ API: pages + search        │
+            │ Permissions / receipts     │
+            └────────────────────────────┘
 ```
 
-### How Formatting Works
+The boxes describe ownership, not a requirement for a different state library in each
+box. React and a small Zustand store are reasonable tools, but one global `currentPage`
+object is insufficient for cached server data, an editable draft, and an in-flight save.
 
-> "When the user clicks the Bold button or presses Ctrl+B, I execute `document.execCommand('bold')` which wraps the current selection in a `<b>` tag. The contentEditable div handles cursor management, text selection, and insertion point tracking natively. The toolbar reads the current selection state to highlight active formats -- if the cursor is inside a `<b>` tag, the Bold button appears pressed."
+| State | Owner | Why it belongs there |
+|-------|-------|----------------------|
+| Space, page ID, view mode, search query | URL/router | Deep links and browser history reproduce the location |
+| Page revisions and navigation metadata | Resource cache keyed by identity | Responses can be reused without replacing unrelated pages |
+| Base revision, draft, selection, undo | Editor session | Typing must survive unrelated fetches and UI renders |
+| Expanded branches and panel state | Local UI state | Presentation preferences do not change page content |
+| Accepted mutation and pending payload | Save coordinator | Resolve retries without confusing them with newer typing |
+| Account and capabilities | Session context | Clear protected resources when identity changes |
 
-**Toolbar state detection flow:**
+A page response carries its stable ID, revision, canonical URL, publication information,
+and permitted actions. Capability flags determine whether to show Edit or Review, while
+the server remains responsible for permission checks. Hiding a button cannot secure the
+API.
 
-```
-User moves cursor or changes selection
-       │
-       ▼
-onSelectionChange event fires
-       │
-       ▼
-queryCommandState('bold')     -> true/false -> highlight B button
-queryCommandState('italic')   -> true/false -> highlight I button
-queryCommandState('underline')-> true/false -> highlight U button
-queryCommandValue('formatBlock') -> 'h1','h2','p' -> highlight heading button
-       │
-       ▼
-Update toolbar UI (active format indicators)
-```
+For an initial product budget, I would aim for a useful reading shell within about two
+seconds on the agreed device/network profile, and visible typing updates within a frame
+during ordinary edits. I would measure large-page typing latency separately from network
+save time. These are proposed targets, not measurements of the demo.
 
-### Trade-off: contentEditable vs ProseMirror/Tiptap
+Loading states are resource-specific. A slow comment request must not turn an already
+readable page into a full-screen spinner. A failed page fetch should show a retry state
+for that page, not the body of a previously opened page under a new title.
+
+Session resolution also has a clear boundary. The shell can load public assets
+immediately, but private content waits for the account context. On logout or account
+change, cancel obsolete work and clear protected caches and drafts according to the
+retention policy.
+
+## 🔧 Deep dive 1: editing without losing work — 12 minutes
+
+### Choose a document model with an explicit edit session
+
+> “I would choose a schema-based editor with its own document and selection state. React
+> owns the surrounding application, while the editor owns the active editing surface.
+> Replacing its HTML every time React renders risks changing the user's selection and
+> undo history.”
+
+The canonical document describes paragraphs, headings, lists, links, and a bounded set
+of macros. The server validates that model and produces safe HTML and searchable text.
+The browser does not submit three unrelated representations and expect them to remain
+consistent forever.
+
+This costs an editor integration and a document schema that must evolve carefully. A
+simple content-editable element is attractive for a small demo, but as formatting,
+paste, undo, and composition support grow, the application starts rebuilding an editor's
+responsibilities piecemeal. I would use a mature editing model once these are real
+product requirements.
+
+The choice is not a claim that a library automatically makes content safe. A link's
+protocol, a macro's attributes, and pasted content still need validation. Schema
+migrations must preserve documents that older clients created, or reject editing with a
+clear upgrade path.
+
+### Separate the last accepted snapshot from current typing
+
+Suppose Alice opens revision 12. The editor stores that base and a mutable draft. A save
+captures an immutable payload and a mutation ID. Alice can keep typing while the request
+is pending, but those later keystrokes are not part of that submitted payload.
+
+When the response confirms revision 13, the application advances the accepted base. It
+clears the dirty indicator only if the current draft still matches what was submitted.
+If Alice typed another paragraph during the request, the screen says those newer edits
+remain unsaved.
+
+| Editor state | Meaning | Useful action |
+|--------------|---------|---------------|
+| Clean | Draft matches the accepted revision | Continue editing |
+| Unsaved | Local changes differ from that revision | Save or preserve a local draft |
+| Saving | One identified payload is awaiting a result | Continue typing; avoid duplicate submission |
+| Outcome unknown | Request failed after it may have committed | Resolve the same mutation before replacing it |
+| Conflict | Another revision superseded the submitted base | Compare and reconcile without discarding text |
+| Access lost | Server no longer permits editing | Preserve permitted recovery options; stop writes |
+
+I would serialize saves within an editor session initially. Autosave, if added,
+coalesces further typing into the next request after the active save resolves. Launching
+overlapping whole-document saves makes ordering harder and usually adds little value for
+a wiki.
+
+A manual Save control remains useful even with autosave. It communicates the boundary
+between work in the browser and work acknowledged by the server. A separate Publish
+action reflects reader visibility; saving a draft should not silently announce
+publication.
+
+### Handle the two-editor case explicitly
+
+Alice and Bob both open revision 12. Bob saves first, producing revision 13. Alice's
+request still names revision 12 as its base. The server returns a conflict instead of
+treating her stale content as a valid replacement for revision 13.
+
+The frontend retains three things: Alice's original base, her draft, and the latest
+server revision. It can explain what changed and offer a comparison. For the first
+release I would let Alice reconcile deliberately rather than automatically merge
+structural changes to rich text.
+
+A text-only merge may look successful while combining incompatible table or macro edits.
+If we later offer automatic merging, it should be based on the document model, preserve
+user intent where defined, and flag unresolved regions. A green “merged” message is a
+correctness claim.
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ contentEditable | Zero dependencies, native browser behavior, small bundle | Limited undo/redo, inconsistent across browsers, unstructured content |
-| ❌ ProseMirror/Tiptap | Structured editing, collaborative-ready, consistent behavior | 50-100KB bundle, significant learning curve, complex state model |
+| ✅ Revision check and explicit conflict | Clear save boundary, protects against stale replacement | Authors sometimes reconcile manually |
+| ❌ Last write wins | Simple request flow | A successful save can silently erase another author's work |
+| ❌ Live collaborative merge initially | Supports simultaneous typing | Requires merge semantics, reconnect handling, and editor integration |
 
-> "I chose contentEditable because this is a wiki editor, not Google Docs. Users write documentation -- headings, paragraphs, lists, and macros. They do not need real-time collaboration, complex table editing, or drag-and-drop content blocks. contentEditable handles these basic formatting needs natively with zero bundle cost. The trade-off is browser inconsistency: Firefox and Chrome handle `execCommand` slightly differently for list nesting and heading insertion. Production Confluence would use Tiptap or ProseMirror to eliminate these inconsistencies and enable collaborative editing, but for the scope of this design, contentEditable is sufficient."
+I would choose explicit conflicts because concurrent live typing is outside our scope.
+If user research shows that teams routinely edit together, the product requirement
+changes, and the additional co-editing machinery becomes justified.
 
-### Macro Insertion in the Editor
+### Recover from uncertain requests and navigation
 
-> "When a user clicks the 'Info' macro button in the toolbar, I insert a styled div at the current cursor position with contentEditable=true on the inner content area. This creates an editable region within the macro container."
+A network timeout does not tell the browser whether the database committed. Retrying the
+exact mutation ID and payload allows the server to return the original result. Creating
+a new ID immediately could turn one user action into two history entries.
 
-```
-User clicks [Info] button
-       │
-       ▼
-Get current cursor position (window.getSelection())
-       │
-       ▼
-Create macro HTML:
-  <div class="macro macro-info" contenteditable="false">
-    <div class="macro-content" contenteditable="true">
-      Type here...
-    </div>
-  </div>
-       │
-       ▼
-Insert at cursor position
-       │
-       ▼
-Focus the inner editable div
-```
+While that outcome is unresolved, preserve the newer local draft separately. It must not
+be substituted into the old mutation's retry. After learning the accepted revision, the
+editor can submit the next draft against the correct base.
 
-> "The outer div has contentEditable=false so users cannot accidentally edit the macro structure. The inner content area has contentEditable=true so they can type within the callout. This nested contentEditable pattern is well-supported across browsers and gives macros a distinct visual boundary."
+Leaving the page needs a policy too. Warn about unsaved edits, offer an explicit
+discard, and save a bounded local recovery copy where the workspace policy permits it.
+Scope that copy to account, space, and page, and expire it; a shared browser must not
+show another account's draft.
 
----
+Local persistence is a recovery aid, not proof of a server save. If browser storage is
+unavailable or full, keep the draft in memory and make the limitation visible. Reopening
+an old local draft still requires checking the current server revision before saving.
 
-## 🔧 4. Deep Dive: Recursive Tree Rendering Performance
+Composition input deserves a direct test. A background page refresh must not replace the
+document while someone is choosing an input-method candidate. Remote changes can be
+announced and reconciled at a controlled boundary instead of resetting the active
+surface.
 
-> "The page tree sidebar must render a hierarchical list of all pages in a space, with expand/collapse behavior, visual nesting indicators, and drag-and-drop reordering. The challenge is performance: a space can have 500+ pages nested 5+ levels deep."
+## 🔧 Deep dive 2: navigation that keeps its identity — 8 minutes
 
-### Recursive PageTree Component
+### Stable IDs, readable URLs, and route ownership
 
-```
-┌────────────────────────┐
-│  Sidebar               │
-│                        │
-│  ▼ Engineering         │  ← expanded (bold = current)
-│    ▼ Backend           │  ← expanded
-│      ● API Design      │  ← current page
-│      ○ Database Guide  │
-│      ○ Auth Patterns   │
-│    ▶ Frontend          │  ← collapsed (children hidden)
-│    ▶ DevOps            │  ← collapsed
-│  ▶ Product             │  ← collapsed
-│  ▶ Design              │  ← collapsed
-│                        │
-└────────────────────────┘
-```
+> “I would treat the page ID as identity and the title-derived slug as a readable hint.
+> Renaming a page should not break bookmarks, search links, or an editor's save
+> response.”
 
-> "The tree component recursively renders itself: each PageTreeNode checks if it has children, and if expanded, maps over its children to render another set of PageTreeNodes. The recursion naturally handles arbitrary nesting depth."
+A route resolves the ID and returns the canonical URL. An old slug can redirect or be
+corrected without selecting another document. Two pages with the same title remain
+distinguishable. This also avoids using a special title such as ‘new’ as an accidental
+substitute for a page identifier.
 
-### Performance Optimization: Lazy Expansion
+The space layout owns the sidebar and an outlet for its child view. The page layout owns
+common page chrome and an outlet where appropriate for editing or history. An end-to-end
+route test should load a direct editor URL; a dashboard test cannot prove nested views
+render.
 
-> "With 500 pages and an average branching factor of 10, expanding the full tree would render 500 React components simultaneously. Instead, I only render children of expanded nodes. A collapsed node with 50 descendants renders as a single component."
+After saving a renamed page, navigation uses the response's canonical URL. It should not
+reconstruct the address from the previous title. If the user has already navigated
+elsewhere, that late response updates the relevant resource cache without dragging them
+back.
 
-```
-Space has 500 pages total
-       │
-Initial render: only root-level pages (typically 5-10)
-       │
-User expands "Engineering" (20 children)
-       │
-Now rendering: 5 root + 20 Engineering children = 25 components
-       │
-User expands "Backend" (8 children)
-       │
-Now rendering: 5 + 20 + 8 = 33 components
-```
+### Load the tree as navigation metadata
 
-> "The expanded/collapsed state is stored in a Set in the SpaceStore. Toggling expansion is O(1) -- add or delete from the Set. The tree data itself comes from the API as a flat list with parent_id references, and I build the tree structure in-memory on the client once when the space loads."
+For a small space, fetching a compact tree can be simplest. For a space with tens of
+thousands of pages, fetch child metadata as branches expand. Nodes need identity, title,
+parent, order, child count, and relevant capabilities—not every page's HTML and revision
+body.
 
-### Building the Tree from Flat Data
+Keep normalized nodes separate from the list of currently visible rows. Expansion
+changes which rows appear without rewriting document content. Preserve expansion by page
+ID when refreshing a branch, and reveal the active page's ancestors when following a
+deep link.
 
-> "The API returns pages as a flat array with parent_id. I transform this into a nested tree structure in a single O(n) pass using a lookup map."
-
-```
-API returns flat list:
-[
-  { id: 1, parent_id: null, title: "Engineering" },
-  { id: 2, parent_id: 1, title: "Backend" },
-  { id: 3, parent_id: 2, title: "API Design" },
-  { id: 4, parent_id: 1, title: "Frontend" },
-]
-
-Build lookup map: { 1: node1, 2: node2, 3: node3, 4: node4 }
-For each node: lookup[parent_id].children.push(node)
-
-Result tree:
-Engineering
-├── Backend
-│   └── API Design
-└── Frontend
-```
-
-> "This O(n) transformation runs once per space load and is cached in the SpaceStore. Subsequent renders simply walk the cached tree. Even with 1,000 pages, the transformation takes under 5ms."
-
-### Drag-and-Drop Reordering
-
-> "Users can drag a page in the sidebar to reorder within its siblings or move to a different parent. I track three pieces of state during a drag operation: the dragged page, the drop target, and the drop position (before, after, or as-child-of the target)."
-
-```
-Drag "API Design" from Backend to Frontend:
-
-Before:                          After:
-Engineering                      Engineering
-├── Backend                      ├── Backend
-│   ├── API Design  ← drag      │   └── Auth Patterns
-│   └── Auth Patterns            └── Frontend
-└── Frontend         ← drop         └── API Design
-```
-
-> "On drop, I send a PUT /pages/:id/move request with the new parent_id and position. The frontend optimistically reorders the tree in the SpaceStore immediately, then rolls back if the API returns an error. The backend wraps the move in a transaction to reorder siblings at both source and destination."
-
----
-
-## 🔧 5. Deep Dive: Real-Time Collaboration Considerations
-
-> "While I am not implementing full real-time collaboration, it is worth discussing how the architecture would evolve to support it, since this is a natural follow-up question in a frontend interview."
-
-### Current Architecture (No Collaboration)
-
-```
-Editor A saves ──▶ PUT /pages/:id ──▶ PostgreSQL
-                                          │
-Editor B loads  ──▶ GET /pages/:id ──▶ (gets latest)
-```
-
-> "Without collaboration, the last writer wins. If Editor A and Editor B both load version 3, edit independently, and save, whichever save arrives last overwrites the other. The version control system preserves both versions, so no data is truly lost, but the second editor does not know their edit conflicted."
-
-### Adding Collaboration: WebSocket + CRDT
-
-```
-Editor A ──▶ WebSocket ──▶ Collaboration Server ──◀── WebSocket ──◀── Editor B
-                                  │
-                           CRDT Document
-                           (shared state)
-                                  │
-                          Periodic persistence
-                                  │
-                            PostgreSQL
-```
-
-> "Real-time collaboration requires replacing contentEditable with a CRDT-backed editor like Yjs + Tiptap. Each keystroke generates a CRDT operation that is broadcast via WebSocket to all other editors. The CRDT guarantees convergence -- all editors see the same document regardless of message ordering. This is a significant architectural change: the editor must switch from storing raw HTML to storing structured operations, and the save model changes from 'save entire document' to 'persist accumulated operations periodically.'"
-
-### Trade-off: contentEditable vs CRDT Editor
+Virtualize the visible rows when their count warrants it. Virtualization reduces mounted
+elements, but does not reduce a giant network payload or make an expensive tree-building
+algorithm free. Measure those costs separately.
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ contentEditable (current) | Zero dependencies, simple save model, native performance | No collaboration, inconsistent cross-browser, last-writer-wins |
-| ❌ Yjs + Tiptap | Real-time collaboration, structured editing, conflict-free | 150KB+ bundle, WebSocket infrastructure, fundamentally different architecture |
+| ✅ Compact metadata with lazy branches for large spaces | Bounded transfer and rendering; supports deep links | Additional loading states and branch invalidation |
+| ❌ Full page bodies in the tree response | Convenient single fetch for a tiny seed | Large payloads, repeated sensitive content, slow navigation |
 
-> "The key insight is that adding collaboration is not incremental -- it requires replacing the entire editor subsystem, adding WebSocket infrastructure, and changing the persistence model. This is why I designed the current system with clean separation between the editor and the data layer. If collaboration becomes a requirement, only the editor component and the save/load API calls need to change; the page tree, macros, comments, and approval workflow remain untouched."
+The trade-off is extra coordination between navigation and the page resource. I accept
+it because readers open many pages but usually inspect only a small part of a large
+hierarchy.
 
----
+### Keep asynchronous work attached to the right route
 
-## 📄 6. Page Viewer and Macro Rendering
+Consider quickly opening page A, then page B. If A's request finishes last, it may
+populate A's cache but must not become B's current view. Every request and mutation
+completion is checked against its captured page and account context.
 
-### Wiki Content Styling
+Abort requests that are no longer useful, but do not rely only on cancellation. A
+response may already be in flight, or cancellation may not stop the server action.
+Identity checks on completion remain necessary.
 
-> "The page viewer renders `content_html` from the API using `dangerouslySetInnerHTML`. The wiki content area has scoped CSS that styles standard HTML elements (headings, paragraphs, lists, tables, links) with Confluence-like typography -- larger heading sizes, comfortable line heights, and proper spacing between elements."
+Moving a page changes tree metadata and breadcrumbs, not its stable address. The server
+validates permission, cycles, and ordering. The client can show a provisional move, but
+it retains the old placement until confirmation and restores it on failure.
 
-### Macro Rendering as React Components
+For the initial interface, a “Move to…” dialog may be easier to make keyboard-accessible
+than drag-and-drop. Dragging can be added as another input method. It should invoke the
+same validated action, rather than becoming a second set of hierarchy rules.
 
-> "Macros stored in `content_json` are rendered as React components. Each macro type has a dedicated component that handles its specific styling and behavior."
+The tree needs visible focus, expand/collapse keyboard behavior, and meaningful
+hierarchy semantics. On smaller screens, the sidebar becomes a dismissible navigation
+panel; a permanently fixed wide sidebar would consume the reading area.
 
-```
-┌──────────────────────────────────────────────┐
-│  MacroRenderer                                │
-│                                               │
-│  ┌──────────────────────────────────────┐    │
-│  │  ℹ️ Info Macro                       │    │
-│  │  ┌──────────────────────────────┐    │    │
-│  │  │ Blue left border, light      │    │    │
-│  │  │ blue background. Used for    │    │    │
-│  │  │ informational callouts.      │    │    │
-│  │  └──────────────────────────────┘    │    │
-│  └──────────────────────────────────────┘    │
-│                                               │
-│  ┌──────────────────────────────────────┐    │
-│  │  ⚠️ Warning Macro                   │    │
-│  │  ┌──────────────────────────────┐    │    │
-│  │  │ Orange left border, light    │    │    │
-│  │  │ yellow background. Used for  │    │    │
-│  │  │ important cautions.          │    │    │
-│  │  └──────────────────────────────┘    │    │
-│  └──────────────────────────────────────┘    │
-│                                               │
-│  ┌──────────────────────────────────────┐    │
-│  │  📑 TOC Macro                        │    │
-│  │  ┌──────────────────────────────┐    │    │
-│  │  │ 1. Introduction              │    │    │
-│  │  │ 2. Getting Started           │    │    │
-│  │  │    2.1 Installation          │    │    │
-│  │  │    2.2 Configuration         │    │    │
-│  │  │ 3. API Reference             │    │    │
-│  │  └──────────────────────────────┘    │    │
-│  └──────────────────────────────────────┘    │
-└──────────────────────────────────────────────┘
-```
+## 🔧 Deep dive 3: useful search without unsafe or misleading results — 8 minutes
 
-> "The TOC macro is generated client-side by scanning the rendered HTML for heading tags. I query the content area DOM for all h1-h6 elements, extract their text and nesting level, and render a clickable table of contents with smooth scroll-to-heading behavior. This means the TOC updates dynamically as the user edits in the editor view."
+### Make query state reproducible
 
----
+The URL stores the query, selected space, and continuation state. Back and forward
+navigation restore those inputs and the appropriate results. A submitted-search
+interaction is a reasonable first version; type-ahead can be added with debouncing when
+it improves the product.
 
-## 📜 7. Version History and Diff Viewer
+Each response belongs to a query identity. If the user submits “deployment” and then
+“incident,” a slow deployment response cannot replace the incident results. Loading can
+retain clearly labeled previous results, but should not imply they answer the current
+query.
 
-### Version Timeline
+Search has at least three outcomes: matching results, a successful empty result, and an
+unavailable or degraded service. A spinner followed by “No results” after an error makes
+people distrust their own knowledge of the wiki.
 
-```
-┌────────────────────────────────────────────┐
-│  Version History                            │
-│                                             │
-│  ● v5 (current)   Alice   2 hours ago      │
-│  │  "Updated API endpoints section"         │
-│  │                                          │
-│  ○ v4             Bob     1 day ago         │
-│  │  "Added authentication details"          │
-│  │                                          │
-│  ○ v3             Alice   3 days ago        │
-│  │  "Restructured page layout"              │
-│  │                                          │
-│  ○ v2             Charlie 1 week ago        │
-│  │  "Initial content draft"                 │
-│  │                                          │
-│  ○ v1             Alice   2 weeks ago       │
-│     "Created page"                          │
-│                                             │
-│  [Compare Selected]  [Restore v4]           │
-└────────────────────────────────────────────┘
-```
+### Be honest about revision and freshness
 
-### Side-by-Side Diff Viewer
+A save acknowledgement updates the editor's page resource immediately. Search is a
+separate derived view and may lag. The user can follow the page's stable link while
+indexing catches up; repeatedly resaving is not a sensible way to refresh search.
 
-> "When comparing two versions, the diff viewer shows them side by side with color-coded changes. The API returns an array of diff segments, each marked as added, removed, or unchanged."
+The server should return safe, authorized result metadata and enough freshness
+information to explain a known delay. The frontend does not promise an exact countdown
+unless the backend actually provides one. During an indexing incident, a concise
+degraded-search message is more useful than a claim that everything is current.
 
-```
-┌─────────────────────────┬─────────────────────────┐
-│  Version 3               │  Version 5               │
-├─────────────────────────┼─────────────────────────┤
-│  # API Design            │  # API Design            │
-│                          │                          │
-│  ## Overview             │  ## Overview             │
-│  ░░░░░░░░░░░░░░░░░░░░░░ │  The API uses REST...   │  ← green (added)
-│  The API follows...      │  The API follows...      │
-│  standard patterns       │  standard patterns       │
-│  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │                          │  ← red (removed)
-│  with rate limiting      │                          │
-│                          │                          │
-│  ## Endpoints            │  ## Endpoints            │
-│  GET /api/users          │  GET /api/v1/users       │  ← yellow (modified)
-└─────────────────────────┴─────────────────────────┘
-```
+A result identifies the page and represented published revision. When opened, the page
+endpoint rechecks current access and publication. If the result became unavailable,
+explain that it changed rather than silently opening another page with a matching slug.
 
-> "I render diffs using a simple mapping: each segment gets a CSS class -- `diff-added` (green background), `diff-removed` (red background), or `diff-unchanged` (no highlight). The two panels scroll in sync using a shared scroll handler that sets scrollTop on both containers simultaneously."
+### Treat snippets as content, not trusted markup
 
----
+> “I would ask the search API for escaped text segments with controlled highlight
+> markers. Search terms should be emphasized, but neither the indexed document nor the
+> highlighter should become an unrestricted HTML source in the browser.”
 
-## 🔍 8. Search Experience
+This is the same content boundary as the reader, expressed through a smaller
+representation. Links and macros in full documents use a validated renderer; snippets
+are text. Arbitrary HTML insertion is convenient but makes every content-producing path
+a potential script injection path.
 
-### Search Results UI
+The server filters current permissions before sending titles, snippets, or sensitive
+counts. Hiding a result in React after receiving it is too late. The client also clears
+protected results when the account changes, while recognizing it cannot make a user
+forget text already displayed.
 
-```
-┌─────────────────────────────────────────────────┐
-│  🔍 [search query                          ] [⏎] │
-│                                                   │
-│  3 results in "Engineering" space                 │
-│                                                   │
-│  📄 API Design Guide                             │
-│     Engineering > Backend > API Design            │
-│     ...the REST API uses **search query** for     │
-│     authentication and...                         │
-│                                                   │
-│  📄 Getting Started                               │
-│     Engineering > Onboarding                      │
-│     ...configure the **search query** in your     │
-│     local environment...                          │
-│                                                   │
-│  📄 Architecture Overview                         │
-│     Engineering > Architecture                    │
-│     ...the **search query** pattern ensures       │
-│     consistent behavior across...                 │
-│                                                   │
-└─────────────────────────────────────────────────┘
-```
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Safe text segments and current authorization | Predictable display and controlled disclosure | More explicit API contract and server work |
+| ❌ Raw highlighted HTML and client filtering | Quick prototype integration | Stored markup can execute; private content already crossed the boundary |
 
-> "Search input is debounced at 300ms to avoid overwhelming the backend with keystroke-by-keystroke queries. The Elasticsearch response includes highlighted snippets with matching terms wrapped in `<em>` tags, which I render with bold styling. Results show the breadcrumb trail so users understand where each page lives in the space hierarchy."
+I would accept a slightly less elaborate snippet rather than relax this boundary. Rich
+page rendering belongs in the page renderer; search should help a user decide which
+authorized page to open.
 
----
+### Bound cost and preserve usability
 
-## 🗂️ 9. State Management Details
+Use short result pages or a continuation cursor, not an unbounded list. The server
+validates query length and limits; the client prevents accidental repeated submission
+but cannot enforce the system's resource budget alone.
 
-### SpaceStore Structure
+If a simpler fallback is available, label its reduced capability. It may use different
+matching or ordering, so do not present its first-page length as the exact number of all
+matches. An unavailable search service can still leave space navigation and known page
+links usable.
 
-> "The SpaceStore manages the most complex state in the application: the page tree, expansion state, and the currently selected page."
+## 🕰️ History, review, and discussion — 4 minutes
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| currentSpace | Space or null | Currently viewed space metadata |
-| pageTree | TreeNode[] | Nested tree built from flat API response |
-| expandedNodes | Set of string | Page IDs of expanded tree nodes |
-| selectedPageId | string or null | Currently viewed page |
-| breadcrumbs | Page[] | Ancestor chain for current page |
-| isTreeLoading | boolean | Loading state for sidebar |
+History initially loads revision metadata, then fetches selected snapshots or a bounded
+diff. A long-lived page should not download its complete content history just to open
+the version list. Label both compared revisions, authors, and timestamps so the user
+understands what is being compared.
 
-### EditorStore Structure
+For rich text, a line diff of serialized HTML is an implementation tool rather than a
+friendly semantic comparison. I would start with readable text/block changes and name
+any formatting detail the comparison omits. Large comparisons can have a separate
+loading state and limit.
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| isEditing | boolean | View mode vs edit mode toggle |
-| content | string | Current HTML content in the editor |
-| isDirty | boolean | Whether unsaved changes exist |
-| activeFormats | Set of string | Currently active text formats at cursor |
-| originalContent | string | Content when edit started (for discard) |
+Restore is a new edit based on an old snapshot, not deletion of later history. The
+confirmation names the source revision and the current revision being replaced. A
+successful response refreshes the page, history, tree title if changed, and publication
+indicators; it does not merely close a dialog.
 
-> "The isDirty flag is checked before navigation and before closing the tab. If the user has unsaved changes, I show a confirmation dialog using the beforeunload event. This prevents accidental data loss during editing."
+Review is tied to a revision. A banner can say “Revision 18 awaiting review; readers see
+revision 16.” If the author saves revision 19, a reviewer looking at 18 must not
+unknowingly publish 19. Cancelled decision prompts submit nothing, and pending controls
+prevent duplicate clicks without pretending to authorize the action.
 
----
+Comments have their own request state. A failure to post retains the comment draft; a
+late reply response cannot append itself to another page's thread. Begin with roots and
+one reply level if that is the intended API contract, and enforce that shape server-side
+too.
 
-## 📱 10. Responsive Layout
+## 🧪 Verification and trade-offs — 3 minutes
 
-| Viewport | Sidebar | Content Area | Editor Toolbar |
-|----------|---------|-------------|----------------|
-| Desktop (1200px+) | 280px fixed sidebar | Fluid main area | Full toolbar with labels |
-| Tablet (768-1199px) | Collapsible overlay | Full width when sidebar closed | Compact icons only |
-| Mobile (< 768px) | Hidden, hamburger toggle | Full width | Scrollable single-row toolbar |
+I would prioritize tests that exercise state boundaries: direct page/editor routes,
+typing while a save completes, two-tab conflicts, timeout after commit, navigation
+during fetch, title changes, access revocation, and composition input. These reveal more
+about a wiki's reliability than checking that a toolbar button exists.
 
-> "The sidebar and content area use a CSS Grid layout with `grid-template-columns: 280px 1fr`. On tablet, the sidebar transitions to an overlay that slides in from the left. On mobile, the sidebar is accessible via a hamburger menu. The page tree is always available regardless of viewport size -- hiding it completely would make navigation impossible in deeply nested spaces."
+Performance checks use a large page, a deeply nested space, and a long history. Measure
+typing latency, navigation payload size, and unnecessary body downloads separately.
+Accessibility checks cover editor focus, tree navigation, error announcements, and
+small-screen navigation.
 
----
+| Decision | Chosen approach | Cost accepted |
+|----------|-----------------|---------------|
+| Editor ownership | Structured edit session separate from server cache | Editor integration and schema evolution |
+| Concurrent saves | Expected revision and preserved conflict draft | Some manual reconciliation |
+| Page identity | Stable ID with readable canonical URL | Resolution and alias handling |
+| Navigation | Metadata first, lazy branches when needed | More branch loading states |
+| Search display | Safe, authorized snippets with explicit status | Tighter API coordination |
+| Publication | Separate saved and published revisions | More than one meaningful version in the UI |
 
-## ♿ 11. Accessibility
+### Relationship to the local project
 
-- **Keyboard navigation:** Arrow keys navigate the page tree (up/down between siblings, right to expand, left to collapse)
-- **ARIA tree role:** The page tree uses `role="tree"` with `role="treeitem"` on each node, `aria-expanded` for collapse state
-- **Editor keyboard shortcuts:** Standard shortcuts (Ctrl+B, Ctrl+I, Ctrl+U) are intercepted and mapped to formatting commands
-- **Focus management:** Entering edit mode focuses the editor; saving returns focus to the page viewer
-- **Color contrast:** Diff viewer uses color plus text markers (+/-) so diffs are readable without color perception
-- **Skip links:** A skip-to-content link bypasses the sidebar for keyboard users
+The local React/Zustand implementation contains a reader, content-editable editor, tree,
+history, comments, and review components. Its generated routes nest page/edit views
+under parents without child outlets, so the normal browser path does not reach those
+components today. Search also builds links using a UUID as a slug.
 
----
+The current editor sends HTML/text and empty structured JSON, has no autosave or draft
+recovery, and can receive stale shared state. Its API lacks expected-version saves and
+space authorization. History uses HTML-line diffs, and templates/TOC behavior is
+incomplete. These are documented teaching gaps, not guarantees established by the
+proposed design. See [architecture.md](./architecture.md#implementation-notes) for the
+source evidence.
 
-## ⚖️ 12. Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Editor approach | contentEditable | ProseMirror/Tiptap | Zero bundle cost, sufficient for wiki editing |
-| Tree rendering | Recursive components | Flat list with indent | Natural nesting, handles arbitrary depth |
-| Tree data structure | Client-side tree build | Server returns nested JSON | Flat data is cheaper to transfer, O(n) transform |
-| Expansion state | In-memory Set | LocalStorage persistence | Simpler, resets on space switch intentionally |
-| Diff rendering | Side-by-side panels | Inline unified diff | Easier to compare visually, Confluence convention |
-| State management | Zustand (3 stores) | Redux | Selector subscriptions prevent editor cascade |
-| Macro rendering | Dual (server HTML + client React) | Server-only | Client rendering enables interactive macros (TOC) |
-| Search debounce | 300ms | No debounce / 100ms | Balances responsiveness with API load |
-| Drag-and-drop | Custom handlers | react-dnd library | Fewer dependencies, tree-specific logic is simpler custom |
-| Routing | TanStack Router | React Router | Type-safe params, space key in URL |
+> “The central frontend contract is that the user can always tell which page they are
+> editing, which work is saved, and which revision readers can see. The component and
+> state choices follow from keeping those three answers reliable.”

@@ -1,390 +1,411 @@
-# Gmail (Email Client) - Backend System Design Answer
+# Gmail: backend system design interview
 
-## 🎯 1. Requirements Clarification
+A proposed 45-minute design for an internal email service. Capacity numbers are
+assumptions for this discussion, not claims about Google's infrastructure or
+measurements of the repository demo.
 
-"Before diving in, let me clarify scope. We are building an email system with thread-based conversations. Key backend challenges I want to focus on: the thread model where each user has independent state, privacy-aware full-text search, and draft conflict detection. I will scope out spam filtering, attachment processing, and POP3/IMAP protocol support."
+## 🎯 Clarify the service and its guarantees — 5 minutes
 
-**Functional:**
-- Send/receive emails with To, CC, BCC recipients
-- Thread-based conversations with reply chains
-- Per-user state: read, starred, archived, trashed, spam
-- Label system: system labels auto-created, custom labels with colors
-- Full-text search with Gmail-style operators (from:, to:, has:attachment, date ranges)
-- Draft auto-save with conflict detection across tabs
-- Contact autocomplete ranked by communication frequency
+> “I would scope this as mail between registered accounts, with conversations, To/CC/BCC, per-user mailbox state, drafts, and search. The interesting backend problem is that content is shared while visibility and organization belong to individual users. I will make those boundaries explicit before choosing databases.”
 
-**Non-Functional:**
+I would leave external SMTP delivery, IMAP/POP3, attachments, mailing-list expansion,
+scheduled sending, and spam classification outside the first version. Those features
+introduce their own delivery, abuse, and storage protocols. A manual Spam folder is
+still useful without claiming that an ML classifier exists.
 
-| Requirement | Target |
-|-------------|--------|
-| Availability | 99.99% uptime |
-| Latency | p99 < 200ms inbox load, p99 < 500ms search |
-| Throughput | 100K emails/second globally |
-| Storage | Petabytes, indefinite retention |
-| Consistency | Strong for send/receive, eventual for search index |
-| Privacy | Users only see emails where they are a participant |
+A message records a fixed sender, body, and audience. A thread groups related
+messages. The two identities are not interchangeable: receiving one message in a
+thread does not entitle a user to every earlier or later message in that conversation.
 
----
+For example, Alice sends to Bob and BCCs Charlie. Charlie can read that message
+without being disclosed to Bob. If Bob replies only to Alice, Charlie must not see the
+reply, its snippet, its sender-derived participant list, or a global count that
+reveals hidden activity.
 
-## 📊 2. Capacity Estimation
+The sender expects one accepted message when retrying the same send operation. Each
+recipient expects one mailbox delivery effect, even when a worker retries. Those are
+distinct invariants. I would not promise one transaction covering every recipient
+across all regions.
 
-"At Gmail scale: 1.8B MAU, 300B emails/day. Average email 75KB text + 500KB attachments. That is roughly 22PB/day storage growth. Search indexes add 30% overhead. For our design, I will focus on the data model and search architecture that enables this scale."
+| Requirement | Contract |
+|-------------|----------|
+| Acceptance | Persist content, intended audience, retry receipt, and delivery work before acknowledgment |
+| Delivery | Retry durably; deduplicate each recipient effect and report progress |
+| Mailbox state | Read, star, archive, labels, and trash are independent for each user |
+| Drafts | Reject stale versions and return enough information to preserve both edits |
+| Search | Return only currently entitled content; distinguish unavailable from no results |
+| Latency/availability | Propose p99 under 200 ms for bounded inbox reads, under 500 ms for search, and 99.99% core availability |
 
-| Metric | Value |
-|--------|-------|
-| Emails sent per second | ~3.5 million |
-| Search queries per second | ~115,000 |
-| Concurrent connections | ~100 million |
-| Thread list reads per second | ~10 million |
+Search may lag accepted mail under normal operation; I would target ten seconds
+initially and alert on backlog age. Recently sent mail should still be visible through
+the authoritative send receipt and mailbox path. Eventual search consistency must not
+be presented as eventual confidentiality.
 
-"The read-to-write ratio is roughly 100:1 -- users check their inbox far more often than they send email. This drives our caching and read-replica strategy."
+## 📊 Estimate the dominant work — 3 minutes
 
----
+Assume ten million daily active users, twenty sends per user per day, and three
+recipients per send. That yields 200 million accepted messages and 600 million
+recipient deliveries daily. The average send rate is about 2,315 per second; a tenfold
+peak is about 23,150 per second.
 
-## 🏗️ 3. High-Level Architecture
+At 10 KB of text per message, bodies add about 2 TB per day before replication and
+indexing. Sender plus recipient mailbox copies create roughly 800 million projection
+records per day. I would measure the distribution of recipient counts and body sizes,
+because a few enormous messages or fan-outs can dominate latency and cost.
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Clients   │────▶│  API Gateway│────▶│  API Servers│
-└─────────────┘     │ (Rate Limit)│     │  (Node.js)  │
-                    └─────────────┘     └──────┬──────┘
-                                               │
-                    ┌──────────────┬────────────┼────────────┐
-                    ▼              ▼            ▼            ▼
-              ┌──────────┐  ┌──────────┐ ┌──────────┐ ┌──────────┐
-              │PostgreSQL│  │  Redis   │ │Elastic-  │ │  Search  │
-              │ (Primary)│  │ (Cache + │ │search    │ │ Indexer  │
-              │          │  │ Sessions)│ │(Search)  │ │ (Worker) │
-              └──────────┘  └──────────┘ └──────────┘ └──────────┘
-```
+A hundred mailbox-page reads per active user gives one billion reads per day, about
+11,575 per second on average. Five searches per user gives fifty million daily
+searches, roughly 580 per second. Peaks and per-user skew determine cache usefulness;
+I would not derive a 97% hit rate from choosing a thirty-second TTL.
 
-"The core insight is separating concerns: PostgreSQL owns the source of truth for emails and state, Elasticsearch handles search with privacy filtering, Redis accelerates read-heavy workloads like inbox listing and unread counts, and a background worker bridges PostgreSQL to Elasticsearch without adding latency to the send path."
+These numbers justify partitioning and independent worker capacity. They do not
+require the first local implementation to deploy a global cluster. I would begin with
+one relational database that expresses the invariants, then preserve the transaction
+boundaries as ownership moves to shards.
 
----
-
-## 💾 4. Data Model
-
-### Thread Model with Per-User State
-
-"The fundamental challenge is that Gmail threads have independent state per user. If Alice and Bob are in the same thread, Alice can mark it read while Bob sees it as unread. Alice can archive it while Bob has it in INBOX."
+## 🏗️ Draw ownership and the asynchronous path — 4 minutes
 
 ```
-┌──────────┐     ┌──────────────────┐     ┌──────────┐
-│ threads  │────▶│thread_user_state │◀────│  users   │
-│          │     │                  │     │          │
-│ id       │     │ thread_id (FK)   │     │ id       │
-│ subject  │     │ user_id (FK)     │     │ username │
-│ snippet  │     │ is_read          │     │ email    │
-│ msg_count│     │ is_starred       │     └──────────┘
-│ last_msg │     │ is_archived      │          │
-└──────────┘     │ is_trashed       │          │
-     │           │ is_spam          │          │
-     │           └──────────────────┘          │
-     ▼                                         ▼
-┌──────────┐     ┌──────────────────┐   ┌──────────┐
-│ messages │────▶│message_recipients│   │  labels  │
-│          │     │                  │   │          │
-│ id       │     │ message_id       │   │ id       │
-│ thread_id│     │ user_id          │   │ user_id  │
-│ sender_id│     │ recipient_type   │   │ name     │
-│ body_text│     │ (to/cc/bcc)      │   │ is_system│
-└──────────┘     └──────────────────┘   └──────────┘
+┌─────────────────────────┐       ┌──────────────────────────────┐
+│ Authenticated mail API  │──────▶│ Message authority + outbox   │
+└─────────────────────────┘       └──────────────┬───────────────┘
+                                                 │
+┌─────────────────────────┐       ┌──────────────▼───────────────┐
+│ Mailbox + search views  │◀──────│ Delivery / indexing workers  │
+└─────────────────────────┘       └──────────────────────────────┘
 ```
 
-### Core Tables
-
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| users | id (UUID PK), username (unique), email (unique), password_hash | email, username | Display name and avatar for thread list rendering |
-| threads | id (UUID PK), subject, snippet, message_count, last_message_at | last_message_at DESC | Snippet is first ~100 chars of latest message body |
-| messages | id (UUID PK), thread_id (FK), sender_id (FK), in_reply_to (FK), body_text, body_html, has_attachments | (thread_id, created_at) | in_reply_to enables reply chain reconstruction |
-| message_recipients | id (UUID PK), message_id (FK), user_id (FK), recipient_type | (user_id, message_id) | recipient_type is constrained to 'to', 'cc', 'bcc' |
-| thread_user_state | id (UUID PK), thread_id (FK), user_id (FK), is_read, is_starred, is_archived, is_trashed, is_spam | (user_id, is_trashed, is_archived) | UNIQUE(thread_id, user_id) -- one row per user per thread |
-| labels | id (UUID PK), user_id (FK), name, color, is_system | UNIQUE(user_id, name) | System labels: INBOX, SENT, TRASH, SPAM, STARRED, DRAFTS, ALL_MAIL, IMPORTANT |
-| thread_labels | id (UUID PK), thread_id (FK), label_id (FK), user_id (FK) | (user_id, thread_id) | UNIQUE(thread_id, label_id, user_id) -- per-user label assignment |
-| drafts | id (UUID PK), user_id (FK), thread_id (FK), subject, body_text, to/cc/bcc_recipients (JSONB), version | (user_id, updated_at DESC) | Version column for optimistic locking |
-| contacts | id (UUID PK), user_id (FK), contact_email, contact_name, frequency, last_contacted_at | (user_id, frequency DESC) | Frequency drives autocomplete ranking |
-| attachments | id (UUID PK), message_id (FK), filename, content_type, size_bytes, storage_key | (message_id) | storage_key references object in blob storage (S3/MinIO) |
-
-"I chose a separate `thread_user_state` table rather than embedding state in the thread. The alternative -- a JSONB column like `{alice: {read: true}}` -- cannot be efficiently indexed. With per-user state in a dedicated table, I can index on `(user_id, is_trashed, is_archived)` for fast inbox queries."
-
-### Label Assignment
-
-"Labels are per-user too. When Bob labels a thread 'Work', Alice does not see that label. The `thread_labels` table has a unique constraint on `(thread_id, label_id, user_id)`, giving each user independent label assignments."
-
----
-
-## 🔌 5. API Design
-
-### Authentication
-
-```
-POST /api/v1/auth/register    → Create account, auto-create system labels
-POST /api/v1/auth/login       → Start session, return user object
-POST /api/v1/auth/logout      → Destroy session
-GET  /api/v1/auth/me          → Return current user from session
-```
-
-### Thread Operations
-
-```
-GET    /api/v1/threads?label=INBOX&page=1    → List threads by label with pagination
-GET    /api/v1/threads/unread-counts         → Unread count per label for sidebar
-GET    /api/v1/threads/:threadId             → Thread detail with all messages, auto-marks read
-PATCH  /api/v1/threads/:threadId/state       → Update read/starred/archived/trashed/spam
-```
-
-### Message Operations
-
-```
-POST   /api/v1/messages/send     → Send new email (creates thread if needed)
-POST   /api/v1/messages/reply    → Reply to existing thread
-```
-
-### Label Operations
-
-```
-GET    /api/v1/labels                     → List all labels for current user
-POST   /api/v1/labels                     → Create custom label with name and color
-PUT    /api/v1/labels/:labelId            → Update label name or color
-DELETE /api/v1/labels/:labelId            → Delete custom label (system labels protected)
-POST   /api/v1/labels/:labelId/assign     → Assign label to thread for current user
-POST   /api/v1/labels/:labelId/remove     → Remove label from thread for current user
-```
-
-### Draft Operations
-
-```
-GET    /api/v1/drafts              → List all drafts for current user
-GET    /api/v1/drafts/:draftId     → Get draft with current version
-POST   /api/v1/drafts              → Create new draft
-PUT    /api/v1/drafts/:draftId     → Update draft (requires version for conflict detection)
-DELETE /api/v1/drafts/:draftId     → Delete draft
-```
-
-### Search and Contacts
-
-```
-GET    /api/v1/search?q=query      → Full-text search with operator parsing
-GET    /api/v1/contacts?q=term     → Contact autocomplete ranked by frequency
-```
-
-"All endpoints require authentication via session cookie except register and login. Rate limits are applied per-user: 50 sends per hour, 60 searches per minute, 1000 general requests per minute."
-
----
-
-## 🔧 6. Deep Dive: Search Architecture
-
-### Privacy-Aware Search with Elasticsearch
-
-"Search in email is uniquely challenging because of privacy. If Alice BCCs Charlie on an email to Bob, Charlie must be able to find this email in search, but Bob must not know Charlie received it."
-
-```
-┌──────────────┐                    ┌──────────────┐
-│  API Server  │──── search ───────▶│Elasticsearch │
-│              │     request        │              │
-│ Always adds: │                    │ Index: emails│
-│ visible_to = │                    │              │
-│ current_user │                    │ visible_to:  │
-└──────────────┘                    │ [sender,     │
-                                    │  to_recips,  │
-       ┌──────────┐                 │  cc_recips,  │
-       │ Indexer  │─── index ──────▶│  bcc_recips] │
-       │ Worker   │    message      │              │
-       └──────────┘                 └──────────────┘
-```
-
-"Each indexed document includes a `visible_to` keyword array with all participant user IDs. The search query always includes a term filter on `visible_to` matching the current user. This way BCC recipients can find the email, but it never leaks to other participants."
-
-### Search Operator Parsing
-
-"I parse Gmail-style operators before constructing the Elasticsearch query:"
-
-| Operator | Example | Elasticsearch Behavior |
-|----------|---------|------------------------|
-| from: | from:alice | Match on sender_name or term filter on sender_email |
-| to: | to:bob | Match on recipient_names or term on recipients |
-| has:attachment | has:attachment | Term filter: has_attachments equals true |
-| before: | before:2024-01-01 | Range filter: created_at less than or equal |
-| after: | after:2024-01-01 | Range filter: created_at greater than or equal |
-| (free text) | project report | Multi-match on subject (boosted 3x) and body_text |
-
-"Operators are extracted via regex parsing. Remaining text after operator extraction becomes the free-text query. Subject is boosted 3x because users typically remember subject lines better than body content."
-
-### Trade-off: Why Not PostgreSQL Full-Text Search?
-
-"PostgreSQL FTS with `tsvector` could handle basic keyword search, but it fails for our privacy requirement. To enforce 'only show results where this user is a participant,' we would need to JOIN with message_recipients on every search query. At 300B emails/day, this JOIN becomes the bottleneck -- the message_recipients table grows at 3-5x the rate of messages (each message has multiple recipients), making it the largest table in the system. Elasticsearch's inverted index with term filtering on `visible_to` handles this in O(1) per document, making it the right choice despite the operational overhead of maintaining a separate search cluster. The trade-off is infrastructure complexity: we need a background indexer, health monitoring for the ES cluster, and we accept 5-10 second search lag for newly sent messages."
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Elasticsearch with visible_to | Privacy at O(1) per doc, rich operators, relevance scoring | Separate infrastructure, search lag |
-| ❌ PostgreSQL FTS | No extra infrastructure, strong consistency | Privacy requires expensive JOINs, limited operators |
-
----
-
-## 🔧 7. Deep Dive: Draft Conflict Detection
-
-"When a user has Gmail open in two tabs and edits the same draft, we need to prevent silent data loss."
-
-### Optimistic Locking Pattern
-
-```
-Tab A loads draft (version=3)        Tab B loads draft (version=3)
-     │                                    │
-     ▼                                    ▼
-Tab A saves: UPDATE ... WHERE ver=3   Tab B saves: UPDATE ... WHERE ver=3
-     │                                    │
-     ▼                                    ▼
-  Success! ver → 4                    0 rows affected!
-                                      → Return 409 Conflict
-                                      → Include current draft state
-```
-
-"I use a `version` column on the drafts table. Every update includes a WHERE clause checking the expected version. If another tab saved first, the version has already incremented, so the conditional UPDATE matches zero rows. The API returns 409 with the current draft state, letting the client show 'This draft was modified elsewhere.'"
-
-### Why Not Pessimistic Locking?
-
-"Drafts auto-save every few seconds. A SELECT FOR UPDATE would hold a row lock for the entire editing session -- potentially hours. With hundreds of millions of concurrent users, this creates massive lock contention and connection exhaustion on the database. Optimistic locking has zero contention in the common case (single tab editing) and handles conflicts gracefully in the rare case. The trade-off is that the client must handle 409 responses, but this is straightforward UI work compared to the operational nightmare of millions of long-held row locks."
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Optimistic locking (version column) | Zero contention normally, simple server logic | Client must handle 409 conflicts |
-| ❌ Pessimistic locking (SELECT FOR UPDATE) | Simpler conflict model | Lock contention on auto-save, connection exhaustion |
-
----
-
-## 🔧 8. Deep Dive: Send Flow Transaction
-
-"Sending an email touches multiple tables atomically:"
-
-```
-BEGIN TRANSACTION
-├── Check idempotency key (prevent duplicate sends)
-├── Look up recipient user IDs by email address
-├── Create thread (or update existing for replies)
-├── INSERT message record
-├── INSERT message_recipients (to, cc, bcc entries)
-├── Add SENT label to sender's thread_labels
-├── For each recipient:
-│   ├── Add INBOX label to recipient's thread_labels
-│   ├── Create/update thread_user_state (is_read = false)
-│   └── Invalidate recipient's cache
-├── Update sender's contacts table (frequency++)
-COMMIT
-```
-
-"The transaction ensures atomicity -- if any step fails, the entire send rolls back. This prevents partial states like 'message exists but no recipients' or 'thread created but no labels assigned.' The idempotency key at the top of the flow prevents duplicate sends from network retries or double-clicks."
-
----
-
-## 🗄️ 9. Caching Strategy
-
-| Data | Cache Key Pattern | TTL | Invalidation Trigger |
-|------|-------------------|-----|----------------------|
-| Thread list | threads:{userId}:{label}:{page} | 30s | On send, receive, state change |
-| Unread counts | unread:{userId} | 30s | On message receive, mark read |
-| Labels | labels:{userId} | 300s | On label create/update/delete |
-| Thread detail | thread:{userId}:{threadId} | 60s | On new message, state change |
-| Search indexer position | search-indexer:last-indexed | None | Updated by worker after each batch |
-
-"I chose short TTLs (30s) for thread lists rather than event-driven invalidation because the complexity of tracking all cache invalidation paths (send, receive, archive, trash, label assign, label remove) across multiple users is not worth the marginal latency improvement. A 30-second TTL means worst case a user sees a stale inbox for half a minute, which is acceptable for email."
-
-> "At scale, cache hit rates above 95% are critical. With 10 million thread list reads per second, even a 1% improvement in cache hit rate removes 100,000 database queries per second. The 30-second TTL gives us roughly 97% hit rate for active users who refresh every few seconds."
-
----
-
-## 📈 10. Scalability Path
-
-### What Breaks First
-
-"The first bottleneck is the thread_user_state table. Every inbox load queries it, every state change writes to it, and it grows proportionally to users multiplied by threads. At 1.8B users with an average of 10,000 threads each, this table has 18 trillion rows."
-
-### Database Sharding
-
-"I would shard by user_id hash. All of a user's data (thread_user_state, thread_labels, drafts, contacts) is accessed with user_id, making it a natural partition key. Cross-shard queries only happen for thread participant lookups during send, which is low-frequency compared to reads."
-
-### Read Replicas
-
-"Thread list queries and unread counts are the highest-volume reads. These can be served from read replicas with a few seconds of replication lag, which is acceptable for inbox display. Writes (send, state changes) always go to the primary."
-
-### Search Index Partitioning
-
-"Elasticsearch indices partitioned by time (monthly) with user_id routing. Recent months on hot nodes (SSD), older months on warm nodes (HDD). This optimizes the 80/20 pattern where most searches target recent emails."
-
-### Archive Strategy
-
-"Threads older than two years move to cold storage. The thread metadata stays in PostgreSQL (for label queries), but message bodies move to blob storage with an on-demand fetch pattern. This keeps the hot dataset manageable."
-
----
-
-## 🛡️ 11. Failure Handling
-
-### Circuit Breakers
-
-"I apply circuit breakers (Opossum pattern) to Elasticsearch calls. When search fails more than 50% of requests in a 30-second window, the circuit opens and search returns empty results with a user-facing message rather than timing out. The circuit enters half-open state after 30 seconds, allowing a test request through. If it succeeds, the circuit closes and normal search resumes."
-
-> "The key insight is that Elasticsearch being down should not prevent users from sending and receiving email. Search is a degraded-but-functional experience, not a hard dependency."
-
-### Retry Strategy
-
-"Database connections use automatic reconnection via the PostgreSQL connection pool. Redis uses exponential backoff starting at 100ms with a 3-second cap. The search indexer worker continues polling on error -- it logs failures and retries on the next cycle. Since the indexer only advances its checkpoint after successful indexing, no messages are ever lost."
-
-### Graceful Degradation
-
-| Component Down | Impact | Mitigation |
-|----------------|--------|------------|
-| Elasticsearch | Search returns empty | Send/receive still works, circuit breaker prevents timeouts |
-| Redis | Sessions fail, cache misses | Users re-login, all reads go to database |
-| Search indexer | New emails not searchable | Backlog clears automatically when indexer recovers |
-| Read replica | Slight latency increase | Reads fall back to primary |
-
----
-
-## 🔍 12. Observability
-
-"I expose Prometheus metrics at a /metrics endpoint for scraping:"
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| http_request_duration_seconds | Histogram | Latency percentiles per endpoint |
-| emails_sent_total | Counter | Send volume for capacity planning |
-| search_queries_total | Counter | Search volume and error rates |
-| search_duration_seconds | Histogram | Search latency separate from general HTTP |
-| draft_conflicts_total | Counter | Frequency of 409 conflicts |
-| indexed_messages_total | Counter | Indexer throughput |
-| circuit_breaker_state | Gauge | 0=closed, 1=open, 2=half-open |
-| cache_hit_ratio | Gauge | Cache effectiveness per key pattern |
-| rate_limit_hits_total | Counter | Rate limit violations by endpoint |
-
-"Structured JSON logging via Pino includes request IDs for distributed tracing, user context for debugging, and query timing to detect slow queries above one second. Health endpoints at /api/health provide liveness checks and detailed dependency status for orchestration."
-
----
-
-## 🔒 13. Security Considerations
-
-"Session-based authentication with Redis-backed store provides immediate revocability -- if a session is compromised, deleting the Redis key instantly invalidates it. Passwords use bcrypt with 12 salt rounds."
-
-"Rate limiting is applied per-user via Redis: 5 login attempts per minute (brute-force prevention), 50 sends per hour (spam prevention), 60 searches per minute (abuse prevention). The rate limiter uses a sliding window algorithm stored in Redis for consistency across multiple API server instances."
-
-"All database queries use parameterized queries to prevent SQL injection. Input validation enforces length limits on usernames, password complexity requirements, and required fields. CORS is restricted to the frontend origin, and cookies use HTTP-only with SameSite=lax to prevent CSRF."
-
-> "BCC privacy is enforced at two levels: the API never returns BCC recipients in thread detail responses, and the search index includes BCC recipients in visible_to without exposing the recipient type. This defense-in-depth approach means even if one layer has a bug, the other still protects privacy."
-
----
-
-## ⚖️ 14. Trade-offs Summary
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Per-user state table | Clean indexes, efficient queries | More JOINs per request |
-| ❌ JSONB state column | Simpler schema | Cannot index efficiently |
-| ✅ ES with visible_to | Privacy at O(1) per doc | Separate infrastructure |
-| ❌ PostgreSQL FTS | No extra infrastructure | Privacy requires expensive JOINs |
-| ✅ Optimistic locking | Zero contention normally | Client must handle 409 |
-| ❌ Pessimistic locking | Simple logic | Lock contention on auto-save |
-| ✅ Background indexer | No send latency hit | Search lags 5-10 seconds |
-| ❌ Inline indexing | Instant search availability | Adds 50-100ms to send latency |
-| ✅ Short TTL caching | Simple invalidation | 30s staleness window |
-| ❌ Event-driven invalidation | Instant freshness | Complex invalidation graph |
-| ✅ User_id sharding | Natural partition key | Cross-shard sends |
-| ❌ Thread_id sharding | Co-locates thread data | Scatters user data across shards |
+The API establishes account identity and routes requests to the correct authority.
+Message acceptance stores immutable content, audience, and a durable receipt together.
+Mailbox services own each user's visible conversation projection, state, drafts, and
+contacts. Workers deliver accepted messages and publish search changes.
+
+Redis is useful for sessions, limits, and bounded mailbox caches, but durable delivery
+work does not live only in an expiring cache. Elasticsearch is a projection with its
+own availability budget. Its outage should not make an accepted message disappear or
+force the sender to submit again.
+
+At the initial scale, message and mailbox tables can share a PostgreSQL database. At
+larger scale, assign the acceptance authority by sender and mailbox ownership by user.
+The acceptance transaction remains local to its authority; recipient delivery becomes
+asynchronous and independently recoverable.
+
+I would keep drafts and the sender's acceptance records colocated so finalizing a
+draft and accepting its frozen revision can use one local transaction. Recipient
+mailbox updates are deliberately outside that transaction. A location directory allows
+user partitions to move without changing every public identifier.
+
+## 💾 Data and API contracts — 5 minutes
+
+| Record | Important key or relationship | Why it exists |
+|--------|-------------------------------|---------------|
+| Message | Stable ID; sender, immutable body, thread ID, optional reply parent | Canonical accepted content |
+| Audience | Message ID + recipient ID; To/CC/BCC role and entitlement | Message-specific visibility |
+| Send receipt | Sender ID + operation key; digest and message ID | Safe replay and uncertain-outcome lookup |
+| Mailbox message | User ID + message ID; unique delivery ID and mailbox sequence | One recipient effect per message |
+| Mailbox conversation | User ID + thread ID; visible summary, state version, read watermark | User-oriented listing and state updates |
+| Labels and assignments | Owner ID in label and assignment keys | Independent filing with enforceable ownership |
+| Draft | Owner, ID, version, content, active/sent/deleted state | Conflict-aware editing and final send boundary |
+| Outbox / consumer receipt | Durable event ID and entity version | Recover asynchronous work across crashes |
+
+A conversation's visible snippet, count, and last activity are derived from that
+user's entitled messages. Storing a global latest snippet beside per-user read flags
+is insufficient when participants differ between messages. The projection may
+duplicate small metadata, while immutable bodies remain shared.
+
+Separate mailbox rows also distribute updates and fit queries ordered by user
+activity. A JSONB aggregate can be indexed, so I would not dismiss it as unqueryable.
+The concern is that a large object containing every participant's state creates a
+shared row hotspot and does not naturally colocate all of one user's mailbox data.
+
+I would show a small API surface rather than every CRUD endpoint:
+
+| Method | Proposed endpoint | Main contract |
+|--------|-------------------|---------------|
+| POST | `/messages` | Accept a frozen send with operation key and digest |
+| GET | `/send-operations/:key` | Resolve accepted, pending, or failed outcome for this sender |
+| GET | `/mailbox/threads` | Bounded page of viewer-specific summaries |
+| GET | `/threads/:id/messages` | Bounded authorized message page and visible sequence |
+| PATCH | `/mailbox/threads/:id` | Desired state with expected mailbox-item version |
+| PUT | `/drafts/:id` | Conditional save with save operation ID |
+| GET | `/search` | Validated query, bounded cursor, explicit availability state |
+
+A missing or unauthorized resource returns an appropriate opaque failure; the API must
+not disclose another user's subject while explaining why access failed. Structured
+conflicts return the caller's current authorized state. Pagination cursors bind to
+account and query context and do not grant access on their own.
+
+## 🔧 Deep dive 1: accept once and deliver reliably — 10 minutes
+
+### Define the exact commit point
+
+> “I would call a message accepted when the service can recover it and its delivery work after a crash. Acceptance is a durable fact, not evidence that every recipient's search index already contains it.”
+
+The request first validates body bytes, recipient count, address types, and reply
+context. Resolve every internal recipient to a stable account ID. Unknown addresses
+reject the operation before acceptance rather than silently dropping part of the
+audience. Deduplicate delivery identities while preserving the intended visible
+recipient roles.
+
+For a reply, check that the sender can read the referenced message, that the parent
+belongs to the stated thread, and that the request does not grant implicit access to
+unrelated history. A public thread identifier is not permission to append into it.
+Recipients get only the newly addressed message and deliberately quoted content.
+
+The acceptance transaction claims a unique receipt scoped to sender and operation key.
+Its digest covers the frozen body, recipient roles, subject, reply context, and draft
+revision if present. If that key already committed with the same digest, return the
+original message ID. If the digest differs, reject the conflict.
+
+The claim must serialize concurrent duplicates before their effects occur. A
+preliminary lookup followed by an unconstrained insert is racy. Inserting a receipt
+after repeating the send, then ignoring its uniqueness conflict, is also insufficient:
+both messages could already exist.
+
+The same transaction stores immutable message content, audience records, and outbox
+work. It also finalizes the sender's draft if this is a draft send. No Redis
+invalidation or Elasticsearch request is required to decide whether that SQL
+transaction commits.
+
+### Work through the crash cases
+
+If the process crashes before commit, no accepted message exists and the same
+operation may be retried. If it crashes after commit but before responding, the
+durable receipt resolves the retry. If the queue is unavailable, the outbox remains
+pending in the database until a publisher can deliver it.
+
+The outbox publisher uses short leases or claimed rows to coordinate workers. It marks
+completion only after the downstream acceptance condition is met. A crash can cause
+publication again, which is why every consumer treats delivery as at least once.
+
+A mailbox consumer writes the user's message entry, visible conversation update,
+unread effect, and processed-event receipt together. The unique user/message delivery
+identity prevents duplicate unread increments. A crash after that commit but before
+queue acknowledgment causes a replay that returns the committed effect.
+
+There is no dependency on a global maximum creation timestamp. A transaction can
+commit later than another transaction that started after it. Pending outbox rows
+remain discoverable regardless of that timing. A monotonically allocated ID alone is
+not necessarily commit order either.
+
+### Separate delivery failure from acceptance failure
+
+Most recipients may be delivered while one mailbox partition is unavailable. Keep the
+send accepted, show delayed delivery status for the remaining recipient, and retry
+with backoff and a budget. Do not roll back recipients who already received the
+message or tell the sender to submit a second independent send.
+
+Permanent delivery failures need a visible status and an auditable reason. Reaching a
+dead-letter queue is not successful delivery. Operators need replay tooling that
+retains the original message and recipient identities, and support staff should not
+need access to message bodies to inspect queue health.
+
+| Approach | Why choose or reject it here | Cost |
+|----------|-----------------------------|------|
+| ✅ Durable acceptance followed by idempotent recipient delivery | A failed recipient shard does not block every sender transaction | Delivery status, outbox workers, deduplication, and repair |
+| ❌ Global transaction across all recipient shards | Gives one broad atomic boundary | Couples latency and availability to every participant and region |
+| ❌ Fire-and-forget publish after committing the message | Small happy path | A crash between commit and publication loses delivery work |
+
+> “I give up simultaneous visibility in every mailbox. In exchange, acceptance remains durable and recoverable during partial failures. The product must expose delivery progress honestly for that trade to work.”
+
+For a small single-database demo, one transaction across all recipients is reasonable.
+The scale transition is what changes the contract. I would not continue calling
+multi-shard delivery strongly atomic merely because the earlier local implementation
+used BEGIN and COMMIT.
+
+### Keep the work bounded
+
+Cap recipients and body bytes before starting the transaction. Contacts can be
+projected later because a missed frequency update should not abort message acceptance.
+Large fan-out belongs in a separate, rate-limited product path rather than one giant
+interactive transaction.
+
+Track accepted operations, outstanding recipient count, oldest delivery age, and
+replay frequency. Per-user quotas should reflect recipients or bytes where those drive
+cost; fifty requests per hour does not constrain a request containing a million
+recipients.
+
+## 🔧 Deep dive 2: search and conversation privacy — 8 minutes
+
+### Entitlement applies to every representation
+
+The first access check is at message level. Mailbox summaries, detail pages, search
+hits, counts, and snippets must all be based on entitled messages. A global
+thread-state row cannot authorize unseen history, and a cached summary can disclose
+content even before someone opens a message.
+
+For BCC, hiding a field from the JSON response is only part of the problem. If the
+hidden recipient's name remains searchable, Bob can query that name and infer that
+Charlie received the message. Therefore searchable fields themselves must reflect the
+viewer's visibility.
+
+I would use per-mailbox search documents keyed by user and message. Public
+sender/To/CC fields appear where appropriate; the sender's projection can additionally
+include their BCC envelope. A BCC recipient can see their own delivery context,
+without learning the other hidden recipients.
+
+This duplicates searchable text for multiple mailboxes, which increases index cost. It
+also makes user-based routing and per-user deletion straightforward. A shared document
+with a `visible_to` array is a valid smaller design if its searchable fields are
+common to all viewers, but it cannot simultaneously express every viewer's distinct
+envelope without additional logic.
+
+### Choose the search engine for its workload
+
+PostgreSQL full-text search can enforce permission predicates, including joins or
+denormalized mailbox fields. I would start there if query quality and measured load
+fit. Elasticsearch becomes worthwhile for independent search scaling, relevance
+tuning, and a large historical corpus, with the operational cost of a separate
+projection.
+
+Neither an inverted index nor an array term filter provides a universal constant-time
+privacy guarantee. Query cost depends on postings, filters, distribution, and result
+size. I would measure realistic mailboxes and operator combinations rather than claim
+that SQL cannot perform private search.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Per-mailbox index at the stated scale | Audience-specific fields and natural mailbox routing | More documents, indexing work, and storage |
+| ❌ One fully shared searchable recipient envelope | Fewer indexed copies | Hidden-recipient queries can reveal information |
+| ❌ Synchronous indexing in the send transaction | Simple apparent freshness | Search outage becomes a send dependency without cross-store atomicity |
+
+### Build a repairable projection
+
+A committed mailbox change emits durable indexing work. The worker publishes an entity
+version and acknowledges only after the search store accepts the upsert or tombstone.
+Duplicate publication is harmless; an older retry must not overwrite a newer deletion
+or state change.
+
+A failing item should remain retryable without blocking unrelated mail forever. Use
+bounded attempts, a durable failure record, alerts, and controlled replay. Deletion
+tombstones or equivalent version history must survive longer than any stale replay
+that could resurrect the document.
+
+For rebuilding, create a new index generation from a consistent source snapshot and
+apply changes that occur during the rebuild. Switch reads only after verification and
+catch-up. Keep the previous generation long enough for a controlled rollback, while
+preserving current access checks. Simply deleting an index while retaining the old
+checkpoint cannot reconstruct history.
+
+Timestamp polling is tempting because it is easy to explain. It can fail at equal
+timestamps, precision conversions, and late commits behind the watermark. Adding an ID
+to the cursor fixes deterministic ties but not a transaction committing after the
+scanner has passed its timestamp. A durable pending-work record addresses the actual
+recovery problem.
+
+### Return only currently authorized results
+
+Query the mailbox index for candidate IDs, then hydrate through the current
+authoritative entitlement and deletion state before producing content. Bound overfetch
+so a page with many removed candidates does not trigger an unbounded database scan.
+Return a continuation or partial page honestly when the budget is exhausted.
+
+A point-in-time search view can stabilize ordering across pages. It does not preserve
+permissions: an entry deleted or revoked after the snapshot must still be removed
+during hydration. Do not expose an exact candidate total if that total includes
+content the user may no longer access.
+
+Return snippets as text plus validated highlight ranges, or use a rigorously defined
+encoding/sanitization contract. An email body is untrusted even when it reaches the UI
+through Elasticsearch. A raw fallback substring can be as unsafe as a highlighted
+fragment.
+
+Search errors return an explicit unavailable or degraded state. The browser can still
+navigate recent authoritative mailbox pages. Returning empty success for an outage
+creates the false impression that mail has been lost, and makes search reliability
+hard to measure.
+
+## 🔧 Deep dive 3: drafts and mailbox concurrency — 6 minutes
+
+### A version check is necessary but not the whole editor
+
+The draft update is scoped to owner and expected version, and increments the version
+in the same atomic operation. If two tabs save from version 4, only one conditional
+update succeeds. The other receives a conflict and the current authorized draft.
+
+There is still ordinary short-lived database locking during updates. Optimistic
+concurrency does not mean zero contention. Its advantage is that the application does
+not reserve an editing session for the duration of a human's work; it detects stale
+state when saving.
+
+The client retains its local text on conflict and offers comparison or a separate
+copy. Returning the server draft is useful only if the browser preserves the failed
+editor's work. Automatically replacing the editor and announcing a conflict would
+detect the data loss while still causing it.
+
+A save operation ID handles a response lost after the conditional update committed.
+Otherwise the client retries the old version and mistakes its own successful save for
+another tab's conflict. Draft creation also needs a stable identity if autosave can
+retry creation.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Expected versions plus durable save receipts | Detect cross-tab conflict and resolve lost acknowledgments | Receipt retention and client conflict handling |
+| ❌ Last-write-wins saves | Simple update path | Delayed requests can overwrite newer text |
+| ❌ Exclusive editing lease | Reduces simultaneous writers | Takeover rules and fencing after expiry |
+
+### Finalize sending with the draft
+
+When sending, the client selects a frozen revision. The sender authority verifies that
+draft version, writes the accepted message and send receipt, and transitions the draft
+to sent in one transaction. A concurrent save or second send fails its expected-state
+condition or replays the same accepted operation.
+
+If a save wins first, the user must review or explicitly send that newer revision. If
+send wins first, a late save cannot turn the draft active again. Discard uses a
+versioned terminal transition too, so a stale editor cannot erase or revive another
+tab's state silently.
+
+The draft owner and sender authority are colocated for this transaction. If the system
+later separates them, it needs another explicit durable coordination protocol. Moving
+tables to separate services does not preserve the old transaction for free.
+
+### Read and archive semantics
+
+For mailbox read state, acknowledge the highest visible message sequence the reader
+actually observed. A new delivery with a higher sequence remains unread even when an
+older read acknowledgment arrives late. A late boolean “read=true” cannot express that
+distinction.
+
+Archive removes Inbox membership for that user's conversation. A subsequent delivery
+follows a defined policy for returning archived conversations to Inbox; Trash and Spam
+rules may differ. State transitions and summary/count updates share a mailbox version
+so caches and clients can reconcile them.
+
+Per-user label assignments must validate both label ownership and conversation
+visibility. Composite constraints or equivalent transactional checks should prevent
+attaching another user's label. Having a user_id column alongside two foreign keys is
+not itself proof that all three belong together.
+
+## 🛡️ Failure handling, operations, and validation — 4 minutes
+
+Sessions remain revocable server-side, with secure cookies, session rotation on
+authentication, explicit request-origin/CSRF protection, and bounded login attempts.
+Redis failure must fail closed for authentication. Optional mailbox caches can bypass
+Redis under a bounded database fallback, but only if the implementation actually
+isolates cache errors from required session work.
+
+A search circuit breaker and deadline can bound repeated dependency failures, provided
+calls really pass through them and timeouts cancel or bound underlying work. A
+declared helper does not protect anything on its own. Preserve typed dependency errors
+until the API decides how to represent degraded behavior.
+
+Liveness checks the process independently of Redis sessions and request quotas.
+Readiness checks dependencies needed for the traffic being routed, while search/worker
+freshness has separate probes. Graceful shutdown stops new work, releases or finishes
+leases, drains requests to a deadline, and then closes pools.
+
+I would test response loss after acceptance, worker crash after mailbox commit,
+repeated recipient events, a BCC recipient excluded from a later reply, stale indexing
+after deletion, two saves from one version, and send racing with save. Those tests
+assess the invariants directly rather than only checking HTTP status on mocked routes.
+
+The local repository uses one SQL send transaction, cookie sessions, Redis request
+counters, a working draft version condition, and a timestamp-polling indexer. It lacks
+send receipts and outbox delivery; archive/cache semantics, reply access,
+message-level visibility, and checkpoint precision have gaps. Search errors become
+empty success, and the circuit-breaker helper is unused.
+[architecture.md](./architecture.md) records those source findings separately from
+this proposal.
+
+> “The design's central boundary is durable acceptance followed by recoverable projections. Message-specific entitlement protects privacy, mailbox ownership keeps state independent, and conditional draft revisions protect authored work. I would validate those boundaries before claiming scale from the number of service instances.”

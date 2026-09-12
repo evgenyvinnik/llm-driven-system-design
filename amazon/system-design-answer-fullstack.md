@@ -1,448 +1,415 @@
-# Amazon E-Commerce Platform - System Design Answer (Fullstack Focus)
+# Amazon — Full-Stack System Design
 
-*45-minute system design interview format - Fullstack Engineer Position*
+*A 45-minute discussion of discovery, stock allocation and a purchase that survives retries.*
 
-## Opening Statement
+This answer proposes a production storefront. The local project has a simpler React/
+Express implementation and simulated payments; [architecture.md](./architecture.md)
+separates its actual behavior from the guarantees discussed here.
 
-"Today I'll design an e-commerce platform like Amazon, focusing on end-to-end flows that span frontend and backend. The key technical challenges are building a responsive shopping experience with real-time inventory feedback, implementing a robust checkout flow that prevents overselling while maintaining excellent UX, and creating a search experience with faceted filtering that stays fast at scale. I'll walk through how these components integrate across the stack."
+## 📋 Define what the shopper can rely on — 4 minutes
 
----
+> “I would follow one shopper from finding headphones to placing an order. At each
+> step I would ask what the screen is promising and which backend record makes
+> that promise true.”
 
-## Step 1: Requirements Clarification (3 minutes)
+The main journey includes search/category browsing, product details, cart, checkout
+and order status. Reviews and recommendations help discovery. Seller/admin operations
+maintain the catalog and handle order exceptions, with permissions enforced by the API.
 
-### Functional Requirements
+I would clarify stock policy first. In this proposal, adding to cart saves intent;
+a short hold begins at checkout. That means a cart item can become unavailable before
+purchase, and the interface needs to communicate that possibility.
 
-1. **Product Discovery**: Search with faceted filtering, category browsing
-2. **Shopping Cart**: Add/remove items with real-time inventory feedback
-3. **Checkout Flow**: Multi-step process with payment integration
-4. **Order Tracking**: View order history and status updates
-5. **Recommendations**: "Also bought" suggestions on product pages
+If the business instead promises a cart-time hold, we can support it, but it changes
+expiry, renewal and abuse-control requirements. I would not infer that promise from
+the presence of a `reserved` counter in a database.
 
-### Non-Functional Requirements
+Assume one hundred million offers, ten million daily active buyers and one million
+orders/day. Average order creation is about twelve/second; a 1,000/second sale peak
+and 50,000 searches/second are separate planning assumptions.
 
-- **Availability**: 99.99% for browsing and cart operations
-- **Consistency**: Strong consistency for inventory (no overselling)
-- **Latency**: < 100ms for API responses, < 50ms for UI updates
-- **Scale**: 100M products, 1M orders/day, 500K concurrent users
+The primary non-functional requirements are fast discovery, no allocation beyond
+available stock, and a recoverable purchase outcome after a lost response. Proposed
+availability targets are 99.99% for browsing and 99.9% for checkout.
 
-### End-to-End Scale Estimates
+I would exclude a full shipping network, tax engine and new payment gateway from
+this interview. We define their contracts and show where their status enters the
+customer journey. The demo substitutes simple rules and a payment simulation.
 
-| Operation | Volume | E2E Latency Target |
-|-----------|--------|-------------------|
-| Product search | 100K QPS | < 300ms total |
-| Add to cart | 10K QPS | < 200ms total |
-| Checkout | 1K QPS | < 2s total |
-| Page load | 500K concurrent | < 1s TTI |
-
----
-
-## Step 2: High-Level Architecture (7 minutes)
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           FRONTEND LAYER                                 │
-│    React + TanStack Router + Zustand + TanStack Query                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Product Search  │  Product Detail  │  Shopping Cart  │  Checkout Flow  │
-│  - Faceted UI    │  - Image gallery │  - Cart sidebar │  - Multi-step   │
-│  - Virtualized   │  - Recommendations  - Quantity      │  - Payment      │
-│  - Infinite      │  - Reviews       │  - Inventory    │  - Confirmation │
-└────────┬─────────┴────────┬─────────┴────────┬────────┴────────┬────────┘
-         │                  │                  │                 │
-         ▼                  ▼                  ▼                 ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           API GATEWAY                                    │
-│                    Rate Limiting + Auth + CORS                          │
-└────────┬─────────────────┬─────────────────┬────────────────────────────┘
-         │                 │                 │
-         ▼                 ▼                 ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│ Catalog Service │ │  Cart Service   │ │  Order Service  │
-│ - Search API    │ │ - Cart CRUD     │ │ - Checkout      │
-│ - Product API   │ │ - Reservations  │ │ - Idempotency   │
-│ - Recommendations│ │ - Inventory    │ │ - Order history │
-└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-         │                   │                   │
-         ▼                   ▼                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           DATA LAYER                                     │
-├──────────────┬──────────────┬──────────────┬────────────────────────────┤
-│  PostgreSQL  │ Elasticsearch│    Valkey    │          Kafka             │
-│  - Products  │  - Search    │  - Sessions  │  - Order events            │
-│  - Orders    │  - Facets    │  - Cart      │  - Inventory updates       │
-│  - Inventory │              │  - Cache     │  - Recommendations         │
-└──────────────┴──────────────┴──────────────┴────────────────────────────┘
-```
-
-### Why This Architecture?
-
-**Separation of Concerns**: Each service handles one domain, enabling independent scaling and deployment.
-
-**Optimistic UI**: Frontend assumes success and rolls back on failure, providing instant feedback.
-
-**Event-Driven Updates**: Kafka enables async processing (recommendations, notifications) without blocking user flows.
-
----
-
-## Step 3: End-to-End Add to Cart Flow (10 minutes)
-
-This is the most critical user journey, requiring tight frontend-backend coordination.
-
-### Data Flow Diagram
+## 🏗️ Draw a small end-to-end architecture — 5 minutes
 
 ```
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│   Browser    │   │   Cart API   │   │  PostgreSQL  │   │    Valkey    │
-│   (React)    │   │  (Express)   │   │  (Inventory) │   │   (Cache)    │
-└──────┬───────┘   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
-       │                  │                  │                  │
-       │ 1. Click "Add"   │                  │                  │
-       │ ──────────────▶  │                  │                  │
-       │ 2. Optimistic    │                  │                  │
-       │    UI Update     │                  │                  │
-       │ ◀──────────────  │                  │                  │
-       │                  │ 3. BEGIN TRANS   │                  │
-       │                  │ ──────────────▶  │                  │
-       │                  │ 4. SELECT...     │                  │
-       │                  │    FOR UPDATE    │                  │
-       │                  │ ──────────────▶  │                  │
-       │                  │ 5. Check avail   │                  │
-       │                  │ ◀──────────────  │                  │
-       │                  │ 6. UPDATE        │                  │
-       │                  │    reserved +=   │                  │
-       │                  │ ──────────────▶  │                  │
-       │                  │ 7. INSERT cart   │                  │
-       │                  │ ──────────────▶  │                  │
-       │                  │ 8. COMMIT        │                  │
-       │                  │ ◀──────────────  │                  │
-       │                  │                  │ 9. Invalidate    │
-       │                  │                  │    cart cache    │
-       │                  │ ─────────────────────────────────▶  │
-       │ 10. Confirm      │                  │                  │
-       │ ◀──────────────  │                  │                  │
+┌───────────────────────────────────────────────────────────────────┐
+│ Storefront: discovery → product → cart → checkout → order status  │
+│ URL state     public results    private snapshot    attempt ID    │
+└───────────────┬──────────────────────┬────────────────────────────┘
+                │                      │
+        ┌───────▼────────┐     ┌───────▼──────────┐
+        │ Catalog/search │     │ Cart/checkout API │
+        │ Public caching │     │ Quote and recovery│
+        └───────┬────────┘     └───────┬──────────┘
+                ▼                      ▼
+        ┌────────────────┐     ┌──────────────────┐
+        │ Search index   │◀────│ Catalog/stock/   │
+        │ and read cache │     │ order DB + outbox│
+        └────────────────┘     └───────┬──────────┘
+                                        │ Durable jobs/events
+                               ┌────────▼─────────┐
+                               │ Payment worker   │────▶ Provider
+                               │ Index / recs     │
+                               └──────────────────┘
 ```
 
-### Frontend Implementation
+The browser owns interaction state and rendering. The purchase API owns accepted
+quotes, stock allocation and order identity. The search index is a read projection,
+so its price and availability can lag without becoming authoritative for a purchase.
 
-**CartStore (Zustand with persist)**:
-- State: `items[]`, `isLoading`, `error`
-- Methods: `addItem`, `removeItem`, `updateQuantity`, `clearCart`, `getTotal`
+I would begin with a modular backend sharing a transactional database for cart, stock
+and order records. Splitting every noun into a service immediately would create
+cross-service transactions before scale requires them.
 
-**addItem() Flow**:
-1. Store previous items for rollback
-2. Optimistic update: add item immediately with 30-min reservation
-3. POST to `/api/cart/items`
-4. On success: update `reservedUntil` from server response
-5. On failure: rollback to previous items, set error
+An outbox persists follow-up work alongside committed business state. Workers can
+update the search index, compute recommendations and coordinate payment without
+holding inventory row locks during external calls.
 
-**Rollback Pattern**:
-```
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ previousItems │    │   API Call    │    │   Result      │
-│    stored     │──▶ │   attempt     │──▶ │               │
-└───────────────┘    └───────────────┘    └───────────────┘
-                            │                     │
-                            │                     ▼
-                            │              ┌─────────────┐
-                            │              │   Success   │──▶ Update reservedUntil
-                            │              └─────────────┘
-                            │                     │
-                            │              ┌─────────────┐
-                            └─────────────▶│   Failure   │──▶ Restore previousItems
-                                           └─────────────┘
-```
+For public product pages, server rendering and edge caching can improve direct
+navigation and indexability. Private cart/account state loads through a separately
+scoped path and must not enter a shared HTML cache.
 
-### Backend Implementation
+On the client, a query layer manages server results and a small UI store coordinates
+shell state. Local forms retain drafts. Giving each kind of state one owner avoids
+two independently calculated carts or a stale user object deciding authorization.
 
-**POST /items Endpoint**:
-1. Get connection from pool, BEGIN transaction
-2. Lock inventory row with `SELECT ... FOR UPDATE`
-3. Check `available = quantity - reserved`
-4. If insufficient: throw `InsufficientInventoryError`
-5. UPDATE `reserved += quantity`
-6. INSERT/UPSERT cart item with `reserved_until`
-7. COMMIT transaction
-8. Invalidate cart cache in Redis
-9. Return cart item
+## 💾 Define shared contracts before components — 4 minutes
 
-**Error Response**:
-- 409 Conflict: `INSUFFICIENT_INVENTORY` with available count
-- Frontend can show "Only X units available"
+| Concept | Backend record | Frontend meaning |
+|---------|----------------|------------------|
+| Product result | Versioned catalog projection | Discoverable offer with potentially stale price/stock |
+| Cart | Buyer lines and version | Confirmed saved intent plus any pending edits |
+| Quote | Validated items, prices, currency, shipping and tax | Amount and terms the shopper reviews |
+| Reservation | Attempt, warehouse allocation, units, expiry/state | A time-bounded hold only after server acceptance |
+| Checkout attempt | Buyer-scoped key and request fingerprint | Recoverable submission identity |
+| Payment operation | Provider reference and known/unknown state | Pending, action required, confirmed or failed outcome |
+| Order | Item/price snapshots and lifecycle version | Durable history and supported actions |
 
-### Error Handling Across the Stack
+The API returns structured conflicts, not just arbitrary text. A revised quote,
+insufficient stock, expired hold and unresolved provider outcome require different
+screen behavior even if all occur after pressing the same button.
 
-**Frontend handleAddToCart()**:
-- On `InsufficientInventoryError`: toast "Only X available", invalidate product query
-- On `ReservationExpiredError`: toast "Expired, try again"
-- On generic error: toast "Failed, try again"
+| Operation | Contract |
+|-----------|----------|
+| Search | Normalized filters, bounded page and explicit facet semantics |
+| Set cart quantity | Desired quantity plus expected cart version |
+| Obtain checkout quote | Authoritative totals and current availability |
+| Submit attempt | Stable identity tied to the accepted quote and account |
+| Read attempt/order | Recover outcome after reload, timeout or notification |
+| Cancel | Conditional transition with payment/stock compensation progress |
 
----
+A browser TypeScript interface cannot guarantee that the server response has this
+meaning. Both sides need runtime validation and a shared behavioral contract.
+For example, absent search filters must be omitted, not serialized as the word
+“undefined” because an object was cast to a string map.
 
-## Step 4: Search with Faceted Filtering (8 minutes)
+## 🔧 Deep dive 1: Connect the cart to a real stock allocation — 8 minutes
 
-### End-to-End Flow
+### Decision: fast pending feedback, authoritative short checkout holds
 
-```
-User types "wireless headphones"
-        │
-        ▼
-┌──────────────────┐
-│ SearchInput.tsx  │──▶ debounce(300ms) ──▶ URL update
-│ - Controlled     │                       /search?q=wireless+headphones
-│ - Debounced      │
-└──────────────────┘
-        │
-        ▼
-┌──────────────────┐
-│ useSearchQuery   │──▶ GET /api/search?q=...
-│ - Cache 5min     │    TanStack Query
-│ - Stale-while-   │
-│   revalidate     │
-└──────────────────┘
-        │
-        ▼
-┌──────────────────┐
-│ Catalog Service  │──▶ Elasticsearch
-│ - ES query build │    products index
-│ - Aggregations   │
-│ - Circuit breaker│
-└──────────────────┘
-        │
-        ▼
-┌──────────────────┐
-│ SearchResults    │◀── Response:
-│ - Virtualized    │    - products[]
-│ - Facets sidebar │    - facets{}
-│ - Infinite scroll│    - totalCount
-└──────────────────┘
-```
+> “When the shopper clicks Add, I can acknowledge the interaction immediately.
+> I should not say the last pair of headphones is theirs until the stock authority
+> has allocated it. Those are different product states.”
 
-### Frontend: Search Component
+The cart records the selected offer and desired quantity. Mutations return a cart
+version and confirmed snapshot. A local pending quantity can make the UI responsive,
+while the confirmed totals remain tied to what the server accepted.
 
-**SearchPage component**:
-- Uses `useSearchParams` for URL state
-- Extracts: `query`, `category`, `priceMin`, `priceMax`, `brands[]`
-- Uses `useInfiniteQuery` for paginated results
-- `getNextPageParam`: returns page number if `hasMore`
-- `staleTime`: 5 minutes
+At checkout, the server validates the quote and obtains a short allocation, initially
+five minutes subject to product testing. The reservation records exactly which
+warehouse supplies each quantity. The client displays the accepted hold and expiry.
 
-**Virtualization with TanStack Virtual**:
-- `count`: products + 1 (for loading indicator)
-- `estimateSize`: 280px per row
-- `overscan`: 5 items
+### Two buyers, one unit
 
-**Infinite Scroll Trigger**:
-- Watch last virtual item index
-- If near end and `hasNextPage`: call `fetchNextPage()`
+Suppose both buyers saw “In stock” from a cached product page. That is acceptable
+if the UI treats it as availability information rather than a purchase guarantee.
+Only one checkout can allocate the remaining unit at the stock authority.
 
-**Facets Sidebar**:
-- Receives `facets` from first page response
-- `selected` state from URL params
-- `onChange` updates URL params
+The backend uses an atomic conditional write or a short transaction locking the
+relevant inventory records. It evaluates availability at that same serialization
+point and records the allocation with the pending order/attempt.
 
-### Backend: Search API with Fallback
+Locking each buyer's cart does not solve this race: those are different rows. Reading
+a stock sum before an unconditional decrement also fails, even if each request uses
+a transaction. The actual shared resource must enforce the invariant.
 
-**GET / Handler**:
-1. Try Elasticsearch with circuit breaker
-2. Build ES query with filters
-3. Extract products and facets from response
-4. Log search for analytics
-5. If circuit open: fallback to PostgreSQL FTS
+When the second buyer loses the race, the response identifies the unavailable line.
+The UI preserves the other cart choices and offers a revised checkout, instead of
+clearing everything or displaying a generic payment error.
 
-**Elasticsearch Query Structure**:
-- `function_score` for relevance boosting
-- `bool.must`: fuzzy match on title
-- `bool.filter`: category, price range, brand terms
-- Boost factors: in_stock (2x), rating (sqrt, 1.2x)
+### More than one warehouse
 
-**Aggregations**:
-- `categories`: top 20 terms
-- `brands`: top 20 terms
-- `price_ranges`: Under $25, $25-50, $50-100, Over $100
-- `avg_rating`: average value
+A total stock count is useful for discovery, but checkout needs an allocation plan.
+If two warehouses each have five units and the order needs three, subtracting three
+from each would consume six. The order must consume and release the exact recorded
+allocation, including during cancellation.
 
-**Fallback Strategy**:
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Elasticsearch  │──X──│ Circuit Breaker │──▶  │  PostgreSQL FTS │
-│    Primary      │     │     OPEN        │     │    Fallback     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-```
+Warehouse allocation can later account for delivery promises and shipment cost.
+For this interview, I would keep that policy simple while preserving explicit records
+so fulfillment does not have to infer where the units came from.
 
----
+### Why not reserve every cart addition?
 
-## Step 5: Checkout Flow (10 minutes)
+That can provide a stronger shopping-window promise, but casual browsing and abandoned
+carts then withhold stock from ready buyers. Scarce launches become vulnerable to
+many long-lived holds unless quotas and renewal rules constrain them.
 
-### Multi-Step Process Overview
+Checkout-only holds give up guaranteed cart availability in exchange for keeping
+inventory available longer. A clear product message and useful conflict resolution
+make that trade-off understandable. If requirements demand cart-time holds, accept
+the operational cost instead of claiming a counter makes it free.
 
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Step 1    │ ─▶ │   Step 2    │ ─▶ │   Step 3    │ ─▶ │   Step 4    │
-│  Shipping   │    │   Payment   │    │   Review    │    │ Confirmation│
-│             │    │             │    │             │    │             │
-│ - Address   │    │ - Card form │    │ - Summary   │    │ - Order ID  │
-│ - Validation│    │ - Stripe    │    │ - Edit      │    │ - Email     │
-│ - Save      │    │   Elements  │    │ - Place     │    │ - Next steps│
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-```
+### Expiry is shared state, not a browser timer
 
-### Frontend: Checkout State Machine
+The countdown helps the shopper, but the backend decides expiry using authoritative
+time and reservation state. Cleanup and checkout compete through a conditional
+transition; only one can release or consume a still-held allocation.
 
-**CheckoutFlow component**:
-- Uses XState machine for flow control
-- Generates `idempotencyKey` on mount
-- Renders step indicator with completion status
-- Conditionally renders step components
+A delayed cleanup job may delay release, but cannot extend a contractual hold silently.
+A repeated cleanup delivery must not release someone else's units. Reservation state
+and the counter change commit together.
 
-**Step Indicator**:
-- Shows checkmark for completed steps
-- Highlights current step
-- Numbered circles for pending steps
+The UI revalidates after a long background period or reconnect. It does not show
+“reserved” merely because an old local timestamp is still present. If the hold expired,
+preserve the form and request a new allocation/quote according to the product policy.
 
-**State Machine Definition**:
+### Concurrent client edits
 
-```
-┌────────────┐    SUBMIT_SHIPPING     ┌────────────┐
-│  shipping  │ ─────────────────────▶ │  payment   │
-└────────────┘                        └────────────┘
-                                            │
-                    BACK                    │ SUBMIT_PAYMENT
-                    ◀───────────────────────┘
-                                            │
-                                            ▼
-                                      ┌────────────┐
-                                      │   review   │
-                                      │  ┌──────┐  │
-                                      │  │ idle │  │
-                                      │  └──┬───┘  │
-                                      │     │ PLACE_ORDER
-                                      │     ▼      │
-                                      │ ┌────────┐ │
-                                      │ │placing │ │
-                                      │ └──┬─────┘ │
-                                      └────┼───────┘
-                           onDone ─────────┘└────────── onError
-                              │                            │
-                              ▼                            ▼
-                       ┌─────────────┐              ┌───────────┐
-                       │confirmation │              │   error   │
-                       │   (final)   │              │  (RETRY)  │
-                       └─────────────┘              └───────────┘
-```
+Whole-cart snapshot rollback can undo a later successful edit. I would serialize
+conflicting mutations or rebase pending operations over the newest server version.
+Older responses never replace a newer confirmed snapshot.
 
-**Context**:
-- `shippingAddress`, `paymentMethod`, `orderId`, `error`, `completedSteps[]`
+The same private state is scoped to the account. Logout clears it and pending work;
+late responses from a previous account cannot repopulate the next shopper's cart.
+After order acceptance, reconcile the header badge with the consumed cart version.
 
-### Backend: Idempotent Order Creation
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Versioned cart plus short authoritative allocation | Responsive intent editing and correct last-unit decision | Stock conflicts and reservation-state coordination |
+| ❌ Treat a cart badge or cached count as ownership | Easy optimistic demo | Promises inventory that was never allocated |
 
-**POST / Handler** (11-step process):
+## 🔧 Deep dive 2: Recover one purchase after an uncertain response — 8 minutes
 
-1. **Idempotency Check**: Query existing order by key, return cached response
-2. **BEGIN Transaction**: Get pooled connection
-3. **Get Cart with Lock**: `SELECT ... FOR UPDATE OF inventory`
-4. **Verify Availability**: Check all items still available
-5. **Calculate Totals**: subtotal + tax (8%) + shipping ($5.99 or free over $50)
-6. **Process Payment**: Stripe with `payment-{idempotencyKey}`
-7. **Create Order**: INSERT with status `confirmed`
-8. **Copy Items**: INSERT order_items FROM cart_items
-9. **Commit Inventory**: UPDATE quantity - X, reserved - X
-10. **Clear Cart**: DELETE cart_items
-11. **COMMIT + Events**: Cache response, emit to Kafka
+### Decision: one durable attempt shared by browser and backend
 
-**Error Handling**:
-- 402 Payment Required: `PAYMENT_FAILED`
-- Rollback on any error
-- Audit log for failed checkouts
+> “The shopper presses Place Order, the network drops, and they reload. I want the
+> page to discover the outcome of that purchase, not ask them to gamble on whether
+> another click will create a second order.”
 
----
+Before submission, the shopper reviews the authoritative quote. The client submits
+a stable attempt key associated with that accepted intent. The backend binds it to
+the account and a request fingerprint, and commits the attempt/order relationship
+with the allocation and durable follow-up work.
 
-## Step 6: Data Synchronization Strategy (5 minutes)
+A repeated request returns the same attempt/order or its pending status. The key
+must survive the browser recovery path. A random key created on each HTTP request
+cannot deduplicate retries, even if the backend has a table called idempotency keys.
 
-### Real-Time Inventory Updates
+### Why not rely on a disabled button and Redis flag?
 
-**Kafka Consumer** (`inventory-sync` group):
-- On `INVENTORY_UPDATED`: Update ES document, invalidate Redis cache
+Button disabling limits one page's immediate clicks. It does not handle another tab,
+a reload, a proxy retry or a response lost after the server committed.
 
-**Frontend WebSocket Hook** (`useInventoryUpdates`):
-- Subscribe to product IDs
-- On message: update query cache with new availability
-- If cart item became unavailable: show warning toast
+A Redis flag written separately from the order can strand processing work or disappear
+after an order exists. It is an optimization around durable state, not the purchase
+identity authority. Database uniqueness and a transaction close the local commit gap.
 
-### Search Index Synchronization
+Supplied keys also need account and payload binding. A global key lookup must not
+return another buyer's private response, and the same key must not silently represent
+a changed cart, address or amount.
 
-**syncProductToElasticsearch()** Background Job:
-- Query product with inventory, category, seller joins
-- If deleted: remove from index
-- Otherwise: index with all searchable fields
+### Payment has a separate boundary
 
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  PostgreSQL │──▶ │  Background │──▶ │Elasticsearch│
-│   (source)  │    │    Job      │    │   (index)   │
-└─────────────┘    └─────────────┘    └─────────────┘
-        │                                    │
-        │         ┌─────────────┐            │
-        └────────▶│   Valkey    │◀───────────┘
-                  │   (cache)   │
-                  └─────────────┘
-```
+The payment coordinator calls the provider after the order transaction commits.
+It records each authorization/capture/refund operation with its own stable provider
+identity. Holding database locks during that call would increase contention without
+making the provider part of a PostgreSQL transaction.
 
----
+A timeout can mean the provider completed before the connection failed. The correct
+state is unknown until queried or reconciled. An authenticated callback or periodic
+reconciliation scan updates the same operation and order state.
 
-## Step 7: Key Design Decisions & Trade-offs
+Persisting pending work matters. A fallback function that merely returns “queued”
+does not create a worker or guarantee future progress. After a process restart, the
+coordinator must be able to enumerate and resume unfinished operations.
 
-### Decision 1: Optimistic UI Updates
+### Reflect uncertainty without confusing the shopper
 
-| Aspect | Chosen Approach | Alternative | Rationale |
-|--------|-----------------|-------------|-----------|
-| Cart Operations | Optimistic update | Wait for server | User perceives instant response |
-| Rollback | Client-side state restoration | Server push | Simpler, works offline |
-| Trade-off | Brief inconsistency on failure | Slower perceived performance | UX wins for common success case |
+The checkout UI distinguishes local form steps from server business state. Completing
+the address form does not authorize payment. An accepted order may still need
+provider authentication or confirmation.
 
-### Decision 2: State Machine for Checkout
+After a lost response, show that the app is checking the existing attempt. Offer a
+status link and preserve the reference. Do not encourage a fresh independent purchase
+while the original outcome is unresolved.
 
-| Aspect | Chosen Approach | Alternative | Rationale |
-|--------|-----------------|-------------|-----------|
-| Flow Control | XState machine | useState flags | Clear states, impossible transitions prevented |
-| Persistence | Context in machine | localStorage | Survives refresh, tracks progress |
-| Trade-off | Learning curve | Simpler but error-prone | Correctness for critical flow |
+If payment fails definitively, follow the server's supported retry/change-method flow.
+If the quote changes, show the revised amount for acceptance. A new purchase intent
+is a deliberate transition, not an automatic result of a transient network error.
 
-### Decision 3: Search Fallback Strategy
+The cost is a pending-state experience, status APIs and reconciliation jobs. That
+complexity is justified by an answer the shopper and support team can both trust.
 
-| Aspect | Chosen Approach | Alternative | Rationale |
-|--------|-----------------|-------------|-----------|
-| Primary Search | Elasticsearch | PostgreSQL FTS | Performance, faceted filtering |
-| Fallback | PostgreSQL FTS on circuit open | Return error | Degraded but available |
-| Trade-off | Maintain two search impls | Single point of failure | Availability over consistency |
+### Cancellation races with payment and fulfillment
 
-### Decision 4: Inventory Reservation Model
+A customer can cancel while authorization is in flight. The backend conditionally
+records cancellation and compensation work. A late success checks that lifecycle
+state rather than blindly setting the order to confirmed.
 
-| Aspect | Chosen Approach | Alternative | Rationale |
-|--------|-----------------|-------------|-----------|
-| Cart Inventory | Reserve on add | Decrement on add | Prevents false out-of-stock |
-| Expiration | 30-minute TTL | No expiration | Balance UX vs. availability |
-| Trade-off | Background cleanup job | Simpler but inventory locks | Fairness to all users |
+If inventory was released, either follow a deliberate reallocation policy or void/
+refund the provider operation. The interface can show cancellation accepted with
+refund pending when that is the actual state.
 
----
+Admin actions use the same domain transitions. Changing a status dropdown cannot
+bypass stock restoration or payment compensation. The server returns supported
+actions so the UI does not reconstruct eligibility from a partial status list.
 
-## Trade-offs Summary
+### Durable history and independent effects
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Optimistic UI | Instant feedback, better UX | Rollback complexity, brief inconsistency |
-| Reserved inventory | Accurate availability, no overselling | Cleanup job needed, complexity |
-| State machine checkout | Predictable flow, easy debugging | Learning curve, more code |
-| ES + PG fallback | High availability, fast search | Two systems to maintain |
-| Idempotency keys | Exactly-once orders, safe retries | Key storage overhead, 24h TTL management |
-| WebSocket inventory | Real-time updates, better UX | Connection management, scaling |
+Order lines snapshot the accepted title, price and quantity. A later catalog edit
+must not rewrite what was purchased. Account authorization applies to recovery URLs
+and status lookups just as it does to order-history pages.
 
----
+Outbox events let fulfillment, notifications and indexing proceed independently.
+Each consumer deduplicates its own effects. One consumer's success cannot suppress
+another consumer's work through a single shared “seen” flag.
 
-## Future Fullstack Enhancements
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Durable attempt and provider reconciliation | Safe recovery after reloads, retries and late outcomes | Pending states and compensation workflows |
+| ❌ Fresh submission after every apparent failure | Simple form handler | Cannot distinguish request failure from completed purchase |
 
-1. **Progressive Web App**: Offline cart access, push notifications for order updates
-2. **Server-Sent Events**: Alternative to WebSocket for inventory updates, simpler scaling
-3. **GraphQL Federation**: Unified API across services with client-driven queries
-4. **Edge Caching**: CDN caching for product pages with stale-while-revalidate
-5. **A/B Testing Infrastructure**: Feature flags for checkout flow experiments
-6. **Micro-Frontends**: Independent deployment of search, cart, checkout modules
+## 🔧 Deep dive 3: Keep discovery fast without making stale data authoritative — 8 minutes
+
+### Decision: a versioned search projection and a navigable frontend
+
+> “I would allow the product list to be a little stale so browsing can scale
+> independently. I would make that safe by checking the purchase at checkout and
+> preserving the meaning of filters and errors on the search page.”
+
+Catalog, stock and rating changes create versioned events. Index workers project
+searchable fields and handle out-of-order delivery. A deletion/deactivation removes
+or hides the old document; a bulk refresh must reconcile obsolete documents too.
+
+The search index supports text matching and facets. PostgreSQL remains the catalog
+and purchase authority. SQL can do text search and aggregation; the dedicated index
+is chosen for workload isolation and relevance needs, not a universal speed claim.
+
+### What the URL means
+
+The URL contains committed query, filters, sort and pagination. Local input state
+holds typing before commit. The browser Back button restores the search choices,
+and opening a product should preserve a useful result position for returning.
+
+I would start with bounded pages rather than a huge in-memory result list. If product
+research favors infinite scrolling, retain a recoverable cursor/scroll anchor and
+virtualize long lists carefully, including keyboard and screen-reader behavior.
+
+Changing a price range is one transition containing both bounds and a pagination
+reset. The API sends stable values and labels; the frontend should not reverse-engineer
+numeric ranges from translated display text.
+
+### Stale responses and stale projections are different
+
+A stale projection is a server freshness issue: the index may not yet reflect a price
+change. A stale response is a client ordering issue: the old query finishes after the
+new one. Both need explicit handling, but a short cache TTL fixes neither by itself.
+
+Key requests by normalized filters, cancel obsolete work and apply responses only
+to the matching query identity. Debouncing autocomplete controls request volume;
+it does not prevent out-of-order completion.
+
+A product page can load primary details independently of reviews/recommendations.
+Defer optional sections and below-the-fold media, while prioritizing the main image
+and reserving its dimensions to avoid shifting the purchase controls during load.
+
+### Why not fall back to PostgreSQL for every empty result?
+
+Zero products can be a legitimate answer. Treating it as an outage switches engines
+without evidence and may change filter semantics or pagination between requests.
+The backend should distinguish empty, degraded and failed states.
+
+During a real ES outage, a bounded fallback can serve supported text/basic filters.
+It needs a separate concurrency budget and deadline so browsing load does not consume
+all checkout connections. A fallback is not a promise of unlimited availability.
+
+The response identifies unsupported facets or reduced freshness. The UI keeps selected
+filters visible and explains limitations. Quietly omitting a minimum rating or stock
+filter changes the shopper's request and can produce misleading results.
+
+If retrieval fails, retain any prior list as visibly outdated or show a retry state.
+Do not present “No products found” as if the query completed successfully. Similar
+care applies to initial cart loading and order recovery.
+
+### Recommendations and caching
+
+An item-to-item co-purchase batch is a reasonable initial recommender. Define eligible
+orders and a time window, then publish complete top-K generations so obsolete peers
+do not remain forever. Cache ranking and hydrate active products without losing order.
+
+The batch trades freshness for simpler operations. Incremental event processing can
+improve freshness if needed; it does not inherently require GPUs or a complex model.
+A missing recommendation remains a secondary-page issue, not a purchase outage.
+
+Public caches include locale/currency and relevant offer context. Private account data
+never shares those keys. Changes need invalidation/version handling, including older
+cache fills that complete after an invalidation.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Versioned projections and explicit search states | Fast browsing with recoverable navigation and honest results | Index maintenance, query identity and fallback budgets |
+| ❌ Uncoordinated caches plus hidden fallback | Easy happy-path loading | Stale stock, changed filters and misleading empty results |
+
+## ♿ Operate and degrade around the customer — 4 minutes
+
+The most useful operational metrics follow promises: allocation conflicts, unresolved
+payment age, index lag, fallback saturation and failed customer journeys. A healthy
+HTTP process or an unused oversell counter cannot establish purchase correctness.
+
+Use consistent correlation IDs for request, attempt and provider work. Keep addresses
+and payment material out of routine analytics. Audit important transitions durably;
+admin access and seller ownership checks remain mandatory even without dedicated UI.
+
+For accessibility, use separate product links and Add buttons, labelled forms and
+quantity controls, meaningful focus after errors and restrained status announcements.
+Search suggestions need keyboard support, and filters need a usable narrow-screen
+presentation. A desktop page-shell screenshot does not verify those flows.
+
+If the network fails, keep safe drafts and show what is outdated. Offline intent is
+possible; offline stock allocation or payment confirmation is not established by a
+local cache. Clear private state on account changes and preserve only intentional
+recovery references within the relevant account boundary.
+
+## ✅ Validate the whole journey — 4 minutes
+
+I would test the cases where two individually reasonable components can disagree:
+
+1. A cached product says in stock while another buyer wins the last-unit allocation.
+2. A checkout hold expires as payment or cancellation completes.
+3. Concurrent cart edits return out of order or cross an account switch.
+4. The order commits, its response is lost, and the shopper reloads.
+5. A provider success arrives after timeout or cancellation.
+6. Search fails under load, while the fallback preserves filters and checkout capacity.
+7. A product is edited/deactivated while older index events and cache fills are pending.
+
+Checks must inspect durable state and visible behavior together: one allocation/order,
+recoverable payment state and a screen that communicates the same outcome. Separate
+field performance and accessibility testing verifies that correctness remains usable
+on slower devices and assistive technology.
+
+The local project is useful for exploring these seams, but it currently uses unlocked
+stock checks, unscoped cache-based idempotency, no payment recovery worker and simple
+client fetching. Its documentation should explain those gaps rather than treat the
+production proposal as an implemented guarantee.
+
+> “The full-stack design connects each screen promise to a durable backend fact.
+> Discovery can be cached, cart edits can feel immediate, and payment can take time,
+> as long as the system preserves identity, checks allocation and tells the shopper
+> what actually happened.”

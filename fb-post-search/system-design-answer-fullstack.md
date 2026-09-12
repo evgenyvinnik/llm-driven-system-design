@@ -1,381 +1,372 @@
-# Facebook Post Search - System Design Answer (Full-Stack Focus)
+# Facebook Post Search — Full-Stack System Design Answer
 
-## 45-minute system design interview format - Full-Stack Engineer Position
+A 45-minute proposal connecting the browser's search experience with reliable indexing and
+current authorization. Proposed contracts extend the local implementation.
 
-### 1. Requirements Clarification (3 minutes)
+## 🎯 Start With One User Journey — 4 minutes
 
-**Functional Requirements:**
-- Full-text search across posts with privacy enforcement
-- Real-time typeahead suggestions
-- Personalized ranking based on social graph
-- Filters for date range, post type, author
-- Search history and saved searches
+> “A user searches for a post, narrows the results, opens one, and goes Back. I want the query to remain clear, pagination to remain coherent, and every returned snippet to be something this viewer may currently read.”
 
-**Non-Functional Requirements:**
-- End-to-end latency: P99 < 300ms
-- Typeahead: < 100ms perceived latency
-- Zero privacy violations (unauthorized content never shown)
-- Graceful degradation on backend failures
+The first version supports keyword/phrase/hashtag search, date/type/author filters,
+suggestions, snippets, and continued result pages. Anonymous users search public content;
+signed-in viewers can also search permitted friend and private posts.
 
-**Full-Stack Focus Areas:**
-- API contract design and type sharing
-- Optimistic UI updates with error handling
-- Real-time suggestion streaming
-- Caching strategy across layers
-- End-to-end testing approach
+I would clarify the audience rules before drawing infrastructure. Here Friends means an
+accepted relationship. Friends-of-friends, groups, and saved searches are extensions
+because they change authorization, not just labels.
 
----
+Full result search happens on Enter, selection, or Apply. Suggestions can update after a
+short typing debounce. That separates frequent draft interaction from the more expensive
+committed query.
 
-### 2. High-Level Architecture (5 minutes)
+| Requirement | Proposed contract |
+|-------------|-------------------|
+| Local input | Immediate typing feedback |
+| First useful results | Target within one second on a defined device/network |
+| Search API | Healthy p95 below 300 ms, p99 below one second |
+| Freshness | Ordinary accepted changes indexed within 10 seconds |
+| Availability | 99.9% regional search-serving target |
+| Privacy | Current validation before returning protected content |
+| Continuity | Bounded stable search session and explicit expiry |
+| Recovery | Preserve intent and distinguish failed search from no matches |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Full-Stack View                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                            Frontend                                     │ │
-│  │  SearchBar → useSearchStore (Zustand) → SearchAPI → SearchResults     │ │
-│  │      ↓              ↓                       ↓              ↓          │ │
-│  │  Debounce    Local Cache              HTTP/fetch     Virtualization   │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                    │                                         │
-│                           HTTP/REST API                                      │
-│                                    ↓                                         │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                            Backend                                      │ │
-│  │  Express Router → SearchService → Elasticsearch → Response Builder    │ │
-│  │       ↓               ↓                ↓                ↓             │ │
-│  │  Auth Middleware  Visibility     Query Builder    Highlighting       │ │
-│  │       ↓               ↓                                               │ │
-│  │  Rate Limiter    Redis Cache ←────── PostgreSQL (Social Graph)       │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                         Shared Package                                  │ │
-│  │  @fb-search/shared-types: API types, validation schemas, constants   │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Those numbers are goals, not test results. I would also ask whether Back must restore the
+same result anchor and whether sharing query intent in a URL is expected. Another viewer
+may run the same query and legitimately see different posts.
 
-**Integration Points:**
-1. **Search API**: Query → Results with highlighting
-2. **Suggestions API**: Partial query → Typeahead options
-3. **Visibility System**: User ID → Authorized fingerprints
-4. **Caching**: Multi-layer (browser, CDN, Redis, ES query cache)
-
----
-
-### 3. Full-Stack Deep-Dives
-
-#### Deep-Dive A: Shared Types Package (6 minutes)
-
-**Search Request/Response Types:**
-
-SearchRequest contains query (string), optional filters (dateRange with ISO 8601 start/end, postType as 'text' | 'photo' | 'video' | 'link', authorId), optional cursor for pagination, and optional limit.
-
-SearchResponse includes results array, total count, has_more boolean, next_cursor (string or null), took_ms for timing, and query_id for analytics.
-
-SearchResult contains id, author object (id, display_name, avatar_url, is_verified), content string, highlights array with start/end/field, post_type, created_at, engagement stats (like_count, comment_count, share_count), optional media array, and relevance_score.
-
-Highlight specifies start and end positions with field type ('content' | 'hashtag' | 'author').
-
-**Suggestions Types:**
-
-SuggestionRequest has query string and optional limit. SuggestionResponse contains suggestions array. Each Suggestion has type ('query' | 'hashtag' | 'person' | 'history'), text, and optional metadata (personId, avatarUrl, postCount).
-
-**Error Types:**
-
-ApiError contains code string, message, and optional details record. ErrorCodes defines constants: INVALID_QUERY, RATE_LIMITED, UNAUTHORIZED, INTERNAL_ERROR, TIMEOUT.
-
-**Zod Validation Schemas:**
-
-searchRequestSchema validates: query (1-500 chars), filters object with optional dateRange (datetime strings), postType enum, authorId (uuid), optional cursor, and limit (1-100, default 20).
-
-suggestionRequestSchema validates: query (1-100 chars), limit (1-10, default 5).
-
-Type inference using z.infer creates ValidatedSearchRequest and ValidatedSuggestionRequest types.
-
-**Using Shared Types:**
-
-Backend imports types and schemas from @fb-search/shared-types, uses safeParse for validation, returns ApiError on failure with ErrorCodes.INVALID_QUERY.
-
-Frontend imports same types, builds URLSearchParams from request, throws SearchError on non-OK response.
-
----
-
-#### Deep-Dive B: API Design and Implementation (8 minutes)
-
-**Express Router Endpoints:**
-
-`GET /search` - Authenticated, rate limited (100/min), validates with searchRequestSchema against query params. Executes search via searchService, adds X-Response-Time header, sets Cache-Control: private, max-age=60 with Vary: Authorization.
-
-`GET /suggestions` - Authenticated, rate limited (300/min), validates with suggestionRequestSchema. Returns suggestions with short cache (10 seconds).
-
-`GET /search/history` - Returns 20 most recent searches for authenticated user.
-
-`DELETE /search/history` - Clears user's search history, returns 204 No Content.
-
-**Validation Middleware:**
-
-Generic validateRequest function accepts Zod schema and request part ('body' | 'query' | 'params'). Calls safeParse, returns 400 with ApiError on failure including flattened error details. Attaches validated data to req.validated.
-
-Express Request type is extended globally to include validated and userId properties.
-
-**Frontend API Client:**
-
-SearchApiClient class with private abortController for cancellation.
-
-search() method cancels in-flight requests, builds URLSearchParams, fetches with credentials: 'include'. Throws SearchApiError on non-OK, handles AbortError specially.
-
-getSuggestions() builds params, fetches, returns empty array on error (fail silently).
-
-getHistory() and clearHistory() for search history management.
-
-buildSearchParams() private method converts SearchRequest to URLSearchParams, handling filters.dateRange, postType, authorId.
-
-Custom errors: SearchApiError extends Error with apiError and status, SearchAbortedError for cancelled requests.
-
----
-
-#### Deep-Dive C: Multi-Layer Caching Strategy (8 minutes)
+## 🏗️ Architecture and Scale — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Caching Layers                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Layer 1: Browser Cache (SessionStorage)                                    │
-│  ├─ Recent search results (per query hash)                                  │
-│  ├─ TTL: Session duration                                                   │
-│  └─ Size: 50 most recent queries                                            │
-│                                                                              │
-│  Layer 2: Service Worker Cache                                              │
-│  ├─ API responses for offline support                                       │
-│  ├─ TTL: 1 hour (stale-while-revalidate)                                   │
-│  └─ Size: 10MB limit                                                        │
-│                                                                              │
-│  Layer 3: Redis (Server-side)                                               │
-│  ├─ Visibility sets per user                                                │
-│  │   └─ Key: visibility:{userId}, TTL: 5 min                               │
-│  ├─ Popular queries                                                         │
-│  │   └─ Key: search:{queryHash}:{visibilityHash}, TTL: 1 min              │
-│  └─ Suggestion results                                                      │
-│      └─ Key: suggest:{prefix}, TTL: 10 min                                 │
-│                                                                              │
-│  Layer 4: Elasticsearch Query Cache                                         │
-│  ├─ Built-in query result caching                                          │
-│  ├─ Invalidated on index refresh                                           │
-│  └─ Size: 10% of heap                                                       │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│ Browser: drafts / committed intent / safe snippets              │
+│ Account + request identity / bounded result pages               │
+└────────────────────────────────┬────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Search API: PIT context / current access / ranking              │
+└─────────────┬────────────────────────────────────┬──────────────┘
+              ▼                                    ▼
+┌────────────────────────────┐       ┌────────────────────────────┐
+│ Elasticsearch projection   │◀──────│ Canonical SQL + outbox     │
+│ PIT + audience tokens      │       │ Versioned index workers    │
+└────────────────────────────┘       └────────────────────────────┘
 ```
 
-**Frontend Cache Implementation:**
+The browser owns draft input, committed query state, request generations, safe rendering,
+and a bounded result cache. The server owns query semantics, ranking, current access, and
+continuation. Index workers own projection progress and repair.
 
-SearchCache class with MAX_ENTRIES=50, TTL_MS=60000 (1 min), STORAGE_KEY='search_cache'.
+React, TypeScript, TanStack Router, and Zustand fit this UI. PostgreSQL keeps canonical
+posts, relationships, and operation results. Elasticsearch supplies text retrieval; Redis
+caches graph-derived token sets and explicitly scoped suggestion data.
 
-get(request) generates cache key, checks entry existence and expiration, deletes expired entries.
+I would keep these as logical boundaries first. A shared generated API schema can reduce
+drift without making every type a shared database entity. The actual demo duplicates its
+frontend/backend types and validates environment configuration, not request bodies with
+shared Zod schemas.
 
-set(request, response) evicts oldest entry if at capacity, stores with timestamp, persists to sessionStorage.
+Assume 100 million daily searchers making five submitted searches each: 500 million
+searches per day, about 5,787 per second average and 28,935 at a five-times-average peak.
+Four suggestion requests per submission would add up to two billion suggestion requests
+before caching and coalescing.
 
-invalidate(pattern) clears all or matching keys.
+At 100 million new posts per day and 1 KB raw searchable records, raw storage grows by 100
+GB per day. Indexed fields, postings, replicas, media, and merge headroom add to that. I
+would measure shard/recovery behavior before choosing a fixed cluster size.
 
-getCacheKey() builds key from query, filters.postType, dateRange.start/end, authorId, cursor joined with pipes.
+| Data boundary | What crosses it |
+|---------------|------------------|
+| Browser to search API | Committed query/filters and opaque continuation |
+| Search to retrieval | Fixed query/ranking context and coarse audience tokens |
+| Retrieval to authority | Candidate IDs/revisions for current validation |
+| Source to indexing | Durable post revision/tombstone events |
+| API to browser | Authorized versioned result, safe snippet, session state |
 
-loadFromStorage/saveToStorage handle sessionStorage with try/catch for unavailability.
+## 🔍 Deep Dive 1: Query Intent Must Survive Asynchrony — 10 minutes
 
-**Backend Cache Service:**
+### Separate what is being edited from what was searched
 
-CacheService class with Redis client.
+The user types coffee, submits, and gets results. Then they open Filters and select
+Photos. Until Apply, those selections are drafts; they must not silently change the query
+used by an existing Load More cursor.
 
-**Visibility Cache:**
-- getVisibilitySet(userId) returns smembers or null if empty
-- setVisibilitySet(userId, fingerprints) uses pipeline: del, sadd, expire(300)
-- invalidateVisibility(userId) deletes key
+I would keep raw input and draft filters local to the controls. Committing them creates a
+new normalized search key and generation. Pagination always uses the captured committed
+tuple, even if the user is editing the next query.
 
-**Search Results Cache:**
-- getSearchResults(request, visibilityHash) returns parsed JSON or null
-- setSearchResults() increments request count, only caches if "popular" (5+ requests/hour), TTL 60s
+| State | Owner | Invariant |
+|-------|-------|-----------|
+| Query/filter draft | Controls | Editing does not mutate current pagination |
+| Committed intent | Route/controller | Query, filters, locale, mode move together |
+| Account generation | Auth boundary | Old viewer responses cannot commit |
+| First-page request | Search controller | Latest generation wins |
+| Next-page request | Session/page controller | At most one request per active cursor |
+| Suggestions | Combobox | Options match current draft generation |
 
-**Suggestions Cache:**
-- getSuggestions(prefix) returns lrange 0-9 or null
-- setSuggestions(prefix, suggestions) uses pipeline with TTL 600s
+A URL can encode committed intent for Back/share. It should not contain access tokens,
+private result JSON, or the internal PIT. Normalize filter ordering deterministically,
+while preserving punctuation/case when meaningful to the query language.
 
-**Helpers:**
-- getSearchCacheKey() combines request hash and visibility hash
-- hashRequest() normalizes and MD5 hashes to 12 chars
-- hashQuery() MD5 hashes lowercase trimmed query to 8 chars
-- hashVisibilitySet() sorts fingerprints, joins, MD5 hashes to 12 chars
+### Debounce is a load control, not a race solution
 
----
+A roughly 200 ms suggestion debounce is a reasonable initial value to measure. Enter can
+cancel the timer and submit immediately. IME composition needs its own boundary so
+intermediate characters are not treated as final input.
 
-#### Deep-Dive D: End-to-End Search Flow (8 minutes)
+Abort obsolete requests to save work, but still check account/search identity when a
+response arrives. The transport may ignore cancellation or complete just before it. A
+stale result must not be accepted merely because the request once belonged to this
+component.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                        Search Request Flow                                    │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  1. User types "vacation photos" in SearchBar                                │
-│     │                                                                         │
-│  2. Frontend: Debounce (150ms) → Check session cache                         │
-│     │                                                                         │
-│  3. Cache MISS → Send GET /api/v1/search?query=vacation+photos               │
-│     │                                                                         │
-│  4. Backend: Auth middleware validates session cookie                         │
-│     │                                                                         │
-│  5. Backend: Validate request with Zod schema                                │
-│     │                                                                         │
-│  6. Backend: Check visibility cache (Redis)                                  │
-│     │                                                                         │
-│  7. Visibility cache MISS → Compute from PostgreSQL                          │
-│     │                                                                         │
-│  8. Backend: Build Elasticsearch query with privacy filter                   │
-│     │                                                                         │
-│  9. Elasticsearch: Execute query, return 500 candidates                      │
-│     │                                                                         │
-│ 10. Backend: Re-rank with social proximity                                   │
-│     │                                                                         │
-│ 11. Backend: Extract highlights, build response                              │
-│     │                                                                         │
-│ 12. Backend: Cache visibility set for 5 min                                  │
-│     │                                                                         │
-│ 13. Response → Frontend                                                       │
-│     │                                                                         │
-│ 14. Frontend: Update Zustand store, cache results                            │
-│     │                                                                         │
-│ 15. Frontend: Render virtualized results with highlights                     │
-│                                                                               │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+Suppose query A starts, then query B completes first. A's later response is discarded. If
+the user logs out while B is in flight, B is also discarded after the account generation
+changes. Clearing current state without guarding later commits does not solve either
+sequence.
 
-**Search Service Implementation:**
+### Give each failure its own UI
 
-SearchService constructor takes ElasticsearchClient, VisibilityService, RankingService, HighlightService, CacheService, SearchHistoryRepository.
+First-page failure means the user has no result for this intent. Next-page failure means
+some useful results already exist. Suggestion failure does not mean full search is
+unavailable.
 
-**search(request, userId) workflow:**
-1. Generate queryId with crypto.randomUUID()
-2. Get user's visibility fingerprints (check cache, compute if miss)
-3. Hash visibility set for cache key
-4. Check search results cache (increment metrics on hit/miss)
-5. Build Elasticsearch query with privacy filter
-6. Execute against posts-* index
-7. Re-rank with social signals via rankingService
-8. Build response with highlights
-9. Construct SearchResponse with results, total, has_more, next_cursor, took_ms, query_id
-10. Async cache and record history (don't await)
-11. Observe latency metric, return response
+I would keep separate loading/error states and show an inline retry for a failed
+continuation. Keep the committed query visible so the reader knows what the results
+describe.
 
-**getVisibilitySet(userId):**
-Checks cache first, computes via visibilityService if miss, caches result.
+For a different query, my initial UI replaces the result area with a labeled loading
+state. Retaining old results is a possible refinement, but they must be labeled as the
+previous query. Unlabeled stale cards under a new heading are misleading.
 
-**buildQuery(request, visibilitySet):**
-Creates bool query with multi_match (content^2, hashtags^1.5, author_name) with fuzziness AUTO.
+### The backend must support the browser's continuity promise
 
-Filter includes terms query on visibility_fingerprints for privacy.
+The server should not call an offset string a stable cursor. Index refreshes can move
+records across an offset, and even score-plus-ID continuation can drift if the ranking
+context changes.
 
-Highlight configuration with pre_tags/post_tags for <mark>.
+For the initial in-engine ranker, I would use a short-lived point-in-time search session
+with fixed query, sort, social features, and time reference. The server cursor carries its
+session and complete continuation sort tuple; the client only stores and returns it.
 
-Applies optional filters: dateRange (range query), postType (term), authorId (term).
+Changing filters creates a new session. Expiry produces an explicit restart. New posts
+become visible on a new search rather than reshuffling a reader's page sequence.
 
-Handles cursor-based pagination with search_after.
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| ✅ Draft/committed separation | Filter editing cannot mix page meanings | More explicit state |
+| ✅ Identity guards plus cancellation | Correct under reordering/account changes | Lifecycle bookkeeping |
+| ✅ Stable server search session | Predictable continuation and Back | Expiry and server resource limits |
+| ❌ Debounce/abort as sole correctness | Small initial implementation | Old callbacks and mixed cursors still corrupt state |
 
-**buildResults(hits, query):**
-Maps ES hits to SearchResult objects with author info, highlights, engagement stats.
+> “The request identity is shared reasoning across the stack. The browser must know which intent may commit, and the server must know which query context a cursor continues.”
 
-**Cursor encoding:**
-buildCursor() base64 encodes { score, created_at, id }.
-decodeCursor() parses base64 back to object.
+## 🔍 Deep Dive 2: Privacy Includes Every Returned Fragment — 10 minutes
 
-**Frontend Integration:**
+### Efficient filtering and final authority have different jobs
 
-executeSearch action in Zustand store:
-1. Gets current query and filters from state
-2. Sets isLoading, clears error
-3. Checks local cache first
-4. Fetches from API if cache miss
-5. Caches successful response
-6. Updates results, hasMore, nextCursor, loading state
-7. Adds to searchHistory (max 50 entries)
-8. Handles SearchAbortedError (ignores), other errors set error state
+An indexed friends post can carry FRIENDS:author. The viewer supplies tokens for accepted
+friends and their own content. Elasticsearch intersects those tokens with the text query
+before selecting candidates.
 
----
+This avoids storing every recipient in every post. A friendship change updates the
+reader's eligible token set; the post's stable token need not be rewritten merely because
+one friend changed.
 
-### 4. Integration Testing Strategy
+But a post's own audience/content change does require projection work. If public becomes
+private and indexing fails, the old ES document still looks public. Efficient filtering
+over a stale document cannot make that response safe.
 
-**Backend Integration Tests (Vitest + Supertest):**
+I would validate the bounded candidate batch against current posts and relationships.
+Require the indexed content revision to match the canonical one before exposing its text
+or highlights. Skip deleted, inaccessible, or stale-version candidates.
 
-Setup: setupTestDb(), seedTestData(), login to get sessionCookie.
+### Stable index state cannot freeze permission
 
-**GET /api/v1/search tests:**
-- Returns matching posts with highlights, took_ms < 500
-- Respects privacy - only shows authorized posts (no friends-only from non-friends)
-- Filters by post type correctly
-- Validates query parameters (empty query returns 400 with INVALID_QUERY)
-- Requires authentication (401 without session)
+A point in time deliberately preserves an old search view. That is useful for ranking
+continuity, but it makes current validation more necessary, not less.
 
-**GET /api/v1/suggestions tests:**
-- Returns typeahead suggestions as array
+Keep the retrieval query fixed, scan forward through candidates, and advance the cursor
+across examined hits. If current checks remove many rows, overfetch only within a work
+budget and report a continuation or partial-work state.
 
-**E2E Tests (Playwright):**
+A graph-context revision change may explicitly expire the search session. Do not silently
+change its token/ranking query and then pretend the old cursor still describes the same
+order.
 
-beforeEach logs in via form submission, waits for redirect.
+The privacy contract is evaluated at the current check. The system cannot recall
+downloaded content, but new validated responses must honor completed revocations. Active
+clients should remove known invalidated content and revalidate protected state on resume.
 
-**Full search flow test:**
-- Fill search bar with "vacation"
-- Wait for suggestions listbox and first option
-- Press Enter to search
-- Wait for feed and first article
-- Verify mark.search-highlight contains query
+### Totals, facets, and suggestions must follow that policy
 
-**Filter test:**
-- Search, open filters, select photo radio
-- Apply, verify URL contains postType=photo
-- Verify first result is visible
+Filtering result cards after retrieval does not fix an unauthorized total or hashtag
+aggregation. Those values can reveal hidden topics without showing any full post.
 
----
+I would initially display verified loaded counts and continuation instead of an
+exact-looking candidate total. Any added total/facet API needs current authorization and
+an explicit relation/approximation policy.
 
-### 5. Trade-offs Analysis
+Shared suggestions come from a public-safe corpus. Personal history is keyed by viewer,
+and directory suggestions follow their own visibility rules. Cache keys include every
+factor that changes the response; a prefix alone is insufficient for personalized or
+authentication-dependent options.
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Shared types package | Type safety across stack, single source of truth | Build complexity, version sync |
-| Session-based caching | Per-user cache isolation, privacy safe | No cross-user cache sharing |
-| Cursor pagination | Stable results, handles concurrent updates | Can't jump to specific page |
-| Over-fetch for re-ranking (500 candidates) | Better relevance with social signals | Higher latency, more ES load |
-| Client-side highlighting fallback | Works if server omits highlights | Less accurate than ES highlighting |
-| Multi-layer cache invalidation | Fresh data when relationships change | Complex invalidation logic |
+Trending search terms require a publication policy. A search for a private matter should
+not automatically become a public suggestion. Time windows, distinct-user counts, and
+moderation can reduce noise/disclosure risk, but a frequency threshold alone is not a
+formal privacy guarantee.
 
----
+### Snippets are an untrusted rendering boundary
 
-### 6. Observability
+Search engines often produce highlighted markup, but the post author controls the
+surrounding text. The fallback path may also be raw content. Inserting either directly as
+HTML can execute content the application did not intend to trust.
 
-**Backend Metrics (Prometheus):**
+I prefer plain text plus typed fragments or ranges. Agree on offset units, validate bounds
+and versions, and let React create text nodes and marked spans. A malformed highlight
+becomes plain text, not a broken card or unsafe HTML.
 
-search_latency_ms histogram with cache_hit label, buckets [10, 50, 100, 200, 500, 1000].
+If an existing integration requires markup, use explicit HTML encoding and a strict
+allowlist through every path, including fallback. A response from our own API is not
+inherently sanitized.
 
-cache_hits_total counter with type and layer labels.
+| Decision | Benefit | Cost |
+|----------|---------|------|
+| ✅ Coarse tokens plus current batch validation | Efficient retrieval and revocation correctness | Extra bounded authority work |
+| ✅ Structured, versioned snippets | Safe text with meaningful highlights | Cross-stack fragment contract |
+| ❌ Trust old index/PIT ACLs | Fast simple serving | Failed restrictions can disclose old text |
+| ❌ Treat suggestions/counts as harmless | Easy global caching | Hidden content can leak through metadata |
 
-search_errors_total counter with error_code label.
+> “I would not call the system privacy-aware just because the main query has a filter. I would trace every field that leaves the service, including snippets, counts, suggestions, and mutation responses.”
 
-**Frontend Metrics (Analytics):**
+## 🔍 Deep Dive 3: Reliable Writes and a Bounded Reading Experience — 9 minutes
 
-trackSearchMetrics sends: query_id, result_count, latency_ms, has_filters, is_cached.
+### Separate durable acceptance from search visibility
 
-trackSearchInteraction sends event with data, timestamp, session_id.
+The author saves a post while Elasticsearch is unavailable. If SQL commits first and the
+request then reports failure, a retry may create another post. If the request reports
+success without durable repair work, the post can remain missing from search.
 
-Usage example: result_clicked event with query, result_position, result_id.
+The proposed transaction includes source state, an actor-scoped operation receipt, a
+monotonic revision, and an outbox event. The client receives canonical acceptance and can
+distinguish it from index progress.
 
----
+A timeout is an unknown outcome, not proof of failure. Retry the same operation ID or read
+its result; do not generate a new content operation blindly. An idempotent ES document ID
+cannot deduplicate two different SQL post IDs.
 
-### 7. Future Enhancements
+Workers apply revisions monotonically and inspect individual bulk results. A stale event
+cannot overwrite a newer private audience, and a delayed update cannot resurrect a deleted
+post. Deletions need durable tombstones or equivalent retained version state.
 
-1. **Real-time Updates**: WebSocket for new matching posts while viewing results
-2. **Federated Search**: Extend to photos, events, groups with unified ranking
-3. **Query Rewriting**: ML-based query expansion and correction
-4. **Personalized Suggestions**: User-specific typeahead based on history and graph
-5. **Offline Search**: Service worker caching for recent queries
-6. **A/B Testing Framework**: Compare ranking algorithms with holdout groups
-7. **Search Analytics Dashboard**: Query trends, zero-result analysis, CTR by position
+For a rebuild, create a new index generation, backfill at a defined boundary, catch up
+changes/deletions, validate coverage, and then switch the read alias. Existing search
+sessions need bounded overlap or an explicit reset. A bulk upsert of current rows does not
+remove orphan index documents.
+
+### The frontend shows meaningful progress, not guessed success
+
+The first search UI need not include a full composer. If post editing is added, show saved
+state from its durable receipt and a separate indexing status when relevant. A user can
+understand “saved, becoming searchable” better than an ambiguous failed save that actually
+committed.
+
+When results later arrive, keep post metadata identity separate from query-specific
+snippets. The same post can appear in several searches with different match context; one
+global snippet field would overwrite the meaning of another page.
+
+Current content versions matter for rendering as well. Do not combine newly edited text
+with old highlight offsets. Revalidate or omit a stale result until a consistent
+authorized representation is available.
+
+### Bound resources through the full journey
+
+Start with twenty ordinary text cards and explicit Load More. Add virtualization if
+measured accumulated-card work justifies it. Windowing limits mounted DOM, while a
+separate page/cache budget limits retained data.
+
+| Resource | Initial policy |
+|----------|----------------|
+| Result pages | Five pages near the reading anchor, reload within a valid session |
+| Private cache | Small account-scoped in-memory budget |
+| Suggestions | Current options, short debounce, cancel stale work |
+| Media previews if added | Known dimensions, responsive sources, lazy loading |
+| PITs | Short idle lifetime and bounded total session age |
+| Bulk writes | Bounded batch size with item-level retry state |
+
+If media previews are added, text remains useful when an image fails. Reserve aspect
+ratios before loading and limit concurrent media work. The local result UI displays type
+icons; it does not render uploaded photos or video players.
+
+On opening a future detail route, retain committed intent, compatible page references,
+result anchor, and offset. Back restores content after necessary access revalidation, not
+merely a pixel coordinate. Expired sessions rerun under the current viewer with an
+explicit reset.
+
+Virtualization changes keyboard and screen-reader behavior because off-screen rows leave
+the DOM. Keep a focused row within a small exception budget, or move focus deliberately
+before disposal. Do not retain every previously focused row indefinitely.
+
+| Choice | Why it fits | Trade-off |
+|--------|-------------|-----------|
+| ✅ Durable receipt/outbox | Saved work survives lost replies and ES outages | Worker/storage operations and search lag |
+| ✅ Versioned projection and rebuild generation | Older work cannot regress newer state | Tombstone and catch-up lifecycle |
+| ✅ Bounded pages and content anchor | Stable resource use and useful Back behavior | Page reload and remeasurement |
+| ❌ Inline indexing plus unlimited retained results | Easy demo path | Ambiguous saves and growing resources |
+
+## 🧪 Contracts and Verification — 5 minutes
+
+The API contract should be small enough to explain on a whiteboard:
+
+| Contract | Essential information |
+|----------|------------------------|
+| Search request | Query, committed filters, opaque cursor; identity from auth |
+| Search page | Search/session identity, ordered results, expiry, continuation/partial state |
+| Result | Post ID, authorized revision, snippet fragments, action hints |
+| Suggestion | Stable option ID, type/scope, label, committed action |
+| Mutation receipt | Operation ID, canonical result, index-progress distinction |
+| Failure | Invalid intent, unavailable dependency, permission change, or session expiry |
+
+Validate network input at runtime: field types, bounded strings/arrays, enum values,
+dates, and positive integer limits. Define date boundaries and timezone semantics
+explicitly rather than letting browser dates and backend parsing disagree.
+
+Tests should span the boundary where the failure occurs:
+
+1. Reorder search replies while changing accounts; old state must not commit.
+2. Edit filters before Apply, then Load More; the cursor stays with committed intent.
+3. Restrict a post while ES is unavailable; old indexed text is denied.
+4. Retry a saved post after a lost reply; one canonical content operation exists.
+5. Fail one item in a bulk response; the reported repair state names the missing work.
+6. Send an old update after deletion; it cannot resurrect content.
+7. Return hostile snippet text or wrong highlight ranges; rendering stays safe.
+8. Open Back after PIT expiry; the user sees a clear restart.
+
+Use isolated state/contract tests for races and real dependency tests for indexing,
+versioning, and query semantics. A login form render and generic main element do not prove
+authenticated search or admin authorization.
+
+Observe accepted-write latency, index lag, partial failures, unauthorized/stale candidates
+dropped, session resets, request races, and first useful rendered content. A high cache
+hit rate can coexist with stale privacy or incomplete results.
+
+A circuit breaker must allow a recovery probe, and its timeout must connect to
+cancellation or bounded in-flight work. A health check should describe usable capability,
+not report all search paths ready merely because SQL responds.
+
+## 📝 Close and Local Boundary — 2 minutes
+
+> “The browser preserves committed intent and accepts only matching responses. The server provides stable retrieval with current authorization, while durable versioned indexing keeps accepted changes recoverable. Those contracts are more important than adding more caching layers.”
+
+The local implementation has React search/admin views, SQL/Redis sessions, visibility
+tokens, one ES ranking query, synchronous indexing, and an offset cursor. It has no shared
+request schema, PIT, outbox, revision protocol, safe snippet structure, frontend
+virtualizer, or live channel.
+
+Current gaps include stale request/filter state, retained data across logout, raw HTML
+snippets, prefix-only suggestion caches, inconsistent post permissions, and SQL/index
+split failures. Admin health expects a different response shape, and reindex success
+ignores bulk item failures.
+
+The [architecture](./architecture.md#implementation-notes) links those findings to source;
+the [README](./README.md) explains the two fixtures and setup. The review ran isolated
+source checks, not the full stack or a production benchmark.

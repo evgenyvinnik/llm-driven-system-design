@@ -1,544 +1,401 @@
-# Airbnb - System Design Answer (Backend Focus)
+# Airbnb — Backend System Design
 
-*45-minute system design interview format - Backend Engineer Position*
+*A 45-minute discussion of geographic discovery, inventory consistency and recovery.*
 
----
+This answer proposes a production marketplace backend. The local application has
+one Express API and a smaller feature set; [architecture.md](./architecture.md)
+records its actual behavior, including incomplete concurrency and worker guarantees.
 
-## 📋 Problem Statement
+## 📋 Establish the scope and invariants — 4 minutes
 
-Design the backend infrastructure for a property rental marketplace like Airbnb, focusing on geographic search, availability calendars, double-booking prevention, and two-sided reviews.
+> “I would concentrate on finding a suitable property and committing a reservation.
+> Search can tolerate some staleness. A booking cannot allocate the same property
+> to two parties for overlapping nights.”
 
----
+The product supports guests searching by area, dates, party size and attributes.
+Hosts manage listing information and calendar rules. Reservations can be immediate
+or pending host approval, and either participant can cancel according to policy.
 
-## 🎯 Requirements Clarification
+I would clarify whether one listing represents one independently bookable property.
+For this design, it does. A hotel selling twenty interchangeable rooms would require
+a quantity-based inventory model, which changes the central constraint.
 
-### Functional Requirements
-| Feature | Description |
-|---------|-------------|
-| Listings | Hosts create properties with photos, amenities, pricing |
-| Search | Geographic + availability + filter-based discovery |
-| Booking | Reservations with double-booking prevention |
-| Reviews | Two-sided ratings (host and guest) |
+I would include messaging and completed-stay reviews at the boundary, but spend
+most time on three difficult decisions: protecting inventory, retrieving candidates,
+and recovering work across failures.
 
-### Non-Functional Requirements
-| Requirement | Target |
-|-------------|--------|
-| Availability | 99.9% for search |
-| Consistency | Strong for bookings (no double-booking) |
-| Latency | < 200ms for search results |
-| Scale | 10M listings, 1M bookings/day, 50M daily searches |
+The invariants I would write on the board are:
 
----
+1. Active reservations for one property do not occupy overlapping nights.
+2. Every inventory mutation follows the same authoritative concurrency protocol.
+3. A retried client operation converges to one durable booking outcome.
+4. Losing a notification does not erase a booking; recovery can find undelivered work.
 
-## 🏗️ High-Level Architecture
+For sizing, assume ten million listings, a peak of ten thousand searches per second
+and a peak of one hundred booking attempts per second. These are interview assumptions.
+Traffic and contention will be concentrated in popular destinations and properties.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway / Load Balancer                   │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Listing Service│    │Booking Service│    │ Search Service│
-│               │    │               │    │               │
-│ - CRUD        │    │ - Reserve     │    │ - Geo search  │
-│ - Calendar    │    │ - Payment     │    │ - Availability│
-│ - Pricing     │    │ - Cancellation│    │ - Ranking     │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                  │
-├─────────────────┬────────────────┬──────────────────────────────┤
-│   PostgreSQL    │     Valkey     │        RabbitMQ              │
-│   + PostGIS     │   (Cache)      │   (Async Events)             │
-└─────────────────┴────────────────┴──────────────────────────────┘
-```
+I would target search p95 below 500 ms and a database booking decision below one
+second at p99. Payment-provider and host-response time are separate measurements.
 
----
-
-## 📅 Deep Dive: Availability Calendar Storage
-
-### The Storage Problem
-
-10M listings with 365 days/year creates massive storage requirements:
-
-| Approach | Calculation | Total Rows |
-|----------|-------------|------------|
-| Day-by-day | 10M × 365 days | 3.65 billion |
-| Date ranges | 10M × ~20 blocks | 200 million |
-
-**Result:** Date ranges provide **18x storage reduction**
-
-### Date Range Storage Model
+## 🏗️ Architecture and ownership — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    availability_blocks table                     │
-├─────────────────────────────────────────────────────────────────┤
-│ id | listing_id | start_date | end_date | status | price | booking_id │
-├────┼────────────┼────────────┼──────────┼────────┼───────┼────────────┤
-│ 1  │ 42         │ 2025-06-01 │ 2025-06-15│available│ $150 │ NULL      │
-│ 2  │ 42         │ 2025-06-15 │ 2025-06-20│ booked │ $150 │ 789       │
-│ 3  │ 42         │ 2025-06-20 │ 2025-07-01│available│ $175 │ NULL      │
-│ 4  │ 42         │ 2025-07-04 │ 2025-07-08│ blocked│ NULL │ NULL      │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────┐       ┌──────────────────────┐       ┌─────────────────┐
+│ Web / Mobile │──────▶│ API / authentication │──────▶│ Search service  │
+└──────────────┘       └──────────┬───────────┘       └────────┬────────┘
+                                 │                            ▼
+                       ┌─────────▼───────────┐       ┌─────────────────┐
+                       │ Booking / inventory │       │ Search views    │
+                       │ authority           │       │ and caches      │
+                       └─────────┬───────────┘       └────────▲────────┘
+                                 ▼                            │
+                       ┌─────────────────────┐       ┌────────┴────────┐
+                       │ Database + outbox   │──────▶│ Broker / workers│
+                       └─────────────────────┘       └─────────────────┘
 ```
 
-**Status values:** available, blocked, booked
-
-### Availability Check Logic
-
-```
-Query: Are dates Jun 16-18 available for listing 42?
-
-Check: Any blocks with status != 'available'
-       WHERE (start_date, end_date) OVERLAPS (Jun 16, Jun 18)?
-
-Result: Block #2 (Jun 15-20, booked) overlaps → NOT AVAILABLE
-```
-
-### Calendar Update with Overlap Handling
-
-When host updates availability, existing blocks may overlap:
-
-```
-Before: [───── available Jun 1-30 ─────]
-
-Host blocks Jun 10-15:
-
-After:  [avail Jun 1-10][blocked Jun 10-15][avail Jun 15-30]
-
-Steps:
-1. Find overlapping blocks → Original Jun 1-30 block
-2. Split before → Create Jun 1-10 available block
-3. Split after → Create Jun 15-30 available block
-4. Delete original → Remove Jun 1-30 block
-5. Insert new → Create Jun 10-15 blocked block
-```
+The booking authority owns occupied intervals and booking transitions. Search owns
+retrieval and ranking, but it does not own the decision that dates are still free.
+Listing information, messaging and reviews can begin as modules beside booking.
+
+I would initially use PostgreSQL with PostGIS for relational and geographic queries.
+A modular application is sufficient before deployment or load requires separation.
+The diagram identifies responsibilities, not an obligation to deploy every box.
+
+Public images live in object storage behind a CDN. Redis can hold sessions and
+public read caches. Neither an image service outage nor an analytics backlog should
+prevent an otherwise valid booking database transaction.
 
-All operations run in a single database transaction.
+A normal booking request is short:
 
-### Storage Alternatives
+1. Authenticate and validate the requested listing, dates, guests and quote.
+2. Resolve the client operation identity.
+3. Lock the property and recheck authoritative inventory and state.
+4. Write the booking, occupied interval, operation result and outbox event.
+5. Commit, return the booking identity, and deliver downstream work asynchronously.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Date ranges | 18x less storage, efficient range queries | Complex split/merge logic |
-| ❌ Day-by-day rows | Simple updates | 3.65B rows, slow queries |
+I would keep external HTTP calls outside this transaction. Holding a database lock
+while waiting for a processor or email service turns their latency into inventory
+contention and consumes database connections.
 
----
+## 💾 Data model and API boundaries — 4 minutes
+
+| Record | Key information | Important rule |
+|--------|-----------------|----------------|
+| Listing | Host, geographic point, capacity, status and stay rules | One independent inventory owner |
+| Host rule | Listing, date interval, availability or price rule | Preserve unaffected intervals when edited |
+| Occupancy | Listing, stay interval, booking/hold identity and state | No overlapping active occupancy |
+| Booking | Guest, listing, dates, status, amount, currency and version | Explicit legal state transitions |
+| Operation | Actor, key, request fingerprint and booking result | Unique actor/operation identity |
+| Outbox event | Event ID, aggregate ID, version, payload and delivery state | Written with the business change |
+| Consumer receipt | Consumer name and event ID | Deduplicated within that consumer's transaction |
 
-## 🌍 Deep Dive: Geographic Search with PostGIS
+Dates are civil dates in the property's calendar. A September 10–12 stay occupies
+the 10th and 11th; another guest can arrive on the 12th. I would make checkout
+exclusive throughout storage, APIs and the calendar UI.
 
-### PostGIS Spatial Data
+Price snapshots include explicit currency and component amounts. Later listing
+changes do not rewrite an agreed booking price. A quote has an identity and expiry,
+but it is not an inventory reservation unless a hold is explicitly created.
 
-Each listing stores location as a GEOGRAPHY point (WGS84).
+| API operation | Contract |
+|---------------|----------|
+| Search listings | Bounded geographic/filter query and continuation |
+| Read calendar / quote | Current rules, available range and itemized price |
+| Create reservation | Quote or validated inputs plus idempotency key |
+| Read operation / booking | Recover durable identity and latest state |
+| Respond / cancel / expire | Expected state/version and authorized transition |
+| Update host rules | Intended interval change and conflict detection |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       listings table                             │
-├─────────────────────────────────────────────────────────────────┤
-│ id | host_id | title | location (GEOGRAPHY) | amenities | price │
-├────┼─────────┼───────┼──────────────────────┼───────────┼───────┤
-│ 42 │ 101     │ Cozy..│ POINT(-122.4, 37.8) │ [wifi,...]│ $150  │
-└─────────────────────────────────────────────────────────────────┘
-
-Index: GIST spatial index on location column
-```
+These are logical contracts. I would agree on typed validation, conflict, unavailable
+and pending responses before detailing every endpoint or request field.
 
-### Radius Search Query Flow
-
-```
-User searches: "San Francisco, 25km radius"
-
-┌─────────────┐     ┌─────────────────────────────────┐
-│ Search API  │────▶│ PostGIS: ST_DWithin(location,   │
-│             │     │   search_center, 25000 meters)  │
-└─────────────┘     └─────────────────────────────────┘
-                                    │
-                                    ▼
-                    Uses GIST index for O(log n) lookup
-                    Returns listings within 25km circle
-```
-
-### Combined Search Pipeline
-
-```
-Step 1: Geographic Filter (fast, uses spatial index)
-        ┌───────────────────────────────────────┐
-        │ 10M listings → 500 within 25km radius │
-        └───────────────────────────────────────┘
-                          │
-                          ▼
-Step 2: Attribute Filter (guests, price, amenities)
-        ┌───────────────────────────────────────┐
-        │ 500 listings → 200 match filters      │
-        └───────────────────────────────────────┘
-                          │
-                          ▼
-Step 3: Availability Filter (exclude booked dates)
-        ┌───────────────────────────────────────┐
-        │ 200 listings → 150 available          │
-        └───────────────────────────────────────┘
-                          │
-                          ▼
-Step 4: Rank and Paginate
-        ┌───────────────────────────────────────┐
-        │ 150 listings → Top 20 by score        │
-        └───────────────────────────────────────┘
-```
-
-### Search Ranking Factors
-
-| Factor | Weight | Rationale |
-|--------|--------|-----------|
-| Distance to search center | High | Relevance to location |
-| Rating + review count | Medium | Quality signal and social proof |
-| Price match to budget | Medium | Affordability |
-| Instant book enabled | Bonus | Conversion optimization |
-
-### Geo Search Alternatives
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ PostGIS | Single DB, GIST index, accurate distance | Limited to PostgreSQL |
-| ❌ Elasticsearch geo | Full-text + geo, facets | Sync complexity |
-| ❌ Geohash grid | Simple, cache-friendly | Less accurate at edges |
-
----
-
-## 🔒 Deep Dive: Double-Booking Prevention
-
-### The Concurrency Problem
-
-Two users try to book the same dates simultaneously:
-
-```
-Without Protection:
-
-User A ──▶ Check availability ──▶ Available! ──▶ Create booking ──▶ ✓
-User B ──▶ Check availability ──▶ Available! ──▶ Create booking ──▶ ✓
-
-Result: BOTH bookings succeed! Double-booking occurs.
-```
-
-### Solution: Transaction with Row-Level Lock
-
-```
-With FOR UPDATE Lock:
-
-User A ─┬─▶ BEGIN TRANSACTION
-        │   Lock listing row (FOR UPDATE)
-        │   Check availability → Available
-        │   Create booking
-        │   Insert availability block
-        │   COMMIT
-        │
-User B ─┼─▶ BEGIN TRANSACTION
-        │   Try to lock listing row → WAITS...
-        │                              │
-        ◀──────────────────────────────┘
-        │   Lock acquired
-        │   Check availability → BOOKED (User A's block exists)
-        │   ROLLBACK with "Dates no longer available" error
-```
-
-### Booking Creation Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Booking Service                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. BEGIN TRANSACTION                                            │
-│     │                                                            │
-│  2. SELECT * FROM listings WHERE id = ? FOR UPDATE               │
-│     │  (Acquire exclusive row lock)                              │
-│     │                                                            │
-│  3. Check availability_blocks for conflicts                      │
-│     │  WHERE status = 'booked'                                   │
-│     │  AND (start_date, end_date) OVERLAPS (check_in, check_out) │
-│     │                                                            │
-│  4. IF conflicts exist → ROLLBACK with error                     │
-│     │                                                            │
-│  5. INSERT INTO bookings (listing_id, guest_id, dates, status)   │
-│     │                                                            │
-│  6. INSERT INTO availability_blocks (listing_id, dates, 'booked')│
-│     │                                                            │
-│  7. COMMIT                                                       │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Instant Book vs Request to Book
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                    Booking Initiation                             │
-└───────────────────────────────────────────────────────────────────┘
-                          │
-         ┌────────────────┴────────────────┐
-         ▼                                 ▼
-┌─────────────────────┐         ┌─────────────────────┐
-│ Instant Book = TRUE │         │ Instant Book = FALSE│
-├─────────────────────┤         ├─────────────────────┤
-│ Create confirmed    │         │ Create pending      │
-│ booking immediately │         │ booking request     │
-│                     │         │                     │
-│ Process payment     │         │ Notify host         │
-│                     │         │                     │
-│ Publish event:      │         │ Schedule 24h expiry │
-│ booking.created     │         │                     │
-│                     │         │ Host approves →     │
-│ Guest confirmed     │         │ Process booking     │
-└─────────────────────┘         └─────────────────────┘
-```
-
-### Lock Strategy Alternatives
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Row-level lock (FOR UPDATE) | Simple, single DB | Blocks concurrent readers |
-| ❌ Distributed lock (Redis) | Scales beyond single DB | Additional complexity |
-| ❌ Optimistic locking (version) | No blocking | Retry storms under contention |
-
----
-
-## ⭐ Deep Dive: Two-Sided Review System
-
-### The Trust Problem
-
-Reviews need retaliation protection: hide reviews until BOTH parties submit, so neither party can see the other's review before writing their own.
-
-### Review Data Model
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       reviews table                              │
-├─────────────────────────────────────────────────────────────────┤
-│ id | booking_id | author_type | rating | sub_ratings | is_public │
-├────┼────────────┼─────────────┼────────┼─────────────┼───────────┤
-│ 1  │ 789        │ guest       │ 4      │ {clean:5,..}│ FALSE     │
-│ 2  │ 789        │ host        │ 5      │ {comm:5,..} │ FALSE     │
-└─────────────────────────────────────────────────────────────────┘
-
-Sub-ratings: cleanliness, communication, location, value (guest)
-             communication, cleanliness, house_rules (host)
-```
-
-### Hidden Until Both Submit Flow
-
-```
-Timeline for booking #789:
-
-Day 1: Checkout complete
-       │
-Day 5: Guest submits review (rating: 4 stars)
-       └─▶ is_public = FALSE (host hasn't reviewed yet)
-       └─▶ API returns: "Review submitted. Visible after host reviews."
-       │
-Day 8: Host submits review (rating: 5 stars)
-       └─▶ Database trigger fires:
-           - Count reviews for booking #789 = 2 (both types)
-           - UPDATE reviews SET is_public = TRUE WHERE booking_id = 789
-       └─▶ Both reviews now visible to everyone
-       │
-       └─▶ Rating aggregation trigger:
-           - Recalculate listing average rating
-           - Update listing.rating and listing.review_count
-```
-
-### Database Triggers
-
-```
-Trigger 1: check_and_publish_reviews
-├── Fires: AFTER INSERT on reviews
-├── Logic: IF COUNT(DISTINCT author_type) = 2 for booking
-│          THEN SET is_public = TRUE for both reviews
-└── Purpose: Atomically reveal both reviews together
-
-Trigger 2: update_listing_rating
-├── Fires: AFTER UPDATE of is_public on reviews
-├── Logic: IF is_public = TRUE AND author_type = 'guest'
-│          THEN recalculate listing.rating as AVG(all public guest ratings)
-│          AND update listing.review_count
-└── Purpose: Keep denormalized rating accurate
-```
-
-### Review Window Rules
-
-Review window opens at checkout and closes 14 days later. Reviews become public when both submit OR the window closes (whichever first). Only public guest reviews count toward listing ratings.
-
----
-
-## 💾 Deep Dive: Caching Strategy
-
-### Cache Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CDN (CloudFront)                         │
-│     Static assets, listing images, search result pages          │
-│     TTL: 1 hour for images, 5 min for search pages              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       Valkey/Redis Cluster                       │
-│     Session cache, listing details, availability snapshots      │
-│     TTL: 15 min listing, 1 min availability, 24h sessions       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   PostgreSQL + PostGIS                           │
-│                 Source of truth for all data                     │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Cache-Aside Pattern
-
-```
-Get Listing Details:
-
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│   Client    │────▶│ Listing API  │────▶│   Valkey    │
-└─────────────┘     └──────────────┘     └─────────────┘
-                           │                    │
-                           │  Cache hit? ◀──────┤
-                           │      │             │
-                    Yes ◀──┤      │ No          │
-                           │      │             │
-                           │      ▼             │
-                           │ ┌─────────────┐    │
-                           │ │ PostgreSQL  │    │
-                           │ └─────────────┘    │
-                           │      │             │
-                           │      │ Set cache ──▶
-                           │      │ (TTL: 15min)│
-                           │      │             │
-                           ▼      ▼             │
-                    Return listing data         │
-```
-
-### Cache Invalidation Strategy
-
-```
-On Listing Update:
-├── Delete listing:{id} from cache
-├── Compute geohash of listing location (4-char precision)
-└── Delete search:{geohash}:* keys (invalidate nearby search results)
-
-On Booking Created:
-├── Delete availability:{listing_id} from cache
-└── Publish booking:created event (notify other services)
-```
-
-### TTL Strategy by Data Type
-
-| Data Type | TTL | Rationale |
-|-----------|-----|-----------|
-| Listing details | 15 min | Property details change infrequently |
-| Availability | 1 min | Must be fresh to prevent conflicts |
-| Search results | 5 min | Slightly stale is acceptable |
-| User sessions | 24 hours | Long-lived authentication |
-
----
-
-## 📨 Deep Dive: Async Processing with RabbitMQ
-
-### Queue Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       API Services                               │
-│            Listing / Booking / Search / Review                   │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     RabbitMQ Exchange                            │
-│                    (Topic Exchange)                              │
-├─────────────────┬─────────────────┬─────────────────────────────┤
-│ booking.created │ listing.updated │ notification.send            │
-│ booking.cancel  │ review.submitted│ search.reindex               │
-└─────────────────┴─────────────────┴─────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Notification  │    │ Search Index  │    │  Analytics    │
-│   Worker      │    │   Worker      │    │   Worker      │
-└───────────────┘    └───────────────┘    └───────────────┘
-```
-
-Each event message contains an eventId (UUID), eventType (e.g., "booking.created"), timestamp, and a data payload with relevant IDs and dates.
-
-### Idempotent Consumer Pattern
-
-```
-Worker receives message:
-
-1. Extract eventId from message
-        │
-2. Check Redis: processed:{eventId} exists?
-        │
-   ┌────┴────┐
-   │         │
-  Yes       No
-   │         │
-   ▼         ▼
- ACK msg   Process message
-(skip)          │
-                ▼
-           Set Redis key: processed:{eventId} = 1
-           (TTL: 7 days)
-                │
-                ▼
-           ACK message
-```
-
-### Retry and Dead Letter Queue
-
-Messages retry up to 3 times with incrementing retry count headers. After 3 failures, messages route to a Dead Letter Queue (DLQ) for manual investigation.
-
----
-
-## 📊 Observability
-
-### SLI/SLO Definitions
-
-| SLI | SLO Target | Alert Threshold |
-|-----|------------|-----------------|
-| Availability (success / total) | 99.9% | < 99.5% for 5 min |
-| Search Latency (p95) | < 200ms | > 500ms for 5 min |
-| Booking Latency (p95) | < 1s | > 2s for 5 min |
-| Double-Booking Rate | 0% | > 0 in 1 hour |
-
-Key Prometheus metrics: `http_request_duration_seconds` (histogram), `bookings_total` (counter by status), `search_latency_seconds` (histogram), `cache_hit_ratio` (gauge).
-
-### Distributed Tracing Flow
-
-```
-Create Booking Request:
-
-[API Gateway] ──span──▶ [Booking Service] ──span──▶ [PostgreSQL]
-      │                        │
-      │                        └──span──▶ [Valkey Cache]
-      │
-      └──span──▶ [Notification Worker] ──span──▶ [Email Service]
-```
-
----
-
-## 📈 Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Calendar storage | ✅ Date ranges | ❌ Day-by-day | 18x storage reduction |
-| Geo search | ✅ PostGIS | ❌ Elasticsearch | Single database, no sync |
-| Double-booking prevention | ✅ Row lock | ❌ Distributed lock | Simpler with single DB |
-| Review visibility | ✅ Hidden until both | ❌ Immediate | Prevents retaliation |
-| Cache pattern | ✅ Cache-aside | ❌ Write-through | Simpler invalidation |
-| Message queue | ✅ RabbitMQ | ❌ Kafka | Sufficient for booking scale |
-| Tracing | ✅ OpenTelemetry | ❌ Zipkin | Vendor-neutral ecosystem |
+## 🔧 Deep dive: Protect the inventory through every transition — 10 minutes
 
+> “The important question is not whether booking creation uses a transaction.
+> It is whether every path that changes ownership preserves the same invariant.”
+
+### Why a preliminary availability check is insufficient
+
+Two guests can both read that a property is available before either writes a booking.
+If each inserts independently, both succeed. A transaction around each insert does
+not solve this unless the transactions actually conflict on a shared authority.
+
+I would lock the listing row, then check occupied intervals and write the reservation
+while holding that lock. Different listings can proceed concurrently; requests for
+one listing form a short serial sequence.
+
+Under this protocol, the second creator waits for the first, then observes its
+committed occupied interval and returns a conflict. The lock must precede the
+conflict read, and the read must use the owning database rather than a stale replica.
+
+A database exclusion constraint over active occupied ranges can provide an additional
+safety check. It is especially useful against a forgotten write path, but it does
+not define cancellation, expiry or host approval for us.
+
+### Follow the lifecycle, not only creation
+
+For instant booking, create a confirmed reservation and occupied interval together.
+For host approval, create a pending request that also occupies the dates under the
+policy chosen here. Give it a deadline so a silent host does not block inventory forever.
+
+Host acceptance, rejection, guest cancellation and expiry must lock the same listing,
+then read and validate the current booking state within the transaction. Use a
+consistent lock order so different operations do not deadlock unnecessarily.
+
+Consider this race:
+
+1. A host reads that a request is pending.
+2. The guest cancels, and the server releases the occupied interval.
+3. The host's delayed update changes the booking to confirmed by ID alone.
+4. Another guest books the apparently free interval.
+
+The first booking is now confirmed without inventory protection. This is why an
+unconditional update after an earlier state check is insufficient, even when creation
+itself is serialized correctly.
+
+With the shared protocol, the host rechecks after acquiring the lock. If cancellation
+won, acceptance returns a conflict and cannot resurrect the request. State checks
+and occupancy changes commit together.
+
+A background expiry job follows the same protocol. It cannot delete a block merely
+because an earlier query found an old pending request; that request may have been
+confirmed since the query ran.
+
+### Choose an availability representation
+
+I would separate booked occupancy from host pricing and availability rules. A host
+changing a nightly rate should not rewrite the records that establish a guest's claim.
+
+Intervals work well when many adjacent nights share a rule. To replace a rule for
+September 10–12 inside September 1–20, preserve September 1–10 and September 12–20.
+The boundaries touch; there is no missing night and no overlap.
+
+A day-by-day model makes individual nightly overrides and unique listing-night
+claims straightforward. It also creates many rows across a large future horizon
+and requires a multi-row transaction for every stay.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Intervals with one inventory authority | Compact repeated rules and one stay range | Careful range edits and lifecycle locking |
+| ❌ Precreate every listing-night by default | Simple per-night lookups and overrides | Large future inventory and multi-row writes |
+
+I would choose based on pricing granularity and measured query patterns. I would
+not claim a fixed storage reduction from intervals without knowing how fragmented
+host calendars become.
+
+### Concurrency trade-off
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Listing-scoped database serialization | One place to reason about all writers | Popular listings can queue; authority must be reachable |
+| ❌ Independent cached availability decisions | Fast reads close to users | Multiple writers can sell the same nights |
+
+Optimistic version checks are also viable if every operation checks the version
+and retries the complete decision. Under contention, they create failed work and
+retry pressure. I would start with short database locks for this modest write rate,
+then measure contention before introducing another coordination system.
+
+Admission limits and bounded lock waits protect a hot listing. No amount of scaling
+API instances makes one property divisible inventory. The expected response to a
+burst is a small number of decisions and clear conflicts, not unbounded waiting.
+
+## 🔧 Deep dive: Geographic search with an honest freshness boundary — 7 minutes
+
+> “I would optimize search for finding useful candidates, and then validate the
+> chosen property at commitment. Synchronizing every search view immediately is
+> expensive and still cannot reserve inventory for a browsing user.”
+
+### Start with the access pattern
+
+A query specifies a geographic area, guest count, dates and optional attributes.
+The spatial index narrows nearby active listings, then relational filters and
+occupied-range checks remove unsuitable candidates.
+
+For an initial system, PostgreSQL/PostGIS avoids a second synchronization pipeline.
+It can combine geographic filtering with host/listing data already stored there.
+That simplicity is useful while the team is still learning actual search behavior.
+
+I would inspect dense-city queries and combinations of amenities, price and dates.
+A spatial index does not guarantee that a broad radius, expensive count and complex
+sort will all be fast. Cap query size and use representative query plans.
+
+Use a deterministic tie-breaker in ordering. Cursor pagination should carry the
+query identity and sort position so a later page cannot be applied to changed dates.
+A live ranking can still move between requests; choose an explicit snapshot policy
+if stable exhaustive paging is a product requirement.
+
+### Cache complete queries, not partial identities
+
+A search key includes all normalized result-affecting fields: geographic area,
+dates, guests, filters, ordering and page. Truncating an encoded parameter string is
+not equivalent to hashing it; different later fields can disappear from the key.
+
+Personalized fields need their own scope. I would prefer a public candidate cache
+with personalized decoration rather than accidentally serving one user's private
+attributes in a shared response.
+
+Dates and availability change frequently, so date-specific cache lifetimes should
+be short or bypassed initially. A short TTL reduces ordinary staleness but does not
+eliminate the race between a search read and a later reservation.
+
+Invalidation also races with in-flight fills. An old database read can repopulate a
+key after a deletion. Versioned values, bounded TTL and authoritative booking checks
+each address different parts of this problem.
+
+### Introduce a projection when it earns its cost
+
+At the assumed peak, an independent search projection may be needed to keep discovery
+load away from booking transactions. Feed it through a recoverable event/change
+pipeline, attach versions, and measure how far behind it is.
+
+New listings may appear late, and deleted listings may remain briefly visible.
+Validate active status on detail/booking paths. If an indexed candidate becomes
+unavailable, return a clear conflict and preserve the guest's dates for alternatives.
+
+An unavailable search service is different from a successful empty search. A circuit
+breaker can stop repeated calls to a failing dependency, but its fallback must carry
+that degraded meaning through the API and UI.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ PostGIS first, independent projection when measured | Simple start with a clear growth path | Later indexing, repair and lag monitoring |
+| ❌ Immediate global synchronization for every search view | Fresher discovery in theory | Couples writes to many read systems without reserving dates |
+
+I would accept bounded stale discovery because users browse many candidates. I would
+not accept stale inventory at commitment because that creates contradictory bookings.
+This is a product-specific consistency boundary, not a blanket preference for
+strong or eventual consistency everywhere.
+
+## 🔧 Deep dive: Recover bookings and downstream work — 7 minutes
+
+> “There are two separate retry problems: a guest retrying a request whose response
+> was lost, and a worker receiving an event more than once. They need different
+> identities and different records.”
+
+### Recover the client operation
+
+The client creates an operation key before submission and reuses it after a timeout.
+The server scopes it to the actor and operation type, then stores a fingerprint of
+the request alongside the durable booking result.
+
+The same key and same payload return the original logical outcome. The same key
+with different dates or guests is a conflict. A database uniqueness rule makes
+concurrent requests converge rather than both creating independent reservations.
+
+If the transaction commits and the response disappears, operation lookup finds the
+booking. If the transaction rolls back, a retry can perform the work. A missing
+response alone cannot tell the client which case occurred.
+
+An operation record can retain its original result while the booking resource shows
+the latest state. For example, replaying a successful creation must not imply that
+a subsequently cancelled booking is still confirmed.
+
+### Close the database-to-broker gap
+
+Publishing after commit has a failure window: the API can die after writing the
+booking but before sending its event. Publishing before commit has the opposite
+problem: consumers can act on a booking that later rolls back.
+
+I would write an outbox event in the booking transaction. A relay publishes it with
+broker confirmation and marks delivery progress. Broker downtime grows a visible
+backlog while the committed booking remains queryable.
+
+If the relay crashes after broker acceptance but before updating the outbox, it may
+publish again. The event ID stays the same. Each consumer deduplicates independently;
+notification and analytics consumers must both be allowed to process that event.
+
+For a database consumer, write its receipt and effect in one transaction. A Redis
+read followed by a later marker write cannot atomically protect a separate database
+update, and one shared marker across consumers can suppress legitimate work.
+
+### Bound retries and handle ordering
+
+Persist an attempt count when republishing failed work, or use broker-supported
+retry routing with an observable counter. Requeuing the unchanged original message
+does not increment a custom retry header by itself.
+
+After a bounded number of attempts, route the message to a dead-letter queue that
+actually has a matching binding. Operators need a replay path after fixing the
+underlying issue, and replay must preserve event identity.
+
+Events can arrive out of order. A stale creation event must not recreate inventory
+after cancellation. Inventory remains owned by its synchronous authority; projections
+apply versions or rebuild current state rather than blindly replaying old actions.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Outbox plus consumer-scoped transactional receipts | Recoverable loss and duplicate delivery | Relay, backlog monitoring and replay tools |
+| ❌ Best-effort publish plus global cache marker | Fewer records and components | Lost events, duplicate effects or skipped consumers |
+
+External email and payment providers require their own idempotency or reconciliation
+support. A local receipt cannot make an external call and a database commit atomic.
+I would state that limit explicitly instead of promising universal exactly-once delivery.
+
+If payments are required, reserve a bounded hold, record the payment attempt and
+call the provider outside inventory locks. Reconcile uncertain outcomes. A late
+success after hold expiry requires compensation, not unconditional confirmation.
+
+## 🛡️ Security, reviews and operational failure — 4 minutes
+
+Authenticate with server-side sessions and enforce guest/host ownership on every
+resource operation. A caller being a host does not authorize editing another host's
+listing. Validate that supplied conversation and booking relationships match the caller.
+
+Keep exact property access details private until the chosen disclosure policy allows
+them. Uploaded files need ownership checks before durable acceptance, content limits,
+safe storage names and a cleanup lifecycle for abandoned uploads.
+
+For reviews, enforce one submission per booking and author role. Reveal according
+to a declared policy after both submissions or a deadline. The reveal decision needs
+serialization or repair so simultaneous submissions do not each miss the other.
+
+Operationally, I would distinguish dependency failure from business rejection:
+
+| Condition | Response |
+|-----------|----------|
+| Dates occupied | Conflict with recoverable user inputs |
+| Owning database unavailable | Reject/defer new booking decisions |
+| Search projection unavailable | Explicit degraded/unavailable search |
+| Notification backlog | Booking remains valid; delivery is delayed |
+| Payment outcome unknown | Persist uncertainty and reconcile before final transition |
+
+Monitor lock waits, conflicts, stale-state rejections, operation recovery, outbox age
+and dead letters. Booking value is not collected revenue; monetary metrics must
+state exactly which lifecycle event they represent.
+
+## 📈 Scale and validate the design — 4 minutes
+
+I would scale public reads and image delivery before splitting inventory ownership.
+At larger write volume, partition bookings and occupied intervals together by listing
+ID. A routing directory sends each listing's writes to its owning partition.
+
+Guest trip history then spans listing partitions. Build a user-oriented read view
+with a repairable update path rather than making the booking transaction fan out
+to every query model synchronously.
+
+Regional replicas improve browsing latency. During a network partition, a region
+that cannot reach a listing's authority cannot independently confirm its dates.
+Changing that requires an explicit ownership-transfer or consensus design.
+
+The highest-value validation uses real transactions and controlled failure points:
+
+1. Two guests reserve overlapping dates simultaneously.
+2. Adjacent checkout/check-in dates both succeed.
+3. Host acceptance races with cancellation and expiry.
+4. A host calendar edit races with a booking.
+5. Creation commits but its response is lost, then the client retries.
+6. An event is duplicated, reordered and replayed independently to two consumers.
+
+Mocked route tests are useful for HTTP contracts but cannot demonstrate database
+isolation, broker acknowledgements or restart recovery. I would test those boundaries
+with the actual infrastructure before claiming their guarantees.
+
+The local repository implements the creation lock, PostGIS queries and cache/queue
+helpers, but not the complete protocol described here. In particular, lifecycle
+races, date-query failures and incomplete workers remain documented implementation gaps.
+
+> “The scalable part is allowing different properties and read views to progress
+> independently. The correctness part is keeping each property's ownership decision
+> in one place and making every retry recover an identifiable outcome.”

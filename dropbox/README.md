@@ -1,242 +1,205 @@
-# Dropbox - Cloud Storage
+# Dropbox: cloud file storage learning project
 
-## Codebase Stats
+A React file browser backed by PostgreSQL metadata and content-addressed chunks in MinIO. It explores folder trees, uploads, version history, sharing, session authentication, and storage administration. This is a teaching implementation with incomplete transfer and permission guarantees; the production proposal is described separately in [architecture.md](./architecture.md).
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 10,575 |
-| Source Files | 71 |
-| .ts | 6,003 |
-| .tsx | 2,090 |
-| .md | 1,951 |
-| .sql | 184 |
-| .json | 164 |
+## What the current application provides
 
-## Overview
+| Area | Implemented behavior and limits |
+|------|---------------------------------|
+| File browser | Root and nested folders, breadcrumbs, list/grid views, selection, create, rename, move, and soft delete. Listings are unpaginated and not virtualized. |
+| Upload | Browser sends each entire file in one multipart request. Express splits it into 4 MiB chunks. The default multipart limit is **8 MiB per file**, including requests to the separate chunk API. |
+| Upload failure | With the default PostgreSQL parser, a storage metric receives a string and throws **after metadata commits**. The UI can show failure for a saved file. Refresh before retrying: completion has no idempotency guard. |
+| Download | Owner download reassembles all chunks into memory. No streaming or Range support. A file with no chunk rows returns an empty payload, including seeded sample files. |
+| Versions | Overwriting a name saves the previous manifest; history can be listed and restored as another version. Concurrent writes have no base-version conflict protocol. |
+| Public links | API creates links with optional passwords, expiry, and download limits. The copied link opens a JSON metadata endpoint; there is no public download-page UI. |
+| Folder sharing | Grant records and UI exist, but `/shared` fails because the token route shadows `shared-with-me`. Normal file operations also require ownership, so grants do not enable recipient browsing. |
+| Administration | Statistics, users, storage breakdown, deletion of another account, and manual cleanup. Counts are not reliable storage accounting; cleanup is not a complete garbage collector. |
+| Notifications | Server-side WebSocket endpoint and Redis Pub/Sub exist. The browser does not connect to them; no durable replay or offline sync is implemented. |
 
-A cloud file storage and synchronization service with file chunking, deduplication, versioning, and sharing capabilities.
+Settings displays account and quota information. Its change-password and delete-account buttons have no actions. There is no desktop sync agent, trash recovery interface, file preview, resumable browser queue, or folder upload workflow.
 
-## Key Features
+The source audit in [Implementation Notes](./architecture.md#implementation-notes) explains these limitations and the relevant files. No application fixes are implied by this documentation review.
 
-- File upload/download with chunking support
-- Folder hierarchy and navigation
-- File versioning with restore capability
-- Share files via public links (with password, expiration, download limits)
-- Share folders with specific users (view/edit permissions)
-- Sync status tracking
-- Admin dashboard with system stats and deduplication metrics
-- Real-time sync notifications via WebSocket
+## Stack and source map
 
-## Implementation Status
+| Layer | Technology | Start reading |
+|-------|------------|---------------|
+| Frontend | React 19, TypeScript, Vite 6, TanStack Router, Zustand, Tailwind, react-dropzone | [Routes](./frontend/src/routes/index.tsx), [file store](./frontend/src/stores/fileStore.ts), [API](./frontend/src/services/api.ts) |
+| Backend | Node.js, Express 4, TypeScript/tsx, ws | [Entry point](./backend/src/index.ts), [file routes](./backend/src/routes/files.ts) |
+| Metadata | PostgreSQL 16 | [Schema](./backend/src/db/init.sql), [file services](./backend/src/services/file/index.ts) |
+| Sessions and notification fanout | Valkey 7 through ioredis | [Redis adapter](./backend/src/utils/redis.ts) |
+| Chunk objects | MinIO through the AWS S3 SDK | [Storage adapter](./backend/src/utils/storage.ts) |
+| Diagnostics | Pino, prom-client, Cockatiel | [Shared modules](./backend/src/shared/metrics.ts) |
 
-- [x] Initial architecture design
-- [x] Core functionality implementation
-- [x] Database/Storage layer (PostgreSQL + MinIO)
-- [x] API endpoints
-- [x] Frontend file browser
-- [ ] Testing
-- [ ] Performance optimization
-- [ ] Desktop sync client
+There is one API process, with optional instances on different ports. There is no RabbitMQ service, sync worker, load balancer, Prometheus server, or Grafana configuration in this project.
 
-## Tech Stack
+## Prerequisites
 
-**Backend:**
-- Node.js + Express + TypeScript
-- PostgreSQL for metadata
-- MinIO (S3-compatible) for file chunks
-- Redis for sessions and caching
+Use Node.js **20 or newer**, npm, and either Docker Compose or native infrastructure. Commands below start in the repository root unless a directory change is shown. Stop other learning projects that occupy these ports.
 
-**Frontend:**
-- React 19 + TypeScript
-- Vite
-- TanStack Router
-- Zustand for state management
-- Tailwind CSS
+| Port | Service |
+|------|---------|
+| 5173 | Vite frontend |
+| 3000 | Express HTTP and WebSocket server |
+| 3001–3003 | Optional alternative API instances |
+| 5432 | PostgreSQL |
+| 6379 | Valkey |
+| 9000 | MinIO S3 API |
+| 9001 | MinIO console |
 
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- Docker and Docker Compose
-- npm or yarn
-
-### Option 1: Using Docker (Recommended)
-
-Start all infrastructure services:
+## Option A: Docker Compose (recommended)
 
 ```bash
-# Start PostgreSQL, Redis, and MinIO
-docker-compose up -d
-
-# Wait for services to be ready (about 30 seconds)
+cd dropbox
+docker compose up -d
+docker compose ps
+docker compose logs minio-init
+docker compose exec postgres pg_isready -U dropbox -d dropbox
+docker compose exec redis redis-cli ping
+curl -f http://localhost:9000/minio/health/live
 ```
 
-MinIO Console will be available at http://localhost:9001 (login: minioadmin / minioadmin123)
+Compose initializes the schema only when the PostgreSQL volume is empty. It does not seed accounts or launch Node/Vite. The MinIO initializer creates `dropbox-chunks` and enables **anonymous download access to the bucket**. Known object keys can bypass application sharing checks; use local sample data. Its final `exit 0` can hide an earlier initialization failure, so inspect the logs.
 
-### Option 2: Native Services
+Seed once on a freshly initialized database:
 
-If you prefer running services natively:
-
-**PostgreSQL:**
 ```bash
-# Install PostgreSQL 16
-brew install postgresql@16  # macOS
-# or use your system's package manager
-
-# Create database
-createdb dropbox
-psql dropbox < backend/init.sql
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U dropbox -d dropbox < backend/db-seed/seed.sql
 ```
 
-**Redis:**
+The account inserts are not rerunnable: they fail on existing emails. Do not treat re-running the seed as a migration or reset.
+
+To stop infrastructure while keeping data:
+
 ```bash
-# Install Redis
-brew install redis  # macOS
-redis-server
+docker compose down
 ```
 
-**MinIO:**
+For an intentional reset, `docker compose down -v` removes this project's database, Valkey, and MinIO volumes. Start again and seed the new database afterward.
+
+## Option B: native installation (no Docker)
+
+Install PostgreSQL, Valkey, and MinIO using Homebrew. MinIO provides its own [official tap](https://github.com/minio/homebrew-stable).
+
 ```bash
-# Install MinIO
-brew install minio/stable/minio  # macOS
-
-# Run MinIO
-minio server ~/minio-data --console-address ":9001"
-
-# Create bucket using mc client
-mc alias set myminio http://localhost:9000 minioadmin minioadmin123
-mc mb myminio/dropbox-chunks
+brew install postgresql@16 valkey
+brew install minio/stable/minio minio/stable/mc
+brew services start postgresql@16
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+pg_isready
+valkey-cli ping
 ```
 
-### Installation
+Create the development role and database once, using your local PostgreSQL administrator account. In a fresh Homebrew installation this is normally your macOS account:
 
 ```bash
-# Install backend dependencies
-cd backend
-cp .env.example .env  # Configure if needed
+psql postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE dropbox LOGIN PASSWORD 'dropbox_password';"
+createdb -O dropbox dropbox
+cd dropbox
+PGPASSWORD=dropbox_password psql -h localhost -U dropbox -d dropbox -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+PGPASSWORD=dropbox_password psql -h localhost -U dropbox -d dropbox -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql
+```
+
+Start MinIO in a separate terminal and keep it running:
+
+```bash
+mkdir -p "$HOME/.local/share/dropbox-minio"
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin123 minio server "$HOME/.local/share/dropbox-minio" --console-address ':9001'
+```
+
+Create and verify the bucket in another terminal:
+
+```bash
+mc alias set dropbox-local http://localhost:9000 minioadmin minioadmin123
+mc mb --ignore-existing dropbox-local/dropbox-chunks
+mc anonymous set none dropbox-local/dropbox-chunks
+mc ls dropbox-local
+curl -f http://localhost:9000/minio/health/live
+```
+
+This native setup keeps the bucket private. Application SDK requests and presigned download URLs work with a private bucket; anonymous access is not required. The checked-in Compose initializer uses the different policy described above. Stop native infrastructure with `brew services stop postgresql@16`, `brew services stop valkey`, and Ctrl-C in the MinIO terminal.
+
+## Start the application
+
+Backend terminal, from the repository root:
+
+```bash
+cd dropbox/backend
 npm install
+npm run dev
+```
 
-# Install frontend dependencies
-cd ../frontend
+Frontend terminal, from the repository root:
+
+```bash
+cd dropbox/frontend
 npm install
+npm run dev
 ```
 
-### Running the Service
+Open [the file browser](http://localhost:5173). Vite proxies `/api` and `/ws` to port 3000; health and metrics are accessed directly on the backend.
 
-**Start the backend:**
+| Account | Password | Initial state |
+|---------|----------|---------------|
+| `admin@dropbox.local` | `password123` | Admin, 10 GiB quota, three folders and eleven sample file records |
+| `demo@dropbox.local` | `password123` | Regular user, 2 GiB quota, empty file browser |
+
+The login page and SQL comments show different passwords, but the seeded bcrypt hashes match **password123** for both accounts. Sample file records have fake content hashes and no stored chunks, history, or shares. They demonstrate navigation and do not contain downloadable sample documents.
+
+For a transfer experiment, use a small disposable file in the demo account. An upload may commit and then show an error because of the metric bug; refresh the folder to inspect the outcome. Do not use repeated upload attempts as a reliable retry or quota test.
+
+## Environment variables
+
+The backend reads the process environment directly. It **does not load `.env` automatically**. Defaults match Compose; no environment file is necessary for that setup. To use the supplied example, copy it to `.env`, review it, then explicitly export it in the backend terminal:
+
 ```bash
-cd backend
-npm run dev          # Single instance on port 3000
-# Or run multiple instances:
-npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
-npm run dev:server3  # Port 3003
+cp .env.example .env
+set -a
+source .env
+set +a
+npm run dev
 ```
 
-**Start the frontend:**
+| Variable | Default / meaning |
+|----------|-------------------|
+| `PORT` | `3000` |
+| `NODE_ENV` | Development behavior unless set to `production`; affects logs and secure cookie |
+| `FRONTEND_URL` | `http://localhost:5173`, allowed credentialed CORS origin |
+| `DATABASE_URL` | `postgres://dropbox:dropbox_password@localhost:5432/dropbox` |
+| `REDIS_URL` | `redis://localhost:6379` |
+| `MINIO_ENDPOINT` / `MINIO_PORT` | `localhost` / `9000`; hostname and port are separate |
+| `MINIO_USE_SSL` | `false`; enabled only by the literal `true` |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | `minioadmin` / `minioadmin123` |
+| `MINIO_BUCKET` | `dropbox-chunks` |
+| `SESSION_EXPIRY_HOURS` | `24` for Redis and SQL records; browser cookie remains fixed at 24 hours |
+| `CHUNK_SIZE` | `4194304` bytes; also sets multipart limit to twice this value; requires a positive integer |
+| `LOG_LEVEL` | `debug` outside production, `info` in production |
+
+`SESSION_SECRET` and `MAX_FILE_SIZE` appear in `.env.example` but are **unused**. Setting `MAX_FILE_SIZE` does not change the 8 MiB default limit. Storage quota arithmetic is unreliable because PostgreSQL BIGINT values are returned as strings and upload comparisons do not normalize them.
+
+## Verification and troubleshooting
+
 ```bash
-cd frontend
-npm run dev  # Runs on http://localhost:5173
+curl -f http://localhost:3000/health/live
+curl -f http://localhost:3000/health/ready
+curl -f http://localhost:3000/health/deep
+curl -f http://localhost:3000/metrics
 ```
 
-### Demo Accounts
+Liveness only checks the process. Readiness checks PostgreSQL and Redis; deep health also checks the MinIO bucket. These endpoints do not demonstrate successful uploads, sharing, restore, or correct accounting.
 
-After starting the services, you can log in with:
+Both application packages expose `npm run type-check`, `npm run build`, and `npm run lint`. There is no backend migration script: apply `init.sql` only to a fresh database. Backend `dev:server1`, `dev:server2`, and `dev:server3` bind 3001–3003; Vite still targets 3000 unless its proxy is changed. No balancing configuration is supplied.
 
-- **Admin:** admin@dropbox.local / password123
-- **User:** demo@dropbox.local / password123
+From the repository root, `node scripts/screenshots.mjs --start dropbox` uses the seeded admin account. `npm run test:smoke dropbox` expects the stack to be available, but the checked-in smoke helper uses unseeded `alice@example.com`. Its page-shell assertions do not verify file bytes or sharing. Project `npm run test:e2e` can start Vite; PostgreSQL, Valkey, MinIO, and the API must already be running.
 
-## API Endpoints
+This documentation review checked source, configuration, links, and isolated behavior with mocked dependencies. It did not start infrastructure, run a full build, or validate a browser session. See [the repository review record](../DOCUMENTATION_REVIEW.md#dropbox).
 
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
+## Design reading
 
-### Files
-- `GET /api/files/folder` - Get root folder contents
-- `GET /api/files/folder/:folderId` - Get folder contents
-- `POST /api/files/folder` - Create folder
-- `POST /api/files/upload` - Upload file (simple)
-- `POST /api/files/upload/init` - Initialize chunked upload
-- `POST /api/files/upload/chunk` - Upload chunk
-- `POST /api/files/upload/complete` - Complete upload
-- `GET /api/files/file/:fileId` - Get file info
-- `GET /api/files/file/:fileId/download` - Download file
-- `PATCH /api/files/file/:fileId/rename` - Rename file/folder
-- `PATCH /api/files/file/:fileId/move` - Move file/folder
-- `DELETE /api/files/file/:fileId` - Delete file/folder
-- `GET /api/files/file/:fileId/versions` - Get version history
-- `POST /api/files/file/:fileId/versions/:versionId/restore` - Restore version
+- [Architecture and exact local schema](./architecture.md)
+- [Frontend interview answer](./system-design-answer-frontend.md)
+- [Backend interview answer](./system-design-answer-backend.md)
+- [Fullstack interview answer](./system-design-answer-fullstack.md)
 
-### Sharing
-- `POST /api/share/link` - Create share link
-- `GET /api/share/links` - Get user's share links
-- `DELETE /api/share/link/:linkId` - Delete share link
-- `GET /api/share/:token` - Access shared file
-- `GET /api/share/:token/download` - Download shared file
-- `POST /api/share/folder` - Share folder with user
-- `GET /api/share/shared-with-me` - Get folders shared with me
-- `GET /api/share/folder/:folderId` - Get folder shares
-- `DELETE /api/share/folder/:folderId/:userId` - Remove folder share
-
-### Admin
-- `GET /api/admin/stats` - Get system statistics
-- `GET /api/admin/users` - Get all users
-- `GET /api/admin/users/:userId` - Get user details
-- `PATCH /api/admin/users/:userId/quota` - Update user quota
-- `DELETE /api/admin/users/:userId` - Delete user
-- `GET /api/admin/activity` - Get recent activity
-- `GET /api/admin/storage/breakdown` - Get storage by file type
-- `POST /api/admin/maintenance/cleanup` - Clean orphaned chunks
-
-## Architecture
-
-See [architecture.md](./architecture.md) for detailed system design documentation.
-
-### Key Design Decisions
-
-1. **File Chunking:** Files are split into 4MB chunks for:
-   - Resume interrupted uploads
-   - Deduplication across users
-   - Delta sync (only upload changed chunks)
-   - Parallel upload/download
-
-2. **Deduplication:** Chunks are identified by SHA-256 hash. Same content = same chunk stored once, saving storage.
-
-3. **Versioning:** Each file edit creates a new version. Old versions are preserved with their chunk references.
-
-4. **Storage Separation:**
-   - Metadata in PostgreSQL (fast queries, ACID)
-   - File chunks in MinIO (scalable object storage)
-   - Sessions in Redis (fast lookups, TTL)
-
-## Development Notes
-
-See [claude.md](./claude.md) for development insights and iteration history.
-
-## Future Enhancements
-
-- [ ] Desktop sync client with file system watcher
-- [ ] Content-defined chunking (Rabin fingerprinting)
-- [ ] End-to-end encryption option
-- [ ] File previews (images, PDFs, documents)
-- [ ] Search functionality
-- [ ] Trash/recycle bin
-- [ ] Team workspaces
-- [ ] Activity logs and audit trail
-- [ ] Bandwidth throttling
-- [ ] Conflict resolution for collaborative editing
-
-## References & Inspiration
-
-- [How We've Scaled Dropbox](https://dropbox.tech/infrastructure/how-weve-scaled-dropbox) - Dropbox engineering blog on scaling infrastructure
-- [Dropbox's Sync Engine Architecture](https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine) - Rewriting the heart of their sync engine in Rust
-- [Magic Pocket: Dropbox's Exabyte-Scale Blob Storage System](https://dropbox.tech/infrastructure/inside-the-magic-pocket) - How Dropbox built their own storage infrastructure
-- [Streaming File Synchronization](https://dropbox.tech/infrastructure/streaming-file-synchronization) - Efficient sync protocol design
-- [Rabin Fingerprinting](https://en.wikipedia.org/wiki/Rabin_fingerprint) - Content-defined chunking algorithm for deduplication
-- [Rsync Algorithm](https://rsync.samba.org/tech_report/) - Seminal paper on delta synchronization
-- [A Low-Bandwidth Network File System (LBFS)](https://pdos.csail.mit.edu/papers/lbfs:sosp01/lbfs.pdf) - MIT paper on content-based chunking
-- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book covering replication and consistency
+The interview answers propose a production system. They emphasize resumable transfers, explicit conflict handling, and authorized synchronization within a 45-minute discussion; they do not claim those guarantees exist in this demo.

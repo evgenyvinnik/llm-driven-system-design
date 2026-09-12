@@ -1,740 +1,370 @@
-# FaceTime - System Design Answer (Backend Focus)
+# FaceTime: Backend System Design Interview
 
-## 45-minute system design interview format - Backend Engineer Position
+## 🎯 Requirements and Scale — 5 minutes
 
----
+> “I’ll design the backend of a FaceTime-inspired calling service. I’ll separate call
+> control from media transport, because an accepted invitation and a working audio path are
+> different facts.”
 
-## Opening Statement (2 minutes)
+The initial product supports one-to-one audio/video calls, ringing all of an invited user’s
+devices, one answering device, call termination, and private call history. Group calling is
+a bounded extension through an SFU. I would defer recording, shared playback, effects, and
+device handoff until the control and recovery model is established.
 
-"Today I'll design FaceTime, Apple's real-time video calling system, from a backend perspective. The key backend challenges are implementing a scalable signaling server for call setup, handling NAT traversal with STUN/TURN infrastructure, building an SFU (Selective Forwarding Unit) for group calls that scales beyond peer-to-peer mesh topology, and ensuring end-to-end encryption while still enabling server-assisted routing. I'll focus on the WebRTC signaling protocol, ICE candidate exchange, and call state management."
+I would clarify the busy policy. For this answer, a user can have at most one accepted call,
+and Decline rejects the invitation for that user across devices. Dismissing only one
+device’s notification would be a separate action. These choices affect both the data model
+and concurrent acceptance behavior.
 
----
+| Requirement | Initial target or invariant |
+|-------------|-----------------------------|
+| Online ringing | p95 below two seconds from request to an online device’s ring |
+| Media setup | p95 below three seconds from acceptance to usable media |
+| Media delay | Aim below 200 ms one-way in a supported regional profile |
+| Control availability | Proposed 99.9% regional availability |
+| Device acceptance | At most one winning device per invited user/seat |
+| Retry behavior | One durable outcome for the same actor, operation ID, and body |
+| History and access | Only authorized participants can read or control their calls |
+| Group extension | Evaluate up to 32 participants with bounded subscriptions |
 
-## Step 1: Requirements Clarification (3 minutes)
+These targets exclude human response time and are not measurements of the repository. TURN
+improves connectivity but cannot promise success through every firewall or provider outage.
+I would also distinguish measured network RTT from total one-way media delay, which includes
+capture, encoding, buffering, and playback.
 
-### Functional Requirements
+For sizing, assume 100,000 concurrent one-to-one calls and a five-minute average duration.
+At steady occupancy, that is about 333 new calls per second. If a completed call produces
+thirty application signaling messages, the average call-related load is about 10,000
+messages per second.
 
-1. **1:1 Calls**: Video and audio calls between two devices
-2. **Group Calls**: Multi-party video calls (up to 32 participants)
-3. **Multi-Device Ring**: Incoming calls ring on all user devices
-4. **Device Handoff**: Transfer active call between devices
-5. **Call History**: Persist call records for later retrieval
+Now assume two million online sockets sending one heartbeat every thirty seconds. That adds
+about 66,667 inbound messages per second even if most users are not calling. Connection
+management and call creation therefore need separate capacity models.
 
-### Non-Functional Requirements
+For media, suppose 20% of those calls use TURN and each endpoint sends 1.5 Mb/s. Twenty
+thousand relayed calls produce 60 Gb/s of relay ingress and another 60 Gb/s of egress across
+the fleet. Relay ratio and actual bitrates are assumptions to replace with
+selected-candidate measurements.
 
-- **Latency**: < 150ms end-to-end for real-time communication
-- **Availability**: 99.9% for signaling infrastructure
-- **Scale**: Millions of concurrent calls globally
-- **Security**: End-to-end encryption for all media
+## 🏗️ Architecture, Records, and Interfaces — 6 minutes
 
-### Backend-Specific Concerns
-
-| Component | Responsibility | Scale |
-|-----------|----------------|-------|
-| Signaling Server | Call setup, SDP exchange | 100K+ concurrent WebSockets |
-| STUN Server | NAT mapping, public IP discovery | Stateless, horizontally scalable |
-| TURN Server | Media relay for symmetric NAT | Bandwidth-intensive |
-| SFU | Group call forwarding | 10K+ concurrent rooms |
-| Database | Call history, user devices | ACID for call state |
-
----
-
-## Step 2: High-Level Architecture (5 minutes)
-
-### Backend Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Client Devices                             │
-│              iPhone | iPad | Mac | Apple Watch                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              │               │               │
-              ▼               ▼               ▼
-┌───────────────────┐ ┌───────────────┐ ┌───────────────┐
-│  Signaling Server │ │  STUN Server  │ │  TURN Server  │
-│  (WebSocket)      │ │               │ │               │
-│  - Call setup     │ │ - NAT mapping │ │ - Media relay │
-│  - SDP exchange   │ │ - ICE cands   │ │ - Fallback    │
-│  - Device registry│ │               │ │               │
-└───────────────────┘ └───────────────┘ └───────────────┘
-         │                                      │
-         ▼                                      │
-┌───────────────────┐                          │
-│   SFU Cluster     │◄─────────────────────────┘
-│                   │    (Group calls only)
-│ - Media forwarding│
-│ - Dominant speaker│
-│ - Quality layers  │
-└───────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                  │
-├─────────────────────┬───────────────────────────────────────────┤
-│     PostgreSQL      │              Redis/Valkey                 │
-│  - Users            │  - User presence (60s TTL)                │
-│  - Devices          │  - Active call state                      │
-│  - Call history     │  - Idempotency keys                       │
-│                     │  - TURN credentials                       │
-└─────────────────────┴───────────────────────────────────────────┘
-```
-
----
-
-## Step 3: Signaling Server Deep Dive (10 minutes)
-
-### WebSocket Connection Management
-
-The signaling server maintains WebSocket connections for all active devices and tracks which devices belong to each user.
+> “I’ll use a transactional authority for call lifecycle decisions, gateways for live device
+> connections, and a separate media path. Redis helps route and cache; it does not
+> independently decide who won a call.”
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SignalingServer Class                        │
-├─────────────────────────────────────────────────────────────────┤
-│  In-Memory State:                                               │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ devices: Map<deviceId, ConnectedDevice>                  │  │
-│  │   └──▶ { ws, userId, deviceId, lastPing }               │  │
-│  │                                                          │  │
-│  │ userDevices: Map<userId, Set<deviceId>>                 │  │
-│  │   └──▶ Track all devices per user                       │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  Message Handlers:                                              │
-│  ┌──────────────────┬───────────────────────────────────────┐  │
-│  │ register         │ Device joins, update presence         │  │
-│  │ call_initiate    │ Start call, ring callees              │  │
-│  │ call_answer      │ Accept call, race condition handling  │  │
-│  │ call_decline     │ Reject call                           │  │
-│  │ ice_candidate    │ Forward ICE to peers                  │  │
-│  │ call_end         │ Terminate call, cleanup               │  │
-│  └──────────────────┴───────────────────────────────────────┘  │
-│                                                                 │
-│  Cleanup: 30s interval removes stale connections               │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────┐     ┌──────────────────────┐
+│ Device connections   │────▶│ Authenticated gateway│
+└──────────────────────┘     └──────────┬───────────┘
+                                        ▼
+┌──────────────────────┐     ┌──────────────────────┐
+│ Presence / routing   │◀────│ Call authority       │
+└──────────────────────┘     └──────────┬───────────┘
+                                        ▼
+                             ┌──────────────────────┐
+                             │ PostgreSQL + outbox  │
+                             │ Claims and receipts  │
+                             └──────────────────────┘
 ```
 
-### Device Registration Flow
+The media path is direct between browsers, through TURN as an opaque relay, or through an
+SFU for a group. Signaling carries session descriptions, candidates, and control decisions.
+It does not carry every video frame.
 
-```
-┌────────┐     register      ┌────────────────┐     SET presence     ┌───────┐
-│ Device │ ──────────────▶  │ Signaling      │ ─────────────────▶  │ Redis │
-│        │                   │ Server         │                      │       │
-└────────┘                   └────────────────┘                      └───────┘
-                                    │
-                                    │ UPSERT device
-                                    ▼
-                             ┌────────────────┐
-                             │  PostgreSQL    │
-                             │  user_devices  │
-                             └────────────────┘
-                                    │
-                                    │ registered ack
-                                    ▼
-                             ┌────────────────┐
-                             │ Device         │
-                             └────────────────┘
-```
+Gateways authenticate sessions and bind devices/connections to accounts. They route commands
+to the call service and deliver versioned events. A device registry maps an active
+connection to its gateway, with a lease that expires independently of the user’s other
+devices.
 
-**Presence Storage:**
-- Redis hash: `presence:{userId}` with status and lastSeen
-- Redis set: `presence:{userId}:devices` for all connected devices
-- 60-second TTL with refresh on heartbeat
+PostgreSQL stores lifecycle state and the invariants that must survive process failure.
+Redis can cache current revisions and routes. A notification bus helps distribute committed
+events, while an outbox supplies recovery when publishing and database commit do not happen
+together.
 
-### Call Initiation with Idempotency
+| Record | Key contents or constraint |
+|--------|----------------------------|
+| User/device | Authenticated account, verified device ownership |
+| Connection lease | Connection ID, device, gateway route, generation, expiry |
+| Call | Initiator, modality, revision, deadline, terminal reason |
+| Invitation/seat | Invited user, state, winning device and endpoint generation |
+| Active-user slot | Unique active claim enforcing the busy policy across calls |
+| Command receipt | Actor, operation ID, body digest, call ID, outcome |
+| Call event/outbox | Call revision, event, recipients, delivery progress |
+| History projection | Authorized participant view of committed call records |
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                        Call Initiation Flow                                   │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Check Idempotency                                                        │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ Redis GET idempotency:call:{key}                                    │ │
-│     │   ├──▶ exists: return cached callId (deduplicated: true)           │ │
-│     │   └──▶ not exists: continue with new call                          │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  2. Create Call (Transaction)                                                │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ BEGIN                                                               │ │
-│     │   INSERT INTO calls (id, initiator_id, call_type, state='ringing') │ │
-│     │   INSERT INTO call_participants (call_id, user_id, state='ringing')│ │
-│     │ COMMIT                                                              │ │
-│     │                                                                     │ │
-│     │ On error: ROLLBACK + delete idempotency key                        │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  3. Store Active Call in Redis                                               │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ HSET call:{callId}                                                  │ │
-│     │   initiator: userId                                                 │ │
-│     │   callType: video|audio                                             │ │
-│     │   state: ringing                                                    │ │
-│     │   createdAt: timestamp                                              │ │
-│     │ EXPIRE call:{callId} 1800  (30 min TTL)                            │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  4. Ring All Callee Devices                                                  │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ For each callee:                                                    │ │
-│     │   For each connected device:                                        │ │
-│     │     WebSocket.send({ type: 'incoming_call', callId, caller })      │ │
-│     │   Send push notification for offline devices                        │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  5. Set Ring Timeout: 30 seconds                                             │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+I would keep media phase separate from invitation state. The server can know that Bob
+accepted at revision 4, while Bob’s browser is still negotiating. Client reports of first
+usable media help observability, but are not a substitute for authoritative membership.
 
-### Call Answer with Race Condition Handling
+| Interface | Purpose |
+|-----------|---------|
+| Session/login API | Authenticate the account and establish a session |
+| Device registration | Bind a verified device and current connection generation |
+| Call initiate command | Create invitation with a stable retry identity |
+| Call accept/decline/end commands | Request conditional lifecycle changes |
+| Call snapshot/resume | Retrieve current revision and endpoint claims |
+| SDP/ICE messages | Negotiate only between authorized endpoint generations |
+| TURN credential API | Issue bounded relay access for an authorized purpose |
+| History API | Cursor-paginated calls visible to the current account |
 
-> "When multiple devices try to answer, only the first one wins. We use PostgreSQL's `FOR UPDATE SKIP LOCKED` to atomically claim the call."
+These are proposed contracts, not an inventory of the local routes. In particular, a user ID
+in a history URL does not authorize access to that user’s calls.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Atomic Answer (First Device Wins)                         │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  SQL Query:                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ WITH locked_call AS (                                                   ││
-│  │   SELECT id, state, initiator_id FROM calls                            ││
-│  │   WHERE id = $callId                                                    ││
-│  │   FOR UPDATE SKIP LOCKED  ◄── Prevents race conditions                 ││
-│  │ )                                                                       ││
-│  │ UPDATE calls                                                            ││
-│  │ SET state = 'connected',                                                ││
-│  │     answered_by_device = $deviceId,                                     ││
-│  │     connected_at = NOW()                                                ││
-│  │ FROM locked_call                                                        ││
-│  │ WHERE calls.id = locked_call.id                                         ││
-│  │   AND locked_call.state = 'ringing'                                     ││
-│  │ RETURNING calls.*, locked_call.initiator_id                             ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Result Handling:                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ rowCount = 0:                                                           ││
-│  │   ├──▶ state = 'connected': already_answered (tell device who won)    ││
-│  │   └──▶ else: call_not_found                                            ││
-│  │                                                                         ││
-│  │ rowCount = 1:                                                           ││
-│  │   ├──▶ Update Redis call state                                         ││
-│  │   ├──▶ Stop ringing on other devices                                   ││
-│  │   ├──▶ Send SDP answer to caller                                       ││
-│  │   └──▶ Confirm call_connected to answerer                              ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep Dive: One Call and One Winning Device — 9 minutes
 
----
+> “I’ll commit call creation, retry receipts, and ring events together. I’ll also make
+> acceptance conditional in storage. This handles failures at the exact places where a user
+> can otherwise see phantom rings or two devices claiming success.”
 
-## Step 4: ICE Candidate Exchange (8 minutes)
+A caller supplies an operation ID and the intended recipients/modality. The server scopes
+that ID to the authenticated actor and compares a digest of the body. Retrying the same
+request returns its recorded outcome. Reusing the ID for a different call is rejected rather
+than silently changing its meaning.
 
-### ICE Candidate Handling with Deduplication
+The creation transaction validates policy, reserves the caller’s active slot, creates the
+call and invitations, and writes the receipt and outbox entries. If the transaction aborts,
+there is no successful receipt pointing to a nonexistent call. If the response is lost after
+commit, a retry retrieves the original call ID.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     ICE Candidate Flow                                        │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌────────┐  ice_candidate   ┌──────────────┐                               │
-│  │ Device │ ───────────────▶ │  Signaling   │                               │
-│  │   A    │                   │   Server     │                               │
-│  └────────┘                   └──────┬───────┘                               │
-│                                      │                                       │
-│                                      ▼                                       │
-│                         ┌────────────────────────────┐                       │
-│                         │ Generate Candidate Hash    │                       │
-│                         │ SHA256(callId:deviceId:    │                       │
-│                         │        candidate).slice(16)│                       │
-│                         └────────────────────────────┘                       │
-│                                      │                                       │
-│                                      ▼                                       │
-│                         ┌────────────────────────────┐                       │
-│                         │ SETNX ice:{callId}:{hash}  │                       │
-│                         │   └──▶ returns 0: duplicate│──▶ ignore            │
-│                         │   └──▶ returns 1: new     │                       │
-│                         └────────────────────────────┘                       │
-│                                      │                                       │
-│                                      ▼                                       │
-│                         ┌────────────────────────────┐                       │
-│                         │ Forward to All Peers       │                       │
-│                         │   - Query call_participants│                       │
-│                         │   - Send to connected      │                       │
-│                         │     devices via WebSocket  │                       │
-│                         └────────────────────────────┘                       │
-│                                      │                                       │
-│                                      ▼                                       │
-│  ┌────────┐  ice_candidate   ┌──────────────┐                               │
-│  │ Device │ ◀─────────────── │   Signaling  │                               │
-│  │   B    │                   │   Server     │                               │
-│  └────────┘                   └──────────────┘                               │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+Storing a Redis key before the SQL insert does not solve this atomically. It replaces a
+duplicate-call risk with a dead-ID risk, and a separate GET followed by SET still lets
+simultaneous requests both proceed. Moving the same two independent writes into the opposite
+order merely moves the crash window.
 
-### TURN Credential Service
+| Creation strategy | Benefit | Cost or failure |
+|-------------------|---------|-----------------|
+| ✅ Receipt, call, and outbox in one transaction | One recoverable committed outcome | Durable receipt retention and delivery worker |
+| ❌ Best-effort Redis key before SQL | Can suppress some sequential retries | Can point to a call that never existed; concurrent requests still race |
+| ❌ SQL followed by an unrelated notification send | Small initial path | Commit can succeed while the ring event is lost |
 
-> "TURN credentials are short-lived (5 minutes) for security. We use RFC 5389 time-limited credentials with HMAC-SHA1."
+For acceptance, imagine Alice’s phone and laptop answering together. Both can send a
+request, but only one transaction may claim Alice’s invited seat while it is still ringing
+and before its deadline. The winning device, participant state, call revision, receipt, and
+sibling-dismiss events commit together.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     TURN Credential Generation                                │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Credential Format (RFC 5389):                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ username = {expiry_timestamp}:{userId}                                  ││
-│  │            │                                                            ││
-│  │            └──▶ Unix timestamp when credential expires                  ││
-│  │                                                                         ││
-│  │ credential = HMAC-SHA1(TURN_SECRET, username).base64()                  ││
-│  │                                                                         ││
-│  │ TTL = 300 seconds (5 minutes)                                           ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Response:                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ {                                                                       ││
-│  │   username: "1674567890:user123",                                       ││
-│  │   credential: "abc123...",                                              ││
-│  │   urls: [                                                               ││
-│  │     "turn:turn.example.com:3478?transport=udp",                         ││
-│  │     "turn:turn.example.com:3478?transport=tcp",                         ││
-│  │     "turns:turn.example.com:5349?transport=tcp"  (TLS)                  ││
-│  │   ],                                                                    ││
-│  │   ttl: 300                                                              ││
-│  │ }                                                                       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Caching:                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ Redis SETEX turn:{userId} (TTL - 30) credentials                        ││
-│  │                     │                                                   ││
-│  │                     └──▶ Cache slightly shorter than validity          ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+A losing request returns the canonical winner. If the winning response was lost, the same
+operation can recover its success. We do not infer “already answered” solely from a locked
+row being temporarily unavailable; we distinguish contention, a committed winner, and a
+terminal call.
 
-### ICE Server Configuration Endpoint
+The busy rule crosses call IDs. Locking just this call cannot prevent Alice’s phone from
+accepting call A while her laptop accepts call B. A unique active-user slot, acquired
+transactionally in a stable locking order, enforces the account-wide rule. The initial
+policy can reserve the caller’s slot while their outgoing invitation is pending.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     GET /api/ice-servers                                      │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Response:                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ {                                                                       ││
-│  │   iceServers: [                                                         ││
-│  │     // STUN (no auth needed)                                            ││
-│  │     { urls: 'stun:stun.l.google.com:19302' },                          ││
-│  │     { urls: 'stun:stun1.l.google.com:19302' },                         ││
-│  │                                                                         ││
-│  │     // TURN (with short-lived credentials)                              ││
-│  │     {                                                                   ││
-│  │       urls: ['turn:...', 'turns:...'],                                 ││
-│  │       username: 'timestamp:userId',                                     ││
-│  │       credential: 'hmac-sha1-signature'                                 ││
-│  │     }                                                                   ││
-│  │   ],                                                                    ││
-│  │   iceTransportPolicy: 'all',  // or 'relay' to force TURN              ││
-│  │   ttl: 300                                                              ││
-│  │ }                                                                       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+Decline, cancel, answer, and timeout all participate in this same transition protocol. A
+stale timer checks the current state and deadline inside the conditional transition. It
+cannot read ringing, wait behind an answer, and then unconditionally overwrite the call as
+missed.
 
----
+For a group, each invited user claims a separate seat. The room can become active after one
+person joins while other invitations remain open until their own deadline. A single
+room-wide ringing flag would incorrectly prevent the remaining invitees from answering.
 
-## Step 5: SFU for Group Calls (8 minutes)
+Terminal transitions are idempotent. Ending a call releases active slots, records the reason
+and final timestamps, and produces termination events once as a committed effect. Duplicate
+deliveries can still occur, so clients ignore repeated or older revisions. This is
+exactly-once effect under the receipt model, not exactly-once network delivery.
 
-### SFU Architecture
+I would retain a clear history model. Call duration based on acceptance differs from
+measured media duration. Store the timestamps needed to explain that difference and avoid
+calling an unanswered invitation a successful conversation just because it has a participant
+row.
 
-> "For group calls, mesh topology doesn't scale - with 5 participants, each sends 4 streams. The SFU acts as a central hub: each participant sends one stream up, and the SFU selectively forwards to others."
+The cost is transactional coordination and deliberate policy. I accept that for a small
+number of lifecycle events per call. Media packets and routine candidate forwarding do not
+need to pay that transaction cost, so a generic claim that PostgreSQL is too slow for video
+calling misses the separation between paths.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     SFU (Selective Forwarding Unit)                           │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Room Structure:                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ Room {                                                                  ││
-│  │   id: string                                                            ││
-│  │   participants: Map<userId, Participant>                                ││
-│  │   dominantSpeaker: string | null                                        ││
-│  │   createdAt: number                                                     ││
-│  │ }                                                                       ││
-│  │                                                                         ││
-│  │ Participant {                                                           ││
-│  │   userId: string                                                        ││
-│  │   deviceId: string                                                      ││
-│  │   peerConnection: RTCPeerConnection                                     ││
-│  │   tracks: MediaStreamTrack[]                                            ││
-│  │   audioLevel: number  (for speaker detection)                           ││
-│  │ }                                                                       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Media Flow:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │                                                                         ││
-│  │   ┌─────────┐           ┌─────────┐           ┌─────────┐              ││
-│  │   │ User A  │           │   SFU   │           │ User B  │              ││
-│  │   └────┬────┘           └────┬────┘           └────┬────┘              ││
-│  │        │                     │                     │                   ││
-│  │        │  ──── video ────▶  │  ──── video ────▶  │                   ││
-│  │        │                     │                     │                   ││
-│  │        │  ◀──── video ────  │  ◀──── video ────  │                   ││
-│  │        │                     │                     │                   ││
-│  │   Each participant: 1 upload stream, N-1 download streams              ││
-│  │                                                                         ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+## 📡 Deep Dive: Routing, Presence, and Reconnection — 9 minutes
 
-### Join Room Flow
+> “A socket lives on one gateway. I’ll make that placement explicit and make call decisions
+> recoverable when a gateway disappears.”
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     joinRoom(roomId, userId, deviceId, offer)                 │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Create/Get Room                                                          │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ if (!rooms.has(roomId))                                             │ │
-│     │   rooms.set(roomId, new Room())                                     │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  2. Create Peer Connection for Participant                                   │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ pc = new RTCPeerConnection({ sdpSemantics: 'unified-plan' })        │ │
-│     │                                                                     │ │
-│     │ pc.ontrack = (event) => {                                           │ │
-│     │   participant.tracks.push(event.track)                              │ │
-│     │   forwardTrackToOtherParticipants(room, userId, event.track)        │ │
-│     │ }                                                                   │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  3. Add Existing Tracks from Other Participants                              │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ for (otherParticipant of room.participants.values())                │ │
-│     │   for (track of otherParticipant.tracks)                            │ │
-│     │     pc.addTrack(track)                                              │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  4. Process SDP Offer/Answer                                                 │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ await pc.setRemoteDescription(offer)                                │ │
-│     │ const answer = await pc.createAnswer()                              │ │
-│     │ await pc.setLocalDescription(answer)                                │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  5. Store Participant & Notify Others                                        │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ room.participants.set(userId, { userId, deviceId, pc, tracks: [] })│ │
-│     │ notifyParticipantJoined(room, userId)                               │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Return: { answer, participants: [...room.participants.keys()] }             │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+Each authenticated connection has an ID, device identity, gateway route, and lease
+generation. Heartbeats refresh that connection’s lease. Several tabs may belong to one
+device, but closing one must not erase another live connection’s route or mark the entire
+device offline.
 
-### Track Forwarding & Renegotiation
+A user-to-connection index supports ring fan-out. Its entries are validated against live
+leases. A single expiring hash per user cannot independently expire an abandoned device if
+another device keeps refreshing the whole key. Expiration is also cleanup, not a durable
+decision that an accepted call ended.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Track Forwarding                                          │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  When User A publishes a track:                                              │
-│                                                                              │
-│  ┌────────┐   track    ┌─────┐   addTrack    ┌────────┐                     │
-│  │ User A │ ────────▶ │ SFU │ ─────────────▶ │ User B │                     │
-│  └────────┘            │     │               │ PC     │                     │
-│                        │     │               └────────┘                     │
-│                        │     │   addTrack    ┌────────┐                     │
-│                        │     │ ─────────────▶ │ User C │                     │
-│                        └─────┘               │ PC     │                     │
-│                                              └────────┘                     │
-│                                                                              │
-│  Renegotiation Required:                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ 1. SFU creates new offer for affected participant                       ││
-│  │ 2. Sends offer via signaling: { type: 'renegotiate', offer }            ││
-│  │ 3. Client responds with answer                                          ││
-│  │ 4. SFU applies answer                                                   ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+The authority commits a ring event before delivery. A worker resolves current routes and
+delivers it to the appropriate gateways. An acknowledgment from a gateway only proves that
+gateway received it; it does not prove the user saw it or accepted it.
 
-### Dominant Speaker Detection
+Events include call revision and expiry. If delayed delivery reaches a phone after the
+laptop already answered, the phone checks current state or observes the newer revision and
+declines to show an actionable stale invitation. Offline push, if later added, follows the
+same rule when the app wakes.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Dominant Speaker Detection                                │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Algorithm:                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ Interval: every 100ms                                                   ││
-│  │                                                                         ││
-│  │ 1. For each participant:                                                ││
-│  │    - Get audio level from RTCPeerConnection stats                       ││
-│  │    - Update rolling window (last 5 samples)                             ││
-│  │                                                                         ││
-│  │ 2. Calculate average audio level per participant                        ││
-│  │                                                                         ││
-│  │ 3. Find participant with:                                               ││
-│  │    - Highest average level                                              ││
-│  │    - Level > SILENCE_THRESHOLD (0.01)                                   ││
-│  │                                                                         ││
-│  │ 4. If dominant speaker changed:                                         ││
-│  │    - Update room.dominantSpeaker                                        ││
-│  │    - Broadcast to all: { type: 'dominant_speaker_changed', userId }     ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Audio Level Source:                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ pc.getStats() ──▶ find report where type='inbound-rtp' && kind='audio' ││
-│  │              ──▶ report.audioLevel (0.0 to 1.0)                         ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Smoothing:                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ audioLevelHistory: Map<userId, number[]>                                ││
-│  │ SMOOTHING_WINDOW = 5 samples                                            ││
-│  │ Average = sum(levels) / levels.length                                   ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+| Delivery approach | Strength | Cost or limitation |
+|-------------------|----------|--------------------|
+| ✅ Durable events plus current connection routing | Recovers after publisher/gateway failures | Needs deduplication, expiry, and acknowledgment semantics |
+| ❌ Process-local user maps only | Very simple local implementation | Users on different processes cannot reach one another |
+| ❌ Redis pub/sub as the complete protocol | Convenient live fan-out | Missed messages, call claims, and deadline recovery remain unsolved |
 
----
+A reconnecting device authenticates again, obtains a fresh connection generation, and
+retrieves current call state. If it still owns its accepted seat, it can resume control. If
+the call ended or another device took over through an authorized transfer, old commands and
+negotiation messages must be rejected.
 
-## Step 6: Database Schema and Caching (5 minutes)
+Healthy direct media can continue during a short signaling interruption. I would allow a
+bounded grace period and reconcile before forcing renegotiation. Conversely, the signaling
+socket can remain open while the media path fails. That requires a media recovery attempt,
+not merely another heartbeat.
 
-### PostgreSQL Schema
+SDP and ICE messages are addressed to the authorized endpoint pair and a negotiation
+generation. The server checks sender membership, destination, current claims, type, and
+payload bounds. It does not trust a claimed actor embedded in an arbitrary message.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Database Tables                                           │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  users                                                                       │
-│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
-│  │ Column          │ Type             │ Notes                             │ │
-│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
-│  │ id              │ UUID PK          │ gen_random_uuid()                 │ │
-│  │ name            │ VARCHAR(100)     │ NOT NULL                          │ │
-│  │ avatar_url      │ VARCHAR(500)     │                                   │ │
-│  │ created_at      │ TIMESTAMP        │ DEFAULT NOW()                     │ │
-│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
-│                                                                              │
-│  user_devices (for multi-device ring)                                        │
-│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
-│  │ Column          │ Type             │ Notes                             │ │
-│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
-│  │ id              │ UUID PK          │                                   │ │
-│  │ user_id         │ UUID FK          │ REFERENCES users(id)              │ │
-│  │ device_type     │ VARCHAR(50)      │ iPhone, iPad, Mac, Watch          │ │
-│  │ push_token      │ VARCHAR(500)     │ For offline notifications         │ │
-│  │ is_active       │ BOOLEAN          │ DEFAULT TRUE                      │ │
-│  │ last_seen       │ TIMESTAMP        │                                   │ │
-│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
-│                                                                              │
-│  INDEX: idx_devices_user_active ON user_devices(user_id) WHERE is_active     │
-│                                                                              │
-│  calls                                                                       │
-│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
-│  │ Column          │ Type             │ Notes                             │ │
-│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
-│  │ id              │ UUID PK          │                                   │ │
-│  │ initiator_id    │ UUID FK          │ REFERENCES users(id)              │ │
-│  │ call_type       │ VARCHAR(20)      │ 'video', 'audio', 'group'         │ │
-│  │ state           │ VARCHAR(20)      │ 'ringing','connected','ended'     │ │
-│  │ answered_by     │ UUID             │ Device that answered              │ │
-│  │ connected_at    │ TIMESTAMP        │                                   │ │
-│  │ ended_at        │ TIMESTAMP        │                                   │ │
-│  │ duration_seconds│ INTEGER          │ Computed on end                   │ │
-│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
-│                                                                              │
-│  INDEXES:                                                                    │
-│    idx_calls_initiator ON calls(initiator_id, created_at DESC)              │
-│    idx_calls_state ON calls(state) WHERE state IN ('ringing','connected')   │
-│                                                                              │
-│  call_participants                                                           │
-│  ┌─────────────────┬──────────────────┬───────────────────────────────────┐ │
-│  │ Column          │ Type             │ Notes                             │ │
-│  ├─────────────────┼──────────────────┼───────────────────────────────────┤ │
-│  │ call_id         │ UUID             │ PK with user_id                   │ │
-│  │ user_id         │ UUID FK          │ PK with call_id                   │ │
-│  │ device_id       │ UUID             │ Device that joined                │ │
-│  │ state           │ VARCHAR(20)      │ 'ringing','connected','left'      │ │
-│  │ joined_at       │ TIMESTAMP        │                                   │ │
-│  │ left_at         │ TIMESTAMP        │                                   │ │
-│  └─────────────────┴──────────────────┴───────────────────────────────────┘ │
-│                                                                              │
-│  INDEX: idx_participants_user ON call_participants(user_id, call_id)        │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+Candidate delivery needs ordering and scope. The client queues candidates until the matching
+remote description is installed, then applies them to that attempt. Restarting ICE changes
+the generation; old candidates and old duplicate-suppression entries cannot be treated as
+current.
 
-### Redis Caching Strategy
+I would not mistake candidate hashing for reliable delivery. Marking a candidate seen before
+forwarding it can lose the candidate if delivery then fails. If the transport session cannot
+be resumed coherently, negotiate a fresh generation instead of replaying unknown fragments
+indefinitely.
 
-| Key Pattern | Data | TTL | Usage |
-|-------------|------|-----|-------|
-| `presence:{userId}` | Online status, lastSeen | 60s | Write-through on heartbeat |
-| `presence:{userId}:devices` | Set of device IDs | 60s | Device routing |
-| `call:{callId}` | Active call state | 30m | Fast state lookup |
-| `idempotency:call:{key}` | Call ID | 5m | Duplicate prevention |
-| `turn:{userId}` | TURN credentials | 5m | Credential caching |
-| `ice:{callId}:{hash}` | Timestamp | 1h | ICE candidate deduplication |
+Ringing deadlines live in durable state. A scheduled worker or periodic indexed sweeper
+finds eligible expired invitations and performs conditional transitions. An in-process timer
+can optimize responsiveness, but is not the only mechanism; a server restart must not leave
+a call ringing forever.
 
----
+Backpressure is part of gateway design. Bound message size, per-connection rates,
+outstanding negotiation work, and output queues. Reject unsupported types before using them
+as metric labels. A socket is not inherently rate-limited merely because it is one
+connection.
 
-## Step 7: Observability (3 minutes)
+The trade-off is more coordination between durable state and transient routes. It allows
+gateways to fail independently without turning every reconnect into a new call or silently
+preserving obsolete participation.
 
-### Key Metrics
+## 🌐 Deep Dive: Media Paths and Group Scaling — 10 minutes
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Prometheus Metrics                                        │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Counters:                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ facetime_calls_initiated_total{call_type}                               ││
-│  │ facetime_calls_answered_total{call_type}                                ││
-│  │ facetime_ice_connection_type_total{type}  (host, srflx, relay)          ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Histograms:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ facetime_call_duration_seconds{call_type}                               ││
-│  │   buckets: [30, 60, 120, 300, 600, 1800, 3600]                          ││
-│  │                                                                         ││
-│  │ facetime_call_setup_latency_seconds{call_type}                          ││
-│  │   buckets: [0.5, 1, 2, 5, 10, 30]                                       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Gauges:                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ facetime_active_websocket_connections                                   ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+> “I’ll prefer direct media for ordinary one-to-one calls, provide tested TURN fallback, and
+> use selective forwarding for groups. Each topology has a different bandwidth and trust
+> model.”
 
-### Health Check Endpoint
+ICE tests candidate pairs that may use local addresses, reflexive addresses discovered
+through STUN, or relay allocations from TURN. It does not require application logic to wait
+a fixed time for each category in sequence. The browser can test candidates while gathering
+continues.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     GET /health                                               │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Response (200 OK / 503 Degraded):                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ {                                                                       ││
-│  │   status: 'ok' | 'degraded',                                            ││
-│  │   uptime: process.uptime(),                                             ││
-│  │   services: {                                                           ││
-│  │     postgres: { status: 'healthy' | 'unhealthy' },                      ││
-│  │     redis: { status: 'healthy' | 'unhealthy' },                         ││
-│  │     websocket: { status: 'healthy' | 'unhealthy' }                      ││
-│  │   },                                                                    ││
-│  │   activeConnections: 1234,                                              ││
-│  │   activeCalls: 567                                                      ││
-│  │ }                                                                       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+A direct path avoids unnecessary relay traffic, but is not automatically the fastest
+Internet path. TURN can help with difficult networks or deliberately hide peer addresses.
+The service still pays for signaling and presence even when media is direct, so “zero server
+cost” is too broad.
 
----
+TURN infrastructure requires reachable listening and relay ports, supported transports,
+capacity limits, and appropriate credentials. A public credential endpoint with a permanent
+shared password offers no per-user allocation policy. I would issue time-limited credentials
+through a supported Coturn mechanism and define renewal behavior for long sessions.
 
-## Step 8: Trade-offs and Alternatives (3 minutes)
+Credential expiry does not mean every active call should abruptly stop at the five-minute
+mark. The design must account for allocation/channel refresh and future reconnects.
+Likewise, a published TLS port is meaningless unless a real TLS listener and certificate
+configuration exist.
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Signaling transport | WebSocket | HTTP long-poll | Lower latency, bidirectional |
-| Call state storage | Redis + PostgreSQL | PostgreSQL only | Fast lookup + durability |
-| Group call topology | SFU | MCU | No transcoding, lower latency |
-| ICE candidate relay | Trickle ICE | Full gathering | Faster connection establishment |
-| NAT traversal | STUN + TURN fallback | Always TURN | Lower latency when P2P possible |
+| One-to-one choice | Why use it | What it costs |
+|-------------------|------------|---------------|
+| ✅ Direct candidates plus TURN fallback | Avoids relaying media when a useful direct path exists | More candidate paths and relay testing |
+| ❌ Always relay by default | Predictable infrastructure path and address-privacy option | Bandwidth for every call and dependence on relay placement |
+| ❌ STUN without operational TURN | Minimal media infrastructure | Some NAT/firewall combinations cannot establish a useful path |
 
-### Why SFU over MCU?
+For a group mesh with N participants, each endpoint has N−1 peers and there are N(N−1)/2
+peer pairs in total. At six people, that is five peers per endpoint and fifteen total pairs.
+At 32 people and 1.5 Mb/s per outgoing peer, an endpoint would upload 46.5 Mb/s before
+overhead.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     MCU vs SFU Comparison                                     │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  MCU (Multipoint Control Unit):                                              │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ [User A] ──▶ ┌─────────┐                                                ││
-│  │              │   MCU   │ ──▶ [Mixed stream to all]                      ││
-│  │ [User B] ──▶ │ transcode│                                                ││
-│  │              └─────────┘                                                ││
-│  │                                                                         ││
-│  │ - Mixes all streams into one                                            ││
-│  │ - HIGH server CPU (transcoding)                                         ││
-│  │ - Lower client bandwidth                                                ││
-│  │ - Higher latency (transcoding delay)                                    ││
-│  │ - Quality loss from re-encoding                                         ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  SFU (Selective Forwarding Unit):                                            │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ [User A] ──▶ ┌─────────┐ ──▶ [User B]                                   ││
-│  │              │   SFU   │                                                ││
-│  │ [User B] ──▶ │ forward │ ──▶ [User A]                                   ││
-│  │              └─────────┘                                                ││
-│  │                                                                         ││
-│  │ - Forwards streams selectively                                          ││
-│  │ - LOW server CPU (no transcoding)                                       ││
-│  │ - Higher client bandwidth                                               ││
-│  │ - Lower latency (just routing)                                          ││
-│  │ - Better video quality (no re-encoding)                                 ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  For a quality-focused service like FaceTime, SFU is the right choice.      │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+An SFU lets each endpoint publish to a media server, which forwards selected streams or
+layers. It usually avoids decoding and re-encoding every video frame for ordinary
+forwarding, but it still handles packet processing, congestion feedback, bandwidth, and
+potentially substantial memory/CPU work.
 
----
+Server relationships become linear in participants. Egress does not become linear if every
+receiver subscribes to every sender. We should bound useful subscriptions, such as a large
+speaker stream plus several lower-resolution visible tiles, rather than forwarding
+everything just because the room supports 32 people.
 
-## Closing Summary
+Simulcast may upload multiple encodings. Scalable video coding may supply layers within an
+encoding. Neither means an endpoint sends exactly one fixed-bitrate stream. Receiver
+capabilities, visible tiles, and measured network conditions determine which layers are
+useful.
 
-I've designed the backend for a real-time video calling system with four core components:
+| Group topology | Benefit | Trade-off |
+|----------------|---------|-----------|
+| ✅ SFU with bounded subscriptions | Lower endpoint upload fan-out and individual stream control | Server egress, media operations, and subscription policy |
+| ❌ Unrestricted mesh | No central media forwarding for direct pairs | Upload/encode pressure grows with peers |
+| ❌ MCU for the initial design | One mixed output can reduce receiver decoding | Server mixing/transcoding and plaintext media access |
 
-1. **Signaling Server**: WebSocket-based call setup with idempotency, race condition handling for multi-device answer, and presence management via Redis
+Encryption must match the topology. Browser-to-browser WebRTC uses encrypted media
+transport, including when TURN forwards the packets. That does not authenticate the intended
+account by itself; secure signaling and endpoint identity are still necessary.
 
-2. **ICE/TURN Infrastructure**: STUN for NAT discovery, TURN with short-lived credentials for relay fallback, and trickle ICE with deduplication
+With an SFU, transport encryption normally terminates on each server leg. Keeping media
+content hidden from the SFU needs an additional endpoint-controlled frame encryption layer
+and authenticated group-key management. I would use an established mechanism, define
+membership/key-epoch changes, and avoid inventing a protocol in an interview.
 
-3. **SFU for Group Calls**: Selective forwarding with dominant speaker detection, renegotiation on participant changes, no transcoding overhead
+An ordinary MCU that mixes plaintext cannot simultaneously be excluded from the media trust
+boundary. Recording introduces another explicit participant/trust decision; it is not a
+feature that can be slipped into an end-to-end encryption claim without changing the
+contract.
 
-4. **Call State Management**: PostgreSQL for durable call history, Redis for real-time state with appropriate TTLs, strong consistency for call transitions
+The main trade-off is operational cost versus endpoint capability and privacy. I would
+validate it with measured relay share, per-room egress, endpoint decode load, and quality
+outcomes. A universal “mesh works until four people” threshold or an invented number of
+users per SFU CPU core is not a useful capacity plan.
 
-**Key trade-offs:**
-- SFU over MCU (quality vs. client bandwidth)
-- WebSocket over HTTP polling (latency vs. scalability complexity)
-- Prefer P2P with TURN fallback (latency vs. reliability)
+## 📊 Observability and Failure Tests — 4 minutes
 
-**What would I add with more time?**
-- Simulcast for adaptive quality based on receiver bandwidth
-- Geographic distribution of TURN servers
-- Call recording with E2E encryption key escrow
-- Rate limiting on call initiation to prevent abuse
+The backend should distinguish request-to-ring, human ring duration, acceptance latency, and
+accept-to-first-media. A server-side acceptance timer cannot establish when a remote video
+frame became visible. Client reports and selected-candidate telemetry complete the picture,
+with sensible privacy and sampling limits.
+
+Useful operational signals include unanswered expired invitations, outbox lag, failed or
+conflicting device claims, receipt retries, socket backlog, stale endpoint messages, relay
+allocation failures, and active-call projection drift. Labels should use bounded categories
+rather than arbitrary client-supplied types or IDs.
+
+| Failure scenario | Required result |
+|------------------|-----------------|
+| Creation commits and response disappears | Same retry returns the original call |
+| Phone and laptop accept together | One invited-seat winner and consistent sibling dismissal |
+| One user accepts two different calls | Busy policy permits only one active claim |
+| Timeout races an answer | Conditional transition cannot overwrite the winner |
+| Gateway fails after ring event commit | Delivery/reconciliation still reaches the current device route |
+| An unrelated registered user sends SDP | Membership check rejects it |
+| Relay is forced or UDP is blocked | Supported fallback is verified with actual media counters |
+| Breaker is reused for a later request | It executes current arguments rather than the first request’s closure |
+
+I would combine deterministic concurrency tests, real database transactions and sockets, and
+controlled browser/network tests. Healthy dependencies and a rendered contact screen do not
+establish call correctness. Load tests should separately exercise many idle sockets, heavy
+call churn, and bandwidth-intensive group rooms.
+
+## 🏁 Repository Mapping — 2 minutes
+
+The local backend has public user/history routes, claimed socket identities, Redis call
+JSON, and process-local connection and ring maps. SQL and Redis transitions are independent;
+there are no durable receipts, seat claims, deadline recovery, cross-gateway delivery, or
+SFU.
+
+Its Opossum registry retains the first action closure for each name, so later database work
+can reuse earlier parameters. Isolated checks confirmed repeated first-user/device work and
+a second call trying the first call ID. Other checks confirmed concurrent acceptance and
+missing sender membership enforcement.
+
+TURN credentials are static, while the browser’s default credential route misses the Vite
+proxy. The [architecture document](architecture.md#implementation-notes) separates these
+actual behaviors from the proposed production mechanisms.
+
+> “My first backend milestone would be one authenticated, retry-safe call lifecycle with a
+> single device winner and restart-safe deadlines. I would establish that contract before
+> distributing sockets across gateways or introducing group media.”

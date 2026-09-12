@@ -1,350 +1,396 @@
-# Etsy (Handmade Marketplace) — System Design Answer (Frontend Focus)
+# Etsy Marketplace — Frontend System Design
 
-*45-minute system design interview format — Frontend Engineer Position*
+> “I would design the shopping experience around a simple distinction: finding a listing,
+> saving it in a cart, and owning a checkout reservation are three different states. The
+> interface should make those states clear, especially when the item is unique.”
 
----
+This is a proposed 45-minute interview design, not a description of every feature in the
+local application. I would draw one architecture and two small state diagrams, then spend
+most of the discussion on search navigation, scarce inventory, and recovering a purchase
+after an uncertain response.
 
-## 📋 Opening Statement
+| Discussion | Minutes |
+|------------|---------|
+| Requirements and user journeys | 4 |
+| UI architecture and rendering | 5 |
+| State ownership and contracts | 5 |
+| Deep dive: search people can navigate | 8 |
+| Deep dive: honest inventory feedback | 8 |
+| Deep dive: recoverable multi-shop checkout | 8 |
+| Performance, accessibility, and verification | 5 |
+| Scope boundary and next decisions | 2 |
 
-"A handmade marketplace looks like any e-commerce frontend and has two properties that change almost every UI decision.
+## 🎯 Requirements and User Journeys — 4 minutes
 
-**Inventory is usually one.** Not 'low stock' — one, ever, with no restock. So two buyers racing for the same item means one of them gets an error for something that will never exist again. That turns add-to-cart and checkout from bookkeeping into a concurrency problem the interface has to handle gracefully, because the loser is a real person who just lost a thing they wanted.
+“I will focus on a buyer finding a handmade or vintage item, comparing shops, saving a
+basket, and buying from several sellers. I will also include the seller's listing and
+fulfillment workflow because the buyer sees the consequences of those edits.”
 
-**A cart spans sellers but an order cannot.** Three items from three shops become three orders that ship, cancel, and refund independently. The cart is a single mental object to the buyer and splits into several the moment they pay, and the UI has to make that transition feel intentional rather than like something went wrong.
+A listing can be unique, but handmade goods can have several units. The interface must
+support both. I would ask whether variants, personalized engraving, international tax, and
+seller messaging are required. For this discussion, I assume fixed-price listings, one
+currency per purchase, and no customization workflow.
 
-I'll go deep on those two, plus search — because with an unnormalized catalog, an empty result set is usually the interface's fault rather than the inventory's."
+The main buyer journey is search to product detail to cart to checkout. Search needs
+meaningful filters, useful images, seller context, and back navigation that preserves the
+exploration. The cart groups items by shop because shipping terms and fulfillment differ
+even when payment is combined.
 
----
+The seller needs to create and revise listings, set stock, and move their orders through
+allowed fulfillment states. A seller with multiple shops needs an explicit shop selector.
+Buyer and seller views should use the same authoritative listing and order versions, even if
+they render different information.
 
-## 🎯 Requirements
+I would propose a mobile-first experience with a p75 largest contentful paint target below
+2.5 seconds on a representative mobile connection, a responsive interaction budget, and
+accessible keyboard completion of the purchase. These are design targets to measure, not
+results from the repository.
 
-### Functional
+Correctness is part of the experience: a sold item must not look purchased merely because a
+button was clicked. A timeout must not prompt the buyer into a second charge. A price change
+must be presented for consent before proceeding.
 
-1. **Browse and search** across an inconsistently-described catalog
-2. **Product pages** with images, variations, seller context
-3. **Cart** spanning multiple shops, surviving reloads
-4. **Checkout** producing per-seller orders, safe under double-submit
-5. **Seller tools** — create a shop, list products, view orders
-6. **Favorites and reviews**
+“I am comfortable showing a slightly stale discovery card. I am not comfortable using that
+card as permission to charge someone.”
 
-### Non-functional
+## 🏗️ UI Architecture and Rendering — 5 minutes
 
-| Requirement | Target | Why |
-|-------------|--------|-----|
-| Search feels responsive | < 300ms perceived | Below this, typing feels like filtering rather than querying |
-| Never sell the same item twice | Guaranteed | One-of-a-kind items make this a correctness requirement |
-| Cart survives sessions | Days | Handmade purchases involve deliberation |
-| Losing a race is explained | Always | "Error" for a gone item is the worst moment in the product |
-| Search degradation | Never blank | A storefront that looks empty during a search outage loses all traffic |
-
-### Non-goals
-
-No real payment integration, no messaging between buyer and seller, no shipping-rate calculation. Each is a substantial subsystem and none illuminates the two structural problems above.
-
----
-
-## 🏗️ Architecture
+I would draw a small architecture with separate public discovery and authenticated purchase
+responsibilities.
 
 ```
-        ┌──────────────────────────────────────────────┐
-        │                   Browser                     │
-        │                                               │
-        │  Browse/Search   Product   Cart   Seller      │
-        │       │             │        │        │       │
-        │       └─────────────┴────┬───┴────────┘       │
-        │                     ┌────▼─────┐              │
-        │                     │  Stores  │              │
-        │                     │ cart │ ui │              │
-        │                     └────┬─────┘              │
-        └──────────────────────────┼───────────────────┘
-                                   │
-                        ┌──────────▼──────────┐
-                        │    Express API      │
-                        └──┬───────┬───────┬──┘
-                           │       │       │
-                    PostgreSQL  Elastic  Redis
-                    (orders,    (search) (cache,
-                     inventory)          sessions)
+┌──────────────────────┐      ┌──────────────────────┐
+│ Browser              │─────▶│ CDN / image variants │
+│ Routes and UI state  │      └──────────────────────┘
+└──────────┬───────────┘
+           ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ API / session        │─────▶│ Catalog and search   │
+│ Typed client adapter │      │ Public projections   │
+└──────────┬───────────┘      └──────────────────────┘
+           ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ Cart / checkout      │─────▶│ Orders and payment   │
+│ Authoritative quote  │      │ Durable status       │
+└──────────────────────┘      └──────────────────────┘
 ```
 
-**The frontend's central concern is that two of those stores can disagree.** Elasticsearch is updated from the write path with no change-data-capture, so search results can describe a product that Postgres says is sold. The UI cannot treat a search result as authoritative about availability — a lesson that shapes the product page, the cart, and checkout.
-
----
-
-## 🔍 Deep Dive 1: When Quantity Is One (12 minutes)
-
-This is the defining problem, and it appears at three separate moments.
-
-### Where the race actually happens
-
-| Moment | What the buyer sees | What can be true |
-|--------|--------------------|------------------|
-| Browsing search results | "Available" | Sold seconds ago; the index is stale |
-| Product page | "Add to cart" | Still available, or gone |
-| In cart, before checkout | Sitting in their cart | Someone else is checking out with it right now |
-| At checkout | Paying | Another transaction commits first |
-
-**A cart is not a hold.** That's the fact everything follows from, and it's the one buyers don't intuit — an item in a cart *feels* claimed. The interface either corrects that belief or sets the buyer up for the worst experience in the product.
-
-### Options
-
-| Approach | Buyer experience | Cost |
-|----------|-----------------|------|
-| ❌ No reservation; fail at checkout | Worst case — payment intent, then loss | Simplest |
-| ✅ **Reserve on add-to-cart, with a visible timer** | Honest, creates urgency | Inventory held by non-buyers; needs expiry |
-| ✅ Reserve at checkout entry only | Short hold, less waste | Race window still exists while browsing the cart |
-| ❌ Optimistic UI everywhere | Feels fast | Amplifies the failure — the item appears *more* claimed than it is |
-
-### What I'd build
-
-**A short reservation created at checkout entry, plus honest availability signalling before that.** A hold from add-to-cart sounds friendlier and is worse at scale: carts are abandoned constantly, so held inventory for a one-of-a-kind item means the listing is invisible to serious buyers while someone who forgot about it holds it.
-
-Before checkout the UI's job is to avoid *implying* a claim. Concretely:
-
-- **Re-validate availability when the cart is viewed**, not just at checkout. A cart page loaded from stale data is where the false sense of ownership forms.
-- **Never render a countdown or "reserved" language before a reservation exists.** Language creates the expectation; if the system isn't holding the item, the UI must not say it is.
-- **Show scarcity truthfully.** "Only one available" is accurate and useful. "Selling fast!" is a manufactured urgency pattern, and in a market where losing means losing forever it's actively hostile.
-
-### Losing the race
-
-When it happens, this is the highest-stakes error state in the product, and generic error handling fails it completely. The buyer needs to know **what** they lost, that it's **permanent**, that they were **not charged**, and **what to do next** — the seller's other work, similar items.
-
-The rest of the cart must survive. Dropping a three-item cart because one item sold is a second, self-inflicted loss.
-
-> "The design principle is that the interface must never be more confident about ownership than the system is. Every 'reserved' badge, every countdown, every optimistic add is a promise — and for one-of-a-kind inventory, a broken promise costs a customer, not a retry."
-
----
-
-### Where this system actually stands
-
-Worth being precise, because it changes what the frontend must do today. The schema has a `reserved_until` column on cart items, written fifteen minutes ahead for quantity-one products — **and nothing reads it.** No checkout path consults it, no sweeper expires it, no availability query filters on it. The reservation the data model advertises does not exist as behavior. Checkout also validates availability with a plain read before opening its transaction, with no row lock, so two concurrent buyers can both pass and both decrement.
-
-That means the frontend is currently the *only* thing standing between a buyer and a confusing failure, and it should be designed accordingly: no reservation language anywhere, availability re-checked at every meaningful step, and a genuinely good "this sold" experience — because until the backend gap closes, that path will be hit.
-
-I'd flag it as the top priority rather than design around it. **A UI that implies a hold the system doesn't take is the worst of both worlds**, and it's an easy thing to ship by accident when the column exists and looks authoritative.
-
----
-
-## 🔍 Deep Dive 2: One Cart, Many Orders (10 minutes)
-
-The buyer builds one cart. Checkout produces one order per shop. The interface has to make that split feel deliberate.
-
-### Why it isn't cosmetic
-
-Each seller-order ships separately, has its own tracking, can be cancelled independently, and may partially fail — one seller's item is gone while the other two are fine. A UI presenting checkout as a single atomic purchase sets an expectation the system can't meet.
-
-### Where to reveal the split
-
-| Point | Effect |
-|-------|--------|
-| ❌ Only after purchase | Buyer expects one shipment, gets three; feels like an error |
-| ✅ **In the cart, grouped by shop** | Split is established before any money is involved |
-| ✅ Reinforced at checkout with per-shop totals | Shipping differences become comprehensible |
-| ✅ Confirmation shows N orders | Matches what they'll track |
-
-**Grouping the cart by shop is the single highest-value decision here**, and it costs nothing. It makes shipping-per-seller obvious, makes partial availability failures local to a group, and means the order confirmation isn't a surprise.
-
-### Partial failure at checkout
-
-If one shop's item is gone at the moment of purchase, the options are all-or-nothing or partial success. **Partial success is right, and it must be presented carefully:** succeeded orders are confirmed and charged, the failed group is explained and not charged, and the summary leads with what *did* work. Leading with the failure makes a mostly-successful purchase read as a failed one.
-
-The alternative — failing everything — is worse for a marketplace, because the buyer's other two sellers lose sales over an unrelated third party's inventory.
-
-> "I'd want the word 'orders', plural, to appear before checkout rather than after. Every confusion downstream — 'where's the rest of my package', 'why three tracking numbers' — comes from a cart that presented itself as one purchase."
-
----
-
-## 🔍 Deep Dive 3: Search Where Nobody Uses the Same Words (10 minutes)
-
-With no canonical vocabulary, one product is a "handmade leather billfold", an "artisan cowhide wallet", or a "hand-made purse". Exact matching returns nothing, and **a buyer who sees zero results concludes the marketplace is empty rather than that their phrasing was unusual.**
-
-The backend addresses this with synonym expansion and fuzzy matching. The frontend's job is everything around that.
-
-### Zero results is a design problem, not an empty state
-
-A blank "No results for 'billfold'" is the worst outcome, because the marketplace almost certainly has matching items. The page should:
-
-- **Say what was searched and how it was interpreted** — if synonyms expanded the query, showing that teaches the buyer the catalog's vocabulary.
-- **Always offer a path** — related categories, popular items, relaxed filters. Never a dead end.
-- **Distinguish "no matches" from "search is down."** The backend returns a fallback flag when Elasticsearch is unavailable and results come from a degraded path. **Rendering degraded results as if they were normal is dishonest**; rendering an empty page during an outage is catastrophic. The UI should say results are limited and offer browsing.
-
-### Making search feel fast
-
-Perceived speed comes from three things, none of which is server latency:
-
-**Debounce, don't throttle.** A user typing "handmade wallet" produces fifteen keystrokes; querying each is fourteen wasted round trips whose results arrive out of order. Debouncing at ~250ms fires once when they pause.
-
-**Cancel superseded requests.** Without cancellation, a slow response for "hand" can arrive after a fast one for "handmade" and overwrite it — the buyer sees results for a prefix they've moved past. Every search request is cancelled when a newer one starts, and late responses are dropped by comparing against the current query.
-
-**Keep the previous results visible while loading.** Blanking to a spinner on every keystroke makes a fast search feel unstable. Dimming the old results and showing a subtle indicator reads as faster despite identical latency.
-
-### Filters belong in the URL
-
-Category, price band and sort are shareable, back-navigable state. A buyer who filters, opens a product, and hits back must land on their filtered results — the most common navigation in the product. Store-held filters break that and produce the single most-reported e-commerce complaint.
-
----
-
-## 🧭 Questions I'd Ask First
-
-**"How long does a reservation last, and who decides?"** It's the hinge of Deep Dive 1. Fifteen minutes is generous to a deliberating buyer and hostile to the next one; two minutes is the reverse. The answer also determines whether the countdown is a prominent element or a quiet one.
-
-**"Can a seller edit a listing that's in someone's cart?"** If yes — price, description, photos — the cart holds a snapshot of something that no longer exists, and the reconciliation UI has to cover more than availability.
-
-**"Is search or browse the primary entry point?"** Search-first justifies investing in query understanding and result quality. Browse-first shifts the investment to category structure and recommendation. They pull in different directions and both are expensive.
-
-> "I'd ask the reservation question first, because it's the one where a wrong default is invisible in testing and obvious in the metrics — held inventory that nobody buys just looks like slow sales."
-
----
-
-## 🏪 The Seller Side Is a Different Kind of Frontend
-
-Worth its own section, because seller tooling is where marketplaces usually under-invest and it's a genuinely different problem.
-
-**Listing creation is a long form with media upload**, which makes draft persistence non-negotiable. A seller who photographs an item, writes a description, and loses it to a reload or a failed upload may not do it again. Drafts belong in local storage from the first keystroke, independent of any server round trip.
-
-**Image upload needs per-file state.** Uploading eight photos where one fails must not discard the other seven — each needs its own progress, retry and removal. A single aggregate "uploading…" state is the version that loses work.
-
-**Validation should be sympathetic to the domain.** Requiring alt text is right (see accessibility below), but a seller listing their first item shouldn't face a wall of rejections on submit. Field-level, as-you-go validation with clear reasons is the difference between a completed listing and an abandoned one.
-
-The asymmetry worth naming: **buyers browse constantly and sellers list rarely.** So the buyer surfaces get optimized for repeat, fast interaction, and the seller surfaces get optimized for one-time, high-stakes completion. Those are different design targets, and treating the seller area as "the same app with more forms" is how it ends up worse than it needs to be.
-
----
-
-## 🖼️ Images Are the Product
-
-For handmade goods the photograph *is* the merchandise, which changes the usual performance calculus.
-
-**Compressing aggressively is the wrong instinct.** A buyer evaluating craftsmanship needs detail; over-compressed thumbnails suppress conversion in a way that no Lighthouse score will reveal. The right approach is responsive sources — small for grids, large on demand for the product page — rather than one degraded compromise.
-
-Three things matter more than any framework choice:
-
-- **Explicit dimensions on every image**, so a grid doesn't reflow as photos load. Layout shift while scrolling is the most-felt defect in a browse experience.
-- **Lazy load below the fold**, eager for the product page's primary image, which is the one being evaluated.
-- **A real placeholder** — dominant color or blur — rather than a grey box, because grid cards read as broken before their images arrive.
-
----
-
-## 🔎 Product Detail: The Page That Has to Be Honest
-
-The product page carries the most consequential decision in the product, and it's where the two structural problems meet.
-
-**Availability is re-checked here, always.** A buyer arriving from a search grid may be looking at an index snapshot minutes old. The product page is the last cheap opportunity to correct that before they invest emotional effort, so it fetches from the source of truth rather than reusing the grid's data.
-
-**Variations complicate scarcity.** A listing with three colors and quantity one per color isn't "one available" — it's one available *per variant*, and selecting a sold-out variant must change the availability message, not just disable a swatch. Getting this wrong produces the worst version of the race: a buyer who selected an option they could never have bought.
-
-**The seller is part of the product.** For handmade goods, buyers evaluate the maker as much as the item — shop, other listings, reviews, response history. That's not decoration; it's the substitute for brand trust that a mass-market catalog gets for free. Treating shop context as a footer link under-serves the actual decision being made.
-
-**Reviews need honest aggregation.** With low review counts per item, a single five-star review shows as "5.0" and means almost nothing. Displaying the count with equal prominence — and resisting the urge to show a rating at all below a threshold — is more useful than a confident number derived from one opinion.
-
----
-
-## 🗄️ State: What the Client May Own
-
-| State | Owner | Home | Note |
-|-------|-------|------|------|
-| Cart contents | Client | Persisted locally | Convenience, not a claim on inventory |
-| Prices and availability | Server | Re-validated on cart view and checkout | Client may display, never assert |
-| Search query, filters, page | URL | — | Shareable and back-navigable |
-| Session / auth | Server | Cookie | Marketplace needs immediate revocation |
-| Favorites | Server | Fetched | Cross-device by definition |
-| Seller drafts | Client | Local until submit | Long forms; losing them to a reload is unacceptable |
-
-**The cart is the interesting row.** Local ownership makes it instant and durable across sessions, which suits deliberate purchasing. But it must store references and last-known display data — never authoritative price or availability. That's the same rule as any commerce client, and here it's load-bearing because the underlying facts change permanently rather than temporarily.
-
----
-
-## 💰 Money Is Not a Number
-
-A real defect from this codebase, and the most transferable frontend lesson in it.
-
-Postgres `DECIMAL` columns arrive through `pg` as **strings**, deliberately — coercing them to JavaScript numbers would introduce IEEE-754 precision loss on money. The frontend treated them as numbers, so `price.toFixed(2)` threw `TypeError: price.toFixed is not a function` at roughly twenty-five call sites, blanking every component that rendered a price.
-
-Three things this teaches:
-
-**The type annotation was a claim, not a check.** The interface said `price: number`. The API returned a string. Both sides compiled. This is the same class of failure as any client/server contract mismatch — types are erased at runtime, so a declared shape is only as good as what validates it at the boundary.
-
-**Money should never be a bare primitive in the client.** Passing a raw value around and formatting at each call site means twenty-five places to get it wrong. One `formatPrice` helper that accepts string-or-number and coerces safely turns a systemic bug into a single function — and it's the kind of thing worth building before the first price renders, not after.
-
-**The blast radius was multiplied by rendering strategy.** A throw during render doesn't degrade one line of text; it takes out the component and, without a scoped boundary, the page. A missing price should render as a dash, not remove the product from the catalog.
-
-> "The deeper point is that the backend made a correct decision — strings preserve decimal precision — and the frontend inherited a consequence nobody wrote down. That's what an API contract is for, and a shared type that nothing enforces isn't one."
-
----
-
-## ♿ Accessibility in a Visual Marketplace
-
-A catalog whose value is photographic is exactly where accessibility is most often abandoned.
-
-- **Alt text is seller-supplied and therefore unreliable.** The UI should require it at listing time with a clear explanation, because a marketplace where products are unlabeled is unusable with a screen reader. This is a design decision in the *seller* flow that determines buyer accessibility.
-- **Price, availability and shop name must be in the accessible name** of a card, not implied by visual adjacency.
-- **Filter changes must be announced** — a screen-reader user who applies a filter and hears nothing has no idea whether it worked.
-- **"Only one available" must not be color alone.** Scarcity is the most decision-relevant fact on the page.
-
----
-
-## 🧪 Testing the Race and the Split
-
-The valuable tests here are the ones that reproduce a concurrent buyer, which never happens in manual testing.
-
-| Scenario | Simulation | Protects |
-|----------|-----------|----------|
-| Item sold while in cart | Mark unavailable between cart load and checkout | The explanation flow, and that the rest of the cart survives |
-| Item sold during payment | Fail one seller-group at submit | Partial success, correct charge, honest summary |
-| Double-submit checkout | Fire submit twice | Idempotency; one set of orders |
-| Search out-of-order responses | Resolve an older query after a newer one | Cancellation — results match the current input |
-| Degraded search | Return the fallback flag | UI says results are limited rather than pretending |
-| Stale search availability | Index says available, product page says sold | Product page re-checks rather than trusting the grid |
-| Filter back-navigation | Filter, open product, go back | Filters and scroll position restored |
-
-The first two are the highest-value tests in the codebase, because they exercise the moment where the product is most likely to lose a customer and where the code is least likely to have been exercised by hand.
-
-I'd write these against **fixtures rather than a live Elasticsearch**, for the same reason as elsewhere: a test that needs a search cluster is a test that gets skipped.
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Rejected | Rationale |
-|----------|--------|----------|-----------|
-| Inventory holds | ✅ Reserve at checkout entry | ❌ Reserve on add-to-cart | Abandoned carts would hide one-of-a-kind items from real buyers |
-| Cart semantics | ✅ Explicitly not a claim | ❌ "Reserved" language | The UI must not be more confident than the system |
-| Cart ownership | ✅ Client, re-validated | ❌ Server cart | Instant edits; correctness enforced where it matters |
-| Multi-seller | ✅ Grouped by shop in cart | ❌ Reveal after purchase | Sets expectations before money is involved |
-| Partial failure | ✅ Partial success, lead with what worked | ❌ Fail everything | Other sellers shouldn't lose sales to an unrelated item |
-| Search input | ✅ Debounce + cancel superseded | ❌ Query per keystroke | Out-of-order responses show results for a stale prefix |
-| Loading | ✅ Keep previous results, dim | ❌ Spinner | Blanking feels slower at identical latency |
-| Degraded search | ✅ Say so explicitly | ❌ Render as normal | Silent degradation misrepresents the catalog |
-| Filters | ✅ URL | ❌ Store | Back button and sharing are the dominant navigation |
-| Images | ✅ Responsive sources | ❌ One compressed size | The photograph is the product |
-
----
-
-## 🔭 What I'd Build Next
-
-**Enforce the reservation the schema already describes.** It's the highest-value change in the product and it's mostly backend, but it unlocks a frontend the current one can't honestly build: a visible hold, a countdown, and a cart that means something. Until then the UI is compensating for a missing guarantee.
-
-**Recommendations from view history.** `view_history` is populated and unused. "Because you viewed" and a personalized homepage are the standard lift for a browse-heavy marketplace, and the data is already there — this is pure frontend-plus-a-query work.
-
-**Image upload for sellers.** Products currently carry URLs, which means listing requires hosting images elsewhere — a real barrier for the individual makers this marketplace is for. It's the most impactful gap in the seller experience.
-
----
-
-## 🚀 What Breaks First
-
-**Stale availability in search results**, before anything performance-related. Elasticsearch is updated from the write path with no CDC, so a failed index write leaves a sold item looking available indefinitely. The client can't fix the index, but it can stop trusting it: availability shown in a grid is a hint, and the product page must re-check. Designing as if search results are authoritative is the mistake.
-
-**Then infinite scroll's interaction with the back button.** Scrolling through 200 results, opening a product, and returning to the top is the most common frustration in marketplace browsing. Restoring scroll position and loaded pages is the fix, and it's the argument for keeping pagination state in the URL.
-
-**Then image weight**, which dominates bytes on every screen and is a delivery problem before it's a code problem.
-
-**Then cart size**, last and least — carts here are small, and a marketplace cart with fifty items isn't a real scenario.
-
----
-
-## 📝 Summary
-
-Three ideas carry this design:
-
-1. **The interface must never be more confident than the system.** With quantity-one inventory, every "reserved" badge and optimistic add is a promise the backend hasn't made — and a broken promise here costs a permanent loss rather than a retry.
-2. **The cart is one object that becomes several.** Revealing that in the cart, before any money moves, converts a post-purchase surprise into an understood structure — and makes partial failure explicable.
-3. **An empty result set is usually the interface's fault.** With an unnormalized catalog, zero results means the buyer's vocabulary didn't match the sellers'. Teaching the catalog's language, cancelling superseded queries, and being honest about degraded search matter more than shaving latency.
+Public product and shop pages benefit from server-rendered initial content, discoverable
+metadata, and cached image derivatives. Search can hydrate the initial result page and then
+navigate interactively. Cart, checkout, and seller pages depend on private session state and
+must not be shared through a public page cache.
+
+I would begin with route boundaries for home, search, product, shop, favorites, cart,
+checkout, purchase status, and seller workspace. Product cards, price display, shop
+identity, and line-level availability messages should be shared components. A checkout page
+should compose delivery, shop groups, totals, and purchase status instead of becoming one
+large stateful component.
+
+A typed client adapter converts the API's money and date representation once. It handles
+credentials, cancellation, response validation, and error classification. TypeScript types
+alone cannot validate a server response or turn a decimal string into a number.
+
+For public caching, I would separate anonymous listing data from personalized favorite
+state. Otherwise a shared product response can accidentally carry one buyer's saved status
+to another. Private requests include the current account in their cache identity and are
+discarded on logout.
+
+The API remains responsible for authorization. Hiding a seller action is useful navigation,
+but it cannot establish shop ownership. The UI needs a clear forbidden state when access
+changes while an edit form is open.
+
+## 🧭 State Ownership and Contracts — 5 minutes
+
+“I would avoid making one global store the owner of everything. Search identity, server
+data, and unsaved form state have different lifetimes.”
+
+| State | Owner | Reason |
+|-------|-------|--------|
+| Search query, filters, sort, cursor | Router URL | Reload, links, and back navigation reproduce the search |
+| Products, shops, cart, orders | Request cache keyed by resource and account | Server remains authoritative; refetch and stale state are explicit |
+| Current authenticated user | Session resource | Hydration, logout, and access changes have defined states |
+| Open filter sheet or navigation panel | Local state or small UI store | Temporary presentation state |
+| Image selection and unsaved listing edits | Component/form state | Avoid cross-product leakage |
+| Purchase operation identity | Durable purchase reference plus recoverable client record | Reload must reconnect to the same operation |
+
+TanStack Router can own navigation, a server-state library can manage queries, and Zustand
+can coordinate small cross-route UI concerns. These choices are replaceable; the ownership
+rules matter more than the library list.
+
+I would make session state loading, authenticated, or anonymous. A protected route waits for
+loading to settle before redirecting. Login and session refresh should return the same
+user/shop shape, and a successful login should preserve the intended destination.
+
+Cart responses include line IDs, quantities, current prices, shop groups, totals,
+availability warnings, and a cart revision. A quote response adds accepted totals, listing
+versions, a server expiry, and a checkout ID. The cart is a saved intention; the quote is
+the service's current offer under a hold.
+
+A favorite can be predicted optimistically because a failed save is reversible. I would
+track the latest desired state per item, serialize or supersede conflicting requests, and
+roll back only the mutation that failed. Replacing an entire favorite list from an old
+closure can undo a newer change.
+
+Cart quantities need a more cautious approach. The UI may acknowledge that an edit is
+pending, but server validation decides whether the requested amount is available. A failed
+cart fetch should show a retryable error, not an empty-cart illustration.
+
+## 🔎 Deep Dive: Search People Can Navigate — 8 minutes
+
+“I choose the URL as the canonical identity of a submitted search. If a buyer explores
+several products and presses Back, the same query and filters should return with a sensible
+scroll position.”
+
+### Query changes and request ordering
+
+The search field can hold a local draft while the person types. Submitting the query commits
+a normalized URL. On desktop, inexpensive filter changes can update it immediately; on
+mobile, a filter sheet can collect draft changes and apply them together. This is a
+deliberate interaction policy rather than accidental behavior from unrelated state
+variables.
+
+Every committed search creates a request identity from query, category, price range,
+attributes, sort, and pagination. Changing filters resets the cursor. Back navigation
+reconstructs the controls from the URL rather than leaving them at their previous local
+values.
+
+I would cancel obsolete requests and also reject results whose identity no longer matches
+the visible search. Cancellation alone is insufficient: a response may already have
+completed, or a cache layer may deliver it after navigation.
+
+While loading, the existing results can remain visible with a clear updating state. The
+count and applied-filter summary should identify which result set is on screen. An old
+result must not be silently relabeled with the new query.
+
+### Filters and degradation
+
+The server returns applied filters and capabilities along with products. If Elasticsearch is
+unavailable and a fallback cannot support a filter, I would preserve the buyer's selection
+and explain the limitation. I would not quietly turn “vintage, under $50, free shipping”
+into an unrestricted product list.
+
+A bounded SQL fallback may support exact category and price filters while offering simpler
+text matching. The response can say that relevance or facet counts are temporarily limited.
+If a required filter cannot be honored, the interface should offer an explicit retry or a
+clearly separate browse option.
+
+Facet counts must have a defined interpretation. I would use counts within the currently
+applied filter set initially. If product wants counts that preview removing a category
+filter, that is a different aggregation contract and should not be invented by the browser.
+
+The result total may be approximate or limited by the search engine. Displaying “10,000+
+results” is more honest than presenting a lower bound as an exact count. Pagination needs a
+stable sort tie-breaker and a bounded cursor lifetime; a dynamically changing catalog cannot
+promise an eternal frozen result set.
+
+### Why this choice is worth its cost
+
+| Approach | Benefit | Cost / failure mode |
+|----------|---------|---------------------|
+| ✅ Canonical URL plus query-keyed data | Shareable, restorable navigation and clear response identity | Requires normalization and explicit draft-versus-applied state |
+| ❌ Independent local filter state | Quick first implementation | Back/reload can disagree with visible controls or cached results |
+| ❌ Replace failed search with general products | Keeps the page visually populated | Misrepresents buyer intent and hides an outage |
+
+For a marketplace, exploration often spans many product pages. Losing the search context
+adds work precisely when a buyer is comparing similar items. I accept more careful routing
+and caching to preserve that context.
+
+I would restore scroll after the relevant page data and image dimensions are available. If
+the listing disappeared, keep the surrounding results and explain the missing item. The goal
+is to preserve the buyer's place without pretending the catalog never changes.
+
+## 🛍️ Deep Dive: Honest Inventory Feedback — 8 minutes
+
+“I choose a short reservation when checkout starts, not when someone saves a product to
+their cart. The frontend must explain that distinction instead of implying that a cart item
+is already secured.”
+
+A product card can show “Only one available” as a recent observation. The detail page
+refreshes availability when opened and when the tab regains focus, with a bounded refresh
+policy. A push update could improve freshness later, but it is still advisory: another buyer
+may win immediately after the latest notification.
+
+Adding to cart stores the buyer's requested quantity. The interface says “Added to cart,”
+not “Reserved.” If quantity changes before checkout, the cart retains the line with an
+actionable warning so the buyer can remove it or choose an acceptable quantity.
+
+### Making the hold visible
+
+At checkout entry, the server attempts to hold all selected lines in one short transaction.
+If a line is unavailable, the interface shows which item failed and preserves delivery
+input. The buyer explicitly chooses a revised basket before another attempt.
+
+Once a quote is returned, the UI shows accepted totals and the hold's expiry. The timer is
+computed from server time/expiry and corrected on status refresh; the browser clock is not
+the authority. When the timer appears to expire, disable new payment initiation and ask the
+server for the current state.
+
+```
+┌──────────────────────┐
+│ Cart: saved intention│
+└──────────┬───────────┘
+           ▼
+┌──────────────────────┐
+│ Request current quote│
+└──────────┬───────────┘
+           ▼
+┌──────────────────────┐
+│ Held until expiry    │
+│ Buyer accepts totals │
+└──────────┬───────────┘
+           ▼
+┌──────────────────────┐
+│ Payment being checked│
+│ Server owns outcome  │
+└──────────────────────┘
+```
+
+Entering payment processing changes the server's hold policy. The client should not
+automatically release a hold because its original five-minute timer elapsed while payment is
+being reconciled. It displays the current purchase state and offers status recovery instead.
+
+If a price or shipping term changes before quote acceptance, show the old and new totals and
+require a fresh acceptance. Product detail caches may be useful for browsing, but the quote
+amount drives the payment summary.
+
+### Alternative and trade-off
+
+| Approach | Benefit | Cost / failure mode |
+|----------|---------|---------------------|
+| ✅ Short checkout hold | Clear payment window for a serious buyer | Expiry, abuse controls, and payment reconciliation states |
+| ❌ Reserve every cart addition | Reassuring immediately after saving | Abandoned carts can hide unique stock for hours |
+| ❌ Validate only after charging | Minimal pre-payment workflow | Buyer may pay for inventory another buyer already obtained |
+
+The chosen approach gives up the promise that a saved item will remain available. I would
+make that cost visible in copy and cart warnings. It avoids giving casual browsing the power
+to indefinitely block scarce goods.
+
+Seller stock changes use expected versions and distinguish total stock from reserved stock.
+If a seller tries to reduce stock below active commitments, the edit receives a conflict
+with the current quantities. The seller must not be allowed to erase a buyer's valid hold
+through an ordinary form save.
+
+## 💳 Deep Dive: Recoverable Multi-Shop Checkout — 8 minutes
+
+“I would represent one buyer purchase and several seller orders. The buyer needs one payment
+outcome, while sellers need independent fulfillment responsibilities.”
+
+The order summary groups lines by shop and makes each shipping charge visible. A combined
+total does not mean combined shipping or one delivery date. The backend returns the amount
+and currency; the browser formats them rather than independently reconstructing a payable
+total.
+
+Before payment submission, the client creates or receives a stable operation identity bound
+to the accepted quote. Double clicks, network retries, and status recovery reuse that
+identity and payload. A new basket or changed quote is a new operation, not an edit to an
+in-flight payment request.
+
+### Handling an uncertain response
+
+Suppose the buyer presses Pay, the provider succeeds, and the response is lost. The browser
+must not infer failure. It navigates to or remains on a durable purchase status view and
+requests the same operation's state.
+
+```
+┌──────────────────────┐      ┌──────────────────────┐
+│ Submit accepted quote│─────▶│ Processing / unknown │
+│ Stable operation ID  │      │ Poll durable status  │
+└──────────────────────┘      └──────────┬───────────┘
+                                         ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ Explicit failure     │◀─────│ Authoritative result │
+│ Re-quote if needed   │      │ Confirmed or declined│
+└──────────────────────┘      └──────────────────────┘
+```
+
+A status endpoint distinguishes still processing, confirmed, definitively declined, expired
+before payment, and requiring attention. Polling can start quickly and back off, pausing
+when the page is hidden. Reopening the purchase resumes status retrieval. A push
+notification can reduce latency but does not replace the durable read.
+
+The backend must scope operation identity to the buyer and request digest. A Redis response
+cache alone is not enough if it disappears after the database commits. Frontend retry
+behavior depends on that contract; disabling a button cannot provide it.
+
+### Cart and seller-order updates
+
+On confirmation, the server consumes only the cart lines/quantities covered by the purchase
+revision. The client replaces or invalidates the cart using the authoritative result. It
+must not send an extra “delete my whole cart” request: another tab may have added something
+while payment was pending.
+
+The confirmation screen lists the seller orders and their delivery expectations. A payment
+pending response says payment is pending; it does not use the same success presentation as a
+confirmed purchase. If one seller later cancels, the purchase page shows the corresponding
+refund and remaining seller orders.
+
+Cancellation UI uses server-provided allowed actions and the current order version. It
+explains whether cancellation is requested, stock has been released, or a refund is still
+processing. The client does not synthesize “refunded” from an order status label.
+
+| Approach | Benefit | Cost / failure mode |
+|----------|---------|---------------------|
+| ✅ Durable purchase status and stable retries | Reload and timeout recovery without a new purchase | More visible intermediate states and a status endpoint |
+| ❌ Treat any timeout as failure | Simple error handler | Encourages a second operation after the first may have succeeded |
+| ❌ Confirm each successful seller silently | Can salvage part of a basket | Changes the accepted purchase without explicit buyer consent |
+
+I choose explicit all-basket consent at checkout entry. Later fulfillment can differ by
+seller, but that does not justify silently changing which lines were purchased. The
+trade-off is that one unavailable line requires the buyer to revise the basket before
+proceeding.
+
+## ⚡ Performance, Accessibility, and Verification — 5 minutes
+
+Images are likely to dominate page weight. I would generate several derivatives, reserve
+aspect-ratio space, load the main product image promptly, and lazy-load images outside the
+viewport. Loading every original image in a search grid wastes bandwidth and delays the
+useful content.
+
+Start with bounded result pages and incremental loading. If long feeds become a measured
+rendering bottleneck, use row-based virtualization with stable item identity and preserve
+keyboard focus and scroll restoration. Virtualization does not solve large image downloads
+or expensive search requests by itself.
+
+Seller forms and checkout should split by route and load optional heavy features when
+needed. Prefetching a likely next product can help, but broad prefetching on every pointer
+movement can flood the API and distort view counters. Record a product view as an
+intentional event rather than treating every fetch as engagement.
+
+For accessibility, I would test labeled inputs, keyboard-operable filter dialogs, focus
+restoration, announced availability changes, and an error summary linked to invalid delivery
+fields. Hover-only account menus and icon-only controls need accessible alternatives. A
+color change alone cannot convey that a hold expired.
+
+My highest-value checks are behavioral:
+
+- Search A returns after search B; the page still shows B and its filters.
+- Back navigation restores query, controls, pagination, and scroll context.
+- A valid session is loading; a protected route waits instead of redirecting.
+- Two buyers try a unique item; the losing buyer keeps their form and sees the exact conflict.
+- Payment succeeds but the response is lost; retry reads the original purchase.
+- Another tab adds a cart item during payment; confirmation preserves that addition.
+- Logout/login switches accounts while requests are in flight; old private data is discarded.
+
+I would collect page performance, failed search transitions, quote conflicts, abandoned
+checkout states, and time spent waiting for payment resolution. A fast success screen is not
+a useful metric if it sometimes confirms an uncompleted purchase.
+
+## 🔭 Scope Boundary and Next Decisions — 2 minutes
+
+“The design gives buyers a stable exploration history, honest availability, and a purchase
+they can recover after a network failure. I would implement those contracts before adding
+personalized recommendations or real-time inventory animation.”
+
+The local project currently uses client-rendered React, TanStack Router, Zustand, SQL carts,
+and JSON API calls. It has no server-state query library, durable quote/hold workflow,
+client idempotency key, or purchase-status recovery. Session hydration and stale-response
+handling have gaps. Fresh checkout also inserts a payment column missing from its supplied
+schema.
+
+Those are implementation boundaries, not features I would claim to have built. The
+[architecture document](./architecture.md#implementation-notes) maps them to source; this
+interview answer describes the proposed product behavior.
+
+If the interviewer wants to extend the design, I would choose either custom-order variations
+or cross-currency multi-shop checkout. Both change the accepted quote and consent model, so
+they deserve a clear contract before more components are added to the whiteboard.

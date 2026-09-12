@@ -1,286 +1,205 @@
-# Calendly - Meeting Scheduling Platform
+# Calendly: meeting scheduling
 
-A full-stack meeting scheduling platform that allows users to share their availability and let others book meetings without back-and-forth email coordination.
+A local learning project for publishing weekly availability, sharing a booking page, and managing one-to-one meetings. Hosts use a React dashboard; guests choose a date and time without creating an account. The backend demonstrates host-scoped database locking, interval calculations, cached availability, and simulated notifications.
 
-## Codebase Stats
+This is an independent implementation, not Calendly's private architecture. It has important scheduling and recovery gaps: rescheduled meetings stop blocking time, some generated slots fall outside working hours, and timezone handling depends on the server's local zone. See [Implementation Notes](./architecture.md#implementation-notes) before treating its results as a reliable calendar.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 12,930 |
-| Source Files | 88 |
-| .ts | 6,918 |
-| .tsx | 2,912 |
-| .md | 2,414 |
-| .sql | 327 |
-| .json | 167 |
+## Supported flows
 
-## Features
+- Register a host, select a timezone, and sign in through a Redis-backed session.
+- Create, edit, activate, deactivate, or delete event types with a duration, buffers, description, and color. Daily caps exist in the API and seed, but the event-type modal has no cap control.
+- Set one weekly working interval per day through the UI. The API supports multiple rules, but the editor collapses them to one interval per day when loaded and saved.
+- Share `/book/<meeting-type UUID>` using Copy Link or Preview Booking Page. The editable slug is metadata; it is not used in the public route.
+- Let guests select a slot, enter name/email/notes, and see a confirmation screen. Host lists and public booking details support cancellation. Rescheduling is API-only.
+- Use an administrator account to view platform totals, users, and simulated email logs. User deletion and global booking queries exist in the API; the admin page has no controls for them.
 
-- **Event Types**: Create customizable meeting types with different durations, buffer times, and descriptions
-- **Availability Management**: Set weekly working hours when you're available for meetings
-- **Booking Page**: Public booking page with calendar view and timezone support
-- **Double-Booking Prevention**: Database-level constraints ensure no overlapping bookings
-- **Timezone Handling**: All times stored in UTC, displayed in user's local timezone
-- **Email Notifications**: Simulated email notifications logged to the database and console
-- **Dashboard**: View upcoming bookings and statistics
-- **Admin Panel**: System-wide statistics and user management
+There is no Google/Outlook integration, external-calendar conflict check, SMTP delivery, calendar export, group capacity, round-robin assignment, or recurring-booking workflow. The landing page's calendar-integration claim and the confirmation screen's “email sent” message exceed the implementation.
 
-## Tech Stack
+## Stack and documentation
 
-- **Frontend**: TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
-- **Backend**: Node.js + Express + TypeScript
-- **Database**: PostgreSQL 16
-- **Cache**: Redis 7
-- **Authentication**: Session-based with Redis store
+| Layer | Implementation |
+|-------|----------------|
+| Browser | React 19, TypeScript, Vite 5, TanStack Router, Zustand 4, Tailwind CSS |
+| API | Node.js 20+, Express 4, TypeScript/tsx, ESM, Zod |
+| Persistence | PostgreSQL 16 for accounts, rules, bookings, archives, and simulated email logs |
+| Cache/auth | Valkey 7 via ioredis; connect-redis and express-session |
+| Notifications | RabbitMQ 3 and a separate Node worker; SQL/console simulation |
+| Operations | Pino, prom-client, health endpoints, manual archival commands |
 
-## Prerequisites
+[architecture.md](./architecture.md) separates the production proposal from the local implementation. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) answers are spoken, timed interview designs. [CLAUDE.md](./CLAUDE.md) contains historical development notes; source takes precedence where its claims differ.
 
-- Node.js 18+ and npm
-- Docker and Docker Compose (for PostgreSQL and Redis)
+## Infrastructure
 
-## Getting Started
+Start in the repository root. Choose one option, then keep subsequent setup terminals in `calendly` unless another directory is specified. Stop other projects using the same infrastructure ports.
 
-### 1. Start Infrastructure with Docker
+### Option A: Docker Compose (recommended)
 
 ```bash
 cd calendly
-
-# Start PostgreSQL and Redis
-docker-compose up -d
-
-# Verify containers are running
-docker-compose ps
+docker compose up -d
+docker compose ps
 ```
 
-This will:
-- Start PostgreSQL on port 5432 with the `calendly` database
-- Start Redis on port 6379
-- Run the database initialization script to create tables and seed demo data
+| Service | Connection | Development credentials |
+|---------|------------|-------------------------|
+| PostgreSQL | localhost:5432, database calendly | calendly / calendly_password |
+| Valkey | localhost:6379 | No authentication |
+| RabbitMQ | localhost:5672 | guest / guest |
+| Broker management | [localhost:15672](http://localhost:15672) | guest / guest |
 
-### 2. Start the Backend
+PostgreSQL applies [init.sql](./backend/src/db/init.sql) on a fresh data volume. It creates seven tables and indexes, **without users or demo meetings**. There is no migration command, and this schema is not safely rerunnable because table creation lacks `IF NOT EXISTS`.
+
+PostgreSQL and Valkey have named volumes. Valkey does not explicitly enable AOF. RabbitMQ has no persistent volume, so ordinary container replacement does not preserve queued notifications.
+
+```bash
+docker compose down
+# Also remove PostgreSQL and Valkey data when deliberately resetting the demo:
+docker compose down -v
+```
+
+### Option B: Native installation on macOS
+
+```bash
+cd calendly
+brew install postgresql@16 valkey rabbitmq
+brew services start postgresql@16
+brew services start valkey
+brew services start rabbitmq
+export PATH="$(brew --prefix postgresql@16)/bin:$(brew --prefix rabbitmq)/sbin:$PATH"
+psql postgres -c "CREATE USER calendly WITH PASSWORD 'calendly_password';"
+createdb -O calendly calendly
+PGPASSWORD=calendly_password psql -h localhost -U calendly -d calendly -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+pg_isready -h localhost -p 5432
+valkey-cli ping
+rabbitmq-diagnostics -q ping
+```
+
+These commands assume the current macOS account can administer the Homebrew PostgreSQL instance. Skip role/database creation if they already exist, and apply the schema only to an empty database. The current [Homebrew RabbitMQ formula](https://formulae.brew.sh/formula/rabbitmq) installs a newer major version than Compose. Local guest credentials work over loopback; the application declares its queues when a connection is established.
+
+## Start the application
+
+Use separate terminals for these commands, each initially in `calendly`.
+
+API:
 
 ```bash
 cd backend
-
-# Install dependencies
 npm install
-
-# Start the development server
 npm run dev
 ```
 
-The API server will be available at http://localhost:3001
+Notification worker:
 
-To verify the backend is running:
 ```bash
-curl http://localhost:3001/health
+cd backend
+npm run dev:worker
 ```
 
-### 3. Start the Frontend
+Frontend:
 
 ```bash
 cd frontend
-
-# Install dependencies
 npm install
-
-# Start the development server
 npm run dev
 ```
 
-The frontend will be available at http://localhost:5173
+Open [localhost:5173](http://localhost:5173). The default API port is **3000**, and Vite proxies `/api` there. The backend can listen after failed database/cache checks; a listening process does not mean booking and authentication are ready.
 
-## Demo Credentials
+The worker requires PostgreSQL, Valkey, and RabbitMQ on startup. Direct notification simulation also runs in the API, so normal operation with a worker can produce duplicate email-log records. No actual email is sent.
 
-Two demo users are created on first startup:
+### Configuration
 
-| User | Email | Password | Role |
-|------|-------|----------|------|
-| Demo User | demo@example.com | password123 | user |
-| Admin | admin@example.com | password123 | admin |
-
-Note: The demo password hash in the database is a placeholder. For first-time login, you may need to register a new account or update the password hash.
-
-## Project Structure
-
-```
-calendly/
-├── docker-compose.yml          # PostgreSQL and Redis services
-├── backend/
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── src/
-│       ├── index.ts            # Express server entry point
-│       ├── db/
-│       │   ├── index.ts        # Database and Redis connections
-│       │   └── init.sql        # Database schema and seed data
-│       ├── routes/
-│       │   ├── auth.ts         # Authentication routes
-│       │   ├── meetingTypes.ts # Event type management
-│       │   ├── availability.ts # Availability rules and slots
-│       │   ├── bookings.ts     # Booking CRUD operations
-│       │   └── admin.ts        # Admin-only routes
-│       ├── services/
-│       │   ├── userService.ts
-│       │   ├── meetingTypeService.ts
-│       │   ├── availabilityService.ts
-│       │   ├── bookingService.ts
-│       │   └── emailService.ts # Simulated email notifications
-│       ├── middleware/
-│       │   └── auth.ts         # Authentication middleware
-│       ├── types/
-│       │   └── index.ts        # TypeScript type definitions
-│       └── utils/
-│           └── time.ts         # Timezone utilities
-└── frontend/
-    ├── package.json
-    ├── vite.config.ts
-    ├── tailwind.config.js
-    └── src/
-        ├── main.tsx            # React entry point
-        ├── routes/             # File-based routing with Tanstack Router
-        │   ├── __root.tsx
-        │   ├── index.tsx       # Home page
-        │   ├── login.tsx
-        │   ├── register.tsx
-        │   ├── dashboard.tsx
-        │   ├── meeting-types.tsx
-        │   ├── availability.tsx
-        │   ├── bookings.tsx
-        │   ├── bookings.$bookingId.tsx
-        │   ├── book.$meetingTypeId.tsx  # Public booking page
-        │   └── admin.tsx
-        ├── components/
-        │   ├── Navbar.tsx
-        │   ├── CalendarPicker.tsx
-        │   ├── TimeSlotPicker.tsx
-        │   └── LoadingSpinner.tsx
-        ├── stores/
-        │   └── authStore.ts    # Zustand auth state
-        ├── services/
-        │   └── api.ts          # API client
-        ├── types/
-        │   └── index.ts
-        └── utils/
-            └── time.ts         # Timezone utilities
-```
-
-## API Endpoints
-
-### Authentication
-- `POST /api/auth/register` - Register a new user
-- `POST /api/auth/login` - Login
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
-
-### Meeting Types
-- `GET /api/meeting-types` - List user's meeting types
-- `GET /api/meeting-types/:id` - Get meeting type details
-- `POST /api/meeting-types` - Create meeting type
-- `PUT /api/meeting-types/:id` - Update meeting type
-- `DELETE /api/meeting-types/:id` - Delete meeting type
-
-### Availability
-- `GET /api/availability/rules` - Get user's availability rules
-- `POST /api/availability/rules` - Set availability rules (bulk)
-- `GET /api/availability/slots` - Get available time slots
-- `GET /api/availability/dates` - Get dates with available slots
-
-### Bookings
-- `GET /api/bookings` - List user's bookings
-- `GET /api/bookings/stats` - Get dashboard statistics
-- `GET /api/bookings/:id` - Get booking details
-- `POST /api/bookings` - Create a booking
-- `PUT /api/bookings/:id/reschedule` - Reschedule a booking
-- `DELETE /api/bookings/:id` - Cancel a booking
-
-### Admin (requires admin role)
-- `GET /api/admin/stats` - System-wide statistics
-- `GET /api/admin/users` - List all users
-- `GET /api/admin/bookings` - List all bookings
-- `GET /api/admin/emails` - Email notification logs
-- `DELETE /api/admin/users/:id` - Delete a user
-
-## Key Implementation Details
-
-### Double-Booking Prevention
-
-The system uses multiple layers to prevent double bookings:
-
-1. **Database Constraint**: Unique index on `(host_user_id, start_time)` for confirmed bookings
-2. **Row-Level Locking**: `SELECT FOR UPDATE` on the host user during booking creation
-3. **Conflict Check**: Query for overlapping bookings before insertion
-4. **Optimistic Locking**: Version field for concurrent modifications
-
-### Availability Calculation
-
-Available time slots are calculated by:
-1. Fetching the user's weekly availability rules
-2. Fetching existing confirmed bookings
-3. Merging busy periods and applying buffer times
-4. Finding gaps that fit the meeting duration
-5. Filtering out past slots
-
-Results are cached in Redis for 5 minutes.
-
-### Timezone Handling
-
-- All times are stored in PostgreSQL as `TIMESTAMP WITH TIME ZONE` (UTC)
-- User's timezone preference is stored separately
-- API accepts timezone parameter for displaying availability
-- Frontend detects user's local timezone automatically
-- Booking confirmations show time in both host's and invitee's timezones
-
-### Email Notifications
-
-Emails are simulated by:
-1. Logging the full email content to the console
-2. Storing email records in the `email_notifications` table
-3. Can be viewed in the Admin panel
-
-In production, integrate with SendGrid, Mailgun, or SMTP.
-
-## Running Multiple Instances
-
-For testing distributed scenarios:
+Export variables in the relevant API/worker terminal before starting it. There is no `.env` loader. Defaults match Compose:
 
 ```bash
-# Terminal 1 - Server on port 3001
-cd backend && npm run dev:server1
-
-# Terminal 2 - Server on port 3002
-cd backend && npm run dev:server2
-
-# Terminal 3 - Server on port 3003
-cd backend && npm run dev:server3
+export DB_HOST=localhost DB_PORT=5432 DB_NAME=calendly
+export DB_USER=calendly DB_PASSWORD=calendly_password
+export REDIS_HOST=localhost REDIS_PORT=6379
+export RABBITMQ_HOST=localhost RABBITMQ_PORT=5672
+export RABBITMQ_USER=guest RABBITMQ_PASSWORD=guest
+export PORT=3000 FRONTEND_URL=http://localhost:5173
+export SESSION_SECRET=calendly-secret-key-change-in-production
+export NODE_ENV=development
 ```
 
-## Stopping Services
+RabbitMQ uses these separate variables; `RABBITMQ_URL` is not read. `NODE_ENV=production` makes cookies secure and requires HTTPS for browser sessions. Availability caching defaults to five minutes via `AVAILABILITY_CACHE_TTL_MINUTES`; idempotency results default to one hour via `IDEMPOTENCY_KEY_TTL`. [shared/config.ts](./backend/src/shared/config.ts) contains retention and alert settings, including several settings whose corresponding features are unused. The active pool uses fixed values of 20 connections and a two-second connection timeout in [db/index.ts](./backend/src/db/index.ts).
+
+To compare API instances, run `dev:server1`, `dev:server2`, and `dev:server3` in separate backend terminals. They listen on 3001–3003 and share data. No load balancer is provided, and Vite still targets 3000. Worker variants `dev:worker1` and `dev:worker2` run the same worker; the supplied `WORKER_ID` values are not read by its code.
+
+## Create a usable demo
+
+The simplest path is to register a host through the UI, choose the intended host timezone, set weekly availability, and create an event type. Copy or preview that event type's link. Use a separate guest browser context to book, then return to the host's Bookings page to inspect the resulting record.
+
+The landing page's built-in demo link and `demo@example.com / demo123` hint refer to records that initialization no longer creates. Do not use them as a setup check.
+
+### Optional sample hosts
+
+The checked-in [seed.sql](./backend/db-seed/seed.sql) is broken as a complete fixture: booking IDs beginning with `bk` and archive IDs beginning with `ar` are invalid UUIDs, and some rows reference absent demo users/types. It is not a successful one-command seed.
+
+For a fresh database, you can import only its valid host/type/availability prefix. This creates four ordinary users, eight event types, and twenty weekly rules, without sample bookings or email logs:
 
 ```bash
-# Stop Docker containers
-docker-compose down
-
-# To also remove volumes (data)
-docker-compose down -v
+awk '/-- SAMPLE BOOKINGS/ {exit} {print}' backend/db-seed/seed.sql > /tmp/calendly-host-fixture.sql
 ```
 
-## Architecture
+Docker:
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+```bash
+docker compose exec -T postgres psql -U calendly -d calendly -v ON_ERROR_STOP=1 < /tmp/calendly-host-fixture.sql
+```
 
-## Development Notes
+Native:
 
-See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
+```bash
+PGPASSWORD=calendly_password psql -h localhost -U calendly -d calendly -v ON_ERROR_STOP=1 -f /tmp/calendly-host-fixture.sql
+```
 
-## References & Inspiration
+Use this prefix once, before creating accounts with the same emails. Rerunning it duplicates availability rules; existing emails with different IDs can break its foreign-key references. The source fixture itself remains unchanged.
 
-- [Calendly Engineering Blog](https://www.calendly.com/blog/engineering) - Official engineering insights from Calendly
-- [Google Calendar API Documentation](https://developers.google.com/calendar) - Calendar integration patterns and best practices
-- [Falsehoods Programmers Believe About Time](https://infiniteundo.com/post/25326999628/falsehoods-programmers-believe-about-time) - Essential reading on time zone edge cases
-- [IANA Time Zone Database](https://www.iana.org/time-zones) - The authoritative source for time zone data
-- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book on distributed systems fundamentals
-- [Merge Intervals - LeetCode](https://leetcode.com/problems/merge-intervals/) - Algorithm for availability slot calculation
-- [The Problem with Time & Timezones (Computerphile)](https://www.youtube.com/watch?v=-5wpm-gesOY) - Video explaining time zone complexity
-- [Date-fns Timezone Documentation](https://date-fns.org/docs/Time-Zones) - Modern approach to JavaScript date handling
-- [Building a Scheduling System at Scale](https://engineering.grab.com/building-a-scheduling-system) - Grab's engineering blog on scheduling challenges
+| Host | Email | Password | Host timezone |
+|------|-------|----------|---------------|
+| Alice | alice@example.com | password123 | America/Los_Angeles |
+| Bob | bob@example.com | password123 | America/Chicago |
+| Charlie | charlie@example.com | password123 | Europe/London |
+| Diana | diana@example.com | password123 | Asia/Tokyo |
+
+The shared sample hash was checked with bcrypt: `password123` matches; `demo123` and `admin123` do not. Diana has weekly rules but no seeded event type. Alice's Quick Call is at [localhost:5173/book/4611eebc-9c0b-4ef8-bb6d-6bb9bd380a11](http://localhost:5173/book/4611eebc-9c0b-4ef8-bb6d-6bb9bd380a11).
+
+### Optional administrator
+
+There is no seeded administrator. After importing the sample hosts, promote Alice explicitly for this local demo:
+
+```bash
+# Docker:
+docker compose exec -T postgres psql -U calendly -d calendly -c "UPDATE users SET role = 'admin' WHERE email = 'alice@example.com';"
+# Native alternative:
+PGPASSWORD=calendly_password psql -h localhost -U calendly -d calendly -c "UPDATE users SET role = 'admin' WHERE email = 'alice@example.com';"
+```
+
+Use only the command for your infrastructure. Log out and log in again because the role is copied into the session. If you created your own host instead, substitute that registered email. No administrator password is created by this update.
+
+## Checks and maintenance
+
+```bash
+curl -i http://localhost:3000/health/live
+curl -i http://localhost:3000/health/ready
+curl -s http://localhost:3000/health/detailed
+curl -s http://localhost:3000/metrics
+```
+
+The API connects to RabbitMQ lazily during notification publication, so its health can initially report degraded broker connectivity even if the separate worker is connected. Readiness permits degraded status; it does not prove notification delivery or worker progress.
+
+Backend and frontend offer `npm run build`, `npm run type-check`, and `npm run lint`. There is no backend unit-test script. From the repository root, `npm run test:smoke calendly` runs eight page checks against the running stack and Alice account. Most only assert `main`; the detail test uses an invalid UUID and can pass on an error page. These tests do not establish successful booking, timezone correctness, or concurrency safety.
+
+Manual backend commands include `db:archive-bookings`, `db:maintenance`, and `db:storage-stats`. Archival removes old completed/cancelled rows from the live table and cascades their email logs; it is a data mutation, not a preview. No scheduler invokes it. `db:maintenance` also queries a nonexistent `calendar_events_cache` table and can partially perform other work before failing. These scripts catch errors and exit without a nonzero status, so inspect their output. Storage statistics represent an inaccessible/missing calendar table as zero.
+
+## Known behavior to account for
+
+- Rescheduling changes status to `rescheduled`; conflict, availability, daily-cap, and reminder paths count only `confirmed` bookings. The moved meeting no longer reserves time. The unique index prevents identical confirmed starts, not arbitrary interval overlap.
+- Create/reschedule do not fully validate that the requested time belongs to working hours, is in the future, or satisfies the displayed slot policy. Buffer and daily-cap rules differ between calculation and writes.
+- Date selection mixes host, invitee, and process-local day boundaries. The interval helper does not clip busy intervals to the working window. Cached slots can remain stale across other meeting types and policy edits.
+- Booking details and anonymous cancel/reschedule APIs rely on possession of the booking UUID. There is no separate scoped guest token. Login currently returns the password hash because the code removes the wrong property name; this should not be deployed as private account management.
+- Notifications have no transactional outbox or duplicate guard. Direct and queued paths both run; reconnect does not restore consumers, and rescheduling does not schedule replacement reminders.
+- Guest confirmation uses the selected draft rather than the complete returned booking, and does not expose a management link. A timezone change in the details step clears the selected slot without returning to time selection. Load failures can look like no availability, while an empty date set enables all future dates in the picker.
+
+The documentation review inspected source/configuration and ran isolated password, date, interval, and object-shape checks. It did not start this application, execute its SQL fixture, run browser tests, or benchmark production behavior. Detailed evidence is in [architecture.md](./architecture.md#implementation-notes).

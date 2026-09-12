@@ -1,86 +1,120 @@
-# Design DocuSign - Electronic Signature Platform
+# DocuSign: electronic signature workflow
 
-## Codebase Stats
+A system design learning project for preparing PDFs, assigning fields to recipients, and coordinating a signing workflow. React provides sender, signer, and administrator screens; one Express API stores metadata in PostgreSQL, sessions in Valkey/Redis, and original PDFs and signature images in MinIO. RabbitMQ integration is present but currently incompatible with the included worker.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 13,119 |
-| Source Files | 90 |
-| .ts | 7,134 |
-| .tsx | 3,427 |
-| .md | 1,982 |
-| .json | 175 |
-| .sql | 152 |
+**Current status:** draft preparation and seeded document viewing are implemented. The normal signing sequence has a confirmed cache-contract defect: opening a signing session stores recipient identifiers under names that the write endpoints do not read, so signing an assigned field returns 403. Completion, notification delivery, audit verification, and document export also have limitations described below. This is a teaching implementation, with no demonstrated legal compliance or certification.
 
-## Overview
+Read [architecture.md](./architecture.md) for the production proposal, exact local schema, and source-backed limitations. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) interview answers describe proposed designs you can explain at a whiteboard. [CLAUDE.md](./CLAUDE.md) records earlier development history; some historical completion claims exceed current behavior.
 
-A simplified DocuSign-like platform demonstrating document workflows, electronic signatures, and secure audit trails. This educational project focuses on building a legally compliant signature system with multi-party signing flows.
+## What you can explore
 
-## Key Features
+| Persona | Implemented interface | Practical limits |
+|---------|-----------------------|------------------|
+| Sender | Register/login, dashboard, envelope list, create draft, upload PDF, add recipients, click to place fields, send/void, audit tab | No templates UI, document versioning, drag/resize editor, or live status updates |
+| Signer | Token link, one-page PDF viewer, field checklist, draw/type signature modal, date/text/checkbox actions, finish/decline screens | Cached signer mismatch blocks normal writes; no enforced routing gate, expiration, or additional authentication |
+| Administrator | Statistics, users and role changes, envelopes, simulated email records | Lists show the first page; a View link opens the sender route and cannot inspect another sender's envelope there |
+| Developer | Health endpoints, Prometheus metrics, Pino logs, queue and storage helpers | These do not establish delivery, tamper resistance, or recovery guarantees |
 
-### 1. Document Management
-- PDF upload and processing
-- Template creation
-- Field placement (signature, initial, date, text, checkbox)
-- Version control
+Both PDF viewers render at a fixed 700 CSS-pixel width. Fields use pixels relative to the surrounding viewer, not normalized page coordinates. The signing overlay shows completion checkmarks rather than the stored signature image or entered value. PDF downloads return the original bytes; a completed envelope does not produce a flattened, digitally signed PDF.
 
-### 2. Signing Workflow
-- Multi-party routing
-- Signing order (serial/parallel)
-- Role-based access
-- Email notifications (simulated)
+## Stack and prerequisites
 
-### 3. Electronic Signatures
-- Draw signature on canvas
-- Type signature with custom font
-- Field completion tracking
+- Node.js 20 or newer and npm; use an actively supported Node release for your environment.
+- React 19, TypeScript, Vite, TanStack Router, Zustand, Tailwind CSS, React-PDF/PDF.js, and Signature Pad.
+- Express 4, PostgreSQL 16, Valkey 7 in Compose, MinIO, and RabbitMQ 3 in Compose.
+- `pdf-lib` parses uploads and generates seed PDFs. There is no separate PDF processing worker.
 
-### 4. Authentication
-- Session-based auth with Redis
-- Email verification for signers
+[React-PDF](https://github.com/wojtekmaj/react-pdf) is the PDF **viewer** dependency. The worker is loaded from unpkg by both viewer routes, so viewing also depends on that external resource. No React Query or Zod integration is present.
 
-### 5. Audit Trail
-- Tamper-proof hash chain
-- Complete event logging
-- IP addresses and timestamps
-- Certificate of completion
+Commands below start from this project's directory (`docusign`). Only one project should use the default ports at a time.
 
-## Quick Start
+## Infrastructure
 
-### Prerequisites
-
-- Node.js 20+
-- Docker and Docker Compose
-- pnpm, npm, or yarn
-
-### 1. Start Infrastructure
+### Option A: Docker Compose (recommended for matching project services)
 
 ```bash
-cd docusign
-docker-compose up -d
+docker compose up -d
+docker compose ps
+docker compose logs minio-init
 ```
 
-This starts:
-- PostgreSQL (port 5432)
-- Redis (port 6379)
-- MinIO (ports 9000, 9001)
+Compose starts infrastructure only. Run the API and frontend separately below. PostgreSQL runs [init.sql](./backend/src/db/init.sql) only when its data directory is first initialized; API startup only checks connectivity. There is no `db:migrate` script. If using an existing, empty database that has not been initialized, apply the schema once:
 
-Wait for services to be healthy:
 ```bash
-docker-compose ps
+docker compose exec -T postgres psql -U docusign -d docusign -v ON_ERROR_STOP=1 < backend/src/db/init.sql
 ```
 
-### 2. Start Backend
+Do not rerun that command against an already initialized schema: the table creation statements are not idempotent. A successful `minio-init` exit is insufficient proof of bucket creation because its script ends with unconditional success. Inspect the buckets in the console or with `mc`.
+
+The supplied initializer grants anonymous download access to both buckets. This is a local demo configuration, and authenticated API routes do not make those objects private. Native instructions below create private buckets instead. Compose uses moving MinIO image tags and provides no object versioning, retention lock, or encryption configuration.
+
+```bash
+docker compose down
+# Optional destructive reset: removes the project's database/object/queue volumes.
+docker compose down -v
+```
+
+### Option B: native installation on macOS (no Docker)
+
+Homebrew's [PostgreSQL 16 formula](https://formulae.brew.sh/formula/postgresql@16) and [RabbitMQ formula](https://formulae.brew.sh/formula/rabbitmq) provide service commands. MinIO publishes its own [Homebrew tap](https://github.com/minio/homebrew-stable). Native formula versions may differ from Compose.
+
+```bash
+brew install postgresql@16 valkey rabbitmq
+brew install minio/stable/minio minio/stable/mc
+brew services start postgresql@16
+brew services start valkey
+brew services start rabbitmq
+export PATH="$(brew --prefix postgresql@16)/bin:$(brew --prefix rabbitmq)/sbin:$PATH"
+```
+
+Create the database and role once, from your local PostgreSQL administrator account. These are development credentials:
+
+```bash
+psql postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE docusign WITH LOGIN PASSWORD 'docusign_dev';"
+createdb -O docusign docusign
+PGPASSWORD=docusign_dev psql -h localhost -U docusign -d docusign -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+pg_isready -h localhost -U docusign -d docusign
+valkey-cli ping
+```
+
+Start MinIO in a separate terminal and keep it running:
+
+```bash
+mkdir -p "$HOME/.local/share/docusign-minio"
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin123 minio server "$HOME/.local/share/docusign-minio" --console-address ':9001'
+```
+
+In another terminal, create and inspect the buckets, then provision RabbitMQ:
+
+```bash
+mc alias set docusign-local http://localhost:9000 minioadmin minioadmin123
+mc mb --ignore-existing docusign-local/docusign-documents
+mc mb --ignore-existing docusign-local/docusign-signatures
+mc ls docusign-local
+curl -f http://localhost:9000/minio/health/live
+rabbitmqctl add_user docusign docusign123
+rabbitmqctl set_permissions -p / docusign '.*' '.*' '.*'
+rabbitmqctl set_user_tags docusign management
+rabbitmq-plugins enable rabbitmq_management
+rabbitmq-diagnostics -q ping
+```
+
+If the role, database, or RabbitMQ user already exists, inspect and reuse it instead of recreating it. Do not start native services on ports already occupied by Compose.
+
+## Run the application
+
+First ensure PostgreSQL, Valkey, and MinIO are reachable. The backend retries their initialization, but does not run migrations. Starting it before MinIO is ready can leave Redis already connected during the next initialization attempt; restart the API once dependencies are ready if this occurs.
+
+From `docusign`, install dependencies and seed the already initialized database:
 
 ```bash
 cd backend
 npm install
+npm run db:seed
 npm run dev
 ```
 
-Backend runs on http://localhost:3001
-
-### 3. Start Frontend
+In another terminal, from `docusign`:
 
 ```bash
 cd frontend
@@ -88,210 +122,82 @@ npm install
 npm run dev
 ```
 
-Frontend runs on http://localhost:5173
+Open [the frontend](http://localhost:5173), [API readiness](http://localhost:3001/health/ready), [MinIO console](http://localhost:9001), and [RabbitMQ management](http://localhost:15672). The API dev script fixes port 3001; bare `npm start` uses port 3000 unless `PORT=3001` is exported. Vite proxies `/api` to port 3001. The frontend build does not supply a production reverse proxy.
 
-### 4. Access the Application
+### Configuration
 
-Open http://localhost:5173 in your browser.
+The application reads exported environment variables; it does not automatically load `.env`. Repeat exports in each API, worker, or seed terminal that needs overrides. Compose container variables are not exports into your host shell.
 
-**Test Accounts** (all use password `password123`):
-- Admin: `admin@docusign.local` / `password123`
-- User: `alice@example.com` / `password123`
-- User: `bob@example.com` / `password123`
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `PORT` | `3000` | Dev/server1 scripts override to 3001; server2/3 use 3002/3003 |
+| `POSTGRES_HOST`, `POSTGRES_PORT` | `localhost`, `5432` | Individual variables, not `DATABASE_URL` |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | `docusign`, `docusign`, `docusign_dev` | PostgreSQL pool has maximum 20 connections per process |
+| `REDIS_URL` | `redis://localhost:6379` | User sessions 24 hours; signer cache 1 hour |
+| `MINIO_ENDPOINT`, `MINIO_PORT` | `localhost`, `9000` | Endpoint is a hostname without scheme/port |
+| `MINIO_USE_SSL` | false | Enabled only by the string `true` |
+| `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | `minioadmin`, `minioadmin123` | Buckets are fixed in source |
+| `RABBITMQ_URL` | API: `amqp://docusign:docusign123@localhost:5672` | Worker defaults to `guest:guest`, so export the API URL there |
+| `FRONTEND_URL` | `http://localhost:5173` | Used to construct simulated email links |
+| `NODE_ENV`, `LOG_LEVEL` | unset, `info` | Production mode changes cookie security and logger transport |
 
-## Running Without Docker
-
-If you prefer to run services natively:
-
-### PostgreSQL
-
-```bash
-# macOS with Homebrew
-brew install postgresql@16
-brew services start postgresql@16
-createdb docusign
-psql docusign < backend/src/db/init.sql
-```
-
-Set environment variables:
-```bash
-export POSTGRES_HOST=localhost
-export POSTGRES_USER=your_username
-export POSTGRES_PASSWORD=your_password
-```
-
-### Redis
+The queue worker is an **incomplete integration**, not a required step for a successful signing demo. For investigating it after API queue initialization:
 
 ```bash
-# macOS with Homebrew
-brew install redis
-brew services start redis
+cd backend
+export RABBITMQ_URL='amqp://docusign:docusign123@localhost:5672'
+npm run dev:worker
 ```
 
-### MinIO
+Matching credentials does not repair its payload or schema mismatches. With a reachable broker, messages can be accepted without producing simulated emails. With the broker unavailable at API initialization, notification code uses the synchronous email simulator. Neither path sends real email.
+
+### Seed data
+
+The actual seed is [seed-envelopes.ts](./backend/src/db/seed-envelopes.ts), invoked by `npm run db:seed`. The schema's comment referring to `db-seed/seed.sql` is stale; that file does not exist.
+
+| Account | Role | Password on fresh seed |
+|---------|------|------------------------|
+| `admin@docusign.local` | Administrator and owner of all four seeded envelopes | `password123` |
+| `alice@example.com` | User / NDA recipient | `password123` |
+| `bob@example.com` | User / consulting recipient | `password123` |
+| `carol@example.com` | User / completed offer recipient | `password123` |
+
+The login screen says any password works for test accounts; the backend actually verifies bcrypt hashes. Seed reruns preserve existing users and skip envelopes with existing IDs. A failed partial seed is not repaired by that skip logic.
+
+The seed creates four one-page PDFs, four recipients, and eight fields across sent, delivered, completed, and draft envelopes. The completed sample marks fields complete without creating captured signature records. These are fixtures, not evidence of a successful signing run.
+
+To inspect the NDA ceremony, open [Alice's local signing fixture](http://localhost:5173/sign/sign-nda-alice-0000000000000001). It can show the page and signature modal; submitting encounters the cache mismatch described above. Signer recipients are separate records from user accounts, so logging in as Alice does not make the admin-owned envelopes appear in Alice's sender list.
+
+## Known behavior and gaps
+
+| Area | Source-backed limitation |
+|------|--------------------------|
+| Signing authentication | Session GET caches `recipientId`/`envelopeId`; middleware expects `id`/`envelope_id`. The flags for SMS/knowledge/ID checks have no implemented challenge or enforcement |
+| Workflow | Only sending takes an envelope row lock. Draft edits, signing, completion, decline, and void are separate checks/writes; routing order controls notification choice, not permission to sign |
+| Completion | Sender notification uses a user ID as `email_notifications.recipient_id`, normally failing its recipient foreign key after the envelope is already completed |
+| Idempotency | Check, mutation, and receipt storage are separate. Concurrent requests can both execute; Redis errors skip the SQL fallback. The UI sends no operation key |
+| Audit | Two writers use incompatible hash payloads; the shared writer's own verifier rejects its stored representation. No independently anchored digest or append-only database enforcement |
+| Queue | Worker expects bare messages instead of the publisher's wrapper and references missing tables. Dead-letter routing also does not match the supplied DLQ binding |
+| Documents | Multipart PDF limit is 25 MiB, parsed in memory. No flattening, signed export, malware scanning, content digest, versioned document binding, or storage cleanup when metadata is deleted |
+| Frontend | No drag/resize, zoom, upload progress, offline draft persistence, automatic polling, or request cancellation. PDF text/annotation layers are hidden; signing overlays are clickable divs without keyboard semantics |
+| Recovery | Status may commit before audit/notification errors return 500. Reload and inspect state; retrying does not guarantee one effect |
+
+See [Implementation Notes](./architecture.md#implementation-notes) for exact paths and the distinction between registered helpers and active behavior. The certificate endpoint returns JSON audit data, not a certificate PDF, and its verification boolean is not a compliance verdict. Completion-page and simulated email copy currently overstate delivery/export functionality.
+
+## Development checks
+
+From the relevant package directory:
 
 ```bash
-# macOS with Homebrew
-brew install minio/stable/minio
-minio server ~/minio-data --console-address ":9001"
+# backend
+npm run type-check
+npm run lint
+# frontend
+npm run type-check
+npm run build
+npm run lint
 ```
 
-Create buckets:
-```bash
-mc alias set local http://localhost:9000 minioadmin minioadmin123
-mc mb local/docusign-documents
-mc mb local/docusign-signatures
-```
+There is no backend `test` or `build` script. Root [screenshot configuration](../scripts/screenshot-configs/docusign.json) includes viewing the ceremony and opening its modal; it does not submit a signature. Existing smoke tests mainly check page rendering, not workflow correctness. Run them only after explicitly setting up the backing services and seed.
 
-## API Endpoints
-
-### Authentication
-- `POST /api/v1/auth/register` - Register new user
-- `POST /api/v1/auth/login` - Login
-- `POST /api/v1/auth/logout` - Logout
-- `GET /api/v1/auth/me` - Get current user
-
-### Envelopes
-- `GET /api/v1/envelopes` - List envelopes
-- `POST /api/v1/envelopes` - Create envelope
-- `GET /api/v1/envelopes/:id` - Get envelope details
-- `POST /api/v1/envelopes/:id/send` - Send for signing
-- `POST /api/v1/envelopes/:id/void` - Void envelope
-
-### Documents
-- `POST /api/v1/documents/upload/:envelopeId` - Upload PDF
-- `GET /api/v1/documents/:id/view` - View document
-
-### Recipients
-- `POST /api/v1/recipients/:envelopeId` - Add recipient
-- `GET /api/v1/recipients/envelope/:envelopeId` - List recipients
-
-### Fields
-- `POST /api/v1/fields/:documentId` - Add field
-- `GET /api/v1/fields/document/:documentId` - List fields
-
-### Signing (Public)
-- `GET /api/v1/signing/session/:accessToken` - Get signing session
-- `POST /api/v1/signing/sign/:accessToken` - Capture signature
-- `POST /api/v1/signing/finish/:accessToken` - Complete signing
-- `POST /api/v1/signing/decline/:accessToken` - Decline to sign
-
-### Audit
-- `GET /api/v1/audit/envelope/:envelopeId` - Get audit events
-- `GET /api/v1/audit/verify/:envelopeId` - Verify chain integrity
-- `GET /api/v1/audit/certificate/:envelopeId` - Get certificate
-
-### Admin
-- `GET /api/v1/admin/stats` - System statistics
-- `GET /api/v1/admin/users` - List all users
-- `GET /api/v1/admin/envelopes` - List all envelopes
-- `GET /api/v1/admin/emails` - View simulated emails
-
-## Architecture
-
-```
-docusign/
-├── docker-compose.yml     # PostgreSQL, Redis, MinIO
-├── backend/
-│   ├── src/
-│   │   ├── index.js           # Express server
-│   │   ├── routes/            # API endpoints
-│   │   │   ├── auth.js
-│   │   │   ├── envelopes.js
-│   │   │   ├── documents.js
-│   │   │   ├── recipients.js
-│   │   │   ├── fields.js
-│   │   │   ├── signing.js
-│   │   │   ├── audit.js
-│   │   │   └── admin.js
-│   │   ├── services/          # Business logic
-│   │   │   ├── auditService.js
-│   │   │   ├── workflowEngine.js
-│   │   │   └── emailService.js
-│   │   ├── middleware/
-│   │   │   └── auth.js
-│   │   └── utils/
-│   │       ├── db.js          # PostgreSQL
-│   │       ├── redis.js       # Session storage
-│   │       └── minio.js       # Document storage
-│   └── db/
-│       └── init.sql           # Database schema
-└── frontend/
-    └── src/
-        ├── routes/            # TanStack Router pages
-        ├── stores/            # Zustand state
-        ├── services/          # API client
-        └── types/             # TypeScript types
-```
-
-## Workflow
-
-1. **Create Envelope** - Name your signing package
-2. **Upload Document** - Add PDF documents
-3. **Add Recipients** - Specify who needs to sign and in what order
-4. **Place Fields** - Click on the document to add signature fields
-5. **Send** - Recipients receive email with signing link
-6. **Sign** - Recipients open link, view document, and sign
-7. **Complete** - All signatures collected, audit trail verified
-
-## Development
-
-### Running Multiple Backend Instances
-
-```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
-```
-
-### Environment Variables
-
-Backend (`backend/.env`):
-```env
-PORT=3001
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=docusign
-POSTGRES_USER=docusign
-POSTGRES_PASSWORD=docusign_dev
-REDIS_URL=redis://localhost:6379
-MINIO_ENDPOINT=localhost
-MINIO_PORT=9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin123
-FRONTEND_URL=http://localhost:5173
-```
-
-## Key Technical Challenges
-
-1. **Document Processing**: Parse and render PDFs, place interactive fields
-2. **Workflow Engine**: Complex routing with conditions and parallel signing
-3. **Legal Compliance**: Meet e-signature laws (ESIGN, eIDAS, UETA)
-4. **Audit Integrity**: Tamper-proof logging with cryptographic verification
-5. **Real-Time Collaboration**: Multiple signers viewing same document
-
-## Architecture Details
-
-See [architecture.md](./architecture.md) for detailed system design documentation.
-
-## Development Notes
-
-See [claude.md](./claude.md) for development insights and design decisions.
-
-## References & Inspiration
-
-- [DocuSign Developer Center](https://developers.docusign.com/) - Official API documentation and integration guides
-- [ESIGN Act (Electronic Signatures in Global and National Commerce Act)](https://www.fdic.gov/resources/supervision-and-examinations/consumer-compliance-examination-manual/documents/10/x-3-1.pdf) - US legal framework for e-signatures
-- [eIDAS Regulation](https://digital-strategy.ec.europa.eu/en/policies/eidas-regulation) - EU electronic identification and trust services
-- [pdf-lib Documentation](https://pdf-lib.js.org/) - JavaScript library for PDF manipulation
-- [React-PDF](https://react-pdf.org/) - PDF rendering in React applications
-- [Certificate Transparency](https://certificate.transparency.dev/) - Concepts applicable to audit trail integrity
-- [Merkle Trees and Hash Chains](https://en.wikipedia.org/wiki/Merkle_tree) - Data structures for tamper-evident logging
-- [UETA (Uniform Electronic Transactions Act)](https://www.uniformlaws.org/committees/community-home?CommunityKey=2c04b76c-2b7d-4399-977e-d5876ba7e034) - State-level e-signature legislation
-- [Designing Document Workflows](https://www.nngroup.com/articles/document-management-software/) - UX research on document management
-- [Digital Signatures and PKI](https://www.ibm.com/docs/en/zos/2.5.0?topic=concepts-digital-signatures) - Cryptographic foundations for signing
+This documentation review used source inspection and isolated executions of the actual TypeScript modules with mocked SQL, Redis, and storage dependencies. Those checks confirmed the cached-signer 403, audit-format mismatch, idempotency race/fallback behavior, and completion notification ordering. No full Docker stack, browser ceremony, load test, or legal certification was performed.

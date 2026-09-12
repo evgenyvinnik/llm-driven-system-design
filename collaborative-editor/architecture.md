@@ -1,726 +1,394 @@
-# Design Collaborative Editor - Architecture
+# Collaborative Editor Architecture
 
 ## System Overview
 
-A real-time collaborative document editor enabling multiple users to edit documents simultaneously with instant synchronization and conflict resolution. Core challenges involve maintaining consistency across distributed clients, handling concurrent edits without data loss, and providing offline support with automatic merge on reconnect.
+This project studies a shared plain-text editor: writers see their own input immediately while a server orders edits, reconciles concurrency, and persists a recoverable document history. Its central question is how a responsive local view relates to an authoritative, durable version when another writer edits the same text or a connection disappears.
 
-**Learning Goals:**
-- Implement operational transformation (OT) algorithms for conflict resolution
-- Design real-time synchronization protocols over WebSocket
-- Handle presence and cursor tracking across distributed servers
-- Build snapshot + operation log storage for version history
-- Coordinate multi-server broadcast via message queues
+The production sections describe a **proposed design**, not measured capabilities of this repository. The checked-in application is a React textarea, an Express/WebSocket server, PostgreSQL, Valkey, and RabbitMQ. Its OT implementation, browser input path, and server coordination have correctness defects. [Implementation Notes](#implementation-notes) distinguish wired patterns, incomplete features, and reproducible failures.
 
----
+Learning goals are to reason about operation context, ordering, optimistic reconciliation, durability acknowledgements, and recovery. Rich-text document models, comments, media, and offline-first synchronization are separate extensions.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed production service
 
-1. **Edit**: Multiple users edit the same document simultaneously with instant local feedback
-2. **Sync**: Real-time updates across all connected clients with guaranteed convergence
-3. **History**: Track and navigate document versions via periodic snapshots + operation log
-4. **Share**: Control document access with view, edit, and admin permissions
-5. **Offline**: Edit without connectivity, sync and merge on reconnect
-6. **Presence**: See other users' cursors, selections, and online status in real time
+- Create, discover, open, and rename documents under explicit view/edit/manage permissions.
+- Collaborate on plain text with deterministic handling of concurrent insertions and deletions.
+- Show participants and approximate cursors without delaying durable edits.
+- Distinguish local changes, pending persistence, acknowledged edits, and interrupted synchronization.
+- Recover after reconnect by reconciling an operation receipt and replaying an ordered suffix; preserve unresolved local work for recovery.
+- Reconstruct historical versions and restore one as a new authorized edit, without rewriting history.
 
-### Non-Functional Requirements (Production Scale)
+Version history and permissions are design requirements, not implemented UI features. Extended offline editing and rich text are out of the initial production scope. A temporary outage can preserve a draft without promising automatic integration of arbitrary old branches.
 
-| Requirement | Target |
-|-------------|--------|
-| Local Latency | < 50ms for changes to appear locally |
-| Sync Latency | < 100ms for operation to reach all connected clients |
-| Consistency | All clients converge to the same document state |
-| Availability | 99.9% uptime |
-| Scale | 50+ simultaneous editors per document, 100K+ concurrent documents |
-| Durability | Never lose user edits, even during server crashes or network partitions |
+### Non-functional requirements — design targets
 
----
+| Dimension | Target and boundary |
+|-----------|---------------------|
+| Responsiveness | Local input visible within a 16 ms frame budget for a typical 100 KB document |
+| Synchronization | p99 durable acknowledgement below 200 ms and peer delivery below 300 ms within a region under normal load |
+| Availability | 99.95% regional editing availability; stop accepting writes when document authority or durability is uncertain |
+| Convergence | Authorized clients applying the same committed sequence converge after pending operations are reconciled |
+| Durability | Acknowledged operations survive the configured database failover model; regional disaster recovery has an explicit separate RPO |
+| Scale | 100,000 concurrent sessions across 20,000 active documents; up to 50 active writers per document initially |
+| Safety | Bounded input size, operation backlog, transform history, document length, and socket buffers |
+
+Convergence does not mean every semantic intention can be preserved. If one user deletes a sentence while another rewrites it, the protocol must define a deterministic policy, with history and recovery helping users understand the result.
 
 ## Capacity Estimation
 
-### Production Scale
+These are sizing assumptions, not repository benchmarks. Suppose 20% of 100,000 connected sessions are actively typing, producing two operation batches per second: **40,000 operations/s** at peak. At 600 bytes per stored operation before indexes and replication, that is 24 MB/s of raw log data. A sustained daily average of 10,000 operations/s produces about 518 GB/day, so history retention, compression, and archival cannot be postponed indefinitely.
 
-| Metric | Value |
-|--------|-------|
-| Concurrent documents | 100,000+ |
-| Editors per document (peak) | 50+ |
-| Operations per second (global) | 500,000 |
-| Average operation size | 50-200 bytes |
-| Snapshot frequency | Every 50-100 operations per document |
-| Storage per document (1 year) | ~10 MB (snapshots + op log) |
+If five editors share a document on average, a committed operation needs about four peer deliveries: 160,000 messages/s or roughly 96 MB/s of payload at that peak. A hot document with 50 writers each sending two batches/s produces 100 commands/s and up to 4,900 peer deliveries/s. Sharding documents spreads aggregate load; it does not remove the ordering or fanout cost of that single document.
+
+Twenty thousand active documents averaging 100 KB need about 2 GB just for raw text. Runtime string representation, recent operations, participant state, serialization, and socket queues add substantial overhead. A full snapshot every 50 operations at 40,000 operations/s would write about 80 MB/s for 100 KB documents. Prefer snapshot thresholds based on replay work, bytes, and elapsed time rather than treating 50 as a universal optimum.
 
 ### Local Development Scale
 
-| Metric | Value |
-|--------|-------|
-| Concurrent documents | 5-10 |
-| Editors per document | 2-5 |
-| Operations per second | 10-50 |
-| Single PostgreSQL instance | Handles all data |
-
----
+Use a few documents and two or three browser windows on one backend, with PostgreSQL, Valkey, and RabbitMQ. Scripts can start three backend processes, but cross-server consistency is incomplete. No verified local concurrency or resource-capacity result is supplied. The five seeded documents are small illustrative fixtures, not load-test evidence.
 
 ## High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Editor                                │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐       │
-│  │  Text Editor  │  │  OT Engine    │  │   Sync        │       │
-│  │               │  │               │  │   Engine      │       │
-│  │ - ContentEdit │  │ - Transform   │  │ - WebSocket   │       │
-│  │ - Selection   │  │ - Compose     │  │ - Reconnect   │       │
-│  │ - Presence UI │  │ - Apply       │  │ - Op buffer   │       │
-│  └───────────────┘  └───────────────┘  └───────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
-                              │ WebSocket (persistent)
-                              ▼
-                    ┌─────────────────────┐
-                    │   Load Balancer     │
-                    │  (sticky sessions)  │
-                    └──────────┬──────────┘
-                               │
-            ┌──────────────────┼──────────────────┐
-            ▼                  ▼                  ▼
-    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-    │ Sync Server  │   │ Sync Server  │   │ Sync Server  │
-    │  (Node.js +  │   │  (Node.js +  │   │  (Node.js +  │
-    │   WebSocket) │   │   WebSocket) │   │   WebSocket) │
-    └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
-           │                  │                  │
-           └──────────────────┼──────────────────┘
-                              │
-       ┌──────────────────────┼──────────────────────┐
-       ▼                      ▼                      ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  PostgreSQL   │    │    Redis/     │    │   RabbitMQ    │
-│               │    │    Valkey     │    │               │
-│ - Documents   │    │ - Presence   │    │ - Op fanout   │
-│ - Operations  │    │ - Cursors    │    │ - Snapshot    │
-│ - Snapshots   │    │ - Idempotent │    │   jobs        │
-│ - Access ctrl │    │   cache      │    │ - DLQ         │
-└───────────────┘    └───────────────┘    └───────────────┘
-```
-
----
-
-## Core Components
-
-### 1. TextOperation
-
-The core data structure for representing text changes. Each operation is a sequence of retain, insert, and delete components:
-
-- **retain(n)**: Keep n characters unchanged (used for positioning)
-- **insert(str)**: Insert text at the current position
-- **delete(n)**: Delete n characters at the current position
-
-Every operation has a `baseLength` (document length before applying) and `targetLength` (document length after applying). This enables validation: an operation can only be applied to a document of exactly `baseLength` characters.
-
-### 2. OT Transform Function
-
-The transform function takes two operations (op1, op2) that were both created against the same document state and returns transformed versions (op1', op2') such that:
+Proposed production topology; ports and Docker mappings belong in the README.
 
 ```
-apply(apply(doc, op1), op2') === apply(apply(doc, op2), op1')
+┌──────────────────┐       ┌──────────────────────┐
+│ Browser editor   │──────▶│ Gateway / sessions   │
+└──────────────────┘       └──────────┬───────────┘
+                                      │ document routing
+                           ┌──────────▼───────────┐
+                           │ Document owner       │
+                           │ Serialized OT stream │
+                           └──────────┬───────────┘
+                                      │ atomic commit
+                           ┌──────────▼───────────┐
+                           │ PostgreSQL           │
+                           │ Head / log / receipt │
+                           │ Snapshot / outbox    │
+                           └──────────┬───────────┘
+                                      │ outbox relay
+                           ┌──────────▼───────────┐
+                           │ Fanout + workers     │
+                           │ Delivery / snapshots │
+                           └──────────────────────┘
 ```
 
-This convergence property ensures that regardless of the order operations arrive, all clients reach the same final state. The transform handles all combinations of retain/insert/delete pairs, splitting operations at boundaries when needed.
+The gateway authenticates connections and routes each document's edits to one logical owner. Gateways may distribute delivery, but do not independently transform edits. Redis holds disposable presence; object storage can hold verified archived history. Static assets can use a CDN. Neither cache nor broker is the authority for the current document head.
 
-### 3. Document State Manager (Server-Side)
+## Core Components / Request Flows
 
-Maintains the authoritative document state:
+### Open a document
 
-```
-applyOperation(clientId, clientVersion, operation)
-├── Fetch all operations since clientVersion from PostgreSQL
-├── Transform incoming operation against each concurrent operation
-├── Apply transformed operation to current document content
-├── Increment version counter
-├── Persist operation to operations table
-├── If version % 100 === 0: queue snapshot save via RabbitMQ
-└── Return { version, transformedOperation }
-```
+1. Authenticate the user and check current document permission before disclosing metadata or content.
+2. Route to the document owner, which loads a verified snapshot and a contiguous committed operation suffix when its cache is cold.
+3. Admit the subscription at a sequence boundary: send state at version V, then ordered events after V. A gateway buffers intervening events while assembling the baseline.
+4. Initialize client synchronization state with document identity, protocol version, connection generation, committed version, and unresolved local operation identity.
+5. Publish presence separately. A presence outage may hide collaborators while document edits remain available.
 
-### 4. Sync Server (WebSocket)
+A snapshot followed by an uncoordinated subscription can miss the edit committed between them. Shared ownership of the baseline/subscription boundary, or buffering before obtaining the baseline, closes that gap.
 
-Manages WebSocket connections and real-time communication:
+### Accept an edit
 
-**Client to Server messages:**
-- `operation { version, operation, operationId }` - Submit an edit
-- `cursor { position }` - Update cursor position
-- `selection { start, end }` - Update text selection
+The editor derives an operation from the **previous model**, applies it once locally, and queues it. It keeps at most one submitted operation awaiting acknowledgement; further edits remain local and may be composed before submission.
 
-**Server to Client messages:**
-- `init { clientId, version, content, clients }` - Initial document state
-- `ack { version, operationId }` - Operation acknowledged with new version
-- `operation { clientId, version, operation }` - Remote operation to apply
-- `cursor { clientId, position }` - Remote cursor update
-- `client_join / client_leave` - Presence updates
-- `resync { version, content }` - Full resync on error recovery
+The server serializes commands for that document, validates the supplied base revision and operation structure, resolves any durable receipt, and transforms an unseen operation against the committed suffix since its base. It computes candidate content without publishing that content as committed. In one database transaction it validates authority, advances the document head, appends the operation and receipt, updates metadata, and records an outbox event. It then updates its memory to the committed state and acknowledges the exact operation ID and assigned version.
 
-### 5. Client Sync Engine
+A commit whose result is unknown pauses the document command stream until the durable receipt/head resolves the outcome. It must not immediately retry a changed operation against possibly committed state. A failed transaction leaves the committed in-memory view unchanged.
 
-Each client maintains a state machine for operation synchronization:
+### Reconcile remote edits
 
-- **content**: Current local document content (always up-to-date)
-- **serverVersion**: Last acknowledged server version
-- **inflightOp**: Operation sent to server, awaiting ack
-- **pendingOps**: Operations applied locally but not yet sent
+A client checks document identity and event sequence before applying a remote operation. It transforms that operation through its in-flight and pending operations, updating both the remote operation and the local operations' contexts. Its visible text remains the committed base plus pending local intent; acknowledgement retires the matching in-flight operation without applying it a second time.
 
-When receiving a remote operation:
-1. Transform it against the inflight operation (if any)
-2. Transform it against all pending operations
-3. Apply the transformed operation to local content
+The tie policy must agree across the full protocol. For this proposal, an already committed insertion precedes a newly admitted concurrent insertion at the same position. The client uses that same committed-versus-pending priority. Calling the same transform function with opposite operand priorities does not establish convergence.
 
-When receiving an ack:
-1. Clear inflightOp
-2. Update serverVersion
-3. Flush next pending operation (compose all pending into one, send)
+### Reconnect and history
 
-### 6. RabbitMQ Queue Topology
+Before replacing local state, preserve the acknowledged base, in-flight identity, and unsent changes. Ask whether the in-flight operation committed, obtain the missing ordered suffix, and reconcile before resending. If the base is outside supported history or the protocol cannot safely rebase it, offer a recoverable local draft alongside current server content. An exact byte-for-byte retry must retain its operation ID and original request context.
 
-Three exchanges handle async processing:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  doc.operations (topic)    doc.presence (fanout)              │
-│  ┌──────────────────┐     ┌──────────────────┐               │
-│  │ Routing: doc.{id}│     │ Broadcast to all │               │
-│  └────────┬─────────┘     └────────┬─────────┘               │
-│           │                        │                          │
-│  Per-server queues:         Single fanout queue:              │
-│  op.broadcast.server1       presence.fanout                   │
-│  op.broadcast.server2                                         │
-│  op.broadcast.server3                                         │
-│                                                               │
-│  doc.snapshots (direct)    doc.dlx (dead letter)             │
-│  ┌──────────────────┐     ┌──────────────────┐               │
-│  │ Snapshot jobs     │     │ Failed messages  │               │
-│  └────────┬─────────┘     └────────┬─────────┘               │
-│           │                        │                          │
-│  snapshot.worker              doc.failed                      │
-│  (prefetch=1)                 (manual retry)                  │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Operation Broadcast**: When server1 receives an operation, it publishes to `doc.operations` with routing key `doc.{documentId}`. Each server has its own queue bound to this exchange. Servers skip messages from themselves and deduplicate via Redis-cached message IDs.
-
-**Snapshot Worker**: Snapshots are queued via `doc.snapshots` and processed by a single worker with `prefetch=1` to avoid database contention. Idempotent INSERT ensures duplicate snapshot messages are harmless.
-
-**Dead Letter Queue**: Failed messages route to `doc.dlx` for manual inspection and retry.
-
----
+A historical preview reconstructs the nearest snapshot at or before the requested version plus a bounded suffix. Restoring history submits a new operation against the current head after an explicit concurrency check; it does not reset version numbers or delete intervening edits.
 
 ## Database Schema
 
+### Checked-in local schema
+
+The following is the actual [backend/src/db/init.sql](./backend/src/db/init.sql). It is useful for inspecting the running demo, but it does not contain the additional authority and recovery fields required by the production proposal.
+
 ```sql
--- Users
-CREATE TABLE users (
+-- Create extension for UUID generation
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  username VARCHAR(50) UNIQUE NOT NULL,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  display_name VARCHAR(100),
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  username VARCHAR(100) NOT NULL UNIQUE,
+  display_name VARCHAR(200) NOT NULL,
+  email VARCHAR(255),
+  color VARCHAR(7) DEFAULT '#3B82F6',
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Documents
-CREATE TABLE documents (
+-- Documents table
+CREATE TABLE IF NOT EXISTS documents (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  title VARCHAR(500) NOT NULL,
-  owner_id UUID NOT NULL REFERENCES users(id),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  title VARCHAR(500) NOT NULL DEFAULT 'Untitled Document',
+  owner_id UUID REFERENCES users(id),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Document snapshots (periodic checkpoints)
-CREATE TABLE document_snapshots (
+CREATE TABLE IF NOT EXISTS document_snapshots (
   document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
   version INTEGER NOT NULL,
-  content TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
+  content TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (document_id, version)
 );
 
--- Operations log (complete history)
-CREATE TABLE operations (
+-- Operations log
+CREATE TABLE IF NOT EXISTS operations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
   version INTEGER NOT NULL,
   client_id VARCHAR(100),
   user_id UUID REFERENCES users(id),
   operation JSONB NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW(),
   UNIQUE (document_id, version)
 );
 
--- Document access control
-CREATE TABLE document_access (
+CREATE INDEX IF NOT EXISTS idx_operations_doc_version ON operations(document_id, version);
+
+-- Document access
+CREATE TABLE IF NOT EXISTS document_access (
   document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
-  user_id UUID NOT NULL REFERENCES users(id),
-  permission VARCHAR(20) NOT NULL CHECK (permission IN ('view', 'edit', 'admin')),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  permission VARCHAR(20) NOT NULL DEFAULT 'edit', -- view, edit, admin
+  created_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (document_id, user_id)
 );
 
--- Inline comments on document ranges
-CREATE TABLE document_comments (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
-  user_id UUID NOT NULL REFERENCES users(id),
-  range_start INTEGER,
-  range_end INTEGER,
-  content TEXT NOT NULL,
-  resolved BOOLEAN DEFAULT false,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Indexes
-CREATE INDEX idx_operations_doc_version ON operations(document_id, version);
-CREATE INDEX idx_snapshots_doc_version ON document_snapshots(document_id, version DESC);
-CREATE INDEX idx_comments_doc ON document_comments(document_id);
-CREATE INDEX idx_access_user ON document_access(user_id);
+-- Seed data is in db-seed/seed.sql
 ```
 
-### Storage Strategy: Snapshot + Operation Log
+The schema has five tables. `document_access.permission` has no enum/check enforcement, and the application does not read this table. Operation `client_id` identifies a socket, not a stable edit. There is no operation request ID, document head row, fencing generation, outbox, session table, comment table, or audit table. Several foreign-key columns are nullable; uniqueness of `(document_id, version)` prevents two rows claiming one revision but does not make the surrounding workflow atomic.
 
-Documents are stored as periodic snapshots plus a complete operation log. This provides:
+The explicit operation index duplicates the column order of the unique constraint's index. Users have no password field. Seed data inserts three users and five documents with snapshots at version zero; it fabricates no edit history. The application creates new document metadata and its initial snapshot in separate statements.
 
-- **Fast loading**: Fetch latest snapshot + apply only recent operations (not full history)
-- **Complete history**: All operations preserved for version navigation and audit
-- **Storage efficiency**: Snapshots every 50-100 operations; older operations can be archived
+### Proposed additions
 
-**Document loading flow:**
-1. Query latest snapshot for document (ORDER BY version DESC LIMIT 1)
-2. Query all operations after snapshot version
-3. Apply each operation to snapshot content to reconstruct current state
+| Record | Keys and responsibilities |
+|--------|---------------------------|
+| Document head | Document ID, committed version, protocol version, authority generation; locked/conditionally advanced with each append |
+| Operation receipt | Unique document + authenticated actor + stable operation ID; original request fingerprint, accepted version, canonical result |
+| Operation log | Unique document + sequence; validated transformed operation, actor, original receipt identity, committed timestamp |
+| Snapshot manifest | Document + exact version, content/checksum, format version, verification status |
+| Outbox | Event ID and document sequence, payload or durable log reference, delivery progress |
+| Access grant | Document + principal, constrained role; changes coordinated with admission and active subscriptions |
 
----
+Use database constraints for required fields, nonnegative versions, valid permissions, and receipt uniqueness. Bound JSON operations at runtime: each component has exactly one kind; counts are finite nonnegative integers; total consumption equals base length; insert lengths and produced length match; and the base belongs to the documented revision. String-length equality alone cannot prove that an operation is valid for that version.
+
+For the initial production topology, the same PostgreSQL authority serializes permission changes and document admissions. Later document sharding keeps head, log, receipt, and outbox co-located. Archived segments retain manifests and restore verification; deletion of transform history is a product retention decision, not a side effect of taking a snapshot.
+
+## API Design
+
+### Current HTTP surface
+
+| Method | Path | Request / response |
+|--------|------|--------------------|
+| GET | `/api/documents` | Returns every document's metadata, ordered by update time; no pagination |
+| GET | `/api/documents/:id` | Metadata or 404; does not return content/history |
+| POST | `/api/documents` | Required `ownerId`, optional `title`; returns newly created metadata with 201 |
+| PATCH | `/api/documents/:id` | Required truthy `title`; returns success even if no row matched |
+| GET | `/api/users` | All demo identities ordered by username |
+| GET | `/api/users/:id` | Demo identity or 404 |
+| GET | `/health` | Dependency status, server ID, uptime, and timing; degraded still returns 200 |
+| GET | `/ready` | PostgreSQL query succeeds: 200; fails: 503 |
+| GET | `/live` | Unconditional 200 |
+| GET | `/metrics` | Prometheus exposition |
+
+Example current creation request and response; IDs/timestamps are illustrative:
+
+```json
+{"ownerId":"11111111-1111-1111-1111-111111111111","title":"Planning notes"}
+```
+
+```json
+{"id":"99999999-9999-4999-8999-999999999999","title":"Planning notes","ownerId":"11111111-1111-1111-1111-111111111111","createdAt":"2026-09-09T12:00:00.000Z","updatedAt":"2026-09-09T12:00:00.000Z"}
+```
+
+No login, logout, sharing, delete, history, or restore endpoints are implemented. Request checks are minimal and SQL errors often become generic 500 responses. TypeScript interfaces are not runtime validation.
+
+### Current WebSocket surface
+
+A connection uses `/ws?documentId=<uuid>&userId=<uuid>`. The server checks that both records exist, assigns a new socket client ID and rotating color, and sends `init` with content, version, and client-map entries. It trusts the supplied user identity.
+
+A current operation request to append “d” to “abc” at version 0 is:
+
+```json
+{"type":"operation","version":0,"operation":{"ops":[{"retain":3},{"insert":"d"}],"baseLength":3,"targetLength":4}}
+```
+
+The normal acknowledgement is:
+
+```json
+{"type":"ack","version":1}
+```
+
+Remote `operation` messages include sender `clientId`, version, and transformed operation. `cursor` carries a position with `index` and optional `length`; `selection` carries a range or null. `client_join`/`client_leave` update the roster. On an operation error, `resync` supplies the server's current in-memory version/content; the client replaces its text and clears pending work. Generic `error` messages are only logged by the browser.
+
+`operationId` is an optional server-side extension, absent from browser sends and acknowledgements. There is no heartbeat, receipt query, replay request, gap detection, retry protocol, or protocol-version negotiation.
+
+### Proposed contract extensions
+
+Keep document and operation identity explicit across every edit and acknowledgement. Add authenticated session establishment, runtime schema validation, a sequence-aware replay/baseline handshake, operation receipt lookup, and clear rejection reasons such as permission revoked, unsupported base, or operation too large. An accepted edit is durable; a broker notification merely announces that committed edit.
 
 ## Key Design Decisions
 
-### 1. OT over CRDT
+### Central ordering with OT
 
-**Decision**: Use Operational Transformation for conflict resolution.
+Choose OT for the proposed connected plain-text editor because the service already controls admission, permissions, and one document history. A short operation expresses a small edit without transferring an entire document. Central order bounds the contexts the client protocol must reconcile.
 
-**Why OT works for this system**: OT operations (retain/insert/delete) are compact -- typically 50-200 bytes regardless of document size. The server maintains canonical ordering, so the transform function only needs to handle the case where two operations were created against the same version. Google Docs uses this approach successfully at massive scale.
+Whole-document last-write-wins replacement is simpler but can erase another writer's unrelated paragraph. OT retains both edits when their semantics permit, at the cost of a difficult transform algorithm and carefully specified client/server state machine. Shared implementation code reduces drift but cannot prove the algorithm or operand ordering correct.
 
-**Why CRDTs fail here**: CRDTs (like Yjs or Automerge) assign unique IDs to every character in the document. A 10,000-character document requires 10,000 unique IDs in memory, each with causal metadata. For a plain text editor, this is a 10-50x memory overhead compared to OT. CRDTs excel in peer-to-peer scenarios without a central server, but our server-authoritative design does not need that property. The tombstone problem (deleted characters retained in metadata forever) further inflates memory over time.
+A CRDT is a credible alternative when extended offline collaboration or multiple independent writers is fundamental. It changes the identity and merge model; it does not remove authentication, storage, history, or delivery responsibilities. Avoid blanket claims that every CRDT permanently stores every deleted character or has a fixed memory multiplier: [Yjs exposes garbage-collection controls](https://docs.yjs.dev/api/y.doc), and its [IndexedDB provider](https://docs.yjs.dev/getting-started/allowing-offline-editing) supports local persistence. Those capabilities are not dependencies or features of this demo.
 
-**Trade-off**: OT requires a central server to establish operation ordering. This means the system cannot function in a true peer-to-peer mode. For a collaborative editor with a backend, this constraint is acceptable and simplifies the consistency model.
+### One document owner, many delivery connections
 
-### 2. Server-Authoritative Ordering
+All admissions for a document pass through one serialized owner, even when readers connect to many gateways. A database-checked authority generation prevents a stale owner from committing after replacement. The owner queue must encompass asynchronous persistence: Node.js's single JavaScript thread does not serialize an entire async workflow across awaits.
 
-**Decision**: All operations pass through the server, which assigns the canonical version number.
+Independent server-local copies plus broker fanout would improve write availability superficially but leave concurrent transforms operating on incompatible heads. A unique SQL version constraint rejects collisions after the fact; it cannot roll back speculative memory or repair clients. The chosen design trades a document's write availability during uncertain failover for a single accepted history. Consistent-hash routing helps placement, but membership changes still require fencing and recovery.
 
-**Why it works**: The server is the single point of truth for operation ordering. When two clients submit concurrent edits, the server transforms one against the other and assigns sequential version numbers. This guarantees convergence without complex vector clocks or Lamport timestamps.
+### Snapshot plus durable ordered log
 
-**Why peer-to-peer ordering fails**: Without a central authority, every client must maintain a full causal history and resolve conflicts independently. This requires O(n) state per client where n is the number of clients, and conflict resolution becomes an NP-hard problem for certain operation types. The operational complexity of peer-to-peer OT is why Google abandoned it in favor of server-authoritative OT.
+Append a small operation and use verified snapshots to bound reconstruction work. Full snapshots on every edit repeat most of the content; keeping only the latest text sacrifices history and retry context. The chosen approach adds replay validation, retention management, and snapshot workers.
 
-**Trade-off**: Single point of failure. If the server is unreachable, no operations can be committed. We mitigate this with the operation buffer (clients continue editing locally) and RabbitMQ for multi-server fanout.
-
-### 3. Snapshot + Operation Log Storage
-
-**Decision**: Periodic snapshots with complete operation log, rather than storing full document snapshots on every change.
-
-**Why it works**: A document edited 10,000 times stores 10,000 operations (each 50-200 bytes, totaling ~1 MB) plus ~100 snapshots (at every 100th operation). Storing a full snapshot on every keystroke for a 50 KB document would consume 500 MB.
-
-**Why full-snapshot-only fails**: At 500,000 operations/second globally, storing a full document copy for each operation would overwhelm storage. More critically, version history requires diffing between adjacent snapshots, which is computationally expensive. With an operation log, the diff is the operation itself.
-
-**Trade-off**: Loading a document requires replaying operations since the last snapshot. If the snapshot interval is too large (e.g., every 1000 ops), load time degrades. We snapshot every 50-100 operations to keep replay under 10ms.
-
----
+Build a snapshot from an exact committed version, verify its checksum and replay boundary, then publish it as usable. Retain the previous snapshot until the new one is verified. A snapshot is a recovery optimization; it is not acknowledgement of an uncommitted edit and does not independently justify deleting the log.
 
 ## Consistency and Idempotency
 
-### Operation Idempotency
+The production acceptance unit is the document head, operation, receipt, and outbox event in one transaction. Look up receipts scoped to the document and actor; reject reuse with different original content or base. Cache successful receipts only as an optimization. A Redis TTL is not a durable retry horizon.
 
-Network issues cause clients to retry operations. Without idempotency, the same `insert("x", pos=5)` applied twice creates "xx" instead of "x", corrupting the document.
+Publish committed sequence numbers through an outbox relay, and make every delivery consumer deduplicate **within its own subscription**. A global “seen” flag can incorrectly suppress delivery to other gateways. Clients ignore duplicates, buffer bounded gaps, and replay missing committed operations before advancing their visible synchronization baseline.
 
-Each operation carries a client-generated `operationId` formatted as `{clientId}-{timestamp}-{contentHash}`. The server checks Redis for this ID before processing. On a cache hit, it returns the cached result (version + transformed operation) without re-applying. The cache TTL is 1 hour, long enough for all retries to complete.
+Publisher confirmation and consumer acknowledgement are separate broker boundaries; neither proves that a peer rendered an edit. See [RabbitMQ's acknowledgement documentation](https://www.rabbitmq.com/docs/confirms). Use confirmed publication, retained outbox state, and consumer recovery; the current code's ordinary channel publication provides none of that end-to-end transactionality.
 
-### Message Deduplication for Multi-Server Broadcast
+During reconnect, resolve the old in-flight request before sending a rebased successor. Preserve original retry identity even if the local representation was transformed while waiting. Never blindly resend a new operation ID for an ambiguous edit, nor overwrite a draft as the only recovery path.
 
-When operations are broadcast via RabbitMQ with at-least-once delivery, duplicate messages are possible. Each message carries a `messageId` of `{documentId}-{version}`. Consuming servers check Redis before processing and cache the messageId for 1 hour after successful processing.
+## Security / Auth
 
-### Delivery Semantics
+Production uses an authenticated session, HttpOnly/Secure cookies, CSRF protection for HTTP mutations, and WebSocket origin checks. Authorize metadata, initial content, editing, presence, history, and permission changes; do not equate knowing a document or user UUID with access.
 
-| Queue | Delivery | Rationale |
-|-------|----------|-----------|
-| `op.broadcast.*` | At-least-once | Deduplicated by messageId in Redis; operations idempotent at same version |
-| `snapshot.worker` | At-least-once | Idempotent INSERT with version check; duplicate writes harmless |
-| `doc.failed` (DLQ) | At-most-once | Manual inspection; no automatic retry |
+Revocation is ordered with new admissions and prevents subsequent content delivery to revoked connections. Already disclosed content cannot be recalled. Reconnect rechecks access, and unresolved local text remains private to its owner until a permitted recovery action exists.
 
----
+Limit operation bytes, document length, nesting, edit rate, reconnect rate, and transform work per client/document. Use a consistent position unit—this JavaScript demo uses UTF-16 code units—and an editor adapter that respects user-visible character boundaries. Attribute fields alone do not implement rich text or sanitize HTML.
 
-## Security and Auth
-
-- **Session-based authentication** with Redis-backed store
-- **Permission levels**: view (read-only), edit (can modify), admin (can share/delete)
-- **WebSocket authentication**: Session validated on connection upgrade; unauthenticated connections rejected
-- **Rate limiting**: Operations per second per client (prevents flood attacks)
-- **Input validation**: Operation baseLength must match current document length; malformed operations trigger resync
-- **Audit logging**: Document create, delete, share, permission change, and version restore events logged with user ID, IP, and timestamp
-
----
+**Current local behavior:** all document/user HTTP routes are public; callers supply `ownerId` and WebSocket `userId`; `document_access` is unused. No sessions, passwords, rate limiter, origin validation for WebSockets, or semantic operation validator is wired. REST CORS is configured, but is not an authorization boundary.
 
 ## Observability
 
-### Prometheus Metrics
+Production should measure input-to-local-render, admission-to-durable-ack, committed-sequence-to-peer-application, owner queue length, transform work, replay length, receipt ambiguity, reconnect/resync rates, and snapshot verification failures. Presence lag is a separate signal. Use low-cardinality labels and correlate individual failures through structured event IDs without logging document contents.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `collab_ws_connections_total` | Gauge | Active WebSocket connections per server |
-| `collab_active_documents` | Gauge | Documents with active editors |
-| `collab_operations_total` | Counter | Operations processed (by status: success, error) |
-| `collab_operation_latency_ms` | Histogram | Time from operation received to ack sent |
-| `collab_transform_latency_ms` | Histogram | Time spent in OT transform |
-| `collab_queue_depth` | Gauge | RabbitMQ queue depth per queue |
-| `collab_circuit_breaker_state` | Gauge | 0=closed, 0.5=half-open, 1=open |
-| `collab_duplicate_operations_total` | Counter | Idempotency cache hits |
+The local server exposes Pino events and prom-client metrics in [shared/logger.ts](./backend/src/shared/logger.ts) and [shared/metrics.ts](./backend/src/shared/metrics.ts). Connection/document/collaborator gauges refresh every five seconds; the RabbitMQ consumer queue-depth gauge refreshes every ten seconds. Transform duration is bucketed by the number of concurrent operations.
 
-### Structured Logging (Pino)
+Metric names overstate some boundaries: `collab_operation_latency_ms` is observed after broker publication, although its help text says receive-to-ack. `collab_sync_latency_ms` covers local send/publication calls, not peer receipt or rendering. The connection-duration histogram is declared but never observed. Queue depth covers the operation consumer queue, not snapshot backlog or the fallback buffer.
 
-Key logged events:
-
-| Event | When | Debug Value |
-|-------|------|-------------|
-| `operation_applied` | Every successful operation | Latency trends, throughput |
-| `ot_conflict_resolved` | Concurrent operations transformed | client_version vs server_version gap, concurrent_ops count |
-| `operation_apply_failed` | Transform produced invalid op | Bug detection in OT algorithm |
-| `ws_connect` / `ws_disconnect` | Client presence changes | Connection stability |
-| `document_loaded` | Server loads document state | Load time, content size |
-| `snapshot_saved` | Periodic checkpoint | Backup frequency |
-
-### Health Checks
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /health` | Comprehensive check (PostgreSQL + Redis + RabbitMQ latency) |
-| `GET /metrics` | Prometheus metrics scrape endpoint |
-| `GET /ready` | Readiness probe (all dependencies healthy) |
-| `GET /live` | Liveness probe (process alive) |
-
-### SLI Targets
-
-| SLI | Target | Measurement |
-|-----|--------|-------------|
-| Operation Latency | p95 < 50ms | From operation received to ack sent |
-| Availability | 99.9% | Successful operations / total attempts |
-| Sync Lag | < 100ms | Time for operation to reach all clients |
-| Recovery Time | < 30s | Time to reconnect and resync after disconnect |
-
----
+`/health` checks PostgreSQL, Redis, and obtaining a Rabbit channel, but responds 200 for degraded dependencies. `/ready` checks only PostgreSQL. Neither establishes active Rabbit consumers, a safe document owner, or OT correctness. Shutdown closes the WebSocket server and dependencies without explicitly draining edits or closing each client first; asynchronous disconnect snapshots may race database shutdown.
 
 ## Failure Handling
 
-### Circuit Breakers (Opossum)
-
-Three circuit breakers protect against dependency failures:
-
-| Dependency | Timeout | Error Threshold | Reset | Fallback |
-|------------|---------|-----------------|-------|----------|
-| PostgreSQL | 5s | 50% at 5+ requests | 30s | Fail operation, request client resync |
-| Redis | 1s | 50% at 10+ requests | 10s | Presence updates fail silently |
-| RabbitMQ | 2s | 50% at 5+ requests | 15s | Buffer publishes in-memory (up to 1000), local broadcast continues |
-
-### Client-Side Retry Strategy
-
-Operations use exponential backoff with jitter:
-- Base delay: 100ms
-- Max retries: 3
-- Backoff: `baseDelay * 2^attempt * (0.5 + random())`
-- After max retries: Request full resync from server
-
-### Failure Handling Summary
-
-| Failure Type | Detection | Response | Recovery |
-|--------------|-----------|----------|----------|
-| Client disconnect | WebSocket close event | Buffer operations locally | Reconnect with exponential backoff; resync on connect |
-| Server crash | Health check failure | Load balancer removes server | Other servers handle clients; state in Redis/DB |
-| Database unavailable | Circuit breaker opens | Fail operation, request resync | Drain queue when circuit closes |
-| RabbitMQ unavailable | Circuit breaker opens | Buffer publishes locally | Replay buffered messages on recovery |
-| Network partition | Timeout on cross-server RPC | Operate independently | Merge states on partition heal |
-| Data corruption | baseLength mismatch on apply | Reject operation, send resync | Client receives fresh document state |
-
----
+| Failure | Proposed behavior | Current implementation limitation |
+|---------|-------------------|-----------------------------------|
+| Lost acknowledgement | Resolve a durable receipt, then retry the identical request if unseen | Browser sends no operation ID or automatic retry |
+| Invalid operation | Reject before committed state changes; retain recoverable local work | Deserialization trusts lengths and component structure |
+| Database append failure | Discard candidate state, pause on uncertain commit | Memory/content version changed before persistence; resync can expose that state |
+| Broker outage | Keep committed outbox events, show delivery lag, recover consumers | Bounded process-memory buffer can drop; subscription recovery is missing |
+| Missing sequence | Replay a bounded suffix or obtain a coordinated baseline | Remote versions are accepted without contiguous checks |
+| Snapshot worker failure | Retain log, alert on replay cost/backlog | Snapshot queue has no consumer |
+| Owner failure | Fence old generation, replay verified state, resume admissions | No owner election, fencing, or command queue |
+| Presence outage | Continue durable editing with reduced awareness | Redis failures can fail connection setup or fail an operation after its SQL append |
+| Local pending work during resync | Save draft and reconcile receipt/history | Client replaces content and clears pending/in-flight operations |
 
 ## Scalability Considerations
 
-### Multi-Server Architecture
+First establish correctness in one process: valid transforms, consistent insertion priority, serialized commands, and commit-before-publish memory. More processes amplify current race conditions.
 
-Each sync server handles a subset of documents. RabbitMQ enables cross-server operation fanout so clients connected to different servers editing the same document stay in sync. Servers are stateless except for in-memory document state (which can be reconstructed from PostgreSQL).
+Then partition by document ID, retain recent committed operations in a bounded owner cache, and fall back to PostgreSQL for older supported bases. The checked-in implementation reads the operation suffix from PostgreSQL on every edit; it has no recent-operation ring. Asynchronous queries do not block the JavaScript event loop while waiting, but consume latency and database capacity; synchronous transform, diff, and string copying do consume CPU on that thread.
 
-### Scaling Path
+Separate a hot document's ordered admission from its delivery fanout. Throttle cursor updates, coalesce each participant's newest cursor, and disconnect slow consumers with a resumable sequence rather than growing unbounded buffers. A 50-writer limit is an admission decision, not something RabbitMQ prefetch enforces.
 
-1. **Add sync servers**: Each server creates its own RabbitMQ queue. No configuration change needed.
-2. **PostgreSQL read replicas**: Operations table is append-only, ideal for replication. Reads (document load, version history) go to replicas.
-3. **Redis Cluster**: Presence and idempotency data sharded across nodes.
-4. **RabbitMQ clustering**: Federation plugin for multi-region broadcast.
-
-### What Breaks First
-
-| Scale | Bottleneck | Mitigation |
-|-------|-----------|------------|
-| 1K concurrent docs | Single PostgreSQL write throughput | Batch INSERT for operations |
-| 10K concurrent docs | Memory per sync server (document state in RAM) | Evict idle documents, reload on reconnect |
-| 100K concurrent docs | RabbitMQ message throughput | Shard exchanges by document ID range |
-| 50+ editors/doc | OT transform CPU (quadratic with concurrent ops) | Limit concurrent editors, batch transforms |
-
----
+Keep one home region per document initially. Replicated read history can tolerate bounded staleness; live editing must route to the authority. Multi-region independent writes require a deliberately different conflict/authority model and cannot be added merely by replicating the broker.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Sync algorithm | OT | CRDT | Compact operations, lower memory, server-authoritative |
-| Transport | WebSocket | HTTP polling | Sub-100ms latency required for real-time editing |
-| Storage | Snapshot + op log | Full snapshots only | 100x storage reduction, built-in version diffs |
-| Authority | Server-authoritative | Peer-to-peer | Guaranteed convergence, simpler consistency model |
-| Cross-server sync | RabbitMQ topic exchange | Redis Pub/Sub | Durable messages survive restarts, DLQ for failures |
-| Session storage | Redis | In-memory | Multi-server session sharing, persistence |
-
----
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-App
-├── Header                    (document title display)
-├── UserSelector              (dropdown to pick demo user identity)
-├── DocumentList              (list of documents with create button)
-│                              shown when no document is selected
-├── TextEditor                (textarea for collaborative editing)
-│                              shown when a document is selected
-└── UserList                  (sidebar showing connected collaborators
-                               with colored cursor indicators)
-```
-
-The application uses a simple two-state layout managed in `App` rather than a router. If no document is selected, `App` renders the `DocumentList` view where users can browse, create, and select documents. Once a document is selected, `App` renders the editor view with the `TextEditor`, `Header`, `UserList`, and a "Back to Documents" button. This is intentional -- there is no TanStack Router because the editor experience is a single view with no URL-based navigation between pages.
-
-### Zustand Store (`editorStore`)
-
-A single Zustand store manages all collaborative editing state, implementing the OT client state machine:
-
-| Slice | State | Purpose |
-|-------|-------|---------|
-| **Connection** | `connected`, `ws`, `clientId` | WebSocket connection state and unique client session ID assigned by server |
-| **Document** | `documentId`, `content`, `serverVersion` | Current document being edited, its text content, and the last acknowledged server version |
-| **OT State Machine** | `inflightOp`, `pendingOps` | The operation sent to server awaiting ack, and operations applied locally but not yet sent |
-| **Presence** | `clients` (Map<string, ClientInfo>) | Map of connected collaborators with cursor position, selection, display name, and assigned color |
-| **User** | `userId` | Current user's ID (set during demo user selection) |
-
-**OT state machine flow within the store:**
-
-1. **Local edit:** `applyLocalChange(op)` applies the operation to content optimistically and adds it to `pendingOps`. If no operation is in-flight, `flushPending()` composes all pending ops into one and sends it to the server, moving it to `inflightOp`.
-
-2. **Server ack:** `handleAck()` clears `inflightOp`, updates `serverVersion`, and calls `flushPending()` to send the next batch of pending operations.
-
-3. **Remote operation:** `handleRemoteOperation()` transforms the incoming operation against `inflightOp` (if present) and then against each operation in `pendingOps`, updating both the remote op and the local ops. The transformed remote operation is then applied to content. This ensures convergence: all clients reach the same document state regardless of operation arrival order.
-
-4. **Resync:** If the OT algorithm produces an invalid operation (baseLength mismatch), the server sends a `resync` message with the full document content and version. The client replaces its entire state, discarding inflight and pending ops.
-
-### Client-Side OT Engine
-
-Two service files implement the OT algorithm on the client side:
-
-**`TextOperation.ts`** -- The core data structure representing a document change as a sequence of retain, insert, and delete components. Provides `apply(doc)` to apply the operation to a string, `toJSON()` / `fromJSON()` for serialization over WebSocket, and `isNoop()` to check if the operation makes no changes.
-
-**`OTTransformer.ts`** -- Contains the `transform(op1, op2)` function that takes two operations created against the same document state and returns transformed versions `[op1', op2']` such that applying op1 then op2' gives the same result as applying op2 then op1'. Also contains `compose(op1, op2)` which combines two sequential operations into a single operation, used by `flushPending()` to batch multiple local edits into one network message.
-
-### Data Fetching
-
-**REST API (`services/api.ts`):** Used for document management operations that happen before editing starts. Provides `getDocuments()` (list all), `getDocument(id)`, `createDocument(title, ownerId)`, `updateDocumentTitle(id, title)`, `getUsers()`, and `getUser(id)`. All calls use `fetch()` against the `/api` base URL. These are only used by `DocumentList` and `UserSelector`.
-
-**WebSocket (managed in `editorStore`):** All real-time editing communication flows through a single WebSocket connection per editing session. The connection URL includes `documentId` and `userId` as query parameters. The store's `connect()` action opens the connection and registers an `onmessage` handler that routes messages by type to specialized handler functions.
-
-### Real-Time Update Patterns
-
-**Message handling in the store:** Incoming WebSocket messages are routed to handler functions that update the Zustand store:
-
-| Server Message | Handler | Store Updates |
-|----------------|---------|---------------|
-| `init` | `handleInit()` | Sets `clientId`, `serverVersion`, `content`, `clients` map, clears pending ops |
-| `ack` | `handleAck()` | Updates `serverVersion`, clears `inflightOp`, flushes more pending |
-| `operation` | `handleRemoteOperation()` | Transforms against local ops, applies to `content`, updates `serverVersion` |
-| `cursor` | `handleCursor()` | Updates cursor position in `clients` map for the sending client |
-| `selection` | `handleSelection()` | Updates text selection in `clients` map |
-| `client_join` | `handleClientJoin()` | Adds new client to `clients` map with color and display name |
-| `client_leave` | `handleClientLeave()` | Removes client from `clients` map |
-| `resync` | `handleResync()` | Replaces `content`, `serverVersion`, clears all pending/inflight ops |
-
-**Operation deduplication:** When the store receives a remote operation, it checks `message.clientId === clientId`. If the operation is from the local client (echoed back by the server), it is skipped because the local content already includes that change. Only the `serverVersion` is updated.
-
-**Textarea synchronization:** The `TextEditor` component uses a `ref` to the textarea element and tracks the last known content in a `lastContentRef`. When the store's `content` changes (due to a remote operation), the `useEffect` updates the textarea's `value` property directly and restores the cursor position and scroll position. This avoids re-rendering the entire component on every remote keystroke.
-
-**Diff-based operation creation:** When the user types in the textarea, the `handleInput` callback computes a diff between the old and new text values. It finds the common prefix length, the common suffix length, and builds a TextOperation from the difference (retain prefix, delete removed characters, insert new characters, retain suffix). This approach handles all edit types (single character insert, paste, backspace, cut) uniformly.
-
-### Key UI Patterns
-
-- **IME composition handling:** The `TextEditor` tracks whether an IME (Input Method Editor) composition is in progress via `isComposingRef`. During composition (used for CJK language input), input events are suppressed to prevent partial characters from generating operations. The operation is created only when `compositionend` fires.
-
-- **Presence indicators:** The `UserList` sidebar shows each connected collaborator with their assigned color, display name, and cursor position. Colors are assigned server-side to ensure uniqueness and consistency across clients.
-
-- **Optimistic local edits:** All local changes are applied to the document immediately before being sent to the server. The user never waits for a server round-trip to see their own keystrokes. If the server rejects the operation or the OT transform produces an error, a resync replaces the local state.
-
-- **Connection status feedback:** The textarea is disabled and shows "Connecting..." as placeholder text when the WebSocket is not connected. The background color changes from white (connected) to gray (disconnected) to provide visual feedback.
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in this project. Each explanation describes what the pattern is, why it exists, and how it works -- assuming no prior knowledge.
-
-### Circuit Breaker
-
-**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing dependency. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately (fast-fail) without attempting the actual operation. After a cooldown period, the circuit enters a "half-open" state where it allows one probe request through. If the probe succeeds, the circuit closes and normal operation resumes.
-
-**Why it matters:** The collaborative editor depends on three external services: PostgreSQL (operation persistence and document loading), Redis (presence and idempotency), and RabbitMQ (cross-server operation broadcast). If PostgreSQL becomes unresponsive, every operation submission would block for 5 seconds (the default timeout), stalling the event loop. With 50 concurrent editors, the server would have 50 blocked requests, exhausting the connection pool and causing all other operations -- including WebSocket pings, cursor updates, and Redis presence -- to queue up and timeout. The circuit breaker stops this cascade by failing database calls instantly when PostgreSQL is known to be unhealthy.
-
-**How it works here:** Three separate circuit breakers protect each dependency with tuned configurations. PostgreSQL: 5-second timeout, 50% error threshold at 5+ requests, 30-second reset. Redis: 1-second timeout, 50% at 10+ requests, 10-second reset (shorter because Redis failures are usually transient). RabbitMQ: 2-second timeout, 50% at 5+ requests, 15-second reset. When the RabbitMQ circuit opens, the server buffers publishes in memory (up to 1000 messages) and continues broadcasting locally. When the PostgreSQL circuit opens, operations fail and the server requests the client to resync.
-
-**File:** `backend/src/shared/circuitBreaker.ts`
-
-### Idempotency
-
-**What it is:** Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a collaborative editor, this is critical because network issues cause clients to retry operations. If a retry is processed as a new operation, the same text is inserted twice, corrupting the document for all collaborators.
-
-**Why it matters:** Consider a user typing "hello" -- the client sends an insert operation, the server processes it and increments the version, but the acknowledgment is lost due to a network blip. The client retries the same insert. Without idempotency, the document now contains "hellohello", and all other collaborators see the duplicate. Because OT relies on version numbers for transform correctness, a duplicate operation at the wrong version can cascade into further corruption.
-
-**How it works here:** Each operation carries a client-generated `operationId` formatted as `{clientId}-{timestamp}-{contentHash}`. Before processing an operation, the server checks Redis for this ID (key: `idemp:{operationId}`, TTL: 1 hour). If the key exists, the server returns the cached result (version number and transformed operation) without re-applying the operation to the document. If the key does not exist, the server processes the operation normally and stores the result in Redis. The 1-hour TTL is long enough for all retries to complete but short enough to avoid unbounded cache growth.
-
-**File:** `backend/src/shared/idempotency.ts`
-
-### Structured Logging
-
-**What it is:** Structured logging writes log entries as machine-parseable JSON objects rather than free-form text strings. Each log entry includes standardized fields (timestamp, level, message) plus context-specific metadata (document ID, client ID, operation version, latency).
-
-**Why it matters:** Debugging OT issues requires correlating events across multiple clients editing the same document. When a conflict resolution produces an unexpected result, you need to find all operations for that document, see their versions, examine the transform inputs and outputs, and determine which client's operation arrived first. With free-form text logs, this is a manual process of grep and mental correlation. With structured JSON logs, it is a query: `documentId=abc AND event=ot_conflict_resolved | sort by timestamp`.
-
-**How it works here:** Pino is configured with child loggers that include `server_id`, `document_id`, and `client_id` as context fields. Key logged events: `operation_applied` (every successful operation, with latency), `ot_conflict_resolved` (concurrent operations transformed, with version gap and concurrent op count), `operation_apply_failed` (transform produced an invalid operation -- a bug indicator), `ws_connect` / `ws_disconnect` (connection stability), `document_loaded` (load time and content size), `snapshot_saved` (backup frequency tracking). `pino-http` adds request-level logging with correlation IDs for REST API calls.
-
-**File:** `backend/src/shared/logger.ts`
-
-### Prometheus Metrics
-
-**What it is:** Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics on an HTTP endpoint (`/metrics`) in a text format. Prometheus scrapes this endpoint periodically and stores the time-series data for visualization in dashboards and alerting when thresholds are crossed.
-
-**Why it matters:** The collaborative editor has specific SLIs (Service Level Indicators) that require continuous measurement: operation latency (p95 < 50ms), OT transform latency (must be negligible compared to total operation time), WebSocket connection count (for capacity planning), and queue depth (for detecting RabbitMQ backpressure). Logs can answer "what happened to this one operation" but cannot answer "what is the p95 operation latency over the last hour" without expensive aggregation.
-
-**How it works here:** The `prom-client` library exposes 8 custom metrics. `collab_ws_connections_total` (Gauge) tracks active WebSocket connections per server instance. `collab_active_documents` (Gauge) counts documents with at least one active editor. `collab_operations_total` (Counter with status label) counts operations processed, split by success/error. `collab_operation_latency_ms` (Histogram) records time from operation received to ack sent. `collab_transform_latency_ms` (Histogram) isolates the OT transform step. `collab_queue_depth` (Gauge) monitors RabbitMQ queue depth per queue. `collab_circuit_breaker_state` (Gauge) reports circuit breaker state (0=closed, 0.5=half-open, 1=open). `collab_duplicate_operations_total` (Counter) counts idempotency cache hits, indicating retry frequency.
-
-**File:** `backend/src/shared/metrics.ts`
-
-### Health Checks
-
-**What it is:** Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers (to route traffic away from unhealthy instances), orchestrators like Kubernetes (to restart crashed containers), and monitoring dashboards.
-
-**Why it matters:** The collaborative editor depends on three external services, and each can fail independently. If PostgreSQL is down, documents cannot be loaded or operations persisted, but active editing sessions can continue briefly using in-memory state. If Redis is down, presence updates and idempotency checks fail, but editing still works. If RabbitMQ is down, cross-server broadcast fails, but single-server editing works normally. Health checks enable automated systems to detect exactly what is failing and respond appropriately rather than treating all failures identically.
-
-**How it works here:** Four endpoints serve different consumers. `/health` performs a comprehensive check of all three dependencies (PostgreSQL query latency, Redis ping, RabbitMQ channel check) and returns a JSON object with the status and latency of each. `/ready` is the Kubernetes readiness probe -- if any dependency is unhealthy, the instance is removed from the load balancer but not restarted, allowing it to continue serving active editing sessions. `/live` is the Kubernetes liveness probe -- only fails if the Node.js process itself is unresponsive. `/metrics` is the Prometheus scrape endpoint.
-
-### Rate Limiting
-
-**What it is:** Rate limiting restricts how many actions a client can perform within a time window. It protects the system from abuse by ensuring no single client can consume disproportionate resources.
-
-**Why it matters:** A collaborative editor is uniquely vulnerable to operation flooding. A malicious script could open a WebSocket connection and send thousands of insert operations per second, overwhelming the OT transform engine (which has quadratic complexity with concurrent operations), filling the operations table, and triggering rapid snapshot generation. Rate limiting caps the operation rate per client to prevent this.
-
-**How it works here:** Operations are rate-limited per client via the WebSocket connection. The server tracks operations per second per client and rejects operations that exceed the threshold. On the REST API side, standard express-rate-limit middleware protects document CRUD endpoints. The rate limits are intentionally lenient for normal editing (a fast typist produces 5-10 operations per second) but restrictive enough to prevent automated flooding.
-
-### RBAC (Role-Based Access Control)
-
-**What it is:** RBAC is an authorization model where permissions are assigned to roles rather than to individual users. Each user is assigned a role, and the role determines what actions they can perform.
-
-**Why it matters:** A collaborative editor needs fine-grained access control per document. Some users should only read a document (viewers), others should be able to edit (editors), and the document owner needs to manage sharing and delete the document (admin). Without RBAC, permission checks would require per-user, per-document configuration that does not scale.
-
-**How it works here:** The `document_access` table stores `(document_id, user_id, permission)` where permission is one of `view`, `edit`, or `admin`. The document owner automatically gets `admin` permission. Permissions are hierarchical: `admin` implies `edit`, which implies `view`. The schema is implemented and populated, but the enforcement middleware is not yet wired into the WebSocket handler -- this is noted in the "What Was Omitted" section. The design is ready for activation without schema changes.
-
-### Redis Cache-Aside
-
-**What it is:** Cache-aside is a caching strategy where the application checks a fast in-memory cache before querying a slower persistent store. On a cache miss, the primary store is queried and the result is stored in the cache for future requests.
-
-**Why it matters:** In the collaborative editor, two data types benefit from caching. First, presence data (cursor positions, online status) changes rapidly and is read by all connected clients. Storing it in Redis instead of PostgreSQL avoids per-keystroke database writes. Second, idempotency keys must be checked on every operation submission. Redis provides sub-millisecond lookups compared to PostgreSQL's multi-millisecond query time. At 500,000 operations per second globally, this difference is the difference between operational and overloaded.
-
-**How it works here:** Presence data is stored directly in Redis (not a cache of database data, but Redis as the primary store) with automatic expiration. When a client disconnects, their presence keys expire after the TTL, automatically removing stale cursor indicators. Idempotency keys use Redis as a write-through cache: the key is written on first operation processing and read on subsequent retries. Both patterns use Redis's built-in TTL for automatic cleanup without requiring garbage collection.
-
-**File:** `backend/src/services/redis.ts`
+| Connected text synchronization | OT with ordered document admission | Independent whole-document replacement | Preserve concurrent edits under a defined policy |
+| Offline scope | Recoverable interrupted drafts | Extended offline collaborative branches | Keep the initial protocol and supported history bounded |
+| Write authority | One fenced owner per document | Independent mutable server copies | Prevent conflicting accepted histories |
+| Persistence | Operation log + verified snapshots | Full content write per keystroke | Bound storage amplification and reconstruction work |
+| Delivery | Committed outbox + ordered replay | Best-effort fanout alone | Recover missed notifications without inventing commits |
+| Presence | Expiring, coalesced transient state | Durable cursor event history | Awareness can tolerate loss; edits cannot |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation running on Docker + Node.js + React.
+### Production patterns present, with their actual boundaries
 
-### Local Architecture
+**Optimistic operation state.** [editorStore.ts](./frontend/src/stores/editorStore.ts) tracks a visible string, committed version, one in-flight operation, and pending operations. Its core operation path is intended to apply a change and then queue it:
 
-```
-┌──────────────────────────────────┐
-│    Browser (localhost:5173)      │
-│  React + Zustand + Tailwind     │
-│  TextOperation + OT client      │
-│  WebSocket sync engine          │
-└───────────────┬──────────────────┘
-                │ WebSocket
-                ▼
-┌──────────────────────────────────┐
-│  Express + ws (localhost:3001)   │
-│  REST API: documents, auth      │
-│  WebSocket: sync, presence      │
-│  + /metrics + /health           │
-└──────┬──────┬──────┬─────────────┘
-       │      │      │
-       ▼      ▼      ▼
-┌────────┐ ┌──────┐ ┌──────────┐
-│Postgres│ │Valkey│ │ RabbitMQ │
-│ :5432  │ │:6379 │ │ :5672    │
-└────────┘ └──────┘ │ :15672   │
-                     └──────────┘
-
-Optional monitoring (--profile monitoring):
-┌────────────┐  ┌──────────┐
-│ Prometheus │  │ Grafana  │
-│   :9090    │  │  :3000   │
-└────────────┘  └──────────┘
+```typescript
+const newContent = operation.apply(get().content);
+const newPending = [...pendingOps, operation];
+set({ content: newContent, pendingOps: newPending });
 ```
 
-### Production-Grade Patterns Implemented
+This pattern supports instant input without waiting for the network, but the current textarea violates the required old-state precondition described below. Pending operations are composed only when flushing, so a long unacknowledged interval can also grow the local array.
 
-| Pattern | Library | File Path | Purpose |
-|---------|---------|-----------|---------|
-| OT engine | custom | `backend/src/services/TextOperation.ts`, `OTTransformer.ts` | Transform, compose, and apply text operations with convergence guarantee |
-| Document state | custom | `backend/src/services/DocumentState.ts` | Server-side document state with version tracking, snapshot + op log |
-| WebSocket sync | ws | `backend/src/services/SyncServer.ts` | Real-time operation relay, presence, cursor tracking, resync on error |
-| Circuit breakers | opossum | `backend/src/shared/circuitBreaker.ts` | Wraps PostgreSQL, Redis, and RabbitMQ calls with fail-fast behavior |
-| Idempotency | custom | `backend/src/shared/idempotency.ts` | Operation deduplication via Redis-cached operationIds (1-hour TTL) |
-| Prometheus metrics | prom-client | `backend/src/shared/metrics.ts` | WebSocket connections, operations, transform latency, queue depth at `/metrics` |
-| Structured logging | pino + pino-http | `backend/src/shared/logger.ts` | JSON logs with server_id, document_id, client_id context |
-| Message queue | amqplib | `backend/src/shared/queue.ts` | RabbitMQ topic exchange for cross-server operation fanout, snapshot worker queue |
-| REST API | express | `backend/src/routes/api.ts` | Document CRUD, sharing, health checks |
-| Multi-server | npm scripts | `package.json` | `dev:server1/2/3` runs 3 instances on ports 3001-3003 for distributed testing |
-| Redis presence | redis | `backend/src/services/redis.ts` | Cursor positions, online status with automatic expiration |
-| Database service | pg | `backend/src/services/database.ts` | PostgreSQL connection pool, query helpers |
+**Snapshot plus replay.** [DocumentState.ts](./backend/src/services/DocumentState.ts) loads the latest PostgreSQL snapshot and applies later logged operations in version order. Every 50 operations it publishes a snapshot request; queue failure falls back to a synchronous save. Last-client disconnect also attempts a snapshot. These are real call sites, but successful publication does not write a snapshot because no worker consumes `snapshot.worker`. Saves upsert content for an existing version, and failures are logged/swallowed. No checksum or contiguous-history validation protects reconstruction.
 
-### What Was Simplified
+**Circuit breaker and bounded fallback.** [shared/queue.ts](./backend/src/shared/queue.ts) uses an Opossum breaker for operation publication, with a two-second timeout, 50% failure threshold, minimum volume five, and 15-second reset interval. Its fallback buffers up to 1,000 events in memory and returns success even when the buffer is full. It drains only on a breaker `close` event, removes all buffered entries before attempting delivery, and logs drain failures without restoring them. A few isolated failures need not open the breaker, so their buffered events need not be drained on a later successful publish. This bounds one memory structure; it does not ensure recovery or durable delivery.
 
-| Production Design | Local Substitute | Impact |
-|-------------------|------------------|--------|
-| Load balancer with sticky sessions | Direct WebSocket connection to single server | No automatic failover between servers |
-| PostgreSQL with read replicas | Single PostgreSQL 16 instance | All reads/writes on one node |
-| Redis Cluster | Single Valkey instance | No sharding needed at dev scale |
-| RabbitMQ cluster with federation | Single RabbitMQ instance | No multi-region fanout |
-| Rich text editor (Quill/ProseMirror) | Plain text editor | No formatting attributes in OT |
-| OAuth/SSO | No authentication (open access) | Any user can edit any document |
-| CDN for static assets | Vite dev server | No edge caching |
+DB/Redis/OT breaker option objects in [shared/circuitBreaker.ts](./backend/src/shared/circuitBreaker.ts) are unused. Snapshot publication does not use the operation publish breaker. The timeout cannot undo a publication that completes later.
 
-### What Was Omitted
+**Broker acknowledgements and deduplication.** Per-server durable queues bind to `doc.*`, use prefetch 10, manually acknowledge messages, and requeue once before dead-lettering. Ordinary `createChannel`/`publish` calls do not await publisher confirms or honor the publish backpressure boolean. No dead-letter consumer is implemented. Consumer deduplication uses a shared Redis `seen:<document-version>` key, lacking recipient identity and an atomic claim; one server can suppress another's required delivery, or simultaneous consumers can both pass the check.
 
-- CDN and edge caching
-- Multi-region deployment with RabbitMQ federation
-- Kubernetes orchestration
-- Rich text formatting (bold, italic, headings)
-- Inline comments with range tracking
-- Offline mode with local operation queue
-- Document export (PDF, DOCX)
-- Full version history UI with visual diffs
-- Access control enforcement (schema ready, middleware not implemented)
-- OpenTelemetry distributed tracing (Jaeger)
-- Automated backup and restore procedures
+**Optional request cache.** [shared/idempotency.ts](./backend/src/shared/idempotency.ts) stores one-hour results under `idempotent:<operationId>`. The server extension checks this before applying an operation, but the browser never sends the field. Keys are not bound to document, actor, or content, and check/apply/store is not atomic. Cache writes can fail after SQL append. There is no durable receipt column or retry safety after expiration.
+
+**Presence, logs, and probes.** [services/redis.ts](./backend/src/services/redis.ts) keeps a document-wide hash with one-hour expiry refreshed on joins only. Cursor writes do not refresh it, and individual users have no heartbeat expiry. Cached clients from other servers can prevent local document eviction after local sockets leave. Join/leave/cursor/selection broadcasts stay within one process; they are not sent through RabbitMQ. Structured logs and dependency probes are wired, subject to the boundaries in [Observability](#observability).
+
+### Verified correctness gaps
+
+The review ran isolated checks against the actual frontend/backend OT classes and Zustand store, without starting a database, broker, or browser application. These examples establish specific defects, not a complete correctness test suite.
+
+| Area | Evidence and consequence |
+|------|--------------------------|
+| Basic input | [TextEditor.tsx](./frontend/src/components/TextEditor.tsx) calls `setContent(newValue)` before `applyLocalChange`. Starting with “abc”, setting “abcd” then applying retain-3/insert-d throws “expected 3, got 4”; content changes but no pending operation is queued. Ordinary insertions/deletions can remain unsent while the header shows Saved. |
+| Partial transform consumption | Both [backend](./backend/src/services/OTTransformer.ts) and [frontend](./frontend/src/services/OTTransformer.ts) replace an array remainder but keep the old `o1`/`o2` variable. Transforming retain-3 against retain-1/insert-X/retain-2 throws “op2 ran out of operations”; composing the same sequential pair also throws. |
+| Insertion priority | With empty text, A admitted first and concurrent B arriving later, server `transform(B,A)` produces BA. B's client processes the committed A using `transform(A,B)` and produces AB. Pairwise algorithm reuse does not repair opposite protocol priorities. |
+| Cursor coordinates | Insert-X/retain-1/delete-2 on “abc” moves an original cursor inside the deleted span to position 1 in the helper; its correct output boundary is 2 in “Xa”. A preceding insertion's offset is lost when the cursor falls inside a later deletion. |
+| Operation validation | Deserializing an operation with base/target length 3 but only retain-1 and applying it to “abc” returns “a”. The helper checks the declared base length, not full consumption or produced length. |
+
+[SyncServer.ts](./backend/src/services/SyncServer.ts) has no serialized per-document command queue. Async message handlers can overlap at database/Redis awaits. [DocumentState.ts](./backend/src/services/DocumentState.ts) queries history, changes shared memory and increments its version before SQL persistence, then reads that mutable version again after later awaits. An interleaving can produce stale transform context or an acknowledgement version belonging to a later operation. `saveOperation` inserts the log and updates the document timestamp in separate statements; timestamp failure can leave a committed log row while the caller takes its error path. Failed appends do not roll back memory, and later snapshots/resyncs can expose that uncommitted state.
+
+Concurrent first connections can each create/load their own DocumentState because the map entry is installed only after awaiting load. Initialization and subscription are not coordinated with an admission boundary. Loading caches its promise, including rejection, within an instance.
+
+Remote RabbitMQ operations are forwarded to local sockets but **never applied to that server's DocumentState**. Its next edit, new-client initialization, or disconnect snapshot can therefore use stale content/version. Broker fanout supplies neither an exclusive owner nor a consistent replicated state machine.
+
+Rabbit subscription setup runs once. A comment promises retry on the next operation, but no such call exists. A failed initial connection leaves the shared `isConnecting`/promise state unrecovered; a later connection close clears handles but does not restore the consumer. Even a reconnected publisher is not evidence that subscriptions resumed. The seeded incident postmortem is fictional and must not be treated as proof of lossless broker recovery.
+
+### Browser behavior and local substitutions
+
+The UI is a native textarea, not contenteditable or a rich-text framework. Diffing finds one common prefix/suffix around a changed region. The editor preserves selection by clamping old numeric offsets after replacing text; it does not transform the local caret through remote edits. IME events defer local submission until composition end, but remote updates can still replace textarea content during composition.
+
+The collaborator sidebar displays colored identities and numeric cursor offsets. It has no remote caret/selection overlay, activity timeout, or accessible live-announcement system. The browser sends `cursor` positions, not separate selection messages, and does not transform roster positions on incoming edits.
+
+The store accepts acknowledgements and remote versions without validating sequence continuity, identity, or an outstanding operation ID. Remote-transform/JSON failures are uncaught in the message callback. Old socket callbacks are not isolated by connection generation, so switching document/user can allow a prior socket's close/message to alter the new session. `onclose` only marks disconnected; it schedules no reconnect. Reopening a document gets a new baseline and discards pending work. A server resync likewise clears in-flight/pending operations without preserving a draft or resolving whether the previous edit committed.
+
+App state chooses a document rather than a route. The title input receives a no-op callback. List/create/user-fetch failures are logged with little UI feedback; failed document fetches can resemble an empty list. The demo identity picker is intentionally simple but supplies no authentication or permission enforcement.
+
+### What is omitted and how to verify progress
+
+There is no offline store/service worker, undo manager, history service/UI, rich-text formatting, comments, shared OT package, Zod validator, snapshot worker, outbox relay, durable request receipt, load balancer, authority fencing, or multi-region deployment. Optional Compose monitoring starts generic Prometheus/Grafana containers; Grafana dashboards are not provisioned.
+
+The [README](./README.md) supplies actual scripts, seed instructions, native infrastructure, and port mappings. The existing [smoke test](./tests/smoke.spec.ts) verifies a heading and absence of error-boundary text only. Future implementation work should first verify valid operation algebra and protocol tie ordering, then input transmission and two-client convergence, then crash/retry/reconnect and multi-process ownership. Build success or a screenshot cannot establish those properties.

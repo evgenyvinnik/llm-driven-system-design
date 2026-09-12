@@ -1,390 +1,427 @@
-# Figma - System Design Answer (Full-Stack Focus)
+# Figma — fullstack system design interview
 
-## 45-minute system design interview format - Full-Stack Engineer Position
+A proposed collaborative design editor, paced for a 45-minute interview. The architecture
+is intentionally broader than the local demo; implementation limitations are documented
+separately in [architecture.md](./architecture.md).
 
-## Opening Statement
+## 🎯 Requirements and user journey — 4 minutes
 
-"Today I'll design Figma, a real-time collaborative design platform, from a full-stack perspective. I'll focus on the integration points between frontend and backend: the WebSocket protocol for real-time sync, shared TypeScript types for type safety across the stack, the API contract for file management, and how frontend state changes flow through to PostgreSQL persistence with CRDT conflict resolution."
+> “I’ll design the path from a designer dragging a rectangle to another designer
+> seeing the committed result. Then I’ll show what happens if the connection drops
+> and the first designer tries to undo the gesture.”
 
----
+I would clarify whether we need the entire design suite. For this answer, the core is
+files, pages, simple shapes and text, layer order, properties, simultaneous editing,
+cursor presence, and named versions. Comments, image uploads, components, prototyping,
+plugins, and exports are later extensions.
 
-## Step 1: Requirements Clarification (3-5 minutes)
+The product is primarily online. We support short interruptions with bounded pending work,
+but unlimited offline multi-writer merging is not assumed. Text is edited as an object
+property rather than a collaborative character sequence. Those decisions keep the hardest
+consistency problem focused on scene operations.
 
-### Functional Requirements
+I assume a typical active page has around 10,000 objects and several collaborators. The
+fleet might have 100,000 concurrent connections, with 20,000 actively editing. These are
+interview assumptions that guide partitioning and performance tests; they are not verified
+capacities of the repository.
 
-1. **Real-time Collaborative Editing** - Multiple users editing the same canvas simultaneously
-2. **Vector Graphics Canvas** - Create and manipulate rectangles, ellipses, text
-3. **Presence System** - See collaborators' cursors and selections
-4. **Version History** - Save snapshots, restore previous versions
-5. **File Management** - Create, list, update, delete design files
+Local pointer feedback should be visible within 50 ms at p95, with a 60 Hz rendering goal
+on a specified desktop. Committed changes should reach regional collaborators within 200
+ms at p95 under admitted load. We target 99.9% regional availability, allowing a brief
+read-only pause during controlled owner failover.
 
-### Non-Functional Requirements
+Durability has a concrete definition: an accepted edit is stored with its retry receipt
+before ACK. A shape moving locally is only a preview until that happens. The UI must
+distinguish pending, saved, rejected, disconnected, and read-only states.
 
-- **Latency**: < 50ms for local operations, < 200ms for sync to collaborators
-- **Consistency**: All clients converge to same state via CRDT
-- **Reliability**: No data loss even with network interruptions
-- **Type Safety**: Shared types prevent API contract drift
+| User action | Frontend obligation | Backend obligation |
+|---|---|---|
+| Open file | Show the correct scene and current access | Consistent snapshot/stream boundary |
+| Drag/style object | Immediate feedback with pending status | Validate and commit the effective patch |
+| Collaborate | Reconcile canonical events and display cursors | One file order, separate expiring presence |
+| Reconnect | Preserve intent and resolve unknown outcomes | Receipt lookup and bounded replay |
+| Undo/restore | Explain scope and conflicts | Ordered conditional mutation |
 
-### Out of Scope
+## 🏗️ Architecture and ownership — 5 minutes
 
-- Component library
-- Prototyping/interactions
-- Export functionality
-- Plugin system
-
----
-
-## Step 2: Full-Stack Architecture Overview (5 minutes)
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Frontend (React + PixiJS)                       │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌──────────────┐  │
-│  │ editorStore   │  │ Canvas.tsx    │  │ useWebSocket  │  │ api.ts       │  │
-│  │ (Zustand)     │  │ (PixiJS)      │  │ (Real-time)   │  │ (REST)       │  │
-│  └───────┬───────┘  └───────────────┘  └───────┬───────┘  └──────┬───────┘  │
-│          │                                     │                  │          │
-└──────────┼─────────────────────────────────────┼──────────────────┼──────────┘
-           │                                     │                  │
-           │  @figma/shared-types                │ WebSocket        │ HTTP
-           │  (Shared TypeScript)                │                  │
-           │                                     │                  │
-┌──────────┼─────────────────────────────────────┼──────────────────┼──────────┐
-│          │                                     │                  │          │
-│  ┌───────▼───────┐                     ┌───────▼───────┐  ┌──────▼───────┐  │
-│  │ Type Imports  │                     │ wsHandler.ts  │  │ routes/      │  │
-│  │ (Validation)  │                     │ (WS Server)   │  │ files.ts     │  │
-│  └───────────────┘                     └───────┬───────┘  └──────┬───────┘  │
-│                                                │                  │          │
-│                         ┌──────────────────────┴──────────────────┤          │
-│                         │                                         │          │
-│                  ┌──────▼──────┐                          ┌───────▼───────┐  │
-│                  │ CRDTEngine  │                          │ FileService   │  │
-│                  │ (LWW Merge) │                          │               │  │
-│                  └──────┬──────┘                          └───────┬───────┘  │
-│                         │                                         │          │
-│                         └─────────────────────┬───────────────────┘          │
-│                                               │                              │
-│                                       ┌───────▼───────┐                      │
-│                                       │ PostgreSQL    │                      │
-│                                       │ (files,       │                      │
-│                                       │  operations)  │                      │
-│                                       └───────────────┘                      │
-│                              Backend (Express + ws)                          │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Step 3: Deep Dive - Shared Types Package (8 minutes)
-
-### Package Structure
-
-The shared types package lives in a monorepo structure with `packages/shared-types/src/` containing separate files for canvas types, operations, presence, WebSocket messages, and API contracts.
-
-### Canvas Data Types
-
-Using Zod, we define the core design object schema:
+I would draw the browser and one file's durable path, then explain how it is replicated
+across files. The diagram should fit on a whiteboard without becoming a catalog of every
+infrastructure service we might add later.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                       DesignObject Schema                        │
-├─────────────────────────────────────────────────────────────────┤
-│  id: UUID                                                        │
-│  type: 'rectangle' | 'ellipse' | 'text' | 'frame' | 'group'     │
-│  name: string (1-255 chars)                                      │
-│  ├── Position: x, y (numbers)                                    │
-│  ├── Size: width, height (non-negative)                          │
-│  ├── Transform: rotation (-360 to 360)                           │
-│  ├── Style: fill, stroke (strings), strokeWidth, opacity         │
-│  ├── State: visible, locked (booleans)                           │
-│  └── Text-specific: text, fontSize, fontFamily (optional)        │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
+│  Controls + renderer   │ ──▶ │  Scene + sync client   │ ──▶ │    File owner / API    │
+└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────┐
-│                       CanvasData Schema                          │
-├─────────────────────────────────────────────────────────────────┤
-│  objects: DesignObject[]                                         │
-│  pages: { id: UUID, name: string }[]                             │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
+│     Operation log      │ ──▶ │    Snapshot worker     │ ──▶ │    Version storage     │
+└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
 ```
 
-The `DesignObjectUpdateSchema` is a partial version (excluding `id` and `type`) for property changes.
+React owns the file route, toolbar, layer navigation, properties forms, and dialogs. A
+normalized scene store contains committed object state. A sync coordinator adds pending
+edits, receipts, and the applied sequence. A tool controller produces local previews,
+while the renderer consumes derived state and dirty object updates.
 
-### Operation Types
+The renderer is not a database. It can dispose and rebuild a Pixi container without losing
+the object. Stable document IDs connect graphics, layer rows, property controls,
+selection, and undo entries. Viewport pan/zoom does not mutate the stored coordinates of
+every object.
 
-Operations use a discriminated union with four types:
+An authenticated gateway routes edits to one logical owner for the file. That owner
+serializes mutations, validates permissions and object invariants, commits the operation
+and receipt, then publishes the result. PostgreSQL or another transactional store can hold
+the durable log and file head; snapshot workers materialize complete prefixes into
+immutable storage.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                           Base Operation                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│  id: UUID, fileId: UUID, objectId: UUID                                    │
-│  timestamp: positive integer, clientId: string                             │
-│  idempotencyKey: UUID (optional)                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-        │
-        ├──► CreateOperation: operationType='create', payload=DesignObject
-        ├──► UpdateOperation: operationType='update', payload=DesignObjectUpdate
-        ├──► DeleteOperation: operationType='delete', payload={}
-        └──► MoveOperation: operationType='move', payload={parentId, index}
-```
+The owner maintains an in-memory projection for fast decisions. On failure it recovers
+from a verified snapshot and contiguous log. A fencing epoch checked by storage prevents
+an old owner from continuing to commit after takeover. Different files use different
+owners and can make progress independently.
 
-### WebSocket Protocol Types
+A broker may notify gateways about new committed sequences, but durable recovery comes
+from the operation log. Presence uses expiring records and replaceable notifications.
+Losing a cursor update should not require replaying document history.
 
-**Client to Server Messages:**
-- `subscribe`: Join a file room with fileId, userId, userName
-- `operation`: Send operations array
-- `presence`: Update cursor position and selection
+File, account, and connection generation scope every client callback. Leaving a file
+disposes its tools and socket and rejects late results. The shell can retain a small view
+checkpoint, but private scene content is reauthorized before being shown again under a
+different session.
 
-**Server to Client Messages:**
-- `sync`: Initial file state with canvasData, presence list, assigned color
-- `operation`: Broadcast operations with fromUserId
-- `presence`: Updated presence list with removed users
-- `ack`: Acknowledge processed operationIds
-- `error`: Error code and message
+## 💾 Data and interface contracts — 4 minutes
 
-Both use `z.discriminatedUnion` on the `type` field for type-safe parsing.
+| Concept | Important fields | Authoritative owner |
+|---|---|---|
+| File head | ID, committed sequence, generation, owner epoch | Durable coordination store |
+| Scene object | Stable ID, parent/order, transform, style, content | Committed document projection |
+| Edit | Operation ID, immutable payload, base revision, effective patch | Durable log and receipt |
+| Snapshot | File, sequence, schema version, checksum, reference | Verified version storage |
+| Pending gesture | Preview and unsent intent | Client tool/sync state |
+| Undo entry | Accepted gesture effect and expected property revisions | Scoped client history, validated by server |
+| Presence | Connection ID, page, cursor, expiry | Ephemeral service |
 
-### API Types
+Object properties have explicit consistency boundaries. Position is an atomic x/y group;
+fill can change independently. Parent and sibling placement also move together.
+Reparenting checks cycles and missing parents. Reordering uses stable object anchors
+resolved against the owner's current order rather than trusting an index from an old
+array.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         File Schema                              │
-├─────────────────────────────────────────────────────────────────┤
-│  id, name, ownerId, thumbnailUrl, canvasData                     │
-│  createdAt, updatedAt (ISO datetime strings)                     │
-└─────────────────────────────────────────────────────────────────┘
+The initial protocol supports semantic create, update, delete, reorder, inverse, and
+restore commands. A patch cannot write arbitrary nested paths or change identity. Finite
+values, permitted fields, batch size, object existence, and current access are validated
+on the server. TypeScript types alone do not validate network bytes.
 
-┌─────────────────────────────────────────────────────────────────┐
-│                      FileVersion Schema                          │
-├─────────────────────────────────────────────────────────────────┤
-│  id, fileId, versionNumber, name (nullable)                      │
-│  createdBy, createdAt, isAutoSave                                │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Proposed interface | Purpose | Response boundary |
+|---|---|---|
+| GET `/api/v1/files/:id/bootstrap` | Open an authorized file | Snapshot/stream boundary and current capabilities |
+| WebSocket `/api/v1/files/:id/stream` | Edits, replay, receipts, presence | Canonical sequence or explicit rejection |
+| GET `/api/v1/files/:id/versions` | Browse history | Paginated metadata rather than every snapshot body |
+| POST `/api/v1/files/:id/versions` | Save a named revision | Immutable version reference |
+| POST `/api/v1/files/:id/restore` | Restore against expected revision | New ordered generation |
 
-API responses wrap data in `{ success: true, data: T }` or `{ success: false, error: { code, message } }`.
+A versioned runtime schema can be shared across client and server builds, but backward
+compatibility remains a protocol responsibility. The server derives the actor from the
+session, not the subscribe payload. Old clients receive a clear upgrade/reload requirement
+if they cannot interpret the scene or operation schema.
 
----
+## 🔄 Trace one edit from pointer to persistence — 4 minutes
 
-## Step 4: Deep Dive - WebSocket Handler Integration (10 minutes)
+Alice presses on a rectangle, and the tool records its initial position and selection.
+Pointer movements update a local preview on animation frames. The properties panel and
+canvas read the same derived position, so they cannot disagree about what the user is
+currently manipulating.
 
-### Backend WebSocket Handler with Type Safety
+The client sends a bounded semantic position patch with a stable operation ID. The owner
+checks current access and validates the patch against committed state. Within one
+transaction it checks the active fencing epoch, looks up a previous receipt, allocates a
+sequence for a new edit, and records the effective change and result. It ACKs only after
+commit.
 
-The `CollaborationServer` class manages real-time connections:
+The client incorporates the effective accepted patch into its canonical base, removes the
+corresponding pending overlay, and updates saving status. Other clients apply the same
+sequence. The origin does this too; skipping all events from the same user would hide
+another tab's edits and server-adjusted outcomes.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        CollaborationServer                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  clients: Map<WebSocket, Client>                                         │
-│  fileClients: Map<fileId, Set<WebSocket>>                                │
-│  crdtEngine: CRDTEngine                                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Client = {                                                              │
-│    ws, userId, userName, fileId,                                         │
-│    color (from 6-color palette), cursor, selection                       │
-│  }                                                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+If Bob changed the rectangle's color while Alice moved it, the independent patches both
+survive. If Bob also changed its position, server commit order determines which absolute
+position becomes canonical. The UI can show the remote selection and settle on that result
+once its own pending work resolves.
 
-**Connection Flow:**
-1. On connection, create Client with empty fileId and assigned color
-2. Parse incoming messages with `ClientMessageSchema.safeParse()`
-3. If validation fails, send error with code `INVALID_MESSAGE`
-4. Route valid messages to appropriate handler
+For a first implementation I would keep one durable batch in flight per file and coalesce
+unsent previews. A final patch on pointer release ensures the final intent is sent. If
+this throughput is insufficient, pipeline with an explicit client sequence instead of
+relying on asynchronous message handlers to finish in order.
 
-**Subscribe Handler:**
-1. Leave previous file room if any
-2. Set client's userId, userName, fileId
-3. Add client to fileClients set
-4. Load file from PostgreSQL
-5. Store presence in Redis hash `presence:{fileId}` with 1-hour TTL
-6. Send sync message with file data, current presence, and assigned color
-7. Broadcast presence update to other clients
+A failed edit leaves an explicit rejected/pending state, not a silent optimistic shape.
+Removing a rejected overlay exposes the current canonical scene while preserving other
+accepted changes. That is why the frontend maintains a committed base separately from what
+the user is previewing.
 
-**Operation Handler:**
-1. Verify client is subscribed to a file
-2. For each operation:
-   - Check idempotency key in Redis (NX with 5-minute TTL)
-   - Skip if already processed
-   - Persist operation to PostgreSQL operations table
-   - Apply to canvas_data via CRDTEngine
-   - Update files table
-3. Send ack to sender with processed operation IDs
-4. Broadcast operations to other clients in file room
-5. Publish to Redis `file:{fileId}:operations` for cross-server sync
+## 🔧 Deep Dive 1: Fast local editing versus durable write volume — 7 minutes
 
-**Presence Handler:**
-Updates cursor and selection in Redis, broadcasts to other clients.
+> “I would make rendering follow the pointer, while persistence follows meaningful
+> document patches. Those are different rates, and coupling them would make both
+> the browser and the database do unnecessary work.”
 
-**Disconnect Handler:**
-Removes from Redis presence, notifies others, cleans up client maps.
+A pointer can produce many events during a drag. Writing the complete scene for every
+event serializes thousands of unchanged objects and generates an unusable undo history.
+With multiple selected objects, that amplification is even larger. A slow network would
+also make the apparent interaction lag behind the pointer.
 
-**Redis Pub/Sub Setup:**
-Subscribes to `file:*:operations` pattern. On message from another server, broadcasts to local clients (skipping if excludeServer matches).
+The tool therefore keeps a temporary transform and samples the latest input once per
+animation frame. It emits coalesced durable patches and one final state on release.
+Intermediate presence can be sent separately. Coalescing happens before an operation gets
+its immutable transmitted payload; a retry must never change the contents associated with
+an existing operation ID.
 
----
+At the assumed peak, 20,000 active editors sending five 500-byte batches per second
+produce 100,000 batches/s and about 50 MB/s of log ingress before overhead. Writing a 5 MB
+scene instead would produce about 500 GB/s of logical scene writes. This explains why an
+operation log matters even if individual files are modest.
 
-## Step 5: Deep Dive - REST API with Validation (8 minutes)
+The server owner resolves a patch against an in-memory committed projection. The durable
+transaction records only the accepted change and coordination state. A snapshot worker
+handles full scene serialization at bounded intervals. The cost is maintaining
+deterministic replay, snapshot manifests, and retention rules.
 
-### File Routes
+The browser has a similar separation. React renders semantic controls, while a retained
+scene renderer updates object transforms and styles. A dirty set identifies changed
+objects. Moving one rectangle should not recreate every text object and cursor graphic on
+the page.
 
-**GET /files** - List all non-deleted files ordered by updated_at DESC. Returns array validated against `FileSchema`.
+GPU rendering is not automatically faster for every workload. Large text/layout costs,
+texture uploads, and repeated allocations can dominate before drawing. I would benchmark
+CPU preparation and GPU work separately, using real scene mixes rather than a claim that a
+certain number of rectangles always runs at 60 Hz.
 
-**GET /files/:id** - Get single file by ID. Returns 404 if not found or deleted.
+Viewport culling uses conservative transformed bounds and a small margin. A spatial index
+can accelerate hit testing when a linear reverse-layer scan becomes expensive. The final
+hit test happens in local object coordinates, so rotation and ellipse geometry behave
+correctly. Hidden layers do not become invisible interactive targets.
 
-**POST /files** - Create new file:
-- Validates body against `CreateFileRequestSchema`
-- Returns 400 with validation errors if invalid
-- Generates UUID for id and owner
-- Initializes with empty canvasData `{ objects: [], pages: [] }`
-- Returns 201 with created file
+Culling only limits drawing. The layer tree, object records, pending queue, and history
+still occupy memory. I would load inactive page metadata first and keep page/resource
+caches bounded. The layer list can use virtualization with stable IDs and deliberate focus
+management.
 
-**PATCH /files/:id** - Update file metadata:
-- Validates body against `UpdateFileRequestSchema`
-- Builds dynamic UPDATE query for provided fields
-- Returns 404 if file not found
+Pointer capture, cancellation, and keyboard equivalents are part of the interaction model.
+A drag outside the canvas should not become stuck. Escape can cancel an uncommitted
+preview; undoing already committed intermediate movement goes through the ordinary inverse
+protocol. Text fields and IME composition suspend canvas shortcuts to avoid deleting
+objects while editing their labels.
 
-**DELETE /files/:id** - Soft delete:
-- Sets `deleted_at = NOW()`
-- Returns 204 on success, 404 if not found
+The accessible path uses labeled forms and a semantic layer tree to select, move, resize,
+reorder, and delete. A canvas element plus decorative handles does not provide those
+capabilities to keyboard or screen-reader users. Rendering failure should preserve pending
+intent and provide a clear retry path through the shell.
 
-### Version Routes
+| Approach | Benefit | Cost or failure |
+|---|---|---|
+| ✅ Local previews plus bounded patches | Immediate interaction and controlled storage volume | Reconciliation and gesture grouping |
+| ❌ Persist full scene per pointer event | Simple single-user prototype | Write amplification and concurrent overwrite risk |
+| ❌ Render every visual as a React/SVG node at any scale | Strong native semantics for smaller scenes | Larger scenes need profiling of browser update costs |
 
-**GET /files/:fileId/versions** - List all versions for a file ordered by version_number DESC.
+If a smaller SVG or Canvas 2D implementation meets the benchmark, it remains a valid
+choice. The non-negotiable part is separating durable state, preview state, and render
+resources so performance changes do not rewrite the collaboration model.
 
-**POST /files/:fileId/versions** - Create snapshot:
-1. Validates body against `CreateVersionRequestSchema`
-2. Gets current file canvas_data
-3. Returns 404 if file not found
-4. Gets next version number: `MAX(version_number) + 1`
-5. Inserts version with is_auto_save=false
-6. Returns 201 with created version
+## 🔧 Deep Dive 2: Reconnect, retries, and concurrent edits — 7 minutes
 
-**POST /files/:fileId/versions/:versionId/restore** - Restore version:
-1. Gets version's canvas_data
-2. Returns 404 if version not found
-3. Updates file's canvas_data with version data
-4. Returns `{ restored: true }`
+> “When a socket drops, neither side can infer whether the last edit committed.
+> I would recover that outcome before retrying or replacing the document.”
 
----
+The server stores a receipt under a unique file/operation ID with a payload digest. A
+repeated ID and identical payload returns the accepted sequence and effective result. A
+different payload under that ID is rejected. A duplicate arriving while the original is
+processing waits briefly or receives pending status.
 
-## Step 6: Deep Dive - Frontend API Client (5 minutes)
+A Redis cache can accelerate this lookup, but a five-minute key cannot be the only proof
+of acceptance. Eviction, outages, or an in-progress marker do not mean an operation is
+safe to execute again. The durable unique record and atomic commit provide that proof.
 
-### Type-Safe API Client
+The file owner serializes accepted edits. It validates current permission and object state
+before committing, and storage checks its fencing epoch. An old owner that resumes after
+losing its lease cannot write another history. This is the availability trade-off: the
+file may pause during takeover instead of accepting conflicting outcomes from independent
+writers.
 
-The API client provides type-safe methods with Zod validation on responses:
+Client state is canonical scene plus pending overlay. Incoming events advance the
+canonical scene in sequence order, while a newer local preview can remain visible. When an
+ACK or rejection resolves that intent, the overlay disappears. This avoids both
+distracting flicker and permanent divergence from the server.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      API Client Structure                        │
-├─────────────────────────────────────────────────────────────────┤
-│  request<T>(path, options, schema?): Promise<T>                  │
-│  ├── Adds Content-Type: application/json                         │
-│  ├── Throws ApiError with code, message, status on failure       │
-│  └── Validates response with schema if provided                  │
-├─────────────────────────────────────────────────────────────────┤
-│  filesApi:                                                       │
-│  ├── list(): Promise<File[]>                                     │
-│  ├── get(id): Promise<File>                                      │
-│  ├── create(data): Promise<File>                                 │
-│  ├── update(id, data): Promise<File>                             │
-│  └── delete(id): Promise<void>                                   │
-├─────────────────────────────────────────────────────────────────┤
-│  versionsApi:                                                    │
-│  ├── list(fileId): Promise<FileVersion[]>                        │
-│  ├── create(fileId, data?): Promise<FileVersion>                 │
-│  └── restore(fileId, versionId): Promise<{restored: boolean}>    │
-└─────────────────────────────────────────────────────────────────┘
-```
+Opening/reopening a file establishes a barrier. A snapshot at S and replay through N
+describe a complete prefix; later events are buffered within a bound. A separate HTTP
+fetch and socket snapshot without a common revision can race and replace newer state with
+older bytes.
 
-### Using the API in Components
+A reconnect follows a specific order:
 
-The FileBrowser component demonstrates the pattern:
-- Uses useState for files, loading, error
-- Calls filesApi.list() on mount
-- handleCreate prompts for name, creates file, navigates to editor
-- handleDelete confirms, removes from local state optimistically
-- Grid display with thumbnails and delete buttons
+1. Reauthenticate and create a fresh file/connection generation.
+2. Recover the canonical prefix through replay or a verified snapshot.
+3. Resolve receipts for operations with unknown outcomes.
+4. Retry unresolved IDs with their original payloads, or show explicit rejections.
+5. Resume new edits after the pending overlay has been reconciled.
 
----
+If the client detects a sequence gap, it stops applying later events to canonical state
+and asks for the missing range. Duplicate events are harmless. If the range is too old,
+the server requests a snapshot reset rather than returning an incomplete list that looks
+like a successful catch-up.
 
-## Step 7: CRDT Engine Implementation (5 minutes)
+A snapshot includes schema version and checksum as well as sequence. The worker publishes
+its manifest only after the bytes are durable and verified. Retention cannot remove the
+only log needed after the latest usable snapshot. Retry receipts and deleted-object
+identity may need longer retention than replay data.
 
-### Last-Writer-Wins CRDT Engine
+The pending queue has count, byte, and age limits. A short in-memory queue can survive a
+network gap but not a browser crash. If crash recovery is required, store scoped pending
+intents in IndexedDB with account cleanup and a defined retention policy. That does not
+remove the need for permission checks after reconnect.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CRDTEngine                                │
-├─────────────────────────────────────────────────────────────────┤
-│  applyOperation(canvasData, operation) → CanvasData              │
-│  ├── 'create': Push payload to objects array                     │
-│  ├── 'update': Find by objectId, Object.assign payload           │
-│  ├── 'delete': Filter out objectId from objects                  │
-│  └── 'move': Splice object to new index                          │
-├─────────────────────────────────────────────────────────────────┤
-│  mergeStates(local, remote, operations) → CanvasData             │
-│  └── Sort operations by timestamp, apply sequentially            │
-├─────────────────────────────────────────────────────────────────┤
-│  resolveConflict(localVal, remoteVal, localTs, remoteTs,         │
-│                  localClientId, remoteClientId) → value          │
-│  ├── Higher timestamp wins                                       │
-│  └── Tie-breaker: lexicographically higher clientId wins         │
-└─────────────────────────────────────────────────────────────────┘
-```
+An operation whose content must change after recovery is a new intent. Resolve the old
+unknown outcome first, then create a new ID if the user accepts the revised operation.
+Reusing one ID for changed content undermines the receipt contract.
 
-The engine deep-clones canvas data before mutations to avoid side effects. LWW provides simplicity at the cost of potentially losing concurrent edits when timestamps collide.
+Presence can expire during all of this without affecting the document. Records use
+connection IDs, and a small idle heartbeat refreshes them. Intermediate cursor positions
+are coalesced; durable events have a bounded queue and explicit resync when a slow client
+exceeds it. One slow spectator must not hold a database transaction open for every editor.
 
----
+| Approach | Why it fits | Cost |
+|---|---|---|
+| ✅ Sequenced edits with durable receipts | Explainable online convergence and unknown-outcome recovery | Owner failover and client reconciliation state |
+| ❌ Full reload with no pending journal | Simple reconnect code | Overwrites unsent intent and does not resolve accepted edits |
+| ❌ Full offline CRDT at launch | Supports broader disconnected collaboration | More tree, deletion, undo, and access semantics to define |
 
-## Step 8: Trade-offs and Decisions (2 minutes)
+## 🔧 Deep Dive 3: Undo and versions across client/server boundaries — 7 minutes
 
-### Key Trade-offs
+> “Undo is personal intent; a version restore is a shared document decision. Both
+> still need to enter the same ordered, authorized mutation path.”
 
-| Decision | Trade-off |
-|----------|-----------|
-| Shared types package | Build complexity vs. type safety across stack |
-| Zod validation on both ends | Runtime overhead vs. contract enforcement |
-| WebSocket for all real-time | More complex than polling, but lower latency |
-| LWW CRDT | Simple but can lose concurrent edits |
-| JSONB for canvas data | Flexible but no referential integrity |
+A drag's undo entry records the gesture's initial value, accepted effect, and resulting
+property revision. Many intermediate previews become one user-visible history item. Memory
+then grows with meaningful gestures and their affected fields, rather than full canvas
+copies per pointer event.
 
-### Alternatives Considered
+Suppose Alice moves a rectangle, then Bob changes its fill. Alice's inverse restores the
+position while preserving the fill. If Bob moves it again, the position revision has
+changed and the inverse conflicts. The server must check that condition in the same
+transaction as accepting the inverse, not in an earlier unprotected read.
 
-1. **GraphQL instead of REST + WebSocket**
-   - Single protocol, subscriptions built-in
-   - More complex setup, overkill for this use case
+I would initially choose all-or-nothing undo for one multi-object gesture. If a guarded
+target changed, return the conflicting object IDs and let the user review. Partial undo
+could be added later, but it needs explicit per-target results and a redo entry based on
+what actually succeeded.
 
-2. **tRPC for type sharing**
-   - Automatic type inference
-   - Less flexible for non-TypeScript clients
+This sacrifices the expectation that undo always works as it does in a single-user
+application. The benefit is avoiding a silent overwrite of a colleague's later work. The
+UI should name the affected action and offer a comprehensible recovery, rather than
+display a generic network error.
 
-3. **Yjs/Automerge for CRDT**
-   - More robust conflict resolution
-   - Larger dependency, more complex
+Redo is constructed from the accepted inverse and its new property revisions. It is not
+blindly replaying the original payload. A rejected inverse does not create a successful
+redo entry, and an unknown inverse outcome remains pending until its receipt is resolved.
 
----
+Deletion needs a defined restoration rule. An ordinary stale update to a deleted ID should
+fail, not recreate the object. Undo may explicitly restore copied content under a new
+identity or a carefully specified restore operation, with parent and placement validation.
+The rule must be deterministic for remote clients and replay.
 
-## Closing Summary
+Named versions capture a committed revision. Before requesting one, the client establishes
+a barrier for its pending edits. It either waits for them to resolve or clearly saves an
+identified earlier revision. A server endpoint that merely copies its current row can omit
+changes still visible as local previews.
 
-"I've designed the full-stack architecture for a Figma-like design tool with:
+Version listings return metadata and load full snapshot content on demand. A version's
+identity is immutable even as the live file changes. Current file permission still
+controls access to older versions; an old version URL is not a permanent authorization
+grant.
 
-1. **Shared Types Package** - Zod schemas used for validation on frontend, backend, and WebSocket messages
-2. **WebSocket Handler** - Type-safe message handling with Redis pub/sub for multi-server support
-3. **REST API** - CRUD operations with request/response validation
-4. **Type-Safe API Client** - Frontend client with runtime type checking
-5. **CRDT Engine** - Last-Writer-Wins conflict resolution for concurrent edits
+Restore previews the selected version and the current head, then asks the user to confirm
+that concrete action. The server requires the expected head revision. If intervening edits
+change it, the caller must review the new situation before a destructive whole-file change
+is accepted.
 
-The key insight is using a shared types package with Zod to ensure type safety at runtime across the entire stack, preventing API contract drift. Happy to dive deeper into any integration point."
+The restore commits as a new log event and advances the document generation. If its
+content is stored outside SQL, the verified immutable snapshot reference must already be
+durable before commit. All clients install that event before applying later edits, even if
+downloading the new snapshot takes time.
 
----
+An offline editor returning with the old generation does not automatically replay its
+queue over the restored design. The client preserves the intent for review, resolves any
+old receipts, and asks the user how to proceed. A whole-file restore is one of the
+clearest cases where unrestricted optimistic replay is wrong.
 
-## Future Enhancements
+Client history, selected objects, and asynchronous work are scoped by file and generation.
+After restore, old inverse guards are invalid. After navigation, a late HTTP response,
+worker result, or reconnect callback cannot apply to another file. Resource cleanup and
+document consistency meet at that lifecycle boundary.
 
-1. **tRPC Migration** - Replace REST with tRPC for automatic type inference
-2. **WebSocket Reconnection Queue** - Queue operations during disconnect
-3. **Optimistic UI** - Apply operations locally before server confirmation
-4. **Conflict Visualization** - Show users when their changes conflict
-5. **E2E Type Testing** - Automated tests verifying API contracts
+| Approach | Benefit | What it gives up |
+|---|---|---|
+| ✅ Conditional inverse gestures | Preserve unrelated collaborator work | Some undo requests require review |
+| ✅ Ordered restore with generation change | All clients agree on the new document | Pending old work needs explicit resolution |
+| ❌ Local snapshot history for shared undo | Very easy to prototype | Erases shared changes and does not persist the undo |
+| ❌ Isolated REST snapshot replacement | Simple storage operation | Races live editing and leaves peers on the old scene |
+
+## 🧪 Scaling, failure handling, and validation — 5 minutes
+
+I would scale ordinary load by file ID, keeping one logical owner per file. Gateways scale
+connection count independently from snapshot workers. Hot files get admission limits and
+isolated owner capacity. Cross-page partitioning is a later change because it introduces
+coordination for moves and whole-file restore.
+
+Slow clients have bounded outgoing queues. Replace presence with its newest value, but
+disconnect/resync a durable stream that falls too far behind. A commit does not wait for
+every peer ACK. Broker notifications are backed by durable log tailing or head checks so
+missed notifications cannot leave a client stale indefinitely.
+
+Permissions are checked at join, every mutation, snapshot/history reads, and reconnect.
+Revocation advances the access revision and closes or downgrades existing streams.
+Previously delivered bytes cannot be recalled, but further disclosure and writes are
+blocked at the server, independent of whether the browser hides controls.
+
+| Test | What it proves |
+|---|---|
+| Two users edit independent properties | Both changes survive |
+| Two users edit the same position | A common canonical result after pending work resolves |
+| Kill owner after commit before ACK | Durable receipt prevents duplicate effect |
+| Resume obsolete owner after takeover | Fencing rejects stale writes |
+| Switch file while loading/reconnecting | Generation guards reject old callbacks |
+| Restore while another client is offline | Old intent is reviewed rather than silently replayed |
+| Undo after a conflicting remote movement | Conditional guard preserves the remote change |
+| Drop presence and overload one spectator | Durable editing remains coherent |
+
+Browser checks cover rotated hit tests, pointer cancellation, keyboard access, IME entry,
+resource disposal, and long-session memory. Server checks cover concurrent receipt claims,
+log gaps, corrupt snapshots, stale schema versions, and permission changes during a
+mutation. A file grid smoke test proves none of these invariants.
+
+I would measure local pointer-to-pixel latency, frame preparation, pending age, commit
+latency, peer delivery, replay duration, snapshot age, and per-file queue pressure. Keep
+telemetry free of design text and asset secrets. Use bounded metric labels and sampled
+diagnostics instead of retaining one time series per file forever.
+
+Readiness means the instance can serve its required path. Shutdown stops admitting work,
+drains bounded commits, notifies clients to reconnect, and transfers ownership under
+fencing. Snapshot cleanup respects recovery watermarks. These controls make the commit,
+recovery, and ownership boundaries testable under normal operational failures.
+
+## ⚖️ Trade-offs and close — 2 minutes
+
+| Decision | Chosen approach | Alternative |
+|---|---|---|
+| Interaction | ✅ Local preview plus semantic patches | ❌ Persist every pointer event |
+| Authority | ✅ One fenced committed order per file | ❌ Concurrent whole-scene replacements |
+| Recovery | ✅ Receipts, snapshot, and log replay | ❌ Blind resend after full reload |
+| History | ✅ Conditional undo and ordered restore | ❌ Local full-file rewind |
+
+> “The browser predicts quickly, and the backend gives that prediction a durable
+> outcome. A consistent contract between them makes retries, undo, and restore
+> understandable. I would prove that contract with two clients and failure injection
+> before adding more tools or promising unlimited offline collaboration.”
+
+The local project provides a useful canvas and API skeleton. Its random browser identity,
+racing full-canvas writes, ignored ACKs, local history defects, and missing
+restore/cross-server broadcasts prevent the guarantees described here. The README and
+architecture state those source-backed limits explicitly.

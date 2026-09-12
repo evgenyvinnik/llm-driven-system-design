@@ -1,251 +1,122 @@
-# Gmail (Email Client) - System Architecture
+# Gmail: system architecture
 
 ## System Overview
 
-Gmail is a web-based email client supporting thread-based conversations, per-user state management, full-text search with privacy controls, label-based organization, and draft auto-save with conflict detection. This design explores the unique challenges of email systems: each message has multiple recipients who maintain independent state (read, labels, archive), search must enforce privacy (BCC recipients hidden), and drafts need conflict-safe concurrent editing support.
+This project explores email conversations whose content and mailbox state have different ownership. A message has a specific sender and recipient set; reading, starring, filing, and deleting it belong to each user's mailbox. A thread groups related messages, but membership in one message must not grant access to every message in that thread.
 
-**Learning Goals:**
-- Thread model with independent per-user state
-- Privacy-aware full-text search using Elasticsearch
-- Optimistic locking for draft conflict detection
-- Label system design (system + custom, per-user assignment)
-- Contact frequency tracking for autocomplete
-
----
+The **production proposal** below describes an internal email service at a stated hypothetical scale. The **local implementation** is a React client, one Express API, a polling indexer, PostgreSQL, Valkey, and Elasticsearch. It has real transactions, sessions, draft version checks, and rate limits, together with substantial gaps described in the final Implementation Notes. It does not implement Google Gmail's infrastructure or external email transport. Setup is in [README.md](./README.md).
 
 ## Requirements
 
-### Functional Requirements
+### Production scope
 
-1. **Account Management**: User registration, login, logout with session-based auth
-2. **Email Composition**: Send emails with To, CC, BCC recipients
-3. **Thread Conversations**: Messages grouped into threads with reply chains
-4. **Per-User State**: Each user independently manages read, starred, archived, trashed, spam status
-5. **Label System**: System labels (INBOX, SENT, TRASH, SPAM, STARRED, DRAFTS, ALL_MAIL, IMPORTANT) auto-created; custom labels with colors
-6. **Full-Text Search**: Search email content with advanced operators (from:, to:, has:attachment, date ranges)
-7. **Drafts**: Auto-save drafts with optimistic locking for conflict detection
-8. **Contact Autocomplete**: Suggest contacts based on communication frequency
+Support internal send/reply with To, CC, and BCC; per-user conversation lists and mailbox state; custom labels; conflict-safe drafts; contact completion; and privacy-filtered full-text search. A new recipient sees only messages addressed to them, plus any content explicitly included in a new message. BCC envelope identities are visible to the sender and relevant recipient, never other recipients.
 
-### Non-Functional Requirements (Production Scale)
+Exclude SMTP/IMAP/POP3 interoperability, mailing-list expansion, attachments, scheduling, and spam classification from the first design. Keep explicit Spam and Trash folders. Distinguish accepting a send from completing delivery to every mailbox. Acknowledging a send must not imply that every downstream search projection is ready.
 
-| Requirement | Target |
-|-------------|--------|
-| Availability | 99.99% uptime |
-| Latency | p99 < 200ms for inbox load, p99 < 500ms for search |
-| Throughput | 100K emails/second globally |
-| Storage | Petabytes of email data, indefinite retention |
-| Consistency | Strong for send/receive, eventual for search index |
-| Privacy | Users can only search/view emails they are participants in |
+| Requirement | Proposed target or invariant |
+|-------------|------------------------------|
+| Availability | 99.99% for accepted sends and mailbox reads; search may degrade separately |
+| Latency | API p99 below 200 ms for a bounded inbox page; below 500 ms for bounded search |
+| Send correctness | One accepted message per sender/operation key and identical request content within the retention window |
+| Delivery | Durable retries and unique recipient delivery records; expose delayed or failed delivery |
+| Draft safety | Conditional revisions; preserve the losing editor's local text on conflict |
+| Privacy | Check message entitlement before returning content, summaries, search snippets, or attachments if later added |
+| Freshness | Read-your-writes for the acting mailbox; target search indexing within 10 seconds under normal load |
+| Limits | Bounded body bytes, recipient count, page size, search work, and draft retention |
 
----
+These are design targets, not measurements. Privacy and durable acceptance remain requirements during dependency failures; degraded search must identify itself rather than returning a false claim of no matching mail.
 
 ## Capacity Estimation
 
-### Production Scale
+Assume 10 million daily active users, 20 sends per user per day, three recipients per send, 100 mailbox-page reads per user per day, five searches per user per day, and 10 KB average text bodies. These inputs are hypothetical, not published Gmail statistics.
 
-| Metric | Value |
-|--------|-------|
-| Monthly Active Users | 1.8 billion |
-| Emails sent/received per day | 300 billion |
-| Average email size | 75 KB (text) + 500 KB (attachments) |
-| Search queries per day | 10 billion |
-| Storage growth per day | ~22 PB |
+| Workload | Daily estimate | Average rate | Tenfold peak assumption |
+|----------|----------------|--------------|--------------------------|
+| Accepted messages | 200 million | About 2,315/s | About 23,150/s |
+| Recipient deliveries | 600 million | About 6,945/s | About 69,450/s |
+| Mailbox page reads | 1 billion | About 11,575/s | About 115,750/s |
+| Searches | 50 million | About 580/s | About 5,800/s |
+
+Text alone adds about 2 TB/day before replication, metadata, indexes, and backups. Sender plus recipient projections create roughly 800 million mailbox-message records/day. Actual recipient distributions and body sizes matter more than a single average; cap fan-out and isolate abusive senders. Retention is a product requirement to price explicitly, not an assumption of unlimited free storage.
 
 ### Local Development Scale
 
-| Metric | Value |
-|--------|-------|
-| Users | 3-10 |
-| Emails | Hundreds |
-| Threads | Dozens |
-| Single PostgreSQL instance | Handles all data |
-
----
+The supplied fixture contains three users, five threads, nine messages, and one draft. One API and one indexer are enough for exploration. Compose allocates a 256 MB Elasticsearch heap. No throughput or memory benchmark establishes production capacity from this setup.
 
 ## High-Level Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                            CDN / Edge Network                                │
-│                    (Static assets, TLS termination)                           │
-└───────────────────────────────────┬──────────────────────────────────────────┘
-                                    │ HTTPS
-                                    ▼
-                          ┌─────────────────────┐
-                          │    API Gateway       │
-                          │  (Rate limit, auth)  │
-                          └──────────┬──────────┘
-                                     │
-                   ┌─────────────────┼─────────────────┐
-                   ▼                 ▼                 ▼
-           ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-           │  API Server  │  │  API Server  │  │  API Server  │
-           │  (Node.js)   │  │  (Node.js)   │  │  (Node.js)   │
-           └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-                  │                 │                 │
-                  └─────────────────┼─────────────────┘
-                                    │
-          ┌──────────┬──────────────┼──────────────┬───────────┐
-          ▼          ▼              ▼              ▼           ▼
-   ┌───────────┐ ┌────────┐ ┌───────────┐ ┌────────────┐ ┌─────────┐
-   │PostgreSQL │ │ Redis/ │ │Elastic-   │ │  Search    │ │  Blob   │
-   │ (Primary  │ │ Valkey │ │search     │ │  Indexer   │ │ Storage │
-   │ + Replicas│ │(Cache +│ │ Cluster   │ │  Worker    │ │  (S3)   │
-   │  + Shards)│ │Session)│ │           │ │            │ │         │
-   └───────────┘ └────────┘ └───────────┘ └────────────┘ └─────────┘
-```
-
----
-
-## Core Components
-
-### 1. API Server (Express + Node.js)
-
-Handles all client requests through RESTful endpoints:
-
-- **Auth Routes** (`/api/v1/auth/*`): Register, login, logout, session management
-- **Thread Routes** (`/api/v1/threads/*`): List by label, get thread detail, update state
-- **Message Routes** (`/api/v1/messages/*`): Send new email, reply to thread
-- **Label Routes** (`/api/v1/labels/*`): CRUD labels, assign/remove from threads
-- **Draft Routes** (`/api/v1/drafts/*`): CRUD drafts with version-based conflict detection
-- **Search Routes** (`/api/v1/search`): Full-text search with advanced operators
-- **Contact Routes** (`/api/v1/contacts`): Autocomplete by communication frequency
-
-### 2. Thread Service
-
-Manages thread listing, detail retrieval, and per-user state:
+Production proposal; the durable event path is an extension to the local code:
 
 ```
-listThreads(userId, labelName, page)
-├── Query threads by label join (thread_labels + labels)
-├── Filter by thread_user_state (not trashed, not spam)
-├── Join participants (senders + recipients)
-├── Join labels for each thread
-└── Return with pagination
-
-getThread(userId, threadId)
-├── Get thread with user state
-├── Get all messages ordered by created_at
-├── Get recipients for each message
-├── Get labels for this user
-└── Auto-mark as read
+┌─────────────────────────┐       ┌──────────────────────────────┐
+│ Browser + static CDN    │──────▶│ Authenticated mail API       │
+└─────────────────────────┘       │ Mailbox / draft / search     │
+                                  └──────────────┬───────────────┘
+                                                 │
+                                  ┌──────────────▼───────────────┐
+                                  │ Message and mailbox stores   │
+                                  │ Receipts + durable outbox    │
+                                  └──────────────┬───────────────┘
+                                                 │
+                                  ┌──────────────▼───────────────┐
+                                  │ Delivery + indexing workers  │
+                                  │ Retry, deduplicate, repair   │
+                                  └──────────────┬───────────────┘
+                                                 │
+                                  ┌──────────────▼───────────────┐
+                                  │ Mailbox search projections   │
+                                  └──────────────────────────────┘
 ```
 
-### 3. Message Service
+Redis holds revocable sessions, shared request limits, and bounded per-mailbox caches. Database ownership and an authenticated user context govern every API operation. The search API retrieves candidate IDs from its projection and verifies current entitlement before producing a response. Static CDN caching does not make private messages public.
 
-Handles email send flow within a database transaction:
+## Core Components / Request Flows
 
-```
-sendMessage(senderId, {to, cc, bcc, subject, bodyText, threadId})
-├── BEGIN TRANSACTION
-├── Check idempotency key (return existing if duplicate)
-├── Look up recipient user IDs by email
-├── Create or update thread
-│   ├── New thread: INSERT with subject and snippet
-│   └── Existing: UPDATE snippet, message_count, last_message_at
-├── INSERT message
-├── INSERT message_recipients (to, cc, bcc)
-├── Add SENT label for sender
-├── Add INBOX label + unread state for each recipient
-├── Update contacts (frequency, last_contacted_at)
-├── COMMIT
-└── Invalidate caches
-```
+### Accept and deliver a message
 
-### 4. Search Service
+The proposed acceptance transaction runs at a message authority associated with the sender. It validates all recipient addresses, checks reply access and parent context, stores immutable content and audience, claims a sender-scoped operation key with a request digest, and records durable delivery work. Unknown internal recipients reject the request before acceptance. A duplicate key with different recipients or text is a conflict, not a replay.
 
-Parses Gmail-style search operators and queries Elasticsearch:
+After commit, return the accepted message ID and delivery status. Workers create recipient mailbox entries with a uniqueness key of message ID and recipient ID; repeated work does not generate another unread increment. Contact updates and search indexing follow durable events. Sender and recipient mailbox shards need not participate in one cross-region transaction. A committed acceptance is preserved through a queue outage because its outbox remains in the database.
 
-```
-search("from:alice has:attachment project")
-├── Parse operators:
-│   ├── from: "alice" → filter by sender_name or sender_email
-│   ├── has:attachment → filter has_attachments: true
-│   └── remaining text: "project" → multi_match on subject + body
-├── Always filter: visible_to contains userId
-├── Sort by relevance score, then recency
-└── Return with highlights
-```
+A crash after delivery but before acknowledgment leads to replay, so the mailbox write and its processed-event receipt commit together. Lease expiry allows another worker to recover abandoned work. Per-message delivery status reports outstanding recipients. Retry budgets distinguish transient infrastructure failures from permanently invalid or disabled recipients; accepted internal addresses have already been resolved to stable account IDs.
 
-### 5. Search Indexer Worker
+**Local:** [messageService.ts](./backend/src/services/messageService.ts) performs message, state, label, and contact SQL in a single database transaction. Recipient cache calls occur inside it, and sender cache calls follow commit. There is no send receipt, outbox, delivery worker, or recipient validation against the complete requested set.
 
-Background process that polls for new messages and indexes them:
+### Read a mailbox and conversation
 
-```
-Poll Loop (every 5 seconds):
-├── Read last_indexed timestamp from Redis
-├── Query messages with created_at > last_indexed (LIMIT 100)
-├── For each message:
-│   ├── Get recipients
-│   ├── Build visible_to = [sender_id, ...recipient_ids]
-│   └── Index in Elasticsearch
-├── Update last_indexed timestamp
-└── Sleep 5 seconds
-```
+The proposal stores a per-user conversation summary derived only from that user's visible messages: latest visible snippet/date, visible message count, and visible participants. Listing is ordered by mailbox activity plus a unique tie-breaker. Keyset pagination bounds deep reads but a live conversation can move across the cursor as replies arrive; deduplicate by thread ID and offer a refresh for newly arrived mail. A fixed search snapshot is a separate contract, not a property of any cursor.
 
-### 6. Draft Service
+Fetch message pages using the user's entitlement records, not a global thread lookup alone. Represent read state by the highest visible mailbox sequence actually presented. A later delivery has a higher sequence and remains unread when an older read request arrives late. Archive removes Inbox membership; Spam/Trash follow one canonical location policy. User actions and counts are committed together or associated with a mailbox revision for reconciliation.
 
-CRUD operations with optimistic locking:
+**Local:** thread-state membership guards the initial detail query, then all thread messages are returned. Thread snippets, counts, and participants are global. An initial BCC-only recipient can consequently see later replies that exclude them. The list omits BCC recipient identities but includes all senders; a BCC recipient who explicitly replies is now a sender, which is a different visibility event.
 
-```
-updateDraft(userId, draftId, data, expectedVersion)
-├── UPDATE drafts SET ... WHERE id = $1 AND version = $expected
-├── If 0 rows affected:
-│   ├── Check if draft exists
-│   ├── If exists: return 409 Conflict with current version
-│   └── If not: return 404
-└── If updated: return new draft with version + 1
-```
+### Save drafts and send a frozen revision
 
----
+A proposed editor separates the current local revision from the acknowledged server revision. Only one save is in flight per draft; newer typing stays dirty after an older save completes. The server conditionally replaces the expected version, with a durable save receipt so a lost successful response can be resolved. A conflict returns current server content while the browser retains its local copy for comparison or saving separately.
+
+Sending freezes recipients and body at a chosen revision. A transaction at the draft/message authority checks that revision, records acceptance and the send receipt, and marks the draft sent. Late saves cannot resurrect a sent draft. The user can resolve an uncertain send through its operation key instead of generating another message. This proposal requires additional schema/state; the local draft table has only a version column and is disconnected from compose and send.
+
+### Search without disclosing hidden recipients
+
+Start with per-mailbox search documents keyed by user ID and message ID. Their contents include only fields visible to that user. Public To/CC fields can be shared; BCC fields require audience-specific projection. A single message document with all recipients in searchable name/address fields would reveal BCC participation through `to:hidden-address` matches even if those fields were omitted from the response.
+
+The search service validates operators, bounds query cost, and returns message hits grouped deliberately in the UI. Current entitlement is checked before snippets or counts are disclosed. If using a point-in-time index view, it stabilizes search ordering, not authorization; revoked/deleted entries must still be removed during hydration. Bound candidate overfetch, report partial pages honestly, and avoid totals that count unauthorized results.
+
+An outbox consumer publishes versioned upserts and tombstones. Old retries cannot restore deleted mail. A rebuild uses a new index generation, a consistent snapshot plus subsequent changes, verification, and an atomic read-alias switch. Retain enough change history to catch up; do not reset a global time checkpoint and assume completeness.
+
+**Local:** each message is indexed once with a `visible_to` array of sender and all recipients. Searchable recipient fields exclude BCC for everyone, including the sender. Results omit that array and recipient fields. This is a useful partial protection, but there is no authoritative SQL hydration, per-user deletion projection, rebuild protocol, or sanitized snippet contract.
 
 ## Database Schema
 
-### Entity Relationship
+### Actual local SQL
 
-```
-┌──────────┐     ┌──────────┐     ┌──────────────────┐
-│  users   │────▶│ messages │────▶│message_recipients│
-│          │     │          │     │                  │
-│ id       │     │ id       │     │ message_id       │
-│ username │     │ thread_id│     │ user_id          │
-│ email    │     │ sender_id│     │ recipient_type   │
-│ password │     │ body_text│     │ (to/cc/bcc)      │
-└──────────┘     └──────────┘     └──────────────────┘
-     │                │
-     │           ┌────┴────┐
-     │           │ threads │
-     │           │         │
-     │           │ id      │
-     │           │ subject │
-     │           │ snippet │
-     │           └─────────┘
-     │                │
-     ▼                ▼
-┌──────────┐   ┌──────────────────┐
-│  labels  │   │thread_user_state │
-│          │   │                  │
-│ id       │   │ thread_id        │
-│ user_id  │   │ user_id          │
-│ name     │   │ is_read          │
-│ color    │   │ is_starred       │
-│ is_system│   │ is_archived      │
-└──────────┘   │ is_trashed       │
-     │         └──────────────────┘
-     ▼
-┌──────────────┐
-│thread_labels │
-│              │
-│ thread_id    │
-│ label_id     │
-│ user_id      │
-└──────────────┘
-```
-
-### Full SQL Schema
+This is the exact [backend/src/db/init.sql](./backend/src/db/init.sql): ten tables and seven explicit secondary indexes, in addition to indexes backing primary/unique constraints. It has no idempotency/outbox table, processed-event receipts, mailbox sequence, or sent-draft state. The attachments table models metadata only. Foreign keys do not ensure that a reply parent belongs to its thread or that a label belongs to `thread_labels.user_id`.
 
 ```sql
-CREATE TABLE users (
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(30) UNIQUE NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
@@ -256,7 +127,7 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE threads (
+CREATE TABLE IF NOT EXISTS threads (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   subject VARCHAR(500) NOT NULL,
   snippet TEXT,
@@ -265,7 +136,7 @@ CREATE TABLE threads (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   thread_id UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   sender_id UUID NOT NULL REFERENCES users(id),
@@ -276,7 +147,7 @@ CREATE TABLE messages (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE message_recipients (
+CREATE TABLE IF NOT EXISTS message_recipients (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id),
@@ -284,7 +155,7 @@ CREATE TABLE message_recipients (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE labels (
+CREATE TABLE IF NOT EXISTS labels (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name VARCHAR(100) NOT NULL,
@@ -294,7 +165,7 @@ CREATE TABLE labels (
   UNIQUE(user_id, name)
 );
 
-CREATE TABLE thread_labels (
+CREATE TABLE IF NOT EXISTS thread_labels (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   thread_id UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   label_id UUID NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
@@ -303,7 +174,7 @@ CREATE TABLE thread_labels (
   UNIQUE(thread_id, label_id, user_id)
 );
 
-CREATE TABLE thread_user_state (
+CREATE TABLE IF NOT EXISTS thread_user_state (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   thread_id UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -316,7 +187,7 @@ CREATE TABLE thread_user_state (
   UNIQUE(thread_id, user_id)
 );
 
-CREATE TABLE drafts (
+CREATE TABLE IF NOT EXISTS drafts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   thread_id UUID REFERENCES threads(id),
@@ -332,7 +203,7 @@ CREATE TABLE drafts (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE contacts (
+CREATE TABLE IF NOT EXISTS contacts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   contact_email VARCHAR(255) NOT NULL,
@@ -343,7 +214,7 @@ CREATE TABLE contacts (
   UNIQUE(user_id, contact_email)
 );
 
-CREATE TABLE attachments (
+CREATE TABLE IF NOT EXISTS attachments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   filename VARCHAR(255) NOT NULL,
@@ -352,421 +223,186 @@ CREATE TABLE attachments (
   storage_key TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_recipients_user ON message_recipients(user_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_thread_labels_user ON thread_labels(user_id, thread_id);
+CREATE INDEX IF NOT EXISTS idx_thread_user_state_user ON thread_user_state(user_id, is_trashed, is_archived);
+CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id, frequency DESC);
+CREATE INDEX IF NOT EXISTS idx_threads_last_message ON threads(last_message_at DESC);
 ```
 
-### Key Indexes
+### Proposed production extensions
 
-```sql
-CREATE INDEX idx_messages_thread ON messages(thread_id, created_at);
-CREATE INDEX idx_message_recipients_user ON message_recipients(user_id, message_id);
-CREATE INDEX idx_thread_labels_user ON thread_labels(user_id, thread_id);
-CREATE INDEX idx_thread_user_state_user ON thread_user_state(user_id, is_trashed, is_archived);
-CREATE INDEX idx_drafts_user ON drafts(user_id, updated_at DESC);
-CREATE INDEX idx_contacts_user ON contacts(user_id, frequency DESC);
-CREATE INDEX idx_threads_last_message ON threads(last_message_at DESC);
-```
+| Record | Key and invariant | Purpose |
+|--------|-------------------|---------|
+| Send receipt | Unique sender ID + operation key; request digest and accepted message ID | Resolve duplicate and uncertain sends |
+| Message audience | Unique message ID + recipient ID; envelope role and entitlement state | Separate content access from thread membership |
+| Mailbox message | Unique user ID + message ID; mailbox sequence and delivery receipt | Replay-safe delivery and per-user visibility |
+| Mailbox conversation | User ID + thread ID; visible summary, state version, read-through sequence | Efficient inbox reads and safe read marking |
+| Outbox / processed event | Durable event ID, entity version, retry/lease state | Recovery across independent stores |
+| Draft lifecycle | Owner, content version, active/sent/deleted state, send ID | Serialize final acceptance with editing |
 
----
+These are proposed records, not tables created by the setup script. A small single-database version can transact across them before partitioning; after partitioning, acceptance and recipient delivery are explicitly separate commits.
 
 ## API Design
 
-### Authentication
+### Implemented API
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | /api/v1/auth/register | Register new user |
-| POST | /api/v1/auth/login | Login |
-| POST | /api/v1/auth/logout | Logout |
-| GET | /api/v1/auth/me | Get current user |
+All paths below have `/api/v1` as their prefix. Except register/login/logout, handlers require a session user ID. Generic pagination uses a parsed page number with no positive-range validation; list and search sizes are fixed by their routes.
 
-### Threads
+| Method | Path | Actual behavior |
+|--------|------|-----------------|
+| POST | `/auth/register`, `/auth/login` | Register with eight labels; login by username |
+| POST / GET | `/auth/logout` / `/auth/me` | Destroy session / load current user from SQL |
+| GET | `/threads?label=INBOX&page=1` | 25 conversations; global summary plus per-user flags/labels |
+| GET | `/threads/unread-counts` | Label-assignment counts plus a separate Starred count |
+| GET | `/threads/:threadId` | All messages after thread-state check; marks thread read |
+| PATCH | `/threads/:threadId/state` | Update supplied flags; success even when no row matches |
+| POST | `/messages/send`, `/messages/reply` | Internal SQL send; 201 returns threadId and messageId |
+| GET / POST | `/labels` | List labels / create custom label |
+| PUT / DELETE | `/labels/:labelId` | Owner-scoped custom-label mutation; system labels protected |
+| POST | `/labels/:labelId/assign`, `/labels/:labelId/remove` | Assign/remove caller's thread-label relation |
+| GET / POST | `/drafts` | Unpaged draft list / create another version-1 draft |
+| GET / PUT / DELETE | `/drafts/:draftId` | Owner-scoped read/update/delete; PUT requires version |
+| GET | `/search?q=...&page=1` | 20 message hits; search failures usually return 200 with an empty result |
+| GET | `/contacts?q=...` | Up to ten matching contacts, ordered by frequency |
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /api/v1/threads?label=INBOX&page=1 | List threads by label |
-| GET | /api/v1/threads/unread-counts | Get unread counts per label |
-| GET | /api/v1/threads/:threadId | Get thread with messages |
-| PATCH | /api/v1/threads/:threadId/state | Update read/starred/archive/trash |
-
-### Messages
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | /api/v1/messages/send | Send new email |
-| POST | /api/v1/messages/reply | Reply to thread |
-
-### Labels
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /api/v1/labels | List user labels |
-| POST | /api/v1/labels | Create custom label |
-| PUT | /api/v1/labels/:labelId | Update custom label |
-| DELETE | /api/v1/labels/:labelId | Delete custom label |
-| POST | /api/v1/labels/:labelId/assign | Assign label to thread |
-| POST | /api/v1/labels/:labelId/remove | Remove label from thread |
-
-### Drafts
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /api/v1/drafts | List drafts |
-| GET | /api/v1/drafts/:draftId | Get draft |
-| POST | /api/v1/drafts | Create draft |
-| PUT | /api/v1/drafts/:draftId | Update draft (with version) |
-| DELETE | /api/v1/drafts/:draftId | Delete draft |
-
-### Search
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /api/v1/search?q=query | Search emails |
-
-### Contacts
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /api/v1/contacts?q=term | Autocomplete contacts |
-
----
+Draft conflicts return 409 with `error` and current `draft`; missing drafts return 404. The browser's shared fetch helper converts failures to a plain Error and drops status/current-draft data. New production contracts would add operation receipts, expected versions, cursor/sequence metadata, and explicit degraded search status. They are not accepted by the current endpoints merely because they appear in this design.
 
 ## Key Design Decisions
 
-### 1. Per-User Thread State Table
+### Per-user projections instead of one mutable global mailbox
 
-**Decision**: Separate `thread_user_state` table rather than embedding state in the thread or message table.
+A shared body avoids copying large content, but a shared read bit cannot represent Alice reading while Bob remains unread. Mailbox rows also supply a natural user partition and query index. The cost is delivery fan-out, projection repair, and extra records. For a bounded small installation, normalized joins can be sufficient; at scale, denormalize the visible summary beside mailbox state rather than joining unrelated shards for every inbox page.
 
-**Why it works**: A single email thread can have 5 participants. Alice reads it, Bob has not. Charlie archived it. Each user needs independent flags. A separate table with a UNIQUE(thread_id, user_id) constraint makes this natural -- each row is one user's view of one thread.
+JSONB is a valid alternative for bounded aggregate data and supports indexes. The reason to avoid an ever-growing user-state object on one thread is its shared update hotspot and poor fit for user-oriented sorting and partitioning, not an inability to index JSONB. PostgreSQL documents both [JSONB indexes and whole-row update locking](https://www.postgresql.org/docs/16/datatype-json.html).
 
-**Why the alternative fails**: Embedding read/starred flags in the thread table would force a single state for all users. Using a JSONB column like `user_states: {alice: {read: true}}` would make queries painfully slow at scale -- you cannot efficiently index inside JSONB for "find all unread threads for user X". At 1.8 billion users, scanning JSONB per-row to filter unread threads for a single user would produce full table scans every time the inbox loads.
+### Dedicated search after measuring database search
 
-**Trade-off**: More JOINs on every thread list query (thread + thread_user_state + thread_labels + labels). We accept this because the JOIN is on indexed columns and the query pattern is predictable. The composite index on `(user_id, is_trashed, is_archived)` ensures the filter is fast.
+PostgreSQL full-text search can be combined with permission predicates and indexes. It does not inherently fail BCC privacy. Elasticsearch becomes attractive when relevance tuning, independently scaled indexing, and a large historical corpus justify a second system. That choice introduces lag, replay, privacy-projection maintenance, and backup/rebuild work. Neither engine supplies authorization automatically.
 
-### 2. Elasticsearch with visible_to for Search Privacy
+The local searchable recipient fields exclude BCC, while the proposed per-mailbox projection supports sender-specific envelope search. Replication costs more index space but keeps query routing aligned with mailbox ownership. A shared document cannot be routed once by each of several independent user IDs without either duplication or broader searches.
 
-**Decision**: Index each message in Elasticsearch with a `visible_to` keyword array containing all participant user IDs. Every search query includes a `term` filter on `visible_to`.
+### Conditional saves with explicit recovery
 
-**Why it works**: BCC recipients see the message in their search results because their user ID is in `visible_to`. But other recipients do not see the BCC recipient because `visible_to` is per-document, not per-query. The indexer includes `[sender, to_recipients, cc_recipients, bcc_recipients]` in `visible_to`, so each participant can find the message.
-
-**Why PostgreSQL full-text search fails**: PostgreSQL `tsvector` search does not natively support "only return results where this user is a participant." You would need to JOIN with message_recipients on every search, which destroys performance at scale. With 300 billion emails per day, a JOIN-based search across a normalized schema would require cross-shard queries that cannot meet the 500ms p99 latency target. Elasticsearch's inverted index with term filtering handles this efficiently because `visible_to` is pre-computed at index time.
-
-**Trade-off**: Requires maintaining a separate search index via a background worker. Search results may lag 5-10 seconds behind newly sent messages. For email, this latency is acceptable -- users do not search for messages they sent seconds ago.
-
-### 3. Optimistic Locking for Drafts
-
-**Decision**: Version column on drafts with conditional UPDATE.
-
-**Why it works**: When Tab A loads draft version 3 and Tab B loads draft version 3, both see the same content. Tab A saves first, incrementing to version 4. Tab B tries to save with `WHERE version = 3`, which matches 0 rows. The API returns 409 Conflict with the current draft state, and the client can show "This draft was modified in another window."
-
-**Why pessimistic locking (SELECT FOR UPDATE) fails**: Drafts auto-save every few seconds. Holding a row lock for the duration of editing would block other tabs indefinitely. With hundreds of millions of users, lock contention on the drafts table would be catastrophic. The database connection pool would exhaust as connections wait on locked rows, eventually cascading into API server unresponsiveness.
-
-**Trade-off**: The client must handle 409 responses gracefully. We implement a simple "last write wins" with user notification rather than complex merge logic. This is acceptable because draft editing is typically a single-user activity -- multi-tab conflicts are the exception, not the rule.
-
----
+A draft version check prevents an older editor from overwriting a newer saved revision. It does not merge text or preserve the losing browser's unsaved work by itself. Prefer conflict-aware saves over unconditional last-write-wins for valuable authored content. Short database locks during the update are normal; pessimistic locking does not inherently mean holding a connection for hours. An editing lease is another option, but must handle abandoned tabs and fencing. Optimistic saves accept occasional conflicts and require a clear recovery UI.
 
 ## Consistency and Idempotency
 
-Email systems face several consistency challenges because a single send operation touches multiple tables, multiple users' states, and an external search index. Without careful design, failures at any point in this pipeline can result in duplicate emails, missing inbox entries, or orphaned search results.
+Production acceptance commits content, audience, request receipt, and outbox together. Duplicate requests serialize on the unique receipt key; insert-or-ignore after repeating the operation is insufficient. A request digest covers recipient roles, text, reply context, and the frozen draft revision. Retain receipts for a declared retry window and keep accepted message IDs queryable; an expired key cannot promise unlimited deduplication.
 
-### Idempotency Keys for Email Sending
+Recipient delivery is at least once in transport with one committed mailbox effect per unique delivery ID. Search is eventually consistent and independently repairable. UI read-your-writes uses a mailbox revision or primary read until replicas catch up. Cache invalidation follows commit; generation checks prevent an older in-flight read from repopulating a newer cache generation.
 
-Every email send request includes a client-generated idempotency key (a UUID generated when the compose modal opens). The server stores this key in a dedicated idempotency table alongside the resulting message ID. Before processing a send request, the server checks whether the idempotency key already exists. If it does, the server returns the previously created message without re-executing the send flow. This prevents the most damaging user-facing bug in an email system: duplicate sends caused by network retries, double-clicks, or browser refresh during submission.
+**Local deviations:** no send or draft-create receipt exists. Recipient SQL and contacts are transactional, but Redis calls inside the transaction can fail it. Sender invalidation can fail after COMMIT; the catch then attempts ROLLBACK and reports an error despite persisted mail. Retrying that request can send again. A client-disabled button does not resolve this outcome. Existing senders' read flags are not set true on conflict, and new deliveries do not clear recipient archive/trash/spam flags.
 
-The idempotency key has a TTL of 24 hours. After that window, the key is purged. This is sufficient because email composition is ephemeral -- users do not retry sends days later. The key is scoped to the sending user, so two different users composing simultaneously never collide.
+## Security / Auth
 
-### Retry Semantics for Failed Deliveries
+Production checks message entitlement, draft ownership, label ownership, recipient limits, and reply-parent context on every route. Reject unauthorized thread IDs before any mutation. Do not log message bodies, BCC lists, or raw search queries. HTML email requires a defined sanitization policy, isolated rendering, safe links, and controlled remote images; plain text is a simpler initial contract.
 
-When the send transaction commits successfully in PostgreSQL, the email is considered delivered within the system. However, several downstream operations can fail independently: cache invalidation for recipients, search index updates, and contact frequency tracking.
+Local sessions use `connect.sid`, Redis prefix `sess:`, HTTP-only/SameSite=Lax cookies, and a seven-day cookie maxAge. Secure cookies require production HTTPS. Login/register assign the existing session without explicit ID regeneration. `requireAuth` checks only the session's userId; `/me` separately loads SQL. Account creation and its eight label inserts are not one transaction. Input checks cover some required fields, username length 3–30, and password length at least six, with bcrypt cost 12; they do not constitute comprehensive validation or email normalization.
 
-For cache invalidation, we use a fire-and-forget pattern. If Redis is temporarily unavailable, the recipient's cached thread list simply expires naturally after its 30-second TTL. No retry is necessary because stale cache entries are self-correcting.
-
-For search indexing, the background indexer worker handles retries implicitly. It polls for messages newer than its last-indexed timestamp. If the indexer crashes or Elasticsearch is temporarily down, the next poll cycle picks up all missed messages. No message is ever skipped because the indexer advances its checkpoint only after successful indexing. If a message fails to index, the checkpoint does not advance and the message is retried on the next cycle.
-
-For contact frequency updates, these are best-effort. A missed frequency increment does not affect correctness -- it only slightly degrades autocomplete ranking. We accept this trade-off rather than adding retry complexity.
-
-### Exactly-Once Processing for Inbox Updates
-
-The send transaction uses a database transaction to ensure that either all recipients receive the message in their inbox or none do. The critical invariant is: if a message row exists, every intended recipient has a corresponding thread_user_state row and INBOX label assignment. Partial failures (message created but some recipients missing) are prevented by the transaction boundary.
-
-For the search indexer, exactly-once semantics are approximated through idempotent upserts. The indexer uses the message ID as the Elasticsearch document ID. If the same message is indexed twice (due to a checkpoint replay after a crash), the second index operation simply overwrites the identical document. This makes the indexer safe to restart at any time without producing duplicate search results.
-
-Draft auto-save achieves consistency through the optimistic locking mechanism described in the Key Design Decisions section. The version column ensures that concurrent saves from multiple tabs never silently overwrite each other. Combined with the idempotency key on draft creation, we prevent duplicate drafts from being created by rapid auto-save retries.
-
----
-
-## Security and Auth
-
-- **Session-based authentication** with Redis-backed store (express-session + connect-redis)
-- **bcrypt password hashing** with salt rounds = 12
-- **Rate limiting** on login (5/min), send (50/hr), search (60/min), general (1000/min)
-- **CORS** restricted to frontend origin
-- **HTTP-only cookies** with SameSite=lax
-- **Input validation** on all endpoints (username length, password strength, required fields)
-- **SQL injection prevention** via parameterized queries
-
----
+CORS allows the two localhost frontend origins. It is not an authorization layer or a complete CSRF defense; URL-encoded bodies are also accepted. `trust proxy=1` assumes a trusted single proxy hop. The current API permits sending into a known unrelated thread and thereby adds the sender's thread-state row, which can expose that thread's history. Label assignment does not validate label ownership or thread membership. Raw `bodyHtml` and search snippets reach `dangerouslySetInnerHTML` without sanitization. These gaps require correction before using private data.
 
 ## Observability
 
-### Prometheus Metrics
+The production dashboard should distinguish accepted sends, recipient delivery latency/backlog, duplicate replays, draft conflicts, search lag, projection repairs, and permission failures. Measure p99 by operation with bounded labels. A healthy process does not prove that a newly accepted message is searchable or delivered.
 
-- `gmail_http_request_duration_seconds` - Request latency histogram
-- `gmail_emails_sent_total` - Counter of sent emails
-- `gmail_search_queries_total` - Counter of search queries
-- `gmail_search_duration_seconds` - Search latency histogram
-- `gmail_draft_conflicts_total` - Counter of draft version conflicts
-- `gmail_indexed_messages_total` - Counter of messages indexed in ES
-- `gmail_circuit_breaker_state` - Circuit breaker state gauge
-- `gmail_rate_limit_hits_total` - Rate limit violations
+Local [metrics.ts](./backend/src/services/metrics.ts) registers HTTP duration/count, send count, search count/duration, draft conflicts, authentication outcomes, and rate-limit hits. HTTP route labels use router-local paths or raw unmatched paths, which can merge unrelated endpoints or create unbounded cardinality. The indexer increments its own process-local indexed-message counter, but exposes no scrape server. The API's separate registry cannot show that worker count. Received-mail, DB duration/pool, and breaker metrics are declared without active producers.
 
-### Structured Logging
-
-Pino JSON logger with request tracing:
-- Request ID propagation via `x-trace-id` header
-- User context (userId, username) in log entries
-- Query timing for slow query detection (>1s triggers warning)
-- Cache hit/miss tracking
-
-### Health Checks
-
-- `/api/health` - Simple liveness
-- `/api/health/detailed` - PostgreSQL + Redis connectivity with latency
-- `/api/health/live` - Process alive check
-
----
+[Pino logging](./backend/src/services/logger.ts) records request completion and `x-trace-id` propagation. Service logs use the global logger, so trace context is not consistently attached. `logQuery`, `logCache`, and the request-child helper are unused; database/Redis errors also use console output. Requests log `originalUrl`, and search debug logs include query text. There is no configured redaction, distributed tracing collector, Prometheus server, or Grafana deployment.
 
 ## Failure Handling
 
-### Circuit Breakers (Opossum)
+| Failure | Proposed response | Actual local behavior |
+|---------|-------------------|-----------------------|
+| Redis unavailable | Fail closed for authentication; isolate optional caches | Sessions/limits depend on Redis; cache helpers throw rather than falling through |
+| SQL unavailable | Reject new work; retain client drafts and uncertain-operation IDs | Pool errors reach routes; an idle-client error exits the process |
+| Search unavailable | Explicit degraded response, bounded deadline, durable indexing backlog | Search catches errors as ordinary empty results; breaker helper is never imported into this flow |
+| Worker stops | Resume leased outbox records with deduplication | Poll loop retries after errors; timestamp-only cursor has skip/replay/stall cases |
+| Response lost after send | Resolve receipt using the same operation key | No receipt; retry can duplicate an already committed send |
 
-Applied to external service calls (Elasticsearch):
-- **Threshold**: 50% failure rate triggers open
-- **Reset**: 30-second timeout before half-open test
-- **Fallback**: Return empty results for search when ES is down
+[rateLimiter.ts](./backend/src/services/rateLimiter.ts) applies Redis counters to general `/api/` traffic (1,000/minute), login failures (five/minute, successful requests decremented), sends/replies (50/hour), and search (60/minute). Keys use session user ID or the library's IP/subnet helper. This is a counter with expiration, not a sliding-window log. It limits requests, not recipients or bytes; general limits include health endpoints.
 
-### Retry Strategy
+The API installs sessions and rate limiting before its health handlers. `/api/health` and `/api/health/live` have simple bodies but are not dependency-isolated liveness endpoints. `/api/health/detailed` checks SQL then Redis and returns 503 on failure, without an overall deadline or Elasticsearch/worker check. SQL has a 20-connection pool, a two-second connection timeout, and no statement timeout. Redis retries linearly at 100 ms times the attempt count, capped at three seconds, with three retries per request. Re-login cannot repair a Redis outage.
 
-- Database connections: Automatic reconnect via pg pool
-- Redis: Exponential backoff (100ms base, 3s max)
-- Search indexer: Continues polling on error, logs and retries
-
-### Graceful Degradation
-
-- If Elasticsearch is down: Search returns empty results, send/receive still works
-- If Redis is down: Sessions fail (users need to re-login), cache misses fall through to DB
-- If search indexer is behind: Recently sent emails may not appear in search for a few seconds
-
----
+Shutdown closes pools and exits without closing/draining the HTTP listener. The worker has an unconditional polling loop without a signal-drain protocol. Proposed shutdown stops new work, finishes or releases leases, drains in-flight requests to a deadline, and then closes dependency clients.
 
 ## Scalability Considerations
 
-### Database Scaling Path
+The first local constraints include one synchronous transaction per send, sequential per-recipient SQL and Redis work, unindexed global message-time polling, and whole-thread retrieval. The indexer handles at most 100 messages before sleeping five seconds, so even ignoring work time and cursor defects its nominal rate is below 20 messages/second.
 
-1. **Read replicas** for thread list queries (read-heavy workload)
-2. **Partitioning** thread_user_state by user_id hash for horizontal sharding
-3. **Archive tables** for old messages (move threads older than 2 years)
+Shard mailbox state, drafts, contacts, and search projections by user ID. Route shared immutable message content through its own authority; do not claim that this makes multi-recipient writes one local transaction. Increase delivery consumers by mailbox partition, preserve per-entity versions, bound fan-out, and reconcile lagging recipients. Partition historical content after measuring retention and access patterns. Cache hot first pages rather than assuming a universal 97% hit rate.
 
-### Search Scaling
-
-1. **Index sharding** in Elasticsearch by user_id range
-2. **Separate hot/warm indices** (recent 30 days vs. older)
-3. **Query routing** to specific shards based on user_id
-
-### Caching Strategy
-
-- Thread lists: 30-second TTL, invalidated on send/state change
-- Unread counts: 30-second TTL, invalidated on message receive
-- Labels: Cached until mutation (long TTL)
-
----
+A conversation that receives continuous mail is a hot aggregate. Batch summary updates, separate immutable messages from mutable mailbox summaries, and bound per-conversation fetches. Large bulk mail belongs on an explicitly limited path. Multi-region durability needs a chosen replication and failover contract; 99.99% availability is not supplied by running three API ports against one database.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Thread state | Per-user table | JSONB in thread | Queryable indexes, clean schema |
-| Search engine | Elasticsearch | PostgreSQL FTS | Privacy filtering, advanced operators |
-| Draft conflict | Optimistic locking | Pessimistic locks | No lock contention on auto-save |
-| Search indexing | Background worker | Inline on send | No send latency increase |
-| Session storage | Redis + cookie | JWT | Immediate revocation, simpler |
-| Label assignment | Per-user | Per-thread | Users need independent label views |
-| Contact ranking | Frequency counter | ML model | Simple, effective for autocomplete |
-
----
+| Content/state model | Immutable messages + per-user projections | One global thread view | Independent state and recipient-specific history |
+| Delivery boundary | Durable acceptance then replay-safe mailbox fan-out | Global multi-recipient transaction | Keeps shard failures out of acceptance latency |
+| Draft updates | Conditional versions + recovery | Unconditional last-write-wins | Preserve authored work and expose conflicts |
+| Search at scale | Per-mailbox search projections | Shared recipient-search document | Align privacy and routing with the viewer |
+| Index propagation | Durable events with versioned writes | Timestamp-only polling | Recover retries, deletions, and late commits |
+| Client navigation | Bounded pages with explicit refresh | Unlimited retained feed | Predictable memory and understandable ordering |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation running on Docker + Node.js + React.
+### What actually runs
 
-### Local Architecture
+[app.ts](./backend/src/app.ts) mounts seven route groups in one Express process. [index.ts](./backend/src/index.ts) starts the listener without a dependency-readiness gate. The [worker](./backend/src/workers/search-indexer.ts) is launched separately; only it initializes the search index. Initialization logs and swallows errors, and an existing index's mapping is not migrated.
 
-```
-┌─────────────────────────────────┐
-│     Browser (localhost:5173)    │
-│  React + TanStack Router +     │
-│  Zustand + Tailwind CSS        │
-└───────────────┬─────────────────┘
-                │ HTTP
-                ▼
-┌─────────────────────────────────┐
-│  Express API (localhost:3001)   │
-│  Routes: auth, threads,        │
-│  messages, labels, drafts,     │
-│  search, contacts              │
-│  + /metrics + /api/health      │
-└──────┬──────┬──────┬────────────┘
-       │      │      │
-       ▼      ▼      ▼
-┌────────┐ ┌──────┐ ┌────────────────┐
-│Postgres│ │Valkey│ │ Elasticsearch  │
-│ :5432  │ │:6379 │ │    :9200       │
-└────────┘ └──────┘ └───────┬────────┘
-                            │
-                    ┌───────┴────────┐
-                    │ Search Indexer │
-                    │   (Worker)     │
-                    └────────────────┘
+[config/index.ts](./backend/src/config/index.ts) loads dotenv, but the [database pool](./backend/src/services/db.ts) ignores `DATABASE_URL` and uses `POSTGRES_*`. The [Redis client](./backend/src/services/redis.ts) ignores `REDIS_URL` and uses `REDIS_HOST`/`REDIS_PORT`. The separate [migration runner](./backend/src/db/migrate.ts) uses exported `DATABASE_URL` without dotenv. Nested instance scripts all force 3001; README supplies direct tsx commands for other ports.
+
+### Implemented patterns and their limits
+
+The send transaction protects the SQL work actually performed for resolved recipients. It does not guarantee that all requested addresses received mail. Contacts update in that same transaction, not best effort afterward. Duplicate addresses can create duplicate recipient rows and increment contact frequency repeatedly because recipient uniqueness and normalization are absent.
+
+The draft update's essential condition is:
+
+```sql
+WHERE id = $1 AND user_id = $2 AND version = $11
 ```
 
-### Frontend Architecture
+[Draft service](./backend/src/services/draftService.ts) increments the version in that same update and returns the current owner-scoped draft on conflict. This prevents stale database writes, but creation is not idempotent, deletion is unconditional on version, and `COALESCE` prevents clearing some nullable reply/HTML fields. Reply references are not checked against the caller's visible thread.
 
-The frontend is a React 19 + TypeScript application built with Vite, using TanStack Router for file-based routing, Zustand for state management, and Tailwind CSS for styling. It replicates Gmail's three-panel layout: a sidebar with labels, a thread list, and a thread detail view.
+Sessions and Redis-backed rate limits are wired. The [circuit-breaker factory](./backend/src/services/circuitBreaker.ts) is only a helper: no production call site creates a breaker. It must not be credited with protecting Elasticsearch. The actual search path catches errors and returns empty results without a fallback flag.
 
-**Component Hierarchy:**
+### Cache and mailbox semantics
 
-```
-__root.tsx (RootLayout -- auth gate + Gmail shell)
-├── Header (search bar, user menu)
-├── Sidebar (compose button, label navigation with unread counts)
-├── ComposeModal (floating compose window, minimizable)
-├── index.tsx (redirects to INBOX)
-├── label.$labelName.tsx (ThreadList for selected label)
-│   └── ThreadList (virtualized via @tanstack/react-virtual)
-│       └── ThreadListItem (subject, sender, snippet, star, timestamp)
-├── thread.$threadId.tsx (ThreadView)
-│   └── MessageCard (per-message: sender, timestamp, body, reply)
-├── login.tsx
-└── register.tsx
-```
+Only thread lists and unread counts are cached, both for 30 seconds. Labels and thread detail are queried directly. List keys include user, label, and page but omit the service's optional limit. `cacheDel` calls `redis.del` on one exact key; `threads:user:*` does not invalidate matching pages. Read/star/archive/trash updates omit the unread key. Label assignment/removal repeats the ineffective list delete; label rename/delete does not refresh cached thread labels or counts.
 
-**Zustand Stores:**
+Recipients' unread keys are deleted before commit, allowing another read to refill stale counts from uncommitted SQL. Sender deletion follows commit and can turn persisted success into an error response. Cache reads/writes themselves throw on dependency failure. There is no bounded fallback, revision check, or request coalescing.
 
-Two stores manage the application state:
+Inbox filtering uses label membership plus not-trash/not-spam; it does not check `is_archived` or remove INBOX on archive. Starred, Trash, Spam, and All Mail have special flag predicates; Drafts and Important are ordinary assigned-label queries. The draft table never populates thread labels. Unread counts do not mirror every special-folder predicate, and opening a thread does not invalidate the unread cache. See [threadService.ts](./backend/src/services/threadService.ts) and [labelService.ts](./backend/src/services/labelService.ts).
 
-1. **`useAuthStore`** (persisted to `localStorage` via Zustand `persist` middleware): Holds the current user, authentication status, and loading flag. Provides `login`, `register`, `logout`, and `checkAuth` actions. The `persist` middleware serializes `user` and `isAuthenticated` to `localStorage`, so refreshing the page does not force a re-login. The `checkAuth` action validates the session against the server on mount.
+### Indexer checkpoint and search contract
 
-2. **`useMailStore`**: The core mail state. Holds the thread list, current thread detail, labels, unread counts per label, current label filter, current page, compose modal visibility, and loading state. Key patterns:
-   - **Optimistic updates**: When the user stars a thread, the store immediately updates the local state (`threads.map(...)`) before sending the API request. If the request fails, the store reverts to the previous state. The same pattern applies to archive and trash operations, where the thread is immediately removed from the list and restored on failure.
-   - **Centralized data fetching**: All API calls flow through store actions (`fetchThreads`, `fetchThread`, `fetchLabels`, `fetchUnreadCounts`), keeping data-fetching logic out of components.
-   - **Label-driven navigation**: `setCurrentLabel` resets the page to 1 and clears the current thread, then `fetchThreads` loads threads filtered by that label.
+The worker selects `created_at > checkpoint`, orders only by that timestamp, and processes 100 records sequentially. It advances after the entire batch succeeds, so an individual index failure retries earlier successful upserts. Stable message document IDs avoid duplicate search documents, but do not prove complete processing.
 
-**Data Fetching Pattern:**
+The installed PostgreSQL parser returns Date objects despite the worker's string annotation. Passing a Date directly to ioredis serializes its ordinary string representation, losing fractional seconds. An isolated execution with 101 messages in one fractional second repeatedly selected the first 100. With an exact timestamp boundary, equal-timestamp rows beyond the batch can instead be skipped. A transaction that commits late with an older `created_at` can also fall behind the checkpoint; PostgreSQL's [NOW() is transaction-start time](https://www.postgresql.org/docs/16/functions-datetime.html). A timestamp plus ID would fix ties but still would not track late commits safely.
 
-All API calls are centralized in `services/api.ts`, which exports separate API objects (`authApi`, `threadApi`, `messageApi`, `labelApi`, `draftApi`, `searchApi`, `contactApi`). Each API object wraps a shared `fetchApi` helper that sets `Content-Type: application/json`, includes credentials (`credentials: 'include'` for cookie-based sessions), and handles error responses by parsing the JSON error body. There is no React Query or SWR; data fetching is imperative through Zustand store actions.
+There is no worker lease, per-message index acknowledgment, dead-letter queue, deletion/update feed, or reindex command. Resetting Elasticsearch while keeping Redis can leave old mail absent. Searchable recipient fields exclude BCC; all recipients remain in `visible_to`. The parser extracts only the first occurrence of each simple operator, without quoted-expression grammar or date validation. `from:`/`to:` combine name matching and exact address terms; before/after are inclusive. Free text uses fuzzy best-fields matching over subject boosted threefold, body, sender name, and public recipient names.
 
-**Email Threading UI:**
+Search uses offsets, no unique sort tie-breaker, and discards Elasticsearch's total-hit relation. It does not filter current Trash/Spam state. Highlight fragments and fallback raw body substrings pass directly to the browser; Elasticsearch's [highlight encoder](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/highlighting-settings) is not configured. HTML-safe snippets require an explicit rendering contract even when highlight tags themselves are generated by the server.
 
-The `ThreadList` component uses `@tanstack/react-virtual` to virtualize the thread list. Each row is estimated at 40px, with 5 rows of overscan. The virtualizer positions items absolutely within a container whose height equals `virtualizer.getTotalSize()`. Pagination is server-side: the toolbar shows "1-25 of 142" and provides next/previous buttons that call `fetchThreads` with the next page number.
+### Browser implementation
 
-The `ThreadView` component loads a full thread (all messages ordered by `created_at`) and renders each message as a `MessageCard`. Opening a thread automatically marks it as read via `threadApi.updateState`.
+The [mail store](./frontend/src/stores/mailStore.ts) holds one list, one detail object, labels, counts, page, and compose visibility. Components generally subscribe to the entire store rather than selecting individual fields. Auth persists user/profile flags in localStorage; the server session remains in an HTTP-only cookie. Mail data is not cleared on logout or account changes, and requests have no account/query generation guard. The root removes the authenticated shell on logout but continues rendering the current route's Outlet, so retained mail may remain visible. Auth checking runs on initial mount, not on focus or every navigation.
 
-**Compose Modal:**
+[ThreadList](./frontend/src/components/ThreadList.tsx) virtualizes one 25-row page with 40 px estimates and five rows of overscan; it does not measure rows or assign thread IDs as virtualizer keys. The layout lacks a rigorously bounded viewport and there is no evidence of a particular frame rate. Rows are clickable divs without keyboard row navigation. The list and detail are alternative routes, not simultaneously mounted columns. Thread detail fetches every body even when [MessageCard](./frontend/src/components/MessageCard.tsx) initially collapses older messages.
 
-The `ComposeModal` is a floating window (positioned `fixed bottom-0 right-20`) that can be minimized to a title bar. It manages its own local state for recipients (To, CC, BCC), subject, and body. The `ContactAutocomplete` component provides type-ahead contact suggestions by querying `/api/v1/contacts?q=term`. CC and BCC fields are hidden by default and shown via toggle buttons, matching Gmail's behavior.
+Star actions update only a matching item in the list, so detail remains stale and a direct visit with no list match sends no request. Archive/trash remove list items without updating totals/detail; failure refetches may restore cached state. Concurrent star responses can overwrite newer intent. Fetch failures are mostly silent and can leave stale content or a permanent detail loading message. Opening a thread marks SQL state read but does not reconcile list/counts. Reply uses the last sender plus To recipients, retains self, drops CC, and never has BCC to copy; its displayed recipient description is incomplete. Reply errors have no visible explanation.
 
-**Search:**
+[ComposeModal](./frontend/src/components/ComposeModal.tsx) retains text while minimized and while the authenticated shell stays mounted, but closes/discards without saving. Inputs remain editable during send; success closes the window even if newer text was entered. The [draft API wrapper](./frontend/src/services/api.ts) has no UI callers, and [LabelManager](./frontend/src/components/LabelManager.tsx) is unmounted. There is no undo toast, route-lazy compose, offline queue, attachment control, or admin view.
 
-The `SearchBar` component in the `Header` accepts Gmail-style search operators (`from:`, `to:`, `has:attachment`). Search results are displayed as a thread list. The search API returns results with relevance-ordered threads.
+[ContactAutocomplete](./frontend/src/components/ContactAutocomplete.tsx) debounces 200 ms and filters already-selected addresses, but has no stale-response guard or active suggestion keyboard model. Enter/comma/Tab accept text containing `@`; Tab is prevented even when the field is empty. A typed address not committed to a chip is omitted from send. [SearchBar](./frontend/src/components/SearchBar.tsx) submits explicitly, keeps only the first page, lacks URL query state and request ordering, renders subject highlights as literal text, and injects snippet HTML. Message HTML is also injected directly. No sanitizer, remote-image protection, modal focus trap, focus restoration, or comprehensive control labeling is implemented.
 
-**Routing:**
+### Simplified, omitted, and verified
 
-TanStack Router with file-based routing. Key routes: `/` (redirects to INBOX), `/label/$labelName` (thread list filtered by label), `/thread/$threadId` (thread detail), `/login`, and `/register`. The root layout includes an auth gate: unauthenticated users see only the `Outlet` (login/register pages), while authenticated users see the full Gmail shell (Header + Sidebar + main content + ComposeModal).
+The local system uses one PostgreSQL database, one Valkey instance with AOF, one Elasticsearch node, and Vite in place of a CDN. It omits durable acceptance receipts, outbox delivery, repairable search projections, cross-region replication, attachments, protocol gateways, spam classification, push notifications, and a connected draft editor.
 
-### Production-Grade Patterns Implemented
-
-| Pattern | Library | File Path | Purpose |
-|---------|---------|-----------|---------|
-| Circuit breakers | opossum | `backend/src/services/circuitBreaker.ts` | Protects against Elasticsearch failures; opens after 50% failure rate, returns empty search results as fallback |
-| Rate limiting | express-rate-limit + rate-limit-redis | `backend/src/services/rateLimiter.ts` | Distributed rate limiting across API instances using Redis as shared state |
-| Prometheus metrics | prom-client | `backend/src/services/metrics.ts` | HTTP duration, email send counts, search latency, draft conflicts, cache hit ratios exposed at `/metrics` |
-| Structured logging | pino + pino-http | `backend/src/services/logger.ts` | JSON logs with request ID tracing, user context, query timing |
-| Health checks | custom | `backend/src/routes/` | Liveness, readiness, detailed dependency checks |
-| Optimistic locking | PostgreSQL version column | `backend/src/services/draftService.ts` | Draft conflict detection via conditional UPDATE with 409 response |
-| Background indexing | polling worker | `backend/src/workers/search-indexer.ts` | Polls PostgreSQL for new messages, indexes into Elasticsearch with `visible_to` privacy filter |
-
-### Production Pattern Deep Dives
-
-This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before.
-
-**Circuit Breaker (`backend/src/services/circuitBreaker.ts`):**
-
-A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service. Imagine Elasticsearch goes down. Without a circuit breaker, every search request waits for a TCP connection timeout (often 30 seconds), consuming a server thread the entire time. With hundreds of concurrent requests, the API server quickly exhausts its thread pool and becomes unresponsive -- even though the rest of the application (sending emails, listing threads) works fine. This is called a "cascading failure."
-
-The circuit breaker tracks the success/failure ratio of recent calls. When the failure rate exceeds a threshold (50% in this project), the breaker "opens" and immediately rejects all subsequent calls without attempting them. After a cooldown period (30 seconds), the breaker enters a "half-open" state where it allows a single test request through. If that request succeeds, the breaker closes and resumes normal operation. If it fails, the breaker reopens for another cooldown cycle.
-
-In this project, the circuit breaker wraps Elasticsearch calls. When it opens, search returns empty results with a `fallback: true` flag so the frontend can display "Search temporarily unavailable." All other email operations (send, receive, label management, drafts) continue working. The breaker state is exposed as a Prometheus gauge (`gmail_circuit_breaker_state`), enabling operations teams to see when and how often Elasticsearch outages occur.
-
-**Redis Cache-Aside (integrated in thread and label services):**
-
-Cache-aside is a caching pattern where the application checks the cache before querying the database. On a cache miss, the application queries the database, stores the result in the cache with a time-to-live (TTL), and returns the data. On a cache hit, the data is returned directly from the cache without touching the database.
-
-In this project, thread lists are cached in Redis with a 30-second TTL. When a user opens their inbox, the API checks Redis first. If the inbox data is cached and fresh, it is returned in under a millisecond. If not, the API executes the thread list query (which involves JOINs across `threads`, `thread_user_state`, `thread_labels`, and `labels`), caches the result, and returns it. Cache entries are invalidated explicitly when the user performs a state change (star, archive, trash) or when a new message arrives.
-
-The 30-second TTL is a trade-off: too short and the cache provides little benefit; too long and users see stale data (e.g., a thread still appearing as unread after being read in another tab). For email, a 30-second staleness window is acceptable because users refresh manually when they expect new mail.
-
-**Structured Logging (`backend/src/services/logger.ts`):**
-
-Structured logging emits log entries as machine-parsable JSON rather than free-form text. Instead of `"User alice sent email to bob, 23ms"`, the logger emits `{"level":"info","event":"email_sent","userId":"abc","recipients":["bob"],"durationMs":23,"traceId":"xyz"}`.
-
-This project uses the Pino library, which is chosen for its speed (Pino serializes JSON faster than most alternatives by avoiding expensive string formatting). Every HTTP request is assigned a trace ID via the `x-trace-id` header. This trace ID is attached to every log entry generated during that request, making it possible to reconstruct the full lifecycle of a request by filtering logs on the trace ID. Pino-http middleware automatically logs request start and completion with method, URL, status code, and duration.
-
-Key events logged: email send (sender, recipient count, thread creation vs. reply), search query (query text, result count, latency, Elasticsearch vs. cache), draft conflict (draft ID, expected version vs. actual version), and rate limit hits (endpoint, client IP). In production, these logs would feed into a centralized system (e.g., Datadog, Elasticsearch/Kibana) for real-time dashboards and alerting.
-
-**Prometheus Metrics (`backend/src/services/metrics.ts`):**
-
-Prometheus is a monitoring system where the application exposes metrics at an HTTP endpoint (`/metrics`), and a Prometheus server periodically scrapes this endpoint to collect time-series data for dashboards and alerting.
-
-Metrics come in four types: **Counters** only go up (e.g., `gmail_emails_sent_total`), **Gauges** go up and down (e.g., `gmail_circuit_breaker_state`), **Histograms** track distributions by bucketing values (e.g., `gmail_http_request_duration_seconds` with buckets at 10ms, 50ms, 100ms, 500ms, 1s, 5s), and **Summaries** compute percentiles client-side. Histograms are preferred over summaries because they can be aggregated across multiple server instances.
-
-This project tracks HTTP request duration and count (labeled by method, route, status code), email send count, search query count and duration, draft version conflicts, messages indexed into Elasticsearch, circuit breaker state, and rate limit violations. These metrics enable SLI-based alerting: for example, "if p95 inbox load latency exceeds 200ms for 5 minutes, page the on-call engineer."
-
-**Rate Limiting (`backend/src/services/rateLimiter.ts`):**
-
-Rate limiting caps the number of requests a client can make within a time window. Without it, a single client could overwhelm the server with requests, degrading service for all users.
-
-This project uses `express-rate-limit` with `rate-limit-redis` as the backing store. Redis is used instead of in-memory storage so that rate limits are shared across multiple API server instances. If the API is scaled to 3 instances behind a load balancer, a user cannot bypass the limit by having requests routed to different instances.
-
-Each endpoint has a different limit based on its cost: login is limited to 5 attempts per minute (brute-force protection), email sending is limited to 50 per hour (prevents spam), search is limited to 60 per minute (prevents scraping), and general API calls are limited to 1000 per minute. When a client exceeds the limit, the server returns HTTP 429 with a `Retry-After` header indicating how many seconds the client should wait.
-
-**Health Checks (`backend/src/routes/`):**
-
-Health checks are HTTP endpoints that report whether the application is functioning correctly. They serve different audiences and purposes:
-
-- **`/api/health`** (simple liveness): Returns HTTP 200 if the process is alive. Used by the orchestrator (Kubernetes) to detect hung processes. If this fails, the container is killed and restarted.
-- **`/api/health/detailed`** (dependency check): Connects to PostgreSQL and Redis, measures round-trip latency, and reports the status of each dependency. Used by load balancers to decide whether to route traffic to this instance. If PostgreSQL is unreachable, this returns unhealthy, and the load balancer stops sending requests.
-- **`/api/health/live`** (process check): Confirms the process is running. Distinct from the liveness probe in that it checks only the Node.js event loop, not external dependencies.
-
-The distinction between liveness and readiness is important: during a database migration, the process is alive (liveness = healthy) but not ready to serve traffic (readiness = unhealthy). The load balancer should stop routing to it but should not restart it.
-
-### What Was Simplified
-
-| Production Design | Local Substitute | Impact |
-|-------------------|------------------|--------|
-| Sharded PostgreSQL cluster | Single PostgreSQL 16 instance | All data on one node; no partition-level queries |
-| Clustered Elasticsearch | Single ES 8.11 node | No index sharding or hot/warm tiers |
-| S3 blob storage for attachments | Schema-only (MinIO omitted) | Attachment metadata stored, files not uploaded |
-| OAuth/JWT federation | Session-based auth with bcrypt | Single auth mechanism, no SSO |
-| CDN for static assets | Vite dev server | No edge caching |
-| Multiple API instances behind LB | Single Express server (can run 3 via npm scripts) | No load balancing by default |
-
-### What Was Omitted
-
-- CDN and edge caching
-- Multi-region deployment
-- Kubernetes orchestration
-- Email spam filtering (ML-based)
-- POP3/IMAP protocol support
-- Push notifications / WebSocket for real-time new mail
-- Calendar and contacts integration
-- Attachment storage (MinIO/S3)
-- Database sharding and read replicas
+The SQL seed has three users, five threads/nine messages, no BCC or attachment fixture, and one API-only draft. Repeated seeding duplicates recipient rows because their generated IDs have no natural uniqueness constraint. Fixed summaries are not always the latest-message summaries. Existing backend tests mock core services; smoke tests assert forms/main and generic error absence, not message correctness. Six isolated checks of actual source with mocked dependencies confirmed cache, send, draft, checkpoint, search, and client-state behavior, plus the fixture password. No application build, browser flow, database mutation, or load benchmark was performed for this review.

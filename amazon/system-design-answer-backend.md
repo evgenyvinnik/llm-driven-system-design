@@ -1,576 +1,393 @@
-# Amazon E-Commerce - System Design Answer (Backend Focus)
+# Amazon — Backend System Design
 
-*45-minute system design interview format - Backend Engineer Position*
+*A 45-minute discussion of inventory allocation, recoverable checkout and search projections.*
 
-## Opening Statement
+This is a proposed production design. The local implementation uses one Express
+process, PostgreSQL, Valkey and Elasticsearch, with simulated payment and incomplete
+correctness guarantees; see [architecture.md](./architecture.md).
 
-"Today I'll design the backend infrastructure for an e-commerce platform like Amazon. The key backend challenges are inventory management that prevents overselling under high concurrency, product search with faceted filtering at scale, and recommendation systems. I'll focus on database design, exactly-once semantics for order processing, caching strategies, and event-driven architecture for inventory updates."
+## 📋 Establish the purchase contract — 4 minutes
 
----
+> “I would separate the browsing promise from the purchase promise. Search may show
+> a slightly old price or stock estimate, but accepting an order requires an
+> authoritative allocation and a recoverable payment decision.”
 
-## 🎯 Requirements Clarification
+The core flows are product discovery, cart management, checkout, order history and
+cancellation. Sellers update their own offers; administrators handle exceptions.
+Reviews and recommendations enrich discovery but should not block purchasing.
 
-### Functional Requirements
+I would clarify when inventory is held. For this proposal, an ordinary cart is intent;
+a short hold begins at checkout. If the product specifically promises cart-time
+reservations, the same allocation machinery applies with different expiry and abuse
+controls, but that promise must be explicit.
 
-1. **Catalog**: Browse and search products across categories
-2. **Cart**: Add items with inventory reservation
-3. **Checkout**: Purchase with payment processing and exactly-once semantics
-4. **Orders**: Track order status through fulfillment
-5. **Recommendations**: "Customers also bought" suggestions
+Assume one hundred million offers, ten million daily active buyers and one million
+orders/day. That averages about 11.6 orders/second. I would plan for a hypothetical
+1,000/second sale peak and 50,000 searches/second, then validate those assumptions.
 
-### Non-Functional Requirements
+At roughly 3 KB per order with lines, order data grows about 3 GB/day before indexes
+and replicas. Catalog metadata at 5 KB per offer is around 500 GB. Images belong in
+object storage and have a separate capacity budget.
 
-| Requirement | Target | Rationale |
-|-------------|--------|-----------|
-| Availability | 99.99% for browsing | Revenue impact of downtime |
-| Consistency | Strong for inventory | No overselling |
-| Latency | < 100ms search, < 10ms inventory | User experience |
-| Scale | 100M products, 1M orders/day | E-commerce baseline |
+These averages conceal the hard case: thousands of buyers competing for one offer.
+The design must handle that concentrated contention even if overall write throughput
+looks modest.
 
-### Scale Estimates
+Proposed targets are 99.99% browsing availability, 99.9% checkout availability and
+bounded search below 200 ms at p95. External payment authentication may take longer
+than an API response budget; acceptance and final confirmation are separate outcomes.
 
-| Metric | Estimate |
-|--------|----------|
-| Products | 100M |
-| Daily Orders | 1M (~12/second) |
-| Peak Concurrent Users | 500K |
-| Search QPS | 100K |
-| Cart Read:Write Ratio | 10:1 |
-
----
-
-## 🏗️ High-Level Architecture
+## 🏗️ Draw ownership boundaries — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway / Load Balancer                   │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Catalog Service│    │ Cart Service  │    │ Order Service │
-│               │    │               │    │               │
-│ - Products    │    │ - Add/remove  │    │ - Checkout    │
-│ - Categories  │    │ - Reservation │    │ - Fulfillment │
-│ - Search      │    │ - Expiration  │    │ - Tracking    │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                  │
-├─────────────┬─────────────┬─────────────┬───────────────────────┤
-│ PostgreSQL  │Elasticsearch│   Valkey    │     Kafka             │
-│ - Products  │ - Search    │ - Cart      │ - Order events        │
-│ - Orders    │ - Facets    │ - Sessions  │ - Inventory updates   │
-│ - Inventory │             │ - Dedup     │ - Recommendations     │
-└─────────────┴─────────────┴─────────────┴───────────────────────┘
+┌──────────────────┐       ┌──────────────────┐
+│ Storefront/API GW│──────▶│ Catalog/search   │────▶ Search index
+│ Auth, admission  │       │ Read projections │────▶ Read cache
+└─────────┬────────┘       └────────▲─────────┘
+          │                        │
+          ▼                        │ Versioned events
+┌──────────────────┐       ┌───────┴──────────┐
+│ Cart + checkout  │──────▶│ Stock/order DB   │
+│ Quote, attempt ID│       │ Attempts, outbox │
+└─────────┬────────┘       └────────┬─────────┘
+          │                        │ Durable work
+          ▼                        ▼
+┌──────────────────┐       ┌──────────────────┐
+│ Payment workflow │◀─────▶│ Workers / replay │
+│ Provider calls   │       │ Index / recs     │
+└─────────┬────────┘       └──────────────────┘
+          ▼
+┌──────────────────┐
+│ Payment provider │
+│ API + callbacks  │
+└──────────────────┘
 ```
 
----
+Initially, cart, stock and order modules can share a PostgreSQL transaction boundary.
+I would not introduce a distributed reservation saga merely to make the service
+diagram look larger. The ownership boundaries allow that evolution when necessary.
 
-## 📦 Deep Dive 1: Reserved Inventory Model
+Each warehouse/offer allocation has one authoritative writer. Read replicas and
+search indexes can serve observations of stock, but cannot independently sell the
+same units during a partition.
 
-### The Overselling Problem
+A transactional outbox records work with the state change that created it. Workers
+publish/index/notify independently, using replay and idempotent effects. This closes
+the gap between a committed order and a process crash before its event is sent.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                         Race Condition Without Reservation                           │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Time ───────────────────────────────────────────────────────────────────────▶      │
-│                                                                                      │
-│  User A: ─── Check inventory (sees 1) ─── Add to cart ─── Checkout ───────▶        │
-│                                                                                      │
-│  User B: ─── Check inventory (sees 1) ─────── Add to cart ─── Checkout ──▶         │
-│                                                                                      │
-│  Result: Both users purchase ──▶ Inventory becomes -1 ──▶ OVERSOLD!                 │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+A payment coordinator calls the provider outside the database transaction. The order
+and provider cannot be made atomic by keeping a row lock open during a network call.
 
-### Solution: Reserved Inventory Table
+## 💾 Data model and API — 4 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              inventory Table                                         │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Columns:                                                                            │
-│  ├── product_id: INTEGER (FK → products, PK with warehouse)                         │
-│  ├── warehouse_id: INTEGER (FK → warehouses, PK with product)                       │
-│  ├── quantity: INTEGER (total physical stock)                                       │
-│  └── reserved: INTEGER (reserved by active carts)                                   │
-│                                                                                      │
-│  Derived:                                                                            │
-│  └── available = quantity - reserved                                                 │
-│                                                                                      │
-│  Invariant:                                                                          │
-│  └── reserved <= quantity (enforced at application layer with row locks)            │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+| Record | Key contents and invariants |
+|--------|-----------------------------|
+| Offer | Product, seller, price/currency, catalog version and active state |
+| Inventory | Offer/warehouse key, remaining quantity and held quantity; nonnegative available stock |
+| Cart | Buyer, lines and version; purchase intent, not an allocation |
+| Quote | Item/price/shipping/tax snapshot, version and validity policy |
+| Checkout attempt | Buyer-scoped client key, request fingerprint, quote and resulting order |
+| Reservation | Attempt, offer, warehouse, units, expiry, state and version |
+| Order and lines | Buyer, price/title snapshots, fulfillment and payment references |
+| Payment operation | Stable operation key, kind, provider reference and known/unknown outcome |
+| Outbox event | Event identity, aggregate/version and delivery progress |
 
-### Add to Cart with Reservation
+Indexes follow access patterns: buyer/time for history, offer/warehouse for allocation,
+expiry for held reservations, and pending-work time for outbox processing. A stock
+index starting with offer ID does not automatically optimize warehouse-only reports.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      addToCart(userId, productId, quantity)                          │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  BEGIN TRANSACTION                                                                   │
-│                                                                                      │
-│  Step 1: Lock and check inventory                                                    │
-│  ├── SELECT * FROM inventory WHERE product_id = $1 FOR UPDATE  ◄── Row lock        │
-│  ├── Calculate: available = quantity - reserved                                     │
-│  └── IF available < requested ──▶ THROW InsufficientInventoryError                 │
-│                                                                                      │
-│  Step 2: Reserve inventory atomically                                                │
-│  └── UPDATE inventory SET reserved = reserved + $quantity WHERE product_id = $1    │
-│                                                                                      │
-│  Step 3: Add to cart with expiration                                                 │
-│  ├── INSERT INTO cart_items (user_id, product_id, quantity, reserved_until)         │
-│  │   VALUES ($1, $2, $3, NOW() + 30 minutes)                                        │
-│  │   ON CONFLICT (user_id, product_id) DO UPDATE                                    │
-│  │   SET quantity = cart_items.quantity + $3,                                       │
-│  │       reserved_until = NOW() + 30 minutes                                        │
-│                                                                                      │
-│  COMMIT                                                                              │
-│                                                                                      │
-│  Return: { success: true, expiresAt: NOW() + 30 minutes }                           │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+| Method | Proposed operation | Important contract |
+|--------|--------------------|--------------------|
+| GET | Product/search results | Bounded pagination and explicit filter/freshness semantics |
+| PUT | Cart line | Absolute desired quantity plus cart version |
+| POST | Checkout quote | Authoritative price and availability validation |
+| POST | Checkout attempt | Stable buyer-scoped key and accepted quote |
+| GET | Attempt/order status | Recover outcome after a timeout or reload |
+| POST | Cancellation | Conditional lifecycle transition and durable compensation |
 
-### Background Job: Release Expired Reservations
+I would avoid designing an endpoint for every internal table. The useful public
+contract is what a caller can safely retry and how it discovers the current outcome.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      releaseExpiredReservations() - Runs every minute                │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  BEGIN TRANSACTION                                                                   │
-│                                                                                      │
-│  Step 1: Find and lock expired items                                                 │
-│  ├── SELECT product_id, SUM(quantity) as total FROM cart_items                      │
-│  │   WHERE reserved_until < NOW()                                                    │
-│  │   FOR UPDATE SKIP LOCKED  ◄── Non-blocking for concurrent job runs              │
-│  │   GROUP BY product_id                                                             │
-│                                                                                      │
-│  Step 2: Release reserved inventory                                                  │
-│  └── FOR EACH expired item:                                                          │
-│      UPDATE inventory SET reserved = reserved - total WHERE product_id = $1        │
-│                                                                                      │
-│  Step 3: Delete expired cart items                                                   │
-│  └── DELETE FROM cart_items WHERE reserved_until < NOW()                            │
-│                                                                                      │
-│  COMMIT                                                                              │
-│                                                                                      │
-│  Log: { released: rowCount, event: "expired_reservations" }                         │
-│  Metric: cartAbandonments.inc(released)                                              │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep dive 1: Allocate the last unit correctly — 8 minutes
 
----
+### Decision: explicit warehouse allocations at one serialization point
 
-## 🔐 Deep Dive 2: Exactly-Once Order Processing
+> “The invariant is that accepted allocations never exceed available stock. A
+> reservation column is useful bookkeeping, but the guarantee comes from how every
+> writer changes it, including expiry, cancellation and admin adjustments.”
 
-### Multi-Layer Idempotency
+For a single warehouse, an atomic conditional update can reserve units only when
+sufficient availability remains. For several lines/warehouses, use a short transaction
+that locks the needed records in a stable order, checks the invariant and records
+which units were allocated where.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      POST /api/orders (Checkout Flow)                                │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Input: Request body + Idempotency-Key header (required)                             │
-│                                                                                      │
-│  Layer 1: Redis Fast-Path Dedup                                                      │
-│  ├── key = "idem:order:" + idempotencyKey                                            │
-│  ├── existing = redis.GET(key)                                                       │
-│  ├── IF existing.status = "processing" ──▶ Return 409 (retry later)                │
-│  ├── IF existing.status = "completed" ──▶ Return 200 (cached response)             │
-│  └── SETEX key 86400 { status: "processing" }                                       │
-│                                                                                      │
-│  Layer 2: Database Constraint Dedup                                                  │
-│  ├── BEGIN TRANSACTION                                                               │
-│  ├── SELECT * FROM orders WHERE idempotency_key = $1                                │
-│  ├── IF exists ──▶ Return existing order                                            │
-│  │                                                                                   │
-│  ├── Lock cart items: SELECT * FROM cart_items WHERE user_id = $1 FOR UPDATE       │
-│  ├── IF empty ──▶ THROW "Cart is empty"                                             │
-│  │                                                                                   │
-│  ├── Verify inventory (re-lock):                                                     │
-│  │   FOR EACH item:                                                                  │
-│  │     SELECT * FROM inventory WHERE product_id = $1 FOR UPDATE                     │
-│  │     IF quantity < requested ──▶ THROW InsufficientInventoryError                │
-│  │                                                                                   │
-│  ├── Create order with idempotency_key (UNIQUE constraint)                          │
-│  ├── Convert reserved to sold:                                                       │
-│  │   UPDATE inventory SET quantity = quantity - $1, reserved = reserved - $1       │
-│  ├── Insert order_items                                                              │
-│  ├── Delete cart_items                                                               │
-│  ├── COMMIT                                                                          │
-│  │                                                                                   │
-│  └── Publish: kafka.send("order-events", { type: "order.created", order })          │
-│                                                                                      │
-│  Cache success: SETEX key 86400 { status: "completed", response: order }            │
-│  Return: 201 Created with order                                                      │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+A reservation record identifies the attempt, offer, warehouse, quantity and state.
+The counters summarize those records; they should be reconcilable. A negative counter
+or mismatch is an error to investigate, not something to hide by clamping it to zero.
 
----
+### Why not read total stock and then decrement it?
 
-## 🔍 Deep Dive 3: Elasticsearch for Product Search
+Two buyers can both read one remaining unit before either writes. Their individual
+cart locks do not conflict because they belong to different accounts. Later updates
+may serialize, but an unconditional decrement still lets both transactions succeed.
 
-### Index Schema
+The stock condition must be evaluated at the serialization point. Database constraints
+provide another defense, but they do not choose the right warehouse or tell us which
+reservation should own the units.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      products Index Schema                                           │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Mappings:                                                                           │
-│  ├── title: text (analyzer: english, boost: 3x)                                     │
-│  ├── description: text (analyzer: english)                                           │
-│  ├── category_id: keyword                                                            │
-│  ├── category_path: keyword (hierarchical path for facets)                          │
-│  ├── brand: keyword                                                                  │
-│  ├── price: float                                                                    │
-│  ├── rating: float                                                                   │
-│  ├── review_count: integer                                                           │
-│  ├── in_stock: boolean                                                               │
-│  └── attributes: nested                                                              │
-│      ├── name: keyword                                                               │
-│      └── value: keyword                                                              │
-│                                                                                      │
-│  Settings:                                                                           │
-│  ├── number_of_shards: 5                                                             │
-│  ├── number_of_replicas: 1                                                           │
-│  └── refresh_interval: 5s  ◄── Trade-off: freshness vs indexing performance         │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+If two warehouses each hold five units and an order needs three, subtracting three
+from both warehouses consumes six. Summing availability does not define an allocation
+plan. Record the chosen distribution and use it again for consumption/release.
 
-### Faceted Search Query Structure
+### Expiry competes with checkout
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      searchProducts(query, filters, page)                            │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Query Structure:                                                                    │
-│  ├── function_score (relevance + business boosting)                                 │
-│  │   ├── bool query:                                                                 │
-│  │   │   ├── must: multi_match on [title^3, description]                            │
-│  │   │   └── filter:                                                                 │
-│  │   │       ├── term: category_path (if provided)                                  │
-│  │   │       ├── range: price gte/lte (if provided)                                 │
-│  │   │       ├── term: in_stock = true (if filter on)                               │
-│  │   │       ├── terms: brand (if brands selected)                                  │
-│  │   │       └── range: rating gte (if minimum rating)                              │
-│  │   │                                                                               │
-│  │   └── functions (boost scores):                                                   │
-│  │       ├── filter: in_stock = true ──▶ weight: 2                                  │
-│  │       ├── field_value_factor: rating (sqrt modifier, 1.2x)                       │
-│  │       └── field_value_factor: review_count (log1p modifier, 1.1x)                │
-│  │                                                                                   │
-│  └── Aggregations (facets):                                                          │
-│      ├── categories: terms on category_path (size: 20)                              │
-│      ├── brands: terms on brand (size: 50)                                          │
-│      └── price_ranges: range aggregation                                             │
-│          ├── Under $25 (to: 25)                                                      │
-│          ├── $25-$50 (from: 25, to: 50)                                              │
-│          ├── $50-$100 (from: 50, to: 100)                                            │
-│          ├── $100-$200 (from: 100, to: 200)                                          │
-│          └── Over $200 (from: 200)                                                   │
-│                                                                                      │
-│  Pagination: from = page * 20, size = 20                                             │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+A checkout hold expires according to server/database time. Cleanup claims a still-held,
+expired reservation and releases its units in the same transaction as the state change.
+Repeating cleanup then sees it already released and does not decrement again.
 
-### PostgreSQL Fallback with Circuit Breaker
+Checkout competes through the same state/version rule. An expired hold cannot be
+consumed merely because the cleanup worker has not reached it. We either obtain a
+new valid allocation or return a stock conflict.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      Circuit Breaker Pattern                                         │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Circuit Configuration:                                                              │
-│  ├── failureThreshold: 3 (consecutive failures to open)                              │
-│  ├── successThreshold: 2 (successes to close from half-open)                         │
-│  └── timeout: 10000ms (time before half-open attempt)                                │
-│                                                                                      │
-│  State Machine:                                                                      │
-│  ├── CLOSED: Normal operation, requests go to Elasticsearch                          │
-│  │   └── On 3 failures ──▶ OPEN                                                     │
-│  │                                                                                   │
-│  ├── OPEN: All requests go to PostgreSQL fallback                                   │
-│  │   └── After 10s ──▶ HALF-OPEN                                                    │
-│  │                                                                                   │
-│  └── HALF-OPEN: Test Elasticsearch with single request                              │
-│      ├── On success (2x) ──▶ CLOSED                                                 │
-│      └── On failure ──▶ OPEN                                                        │
-│                                                                                      │
-│  PostgreSQL Fallback Query:                                                          │
-│  ├── Uses to_tsvector/plainto_tsquery for full-text search                          │
-│  ├── ts_rank for relevance scoring                                                   │
-│  ├── Standard WHERE clauses for filters                                              │
-│  └── Returns { products, facets: {}, fallback: true }                               │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+A worker selecting expired carts outside a transaction and deleting them later can
+remove a renewed line or release units after another path consumed them. The selection
+is only a candidate list; the transition must re-check authoritative current state.
 
----
+### Why hold at checkout rather than every cart addition?
 
-## 🎯 Deep Dive 4: Recommendation Engine
+A short checkout hold protects the payment interaction while reducing stock withheld
+by casual browsing and abandonment. Cart-time holds can create artificial shortages
+when many shoppers add an item they never intend to purchase.
 
-### Batch Computation of "Also Bought"
+The cost is that a shopper may lose availability between adding to cart and checking
+out. I would communicate that and keep the checkout conflict useful: identify the
+unavailable line and preserve the rest of the shopper's intent.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      computeAlsoBoughtRecommendations() - Nightly Job                │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  For each active product (batched, 100 at a time):                                   │
-│                                                                                      │
-│  Step 1: Query co-purchased products (last 90 days)                                  │
-│  ├── SELECT oi2.product_id, COUNT(*) as frequency,                                   │
-│  │     COUNT(*) / total_orders_for_product as score                                 │
-│  ├── FROM order_items oi1                                                            │
-│  ├── JOIN order_items oi2 ON oi1.order_id = oi2.order_id                            │
-│  ├── WHERE oi1.product_id = current_product                                          │
-│  │     AND oi2.product_id != current_product                                         │
-│  │     AND oi1.created_at > NOW() - 90 days                                          │
-│  ├── GROUP BY oi2.product_id                                                         │
-│  └── ORDER BY frequency DESC LIMIT 20                                                │
-│                                                                                      │
-│  Step 2: Cache in Valkey (hot path)                                                  │
-│  └── SETEX "recs:also_bought:{productId}" 86400 JSON(results)                       │
-│                                                                                      │
-│  Step 3: Store in PostgreSQL (durability)                                            │
-│  ├── DELETE FROM product_recommendations                                             │
-│  │   WHERE product_id = $1 AND type = 'also_bought'                                 │
-│  └── INSERT INTO product_recommendations                                             │
-│      (product_id, recommended_product_id, type, score)                              │
-│      VALUES (...)                                                                    │
-│                                                                                      │
-│  Log progress: { processed: offset, event: "recommendation_batch" }                  │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+If a product requires a cart reservation promise, enforce per-account limits, renewal
+rules and an expiry window. A long TTL does not fix contention; it increases the
+amount of time stock can be unavailable to ready buyers.
 
-### Real-Time Recommendation Retrieval
+### Contention and scaling costs
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      getAlsoBoughtRecommendations(productId)                         │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Try Cache First:                                                                    │
-│  ├── cached = redis.GET("recs:also_bought:" + productId)                             │
-│  ├── IF cached:                                                                      │
-│  │   └── Return products WHERE id IN (cached.product_ids) AND is_active = true     │
-│                                                                                      │
-│  Fallback to Database:                                                               │
-│  ├── SELECT * FROM product_recommendations                                           │
-│  │   WHERE product_id = $1 AND type = 'also_bought'                                 │
-│  │   ORDER BY score DESC LIMIT 10                                                    │
-│  └── Return products WHERE id IN (rec.product_ids) AND is_active = true             │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+Row locks serialize hot writes, so requests need deadlines and bounded admission.
+Consistent lock ordering reduces deadlocks for multi-item carts. Retry genuine
+transaction aborts with jitter, but do not retry indefinitely under a flash-sale storm.
 
----
+Optimistic versions are a valid alternative at lower conflict rates. They still
+serialize conflicting commits and may cause many failed attempts on the last unit.
+The choice is about measured contention and retry cost, not “optimistic always faster.”
 
-## 📚 Deep Dive 5: Data Lifecycle and Archival
+At higher scale, a per-offer allocation queue can control demand. It must preserve
+stable identities and durable outcomes; the queue itself does not enforce inventory.
+Partitioning a hot offer needs allocated quotas or another single authority, not
+independent copies of the same available balance.
 
-### Retention Policies
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Atomic allocation with explicit warehouse records | Preserves stock and makes release/reconciliation explainable | Contention, ordering and allocation-state complexity |
+| ❌ Unlocked aggregate read then unconditional updates | Simple sequential demo | Overselling and incorrect multi-warehouse accounting |
 
-| Data Type | Hot Storage | Archive Retention | Notes |
-|-----------|-------------|-------------------|-------|
-| Orders | 2 years | 7 years total | Legal/tax requirement |
-| Cart Items | 30 minutes | N/A (ephemeral) | Reservation duration |
-| Audit Logs | 1 year | 3 years | Compliance |
-| Search Logs | 90 days | N/A | Analytics only |
+## 🔧 Deep dive 2: Recover checkout across the database/provider boundary — 8 minutes
 
-### Order Archival Process
+### Decision: durable attempt identity and payment reconciliation
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      archiveOldOrders() - Monthly Job                                │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Cutoff: created_at < NOW() - 2 years                                                │
-│  Batch size: 1000 orders per iteration                                               │
-│                                                                                      │
-│  For each batch:                                                                     │
-│  ├── SELECT orders WHERE created_at < cutoff                                         │
-│  │     AND archived_at IS NULL                                                       │
-│  │     AND status IN ('delivered', 'cancelled', 'refunded')                          │
-│  │     LIMIT 1000                                                                    │
-│  │                                                                                   │
-│  ├── For each order:                                                                 │
-│  │   ├── Fetch order_items                                                           │
-│  │   ├── Create archive_data JSON (order + items)                                   │
-│  │   │                                                                               │
-│  │   ├── INSERT INTO orders_archive (order_id, user_id, archive_data, ...)          │
-│  │   │                                                                               │
-│  │   └── UPDATE orders SET                                                           │
-│  │         archived_at = NOW(),                                                      │
-│  │         archive_status = 'archived',                                              │
-│  │         shipping_address = { anonymized: true },                                 │
-│  │         billing_address = NULL,                                                   │
-│  │         notes = NULL                                                              │
-│  │                                                                                   │
-│  └── Log: { archived: batch.length, event: "order_archival" }                       │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+> “I would promise that one unchanged checkout attempt resolves to one order, and
+> that each provider operation is recovered safely. I would not promise that a
+> distributed request is delivered exactly once.”
 
----
+The client supplies a stable key for the accepted intent. The server scopes it to
+the buyer and compares a request fingerprint, including the quote and relevant
+purchase details. The same key with different contents is a conflict.
 
-## 📊 Deep Dive 6: Observability
+Within the order transaction, create or lock that attempt, reserve stock, snapshot
+the order and persist work for the payment coordinator. A duplicate returns the
+existing attempt/order or its pending state. A crash after commit does not erase
+the relationship between the key and the order.
 
-### Prometheus Metrics
+Keep prices in a deliberate money representation with currency and rounding rules.
+A quote change needs customer acceptance; the retry key must not silently cover a
+new amount that was never reviewed.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           Core Metrics                                               │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Order Metrics:                                                                      │
-│  ├── orders_total (Counter)                                                          │
-│  │   └── Labels: status (success/failed/duplicate)                                  │
-│  └── order_value_dollars (Histogram)                                                 │
-│      └── Buckets: [10, 25, 50, 100, 250, 500, 1000, 2500]                           │
-│                                                                                      │
-│  Inventory Metrics:                                                                  │
-│  ├── inventory_reservations_total (Counter)                                          │
-│  │   └── Labels: status (success/insufficient/error)                                │
-│  └── cart_abandonments_total (Counter)                                               │
-│                                                                                      │
-│  Search Metrics:                                                                     │
-│  └── search_latency_seconds (Histogram)                                              │
-│      ├── Labels: query_type, engine (elasticsearch/postgres)                        │
-│      └── Buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1]                            │
-│                                                                                      │
-│  Circuit Breaker:                                                                    │
-│  └── circuit_breaker_state (Gauge)                                                   │
-│      ├── Labels: service                                                             │
-│      └── Values: 0=closed, 1=half-open, 2=open                                      │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+### Why not make Redis the primary duplicate guard?
 
-### Alert Rules
+If Redis marks processing before the order commits, a crash can strand an unfinished
+attempt. If the order commits first, a crash before the cache update can allow another
+attempt. Independent writes do not become atomic because their normal latency is low.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           Critical Alerts                                            │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  HighCheckoutFailureRate (severity: critical)                                        │
-│  ├── Condition: failed/total > 5% for 2 minutes                                      │
-│  └── Action: Page on-call engineer                                                   │
-│                                                                                      │
-│  InventoryOversell (severity: critical)                                              │
-│  ├── Condition: inventory_oversell_total increases                                   │
-│  └── Action: Immediate investigation required                                        │
-│                                                                                      │
-│  SearchLatencyHigh (severity: warning)                                               │
-│  ├── Condition: p99 latency > 300ms for 5 minutes                                    │
-│  └── Action: Check Elasticsearch cluster health                                      │
-│                                                                                      │
-│  ElasticsearchCircuitOpen (severity: warning)                                        │
-│  ├── Condition: circuit_breaker_state{service="elasticsearch"} == 2                 │
-│  └── Action: Investigate Elasticsearch availability                                  │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+A cache hit also needs account and payload binding. Returning a response solely by a
+global caller-supplied key risks exposing another buyer's order or applying the wrong
+intent. Fast lookup is useful only after the contract is correct.
 
----
+Redis can accelerate durable lookup, but database uniqueness/transactions establish
+the invariant. The cost is a persistent attempt table, retention policy and recovery
+logic. For purchases, those are fundamental records rather than optional optimization.
 
-## 🗄️ Database Schema Highlights
+### Provider calls happen outside stock transactions
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              products Table                                          │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Columns:                                                                            │
-│  ├── id: SERIAL PRIMARY KEY                                                          │
-│  ├── seller_id: INTEGER (FK → sellers, CASCADE)                                      │
-│  ├── title: VARCHAR(500) NOT NULL                                                    │
-│  ├── slug: VARCHAR(500) UNIQUE NOT NULL                                              │
-│  ├── description: TEXT                                                               │
-│  ├── category_id: INTEGER (FK → categories, SET NULL)                                │
-│  ├── price: DECIMAL(10,2) NOT NULL                                                   │
-│  ├── rating: DECIMAL(2,1) DEFAULT 0                                                  │
-│  ├── review_count: INTEGER DEFAULT 0                                                 │
-│  ├── is_active: BOOLEAN DEFAULT true                                                 │
-│  └── created_at, updated_at: TIMESTAMP                                               │
-│                                                                                      │
-│  Indexes:                                                                            │
-│  ├── idx_products_category: B-tree on category_id                                   │
-│  ├── idx_products_price: B-tree on price                                             │
-│  ├── idx_products_rating: B-tree on rating                                           │
-│  └── idx_products_search: GIN on to_tsvector(title || description)                  │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+Create a stable provider operation identity before the network call. Authorization,
+capture, void and refund are different operations with separate progress. The exact
+capture point is a business decision; it is not implied by receiving an order request.
 
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              orders Table                                            │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│  Columns:                                                                            │
-│  ├── id: SERIAL PRIMARY KEY                                                          │
-│  ├── user_id: INTEGER (FK → users, SET NULL)                                         │
-│  ├── status: VARCHAR(30) DEFAULT 'pending'                                           │
-│  ├── total: DECIMAL(10,2) NOT NULL                                                   │
-│  ├── shipping_address: JSONB NOT NULL                                                │
-│  ├── idempotency_key: VARCHAR(255) UNIQUE  ◄── Exactly-once guarantee              │
-│  ├── archive_status: VARCHAR(20) DEFAULT 'active'                                    │
-│  ├── archived_at: TIMESTAMP                                                          │
-│  └── created_at: TIMESTAMP DEFAULT NOW()                                             │
-│                                                                                      │
-│  Indexes:                                                                            │
-│  ├── idx_orders_idempotency: B-tree on idempotency_key                              │
-│  └── idx_orders_archive_status: B-tree on archive_status                            │
-│                                                                                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
+If the provider times out, its outcome is unknown. Query the provider or process its
+authenticated callback using the same operation reference. Do not immediately create
+a new charge or assume that rollback of PostgreSQL would undo external payment.
 
----
+The coordinator can retry safe operations within the provider's contract. After a
+process restart, durable pending/unknown records identify work to reconcile. A
+periodic scan backs up event delivery so a missed callback does not strand the order.
 
-## ⚖️ Trade-offs Summary
+### Payment and cancellation can race
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Inventory model | Reserved quantity | Decrement on add | Prevents overselling, allows cart expiration |
-| Search engine | Elasticsearch + PG fallback | PostgreSQL only | Performance at scale, graceful degradation |
-| Recommendations | Batch precompute | Real-time ML | Simplicity, cache-friendly, acceptable staleness |
-| Order idempotency | Redis + PostgreSQL | PostgreSQL only | Fast duplicate detection, durable backup |
-| Cart storage | PostgreSQL + cache | Redis only | Durability for inventory reservations |
-| Archival | Tiered (hot/warm/cold) | Keep all in PostgreSQL | Cost efficiency, query performance |
+Suppose an owner cancels while payment authorization is in flight. Cancellation
+records a conditional transition and any compensation required. A late success must
+check that state before confirming the order.
 
----
+If stock was released, the system cannot blindly confirm against the old allocation.
+It either follows an explicit reallocation policy or voids/refunds the authorization.
+The frontend sees the current state, including compensation pending when necessary.
 
-## 🔮 Future Backend Enhancements
+Similarly, fulfillment transitions need eligibility rules. An admin accepting any
+status string can reopen a cancelled order without restoring its payment/allocation
+history. Administrative exceptions still require domain operations and an audit trail.
 
-| Enhancement | Complexity | Value |
-|-------------|------------|-------|
-| Kafka for async processing | Medium | Decouple checkout from inventory |
-| Read replicas for catalog | Low | Distribute read load |
-| Order sharding by user_id/date | High | Horizontal scaling |
-| Real-time ML recommendations | High | Personalization improvement |
-| Geo-distributed inventory | High | Multi-region fulfillment |
-| Token bucket rate limiting | Low | Flash sale protection |
-| Saga pattern for checkout | Medium | Distributed transactions |
+### Events and audit share the durability boundary
 
----
+Write an outbox event with each committed business change. Publication can repeat;
+consumers deduplicate by event and effect identity, and reject obsolete versions.
+A notification consumer and a fulfillment consumer do not share one global “seen”
+flag that lets the first consumer suppress the other.
 
-## 🎤 Interview Wrap-up
+Critical audit records should be transactional or recoverable through that outbox.
+Best-effort logging after commit is useful diagnostics, but may miss the very event
+we need to explain an incident. Tamper evidence requires more than a table name.
 
-> "We've designed an e-commerce backend that handles 1M orders/day with strong inventory consistency. The reserved quantity model with row-level locking prevents overselling. Multi-layer idempotency (Redis + database UNIQUE constraint) ensures exactly-once order processing. Elasticsearch with PostgreSQL fallback via circuit breaker provides sub-100ms search with graceful degradation. Batch-computed 'also bought' recommendations are cached in Redis for low-latency retrieval. The observability stack catches issues like checkout failures and inventory oversells before they impact customers."
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Durable attempt plus provider-operation recovery | Handles duplicate delivery and ambiguous results | Pending states, reconciliation and compensation |
+| ❌ Cache flag plus synchronous payment assumption | Short happy-path checkout | Crash windows and no reliable answer after a timeout |
+
+## 🔧 Deep dive 3: Search is a projection with a failure budget — 8 minutes
+
+### Decision: versioned indexing and bounded degraded search
+
+> “I would let search be eventually consistent because discovery tolerates a little
+> delay. I would never let an old search document authorize a price or stock sale.
+> That separation makes independent read scaling possible.”
+
+The authoritative catalog emits versioned changes through the outbox. Index workers
+project product text, categories, price, rating and stock summaries. Inventory and
+rating changes need projection updates too; indexing only product edits leaves
+important fields stale indefinitely.
+
+Workers handle retries and out-of-order events. A product version or authoritative
+re-read prevents an older event from replacing newer data. Deletion/deactivation has
+a defined tombstone/removal path, including during full index rebuilds.
+
+### Why not query the transactional database for every search?
+
+PostgreSQL can perform text search and aggregations. At large search volume, separate
+index capacity gives us workload isolation and specialized relevance tuning without
+competing directly with allocation transactions.
+
+The price is another data model and a synchronization pipeline. We need lag metrics,
+rebuild tooling and parity tests for filters, not just a script that logs how many
+products it attempted to send.
+
+A bulk indexing response may contain individual failures. Check those results and
+retry/reconcile them. A top-level successful HTTP call is not proof that every document
+was accepted. A rebuild must also remove obsolete documents, not only upsert survivors.
+
+### Search and facets form one contract
+
+Normalize filters and bound request cost, pagination depth and aggregation sizes.
+Use stable ordering; large offset pages eventually need a cursor/search snapshot
+strategy if deep browsing is a real requirement.
+
+Decide whether each facet count includes its own selected filter. The frontend needs
+that meaning and explicit range values, not labels it must parse back into query
+parameters. Results and counts should describe the same filtering contract.
+
+A category hierarchy also needs a decision: exact-category matching or descendant
+expansion. A parent category's count cannot silently mean something different from
+the product list shown when the user selects it.
+
+### Why not fall back whenever search returns zero products?
+
+An empty result can be correct, including an out-of-range page. Treating emptiness as
+an outage mixes relevance engines and can change results, counts and filters between
+pages. Failures and valid empty results need distinct response states.
+
+On an Elasticsearch failure, a limited PostgreSQL fallback can preserve supported
+text and basic filters. It needs its own concurrency budget and query deadline.
+At tens of thousands of searches per second, unrestricted fallback can overload the
+same database whose checkout availability we intended to protect.
+
+If capacity is exhausted, return a useful temporary search limitation or cached
+public result where appropriate. Availability is bounded by real resources; a fallback
+does not guarantee that search can never fail.
+
+### Cache and recommendation boundaries
+
+Cache public product descriptions longer than volatile stock. Invalidate/version the
+relevant entries when catalog changes commit, and account for old fills arriving after
+invalidation. A TTL limits some staleness but is not a complete synchronization protocol.
+
+Start recommendations with a co-purchase batch over eligible orders and a defined
+window. Publish a complete versioned top-K set so old peers disappear when no longer
+eligible. Cache IDs/ranking, then hydrate only active products without losing order.
+
+A batch trades freshness for operational simplicity. Incremental updates can improve
+freshness without requiring GPUs or a complex online model. Choose them when the
+batch window or product needs justify the extra event/state machinery.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Versioned index and bounded fallback | Independent read scale with controlled degradation | Projection maintenance and explicit consistency limits |
+| ❌ Manual copies and unlimited fallback | Easy initial setup | Stale fields, obsolete documents and cascading database load |
+
+## 📈 Operations, security and scale — 4 minutes
+
+Protect APIs with session validation, resource ownership and admission controls.
+Seller role is not authorization to update every seller's offer. Private attempt and
+order lookups bind to the authenticated buyer; administrative diagnostics also need
+an explicit access policy.
+
+Measure stock conflicts separately from server faults. Track held/consumed/released
+balance, unresolved payment age, outbox/index lag and fallback saturation. Declared
+counters that no business path updates do not establish that overselling never occurred.
+
+Partition when measured pressure requires it. Multi-item checkout across independent
+stock shards introduces durable coordination and compensation; keep the single-database
+transaction while it is sufficient. Failover must fence old stock writers before
+another writer allocates the same balance.
+
+Retention needs a tested lifecycle: eligibility, archive write, retrieval, removal and
+all relevant copies. A JSON archive table in the same PostgreSQL instance is not
+inherently cold storage or a smaller hot table. Requirements depend on the data and
+applicable obligations; there is no universal retention duration for every storefront.
+
+## ✅ Verify the invariants — 4 minutes
+
+I would prioritize adversarial sequences rather than only happy-path route tests:
+
+1. Two buyers compete for the last unit and across several warehouses.
+2. A hold expires while checkout, renewal or cancellation tries to change it.
+3. Multiple workers repeat expiry and event delivery.
+4. The API loses its connection during commit, then receives the same attempt again.
+5. The provider succeeds before a timeout, or sends success after cancellation.
+6. Index events arrive out of order and a bulk response contains partial failures.
+7. Elasticsearch fails under load while checkout still needs database capacity.
+
+Also test account/payload binding for idempotency keys, seller ownership, quote changes,
+and restoration of archived orders. Verify invariants in the durable records, not
+only the HTTP status returned by the first request.
+
+The local repository exposes these learning points clearly: cart and stock checks
+are not atomic, the order key is not unique, payment fallback has no worker, and
+search bypasses the breaker helper. Those gaps are documented as current behavior,
+not hidden behind the production diagram.
+
+> “The design scales by separating read projections from purchase authority. Its
+> correctness comes from explicit allocation records, durable attempt identity and
+> recoverable external effects. That gives us a clear answer when a buyer asks what
+> happened after an ordinary network failure.”

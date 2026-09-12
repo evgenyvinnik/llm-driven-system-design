@@ -1,439 +1,384 @@
-# Amazon E-Commerce - System Design Answer (Frontend Focus)
+# Amazon — Frontend System Design
 
-*45-minute system design interview format - Frontend Engineer Position*
+*A 45-minute discussion of product discovery, trustworthy cart state and checkout recovery.*
 
-## Opening Statement
+This answer proposes a production storefront. The repository currently uses a
+client-rendered React application with simpler fetching and simulated payment;
+[architecture.md](./architecture.md) records the actual implementation.
 
-"Today I'll design the frontend architecture for an e-commerce platform like Amazon. The key frontend challenges are building a performant product browsing experience with faceted search, implementing a real-time shopping cart with inventory feedback, creating a seamless checkout flow, and displaying personalized recommendations. I'll focus on component architecture, state management patterns, and optimizing the critical rendering path for conversion."
+## 📋 Start with the shopper's decisions — 4 minutes
 
----
+> “I would design around three questions: can I find the right product, can I trust
+> the price and availability shown, and can I tell whether my purchase succeeded?
+> Those questions matter more than selecting a state library at the start.”
 
-## Requirements Clarification
+The main journey is search or category browsing, product details, cart, checkout and
+order confirmation. I would include reviews and item-to-item recommendations, but
+keep their failures separate from the core purchase path.
 
-### Functional Requirements
+The interviewer may also want a seller/admin experience. I would clarify that scope,
+then keep this discussion on the shopper while ensuring backend permissions remain
+independent of which controls the storefront happens to display.
 
-1. **Product Browsing**: Category navigation, search with filters, product detail pages
-2. **Shopping Cart**: Add/remove items, quantity updates, inventory warnings
-3. **Checkout Flow**: Multi-step checkout with address, payment, confirmation
-4. **Order History**: View past orders and order status
-5. **Recommendations**: Display "customers also bought" and personalized suggestions
+Assume a large catalog, substantial mobile traffic and many anonymous visitors.
+Users arrive directly on product/search URLs, switch networks, open several tabs,
+and sometimes reload after submitting payment. Those are normal design inputs.
 
-### Non-Functional Requirements
+I would target the 75th percentile of field experience at LCP no more than 2.5 seconds,
+INP no more than 200 ms and CLS no more than 0.1, measured separately for mobile and
+desktop. These are performance goals, not measured properties of this demo.
+[Core Web Vitals guidance](https://web.dev/articles/vitals?hl=en).
 
-- **Performance**: LCP < 2.5s for product pages, FID < 100ms
-- **Responsiveness**: Full mobile support (60%+ of e-commerce traffic)
-- **Accessibility**: WCAG 2.1 AA compliance
-- **Offline Support**: Cart persistence, cached product data
-- **Conversion Optimization**: Minimize checkout friction
+For correctness, displayed inventory is a recent observation, not an allocation.
+Putting an item in a cart does not necessarily reserve it. The interface should
+explain the product's actual hold policy instead of implying a promise from a badge.
 
-### Scale Considerations
+I would exclude real payment-field implementation and tax rules from the whiteboard.
+We integrate a provider's payment component/reference and a server-calculated quote.
+The storefront does not need to receive raw card details to orchestrate checkout.
 
-| Metric | Target |
-|--------|--------|
-| Product Pages | 100M+ (static generation not feasible) |
-| Concurrent Users | 500K |
-| Cart Updates | Real-time feedback |
-| Search Results | < 200ms perceived latency |
-
----
-
-## High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    React Application                             │
-├─────────────────────────────────────────────────────────────────┤
-│  TanStack Router (file-based routing)                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌────────────┐ │
-│  │   Layout    │ │   Product   │ │    Cart     │ │  Checkout  │ │
-│  │   Shell     │ │   Catalog   │ │   Drawer    │ │    Flow    │ │
-│  └─────────────┘ └─────────────┘ └─────────────┘ └────────────┘ │
-│                                                                  │
-├─────────────────────────────────────────────────────────────────┤
-│  State Management (Zustand)                                      │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐               │
-│  │  cartStore  │ │ searchStore │ │  userStore  │               │
-│  └─────────────┘ └─────────────┘ └─────────────┘               │
-├─────────────────────────────────────────────────────────────────┤
-│  Data Layer                                                      │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  TanStack Query (caching, prefetching, optimistic updates)  ││
-│  └─────────────────────────────────────────────────────────────┘│
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  API Client (fetch wrapper with retry, error handling)      ││
-│  └─────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Deep Dive 1: Product Search with Faceted Filtering
-
-### Search Results Component
-
-The SearchResults component uses TanStack Virtual for efficient rendering of large result sets with infinite scroll:
+## 🏗️ Draw the page and data boundaries — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  SearchResults Layout                                            │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────────────────────────────────┐ │
-│  │   Facets     │  │  Results Header                          │ │
-│  │   Sidebar    │  │  "X,XXX results for 'query'"  [Sort ▼]   │ │
-│  │   (w-64)     │  ├──────────────────────────────────────────┤ │
-│  │              │  │                                          │ │
-│  │  Category    │  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐        │ │
-│  │  ☑ Electronics│  │  │Card │ │Card │ │Card │ │Card │        │ │
-│  │  ☐ Books     │  │  └─────┘ └─────┘ └─────┘ └─────┘        │ │
-│  │              │  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐        │ │
-│  │  Price       │  │  │Card │ │Card │ │Card │ │Card │        │ │
-│  │  [====○====] │  │  └─────┘ └─────┘ └─────┘ └─────┘        │ │
-│  │  $0 - $1000  │  │                                          │ │
-│  │              │  │  (Virtualized - only visible rendered)   │ │
-│  │  Brand       │  │                                          │ │
-│  │  ☑ Apple     │  │  ┌──────────────────────────────────┐   │ │
-│  │  ☐ Samsung   │  │  │  Loading more... (infinite)      │   │ │
-│  │              │  │  └──────────────────────────────────┘   │ │
-│  │  Rating      │  │                                          │ │
-│  │  ★★★★☆ & up  │  └──────────────────────────────────────────┘ │
-│  │              │                                               │
-│  │  Availability│                                               │
-│  │  ☑ In Stock  │                                               │
-│  │              │                                               │
-│  │  [Clear All] │                                               │
-│  └──────────────┘                                               │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ Storefront shell: navigation, account state, cart summary          │
+├──────────────────────┬──────────────────────┬────────────────────┤
+│ Discovery            │ Purchase             │ After purchase     │
+│ Search / product     │ Cart / checkout      │ Order status       │
+│ Public cached data   │ Private current data │ Recoverable result │
+└───────────┬──────────┴──────────┬───────────┴─────────┬──────────┘
+            │                     │                     │
+┌───────────▼─────────────────────▼─────────────────────▼──────────┐
+│ Data layer: query identity, cancellation, errors, mutation status │
+└───────────┬─────────────────────┬─────────────────────┬──────────┘
+            ▼                     ▼                     ▼
+┌────────────────────┐  ┌───────────────────┐  ┌──────────────────┐
+│ Catalog/search API │  │ Cart/quote API    │  │ Checkout/status  │
+│ Stale reads allowed│  │ Versioned snapshot│  │ Stable attempt ID│
+└────────────────────┘  └───────────────────┘  └──────────────────┘
 ```
 
-**SearchFilters Interface:**
-- query: Search text
-- category: Selected category filter
-- priceMin/priceMax: Price range bounds
-- brands: Array of selected brand filters
-- rating: Minimum star rating
-- inStock: Boolean availability filter
+Public product metadata can be rendered and cached close to the visitor. I would
+use server rendering with selective revalidation for indexable product/category
+pages rather than rebuild the entire catalog whenever one offer changes.
 
-**Implementation Details:**
-- Uses `useSearchParams` from TanStack Router to sync filters with URL
-- `useSearchProducts` hook returns paginated data with `useInfiniteQuery`
-- `useVirtualizer` with 280px estimated row height and overscan of 5
-- Infinite scroll triggers `fetchNextPage` when last virtual item is visible
-- Loading state shows `SearchResultsSkeleton`
+A large catalog does not rule out static output; it rules out eagerly rebuilding
+every page for every update. On-demand generation or caching can serve popular pages,
+while long-tail pages render when requested. The choice needs cache-key discipline.
 
-### Facets Sidebar
+Cart, account and checkout data are private and have a different freshness policy.
+They must not leak into a shared HTML cache. Public rendering can provide a stable
+shell while the authenticated cart summary loads independently.
 
-The FacetsSidebar component displays filter options with counts:
+Within React, I would separate the route shell, discovery modules and purchase modules.
+The cart summary and checkout share a server snapshot, not two independently calculated
+versions of what the shopper intends to buy.
 
-**Category Facet:** List of checkboxes with document counts, single-select behavior
+The backend owns stock allocation, price calculation and payment state. The frontend
+owns interaction state, useful pending feedback and reconciliation with those answers.
+A fast optimistic animation cannot establish that stock is reserved.
 
-**Price Range Facet:**
-- Slider component for continuous range selection (0-1000)
-- Quick-select buttons for predefined ranges with counts
+## 💾 Assign each state one owner — 4 minutes
 
-**Brand Facet:** Multi-select checkboxes, limited to top 10 brands
+| State | Owner | Reason |
+|-------|-------|--------|
+| Query, selected filters, sort and page/cursor | URL | Shareable links and browser history |
+| Product, review and recommendation results | Query cache | Independent freshness and loading/error boundaries |
+| Confirmed cart and quote | Account-scoped server state | Prices, limits and cart version come from the authority |
+| Unsaved address and quantity draft | Local form state | Immediate editing without pretending persistence |
+| Checkout attempt and its status | Durable server record plus client reference | Recover after reload or a lost response |
+| Open filters, selected thumbnail, dialog focus | Local UI state | Short-lived interaction details |
 
-**Rating Filter:** Star rating buttons (4, 3, 2, 1) with "& up" label
+A query-cache library can handle request deduplication and invalidation. A small
+Zustand store can coordinate shell state. I would choose those tools because of
+these responsibilities, not store the same product and cart data in both.
 
-**Availability Filter:** Single checkbox for "In Stock Only"
+Query identity includes every parameter that changes the result. Private results also
+include account identity. On account change, cancel work, discard private cached
+results and reject late responses from the previous account generation.
 
-**Clear Filters:** Shown when any filters are active, resets all to defaults
+Types help developers pass the expected shape, but do not remove runtime values.
+A serializer must explicitly omit absent filters; casting an object to a string map
+does not stop `undefined` from becoming a literal query-string value.
 
-**Filter Change Handler:** Updates URL search params - sets value for single, appends for arrays, deletes for null
+For purchase mutations, retain structured errors such as stock conflict, revised
+quote, authentication needed and unknown payment outcome. Reducing every failure to
+one message string deprives the UI of the information needed to recover safely.
 
----
+## 🔧 Deep dive 1: Search should survive navigation and partial failure — 8 minutes
 
-## Deep Dive 2: Shopping Cart with Real-Time Inventory
+### Decision: URL-driven filters with bounded result pages
 
-### Cart Store (Zustand)
+> “I would make search a navigable document, not a transient list hidden in a store.
+> A shopper should be able to open a product, go back and find the same filter choices
+> and approximate place in the results.”
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  CartStore State                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  State                                                           │
-│  ├─ items: CartItem[]                                           │
-│  │   └─ productId, title, price, quantity, image                │
-│  │   └─ maxQuantity, reservedUntil                              │
-│  ├─ isOpen: boolean                                             │
-│  ├─ isLoading: boolean                                          │
-│  └─ error: string | null                                        │
-├─────────────────────────────────────────────────────────────────┤
-│  Actions                                                         │
-│  ├─ openCart() / closeCart()                                    │
-│  ├─ addItem(product, quantity) → POST /api/cart/items           │
-│  │   └─ Handles INSUFFICIENT_INVENTORY error                    │
-│  ├─ updateQuantity(productId, qty) → PATCH with optimistic      │
-│  │   └─ Rollback on failure                                     │
-│  ├─ removeItem(productId) → DELETE with optimistic              │
-│  ├─ clearCart()                                                 │
-│  └─ syncWithServer() → GET /api/cart                            │
-├─────────────────────────────────────────────────────────────────┤
-│  Computed                                                        │
-│  ├─ totalItems() → sum of quantities                            │
-│  ├─ subtotal() → sum of price × quantity                        │
-│  └─ hasExpiredReservations() → any reservedUntil < now          │
-├─────────────────────────────────────────────────────────────────┤
-│  Persistence                                                     │
-│  └─ localStorage 'amazon-cart' with partialize (items only)     │
-└─────────────────────────────────────────────────────────────────┘
-```
+The URL holds the committed query, filter set, sort order and pagination state.
+Typing is a local draft; submitting or a deliberate debounced search commits it.
+Autocomplete has a separate, lightweight request and does not require fetching a
+full product grid on each keystroke.
 
-**AddItem Flow:**
-1. Set loading state, clear error
-2. POST to /api/cart/items with productId and quantity
-3. Handle INSUFFICIENT_INVENTORY error with available count message
-4. On success: Update items array (add new or increment existing)
-5. Store reservation expiry timestamp
-6. Open cart drawer
+I would use bounded pages initially. A page of twenty or forty cards is manageable
+without virtualization. For a long continuous browsing experience, virtualization
+becomes useful, but then focus, scroll restoration and screen-reader navigation
+need explicit handling.
 
-**Optimistic Update Pattern:**
-1. Store previous state
-2. Apply optimistic update immediately
-3. Make API request
-4. On failure: Rollback to previous state and set error
+### Why not begin with infinite scroll everywhere?
 
-### Cart Drawer Component
+It can encourage exploration, but makes a stable result position harder to recover
+and can keep a footer or comparison workflow out of reach. Appending indefinitely
+also grows memory unless both data retention and rendering are bounded.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Cart Drawer (Sheet from right, max-w-lg)                        │
-├─────────────────────────────────────────────────────────────────┤
-│  Shopping Cart (X)                               [×]            │
-├─────────────────────────────────────────────────────────────────┤
-│  ⚠ Reservation Warning (if expired items)                       │
-│  "Some items may no longer be reserved..."                       │
-├─────────────────────────────────────────────────────────────────┤
-│  Cart Items List (scrollable)                                    │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │  ┌──────┐  Product Title (line-clamp-2)                    │ │
-│  │  │ img  │  $XX.XX                                          │ │
-│  │  └──────┘  ⚠ Only X left (if low stock)                    │ │
-│  │            ⚠ Reservation expired (if expired)              │ │
-│  │            [- 1 +]  Remove                                 │ │
-│  ├────────────────────────────────────────────────────────────┤ │
-│  │  ... more items ...                                        │ │
-│  └────────────────────────────────────────────────────────────┘ │
-├─────────────────────────────────────────────────────────────────┤
-│  Subtotal                                      $XXX.XX          │
-│  Shipping and taxes calculated at checkout                      │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │         Proceed to Checkout                                │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-```
+Pagination trades a deliberate next-page action for simpler URLs, predictable result
+size and easier back navigation. If product research favors continuous scroll, I
+would preserve a recoverable cursor and scroll anchor rather than abandon those needs.
 
-**CartItemRow Features:**
-- Low stock indicator: Shows "Only X left" when maxQuantity <= 3
-- Expired indicator: Dims item and shows "Reservation expired" message
-- QuantitySelector: Disabled when reservation expired
-- Remove button: Triggers optimistic removal
+### Filter changes are one transition
 
-**Empty Cart State:**
-- Shopping bag icon
-- "Your cart is empty" message
-- "Continue Shopping" link to close drawer
+Changing a price range changes both boundaries and resets pagination. Send that as
+one URL update derived from the latest state. Two separate navigations can each use
+the same old object, causing the second change to erase the first.
 
----
+Normalize and validate URL input: allowed sort values, numeric bounds and bounded
+page sizes. Avoid rewriting equivalent queries endlessly. Keep the search input in
+sync when browser history or an external link changes the committed query.
 
-## Deep Dive 3: Product Detail Page
+A new request is keyed by the normalized query. Cancel obsolete requests where
+possible and apply results only to the matching query identity. Debouncing reduces
+request volume; it does not prevent an older response from arriving last.
 
-### Product Page Layout
+When refreshing, the UI can keep previous results visible with a clear updating state.
+They should not silently appear to satisfy new filters. An error must not look like
+a successful “No products found” result.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Breadcrumbs: Home > Category > Subcategory                      │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────────────┐  ┌──────────────────────────────────┐ │
-│  │  Thumbnails  Main    │  │  Product Title                   │ │
-│  │  ┌──┐      ┌──────┐  │  │  ★★★★☆ (X,XXX reviews)           │ │
-│  │  │01│      │      │  │  │                                  │ │
-│  │  └──┘      │      │  │  │  $̶X̶X̶.̶X̶X̶ (if compare price)      │ │
-│  │  ┌──┐      │ ZOOM │  │  │  $XX.XX                          │ │
-│  │  │02│      │      │  │  │                                  │ │
-│  │  └──┘      │      │  │  │  ✓ In Stock / ✗ Out of Stock    │ │
-│  │  ┌──┐      │      │  │  │  ⚠ Only X left (if low)         │ │
-│  │  │03│      └──────┘  │  │                                  │ │
-│  │  └──┘                │  │  [- 1 +]  [ Add to Cart ]        │ │
-│  └──────────────────────┘  │                                  │ │
-│                            │  Product Details                 │ │
-│                            │  Brand: Apple                    │ │
-│                            │  Model: iPhone 15                │ │
-│                            │  Color: Black                    │ │
-│                            └──────────────────────────────────┘ │
-├─────────────────────────────────────────────────────────────────┤
-│  About this item                                                 │
-│  Product description HTML content...                             │
-├─────────────────────────────────────────────────────────────────┤
-│  Customers also bought                                           │
-│  ◄ [ Product Carousel with recommendation cards ] ►             │
-├─────────────────────────────────────────────────────────────────┤
-│  Reviews Section                                                 │
-│  ProductReviews component                                        │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Facets have an API contract
 
-**Data Loading:**
-- Primary query: `['product', productId]` fetches product details
-- Secondary query: `['recommendations', productId]` enabled when product loaded
+The API returns labels, stable filter values and counts. The client should not parse
+a label like “$25–$50” to guess numeric boundaries; labels may be translated and the
+upper-bound rule may differ from a shopper's interpretation.
 
-**Add to Cart Handler:**
-1. Set adding state to true
-2. Call cartStore.addItem with product and selectedQuantity
-3. Show toast error on failure
-4. Reset adding state
+I would agree whether category counts reflect all active filters or exclude the
+category filter itself. Selected values remain visible even when their count is zero
+or a degraded response omits the corresponding aggregation.
 
-**Availability States:**
-- In Stock: Green checkmark with "In Stock"
-- Low Stock: Green checkmark with "Only X left" (quantity <= 5)
-- Out of Stock: Red X with "Out of Stock", quantity selector hidden
+When the server falls back to a simpler search engine, the response identifies which
+filters remain supported. We can keep a useful product list and explain unavailable
+facets. Quietly dropping the rating filter would violate the shopper's request.
 
-### Image Gallery with Zoom
+### Render the critical content first
 
-**Layout:** Vertical thumbnail strip (64x64px) on left, main image (aspect-square) on right
+Prioritize the visible product image and title. Reserve image dimensions, provide
+responsive sizes, and lazy-load below-the-fold images. Making the primary image lazy
+can delay the largest visible content, so loading policy depends on placement.
 
-**Thumbnail Selection:** Click to select, blue border indicates active
+On a product page, primary product data must not wait for recommendations or reviews.
+Those sections can render independently with bounded placeholders or a retry action.
+A recommendation outage should not turn an existing product into “not found.”
 
-**Zoom Behavior:**
-- Mouse enter: Enable zoom mode
-- Mouse move: Calculate position as percentage of container
-- Transform: Scale 1.5x with transform-origin at cursor position
-- Mouse leave: Disable zoom, reset transform
+Prefetch likely navigation after intent or idle time, within a budget. Prefetching
+all results can waste a mobile data connection and compete with the page being read.
 
----
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ URL state and bounded pages | Shareable, recoverable browsing with controlled work | Explicit pagination and query normalization |
+| ❌ Store-only infinite results initially | Simple continuous browsing demo | Harder history, focus and memory management |
 
-## Deep Dive 4: Checkout Flow
+## 🔧 Deep dive 2: A responsive cart still needs a confirmed snapshot — 8 minutes
 
-### Multi-Step Checkout
+### Decision: distinguish an edit from an accepted cart change
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Checkout Progress                                               │
-│  ● Shipping ─────○ Payment ─────○ Review                        │
-│    (active)       (pending)      (pending)                       │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌────────────────────────────────────┐  ┌────────────────────┐ │
-│  │  Step Content (lg:col-span-2)      │  │  Order Summary     │ │
-│  │                                    │  │                    │ │
-│  │  [ShippingStep]                    │  │  Item 1    $XX.XX  │ │
-│  │  or                                │  │  Item 2    $XX.XX  │ │
-│  │  [PaymentStep]                     │  │  ──────────────    │ │
-│  │  or                                │  │  Subtotal  $XX.XX  │ │
-│  │  [ReviewStep]                      │  │  Shipping  $X.XX   │ │
-│  │                                    │  │  ──────────────    │ │
-│  │                                    │  │  Total     $XX.XX  │ │
-│  └────────────────────────────────────┘  └────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-```
+> “I would let the shopper see that their click registered immediately, while keeping
+> a distinction between the quantity they are requesting and the quantity the server
+> accepted. Otherwise an optimistic cart can overstate what we can sell.”
 
-**Step State Machine:**
-- shipping → payment (on address completion)
-- payment → review (on payment method selection)
-- review → confirmation page (on order placement)
+An ordinary cart is purchase intent. In this proposal, stock is held briefly when
+checkout begins. The product page can show a recent availability summary, while the
+cart warns that final availability and price are checked at checkout.
 
-**State Management:**
-- step: Current checkout step
-- shippingAddress: Completed address or null
-- paymentMethod: Selected payment or null
+For quantity edits, display a local draft/pending state and send the intended absolute
+quantity with the cart version. The response contains a new authoritative snapshot
+and any stock/price adjustment that the shopper needs to understand.
 
-**Order Placement:**
-- Uses `useMutation` with `createOrder` function
-- On success: Clear cart, navigate to confirmation page
-- On error: Show toast with error message
+A UI may optimistically update a quantity label, but totals based on unconfirmed
+price/availability should remain visibly provisional. The server calculates the
+confirmed subtotal and later the shipping/tax quote.
 
-### Shipping Step
+### Why not snapshot the whole store and roll it back on error?
 
-**Saved Addresses Section:**
-- Query for user's saved addresses
-- Display as clickable cards with name and formatted address
-- Click fills form and completes step
+Suppose the shopper changes quantity, then removes another item before the first
+request fails. Restoring a saved copy of the entire old cart can undo the later
+successful removal. That rollback is not tied to the operation that failed.
 
-**Address Form Schema (Zod):**
-- fullName: Required, min 1 char
-- addressLine1: Required
-- addressLine2: Optional
-- city: Required
-- state: Required
-- zipCode: Regex pattern for 5 or 9 digit ZIP
-- country: Required
-- phone: Regex pattern for phone numbers
+I would either serialize mutations per cart/line or use an operation log that rebases
+pending edits over each confirmed version. For an initial storefront, a short per-line
+queue and bounded pending controls are usually simpler to explain and debug.
 
-**Form Implementation:**
-- Uses React Hook Form with Zod resolver
-- Autocomplete attributes for browser autofill
-- "Continue to Payment" button on submit
+A stale response cannot replace a newer confirmed cart version. After a conflict,
+refresh the authoritative snapshot and ask the shopper to review material changes.
+Do not repeatedly auto-retry a disputed quantity while hiding the conflict.
 
----
+### More than one tab or account
 
-## Deep Dive 5: Performance Optimization
+Server versions handle concurrent edits from another tab/device. Cross-tab hints can
+prompt a refresh, but the database remains the authority. A browser message is not
+proof of a stock reservation or the current quote.
 
-### Route Prefetching
+On logout, clear cart display state as well as the session token. Cancel pending
+requests and guard their completion against the previous account identity. Otherwise
+another user's cart can briefly appear after a fast sign-in switch.
 
-ProductCard component prefetches product detail route on mouse hover using `router.preloadRoute()` with the product ID parameter. This ensures instant navigation when user clicks.
+For anonymous browsing, a local cart draft is an option. On sign-in, merging it with
+the account cart needs a policy for duplicates and quantities, followed by server
+validation. Local storage capacity alone is not a reason to persist private data.
 
-### Image Optimization
+### Expiry and stock messages
 
-OptimizedImage component provides:
-- **Responsive srcset**: Generates 0.5x, 1x, 1.5x, 2x variants
-- **Lazy loading**: `loading="lazy"` for below-fold images
-- **Priority loading**: `loading="eager"` for above-fold images
-- **Blur placeholder**: Gray animated pulse until image loads
-- **Decode async**: Non-blocking image decode for lazy images
+If the product promises a checkout hold, show its server-provided expiry and the
+consequence of expiration. A countdown uses a server-time estimate, but only the
+backend can decide whether an allocation remains valid.
 
-### Service Worker for Offline Cart
+The UI should not treat “available for new buyers” as the maximum total quantity a
+buyer with an existing hold may retain. The API can return the accepted quantity and
+maximum permitted adjustment explicitly, avoiding client reconstruction of stock math.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Service Worker Caching Strategy                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  Install Event                                                   │
-│  └─ Cache static assets: /, /cart, /offline.html                │
-├─────────────────────────────────────────────────────────────────┤
-│  Fetch Event Handlers                                            │
-│                                                                  │
-│  /api/cart (GET)                                                 │
-│  ├─ Try network first                                           │
-│  └─ Fallback to cached cart or empty response when offline      │
-│                                                                  │
-│  /api/products/*                                                 │
-│  ├─ Stale-while-revalidate strategy                             │
-│  ├─ Return cached immediately if available                      │
-│  └─ Update cache with network response in background            │
-└─────────────────────────────────────────────────────────────────┘
-```
+Loading, empty and failed are separate states. During a first cart fetch, render a
+loading state; showing “Your cart is empty” first creates unnecessary doubt.
+After checkout, reconcile the cart summary with the consumed cart version so the
+header does not continue advertising items already purchased.
 
----
+### Offline trade-off
 
-## State Management Summary
+An offline draft can preserve shopping intent, but cannot reserve units or establish
+a current price. I would allow clearly labelled draft edits only if the product needs
+them, then revalidate on reconnect. Checkout requires an authoritative response.
 
-> "I'm splitting state between Zustand for client-side concerns and TanStack Query for server state. This separation keeps the architecture clean and leverages each tool's strengths."
+Persisting an old cart as if it were current creates a worse failure than admitting
+that availability cannot be checked yet. Offline support also requires an explicit
+account boundary, expiry policy and conflict-resolution design.
 
-**Client State (Zustand):** Cart with localStorage persistence, auth/user preferences, recent searches, UI state (modals, drawers)
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Pending edits over a versioned cart | Responsive feedback and recoverable conflicts | Mutation sequencing and reconciliation |
+| ❌ Unqualified optimistic success and whole-store rollback | Short happy-path implementation | Lost later edits and misleading totals/stock |
 
-**Server State (TanStack Query):** Product queries, infinite search results, recommendations, order history, checkout mutations
+## 🔧 Deep dive 3: Checkout must recover from an unknown result — 8 minutes
 
----
+### Decision: model a durable purchase attempt
 
-## Trade-offs Summary
+> “Disabling Place Order helps with double-clicks, but it does not handle a lost
+> response, a browser reload or a provider timeout. I would make the purchase attempt
+> itself recoverable, then design the page around its states.”
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| State management | ✅ Zustand + TanStack Query | ❌ Redux | Simpler for cart, Query handles server cache |
-| Routing | ✅ TanStack Router | ❌ React Router | Type-safe, file-based, better prefetching |
-| Cart persistence | ✅ LocalStorage + API | ❌ Cookie | Larger capacity, works offline |
-| Image loading | ✅ Lazy + blur placeholder | ❌ Eager | Better LCP for visible, saves bandwidth |
-| Search virtualization | ✅ @tanstack/virtual | ❌ windowing | Better for variable heights |
-| Form handling | ✅ React Hook Form + Zod | ❌ Formik | Better TypeScript, validation co-location |
+The shopper reviews a server quote covering items, quantities, prices, currency,
+shipping and tax. A meaningful change creates a revised quote that requires acceptance.
+The button must not display one amount while the server silently commits another.
 
----
+Create a stable attempt reference for the accepted intent. Submit with that same
+identity on retry. Keep the reference in account-scoped recovery state so a reload
+can query the existing attempt rather than create a new purchase automatically.
 
-## Future Frontend Enhancements
+The server binds the key to the account and request fingerprint. Reusing it with a
+different address, quote or cart is a conflict, not permission to return an unrelated
+old order. A deliberately changed purchase needs a new reviewed intent.
 
-1. **React Server Components**: Server-render product pages for better SEO and LCP
-2. **Streaming SSR**: Progressive hydration for faster TTI
-3. **View Transitions API**: Smooth page transitions between products
-4. **Web Push Notifications**: Order status updates, price drop alerts
-5. **AR Product Preview**: 3D product visualization using WebXR
-6. **Voice Search**: Web Speech API for hands-free shopping
-7. **Accessibility Audit**: Full screen reader testing, keyboard navigation improvements
+### Separate interaction steps from business outcomes
+
+The address/payment/review screens are local navigation states. Submitted, payment
+pending, action required, confirmed and failed are server business states. Finishing
+a local form is not evidence that the provider authorized a payment.
+
+A state machine can express these transitions without requiring a particular library.
+The important part is the transition contract and persistence, not a diagram full
+of framework event names. In-memory machine context alone does not survive reload.
+
+After submission, show the attempt/order reference and what is known. If the response
+is lost, query status. If payment is still unresolved, explain that checking is in
+progress and avoid encouraging a second independent purchase.
+
+### Why not turn every timeout into “Payment failed — retry”?
+
+The provider may have authorized payment before the connection broke. A new operation
+could duplicate the effect. Conversely, declaring success from an API acceptance
+would mislead the shopper if payment still needs authentication or reconciliation.
+
+The backend coordinates provider idempotency and recovery. The frontend preserves
+that distinction and offers the supported next action. A retry reuses the existing
+attempt until the server establishes a terminal outcome.
+
+The cost is a pending-state experience and recovery endpoints. That is justified
+because a clear temporary uncertainty is better than a confident but incorrect
+purchase result that support later has to untangle.
+
+### Forms and payment integration
+
+Use explicit labels, autocomplete hints, field-level errors and a focused error
+summary. Validate locally for feedback and on the server for authority. Preserve
+safe form input across recoverable errors without persisting raw card information.
+
+A provider-controlled payment component handles sensitive fields and returns a
+reference. If additional authentication opens, returning to the storefront should
+resume the same attempt and re-read server state.
+
+Allow changing an address before submission; after submission, changes follow the
+server's order-edit policy. Merely moving back to the address step cannot undo an
+already accepted order or payment operation.
+
+### Cancellation and confirmation
+
+Show the server's actual order/payment status and supported actions. A cancellation
+request may be accepted while payment compensation is still pending. Its response
+should preserve or re-fetch order lines and show the current refund state.
+
+Confirmation links are durable and account-authorized. A notification or redirect
+can help navigation, but order status comes from the same authoritative record used
+by customer support and fulfillment.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Stable attempt with status recovery | Handles reloads, lost responses and unresolved payments | Pending UI and server reconciliation contract |
+| ❌ Button disabling plus a fresh request on retry | Easy form submission flow | Cannot distinguish failed requests from completed purchases |
+
+## ♿ Make the storefront usable under constraints — 4 minutes
+
+Keyboard users need independent product links and Add buttons, a labelled quantity
+control, and predictable focus after cart changes. Avoid putting interactive buttons
+inside an entire-card link. Result counts and cart confirmations can use restrained
+status announcements rather than repeatedly reading the whole page.
+
+Autocomplete needs a clear input label, keyboard navigation and dismissal behavior.
+Thumbnail buttons need names, not just decorative images. Form errors should identify
+which field needs correction without relying on color.
+
+On narrow screens, filters can move into an accessible dialog with focus restoration.
+The product title, price and main action should remain reachable without horizontal
+scrolling. Test real text lengths and zoom, not just a screenshot at one viewport.
+
+For slow devices, bound rendered results, avoid blocking input with expensive filtering,
+and defer optional modules. Measure network, rendering and interaction delay separately;
+a fast backend cannot compensate for a blocked main thread.
+
+## ✅ Verify the customer-visible guarantees — 4 minutes
+
+I would test these end-to-end behaviors before broad visual polish:
+
+1. Navigate through filters, a product and Back, preserving query and result position.
+2. Deliver search responses out of order and distinguish empty results from failure.
+3. Change both price boundaries in one action, including a shared URL with absent fields.
+4. Make overlapping cart edits and a second-tab conflict without undoing later work.
+5. Switch accounts while private requests are pending.
+6. Lose the checkout response, reload and recover the same order/attempt.
+7. Show pending payment, revised quote and refund progress without false confirmation.
+
+Performance checks combine lab diagnosis with field measurements on representative
+devices. Accessibility checks include keyboard and screen-reader journeys. Page-shell
+smoke tests alone do not prove that search filters or purchase recovery are correct.
+
+The local project offers useful examples of route-driven search, server-returned cart
+snapshots and a simple checkout. It currently lacks request/version guards, sends no
+stable checkout key and simulates payment; its implementation notes describe those
+limitations instead of presenting this proposal as already built.
+
+> “My frontend makes shopping feel responsive while keeping the boundaries honest:
+> a displayed product is discoverable, a cart is intent, and a confirmed order is a
+> server-established outcome. The state model connects those meanings to every
+> loading, retry and recovery interaction.”

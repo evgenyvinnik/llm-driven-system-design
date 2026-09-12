@@ -1,615 +1,447 @@
-# Distributed Cache - System Design Answer (Backend Focus)
+# Distributed Cache — Backend System Design
 
-## 45-minute system design interview format - Backend Engineer Position
+A 45-minute interview answer. The design below is proposed for production; the repository
+provides a smaller, single-owner teaching implementation. I would use one architecture
+diagram and explain the hard parts through concrete failure scenarios rather than write
+cache classes or configuration on the whiteboard.
 
----
+## 🎯 Clarify the cache contract — 3 minutes
 
-## 1. Requirements Clarification (3-4 minutes)
+> “Before choosing a hash ring or a replication factor, I want to know whether this data can be lost and how it can be rebuilt. That answer determines whether we are designing a cache or a durable database.”
 
-### Functional Requirements
-- **GET/SET/DELETE**: Core cache operations with string keys and arbitrary values
-- **TTL Support**: Per-key expiration with configurable time-to-live
-- **Eviction**: LRU eviction when memory limits are exceeded
-- **Distribution**: Partition data across multiple nodes for scale
-- **Replication**: Data redundancy for fault tolerance
+I will assume application services cache rebuildable data from an external source of truth.
+Entries may be evicted, expire, or disappear when an owner fails. The application tolerates
+a defined amount of staleness and controls origin refill.
 
-### Non-Functional Requirements
-- **Latency**: Sub-millisecond for local cache, < 5ms for distributed reads
-- **Throughput**: 100K+ operations per second per node
-- **Availability**: 99.9% uptime, survive single node failures
-- **Consistency**: Eventual consistency with configurable guarantees
-- **Memory Efficiency**: Maximize useful cache storage, minimize overhead
+That does not make failures free. A cache normally protects something more expensive. If
+losing a node sends more work to the origin than it can handle, the cache failure becomes
+an application outage.
 
-### Scale Estimation
-- **Cache Size**: 10K entries per node, 100MB memory limit
-- **Cluster Size**: 3-10 nodes typical deployment
-- **Key Distribution**: Even spread via consistent hashing
-- **Replication Factor**: 2-3 replicas per key
+The core API is GET, SET, DELETE, and expiration. Increment can be an optional operation
+for disposable approximate counters, but I would not use it for payments, durable quotas,
+or authoritative account state.
 
----
+I would clarify typical value size, read/write ratio, working-set size, expected hot keys,
+and origin headroom. I would also ask whether a deployment must retain cached values
+through a node failure, or whether bounded cold recovery is sufficient.
 
-## 2. High-Level Architecture (5 minutes)
+For this answer I will choose one current owner per key and controlled refill after loss.
+Replication remains an explicit upgrade if origin capacity cannot support that choice. I
+will not promise that single-owner storage preserves every cached value during failure.
 
-```
-                                    ┌─────────────────┐
-                                    │   Coordinator   │
-                                    │   (Router)      │
-                                    └────────┬────────┘
-                                             │
-                    ┌────────────────────────┼────────────────────────┐
-                    │                        │                        │
-                    ▼                        ▼                        ▼
-            ┌───────────────┐        ┌───────────────┐        ┌───────────────┐
-            │  Cache Node 1 │        │  Cache Node 2 │        │  Cache Node 3 │
-            │   Port 3001   │        │   Port 3002   │        │   Port 3003   │
-            └───────────────┘        └───────────────┘        └───────────────┘
-                    │                        │                        │
-                    └────────────────────────┼────────────────────────┘
-                                             │
-                                    ┌────────▼────────┐
-                                    │  Consistent     │
-                                    │  Hash Ring      │
-                                    └─────────────────┘
-```
+The local project follows the single-owner shape and has no origin integration. It is
+useful for studying placement and cache internals, but its current migration and
+persistence helpers do not establish the production guarantees I am about to describe.
 
-### Component Responsibilities
-- **Coordinator**: Routes requests to appropriate nodes, health monitoring
-- **Cache Nodes**: Store data, handle TTL, perform eviction
-- **Hash Ring**: Determines key-to-node mapping with virtual nodes
+## 📏 Estimate what actually drives capacity — 4 minutes
 
----
+Assume 100 million entries, average value size 1 KiB, and one million operations/second at
+peak. Reads are 95% of traffic, with a 95% read hit rate. These are sizing assumptions, not
+measured project throughput.
 
-## 3. Consistent Hashing Implementation (8 minutes)
+| Quantity | Estimate | Consequence |
+|----------|----------|-------------|
+| Raw values | 102.4 GB | Before keys, metadata, and allocator overhead |
+| Values plus 200 bytes metadata/key | 122.4 GB, about 114 GiB | A starting model, not a JavaScript heap measurement |
+| Read traffic | 950,000 requests/second | Serialization and network cost matter |
+| Origin misses | 47,500 reads/second | Refill capacity is part of the design |
+| Initial node scenario | 100 nodes, 2 GiB cache budget each | Headroom for skew and maintenance |
 
-### Hash Ring with Virtual Nodes
+The average is ten thousand operations/second per node, but average load is not a capacity
+guarantee. A single key may receive more requests than an entire average node. More virtual
+nodes cannot divide one key's traffic among independent owners.
 
-The consistent hash ring uses MD5 hashing with 150 virtual nodes per physical node.
+If one failed node held 1% of previously successful hits, it adds about 9,025 origin
+requests/second. That is a meaningful increase over 47,500 baseline misses. If the node
+holds a hot key, the increase can be much larger.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         CONSISTENT HASH RING                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Data Structures:                                                          │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ ring: VirtualNode[]  ─── sorted array for binary search            │   │
-│   │   ├─ hash: number    (MD5 first 32 bits)                           │   │
-│   │   ├─ nodeId: string  (physical node identifier)                    │   │
-│   │   └─ virtualIndex: number                                          │   │
-│   │                                                                     │   │
-│   │ nodes: Map<nodeId, address>  ─── physical node lookup              │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Hash Function:                                                            │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ key ──► MD5(key) ──► first 8 hex chars ──► parseInt(hex, 16)       │   │
-│   │                                                                     │   │
-│   │ Example: "user:123" → "a3f2b1c4..." → 0xa3f2b1c4 → 2750492100      │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Operations:                                                               │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ addNode(id, address):                                               │   │
-│   │   for i = 0 to 149:                                                 │   │
-│   │     virtualKey = "{id}:{i}"                                         │   │
-│   │     ring.push({ hash: hash(virtualKey), nodeId: id, virtualIndex }) │   │
-│   │   ring.sort(by hash)                                                │   │
-│   │                                                                     │   │
-│   │ getNode(key):                                                       │   │
-│   │   keyHash = hash(key)                                               │   │
-│   │   index = binarySearch(ring, keyHash)  ─── O(log n)                │   │
-│   │   return nodes.get(ring[index % length].nodeId)                     │   │
-│   │                                                                     │   │
-│   │ getNodes(key, count):  ─── for replication                          │   │
-│   │   Walk clockwise from keyHash                                       │   │
-│   │   Collect distinct physical nodes until count reached               │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+I would validate the design with realistic size and popularity distributions. A uniform
+workload of tiny strings can hide both memory overhead and the origin pressure caused by
+skew.
 
-### Why 150 Virtual Nodes?
+For the regional data path, I would target p99 below five milliseconds for admitted
+small-value requests and 99.9% API availability. Those targets exclude origin latency and
+do not imply that every previously cached key remains a hit.
 
-| Virtual Nodes | Standard Deviation | Memory Overhead |
-|--------------|-------------------|-----------------|
-| 50           | ~8%               | Low             |
-| 100          | ~5%               | Medium          |
-| 150          | ~3%               | Medium          |
-| 500          | ~1%               | High            |
+The local scripts configure three nodes with ten thousand entries and a 100 MiB estimate
+each. Those values are convenient for exploration; they are not evidence for the production
+capacity assumptions.
 
-150 provides good balance: < 5% variance in key distribution with reasonable memory.
-
----
-
-## 4. LRU Cache with TTL (8 minutes)
-
-### Doubly-Linked List for O(1) Operations
+## 🏗️ Architecture, data model, and API — 6 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              LRU CACHE                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Data Structures:                                                          │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ cache: Map<key, CacheEntry>                                         │   │
-│   │                                                                     │   │
-│   │ CacheEntry {                                                        │   │
-│   │   key: string                                                       │   │
-│   │   value: T                                                          │   │
-│   │   size: number       ─── estimated memory (JSON.stringify length)   │   │
-│   │   createdAt: number                                                 │   │
-│   │   expiresAt: number | null                                          │   │
-│   │   prev: CacheEntry | null  ─┐                                       │   │
-│   │   next: CacheEntry | null  ─┼── doubly-linked list pointers         │   │
-│   │ }                           │                                       │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Linked List Layout:                                                       │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                                                                     │   │
-│   │   HEAD (MRU)                                       TAIL (LRU)       │   │
-│   │      │                                                │             │   │
-│   │      ▼                                                ▼             │   │
-│   │   ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐         │   │
-│   │   │ key1 │◄──►│ key2 │◄──►│ key3 │◄──►│ key4 │◄──►│ key5 │         │   │
-│   │   └──────┘    └──────┘    └──────┘    └──────┘    └──────┘         │   │
-│   │     newest                                          oldest          │   │
-│   │                                                      ↑              │   │
-│   │                                            evict this first         │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Operations (all O(1)):                                                    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ get(key):                                                           │   │
-│   │   entry = cache.get(key)                                            │   │
-│   │   if expired: delete and return null  ─── lazy expiration           │   │
-│   │   moveToHead(entry)                                                 │   │
-│   │   return entry.value                                                │   │
-│   │                                                                     │   │
-│   │ set(key, value, ttl):                                               │   │
-│   │   if exists: remove from list, subtract memory                      │   │
-│   │   create entry with expiresAt = now + ttl                           │   │
-│   │   evictIfNeeded()  ─── by count or memory                           │   │
-│   │   cache.set(key, entry)                                             │   │
-│   │   moveToHead(entry)                                                 │   │
-│   │                                                                     │   │
-│   │ evictIfNeeded():                                                    │   │
-│   │   while (size >= maxEntries OR memory >= maxBytes):                 │   │
-│   │     removeTail()  ─── evict LRU entry                               │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Active Expiration (background):                                           │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ Every 1 second:                                                     │   │
-│   │   Sample 20 random keys                                             │   │
-│   │   Delete any that are expired                                       │   │
-│   │                                                                     │   │
-│   │ Prevents memory bloat from expired but unaccessed keys              │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────┐       ┌──────────────────────┐
+│ Application services   │──────▶│ Durable origin       │
+│ Refill + freshness     │       │ Application-owned    │
+└────────────────────────┘       └──────────────────────┘
+             │ cache operations
+             ▼
+┌────────────────────────┐       ┌──────────────────────┐
+│ Regional router pool   │◀──────│ Membership authority │
+│ Admission + deadlines  │       │ Placement versions   │
+└────────────────────────┘       └──────────────────────┘
+             │ current owner and generation
+             ▼
+┌──────────────────────────────────────────────────────┐
+│ Cache nodes: bounded memory, LRU, TTL, fencing       │
+└──────────────────────────────────────────────────────┘
 ```
 
-### Expiration Strategy Comparison
+I would initially route through a small pool of proxies. That gives heterogeneous clients
+one place for deadline handling, authorization, and routing. The cost is another network
+hop and a tier that must scale with request volume.
 
-| Strategy | Pros | Cons |
-|----------|------|------|
-| Lazy only | Zero CPU overhead | Memory bloat with many expired keys |
-| Active only | Predictable cleanup | CPU overhead even when idle |
-| Lazy + Active | Best of both | Slightly more complex |
+A smart client can remove that hop later. It needs the same placement-version and
+stale-owner rules, and those rules now have to be deployed in every language SDK. I would
+make the change when measured proxy cost justifies that coordination burden.
 
-We use lazy + active: check on access (lazy) plus sample 20 random keys every second (active).
+The membership authority publishes accepted placement. Health probes provide evidence, but
+each router must not independently rewrite ownership after a local timeout. Two routers
+with different rings can otherwise send writes for the same key to different nodes.
 
----
+At a node, a hash map identifies an entry and a doubly linked list tracks recency. I would
+draw only the relationship between the map and the list if asked; writing pointer
+manipulation would not answer the distributed-system problem.
 
-## 5. Cache Node HTTP Server (6 minutes)
+| Record | Important fields | Purpose |
+|--------|------------------|---------|
+| Cache entry | Namespace/key, value, size, deadline, generation | Data and the conditions under which it may be served |
+| Placement | Partition/range, owner, version | Authoritative routing contract |
+| Transition | Old/new owners, generation, phase | Make ownership changes explicit |
+| Observation | Node, sample time, outcome, counters | Diagnose partial failures without inventing totals |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          CACHE NODE API                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Configuration:                                                            │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ maxEntries: 10,000                                                  │   │
-│   │ maxMemoryBytes: 100MB                                               │   │
-│   │ defaultTTLMs: 300,000 (5 minutes)                                   │   │
-│   │ activeExpirationInterval: 1,000ms                                   │   │
-│   │ activeExpirationSampleSize: 20                                      │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Endpoints:                                                                │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ GET /cache/:key                                                     │   │
-│   │   → 200: { key, value }                                             │   │
-│   │   → 404: { error: "Key not found" }                                 │   │
-│   │                                                                     │   │
-│   │ PUT /cache/:key                                                     │   │
-│   │   Body: { value, ttl? }                                             │   │
-│   │   → 201: { key, stored: true }                                      │   │
-│   │   → 400: { error: "Value is required" }                             │   │
-│   │                                                                     │   │
-│   │ DELETE /cache/:key                                                  │   │
-│   │   → 200: { key, deleted: boolean }                                  │   │
-│   │                                                                     │   │
-│   │ GET /health                                                         │   │
-│   │   → 200: { status: "healthy", timestamp }                           │   │
-│   │                                                                     │   │
-│   │ GET /stats                                                          │   │
-│   │   → 200: { entries, memoryBytes, hits, misses, hitRate,             │   │
-│   │           evictions, expirations }                                  │   │
-│   │                                                                     │   │
-│   │ GET /metrics  ─── Prometheus format                                 │   │
-│   │   cache_entries, cache_memory_bytes, cache_hits_total,              │   │
-│   │   cache_misses_total, cache_hit_rate, cache_evictions_total,        │   │
-│   │   cache_expirations_total                                           │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+These are logical records, not relational tables. The local project stores a Map and JSON
+snapshots; it has no SQL database.
 
----
+| Operation | Contract I would define |
+|-----------|-------------------------|
+| GET | HIT with metadata, MISS, or an explicit unavailable/rejected result |
+| SET | Validated value and deadline accepted by the current owner |
+| DELETE | Remove the intended version or apply a defined unconditional policy |
+| INCREMENT | Atomic only within the owner contract; retries need special handling |
+| Scan | Bounded work and cursor; live results may change between pages |
+| Change membership | Identified operation with progress and per-target outcomes |
 
-## 6. Coordinator Service (6 minutes)
+A successful cache write means the node accepted it into this disposable tier. It does not
+mean the application database committed anything. Expiration and eviction remain allowed
+afterward.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         COORDINATOR SERVICE                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Configuration:                                                            │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ HEALTH_CHECK_INTERVAL: 5,000ms                                      │   │
-│   │ MAX_CONSECUTIVE_FAILURES: 3                                         │   │
-│   │ REPLICATION_FACTOR: 2                                               │   │
-│   │ WRITE_QUORUM: 2                                                     │   │
-│   │ READ_QUORUM: 1                                                      │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Health Tracking:                                                          │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ nodeHealth: Map<nodeId, {                                           │   │
-│   │   address: string                                                   │   │
-│   │   healthy: boolean                                                  │   │
-│   │   lastCheck: timestamp                                              │   │
-│   │   consecutiveFailures: number                                       │   │
-│   │ }>                                                                  │   │
-│   │                                                                     │   │
-│   │ Health Check Loop (every 5s):                                       │   │
-│   │   for each node:                                                    │   │
-│   │     GET /health with 2s timeout                                     │   │
-│   │     if success: reset failures, mark healthy                        │   │
-│   │     if failure: increment failures                                  │   │
-│   │       if failures >= 3: mark unhealthy, remove from ring            │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Request Flow:                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                                                                     │   │
-│   │   GET /cache/:key (Read Quorum = 1)                                 │   │
-│   │   ┌─────────────────────────────────────────────────────────────┐   │   │
-│   │   │ nodes = ring.getNodes(key, REPLICATION_FACTOR)              │   │   │
-│   │   │ for node in nodes[0:READ_QUORUM]:                           │   │   │
-│   │   │   try: return node.get(key)                                 │   │   │
-│   │   │   catch 404: return not found                               │   │   │
-│   │   │   catch error: try next node                                │   │   │
-│   │   │ return 503 "All nodes failed"                               │   │   │
-│   │   └─────────────────────────────────────────────────────────────┘   │   │
-│   │                                                                     │   │
-│   │   PUT /cache/:key (Write Quorum = 2)                                │   │
-│   │   ┌─────────────────────────────────────────────────────────────┐   │   │
-│   │   │ nodes = ring.getNodes(key, REPLICATION_FACTOR)              │   │   │
-│   │   │ if nodes.length < WRITE_QUORUM: return 503                  │   │   │
-│   │   │                                                             │   │   │
-│   │   │ results = parallel PUT to all replica nodes                 │   │   │
-│   │   │ successes = count successful writes                         │   │   │
-│   │   │                                                             │   │   │
-│   │   │ if successes >= WRITE_QUORUM:                               │   │   │
-│   │   │   return 201 { stored: true, replicas: successes }          │   │   │
-│   │   │ else:                                                       │   │   │
-│   │   │   return 503 "Write quorum not achieved"                    │   │   │
-│   │   └─────────────────────────────────────────────────────────────┘   │   │
-│   │                                                                     │   │
-│   │   DELETE /cache/:key                                                │   │
-│   │   ┌─────────────────────────────────────────────────────────────┐   │   │
-│   │   │ nodes = ring.getNodes(key, REPLICATION_FACTOR)              │   │   │
-│   │   │ parallel DELETE to all nodes                                │   │   │
-│   │   │ return { deleted: anySucceeded, nodesUpdated: successCount }│   │   │
-│   │   └─────────────────────────────────────────────────────────────┘   │   │
-│   │                                                                     │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Cluster Endpoints:                                                        │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ GET /cluster/status                                                 │   │
-│   │   → { totalNodes, healthyNodes, nodes[], replicationFactor,         │   │
-│   │       writeQuorum, readQuorum }                                     │   │
-│   │                                                                     │   │
-│   │ GET /cluster/distribution                                           │   │
-│   │   Sample 10,000 keys, show distribution across nodes                │   │
-│   │   → { sampleSize, distribution: { node1: { count, percentage } } }  │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+I would use bounded HTTP/JSON initially for ease of integration. A binary protocol or
+batching may improve throughput, but I would measure parsing, allocation, network, and
+queueing before making protocol complexity the first optimization.
 
----
+## 🔧 Deep dive 1: Placement does not move the data — 9 minutes
 
-## 7. Replication and Consistency (5 minutes)
+> “Consistent hashing answers where a request should go. It does not answer how a new owner obtains a current value, how old writes are fenced, or what happens when the old owner is unreachable.”
 
-### Quorum Configuration
+### Why use consistent hashing
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        QUORUM CONFIGURATIONS                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Variables:                                                                │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ N = Replication Factor (total replicas)                             │   │
-│   │ W = Write Quorum (writes that must succeed)                         │   │
-│   │ R = Read Quorum (reads that must succeed)                           │   │
-│   │                                                                     │   │
-│   │ Strong consistency when: W + R > N                                  │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Configurations:                                                           │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ Strong Consistency:   N=3, W=2, R=2  (2+2=4 > 3) ✓                  │   │
-│   │ Eventual Consistency: N=3, W=1, R=1  (favor availability)           │   │
-│   │ Read-Heavy Workload:  N=3, W=3, R=1  (all must ack write)           │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+With modulo placement, changing the node count changes the mapping for a large fraction of
+keys. For example, moving from three to four buckets can remap roughly three quarters of
+uniformly distributed assignments.
 
-### Read Repair
+A consistent ring adds a new node's positions among existing ones. Only the ranges captured
+by the new positions change owner. With similarly weighted nodes, adding a fourth node is
+expected to move roughly a quarter of assignments, not exactly a quarter of actual bytes or
+requests.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            READ REPAIR                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Flow:                                                                     │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ 1. Read from all replicas in parallel                               │   │
-│   │ 2. Collect { node, value, version } from each                       │   │
-│   │ 3. Find newest version                                              │   │
-│   │ 4. Identify stale replicas (different version)                      │   │
-│   │ 5. Asynchronously update stale replicas with newest value           │   │
-│   │ 6. Return newest value to client                                    │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Example:                                                                  │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │   Client reads key "user:123"                                       │   │
-│   │                                                                     │   │
-│   │   Node A: value="Alice", version=5  ← newest                        │   │
-│   │   Node B: value="Alice", version=5                                  │   │
-│   │   Node C: value="Ally", version=3   ← stale                         │   │
-│   │                                                                     │   │
-│   │   Response: { value: "Alice", repaired: true }                      │   │
-│   │   Background: Update Node C with version=5                          │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Virtual nodes spread each physical node's ownership across the ring. They reduce
+sensitivity to one unlucky token gap, but they do not ensure equal demand. I would choose
+the count from measured distribution and operating cost rather than promise a universal
+variance from a particular number.
 
----
+The local implementation uses 150 virtual nodes and hashes node URLs. Production should
+separate stable node identity from its current address; replacing an address should not
+accidentally be treated as an unrelated membership event.
 
-## 8. Hot Key Detection and Mitigation (4 minutes)
+### The dangerous copy sequence
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        HOT KEY DETECTION                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   HotKeyDetector:                                                           │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ accessCounts: Map<key, count>                                       │   │
-│   │ windowMs: 60,000 (1 minute window)                                  │   │
-│   │ threshold: 1,000 (accesses to be considered "hot")                  │   │
-│   │                                                                     │   │
-│   │ recordAccess(key):                                                  │   │
-│   │   if window expired: clear counts, reset window                     │   │
-│   │   increment count for key                                           │   │
-│   │   return count >= threshold                                         │   │
-│   │                                                                     │   │
-│   │ getHotKeys():                                                       │   │
-│   │   return keys with count >= threshold, sorted by count desc         │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Coordinator Integration:                                                  │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ localHotKeyCache: Map<key, { value, expiresAt }>                    │   │
-│   │ HOT_KEY_LOCAL_TTL: 1,000ms (1 second)                               │   │
-│   │                                                                     │   │
-│   │ GET /cache/:key:                                                    │   │
-│   │   1. Check localHotKeyCache first                                   │   │
-│   │      if found and not expired: return from local cache              │   │
-│   │                                                                     │   │
-│   │   2. Record access, check if hot                                    │   │
-│   │                                                                     │   │
-│   │   3. Route to cache node normally                                   │   │
-│   │                                                                     │   │
-│   │   4. If key is hot: store in localHotKeyCache                       │   │
-│   │      (short TTL prevents staleness)                                 │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Imagine the ring changes from A to B. A migration reads value 7 from A. A client then
+writes value 8 to B. The migration copies 7 onto B and deletes A's entry.
 
-### Hot Key Mitigation Strategies
+Every individual operation succeeded, but the migration overwrote the newer value. A delete
+racing with a copy can similarly bring an intentionally removed key back. Merely slowing
+the copy loop does not fix either race.
 
-| Strategy | Pros | Cons |
-|----------|------|------|
-| Local caching | Simple, effective | Stale data briefly |
-| Read replicas | Distributes load | More infrastructure |
-| Key sharding | Eliminates bottleneck | Complex key management |
-| Rate limiting | Protects system | Impacts users |
+The reverse ordering is not a general solution. If we delete before copying, a failed
+transfer creates a miss; if we copy before deletion without version checks, concurrent
+writes can still be lost or overwritten.
 
----
+### My initial choice: bounded cold cutover
 
-## 9. Cache Invalidation Patterns (3 minutes)
+For the selected rebuildable workload, I would prefer a controlled cold transition over an
+incomplete warm-copy protocol. Move a bounded group of partitions at a time and allow
+refills within a known origin budget.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     CACHE INVALIDATION PATTERNS                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Pattern 1: Write-Through (Synchronous)                                    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ Client ──► Update Database ──► Update Cache ──► Response            │   │
-│   │                                                                     │   │
-│   │ Pros: Strong consistency                                            │   │
-│   │ Cons: Higher latency                                                │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Pattern 2: Write-Behind (Asynchronous)                                    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ Client ──► Update Cache ──► Response                                │   │
-│   │                    │                                                │   │
-│   │                    └──► Queue ──► Background Worker ──► Database    │   │
-│   │                                                                     │   │
-│   │ Pros: Low latency                                                   │   │
-│   │ Cons: Data loss risk if crash before flush                          │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Pattern 3: Cache-Aside with TTL                                           │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ Read:                                                               │   │
-│   │   Check cache ──► Hit? Return                                       │   │
-│   │                   Miss? Fetch DB ──► Populate cache (with TTL)      │   │
-│   │                                                                     │   │
-│   │ Write:                                                              │   │
-│   │   Update DB ──► Invalidate cache                                    │   │
-│   │                                                                     │   │
-│   │ Pros: Simple, self-healing via TTL                                  │   │
-│   │ Cons: Cache miss penalty                                            │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Pattern 4: Pub/Sub Invalidation (Multi-Node)                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                                                                     │   │
-│   │   Writer ──► Publish to "cache-invalidation" channel                │   │
-│   │                         │                                           │   │
-│   │         ┌───────────────┼───────────────┐                           │   │
-│   │         ▼               ▼               ▼                           │   │
-│   │   ┌──────────┐    ┌──────────┐    ┌──────────┐                      │   │
-│   │   │ Cache 1  │    │ Cache 2  │    │ Cache 3  │                      │   │
-│   │   │ delete() │    │ delete() │    │ delete() │                      │   │
-│   │   └──────────┘    └──────────┘    └──────────┘                      │   │
-│   │                                                                     │   │
-│   │ Message: { key, action: "delete", timestamp }                       │   │
-│   │                                                                     │   │
-│   │ Pros: Immediate invalidation across cluster                         │   │
-│   │ Cons: Redis/message broker dependency                               │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The steps I would explain are:
 
----
+1. Prepare the target and reserve enough capacity for the incoming group.
+2. Stop admitting old-generation work for that group and establish an enforceable fence against obsolete owners.
+3. Publish the new owner generation through the membership authority.
+4. Treat old-generation data as unusable, even if bytes remain on disk or in memory.
+5. Admit misses and fills at a bounded rate; advance the next group only when the recovery budget permits.
 
-## 10. Key Backend Trade-offs
+A router carrying an old version can refresh and retry an appropriate request. The node
+must still reject obsolete ownership; relying on every client to update instantly is not a
+correctness mechanism.
 
-### Decision Matrix
+If the old owner cannot be fenced during a partition, the cache may have to reject affected
+operations or wait for an ownership lease to expire. The application may use its separately
+budgeted origin path. I am choosing an explicit availability cost rather than letting two
+owners silently accept conflicting generations.
 
-| Decision | Choice | Trade-off |
-|----------|--------|-----------|
-| Hash function | MD5 | Fast, good distribution, not cryptographic (fine for hashing) |
-| Virtual nodes | 150 | ~3% variance, moderate memory overhead |
-| Expiration | Lazy + Active | CPU for sampling, but prevents memory bloat |
-| Protocol | HTTP | Higher overhead than binary, but easier to debug |
-| Consistency | Quorum-based | Configurable W/R for CAP trade-offs |
-| Replication | Synchronous writes | Higher latency, but strong durability |
+### When warm migration is worth it
 
-### When to Use Each Consistency Level
+If origin headroom is too small for even gradual cold cutover, I would add warm transfer or
+maintained replicas. A correct transfer must preserve absolute expiration, identify source
+versions, account for deletions, and catch up changes before ownership becomes exclusive at
+the target.
 
-```
-Strong Consistency (W + R > N):
-- Financial data
-- User authentication tokens
-- Configuration that must be consistent
+A transfer also needs progress tracking, bounded enumeration, retry state, and a completion
+condition. “We copied some keys without throwing” is not a completion condition.
 
-Eventual Consistency (W=1, R=1):
-- Session data
-- View counts
-- Recommendations
-- Any data that tolerates brief staleness
-```
+Replicas can reduce refill after failure, but they raise another question: how current must
+the replacement be? Asynchronous replication can lose recent writes; synchronous
+acknowledgement adds latency and can reduce write availability. The cache contract should
+decide whether those costs are justified.
 
----
+### The trade-off
 
-## 11. Production Considerations
+| Approach | Why it fits or fails here |
+|----------|---------------------------|
+| ✅ Fenced, bounded cold cutover | Simple ownership semantics; costs temporary misses |
+| ❌ Blind GET/SET/DELETE migration | Warm-looking transfer can overwrite newer values |
+| Deferred versioned warm transfer | Preserves more hits but needs a real transition protocol |
+| Deferred replicas | Reduce loss/refill while adding capacity and consistency work |
 
-### Circuit Breaker for Node Failures
+I am giving up seamless retention of warm entries during maintenance. That is acceptable
+only if the origin budget supports the resulting misses. If it does not, I would revise the
+design rather than relabel data loss as availability.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          CIRCUIT BREAKER                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   States:                                                                   │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ CLOSED ──(error threshold 50%)──► OPEN                              │   │
-│   │    ▲                                 │                              │   │
-│   │    │                                 │ (30s timeout)                │   │
-│   │    │                                 ▼                              │   │
-│   │    └───────(success)───────── HALF-OPEN                             │   │
-│   │                                      │                              │   │
-│   │                              (failure)                              │   │
-│   │                                      └──► OPEN                      │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Configuration:                                                            │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ timeout: 5,000ms                                                    │   │
-│   │ errorThresholdPercentage: 50                                        │   │
-│   │ resetTimeout: 30,000ms                                              │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   Behavior:                                                                 │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ CLOSED: Requests pass through normally                              │   │
-│   │ OPEN: Requests fail fast (no attempt to call node)                  │   │
-│   │ HALF-OPEN: Allow one test request to check recovery                 │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The local helper illustrates the gap: addition changes the ring before copying, while
+graceful removal consults the old ring and skips keys that still belong to the departing
+node. Neither path implements the fence described here.
 
-### Graceful Shutdown
+## 🔧 Deep dive 2: Memory and TTL need a precise contract — 8 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         GRACEFUL SHUTDOWN                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   On SIGTERM:                                                               │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │ 1. Stop accepting new requests (server.close())                     │   │
-│   │ 2. If persistence enabled: persist cache snapshot to disk           │   │
-│   │ 3. Close health check timers (cache.shutdown())                     │   │
-│   │ 4. Exit process                                                     │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+> “The map and linked list make lookup and recency updates cheap. They do not make every cache operation constant-time, enforce a heap budget automatically, or make expiration exact under every restore path.”
 
----
+### The useful part of LRU
 
-## Summary
+A map lookup finds an entry, and a live GET moves that entry toward the most-recent end.
+When space is needed, the least-recent entry is a candidate for eviction. Each individual
+list update is constant-time.
 
-This distributed cache implementation demonstrates key backend concepts:
+A SET still has to validate and serialize the value, allocate storage, and possibly evict
+several entries. Its work depends on value size and the number of victims. I would state
+that distinction instead of writing “all operations O(1)” on the board.
 
-1. **Consistent Hashing**: O(log n) lookup with virtual nodes for even distribution
-2. **LRU Cache**: O(1) operations with doubly-linked list
-3. **TTL Expiration**: Lazy + active hybrid for efficiency
-4. **Replication**: Quorum-based for configurable consistency
-5. **Hot Key Handling**: Detection and local caching at coordinator
-6. **Invalidation**: Multiple patterns for different use cases
-7. **Observability**: Prometheus metrics, health checks, circuit breakers
+Replacing an existing key must enforce the same budget as a new insertion. Otherwise a tiny
+admitted value can later grow beyond the node's limit. A value larger than the entire
+allowed entry budget should be rejected explicitly.
 
-The coordinator pattern adds a network hop but simplifies client implementation and enables cluster-wide features like hot key detection and health monitoring.
+Memory accounting also needs headroom for keys, maps, object overhead, request bodies, and
+temporary buffers. Counting serialized value bytes alone is a useful signal, not a
+process-memory cap.
+
+### LRU is an admission policy choice
+
+A one-time scan can repeatedly insert values and evict a hot working set. LRU sees recent
+use, not future value. If that workload is common, frequency-aware admission can prevent
+many scan entries from entering the cache at all.
+
+The cost is more policy state and tuning. I would begin with LRU plus size limits and
+measure avoided origin work per byte, then add admission sophistication when scans or churn
+demonstrably reduce useful hit rate.
+
+| Choice | Strength | Cost |
+|--------|----------|------|
+| ✅ LRU with bounded admission | Clear baseline, adapts to recent demand | Vulnerable to scan pollution |
+| Deferred frequency-aware admission | Protects repeated-use working set | More metadata and approximate policy |
+| ❌ Admit every oversized value | Simple success path | Can displace useful data or exceed capacity |
+
+### TTL is about freshness, not just cleanup
+
+Every read checks whether the entry deadline has passed before returning a value. A
+background expiration pass reclaims memory from expired keys that nobody reads. This
+separates semantic expiration from eventual physical removal.
+
+A bounded sampling pass should not allocate an array of the entire keyspace. Otherwise the
+“twenty sampled keys” headline hides O(N) work and event-loop pressure. I would use an
+incremental cursor or another bounded traversal strategy.
+
+The proposed fill carries an absolute freshness deadline tied to the source observation. If
+a slow origin read started long ago, assigning a brand-new full TTL when it finally
+completes can extend staleness beyond the intended policy.
+
+An absolute deadline still needs a clock policy, especially when entries move between
+machines. We should budget for clock error and preserve the original deadline during
+migration rather than repeatedly round remaining TTL up and start it again.
+
+TTL limits how long we retain an observed value; it does not prove that value was current
+when read. Strong invalidation requires source versions or another source-coordinated
+protocol. I would use the origin directly for decisions that cannot tolerate this cache's
+staleness.
+
+### Snapshot recovery
+
+Snapshots are a warm-start optimization. They should include absolute deadlines and enough
+metadata to reject obsolete owner generations. A recovered node should not simply start
+serving every value found on disk.
+
+For robust optional recovery, write a temporary file, validate it, replace the final file
+atomically, and make durability expectations explicit. On load, try older valid compatible
+snapshots if the newest one is corrupt.
+
+Deleted entries are a subtle case. A value removed after the last snapshot can return after
+a restart. If that is forbidden by the workload, snapshots need deletion/version protection
+or the recovered generation must be treated as cold.
+
+Recency is another separate property. Restoring by last-write timestamp does not reproduce
+last-read order. If preserving the warm working set matters, save a suitable approximation
+and load it in an order that does not immediately evict the most valuable entries.
+
+### What the choice costs
+
+Precise admission and expiration add checks to the fast path, but their cost is bounded by
+the value and request budgets. Skipping them creates misleading success and unpredictable
+resource use.
+
+The local implementation estimates memory from JSON string length, misses eviction on
+existing-key growth, and rounds TTL during restore. It has useful learning mechanisms, but
+its one-minute snapshot timer is not a bound on crash loss and its memory setting is not a
+hard process limit.
+
+## 🔧 Deep dive 3: A cache failure must not become an origin failure — 8 minutes
+
+> “My failure policy is not ‘on any error, hit the database.’ It is ‘preserve an explicit result, then let the application attempt a bounded fallback if its workload permits it.’”
+
+### Miss, failure, and overload are different
+
+A MISS means the current owner did not return a live entry. A transport error means we
+could not obtain that observation. An overload rejection means the service deliberately
+refused more work. The application may choose the same fallback for some of these, but
+observability and capacity accounting should preserve the distinction.
+
+If a failing node makes each request wait five seconds, large numbers of calls can
+accumulate. Deadlines need to include reading the response body, not just receiving
+headers. Queues and concurrent downstream calls need upper bounds as well.
+
+Circuit breakers can suppress repeated calls to a failing dependency. A normal cache miss
+is not a dependency failure; a breaker that counts 404 responses as errors can stop traffic
+to a perfectly healthy node.
+
+Probe success is only one signal. A process can answer health checks while its data path is
+overloaded or its recovered generation is not ready to serve. Membership decisions need an
+explicit readiness and authority model.
+
+### Control the refill wave
+
+Suppose a popular key expires and a thousand application requests miss at once. Coalescing
+those requests within an application instance avoids duplicate origin work for that
+process. It does not collapse requests across every application instance automatically.
+
+I would combine local same-key coalescing with a global or partitioned origin admission
+budget. Waiting callers have bounded time and queue space. Excess requests receive a
+defined degraded response rather than creating an unlimited backlog.
+
+Jittering expiration deadlines reduces synchronized expiry of unrelated keys. It does not
+solve a genuinely hot key or an entire node disappearing. Those cases still require refill
+capacity and overload behavior.
+
+For selected stale-tolerant data, a short application-local cache or managed read copies
+can reduce repeated demand on one owner. They must preserve the freshness policy. Randomly
+splitting one mutable key into several names does not keep the copies coherent.
+
+### Retry semantics
+
+Reads are generally safe to retry within an overall deadline, although their values may
+change. A timed-out mutation is different: the server may have applied it before the
+connection failed.
+
+SET with the same body is not always the same effect. It can restart a relative TTL and
+overwrite a concurrent writer. DELETE can remove a key recreated after the original
+attempt. Increment can apply twice.
+
+Where the caller needs the same logical effect, use an operation identity and scoped
+receipt, or a conditional version contract. That receipt needs a defined lifetime and
+authority; a request ID written only to a log does not deduplicate a mutation.
+
+For this simple cache I would avoid promising durable exactly-once increment. Callers that
+require durable counters should use an appropriate authoritative service. The cache can
+store a derived view of the result.
+
+### Failure-oriented trade-off
+
+| Policy | Benefit | Cost |
+|--------|---------|------|
+| ✅ Bounded fallback and explicit errors | Protects the origin and makes overload diagnosable | Some requests must degrade or fail |
+| ❌ Unlimited fallback on every timeout | Appears highly available at low load | Converts cache failure into origin overload |
+| ❌ Retry every operation automatically | Simple client wrapper | Can duplicate or overwrite mutation effects |
+
+The chosen policy gives up the promise that every cache error can be hidden from the user.
+It preserves the larger application's ability to keep serving admitted work during a
+failure.
+
+Recovery should be paced against live origin load, not a fixed number of milliseconds
+between copy batches. A nominal delay says little about actual bytes, downstream
+concurrency, or the work each refill triggers.
+
+The local project does not include an origin or refill coordinator. Its active fetch helper
+also bypasses the Opossum implementation. Those are concrete boundaries between the
+learning code and this proposed failure policy.
+
+## 🔬 Security, observation, and validation — 4 minutes
+
+Service identity should authorize namespaces on data operations; administration needs a
+separate scoped identity. Cache nodes should not be public endpoints, and adding a node
+must resolve to an allowed cache service rather than an arbitrary URL.
+
+The operator console should receive observations with collection age and coverage. If 99
+nodes respond, label totals as covering those nodes. Do not silently subtract the failed
+node and make the system look less busy.
+
+I would measure hits, misses, unavailable results, admission rejections, latency
+distributions, bytes, evictions, expiration work, event-loop delay, and origin refill.
+Transition metrics need remaining work and failures, not just a counter of successful
+copies.
+
+Raw key labels can expose data and create high-cardinality telemetry. Use bounded
+diagnostic samples and stable metric dimensions. A top-key report is useful, but it should
+not become an unbounded catalog in the metrics database.
+
+The most informative tests are scenarios that challenge a guarantee:
+
+| Scenario | Property to verify |
+|----------|--------------------|
+| Old owner receives a request after cutover | Obsolete generation cannot serve or mutate |
+| Write races a warm transfer | Older copy cannot replace a newer value |
+| Existing value grows beyond admission limit | Replacement is rejected or bounded correctly |
+| Origin is saturated during node loss | Refill remains within admission budget |
+| Response disappears after increment | No undocumented automatic replay |
+| Newest snapshot is corrupt | Defined fallback or cold-start behavior |
+
+I would combine deterministic helper/contract tests with a small multi-process failure
+exercise. A page-render smoke test does not verify these properties, and a throughput
+benchmark without failures does not establish them either.
+
+## ⚖️ Decisions and the local implementation — 3 minutes
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Data role | ✅ Rebuildable cache | ❌ Durable primary store | Allows eviction and bounded cold recovery |
+| Placement | ✅ Versioned consistent hashing | ❌ Independent health-driven rings | Assignment stability needs ownership agreement |
+| Transition | ✅ Fenced cold cutover first | ❌ Unversioned copy loop | Avoid stale-copy overwrite |
+| Eviction | ✅ LRU plus admission | ❌ Unbounded replacement growth | Keep memory behavior explainable |
+| Failure | ✅ Bounded origin fallback | ❌ Unlimited retries/refill | Protect the service behind the cache |
+
+The repository implements direct key hashing, one coordinator, one in-memory owner,
+LRU/TTL, HTTP operations, snapshots, health probes, and a dashboard. It does not implement
+replication, quorums, source-version validation, owner fencing, origin refill, or durable
+operation receipts.
+
+It also has current defects in migration ordering, memory enforcement, snapshot
+restoration, and admin route coverage. I would repair those basics and establish failure
+tests before measuring production performance or introducing more distributed mechanisms.
+
+> “My central design decision is to make loss and freshness explicit. The hash ring reduces placement churn, but the system remains dependable only when ownership transitions are fenced, resource work is bounded, and a cache failure cannot freely overwhelm the origin.”

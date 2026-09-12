@@ -1,350 +1,436 @@
-# Distributed Cache — System Design Answer (Frontend Focus)
+# Distributed Cache — Frontend System Design
 
-*45-minute system design interview format — Frontend Engineer Position*
+A 45-minute interview discussion about an operator console. This is a proposed design,
+grounded in the local project rather than a claim that every feature below is implemented.
+I would draw one architecture and spend the rest of the time explaining observations,
+requests, and consequential actions.
 
----
+## 🎯 Scope and the operator's problem — 3 minutes
 
-## 📋 Opening Statement
+> “I’m designing a console for engineers who need to understand a cache and occasionally change it. The hardest frontend problem is telling them what we know, how recently we learned it, and which actions actually completed.”
 
-"This is an operator console for a distributed cache, and that makes it a different frontend problem than a consumer app. Nobody browses this UI — an engineer opens it because something is wrong, or because they're about to change the cluster and want to see what happens. So the design pressure isn't engagement or conversion; it's **whether the operator can trust what's on screen, and whether the UI can hurt the system it's observing.**
+I would first clarify whether this is a teaching cluster or a production administration
+tool. The local project supports exploration; for this interview I will assume a production
+console for a regional, shared cache of rebuildable application data.
 
-Three decisions carry the whole design: how the client learns about a cluster whose topology changes underneath it, how to show a live system without the dashboard itself becoming load, and how to present destructive actions so the console can't cause the outage it's meant to diagnose. I'll go deep on those."
+The application using the cache owns the durable origin. A cache miss can be acceptable,
+but a sudden wave of misses can overload that origin. The console therefore needs to
+explain the consequences of a flush or node transition in terms of refill work, not just
+disappearing rows.
 
----
+The main user journeys are straightforward: assess cluster condition, inspect a specific
+key, investigate a capacity imbalance, and carry out a scoped administrative change. I
+would make the overview read-only and keep experimental writes in an explicitly identified
+environment and namespace.
 
-## 🎯 Requirements
+I am not designing a general metrics platform, an incident-management system, or a database
+browser. Historical trends can come from a metrics backend later. The first screen needs
+useful current observations and a clear path to the relevant node or key.
 
-### Functional
+A key distinction is that “the owner is node B” and “node B contains the value” are
+separate facts. Routing can change before data moves, and an entry can expire between a
+listing and inspection. The UI should not collapse these into one confident location label.
 
-1. **See cluster topology** — which nodes exist, which are healthy, how the keyspace is distributed
-2. **Browse and inspect keys** — what's cached, on which node, with what TTL
-3. **Exercise the cache live** — set/get/delete against the real cluster to observe routing
-4. **Watch a topology change** — add or remove a node and see rebalancing happen
-5. **Notice failure fast** — a dead node must be obvious without hunting
+The local implementation already has overview, keys, cluster, and test routes. It uses
+React, TanStack Router, Zustand, and a coordinator HTTP API. That is a reasonable starting
+point for the interview design.
 
-### Non-functional
+## 📏 Scale, freshness, and useful budgets — 4 minutes
 
-| Requirement | Target | Why |
-|-------------|--------|-----|
-| Staleness of health data | ≤ 5s | Longer and the operator acts on a stale picture during an incident |
-| Dashboard's own load | Negligible vs. cache traffic | An observability tool that perturbs the system is worse than none |
-| Time to spot a dead node | Immediate on load | This is the primary reason the page gets opened |
-| Correctness of "which node owns this key" | Exact | A wrong answer here sends someone debugging the wrong machine |
+I will size the console for 100 cache nodes, millions of keys, and 200 simultaneous viewers
+during an incident. Those are planning assumptions, not measured limits of the repository.
 
-### Non-goals
+| Concern | Proposed target | Reason |
+|---------|-----------------|--------|
+| Initial overview | Useful cached observation within one second | Operators need orientation quickly |
+| Health observation age | Usually below ten seconds | Includes collection and browser refresh delays |
+| Key inspection | One bounded value preview | A large object must not freeze the page |
+| Browser requests | One active observation request per view | Slow responses must not create a queue |
+| Key listing | Bounded, paginated scan | Millions of keys cannot be loaded at once |
+| Mutation feedback | Immediate pending state, authoritative outcome later | Responsiveness does not require pretending success |
 
-No authentication UI beyond an admin API key, no historical time-series, no alerting. Those are real needs at scale, and each one is a different product — a metrics backend, not a console.
+A five-second browser interval does not guarantee data is at most five seconds old. The
+server might have sampled a node just before the last interval, and a slow node can extend
+collection. I would show the server sample time and browser receipt time separately where
+the distinction matters.
 
----
+Two hundred viewers polling every five seconds create forty overview requests per second.
+If every request separately reads stats and lists keys from all 100 nodes, that becomes
+8,000 node requests per second, before normal health probes.
 
-### Questions I'd ask before designing
+The request count alone is not proof of an outage. The concern is the work behind those
+requests: key enumeration can scan large maps and allocate arrays. A dashboard that appears
+lightweight in the browser can create expensive work in the cache.
 
-Three answers would change the architecture materially:
+I would collect bounded node observations once and serve the same recent envelope to many
+viewers. At one collection every five seconds, a 100-node pass averages twenty node samples
+per second, with bounded concurrency rather than one uncontrolled burst.
 
-**"Who opens this, and when?"** If it's two platform engineers during incidents, everything above holds. If it's a self-service tool for dozens of application teams checking their own keys, then multi-tenancy, per-team scoping, and read-only defaults become the dominant concerns, and the shared-polling load problem gets an order of magnitude worse.
+The console's performance budget therefore starts at the API contract. Smaller React
+components cannot compensate for an endpoint that scans every key for each viewer.
 
-**"Is this ever pointed at production?"** A teaching cluster and a production cluster want opposite defaults. Against production I'd make the console read-only by default and put mutations behind an explicit mode switch, because the cost of an accidental flush is unbounded.
-
-**"How many nodes, realistically?"** Three nodes and thirty nodes are different visualizations. The ring diagram stops being readable somewhere around a dozen, and beyond that a sorted distribution histogram communicates the same property better. Designing the ring view without knowing this risks building the wrong picture well.
-
----
-
-## 🏗️ Architecture
+## 🏗️ Architecture and state ownership — 5 minutes
 
 ```
-        ┌────────────────────────────────────────────────┐
-        │              Admin Console (browser)            │
-        │                                                 │
-        │   ┌──────────┐  ┌──────────┐  ┌─────────────┐  │
-        │   │ Cluster  │  │   Keys   │  │  Live test  │  │
-        │   │   view   │  │  browser │  │   console   │  │
-        │   └────┬─────┘  └────┬─────┘  └──────┬──────┘  │
-        │        └─────────────┼───────────────┘         │
-        │                 ┌────▼─────┐                    │
-        │                 │  Store   │  5s poll           │
-        │                 └────┬─────┘                    │
-        └──────────────────────┼─────────────────────────┘
-                               │ HTTP (admin API key)
-                       ┌───────▼────────┐
-                       │  Coordinator   │ ◀── owns the hash ring,
-                       └───┬────┬───┬───┘     health, breakers
-                           │    │   │
-                  ┌────────▼─┐ ┌▼──┐ ┌▼────────┐
-                  │  node-1  │ │n-2│ │  node-3 │
-                  └──────────┘ └───┘ └─────────┘
+┌─────────────────────────┐
+│ React operator console  │
+│ Overview / keys / admin │
+└─────────────────────────┘
+             │ authenticated requests
+             ▼
+┌─────────────────────────┐
+│ Console API             │
+│ Samples + operation IDs │
+└─────────────────────────┘
+             │ bounded collection and control
+             ▼
+┌─────────────────────────┐
+│ Membership + cache API  │
+│ Versioned node routing  │
+└─────────────────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ Independent cache nodes │
+└─────────────────────────┘
 ```
 
-**The console talks only to the coordinator, never to nodes directly.** That mirrors how real clients reach the cache, and it matters for a reason beyond symmetry: the coordinator is the only component that knows the current ring. A dashboard that queried nodes individually would have to reconstruct topology from what it found, and would show a view no actual client ever sees.
+The browser talks to one authenticated console API. It does not discover arbitrary node
+URLs and call them directly. The backend owns routing and authorization; the browser owns
+presentation and interaction.
 
----
+The data path and observation path need not be separate deployments initially. They do need
+separate budgets, so opening the console cannot exhaust the capacity reserved for
+application reads.
 
-## 🔍 Deep Dive 1: Rendering a Topology That Changes Underneath You (10 minutes)
+I would organize routes around questions: “Is the cluster serving?”, “What happened to this
+key?”, and “What would this change affect?” A test route belongs in a development
+environment, with server-enforced scope if it can write.
 
-This is the defining problem. Every other admin dashboard renders records; this one renders **a distributed system's current belief about itself**, and that belief changes while you're looking at it.
+| State | Owner | Example |
+|-------|-------|---------|
+| Placement and sampled health | Server | Membership version, node sample age |
+| Key search context | URL | Namespace, pattern, selected key |
+| Cached query result | Query/store layer | Page tied to its request and placement version |
+| Draft input and selection controls | Component | Value editor, expanded detail |
+| Administrative operation | Server, mirrored in UI | Pending or partially completed removal |
 
-### Why the obvious approach is wrong
+Zustand is adequate for a small console, provided server data is keyed by query identity. A
+single global loading flag is not enough when overview refresh, key inspection, and node
+removal can overlap.
 
-The natural implementation fetches nodes, fetches keys, fetches stats, and renders all three. But those are three separate requests against a cluster that may be mid-rebalance. You can easily produce a screen showing four nodes in the topology panel, a key count that sums to three nodes' worth, and a key browser listing keys on a node that was removed between request one and request three.
+I would keep the selected namespace and key in URL state so another operator can open the
+same view. Cached values and credentials do not belong in a shareable URL. Navigating to a
+URL starts a fresh authorized query; it does not certify a historical observation.
 
-**Nothing on that screen is wrong individually, and the composite is a lie.** For an operator making a decision during an incident, that's worse than showing less.
+Static typing helps development, but it does not validate a server response. The API
+boundary should validate the fields needed to render safely and convert transport errors
+into a consistent client error model.
 
-### Options
+The frontend does not need to reproduce the consistent-hash algorithm. A backend placement
+endpoint is the authority for the version the cluster accepts. A local educational
+visualization can explain the algorithm without being used to authorize a mutation.
 
-| Approach | Consistency | Cost |
-|----------|-------------|------|
-| ❌ Independent fetches, render as they arrive | None — panels disagree | Simplest; actively misleading during change |
-| ✅ **One snapshot endpoint, render atomically** | Panels always agree | Requires a coordinator endpoint returning topology + stats together |
-| ✅ **Version/epoch stamp on every response** | Client can detect and discard mixed data | Needs a ring epoch the coordinator increments |
-| ❌ Long-poll or stream per panel | Fresh, still uncoordinated | Most connections, no consistency gain |
+## 🔧 Deep dive 1: An honest view of partial observations — 9 minutes
 
-### What I'd build
+> “I want one understandable observation envelope, but I won’t call it an atomic snapshot of a distributed system. The envelope must tell me which topology it describes and which node samples are missing or older.”
 
-Fetch a **single coordinated snapshot** and render from it as one unit. The client should never assemble a view from independently-timed reads of a system whose whole point is that its topology mutates.
+### Why independently fetched panels are tricky
 
-Where that isn't possible — the key browser genuinely is a separate, paginated query — I'd stamp responses with the **ring epoch** and show the key list as belonging to a specific topology version. When the epoch changes, the list is marked stale rather than silently mixed with new data. The operator sees "this listing is from before the rebalance", which is honest and actionable.
+Imagine the topology panel reports four nodes, the statistics request finishes using three,
+and the key listing returns a key from a node that has just left. Each result can describe
+a real observation while the combined page suggests a state that never existed.
 
-The subtler point: **during a rebalance, "which node owns this key" has two answers** — the pre-migration owner and the post-migration one. A UI that shows one number is asserting something the cluster isn't sure about. I'd surface migration explicitly, showing keys in flight as *moving* rather than resolved. That turns the most confusing period into the most informative screen in the console.
+Fetching everything through one endpoint makes response handling simpler, but the backend
+still samples nodes at different times. It cannot create simultaneous measurements just by
+returning one JSON object.
 
-> "The thing I want to avoid is a dashboard that's most confident exactly when the system is least stable. Rebalancing is when someone is watching, and it's when naive rendering lies most."
+I would include a membership version, collection start/end times, expected nodes, and
+per-node outcomes. When membership changes during collection, the response can report that
+change or require the client to refresh before enabling a topology-dependent action.
 
----
+An old sample can remain useful. The page should label it as the last successful
+observation, with its age, rather than discard it or display it as current.
 
-## 🔍 Deep Dive 2: An Observer That Doesn't Perturb What It Observes (9 minutes)
+### The data contract drives the UI
 
-The console polls every 5 seconds. That number deserves defending, because both directions are tempting and both are wrong.
+| Observation | Display |
+|-------------|---------|
+| All expected samples present | Aggregate with collection interval |
+| One node unavailable | Aggregate labeled “from 99 of 100 nodes” |
+| Previous value retained after failure | Last known sample and age |
+| Membership changed | New topology; older key pages marked stale |
+| No nodes configured | Genuine empty-cluster state |
+| Coordinator unreachable | Unknown current state, not zero nodes |
 
-### The pull toward faster
+This costs a little screen space, but that space explains how much confidence an operator
+should place in a number. Hiding failed nodes from a sum can make a failure look like
+reduced memory pressure.
 
-An operator watching a failover wants sub-second feedback, and 5 seconds feels sluggish. But every poll is a request the coordinator serves *while it is routing real traffic and monitoring node health*. During an incident — precisely when dashboards get opened, often several at once — that load arrives at the worst moment.
+I would compute hit rate from successful sample counters by summing hits and misses, not
+averaging percentages across nodes. A node with ten requests should not carry the same
+weight as one with a million.
 
-**The pathological case is a dashboard that contributes to the outage it's displaying.** Several tabs left open across a team, each polling aggressively, each triggering a topology fan-out on the coordinator, is a self-inflicted load spike correlated with incidents.
+Even the weighted value needs a label: it is the cumulative hit rate over the included
+nodes' counter lifetimes. A rate over the last minute needs interval deltas and reset
+handling. The UI should not invent that time window from one cumulative sample.
 
-### The pull toward slower or event-driven
+### Request ordering is part of correctness
 
-| Approach | Freshness | Load | Failure mode |
-|----------|-----------|------|--------------|
-| ❌ 500ms polling | Excellent | Multiplies per open tab | Dashboards amplify incidents |
-| ✅ **5s polling** | Adequate for human decisions | Bounded, predictable | Up to 5s stale — visible via a timestamp |
-| ✅ SSE push from coordinator | Best | One connection per viewer, coordinator does the work once | Coordinator must own a broadcast loop |
-| ❌ On-demand only (manual refresh) | None | Zero | Operator stares at a frozen screen believing it's live |
+Suppose an operator selects key A, then key B. If A's slower response arrives last, a naive
+component can show A under B's selection. I would bind the response to a request generation
+and key identity before accepting it.
 
-**5-second polling is the right default and SSE is the right upgrade.** The reason to prefer polling *now* is that push moves work into the coordinator — it must maintain a client registry and a broadcast timer — and the coordinator is the component whose reliability matters most. Adding responsibilities to it in order to make a dashboard prettier is a bad trade at this scale.
+Cancellation reduces wasted work, but generation checks are still useful because
+cancellation may happen after a response is already completing. The invariant is that a
+response for an obsolete selection cannot replace the current detail.
 
-Three things make polling honest:
+The same rule applies to pattern search and namespace changes. A previous page must not
+appear under a newly typed search. I would reset or mark the old results explicitly while
+the new request is pending.
 
-- **Show the data's age.** A "last updated 3s ago" stamp costs nothing and converts an invisible property into a visible one. Without it, a frozen dashboard and a quiet cluster look identical.
-- **Poll only what's visible.** The key browser shouldn't refresh while the operator is on the cluster tab. Per-view polling scales with attention, not with tabs.
-- **Back off when hidden.** `visibilitychange` should slow or stop polling in background tabs — this alone removes most of the multi-tab load problem, because the tabs contributing load are the ones nobody is looking at.
+### Ownership and presence
 
-> "I'd take a 5-second delay with an honest timestamp over a 500ms refresh that makes the console part of the incident. The operator can wait five seconds; the coordinator can't absorb ten dashboards during a failover."
+The detail view should show the node that actually served the value and the placement
+version used. A separate owner lookup may report where a future request would go. If those
+observations differ, present the difference rather than choosing whichever response arrived
+later.
 
----
+A listed key can disappear through expiration or eviction before inspection. That is a
+normal miss, not necessarily a frontend bug. I would leave the row's context visible and
+say the value was absent at inspection time.
 
-## 🔍 Deep Dive 3: A Console That Can Break Production (9 minutes)
+TTL is also a sample. A local countdown can help interpretation, but it cannot prove the
+server still holds the value. At zero, label the observation expired and offer a refresh;
+do not claim a server deletion happened at that instant.
 
-This UI can delete keys, remove nodes, and trigger rebalancing. That makes safety a frontend design problem, not just a permissions one.
+### The trade-off
 
-### The asymmetry that drives everything
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Observation envelope with coverage and versions | Makes uncertainty inspectable | Richer API and rendering states |
+| ❌ Render whichever panels finish | Very simple initial implementation | Mixed generations and hidden partial totals |
+| ❌ Freeze all writes to take a global snapshot | Stronger observation boundary | Disrupts a live cache for a monitoring screen |
 
-Cache operations are not equally reversible:
+The alternative of independent requests is still workable when each panel carries its own
+provenance and no combined guarantee is implied. I prefer one envelope for the overview
+because it makes correct use the easy path, while key inspection remains a separately
+identified observation.
 
-| Action | Reversibility | Blast radius |
-|--------|--------------|--------------|
-| Get / browse keys | Fully | None |
-| Set a key | Trivially | One key |
-| Delete a key | Recoverable — repopulates from source of truth | One key, one miss |
-| **Remove a node** | Triggers rebalance; the shard's keys are gone | ~1/N of the keyspace |
-| **Flush** | Not recoverable from the cache | Everything — and a thundering herd on the origin |
+## 🔧 Deep dive 2: Freshness without expensive observation — 8 minutes
 
-The last two aren't "delete" operations in the usual CRUD sense. Removing a node from a cache with **no replication** means that shard's keys cease to exist, and every request for them falls through to the origin database simultaneously. **The dangerous outcome isn't lost cache data — cache data is by definition rebuildable — it's the stampede against the system behind it.**
+> “I would begin with modest polling of shared observations. The important optimization is to collect once and serve many viewers; changing the browser transport alone does not remove expensive node scans.”
 
-### How that shapes the UI
+### Choosing a refresh mechanism
 
-I'd separate the controls by consequence rather than grouping them by resource:
+Five-second polling is easy to operate and sufficient for many human decisions. I would
+schedule the next request after the previous one completes, add small jitter, and enforce a
+timeout. A fixed interval that starts another request while the last one is still pending
+can accumulate work during the very incident being observed.
 
-- **Reads and single-key writes** are immediate, no friction. Adding a confirmation to a `get` trains people to click through dialogs, which is what makes the dangerous confirmation useless.
-- **Node removal and flush** get a confirmation that **states the consequence in the system's own terms** — not "Are you sure?" but "This removes ~1,847 keys (≈33% of the cache). Those requests will hit the origin until repopulated." A dialog that quantifies the blast radius is the only kind anyone actually reads.
-- **Destructive actions show what will happen before they happen.** The console already knows the ring; it can compute which keys a node owns. Previewing the affected set turns an irreversible decision into an informed one.
+Manual refresh should coalesce with an in-flight request or deliberately replace it.
+Repeated clicks should not create parallel observation passes.
 
-### What I'd give up
+When the page is hidden, pause or substantially slow polling. Resume with one refresh when
+it becomes visible. If requests fail, back off and show age; do not make repeated failures
+produce a faster retry loop.
 
-This friction is real cost during an incident, when the operator may *need* to remove a node quickly. So the confirmation must be fast to clear — one keystroke, no typing the node name — and the preview must be already-computed rather than triggering a slow query at the worst moment. **Safety that adds latency to emergency actions gets routed around**, usually by someone curling the API directly, which loses the audit trail entirely.
+SSE becomes attractive if operators need faster one-way updates or many viewers repeatedly
+fetch unchanged envelopes. The backend can push a new observation identifier and changed
+samples. It still needs a bounded collection loop and per-client output limits.
 
-> "The design goal is that nobody ever needs to bypass the console to move fast. The moment the safe path is slower than curl, the safe path stops being used."
+WebSockets are reasonable when the product requires an ongoing bidirectional protocol.
+Ordinary administrative commands can remain HTTP requests with explicit outcomes, so I
+would not choose a socket merely because the screen is “live.”
 
----
+| Approach | Why I would choose or defer it |
+|----------|--------------------------------|
+| ✅ Poll shared observations | Small protocol, bounded server work, simple recovery |
+| ❌ Poll each node from each viewer | Multiplies collection work and duplicates topology logic |
+| Deferred SSE | Useful for many viewers or tighter freshness needs |
+| Deferred WebSocket | Adds connection lifecycle without a present bidirectional requirement |
 
-## 🧪 The Live Test Console Writes to a Real Cluster
+### Browsing keys is a different workload
 
-The console includes a set/get/delete panel that operates against the actual cache. That's an unusual thing to ship, and it's worth examining rather than glossing over.
+The overview needs counters and node samples; it does not need a key list. I would remove
+enumeration from background overview refresh entirely.
 
-**Why it earns its place:** the fastest way to understand consistent hashing is to type a key and watch which node claims it. Change one character, watch it land elsewhere. No diagram teaches that as well as doing it. For a system whose purpose is pedagogical, an interactive probe is the highest-value screen in the product.
+The key browser uses explicit Search or debounced input and a bounded cursor. The server
+limits work per page, not just returned rows. A scan that visits ten million keys and
+returns ten rows is still expensive.
 
-**Why it's dangerous:** it is a production write endpoint with a friendly form in front of it. Someone exploring can overwrite a real key, and nothing about a text input suggests consequence.
+Pagination through a live cache is not a perfect census. Keys can be added, evicted, or
+expire between pages. The response should state the scope and scan version; a topology
+change may invalidate the cursor and require restarting the scan.
 
-The reconciliation I'd build:
+For stable results at a particular time, the system would need a separate snapshot/export
+facility with a different cost model. I would not make interactive browsing pay that cost
+by default.
 
-| Concern | Approach |
-|---------|----------|
-| Accidental overwrite | Namespace test keys with a visible prefix, and default the input to it |
-| Confusion with real traffic | Label results with the node that served them, so the routing lesson stays the point |
-| Destructive exploration | Delete is available but never the default action; the panel opens in get/set mode |
-| Blast radius | The panel operates on single keys only — no bulk, no patterns, no flush |
+### Rendering and previews
 
-The last row is the important one. **The test console deliberately cannot express a dangerous operation.** Bulk and flush live elsewhere, behind the confirmation flow described above. Capability separation by screen is stronger than confirmation dialogs, because it removes the dangerous action from the context where someone is experimenting quickly.
+A virtualized list helps when a fetched page contains enough rows to make rendering
+expensive. Stable row identity should include namespace and key, plus physical source if
+the view intentionally exposes duplicate copies during diagnosis.
 
-> "I'd rather the exploratory tool be incapable of large damage than be capable and guarded. Guards get clicked through; missing features don't."
+Virtualization does not reduce network payload or backend enumeration. Server pagination
+and browser windowing solve different problems, and I would introduce each where
+measurement justifies it.
 
----
+Large values need a size-limited preview and an explicit fetch/download path, subject to
+permission. Serializing a huge object into a pretty-printed string can block the main
+thread even if the surrounding layout is small.
 
-## 🧩 How Views Map to Questions
+The ring view should answer a specific question. For three nodes, a compact diagram is
+educational. For a hundred, a sorted distribution chart or table communicates imbalance
+more clearly than hundreds of tiny arcs.
 
-The console has four views, and each exists to answer one operator question:
+I would show ownership share, stored bytes, and request rate as separate measures. Equal
+arcs do not mean equal memory or equal load. A hot key can overload one node despite an
+evenly divided ring.
 
-| View | Question | Refresh behavior |
-|------|----------|------------------|
-| Overview | "Is anything wrong right now?" | Polls; the only view that should be left open |
-| Cluster | "How is the keyspace distributed?" | Polls while visible |
-| Keys | "What's actually cached, and where?" | On demand + explicit refresh — listings are expensive |
-| Test | "Where does *this* key go?" | No polling; purely interactive |
+### What this choice gives up
 
-Organizing by question rather than by resource is what keeps this from becoming a CRUD admin panel. A resource-oriented design would give me a Nodes page, a Keys page, and a Stats page — and the operator's actual first question, "is anything wrong", would require visiting all three and synthesizing.
+Polling permits visible delay. Shared collection also means an operator cannot demand a
+fresh probe of every node for free. An explicit diagnostic refresh may be useful, but it
+needs a separate budget and a visible completion state.
 
-**The overview is therefore the only page designed to be watched**, and it's the only one that polls unconditionally. That single decision resolves most of the load concern from Deep Dive 2: the expensive views are the ones nobody leaves open.
+The benefit is predictable work when many operators open the console. I would accept
+several seconds of clearly labeled age before accepting unbounded enumeration that competes
+with application traffic.
 
----
+## 🔧 Deep dive 3: Administrative actions with truthful outcomes — 8 minutes
 
-## 🚦 Loading, Empty, and Error States Are the Product
+> “A responsive console can show that a request is pending immediately. It should wait for evidence before saying a node was removed or the cluster was flushed.”
 
-In a consumer app these are edge cases. In a monitoring console they're a substantial fraction of what gets displayed, and getting them wrong destroys trust in everything else.
+### Consequence determines the interaction
 
-**"No data" and "can't reach the coordinator" must never look the same.** An empty key list means the cache is empty; a failed request means the console doesn't know. Rendering both as an empty table tells the operator the cache is empty during an outage — the most damaging possible confusion in this UI.
+Reading a key needs no confirmation, although it still requires permission because values
+may be sensitive. Removing a node or flushing a namespace can create a surge of origin
+reads. Those actions deserve a preview of scope and a short, specific confirmation.
 
-| State | Treatment | Why |
-|-------|-----------|-----|
-| Loading (first) | Skeleton in place | Layout shouldn't jump when data arrives |
-| Loading (refresh) | Keep previous data, show a subtle indicator | Blanking a live dashboard on every 5s poll makes it unreadable |
-| Empty | Explicit "cache is empty" copy | Distinguishes from failure |
-| Coordinator unreachable | Full-width banner, **previous data dimmed and timestamped** | Operator can still read the last known state, clearly marked as stale |
-| Partial failure (one node down) | Render the cluster, mark that node | A single dead node must not blank the page — it's the thing they came to see |
+The preview should identify environment, namespace or node, placement version, available
+refill headroom, and estimated impact. Estimates need coverage and age; a sample of 1,000
+keys cannot be presented as the exact number affected in a million-key shard.
 
-The partial-failure row is the one people miss. If the topology request succeeds but one node's stats request fails, the naive implementation throws and shows an error page — hiding the healthy nodes and the very failure being diagnosed. **Per-node error isolation is a requirement, not a refinement.**
+The backend must bind the accepted operation to the expected placement version. If topology
+changed after preview, the UI should request a new preview. A frontend confirmation alone
+cannot prevent an obsolete request or a direct API call.
 
----
+### Long-running operations need identities
 
-## 🗄️ State: Server Data Isn't Application State
+For node changes I would use a server operation resource. The initial response returns an
+operation ID; later responses identify pending work, completed targets, failures, and
+whether the operation can be resumed.
 
-The store holds cluster snapshot, key listing, and the test console's local form state — and the distinction between them is the organizing idea.
+The UI can navigate away and return using that ID. The operation's lifetime should not
+depend on an open browser tab or an in-memory component promise.
 
-| Data | Owner | Lifetime |
-|------|-------|----------|
-| Node list, health, distribution | Server | Refetched; never mutated locally |
-| Key listing | Server | Refetched; scoped to a ring epoch |
-| Test console input/results | Client | Session-local, never persisted |
-| Selected node / active tab | Client (URL) | Shareable — an operator pastes a link to a specific node |
+| Outcome | User-visible meaning |
+|---------|----------------------|
+| Accepted | Server registered the operation |
+| Running | Some work remains |
+| Completed | Defined completion condition satisfied |
+| Partially completed | Named targets succeeded; others remain or failed |
+| Unknown after timeout | Request may have taken effect; reconcile by operation ID |
 
-**Nothing server-derived is edited locally.** There's no optimistic update anywhere in this console, and that's deliberate: an optimistic "key deleted" that then fails leaves the operator believing they've done something they haven't. In a diagnostic tool, showing the truth slightly later beats showing a hopeful guess immediately.
+A 200 response containing some failed node results is not a successful cluster-wide flush.
+The client should inspect the operation contract, not just HTTP status.
 
-Selected node and active view live in the **URL**, not the store, because the primary sharing mechanism during an incident is pasting a link into chat. State that isn't in the URL can't be shared, and a console whose views can't be shared gets screenshotted instead.
+### Why I avoid optimistic topology changes
 
----
+Removing a node card immediately can hide a failure to remove it. Rolling the card back
+later does not undo any migration already performed by the server. This is different from
+optimistically toggling a local preference.
 
-## 🔑 Where the Admin Key Lives
+I would keep the node visible with a pending action badge, disable duplicate submissions
+for that operation, and refresh from the authoritative result. Unrelated inspection stays
+usable.
 
-Mutating endpoints require an admin API key, and a browser is a poor place to keep one. Worth addressing directly, because it's the security question this console actually raises.
+A lost response is especially important for increment. If an increment was applied but its
+response disappeared, retrying can apply it twice. Unless the backend provides a receipt
+for the same logical operation, the console should report an unknown outcome and inspect
+current state rather than automatically replay it.
 
-**Any key the browser can send is a key the user can read.** Storing it in `localStorage`, in a store, or in a bundled env var are all the same thing from an attacker's perspective — an XSS on this page exfiltrates cluster-admin credentials. Vite inlines `VITE_`-prefixed variables into the built JavaScript, so "putting it in the environment" ships it to every visitor.
+SET is not universally harmless to replay either. A relative TTL restarts on each attempt,
+and another writer may have changed the key in between. Version conditions matter when the
+user means “replace the value I inspected.”
 
-| Approach | Exposure | Practicality |
-|----------|----------|--------------|
-| ❌ Key baked into the bundle | Everyone who loads the page | Trivial, and wrong |
-| ❌ Key in `localStorage` | Any XSS, persists across sessions | Common, still wrong |
-| ✅ **Session cookie, `HttpOnly`** | Not readable by JavaScript | Requires the coordinator to accept a session |
-| ✅ **Console behind a reverse proxy that injects the key** | Never reaches the browser | Best for an internal tool; no client changes |
+### Keep experimentation bounded
 
-For an internal operator console, the proxy option is the honest answer: the browser authenticates as a *person*, and the infrastructure attaches the cluster credential. The frontend then holds no secret at all, which is the only state that survives an XSS.
+The local Test page can write arbitrary keys and perform 100 sequential SETs. In a
+production console I would place that capability in a dedicated development environment, or
+enforce a small test namespace with expiry and quotas at the API.
 
-Given this project's local-first constraint, the key is supplied at runtime rather than bundled — which keeps it out of the artifact but not out of memory. **I'd call that out as the deliberate gap it is**, rather than describing the console as secure.
+A UI prefix is useful feedback but not access control. The server must reject requests
+outside the allowed scope, even if someone edits the request in browser tools.
 
----
+I would cap the result log, preserve inputs after failures, and distinguish malformed JSON
+from an intentional string. Quietly treating every parse error as a string can store a
+different value type than the operator intended.
 
-## 📊 Visualizing the Ring
+### The trade-off
 
-The hash ring is the concept the console exists to make tangible, and it's the one thing a table can't convey.
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Pending state plus server operation result | Accurate during partial failures and navigation | Requires backend operation tracking |
+| ❌ Optimistic success then local rollback | Fast-looking first response | Cannot reverse distributed effects |
+| ❌ Confirmation for every interaction | Uniform implementation | Trains operators to dismiss prompts |
 
-Consistent hashing places 150 virtual nodes per physical node around a 2³² circle. The properties an operator needs to see are **whether distribution is even** and **how much moves when topology changes** — and those are spatial facts, not numeric ones.
+I am giving up the appearance of instant completion, not immediate feedback. The pending
+state can be fast, clear, and useful while the actual work remains asynchronous.
 
-- **A ring diagram** shows vnode interleaving directly: healthy distribution looks like evenly mixed colors, and a hot node looks like a visible arc.
-- **A distribution bar** answers "is it balanced?" faster than the ring does, because comparing lengths is easier than comparing arc coverage.
-- **During rebalance**, highlighting only the moving range makes the central claim of consistent hashing — that ~1/N moves, not everything — visible in one glance.
+## 🔐 Access, accessibility, and verification — 5 minutes
 
-I'd render the ring with **inline SVG rather than a charting library**. It's a circle with colored arcs; a charting dependency would be larger than the code it replaces and would fight me on the one interaction that matters (hovering an arc to see the key range). This is the rare case where hand-drawn beats a library.
+The browser should authenticate a person through a session and receive only their permitted
+views and actions. A backend can hold a service credential, but it must authorize each
+request before forwarding it. Keeping a key out of JavaScript does not prevent an
+authenticated user from issuing an unauthorized command unless the server checks scope.
 
-The honest limitation: with three nodes and 450 vnodes, an accurate ring is visually dense. I'd sample the render — draw the *distribution* faithfully without drawing all 450 marks — and say so in a caption, because a diagram that silently omits data is its own kind of lie.
+The current frontend sends no admin key, so protected node controls fail. That is an
+integration gap; it is not evidence of a working login flow. Conversely, current public
+data and flush endpoints are not made safe by hiding controls in the UI.
 
----
+For accessibility, health needs a word or symbol in addition to color. Action controls need
+proper labels, keyboard focus, and an intelligible pending state. I would announce
+meaningful health changes politely rather than every polling update, which would overwhelm
+a screen reader.
 
-## ♿ Status Must Not Be Color Alone
+Small screens can collapse node details and move the key inspector below the list. Long
+URLs and keys should wrap or truncate with a way to inspect the full value. A fixed
+navigation row should not push primary actions out of reach.
 
-Node health is the primary signal on the page, and "green dot / red dot" fails roughly one in twelve men with a red-green deficiency — a population well represented among on-call engineers.
+The most valuable frontend tests exercise ordering and uncertainty:
 
-Every status carries a **shape and a word**, not just a hue: healthy, degraded, and unreachable are distinguishable in grayscale. Health changes are announced through a polite live region so a screen-reader user learns a node went down without re-reading the table.
+| Scenario | Expected behavior |
+|----------|-------------------|
+| A selected, then B; A returns last | B remains selected and displayed |
+| One node sample fails | Partial total and failed node remain visible |
+| Membership changes during preview | Old preview cannot submit silently |
+| Flush finishes on only some targets | Per-target outcomes, no blanket success |
+| Tab hidden, then visible | Polling backs off, then refreshes once |
+| Inspection of expired key | Clear miss with prior listing context |
 
-The same principle applies to the distribution bar: relying on color to separate node segments makes it unreadable for the same users, so segments are labeled directly.
+These can be deterministic contract/component tests. A small real-cluster smoke test then
+verifies routing, authentication integration, and one operation lifecycle. The repository's
+three existing page checks do not prove these behaviors.
 
----
+## ⚖️ Decisions and implementation boundary — 3 minutes
 
-## 🔬 Testing an Interface to a Moving System
+| Decision | Chosen | Alternative | Reason |
+|----------|--------|-------------|--------|
+| Overview data | ✅ Versioned observations with coverage | ❌ Unqualified totals | Missing nodes must remain visible |
+| Refresh | ✅ Shared collection plus modest polling | ❌ Full fan-out per tab | Bound work during incidents |
+| Node changes | ✅ Pending operation with receipts | ❌ Optimistic completion | Distributed effects can be partial |
+| Key browsing | ✅ Bounded scan and preview | ❌ Entire keyspace in memory | Control backend and browser work |
 
-The interesting tests here don't assert that components render — they assert the UI stays truthful while the cluster misbehaves.
+The current application has the four routes, local component state, an overview store,
+five-second polling, and basic HTTP operations. It does not have placement versions, shared
+observation snapshots, cursor pagination, request-generation checks, authenticated
+sessions, or durable administrative operation records.
 
-| Scenario | Simulation | What it protects |
-|----------|-----------|------------------|
-| Mid-rebalance render | Snapshot with an in-flight migration | The composite-lie problem from Deep Dive 1 |
-| Coordinator unreachable | Reject all requests | Stale data stays visible and marked, not blanked |
-| One node down | Partial-failure fixture | Per-node isolation; page still renders |
-| Epoch change during browse | Bump the ring version between fetches | Key listing marked stale rather than silently mixed |
-| Background tab | Fire `visibilitychange` | Polling actually backs off |
-| Destructive confirm | Attempt node removal | Blast-radius preview computed and shown before commit |
+Those gaps define a practical first iteration: make incomplete results explicit, remove
+unused enumeration from overview polling, prevent obsolete responses from replacing current
+selections, and connect scoped administration through a real authorization boundary.
 
-The last two are the ones a normal test suite never covers and that matter most operationally — one is the load-amplification bug, the other is the "console caused the outage" bug.
-
-I'd write these against **fixture snapshots rather than a live cluster.** A test that needs three cache nodes running is a test that gets skipped. Serializing a few coordinator responses — healthy, rebalancing, degraded, unreachable — gives full coverage of the states that matter and runs in milliseconds.
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Rejected | Rationale |
-|----------|--------|----------|-----------|
-| Data freshness | ✅ 5s poll + visible timestamp | ❌ Sub-second polling | Dashboards must not amplify the incidents they display |
-| Upgrade path | ✅ SSE when needed | ❌ WebSocket | One-way data; no client→server channel required |
-| Consistency | ✅ One coordinated snapshot | ❌ Independent panel fetches | Composite views lie during rebalance |
-| Stale detection | ✅ Ring epoch on responses | ❌ Timestamps alone | Epoch tells you the *topology* changed, not just the clock |
-| Mutations | ✅ Confirm on write, never on read | ❌ Uniform confirmations | Uniform dialogs train people to dismiss them |
-| Danger UX | ✅ Quantified blast radius | ❌ "Are you sure?" | Only a specific consequence gets read |
-| Optimism | ✅ None | ❌ Optimistic updates | A diagnostic tool must not display hoped-for state |
-| Shareable state | ✅ URL | ❌ Store-only | Incident response is collaborative |
-| Ring rendering | ✅ Inline SVG | ❌ Charting library | Bigger than the code it replaces; fights the key interaction |
-
----
-
-## 🚀 What Breaks First
-
-**Polling amplification, before anything visual.** Several open tabs during an incident multiply coordinator load exactly when it's scarce. Visibility-based backoff first, SSE second.
-
-**Then the key browser.** Listing keys is unbounded by nature — a real cache holds millions. The current listing works because the dataset is small; at scale it needs server-side pagination and search, and the UI should refuse to render an unbounded list rather than freezing while it tries.
-
-**Then ring rendering**, at high node counts, where SVG arc count grows and the diagram stops being readable before it stops being fast. That's a design limit, not a performance one — past a certain cluster size a ring diagram is the wrong visualization and a distribution histogram is the right one.
-
-Notably absent from this list: the usual frontend concerns. There's no bundle-size problem, no render-performance problem, and no state-management complexity. **An operator console fails on trustworthiness and safety, not on speed** — which is why those got the deep dives.
-
----
-
-## 📝 Summary
-
-Three ideas:
-
-1. **Render one coherent snapshot, not several independent truths.** A distributed system's console must never compose a view from reads taken at different moments — that's precisely how it misleads during the topology changes it exists to show.
-2. **The observer must not perturb the observed.** Polling interval, per-view fetching, and background backoff are correctness decisions here, not optimizations, because the tool's load lands on the component whose health is in question.
-3. **Match friction to blast radius.** Reads are free, single keys are cheap, and node removal is a stampede against the origin — so the UI quantifies consequences rather than asking a generic question, and never makes the safe path slower than bypassing it.
+> “The console succeeds when an operator can explain what a number includes, identify when a result is uncertain, and carry out a change without confusing acceptance with completion. Those are the frontend guarantees I would establish before adding a more elaborate ring animation.”

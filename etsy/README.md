@@ -1,249 +1,210 @@
-# Design Etsy - Seller Marketplace
+# Etsy — handmade and vintage marketplace
 
-## Codebase Stats
+A local marketplace learning project with buyer browsing, keyword search, shops, favorites, a server-side cart, and seller tools. It combines a React interface with PostgreSQL catalog/order data, Valkey sessions and caches, and an Elasticsearch search index. The interesting design problems are selling scarce inventory, coordinating purchases across sellers, and keeping search useful as listings change.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 10,585 |
-| Source Files | 70 |
-| .ts | 5,008 |
-| .tsx | 2,880 |
-| .md | 1,924 |
-| .sql | 417 |
-| .json | 154 |
+**Current implementation:** browsing and seeded order pages provide a useful demo, but fresh-schema checkout fails. The checkout handler inserts `orders.payment_transaction_id`, which [the supplied schema](./backend/src/db/init.sql) does not define. Payment is simulated before this insert. There is no real charge, payment queue, or refund service. See [implementation limits](#implementation-limits) before evaluating checkout correctness.
 
-## Overview
+Read [architecture.md](./architecture.md) for the production proposal and source-grounded implementation map. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) answers are separate 45-minute interview walkthroughs; their proposed reservations and durable payment workflow are not implemented here.
 
-A simplified Etsy-like platform demonstrating seller marketplace dynamics, search relevance, personalization, and handmade/vintage product discovery. This educational project focuses on building a multi-seller e-commerce platform with emphasis on unique product discovery.
+## What you can explore
 
-## Key Features
+| Persona | Interface | Current behavior |
+|---------|-----------|------------------|
+| Visitor | Home, categories, search, products, shops | Trending cards, filters, product images, related-product suggestions |
+| Buyer | Login, favorites, cart, checkout, orders | PostgreSQL cart grouped by shop, delivery form, seeded order history |
+| Seller | Shop creation, dashboard, new listing | First-shop statistics, recent orders, status changes, listing creation with image URLs |
+| Admin | Seeded account only | No admin API or moderation interface |
 
-### 1. Seller Shops
-- Shop setup and branding
-- Product listings
-- Inventory management
-- Order fulfillment
+Search requires separately indexing seeded products. Favorites and cart changes wait for the API; there is no optimistic cache, real-time inventory feed, or offline checkout. Reviews have an API but no review-reading or submission interface. The dashboard's **Edit** link opens the public product page; it does not provide a listing editor.
 
-### 2. Product Discovery
-- Category browsing
-- Full-text search with Elasticsearch
-- Synonym-enhanced search for handmade items
-- Trending and popular items
+## Stack and ports
 
-### 3. Personalization
-- Favorite shops and items
-- View history tracking
-- Similar product recommendations
+Use Node.js 20+ and npm. The dependency manifests specify React 19, Vite 5, TypeScript, TanStack Router, Zustand, Tailwind CSS 3, Express 4, `pg`, `ioredis`, `connect-redis`, Opossum, Pino, and `prom-client`.
 
-### 4. Buyer Experience
-- Shopping cart (multi-seller)
-- Checkout with orders split by seller
-- Order tracking per seller
-- Reviews and favorites
+| Component | Local address | Configuration |
+|-----------|---------------|---------------|
+| Frontend | http://localhost:5173 | Vite proxies `/api` and `/uploads` to port 3000 |
+| API | http://localhost:3000 | One Express process; optional instance scripts use 3001–3003 |
+| PostgreSQL 16 | localhost:5432 | User `etsy`, password `etsy_password`, database `etsy_db` |
+| Valkey 7 | localhost:6379 | No development password |
+| Elasticsearch 8.11.0 | http://localhost:9200 | Single node; development security disabled; transport port 9300 |
 
-## Tech Stack
+Elasticsearch 8.11.0 is the pinned teaching configuration, not a claim that it is a current supported release. Use one infrastructure option below, then follow the common application setup. Existing projects using these ports must be stopped first.
 
-- **Frontend**: TypeScript, Vite, React 19, TanStack Router, Zustand, Tailwind CSS
-- **Backend**: Node.js, Express
-- **Database**: PostgreSQL
-- **Cache/Sessions**: Redis
-- **Search**: Elasticsearch
+## Infrastructure
 
-## Quick Start
+### Option A: Docker Compose (recommended)
 
-### Prerequisites
-
-- Node.js 18+
-- Docker and Docker Compose
-- npm or yarn
-
-### 1. Start Infrastructure
+Run from the `etsy` directory:
 
 ```bash
-# Start PostgreSQL, Redis, and Elasticsearch
-docker-compose up -d
-
-# Wait for services to be healthy (especially Elasticsearch)
-docker-compose ps
+docker compose up -d
+docker compose ps
+curl -fsS http://localhost:9200/_cluster/health
 ```
 
-### 2. Backend Setup
+Compose starts PostgreSQL, Valkey, and Elasticsearch with persistent volumes. It does not start the Node processes. PostgreSQL runs `init.sql` when its volume is first created. Elasticsearch uses a 512 MiB heap; allow additional memory for its process, PostgreSQL, and the application.
 
 ```bash
-cd backend
+# Stop containers while preserving data.
+docker compose down
+# Reset this project's database, sessions, and search index; deletes its volumes.
+docker compose down -v
+```
 
-# Install dependencies
+Legacy `docker-compose` is equivalent if that is the executable installed. Repository screenshot automation invokes that spelling.
+
+### Option B: Native installation (macOS, no Docker)
+
+Install and start PostgreSQL and Valkey with Homebrew:
+
+```bash
+brew install postgresql@16 valkey
+brew services start postgresql@16
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+
+# One-time development role and database creation.
+psql postgres -c "CREATE ROLE etsy LOGIN PASSWORD 'etsy_password';"
+createdb -O etsy etsy_db
+PGPASSWORD=etsy_password psql -h localhost -U etsy -d etsy_db -c 'SELECT 1;'
+valkey-cli ping
+```
+
+For Elasticsearch, download the macOS archive and matching checksum from the official [8.11.0 release page](https://www.elastic.co/downloads/past-releases/elasticsearch-8-11-0). Select **aarch64** for Apple Silicon or **x86_64** for Intel. The following example assumes the two files are in the current directory; set the architecture accordingly:
+
+```bash
+etsy_es_arch=aarch64
+shasum -a 512 -c "elasticsearch-8.11.0-darwin-${etsy_es_arch}.tar.gz.sha512"
+tar -xzf "elasticsearch-8.11.0-darwin-${etsy_es_arch}.tar.gz"
+cd elasticsearch-8.11.0
+ES_JAVA_OPTS='-Xms512m -Xmx512m' ./bin/elasticsearch \
+  -Ediscovery.type=single-node \
+  -Enetwork.host=127.0.0.1 \
+  -Expack.security.enabled=false \
+  -Expack.security.enrollment.enabled=false
+```
+
+Keep this terminal open; use a fresh archive configuration for these local HTTP settings. The archive bundles Java and accepts configuration through `-E` arguments; see Elastic's [archive installation guide](https://www.elastic.co/guide/en/elasticsearch/reference/8.11/targz.html). In another terminal, verify `curl -fsS http://localhost:9200/_cluster/health`. The API creates the `products` index on startup, but does not populate it from PostgreSQL.
+
+Stop native Elasticsearch with Ctrl-C. Use `brew services stop postgresql@16` and `brew services stop valkey` when finished. These stop commands preserve data.
+
+## Application setup
+
+From `etsy/backend`:
+
+```bash
 npm install
-
-# Copy environment file
 cp .env.example .env
-
-# Run database migrations (also auto-applied via docker-entrypoint-initdb.d on first docker-compose up)
+mkdir -p uploads
 npm run db:migrate
-
-# Seed with sample data
-npm run seed
-
-# Start the backend server
+npm run db:seed
 npm run dev
 ```
 
-The backend runs on http://localhost:3000
+`dotenv` loads `backend/.env` when commands run from the backend directory. `uploads/` is required for the image-upload API; the frontend's new-listing form currently accepts URLs instead. Migration uses `CREATE TABLE IF NOT EXISTS`; rerunning it does not add missing columns to existing tables or fix the checkout/schema mismatch.
 
-### 3. Frontend Setup
+| Environment variable | Default / local value |
+|----------------------|-----------------------|
+| `DATABASE_URL` | `postgresql://etsy:etsy_password@localhost:5432/etsy_db` |
+| `REDIS_URL` | `redis://localhost:6379` |
+| `ELASTICSEARCH_URL` | `http://localhost:9200` |
+| `SESSION_SECRET` | Set a development secret in `.env`; source fallback is `dev-secret-key` |
+| `PORT` | `3000` |
+| `NODE_ENV` | `development` |
+| `FRONTEND_URL` | `http://localhost:5173` |
+
+In a second terminal, from `etsy/frontend`:
 
 ```bash
-cd frontend
-
-# Install dependencies
 npm install
-
-# Start the frontend dev server
 npm run dev
 ```
 
-The frontend runs on http://localhost:5173
+Open [the marketplace](http://localhost:5173). Health checks are available at `/api/health`, `/api/ready`, and `/api/live`; `/metrics` exposes Prometheus text. Health and readiness check PostgreSQL and Valkey. They do not verify search index contents, image storage, or checkout/schema compatibility.
 
-## Test Accounts
+### Seed accounts and fixtures
 
-After running the seed script, these accounts are available:
+The common setup above uses [the TypeScript seed](./backend/src/db/seed.ts). On a fresh database it creates eight categories, five users, three shops, ten products, and a small buyer cart/favorites/order fixture.
 
-| Email | Password | Role |
-|-------|----------|------|
-| buyer@example.com | password123 | Buyer |
-| alice@example.com | password123 | Seller (Alice's Handmade Jewelry) |
-| bob@example.com | password123 | Seller (Bob's Woodwork Studio) |
-| carol@example.com | password123 | Seller (Carol's Vintage Finds) |
-| admin@example.com | password123 | Admin |
+| Login email | Persona | Password with `npm run db:seed` |
+|----------------|---------|----------------------------------|
+| `buyer@example.com` | Buyer | `password123` |
+| `alice@example.com` | Alice’s Handmade Jewelry seller | `password123` |
+| `bob@example.com` | Bob’s Woodwork Studio seller | `password123` |
+| `carol@example.com` | Carol’s Vintage Finds seller | `password123` |
+| `admin@example.com` | Admin-role account, no admin interface | `admin123` |
 
-## API Endpoints
-
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
-
-### Shops
-- `GET /api/shops` - List shops
-- `GET /api/shops/:id` - Get shop by ID
-- `GET /api/shops/slug/:slug` - Get shop by slug
-- `POST /api/shops` - Create shop (auth required)
-- `PUT /api/shops/:id` - Update shop (owner only)
-- `GET /api/shops/:id/products` - Get shop products
-- `GET /api/shops/:id/orders` - Get shop orders (owner only)
-- `GET /api/shops/:id/stats` - Get shop stats (owner only)
-
-### Products
-- `GET /api/products` - List products
-- `GET /api/products/search` - Search products (Elasticsearch)
-- `GET /api/products/trending` - Get trending products
-- `GET /api/products/:id` - Get product details
-- `POST /api/products` - Create product (shop owner)
-- `PUT /api/products/:id` - Update product (shop owner)
-- `DELETE /api/products/:id` - Delete product (shop owner)
-
-### Cart
-- `GET /api/cart` - Get cart (grouped by shop)
-- `POST /api/cart/items` - Add to cart
-- `PUT /api/cart/items/:id` - Update quantity
-- `DELETE /api/cart/items/:id` - Remove item
-- `DELETE /api/cart` - Clear cart
-
-### Orders
-- `GET /api/orders` - Get user's orders
-- `GET /api/orders/:id` - Get order details
-- `POST /api/orders/checkout` - Create order(s)
-- `PUT /api/orders/:id/status` - Update status (seller)
-
-### Favorites
-- `GET /api/favorites` - Get favorites
-- `POST /api/favorites` - Add favorite
-- `DELETE /api/favorites/:type/:id` - Remove favorite
-- `GET /api/favorites/check/:type/:id` - Check if favorited
-
-### Reviews
-- `GET /api/reviews/product/:id` - Get product reviews
-- `GET /api/reviews/shop/:id` - Get shop reviews
-- `POST /api/reviews` - Create review (must have purchased)
-- `PUT /api/reviews/:id` - Update review
-- `DELETE /api/reviews/:id` - Delete review
-
-### Categories
-- `GET /api/categories` - List categories
-- `GET /api/categories/:id/products` - Get products in category
-
-## Project Structure
-
-```
-etsy/
-├── docker-compose.yml      # PostgreSQL, Redis, Elasticsearch
-├── backend/
-│   ├── src/
-│   │   ├── db/            # Database connection and migrations
-│   │   ├── routes/        # Express route handlers
-│   │   ├── services/      # Redis, Elasticsearch clients
-│   │   ├── middleware/    # Auth middleware
-│   │   ├── config.js      # Environment config
-│   │   └── index.js       # Express app entry
-│   └── uploads/           # Product images
-├── frontend/
-│   ├── src/
-│   │   ├── components/    # React components
-│   │   ├── routes/        # TanStack Router pages
-│   │   ├── stores/        # Zustand stores
-│   │   ├── services/      # API client
-│   │   └── types/         # TypeScript types
-│   └── index.html
-├── architecture.md        # System design documentation
-├── claude.md              # Development notes
-└── README.md              # This file
-```
-
-## Running Multiple Backend Instances
-
-For testing load balancing and distributed scenarios:
+For richer screenshots, choose [the SQL seed](./backend/db-seed/seed.sql) **instead of** `npm run db:seed`, after migration, on a fresh database:
 
 ```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
+# Run from etsy/backend; requires the psql client.
+PGPASSWORD=etsy_password psql -v ON_ERROR_STOP=1 \
+  -h localhost -U etsy -d etsy_db -f db-seed/seed.sql
 ```
 
-## Key Technical Challenges Addressed
+The SQL fixture uses `password123` for **all five accounts, including admin**. It adds three buyer orders, a multi-shop cart, and illustrative ratings/counters. The root screenshot runner chooses this SQL fixture because it contains user rows. Neither seeder is fully idempotent: repeated runs add duplicate products and can add dependent fixtures. Existing user passwords are not overwritten by the other seeder.
 
-### 1. Multi-Seller Cart
-Cart items are grouped by shop, and checkout creates separate orders per seller with independent fulfillment tracking.
+Neither seed populates Elasticsearch. A running, empty index returns zero search results; this does not trigger the SQL fallback.
 
-### 2. Search Relevance
-Elasticsearch with synonym filters handles varied terminology (handmade, handcrafted, artisan) and fuzzy matching for typos.
+### Put seeded products into the search index
 
-### 3. One-of-a-Kind Inventory
-Products often have quantity=1. Short cart reservations (15 min) prevent overselling unique items.
+For a fresh demo index, this one-off command uses the existing indexing helper. Run from `etsy/backend` after dependencies, database, and Elasticsearch are ready:
 
-### 4. Sparse Signal Personalization
-Recommendations based on favorites and view history, with trending products for cold-start users.
+```bash
+node --import tsx --input-type=module <<'NODE'
+import db from './src/db/index.ts';
+import es, { initializeIndex, indexProduct } from './src/services/elasticsearch.ts';
+try {
+  await initializeIndex();
+  const { rows } = await db.query(`
+    SELECT p.*, s.name AS shop_name, s.rating AS shop_rating,
+           s.sales_count AS shop_sales_count, c.name AS category_name
+    FROM products p
+    JOIN shops s ON s.id = p.shop_id
+    LEFT JOIN categories c ON c.id = p.category_id
+    WHERE p.is_active = true AND s.is_active = true
+  `);
+  for (const product of rows) await indexProduct(product);
+  await es.indices.refresh({ index: 'products' });
+  console.log(await es.count({ index: 'products' }));
+} finally {
+  await db.pool.end();
+  await es.close();
+}
+NODE
+```
 
-## Architecture
+The helper logs individual indexing failures rather than throwing them, so inspect errors and the resulting count. Ten documents are expected for either single fresh seed. This command upserts current rows; it is not a complete repair of stale/deleted documents or mappings. Previously cached empty searches can remain for two minutes. Product creation and updates attempt indexing, but there is no retry worker or seed-index script in `package.json`.
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+### Seller navigation
 
-## Development Notes
+Log in as a seller from the home page, reload the **home page**, wait for the session check, then navigate to the seller dashboard through the UI. Login returns `shopIds`, while `/api/auth/me` returns the `shops` objects the dashboard expects. Directly reloading a protected seller route can redirect to login before session hydration finishes. The dashboard only displays the first shop.
 
-See [claude.md](./claude.md) for development insights and design decisions.
+## Useful commands and verification
 
-## References & Inspiration
+| Directory | Command | Purpose |
+|-----------|---------|---------|
+| `backend` | `npm run build` / `npm run type-check` | Compile / check backend TypeScript |
+| `backend` | `npm run start` | Run compiled `dist/index.js` after building |
+| `backend` | `npm run dev:server1` through `dev:server3` | Optional API processes on ports 3001–3003 |
+| `frontend` | `npm run build` | TypeScript project build and Vite production bundle |
+| Either application directory | `npm run lint` | Existing ESLint setup |
+| `etsy` | `npm install` then `npm run test:e2e` | Project Playwright smoke tests |
+| Repository root | `npm run test:smoke etsy` | Root smoke runner against a running stack |
+| Repository root | `node scripts/screenshots.mjs --start etsy` | Start infrastructure/apps, seed, capture, and clean up processes |
 
-- [Etsy Code as Craft](https://www.etsy.com/codeascraft) - Etsy's official engineering blog with marketplace insights
-- [Search Ranking at Etsy](https://www.etsy.com/codeascraft/how-we-built-a-context-specific-bidding-system-for-etsy-ads) - Context-aware search and ranking
-- [Personalization at Scale](https://www.etsy.com/codeascraft/personalized-recommendations-at-etsy) - Etsy's approach to product recommendations
-- [Elasticsearch Synonyms Guide](https://www.elastic.co/guide/en/elasticsearch/reference/current/analysis-synonym-tokenfilter.html) - Handling variant terminology in search
-- [Relevance Tuning for E-Commerce](https://opensourceconnections.com/blog/2016/08/11/relevance-at-scale/) - Balancing relevance and business rules
-- [Two-Sided Marketplace Design](https://a16z.com/marketplace-100/) - Andreessen Horowitz insights on marketplace dynamics
-- [Building Etsy's Activity Feed](https://www.etsy.com/codeascraft/the-architecture-of-etsys-activity-feeds/) - Architecture for activity feeds and notifications
-- [Search Quality at Pinterest](https://medium.com/pinterest-engineering/building-a-real-time-user-action-counting-system-for-ads-88a60d9c9a) - Related approaches to discovery-based commerce
+The Vite proxy still targets port 3000 when alternate API instances run; no load balancer is included. Shared database and sessions alone do not make checkout concurrency safe.
+
+The Playwright configuration can start Vite, but requires a working backend/database/session service. Its smoke tests log in as Alice and check basic home, cart, favorites, and order page rendering. They do not establish successful checkout, search correctness, or seller workflow correctness. Screenshots use the buyer account. This documentation review used source inspection and isolated mocked handler checks; it did not start the full stack or claim passing runtime tests.
+
+## Implementation limits
+
+- **Checkout and inventory:** the missing payment column blocks a fresh checkout. Even with a compatible database, availability is read before the transaction and decremented without a conditional stock claim. `reserved_until` is set to 15 minutes ahead when adding a new cart row for a one-unit product, but it is never enforced or expired by a worker.
+- **Payment and retries:** payment is a random simulation. Its fallback says “queued” without storing a job. The optional Redis idempotency middleware is not used by the frontend; keys are not scoped to a user or request body and can replay another user's response.
+- **Cancellation:** buyer cancellation can restock twice under concurrency; seller status changes to cancelled do not restock. Neither path refunds payment. Status transitions have no concurrency guard.
+- **Search and freshness:** indexing failures are swallowed, inventory changes do not consistently reach the index, and cache invalidation misses shop-page and search keys. SQL fallback drops price, shipping, attribute filters, and requested sorting. The UI does not disclose degradation and can substitute general catalog results after a search request error.
+- **Client state:** protected routes race session hydration; requests can apply stale responses after navigation/account changes. Cart failures can appear as an empty cart. Checkout sends another cart deletion after success, which can remove newly added items.
+- **Scope:** no real payment provider, reservation worker, order reconciliation, fulfillment integration, object store/CDN, admin moderation, personalized feed, or WebSocket updates. Uploads are local files. Monetary arithmetic uses floating-point JavaScript values, although PostgreSQL stores decimal amounts.
+
+See [Implementation Notes](./architecture.md#implementation-notes) for source links and the distinction between implemented patterns and their current guarantees.

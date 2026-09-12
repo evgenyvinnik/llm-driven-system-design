@@ -1,289 +1,204 @@
 # Facebook Post Search
 
-A privacy-aware search engine for social media posts with personalized ranking and real-time indexing.
+A local learning project for searching social posts with Elasticsearch. It demonstrates visibility-token filtering, friend/self relevance boosts, highlighted snippets, typeahead, and an admin inspection dashboard. PostgreSQL stores the source records and relationships; Valkey caches sessions and visibility sets.
 
-## Codebase Stats
+The [architecture](./architecture.md) distinguishes the production proposal from the code. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [full-stack](./system-design-answer-fullstack.md) answers turn those ideas into focused interview discussions.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 9,841 |
-| Source Files | 82 |
-| .ts | 5,690 |
-| .tsx | 1,828 |
-| .md | 1,758 |
-| .sql | 240 |
-| .json | 164 |
+## What the app does
 
-## Overview
+| Surface | Current behavior |
+|---------|------------------|
+| Search | Anonymous public search or signed-in visibility-filtered search; Enter/suggestion/hashtag commits a query |
+| Filters | Date range, post type, and Public/Friends selections with Apply/Clear |
+| Results | Snippets, author initials, dates, visibility/type icons, counts, and a raw relevance score; explicit Load More |
+| Suggestions | Trending query prefixes, signed-in user-name matches, and a hashtag aggregation path with a prefix bug |
+| Accounts | Username/password login, registration, opaque bearer sessions, logout |
+| Admin | Overview, first page of users/posts/search history, health indicators, bulk reindex button |
+| API-only features | Create/edit/delete posts, recent feed, author posts, increment likes, clear search history |
+| Not implemented in the UI | Composer, profile/detail pages, functional Like/Comment/Share controls, uploads/media playback, friendship management, saved searches, live updates |
 
-This project implements a Facebook-like post search system that demonstrates:
+This is **not a complete privacy boundary**. Search trusts indexed visibility and cached relationships; author listings and likes use different access rules. Suggestions/trends can expose information outside result filtering. Snippets are inserted as raw HTML without sanitization, and passwords use unsalted SHA-256 rather than bcrypt. These limitations are explained in the architecture and should be part of evaluating the demo.
 
-- **Full-text search** with Elasticsearch
-- **Privacy-aware filtering** - users only see posts they have permission to view
-- **Personalized ranking** - prioritizes posts from friends and engaged content
-- **Real-time indexing** - new posts are immediately searchable
-- **Typeahead suggestions** - autocomplete as users type
-- **Admin dashboard** - system monitoring and management
+## Stack
 
-## Key Features
+Node.js 20+ with Express and TypeScript; PostgreSQL 16; Elasticsearch 8.11.0; Valkey 7 through ioredis. The browser uses React 19, Vite 5, TanStack Router, Zustand, Tailwind CSS, and lucide-react. Cockatiel, Pino, and prom-client provide partial resilience/observability wiring. There is no Kafka worker or frontend virtualizer.
 
-- Full-text search with fuzzy matching and highlighting
-- Privacy filtering using visibility fingerprints
-- Social graph-based result boosting
-- Search suggestions and trending searches
-- Search history tracking
-- Admin dashboard with system stats
+## Run locally
 
-## Implementation Status
+Commands begin in `fb-post-search/` unless stated otherwise. Ports 5432, 6379, 9200/9300, 3000, and 5173 must be available.
 
-- [x] Initial architecture design
-- [x] Core functionality implementation
-- [x] Database/Storage layer (PostgreSQL + Elasticsearch + Redis)
-- [x] API endpoints
-- [x] Frontend search interface
-- [x] Admin dashboard
-- [ ] Performance optimization
-- [ ] Comprehensive testing
-
-## Tech Stack
-
-- **Frontend:** TypeScript + Vite + React 19 + TanStack Router + Zustand + Tailwind CSS
-- **Backend:** Node.js + Express + TypeScript
-- **Database:** PostgreSQL 16
-- **Search Engine:** Elasticsearch 8.11
-- **Cache:** Redis 7
-- **Infrastructure:** Docker Compose
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+ (v20 recommended)
-- Docker and Docker Compose
-- npm or yarn
-
-### Quick Start
-
-1. **Clone and navigate to the project:**
+### Option A: Docker Compose (recommended)
 
 ```bash
-cd fb-post-search
+docker compose up -d
+docker compose ps
+docker compose exec -T postgres pg_isready -U fb_search -d fb_post_search
+docker compose exec -T redis redis-cli ping
+curl -f http://localhost:9200/_cluster/health
 ```
 
-2. **Start infrastructure services:**
+A fresh PostgreSQL volume runs [init.sql](./backend/src/db/init.sql). Load the deterministic SQL fixture once before starting the backend:
 
 ```bash
-docker-compose up -d
+docker compose exec -T postgres psql -U fb_search -d fb_post_search -v ON_ERROR_STOP=1 < backend/db-seed/seed.sql
 ```
 
-Wait for services to be healthy:
+Existing volumes retain their data. Schema initialization uses guarded tables/indexes and recreated triggers; it does not upgrade an old table definition. The fixture skips existing keyed users/posts/edges but appends search-history rows on rerun. Do not mix it with the separate destructive JavaScript seeder described below.
+
 ```bash
-docker-compose ps
+docker compose down
+# Destructive: removes this project's database, cache, and index volumes.
+docker compose down -v
 ```
 
-3. **Set up the backend:**
+### Option B: Native installation (no Docker)
+
+For a fresh macOS Homebrew PostgreSQL/Valkey installation:
+
+```bash
+brew install postgresql@16 valkey
+brew services start postgresql@16
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+psql postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE fb_search WITH LOGIN PASSWORD 'fb_search_password';"
+createdb -O fb_search fb_post_search
+PGPASSWORD=fb_search_password psql -h localhost -U fb_search -d fb_post_search -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+PGPASSWORD=fb_search_password psql -h localhost -U fb_search -d fb_post_search -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql
+pg_isready -h localhost -U fb_search -d fb_post_search
+valkey-cli ping
+```
+
+Inspect existing roles/databases and skip creation when appropriate. Do not run native and Docker services on the same ports.
+
+Use the matching macOS archive from the [Elasticsearch 8.11.0 release](https://www.elastic.co/downloads/past-releases/elasticsearch-8-11-0). The following follows Elastic's [archive installation](https://www.elastic.co/guide/en/elasticsearch/reference/8.11/targz.html), with local-only settings matching this demo's unauthenticated client:
+
+```bash
+mkdir -p "$HOME/.local/share/fb-post-search"
+cd "$HOME/.local/share/fb-post-search"
+FPS_ES_ARCH="$(uname -m)"
+case "$FPS_ES_ARCH" in
+  arm64) FPS_ES_ARCH=aarch64 ;;
+  x86_64) ;;
+  *) echo "Choose a supported macOS archive"; exit 1 ;;
+esac
+FPS_ES_ARCHIVE="elasticsearch-8.11.0-darwin-${FPS_ES_ARCH}.tar.gz"
+curl -fLO "https://artifacts.elastic.co/downloads/elasticsearch/${FPS_ES_ARCHIVE}"
+curl -fLO "https://artifacts.elastic.co/downloads/elasticsearch/${FPS_ES_ARCHIVE}.sha512"
+shasum -a 512 -c "${FPS_ES_ARCHIVE}.sha512"
+tar -xzf "$FPS_ES_ARCHIVE"
+cd elasticsearch-8.11.0
+ES_JAVA_OPTS="-Xms512m -Xmx512m" ./bin/elasticsearch \
+  -Ediscovery.type=single-node -Enetwork.host=127.0.0.1 \
+  -Expack.security.enabled=false -Expack.security.enrollment.enabled=false
+```
+
+Keep this terminal open; Ctrl-C stops Elasticsearch. Verify from another terminal with `curl -f http://localhost:9200/_cluster/health`. The API creates the configured posts index, so no manual mapping command is needed.
+
+### Backend and frontend
+
+In a terminal starting in the project directory:
 
 ```bash
 cd backend
-cp .env.example .env
 npm install
-npm run db:migrate
-npm run db:seed
+cp -n .env.example .env
 npm run dev
 ```
 
-4. **Set up the frontend (in a new terminal):**
+In another terminal starting at the repository root:
 
 ```bash
-cd frontend
+cd fb-post-search/frontend
 npm install
 npm run dev
 ```
 
-5. **Access the application:**
+Open [PostSearch](http://localhost:5173). Vite proxies `/api` to port 3000. The backend listens before Elasticsearch initialization finishes, retries initialization up to ten times, and attempts a sequential backfill only when the index is empty. Wait for the backfill log before checking SQL-fixture searches. A partially populated index is not repaired by restarting; use the admin reindex action for upserts, subject to its limitations below.
 
-- Frontend: http://localhost:5173
-- Backend API: http://localhost:3000/api/v1
-- Elasticsearch: http://localhost:9200
+## Fixtures and credentials
 
-### Sample Login Credentials
+**The setup above uses [backend/db-seed/seed.sql](./backend/db-seed/seed.sql):** six users, fifteen posts across all four visibility labels, ten accepted directed friendship rows plus one pending row, and ten history entries.
 
-| Role  | Username | Password     |
-|-------|----------|--------------|
-| User  | alice    | password123  |
-| User  | bob      | password123  |
-| Admin | admin    | admin123     |
+| Username | Password | Notes |
+|----------|----------|-------|
+| alice | password123 | Friends with Bob and Carol |
+| bob | password123 | Friends with Alice, David, and Emma |
+| carol | password123 | Friends with Alice and Emma |
+| david | password123 | Friend of Bob; pending request to Alice |
+| emma | password123 | Friends with Bob and Carol |
+| admin | password123 | Email admin@facebook.local; admin dashboard access |
 
-## Project Structure
+Log in with **username**, not email. The login page's printed `admin / admin123` applies to the other seeder, not this SQL fixture. The SQL hash matches the actual SHA-256 login implementation.
 
-```
-fb-post-search/
-├── backend/
-│   ├── src/
-│   │   ├── config/          # Database, Elasticsearch, Redis config
-│   │   ├── controllers/     # Route handlers
-│   │   ├── middleware/      # Auth middleware
-│   │   ├── routes/          # API routes
-│   │   ├── services/        # Business logic
-│   │   │   ├── authService.ts      # Authentication
-│   │   │   ├── indexingService.ts  # Elasticsearch indexing
-│   │   │   ├── postService.ts      # Post CRUD
-│   │   │   ├── searchService.ts    # Search with privacy
-│   │   │   └── visibilityService.ts # Privacy filtering
-│   │   ├── types/           # TypeScript types
-│   │   └── scripts/         # Migration and seed scripts
-│   └── package.json
-├── frontend/
-│   ├── src/
-│   │   ├── components/      # React components
-│   │   ├── routes/          # TanStack Router routes
-│   │   ├── services/        # API client
-│   │   ├── stores/          # Zustand stores
-│   │   └── types/           # TypeScript types
-│   └── package.json
-├── docker-compose.yml
-├── architecture.md
-├── system-design-answer-fullstack.md
-└── CLAUDE.md
-```
+**Alternative `npm run db:seed`:** runs [scripts/seed.ts](./backend/src/scripts/seed.ts). It first initializes Elasticsearch, then deletes existing SQL users, posts, friendships, sessions, and history and attempts to clear the index. It creates nine users, twenty-five posts with randomized authors/dates/counters, and twenty-six accepted directed edges. Its admin is `admin / admin123`; ordinary users are alice, bob, carol, david, eve, frank, grace, and henry with password123. It contains public/friends posts, including coffee and birthday examples, rather than all four visibility labels. It does not clear Redis caches or inspect individual bulk indexing errors. Use it only for a disposable alternative dataset.
 
-## API Endpoints
+## Walkthrough
 
-### Authentication
+1. Search for `code` or `#programming` with the SQL fixture. Search is public without login; signing in adds eligible indexed friend/private content.
+2. Open Filters, choose a type or visibility, and Apply. Typing updates suggestions immediately; it does not run a full search until Enter or a suggestion click.
+3. Compare Alice and David searching for `sunset`: Alice owns the friends post, while David's pending edge should not grant search access under the indexed model. This does not establish the safety of every API endpoint.
+4. Log in as the fixture's admin to inspect overview/users/posts/history. The health API returns nested service objects, while the UI expects booleans, so red indicators do not reliably reflect dependency health.
+5. Use the interview answers to compare the current offset paging and request races with a proposed search-session contract.
 
-| Method | Endpoint           | Description              |
-|--------|-------------------|--------------------------|
-| POST   | /api/v1/auth/login    | Login with credentials   |
-| POST   | /api/v1/auth/register | Create new account       |
-| POST   | /api/v1/auth/logout   | End session              |
-| GET    | /api/v1/auth/me       | Get current user         |
+The SQL fixture has no coffee/birthday posts despite the home placeholder. Recent-search retrieval currently uses invalid aggregate/DISTINCT SQL; its failure is hidden by the browser. Admin tables load only their first page, and the health bar is not polled continuously.
 
-### Search
+## Environment and scripts
 
-| Method | Endpoint                   | Description              |
-|--------|---------------------------|--------------------------|
-| POST   | /api/v1/search            | Search posts             |
-| GET    | /api/v1/search/suggestions | Get typeahead suggestions |
-| GET    | /api/v1/search/trending   | Get trending searches    |
-| GET    | /api/v1/search/recent     | Get user's recent searches |
-| DELETE | /api/v1/search/history    | Clear search history     |
+| Setting | Actual default / behavior |
+|---------|---------------------------|
+| `NODE_ENV` / `PORT` | development / 3000 |
+| `POSTGRES_HOST` / `POSTGRES_PORT` | localhost / 5432 |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | fb_search / fb_search_password / fb_post_search |
+| `ELASTICSEARCH_URL` / `ELASTICSEARCH_INDEX` | http://localhost:9200 / posts |
+| `REDIS_URL` | redis://localhost:6379 |
+| `SESSION_SECRET` | Parsed, but unused by opaque session handling |
+| `LOG_LEVEL` | Not read; logger selects debug/info/silent by NODE_ENV |
+| CORS | Fixed localhost:5173 and localhost:3000 origins |
 
-### Posts
+The application and most scripts load `.env` through config. **`db:migrate` is different:** it reads exported `DATABASE_URL` or a hardcoded connection string matching Compose, and does not load `.env` or the `POSTGRES_*` settings. Run it from the backend directory when initializing an empty database or reapplying the consolidated schema; it does not record a version history.
 
-| Method | Endpoint                | Description              |
-|--------|------------------------|--------------------------|
-| POST   | /api/v1/posts          | Create new post          |
-| GET    | /api/v1/posts/feed     | Get user's feed          |
-| GET    | /api/v1/posts/:id      | Get post by ID           |
-| PUT    | /api/v1/posts/:id      | Update post              |
-| DELETE | /api/v1/posts/:id      | Delete post              |
-| POST   | /api/v1/posts/:id/like | Like a post              |
+`db:status` and `db:rollback` use a different numbered-migration helper and a missing `src/db/migrations` directory; they do not describe or undo `db:migrate`. `db:index` points to the missing `src/scripts/index-seeded-posts.ts`. `db:cleanup` deletes SQL search history older than 90 days when invoked; no scheduler runs it automatically.
 
-### Admin
+`dev:server1`, `dev:server2`, and `dev:server3` run on 3001–3003 in separate backend terminals. They share the three data services, but the Vite proxy remains on 3000. Rate limits and circuit state are per process; no load balancer is supplied.
 
-| Method | Endpoint                    | Description              |
-|--------|----------------------------|--------------------------|
-| GET    | /api/v1/admin/stats        | Get system statistics    |
-| GET    | /api/v1/admin/users        | List all users           |
-| GET    | /api/v1/admin/posts        | List all posts           |
-| GET    | /api/v1/admin/search-history | View search history     |
-| POST   | /api/v1/admin/reindex      | Reindex all posts        |
-| GET    | /api/v1/admin/health       | Health check             |
+## API map
 
-## Search Request Example
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/v1/auth/register`, `/api/v1/auth/login`, `/api/v1/auth/logout` | Account/session lifecycle |
+| GET | `/api/v1/auth/me` | Current user |
+| POST | `/api/v1/search` | Query, filters, and pagination; optional authentication |
+| GET | `/api/v1/search/suggestions`, `/api/v1/search/trending`, `/api/v1/search/filters` | Suggestions, trends, advertised filter choices |
+| GET / DELETE | `/api/v1/search/recent` / `/api/v1/search/history` | Personal history / clear history |
+| POST | `/api/v1/posts` | Create; SQL then synchronous indexing |
+| GET | `/api/v1/posts/feed`, `/api/v1/posts/user/:userId`, `/api/v1/posts/:id` | Feed, author list, single post |
+| PUT / DELETE / POST | `/api/v1/posts/:id` / `/api/v1/posts/:id` / `/api/v1/posts/:id/like` | Edit, hard-delete, increment likes |
+| GET | `/api/v1/admin/stats`, `/api/v1/admin/users`, `/api/v1/admin/posts`, `/api/v1/admin/search-history`, `/api/v1/admin/health` | Admin inspection |
+| POST | `/api/v1/admin/reindex` | Bulk upsert current SQL posts |
 
-```json
-POST /api/v1/search
-{
-  "query": "birthday party",
-  "filters": {
-    "date_range": {
-      "start": "2024-01-01",
-      "end": "2024-12-31"
-    },
-    "post_type": ["text", "photo"],
-    "visibility": ["public", "friends"]
-  },
-  "pagination": {
-    "limit": 20,
-    "cursor": null
-  }
-}
-```
+Explicit list limits/offsets are advisable when calling list APIs directly: several optional query-parameter defaults turn an omitted value into NaN. The frontend passes these parameters for its list calls. Search advertises sort choices through `/filters`, but the search request has no sort implementation.
 
-## Privacy Model
+## Known implementation boundaries
 
-Posts have visibility settings:
+- Search reads Elasticsearch content directly, with no current SQL permission/deletion check. Visibility caches last 15 minutes and their invalidation helper has no callers. There are no friendship mutation routes. Friends-of-friends maps to direct friends in search, and other post endpoints enforce different rules.
+- Creation can save SQL but return 500 after indexing fails. Deletion removes SQL and swallows any index-delete error. There is no durable retry queue, idempotent creation receipt, or event-version guard. Reindex upserts existing posts; it does not remove orphan documents or rebuild an index atomically, and its success count ignores item failures.
+- Suggestions cache by prefix alone, ignoring viewer/authentication and requested limit. Hashtags are stored with `#`, while the aggregation strips it; the aggregation also lacks visibility filtering. Trending queries are global, cumulative, and based on signed-in searches, including repeated page requests.
+- The home store has no cancellation, request generations, URL query state, deduplication, result-memory bound, or account reset. Old responses can overwrite a newer search; editing filters before Apply can combine a new filter with an old Load More cursor. A page failure replaces the whole result view with an error.
+- The Cockatiel retry policy is unused by the wrapper. A search/health pre-check can prevent half-open recovery; the outer timeout does not cancel Elasticsearch work or necessarily count as an inner breaker failure. Health/readiness can pass with Elasticsearch/Redis down, and the global rate limiter also covers probes/metrics. Shutdown calls process.exit immediately.
 
-- **public** - Anyone can see
-- **friends** - Only the author's friends can see
-- **friends_of_friends** - Friends and their friends can see
-- **private** - Only the author can see
-
-The search engine uses visibility fingerprints to efficiently filter results at query time, ensuring users only see posts they have permission to view.
-
-## Running Multiple Backend Instances
-
-For testing distributed scenarios:
+## Development and verification
 
 ```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
+npm --prefix backend run build
+npm --prefix frontend run build
+npm --prefix frontend run type-check
+npm --prefix backend run lint
+npm --prefix frontend run lint
+curl -f http://localhost:3000/health
+curl -f http://localhost:3000/readyz
+curl -f http://localhost:3000/metrics
 ```
 
-## Development Commands
+Project-level `npm run test:e2e` and repository-level `npm run test:smoke fb-post-search` use Playwright after installing its dependencies/browser and starting the data services/API. The smoke helper still selects an email field on a username form; its admin case uses Alice and only asserts a generic main element. Screenshot setup uses the correct Alice username but also navigates to admin as Alice. These are not permission or search-correctness tests.
 
-### Backend
-
-```bash
-npm run dev          # Start dev server with hot reload
-npm run build        # Build for production
-npm run db:migrate   # Run database migrations
-npm run db:seed      # Seed database with sample data
-npm run lint         # Run ESLint
-npm run format       # Format with Prettier
-```
-
-### Frontend
-
-```bash
-npm run dev          # Start dev server
-npm run build        # Build for production
-npm run preview      # Preview production build
-npm run type-check   # TypeScript type checking
-npm run lint         # Run ESLint
-```
-
-## Architecture
-
-See [architecture.md](./architecture.md) for the system design overview and [system-design-answer-fullstack.md](./system-design-answer-fullstack.md) for the complete system design interview answer.
-
-## Development Notes
-
-See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
-
-## Future Enhancements
-
-- [ ] Two-tier indexing (hot/cold)
-- [ ] Bloom filters for visibility sets
-- [ ] ML-based ranking model
-- [ ] Real-time WebSocket updates
-- [ ] Comment search
-- [ ] Multi-language support
-- [ ] Load testing and benchmarks
-
-## References & Inspiration
-
-- [Unicorn: A System for Searching the Social Graph](https://research.facebook.com/publications/unicorn-a-system-for-searching-the-social-graph/) - Facebook's research paper on social graph search
-- [Under the Hood: Indexing and Ranking in Graph Search](https://engineering.fb.com/2013/02/20/core-infra/under-the-hood-indexing-and-ranking-in-graph-search/) - Facebook's approach to privacy-aware search
-- [Typeahead Search at Facebook](https://engineering.fb.com/2010/05/17/web/the-life-of-a-typeahead-query/) - Real-time search suggestions implementation
-- [Elasticsearch: The Definitive Guide](https://www.elastic.co/guide/en/elasticsearch/guide/current/index.html) - Comprehensive guide for full-text search
-- [Privacy in Social Search](https://research.facebook.com/publications/privacy-social-search/) - Research on balancing privacy and search relevance
-- [BM25 Ranking Algorithm](https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables) - Understanding the default Elasticsearch ranking
-- [Facebook's TAO](https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/) - Graph data store enabling efficient social queries
+This documentation review read the source and ran ten isolated checks with mocked dependencies and the installed Cockatiel library. It did not start the stack, build, benchmark, or repair application code.

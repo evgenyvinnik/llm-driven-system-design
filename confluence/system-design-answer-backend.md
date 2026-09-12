@@ -1,428 +1,432 @@
-# System Design: Confluence Wiki (Backend Focus)
+# Design a team wiki — backend interview
 
-## 🎯 1. Requirements Clarification
+## 🎯 Establish the contract — 3 minutes
 
-> "Before diving in, let me clarify scope. We are building a wiki-based knowledge management platform where teams create, organize, and collaborate on documentation within spaces. The key backend challenges I want to focus on: the hierarchical page tree model and efficient tree queries, the Elasticsearch indexing pipeline with consistency guarantees, version control with diff computation, the macro expansion service, and the content approval workflow state machine. I will scope out real-time collaborative editing, file attachments, and PDF export."
+> “I would build a wiki around durable page revisions, explicit space permissions, and
+> search that can be rebuilt from the database. The most important distinction is that
+> accepting an edit and making it searchable are separate events.”
 
-**Functional:**
-- Create and manage **spaces** as organizational containers for pages
-- Hierarchical **page tree** with parent-child relationships within each space
-- **Rich-text content** with embedded macros (info, warning, note, code, toc)
-- **Version control** for every page edit with full diff capability between any two versions
-- **Full-text search** across all spaces with filtering, highlighting, and relevance scoring
-- **Threaded comments** on pages with resolve/unresolve capability
-- **Content approval workflow** (request review, approve, reject)
-- **Labels/tags** for cross-cutting categorization
-- **Templates** for standardized page creation
+Users organize pages into spaces, browse a hierarchy, edit content, inspect history,
+restore a revision, comment, and search. Some spaces require approval before
+publication. I would clarify that live character-level co-editing is outside this
+interview: we use whole-document saves with conflict detection.
 
-**Non-Functional:**
+A successful save must not silently overwrite a newer edit. Approval must refer to the
+content actually reviewed. Search may be briefly stale, but it must not expose content
+the caller is no longer allowed to read.
 
-| Requirement | Target |
-|-------------|--------|
-| Page load latency (p99) | < 200ms |
-| Search latency (p99) | < 500ms |
-| Availability | 99.95% |
-| Concurrent editors | 10,000+ |
-| Total pages | 100M+ |
-| Daily page views | 50M+ |
-| Daily page edits | 1M+ |
-| Consistency | Strong for page writes, eventual for search index |
+I would start with one relational authority and a few logical modules. Splitting
+comments, versions, permissions, and pages across independent databases would turn
+ordinary wiki actions into distributed transactions before we have a scaling reason.
 
----
+This answer describes a proposed production design. The repository's Express/PostgreSQL
+implementation illustrates parts of it, but does not yet enforce several of these
+contracts.
 
-## 📊 2. Capacity Estimation
+| Discussion | Time |
+|------------|------|
+| Scope and guarantees | 3 min |
+| Scale, architecture, and data model | 7 min |
+| Deep dive: revision acceptance and publication | 11 min |
+| Deep dive: reliable and authorized search | 11 min |
+| Deep dive: hierarchy and stable identity | 7 min |
+| Failure handling, scaling, and verification | 6 min |
+| Total | 45 min |
 
-> "At production scale: 500K active users with 10K concurrent, 100M pages across 50K spaces. Average page is 50KB HTML plus 10KB plain text. With 1M edits per day, that is roughly 12 edits per second on average, with bursts up to 100/s during business hours. 5M search queries per day translates to about 58 queries per second. Storage is 100M pages at 50KB each, roughly 5TB of content plus version history."
+## 🏗️ Scale, architecture, and data model — 7 minutes
 
-| Metric | Value |
-|--------|-------|
-| Pages created per second (avg) | ~12 |
-| Search queries per second | ~58 |
-| Page views per second | ~580 |
-| Storage (content + versions) | ~5TB + ~10TB versions |
-| Read-to-write ratio | ~50:1 |
+Assume one million daily active users and 20 million pages. Forty million reads per day
+is about 463 per second on average; I would initially plan for a 5,000-per-second peak.
+Half a million accepted edits per day is only about six per second on average, with a
+proposed peak budget of 100.
 
-> "The read-heavy ratio tells me caching page content and page tree structures aggressively will yield significant database offloading. The search QPS is moderate enough that a well-configured Elasticsearch cluster can handle it without sharding."
+At 40 KB per canonical snapshot, current content is roughly 800 GB. New snapshots add
+about 20 GB per day before compression. Rendered HTML, extracted text, indexes,
+replicas, and backups increase storage, so history retention deserves a policy, but
+these numbers do not force us into a custom distributed database.
 
----
-
-## 🏗️ 3. High-Level Architecture
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Clients   │────▶│  API Gateway│────▶│  API Servers│
-│  (Browser)  │     │ (Rate Limit)│     │  (Express)  │
-└─────────────┘     └─────────────┘     └──────┬──────┘
-                                               │
-                    ┌──────────┬────────────────┼────────────┐
-                    ▼          ▼                ▼            ▼
-              ┌──────────┐ ┌──────────┐  ┌──────────┐ ┌──────────┐
-              │PostgreSQL│ │  Redis   │  │ RabbitMQ │ │  Search  │
-              │ (Pages,  │ │ (Cache + │  │ (page-   │ │  Indexer │
-              │ Versions,│ │ Sessions)│  │  index   │ │ (Worker) │
-              │ Spaces)  │ └──────────┘  │  queue)  │ └────┬─────┘
-              └──────────┘               └──────────┘      │
-                                                     ┌─────▼──────┐
-                                                     │Elasticsearch│
-                                                     │(Full-text   │
-                                                     │ search)     │
-                                                     └────────────┘
-```
-
-> "The core insight is the asynchronous indexing pipeline. Page writes go directly to PostgreSQL (source of truth) and publish a message to RabbitMQ. A background worker consumes these messages and indexes content into Elasticsearch. This decouples write latency from search indexing latency -- a page edit takes 50ms regardless of how long ES indexing takes. The trade-off is a brief window where search results are stale, but for a wiki this is acceptable."
-
----
-
-## 💾 4. Data Model
-
-### Entity Relationship
+I would propose 99.9% availability and p95 targets of 200 ms for page reads and 500 ms
+for saves and search under the agreed workload. Searchable changes should normally
+appear within five seconds. These are design targets to test, not measured results from
+the learning project.
 
 ```
-┌──────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  spaces  │────▶│      pages       │────▶│  page_versions  │
-│          │     │                  │     │                 │
-│ id       │     │ id               │     │ id              │
-│ key      │     │ space_id (FK)    │     │ page_id (FK)    │
-│ name     │     │ parent_id (self) │     │ version_number  │
-│ homepage │     │ title, slug      │     │ title           │
-│ is_public│     │ content_json     │     │ content_json    │
-└──────────┘     │ content_html     │     │ content_html    │
-     │           │ content_text     │     │ change_message  │
-     ▼           │ version          │     │ created_by (FK) │
-┌──────────┐     │ status           │     └─────────────────┘
-│  space_  │     │ position         │
-│ members  │     │ created_by (FK)  │
-│          │     └──────────────────┘
-│ space_id │           │
-│ user_id  │           ▼
-│ role     │     ┌──────────────────┐
-└──────────┘     │    comments      │
-                 │ page_id (FK)     │
-                 │ parent_id (self) │
-                 │ content          │
-                 │ is_resolved      │
-                 └──────────────────┘
+┌──────────────┐        ┌─────────────────────────┐
+│ Browser      │───────▶│ Wiki / search API       │
+└──────────────┘        │ Session + permission    │
+                        └────────────┬────────────┘
+                                     │
+                 ┌───────────────────┴─────────────┐
+                 ▼                                 ▼
+     ┌───────────────────────┐         ┌───────────────────────┐
+     │ PostgreSQL            │         │ Search index          │
+     │ Pages / revisions     │         │ Derived results       │
+     │ Receipts / outbox     │         └───────────▲───────────┘
+     └───────────┬───────────┘                     │
+                 │                                 │
+                 ▼                                 │
+     ┌───────────────────────┐         ┌───────────┴───────────┐
+     │ Outbox publisher      │────────▶│ Queue / indexers      │
+     └───────────────────────┘         └───────────────────────┘
 ```
 
-### Core Tables
+Redis supports sessions and cached immutable content. It is not the source of truth for
+a page's current revision. A CDN serves application assets; protected page responses
+still pass through an authorization boundary.
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| spaces | id (UUID PK), key (unique), name, description, homepage_id (FK), is_public, created_by (FK) | key | Organizational container for pages |
-| pages | id (UUID PK), space_id (FK), parent_id (self FK), title, slug, content_json (JSONB), content_html (TEXT), content_text (TEXT), version (INT), status, position (INT), created_by (FK) | (space_id, parent_id, position), (space_id, slug) | Adjacency list tree; status: draft/published/archived |
-| page_versions | id (UUID PK), page_id (FK), version_number (INT), title, content_json, content_html, content_text, change_message, created_by (FK) | (page_id, version_number DESC) | Immutable history; one row per edit |
-| comments | id (UUID PK), page_id (FK), parent_id (self FK), content (TEXT), is_resolved (BOOL), created_by (FK) | (page_id, created_at) | Threaded via self-referencing parent_id |
-| space_members | id (UUID PK), space_id (FK), user_id (FK), role | UNIQUE(space_id, user_id) | Role: admin, member, viewer |
-| page_labels | page_id (FK), label_id (FK) | UNIQUE(page_id, label_id) | Many-to-many for cross-cutting tagging |
-| approvals | id (UUID PK), page_id (FK), requested_by (FK), reviewed_by (FK), status, version_number | (page_id, status) | Status: pending, approved, rejected |
+### Main records and access patterns
 
-### Triple Content Storage
+| Record | Important fields | Main access pattern |
+|--------|------------------|---------------------|
+| User and space membership | User ID, space ID, role | Current permission for a resource |
+| Space | ID, key, name, policy, hierarchy generation | Resolve a space and coordinate tree changes |
+| Page | ID, space, parent, order, head revision, published revision | Open a page; list children |
+| Revision | Page ID, revision number, canonical content, author, timestamp | Read immutable content or compare selected versions |
+| Mutation receipt | Scoped mutation ID, request digest, result | Resolve retries and uncertain commit outcomes |
+| Outbox event | Event ID, page ID, search generation, payload | Deliver derived-state changes reliably |
+| Comment | Page, author, parent, body, resolution state | Read a bounded discussion thread |
+| Approval | Page, target revision, requester, reviewer, status | Review an identifiable revision |
+| Label and template | Space/page association, validated data | Filter content or initialize a document |
 
-> "I store page content in three parallel columns: `content_json` (JSONB) holds structured content including macro nodes for programmatic access and macro expansion. `content_html` (TEXT) holds the rendered HTML that the frontend displays directly. `content_text` (TEXT) holds stripped plain text used for full-text search indexing. This triple storage means reads never need to re-parse or re-render -- each consumer gets the format it needs directly. The trade-off is storage overhead (roughly 3x per page), but at 50KB average page size this is negligible compared to the performance benefit."
+The most important indexes follow these accesses: children by space/parent/order,
+revisions by page and descending version, memberships by space/user, and pending outbox
+work by delivery state and sequence. Full page content does not belong in a tree
+metadata query.
 
----
+### API surface
 
-## 🔌 5. API Design
+I would keep the whiteboard API list small and discuss the contracts behind it.
 
-### Authentication
+| Method | Proposed endpoint | Contract |
+|--------|-------------------|----------|
+| GET | `/pages/:id` | Authorized revision and canonical URL |
+| POST | `/spaces/:id/pages` | Identified create request with initial revision |
+| PUT | `/pages/:id` | Save only against the expected head |
+| GET | `/pages/:id/versions` | Paginated history metadata |
+| POST | `/pages/:id/restore` | New revision from an older snapshot |
+| POST | `/pages/:id/move` | Validated hierarchy change |
+| POST | `/pages/:id/reviews` | Request review of a specific revision |
+| GET | `/search` | Authorized results and explicit search status |
 
-```
-POST /api/v1/auth/register    -> Create account
-POST /api/v1/auth/login       -> Start session (Redis-backed)
-POST /api/v1/auth/logout      -> Destroy session
-GET  /api/v1/auth/me          -> Return current user
-```
+The local project uses `/api/v1` routes with somewhat different paths. This proposed
+list is about resource contracts, not a route-by-route transcription.
 
-### Space Operations
+## 🔧 Deep dive 1: accept revisions without losing updates — 11 minutes
 
-```
-POST   /api/v1/spaces                  -> Create space with key and name
-GET    /api/v1/spaces                  -> List user's spaces
-GET    /api/v1/spaces/:key             -> Get space with page tree
-POST   /api/v1/spaces/:id/members      -> Add member with role
-DELETE /api/v1/spaces/:id/members/:uid -> Remove member
-```
+### One transaction defines an accepted save
 
-### Page Operations
+> “I would choose immutable full snapshots and optimistic concurrency. The request names
+> the revision the author edited, and the database conditionally advances that head. If
+> it changed, we return a conflict rather than inventing a merge the user did not ask
+> for.”
 
-```
-POST   /api/v1/pages                            -> Create page in space
-GET    /api/v1/pages/space/:key/slug/:slug       -> Get page by space key + slug
-PUT    /api/v1/pages/:id                         -> Update page (creates version)
-DELETE /api/v1/pages/:id                         -> Soft-delete (archive)
-PUT    /api/v1/pages/:id/move                    -> Move page (change parent/position)
-GET    /api/v1/pages/:id/versions                -> List version history
-GET    /api/v1/pages/:id/versions/:v1/diff/:v2   -> Diff between two versions
-```
+Alice and Bob both open revision 8. Bob saves and creates revision 9. Alice submits
+content based on 8. A conditional update against 8 cannot succeed, so Alice receives the
+current head and keeps her draft for reconciliation.
 
-### Search, Comments, Approvals
+The transaction does more than increment a number. It checks the caller's current write
+authority, reserves or resolves the request identity, advances the expected head,
+inserts the immutable snapshot, and records the indexing obligation and receipt. If any
+required part fails, none of that save commits.
 
-```
-GET    /api/v1/search?q=query&space=KEY          -> Full-text search with ES
-POST   /api/v1/pages/:id/comments                -> Add comment (supports threading)
-PATCH  /api/v1/comments/:id/resolve              -> Toggle resolve status
-POST   /api/v1/pages/:id/approvals               -> Request approval
-PATCH  /api/v1/approvals/:id                     -> Approve or reject
-```
+Permission changes must have a defined ordering with protected writes. I would use a
+shared transactional policy boundary initially, so a completed revocation cannot be
+bypassed by a later save using an old membership cache. The exact lock granularity can
+evolve after measuring contention.
 
-> "All endpoints require session authentication. Rate limits are applied per-user: 500 requests per 15 minutes for general API, 20 per 15 minutes for auth endpoints. Page writes invalidate Redis cache keys using pattern-based deletion (space tree cache and individual page cache)."
+### Version uniqueness is necessary but insufficient
 
----
+A unique page/version key prevents two history records from sharing a number. It does
+not establish that the author edited the latest revision. If an old draft arrives after
+another transaction completed, the server can read the new number and still overwrite
+the content unless the request supplied an expected base.
 
-## 🔧 6. Deep Dive: Search Pipeline Consistency
+Likewise, selecting a row and then updating it in a transaction is not automatically an
+optimistic concurrency protocol. The comparison must participate in the write's database
+condition or an equivalent serialized check. Otherwise overlapping requests may fail
+through incidental constraints rather than a meaningful conflict response.
 
-> "The most interesting backend challenge is keeping Elasticsearch consistent with PostgreSQL without adding latency to page operations."
-
-### The Pipeline
-
-```
-Page Create/Update
-       │
-       ├──▶ PostgreSQL (sync, in transaction)
-       │         └── page record + version record
-       │
-       └──▶ RabbitMQ (async, after commit)
-                  │
-                  ▼
-            Search Indexer Worker
-                  │
-                  ├── Fetch page from PostgreSQL (fresh read)
-                  │
-                  └── Index to Elasticsearch
-                        ┌──────────────────────┐
-                        │ page_id (keyword)     │
-                        │ space_id (keyword)    │
-                        │ title (text, boost 3x)│
-                        │ content_text (text)   │
-                        │ labels (keyword[])    │
-                        │ status (keyword)      │
-                        └──────────────────────┘
-```
-
-### Consistency Challenges
-
-**Problem 1: Message ordering.** If a user edits a page twice rapidly, two messages enter the queue. If worker A processes the second message before worker B processes the first, Elasticsearch ends up with stale content.
-
-> "I solve this by including the `version` number in the queue message and checking it during indexing. The worker reads the current version from PostgreSQL before indexing. If the page version in the database is newer than what the message contains, the worker fetches the latest version and indexes that instead. This makes the indexer idempotent -- processing the same message twice always converges to the current state."
-
-**Problem 2: RabbitMQ unavailable.** If the message broker is down, page edits should still succeed.
-
-> "The publish-to-queue step happens after the PostgreSQL transaction commits, wrapped in a try-catch. If RabbitMQ is unavailable, the page edit succeeds but no index message is published. To recover, I run a periodic reconciliation job that scans PostgreSQL for pages with `updated_at` newer than the latest indexed timestamp in Elasticsearch. This catch-up mechanism ensures eventual consistency even after broker failures."
-
-**Problem 3: Elasticsearch unavailable.** The worker cannot index if ES is down.
-
-> "The worker uses a circuit breaker around Elasticsearch calls. When the circuit opens, messages are requeued with a delay (using RabbitMQ dead-letter exchange with TTL). This prevents the worker from spinning on failed index attempts. The circuit enters half-open state after 30 seconds, allowing a test request through."
-
-### Fallback to PostgreSQL
-
-> "When Elasticsearch is completely unavailable for search queries, the API falls back to PostgreSQL ILIKE search on the `content_text` and `title` columns. This is significantly slower (no relevance scoring, no highlighting, no stemming) but ensures search functionality degrades gracefully rather than failing entirely."
+A conflict is a normal product outcome. Return enough metadata to fetch the current
+revision, but avoid automatically returning a large private snapshot before
+authorization. The client can show the base, draft, and current content in a deliberate
+reconciliation flow.
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ Async indexing via RabbitMQ | Non-blocking writes, independently scalable workers | Brief staleness window, message ordering complexity |
-| ❌ Synchronous ES writes | Instant search consistency | 50-200ms added to every page edit, ES failure blocks writes |
-| ✅ PostgreSQL ILIKE fallback | Always available, no extra infra | No relevance scoring, O(n) scan, no highlighting |
-| ❌ No fallback | Simpler code | Search completely unavailable during ES outages |
+| ✅ Full snapshots with expected revision | Simple historical reads; explicit conflict semantics | Extra storage and occasional manual reconciliation |
+| ❌ Unconditional last write wins | Minimal save protocol | Quietly destroys a concurrent author's changes |
+| ❌ Live operation merge initially | Supports simultaneous typing | Adds editor-specific merge and reconnect protocols beyond scope |
 
----
+For a wiki where most edits are independent and submissions are relatively infrequent,
+snapshot storage is an acceptable cost. Delta-only history reduces repeated content but
+makes old reads and restore dependent on applying a chain correctly. Compression or
+archival can come later without changing the visible revision contract.
 
-## 🔧 7. Deep Dive: Version Control and Conflict Resolution
+### Give retries their own durable identity
 
-> "Every page edit creates an immutable version record. This is the backbone of the wiki -- users must be able to see what changed, who changed it, and revert if needed."
+Suppose the database commits revision 9, then the connection drops before Alice receives
+the response. A timeout is ambiguous. If she retries as a new save, the system may
+produce revision 10 with identical content and a misleading extra history entry.
 
-### Version Creation Flow
+The original request carries a mutation ID scoped to its actor and resource domain, plus
+a canonical payload digest. A committed receipt stores its accepted revision and
+response. Retrying the same ID and payload returns that outcome; the same ID with
+different content is rejected.
 
-```
-Client sends PUT /pages/:id
-       │
-       ▼
-BEGIN TRANSACTION
-├── SELECT version FROM pages WHERE id = $1 FOR UPDATE
-│        └── Lock the row to prevent concurrent version creation
-├── new_version = current_version + 1
-├── UPDATE pages SET content_html = $2, content_text = $3,
-│                    version = new_version, updated_by = $4
-├── INSERT INTO page_versions (page_id, version_number, title,
-│        content_json, content_html, content_text, change_message, created_by)
-COMMIT
-       │
-       ▼
-Invalidate Redis cache (page + space tree)
-Publish to RabbitMQ (page-index queue)
-```
+The receipt must commit with the page revision. Putting it only in a short-lived Redis
+cache reintroduces ambiguity after eviction or a crash between the two writes. Redis can
+accelerate lookup, but the database remains the authority.
 
-> "The `SELECT ... FOR UPDATE` is critical. Without it, two concurrent edits could both read version=3, both try to create version=4, and one would either fail on a unique constraint or silently overwrite the other. The row lock serializes concurrent edits, ensuring version numbers are always sequential with no gaps."
+We also need a retention contract. Within the retry window, the original receipt is
+available. After it expires, the server cannot promise that an arbitrary ancient retry
+is new work; clients need an explicit recovery path rather than silently replaying it.
 
-### Diff Computation
+Creates, restores, and publication actions need the same reasoning. A unique
+page/version number does not deduplicate a repeated create that generates a different
+page ID. A restore should copy the requested historical content into a new revision
+against the current expected head.
 
-> "Diffs are computed on-demand, not stored. When a user requests the diff between version 2 and version 5, the API loads both version records from `page_versions` and runs a line-level diff algorithm on the `content_html` content. Each change is classified as added, removed, or unchanged."
+### Bind publication and approval to immutable content
 
-```
-Version 2                    Version 5
-┌──────────────────┐         ┌──────────────────┐
-│ Line 1 (same)    │         │ Line 1 (same)    │
-│ Line 2 (removed) │   ──▶   │ Line 2a (added)  │
-│ Line 3 (same)    │         │ Line 3 (same)    │
-│                   │         │ Line 4 (added)   │
-└──────────────────┘         └──────────────────┘
-```
+A page has an authoring head and a published revision pointer. Saving draft revision 10
+does not change the version ordinary readers see. A direct publication or successful
+review changes the pointer in an authorized transaction and writes its own event.
 
-### Why Not Store Pre-computed Diffs?
+An approval request names revision 10. If the author creates revision 11 while review is
+pending, approving the request does not implicitly approve 11. The reviewer can publish
+the reviewed version if policy permits, or require a new request for the changed
+content.
 
-> "I considered storing diffs rather than full content for each version. This would save storage (a typical edit changes 5% of a page, so storing only the delta would be ~20x smaller). But the trade-off is reconstruction cost: to view version N, you would need to replay N diffs from the base version, which is O(N) in version count. For a frequently edited page with 500 versions, reconstructing the latest version means applying 500 sequential patches. Storing full snapshots makes any version retrievable in O(1) at the cost of storage. At 50KB per version and 1M edits per day, that is 50GB/day of version storage -- significant but manageable with blob storage tiering. The simplicity and performance of O(1) retrieval justifies the storage cost."
+A conditional pending-to-approved transition prevents two reviewers from completing the
+same request twice. A unique active-request key prevents concurrent duplicate requests.
+Neither constraint replaces reviewer authorization or the revision binding.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Full snapshots per version | O(1) retrieval, simple diff between any two versions | Higher storage (full copy per edit) |
-| ❌ Delta-only storage | 20x storage reduction | O(N) reconstruction, complex merge logic |
-| ✅ On-demand diff computation | No storage for diffs, flexible comparison pairs | CPU cost on each diff request |
-| ❌ Pre-computed diffs | Instant diff display | Only adjacent version diffs; comparing v2 to v8 requires chaining |
+This model gives up a single convenient “current version” field everywhere. In return,
+it can answer a critical question: which exact content did a reviewer approve, and which
+content can a reader see? For a knowledge base with approval requirements, that
+precision is worth the extra state.
 
----
+## 🔧 Deep dive 2: make search repairable and permission-aware — 11 minutes
 
-## 🔧 8. Deep Dive: Page Tree Performance at Scale
+### Choose a search deployment for the workload
 
-### The Adjacency List Model
+At a smaller scale, I would seriously consider PostgreSQL full-text search. It supports
+lexical processing, ranking, and highlighting; a separate cluster is not a prerequisite
+for useful wiki search. A substring fallback should not be confused with that
+capability. [PostgreSQL text search
+controls](https://www.postgresql.org/docs/16/textsearch-controls.html)
 
-> "Each page has a `parent_id` that references another page in the same space. The root pages have `parent_id = NULL`. A `position` integer controls ordering among siblings. This is the simplest tree model -- a single self-referencing foreign key."
+For the assumed corpus and independent search load, I would choose a separate search
+index. It lets us tune title/body relevance and typo handling without competing directly
+with revision transactions. The cost is operating and repairing a second representation
+of the data.
 
-### Tree Operations
+> “I would not make a page save synchronously depend on Elasticsearch. If the database
+> commits and search fails, returning an error cannot undo the saved page. I would
+> commit a durable indexing obligation beside the revision instead.”
 
-**Loading the full tree:** The API loads all pages for a space in a single query (SELECT id, parent_id, title, slug, position FROM pages WHERE space_id = $1 ORDER BY position), then builds the tree in-memory by mapping parent_id to children arrays.
+### Close the database-to-queue gap
 
-> "For a space with 500 pages, this query returns 500 rows (roughly 25KB of data) and the in-memory tree construction takes under 1ms. The result is cached in Redis for 120 seconds. This approach works because wiki spaces are typically bounded: even large engineering organizations rarely exceed 2,000 pages per space."
+The outbox is a table written in the same transaction as the authoritative change. A
+publisher sends pending events and marks delivery only after broker confirmation. If it
+crashes after sending but before recording delivery, it sends again; duplicates are
+expected.
 
-**Breadcrumb queries:** To display the breadcrumb trail (Home > Engineering > Backend > API Design), I use a recursive CTE that walks up the ancestor chain from the current page.
+The consumer acknowledges a delivery only after the index effect succeeds or a newer
+accepted generation makes it obsolete. Transient errors retry with bounded backoff.
+Permanent malformed events enter a repair path, and the oldest outstanding event age
+alerts us before the freshness target is missed for long.
 
-```
-Current page (API Design)
-       │ parent_id
-       ▼
-  Backend page
-       │ parent_id
-       ▼
-  Engineering page
-       │ parent_id
-       ▼
-  Home page (parent_id = NULL, stop)
-
-Result: [Home, Engineering, Backend, API Design]
-```
-
-> "The recursive CTE terminates when it reaches a page with NULL parent_id. For a tree 5 levels deep, this is 5 index lookups on the primary key -- essentially free. The composite index on (space_id, parent_id, position) ensures sibling queries and subtree operations are efficient."
-
-**Moving pages:** Changing a page's position in the tree requires updating its `parent_id` and `position`, then reordering siblings at both the source and destination. This is wrapped in a transaction to prevent orphaned nodes.
-
-### When Adjacency List Breaks Down
-
-> "The adjacency list model struggles with one operation: subtree queries. 'Find all descendants of page X' requires either a recursive CTE (which performs one index lookup per level) or loading the full tree and filtering in-memory. For a 5-level tree this is fast, but for a 50-level tree (deeply nested documentation) it becomes expensive."
-
-> "Nested sets would make subtree queries O(1) -- a single range query on left/right values -- but every insert or move requires recalculating left/right values for potentially thousands of nodes. For a wiki where page moves happen frequently (reorganizing documentation) but deep subtree queries are rare, the adjacency list trade-off is correct."
-
-| Approach | Tree Load | Page Move | Subtree Query | Complexity |
-|----------|-----------|-----------|---------------|------------|
-| ✅ Adjacency list | O(n) load + build | O(1) parent update | O(depth) CTE | Low |
-| ❌ Nested sets | O(log n) range | O(n) recalculate | O(1) range | Medium |
-| ❌ Materialized path | O(n) prefix match | O(n) path rewrite | O(1) prefix | Low |
-
----
-
-## 🗄️ 9. Caching Strategy
-
-| Data | Cache Key Pattern | TTL | Invalidation |
-|------|-------------------|-----|--------------|
-| Page content | page:{spaceKey}:{slug} | 120s | On page edit |
-| Space page tree | space-tree:{spaceKey} | 120s | On page create/edit/move/delete |
-| Breadcrumbs | breadcrumbs:{pageId} | 300s | On page move or ancestor change |
-| Search results | Not cached | - | Always fresh from ES |
-| User session | sess:{sessionId} | 24h | On logout |
-
-> "I use pattern-based cache invalidation: when a page is edited, I delete both the page cache key and the space tree cache key. This is simpler than tracking dependencies between cache entries. The 120-second TTL provides a safety net -- even if invalidation misses a key, staleness is bounded."
-
----
-
-## 🔄 10. Macro Expansion Service
-
-> "Macros are structured content blocks stored as nodes in the `content_json` JSONB column. The macro service expands these nodes into styled HTML during page save and also supports client-side rendering."
-
-### Macro Types
-
-| Macro | Input | Output | Use Case |
-|-------|-------|--------|----------|
-| info | Text content | Blue-bordered callout box | Informational highlights |
-| warning | Text content | Yellow-bordered callout box | Warnings and cautions |
-| note | Text content | Purple-bordered callout box | Side notes |
-| code | Code string + language | Syntax-highlighted block | Code snippets |
-| toc | None (auto-generated) | Ordered list of heading links | Page navigation |
-
-> "The TOC macro is interesting because it must be regenerated on every page save. The service scans the content_html for heading tags (h1-h6), extracts their text and nesting level, and generates an ordered list with anchor links. This means the TOC is always consistent with the actual page headings."
-
----
-
-## 📈 11. Scalability Path
-
-### What Breaks First
-
-> "The first bottleneck is the page_versions table. With 1M edits per day, this table grows by 1M rows daily -- 365M rows per year. Each row contains full HTML content (50KB average), so the table grows by 50GB per day. After a year, it is 18TB of version data."
-
-**Mitigation:** Partition `page_versions` by `created_at` (monthly partitions). Recent versions (last 90 days) stay on fast SSD storage. Older partitions are moved to cheaper HDD-backed tablespace. The vast majority of version access is recent (users reviewing last few edits), so this hot/cold split optimizes for the common case.
-
-### Horizontal Scaling Path
-
-1. **Read replicas** for page queries (read-heavy workload)
-2. **Shard PostgreSQL by space_id** -- all pages within a space are co-located, and cross-space queries are rare
-3. **Scale Elasticsearch** horizontally with index sharding (by space_id routing)
-4. **Replace RabbitMQ with Kafka** for higher-throughput indexing at extreme scale
-5. **CDN** for static page content that does not change frequently
-6. **CRDT-based collaborative editing** via WebSocket for real-time co-editing
-
----
-
-## 🛡️ 12. Security and Auth
-
-> "Session-based authentication with Redis-backed store. Sessions expire after 24 hours. Passwords are hashed with bcrypt (12 salt rounds)."
-
-**Space-level access control:**
-
-| Role | Read Pages | Edit Pages | Manage Members | Delete Space |
-|------|-----------|------------|----------------|-------------|
-| Viewer | Yes | No | No | No |
-| Member | Yes | Yes | No | No |
-| Admin | Yes | Yes | Yes | Yes |
-
-> "All page operations check space membership before proceeding. This is a simple RBAC model -- production would add page-level permissions, group-based access, and anonymous viewing for public spaces."
-
----
-
-## 🔍 13. Observability
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| http_request_duration_seconds | Histogram | Latency percentiles per endpoint |
-| page_operations_total | Counter | Create/update/delete volume by operation type |
-| search_duration_seconds | Histogram | Search latency separate from general HTTP |
-| search_fallback_total | Counter | How often PostgreSQL fallback is triggered |
-| indexer_lag_seconds | Gauge | Time between page edit and ES index |
-| version_count_per_page | Histogram | Distribution of version counts |
-| circuit_breaker_state | Gauge | 0=closed, 1=open, 2=half-open |
-
-> "Structured JSON logging via Pino includes request IDs for distributed tracing. The most important alert is indexer lag exceeding 60 seconds, which indicates the search pipeline is falling behind and users are seeing stale search results."
-
----
-
-## ⚖️ 14. Trade-offs Summary
+A durable queue and a persistent-message flag help broker survival, but they do not make
+an unconfirmed publication reliable or prevent a consumer from acknowledging a failed
+effect. Each boundary needs an explicit success condition.
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ Adjacency list (page tree) | Simple writes, O(1) move | O(depth) ancestor queries |
-| ❌ Nested sets | O(1) subtree queries | O(n) writes on insert/move |
-| ✅ Full version snapshots | O(1) retrieval of any version | Higher storage per edit |
-| ❌ Delta-only versions | 20x storage savings | O(N) reconstruction cost |
-| ✅ Async ES indexing via RabbitMQ | Non-blocking page writes | Brief search staleness |
-| ❌ Sync ES writes | Instant search consistency | 50-200ms per page edit |
-| ✅ Triple content storage (JSON/HTML/text) | Zero-cost format conversion on read | 3x storage per page |
-| ❌ Single format with on-demand conversion | Minimal storage | CPU cost on every read |
-| ✅ ES with PostgreSQL ILIKE fallback | Graceful degradation | Two search code paths to maintain |
-| ❌ ES only, no fallback | Simpler code | Search unavailable during ES outages |
-| ✅ Session auth (Redis) | Immediate revocation | Requires Redis for auth |
-| ❌ JWT | Stateless auth | No immediate revocation without blacklist |
+| ✅ Outbox plus repeatable index effects | Database acceptance survives broker outages; changes are repairable | Publisher, retries, lag monitoring, and reconciliation |
+| ❌ Synchronous database/index dual write | Appears simple in the happy path | Partial success creates ambiguous saves and inconsistent search |
+| ❌ Best-effort queue after commit | Low save latency | A crash or skipped publish can lose an update indefinitely |
+
+### Prevent old work from overwriting new work
+
+An event includes a monotonic search generation and one consistent state representation.
+That generation advances for content, labels, publication, and deletion. Content
+revision alone is insufficient because a label or publication pointer can change without
+a new text snapshot.
+
+Suppose job 20 reads an old title, then stalls. Job 21 indexes the new title. When job
+20 resumes, an unconditional write would put the old title back. Fetching the database
+when each job starts does not remove this race.
+
+The index accepts only a higher generation. Elasticsearch external versioning provides
+that comparison; the consumer still needs to distinguish an obsolete/duplicate
+generation from a real failure and ensure that one generation identifies only one
+payload. [Elasticsearch Index
+API](https://www.elastic.co/guide/en/elasticsearch/reference/8.11/docs-index_.html)
+
+Deletion needs the same ordering rule. Keep a versioned tombstone without the old
+searchable body until the supported replay and rebuild windows cannot deliver older
+content. Simply removing the document and forgetting its generation can allow a delayed
+old index job to recreate it.
+
+A rebuild starts from a consistent database snapshot and catches up subsequent changes.
+It compares generations and reconciles deletions before switching the read alias. A
+script that only indexes all existing pages is useful for a fresh demo, but is not a
+complete live rebuild protocol.
+
+### Keep stale search from becoming an authorization leak
+
+The index narrows candidates by space and publication metadata. Before sending a title
+or snippet, the search API checks current permission and the allowed published revision
+against authoritative state. A stale index must not return an old private title merely
+because React later hides the link.
+
+Batch these checks and bound overfetching. When filtering removes candidates, the raw
+index total is not an exact count of authorized results. Prefer an honest continuation
+response over leaking a private hit count or running an unlimited scan to fill one page.
+
+If the indexed revision no longer matches the published revision, rebuild the result
+from currently permitted content or omit it. A permission check on the page ID alone is
+insufficient if the index contains a draft that this reader may not see.
+
+This adds database work to search. We can cache immutable revision payloads, but current
+authorization and publication still need a coherent freshness contract. During a
+permission-service failure, return unavailability for protected results rather than
+trusting stale permission data.
+
+### Degrade within an explicit budget
+
+An Elasticsearch outage need not stop direct page reads. A bounded PostgreSQL search
+fallback may be acceptable for selected scopes, with reduced relevance and a visible
+degraded status. It needs query timeouts, concurrency limits, and a plan to protect the
+write database.
+
+Sending every failed search into an unrestricted SQL scan can turn a search outage into
+a page-save outage. For an expensive query or overloaded database, explicit search
+unavailability is the correct response. The product should retain navigation and known
+links.
+
+Measure freshness from database commit to search visibility, including publication
+delay, queue wait, worker time, and refresh. A broker queue depth of zero does not prove
+the index contains the latest published content.
+
+## 🔧 Deep dive 3: hierarchy correctness and stable links — 7 minutes
+
+### Choose adjacency lists for a movable wiki tree
+
+> “I would store each page's parent and sibling order, then query children by space and
+> parent. Pages move often enough that I would avoid putting their entire ancestor path
+> into their identity.”
+
+A stable UUID identifies the page. Human-readable slugs are hints or aliases, with
+collision handling and redirects. Renaming or moving a page should not change the target
+of a bookmarked link or require rewriting every comment and search reference.
+
+For ordinary browsing, query only child metadata and fetch more as the user expands
+branches. A page body is separate. Breadcrumbs use bounded ancestry traversal, and a
+deep-link response helps the browser reveal the selected path.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Adjacency list | Simple parent relation; moves avoid rewriting descendant paths | Recursive ancestry/subtree queries and explicit cycle prevention |
+| ❌ Materialized ancestor path initially | Efficient prefix/subtree reads | Large moves rewrite descendants and complicate concurrent changes |
+| ❌ Nested-set numbering initially | Efficient subtree ranges | Inserts and moves can renumber substantial portions of a space |
+
+Adjacency lists do not make every move constant-time. Sibling positions may need
+updates, ancestry must be checked, and caches must learn the new hierarchy generation.
+The benefit is a manageable representation for the expected mix of reads and occasional
+moves.
+
+### Serialize the mutations that protect the invariant
+
+In a transaction, lock the space's hierarchy coordination row, validate source and
+destination membership, reject self/descendant parents, and update the parent and
+ordering. Every create, move, and delete that changes hierarchy participates in the same
+protocol.
+
+Without a shared boundary, two requests can each pass a cycle check and then create a
+cycle together. Locking only the source page does not necessarily protect the
+relationship being tested. The simple space-level lock makes the first design easier to
+reason about.
+
+It also serializes unrelated moves in the same space. I accept that initially because
+moves are much rarer than reads. If a hot space proves this is a bottleneck, we can
+introduce finer locks with a defined ordering and repeat the concurrent-cycle tests
+before deploying them.
+
+A same-space foreign-key strategy prevents cross-space parent references, while the
+transaction enforces acyclicity. Limit hierarchy depth and request size. For deletion,
+define whether children become roots, are reparented, or are deleted; do not leave that
+product behavior implicit in a database cascade.
+
+The resulting event invalidates or advances navigation metadata and breadcrumbs.
+Immutable page content need not be rewritten just because the parent changed. If
+permissions inherit through the hierarchy, the move also changes authorization scope and
+requires a stronger policy update protocol; I would keep initial permissions at the
+space level to avoid that expansion.
+
+## 🛠️ Failure handling, scaling, and verification — 6 minutes
+
+### Read path and caching
+
+Authorize the request, select the permitted revision, and fetch an immutable payload by
+page/revision/rendering version. A cache hit speeds the body read but never decides
+current permission or publication. After an acknowledged save, direct reads must reach a
+source that has observed the accepted revision.
+
+A lagging replica can make a correct save appear to disappear. Route that read to the
+primary or use a revision-aware wait/fallback policy. Reads of an explicitly older
+immutable revision can use a replica or cache without that ambiguity.
+
+The first scaling work is usually removing overfetching: full page bodies in tree
+responses, full snapshots in history lists, and unbounded search inputs. Then scale API
+and index workers independently. Partition by tenant or space only after measured
+database limits justify it, accounting for unusually large spaces.
+
+### Operational signals and recovery exercises
+
+| Signal or exercise | What it tells us |
+|--------------------|------------------|
+| Save acknowledgements versus committed receipts | Whether uncertain requests are resolved consistently |
+| Conflict rate by workspace size | Whether explicit conflicts still match user behavior |
+| Oldest outbox event and index visibility lag | Whether derived state is meeting the freshness contract |
+| Retry and repair-queue age | Whether failures are recoverable rather than silently discarded |
+| Authorized search checks and rejection counts | Whether index candidates still match current access/publication |
+| Database restore and index rebuild drill | Whether recovery procedures work beyond the happy path |
+
+Keep liveness and readiness distinct. Search degradation should be visible without
+declaring every page unreadable. Logs carry mutation, page, revision, and event
+identities, while metrics avoid arbitrary page IDs as labels.
+
+I would test two simultaneous saves, a stale sequential save, response loss after
+commit, approval after another edit, label-only indexing, delayed deletion jobs,
+broker/worker restarts, and concurrent moves that could form a cycle. A test that only
+asserts HTTP 200 on health cannot establish these properties.
+
+### Trade-offs to defend
+
+| Decision | Benefit | Cost accepted |
+|----------|---------|---------------|
+| Relational revision transaction | Clear acceptance and history boundary | One authority for a page's writes |
+| Durable mutation receipt | Safe resolution of ambiguous retries | Storage and a retention contract |
+| Revision-bound publication | Review corresponds to actual content | Separate authoring and reader state |
+| Asynchronous search projection | Independent search availability/capacity | Lag, retries, tombstones, and rebuild operations |
+| Space-level hierarchy serialization | Understandable cycle prevention | Concurrent moves in one space wait |
+
+### Relationship to the local project
+
+The local code stores page snapshots transactionally, but updates have no expected-base
+condition or mutation receipt. Cache failures after commit can surface as save errors.
+Approval targets only a page and can publish later content without cache or search
+updates.
+
+Its ordinary RabbitMQ publisher is best effort, and index helpers swallow failures
+before worker acknowledgement. Some mutations never publish events. Tree queries return
+full content, moves involving roots have a parameter-count defect, and membership is not
+enforced on page reads/writes. The SQL fallback is substring matching, not full-text
+search.
+
+Those findings explain why the production design adds these boundaries; they are not
+claims that the local demo already has them.
+[architecture.md](./architecture.md#implementation-notes) traces the actual source and
+verification limits.

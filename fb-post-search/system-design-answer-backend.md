@@ -1,407 +1,363 @@
-# Facebook Post Search - System Design Answer (Backend Focus)
+# Facebook Post Search — Backend System Design Answer
 
-## 45-minute system design interview format - Backend Engineer Position
+A 45-minute interview proposal. I use the local project's search ideas, while
+distinguishing production guarantees from what its source currently implements.
 
-### 1. Requirements Clarification (3 minutes)
+## 🎯 Requirements and Scale — 4 minutes
 
-**Functional Requirements:**
-- Full-text search across billions of posts
-- Privacy-aware filtering (only show posts user is authorized to see)
-- Personalized ranking based on social graph and engagement
-- Real-time indexing of new posts
-- Search suggestions and typeahead
-- Filters: date range, post type, author
+> “The hard part is not finding text. It is finding relevant posts without disclosing content the viewer can no longer read, even while the index and social graph are changing.”
 
-**Non-Functional Requirements:**
-- Search latency: P99 < 200ms
-- Indexing latency: < 30 seconds from post creation
-- Privacy: Zero unauthorized content leakage
-- Scale: 3 billion users, 500 billion posts, 10M searches/second
+I would start with keyword, exact-phrase, and hashtag search over posts, plus
+date/type/author filters. Public search can be anonymous; accepted friends and an author's
+private posts require viewer context. Friends-of-friends and custom groups can be later
+extensions.
 
-**Backend Focus Areas:**
-- Elasticsearch cluster design and indexing pipeline
-- Privacy-aware visibility fingerprints
-- Two-phase ranking architecture
-- Caching strategies for visibility sets
-- Real-time indexing via Kafka
+I would clarify when a privacy change takes effect. My contract is that new responses
+validated after a completed revocation use the current policy. Indexing can lag, but that
+lag cannot authorize old private content. Already delivered bytes cannot be recalled.
 
----
+| Requirement | Proposed target or contract |
+|-------------|-----------------------------|
+| Search latency | Healthy-path p95 below 300 ms, p99 below one second |
+| Availability | 99.9% regional search serving |
+| Index freshness | Ordinary accepted changes searchable within 10 seconds |
+| Privacy | Current authoritative access before returning content |
+| Pagination | Bounded stable search session with explicit expiry |
+| Writes | Accepted operations survive retries and index outages |
 
-### 2. High-Level Architecture (5 minutes)
+For an example workload, assume 100 million daily searchers making five submissions each:
+500 million searches per day, about 5,787 per second average and 28,935 at a
+five-times-average peak. Suggestions are separate traffic and can outnumber submissions
+several times over.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Search Flow                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Client ──▶ API Gateway ──▶ Search Service ──▶ Query Parser ──▶ Elasticsearch│
-│                                    │                              │          │
-│                            Visibility Filter ◀──── Redis (Visibility Cache) │
-│                                    │                                         │
-│                            Ranking Service ──▶ ML Re-ranker ──▶ Response    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                            Indexing Flow                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Post Service ──▶ Kafka ──▶ Indexing Workers ──▶ Visibility Compute ──▶ ES  │
-│                                    │                                         │
-│                      PostgreSQL (Social Graph) ──▶ Fingerprint Generator    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+At 100 million new posts per day and 1 KB raw searchable records, the raw growth is 100 GB
+per day, or 182.5 TB over five years. Actual indexed storage includes postings, stored
+fields, replicas, and merge space. These are sizing assumptions, not Facebook's
+measurements or a benchmark of this repository.
 
-**Core Components:**
-1. **Search Service**: Query parsing, coordination, response assembly
-2. **Elasticsearch Cluster**: Full-text search with BM25 scoring
-3. **Visibility Service**: Computes and caches what users can see
-4. **Indexing Pipeline**: Kafka-based real-time document processing
-5. **Ranking Service**: Two-phase ranking with ML re-ranking
-6. **PostgreSQL**: Social graph, user data, search history
-
----
-
-### 3. Backend Deep-Dives
-
-#### Deep-Dive A: Elasticsearch Index Design (8 minutes)
-
-**Document Schema:**
+## 🏗️ Architecture and Records — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        PostDocument Structure                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Core Fields:                                                            │
-│  ├── post_id, author_id (identifiers)                                   │
-│  ├── content, content_ngrams (text + typeahead)                         │
-│  ├── hashtags[], mentions[] (extracted entities)                        │
-│  ├── post_type: 'text' | 'photo' | 'video' | 'link'                    │
-│  ├── visibility: 'public' | 'friends' | 'friends_of_friends' | 'custom'│
-│  └── created_at, updated_at (timestamps)                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Privacy Fields:                                                         │
-│  └── visibility_fingerprints[] ◀── Precomputed visibility tokens        │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Ranking Signals:                                                        │
-│  ├── engagement_score (computed)                                        │
-│  ├── like_count, comment_count, share_count                             │
-│  └── author_name, author_verified (denormalized)                        │
-└─────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────┐       ┌────────────────────────────┐
+│ Search API + auth          │       │ Post / graph authority     │
+│ Rank / current validation  │       │ SQL + receipts + outbox    │
+└─────────────┬──────────────┘       └─────────────┬──────────────┘
+              ▼                                    ▼
+┌────────────────────────────┐       ┌────────────────────────────┐
+│ ES retrieval projection    │◀──────│ Versioned index workers    │
+│ PIT + visibility tokens    │       │ Bulk / retries / repair    │
+└────────────────────────────┘       └────────────────────────────┘
 ```
 
-**Index Settings:**
-- number_of_shards: 1000 (for horizontal scaling)
-- number_of_replicas: 2 (for availability)
-- content_analyzer: standard tokenizer + lowercase + stop + snowball filters
-- ngram_analyzer: edge_ngram tokenizer (2-15 chars) for typeahead
-
-**Sharding Strategy:**
-
-1. **Route by post_id hash** for even distribution across 1000 shards
-2. **Time-based index naming** for Index Lifecycle Management:
-   - Posts <= 60 days: `posts-hot`
-   - Posts <= 2 years: `posts-warm`
-   - Posts > 2 years: `posts-cold`
-
-**Index Lifecycle Management (ILM) Phases:**
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         ILM Policy Phases                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  HOT (0-60 days):                                                        │
-│  ├── rollover at 60 days or 50GB                                        │
-│  └── priority: 100                                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  WARM (60 days - 2 years):                                              │
-│  ├── shrink to 100 shards                                               │
-│  ├── forcemerge to 1 segment                                            │
-│  └── priority: 50                                                        │
-├─────────────────────────────────────────────────────────────────────────┤
-│  COLD (2-5 years):                                                       │
-│  ├── searchable snapshot                                                 │
-│  └── priority: 0                                                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  DELETE (> 5 years):                                                     │
-│  └── remove from index                                                   │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-#### Deep-Dive B: Privacy-Aware Visibility System (8 minutes)
-
-**Visibility Fingerprint Types:**
-- `PUBLIC` - visible to everyone
-- `AUTHOR:{userId}` - author always sees own posts
-- `FRIENDS:{authorId}` - friends of author can see
-- `FOF:{authorId}` - friends-of-friends can see
-- `CUSTOM:{postId}:{userId}` - specific users in custom list
-
-**Computing Post Fingerprints (during indexing):**
-
-1. Always add `AUTHOR:{author_id}`
-2. For public posts: add `PUBLIC`
-3. For friends-only: add `FRIENDS:{author_id}`
-4. For friends-of-friends: add `FOF:{author_id}`
-5. For custom lists: add `CUSTOM:{post_id}:{user_id}` for each allowed user
-
-**Computing User Visibility Set (during search):**
-
-1. Check Redis cache first (`visibility:{userId}`)
-2. If cache miss, build set:
-   - Add `PUBLIC` and `AUTHOR:{userId}`
-   - Query friendships table for direct friends, add `FRIENDS:{friendId}` for each
-   - Query for friends-of-friends, add `FOF:{fofId}` for each
-3. Cache result for 5 minutes with SADD + EXPIRE
-
-**Cache Invalidation on Friendship Change:**
-
-1. Delete user's visibility cache
-2. Delete visibility cache for all user's friends (affects FOF calculations)
-3. Publish re-index event for user's posts
-
-**Friends-of-Friends Query:**
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      FOF Query Logic                                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. Get direct friends from friendships table                           │
-│  2. For each friend, get their friends                                  │
-│  3. Exclude: the user themselves, direct friends                        │
-│  4. Return distinct set of FOF user IDs                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**Bloom Filter Optimization:**
-
-For users with very large visibility sets:
-- BITS_PER_USER: 10,000
-- HASH_FUNCTIONS: 7
-- False positives possible (require verification)
-- Compact representation for network transfer
-
----
-
-#### Deep-Dive C: Real-Time Indexing Pipeline (8 minutes)
-
-**Kafka Topics:**
-
-| Topic | Purpose |
-|-------|---------|
-| posts.created | New post events |
-| posts.updated | Post content edits |
-| posts.deleted | Post deletion events |
-| visibility.changed | Privacy setting changes |
-| friendships.changed | Friend add/remove events |
-| posts.reindex | Manual re-indexing requests |
-
-**Indexing Worker Flow:**
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Indexing Worker Process                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. Subscribe to all relevant Kafka topics                              │
-│  2. For each message:                                                    │
-│     ├── posts.created → handlePostCreated()                             │
-│     ├── posts.updated → handlePostUpdated()                             │
-│     ├── posts.deleted → handlePostDeleted()                             │
-│     ├── visibility.changed → handleVisibilityChanged()                  │
-│     └── posts.reindex → handleReindexRequest()                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**handlePostCreated Details:**
-
-1. Fetch full post data from database
-2. Compute visibility fingerprints via VisibilityService
-3. Extract hashtags and mentions from content
-4. Build PostDocument with all fields
-5. Determine target index (hot/warm/cold based on age)
-6. Index to Elasticsearch with `refresh: 'wait_for'` (searchable within 1 second)
-7. Increment indexedPostsCounter metric
-
-**handleVisibilityChanged Details:**
-
-1. Fetch post with updated visibility setting
-2. Recompute visibility fingerprints
-3. Update document in Elasticsearch with new fingerprints and updated_at
-
-**handleReindexRequest Details:**
-
-1. Query all posts by affected user where visibility is 'friends' or 'friends_of_friends'
-2. For each post, trigger handlePostUpdated to refresh fingerprints
-
-**Engagement Score Updater:**
-
-Runs every 60 seconds to update engagement signals:
-1. Query posts with recent engagement changes (last hour)
-2. Compute engagement_score = (likes * 1) + (comments * 3) + (shares * 5)
-3. Bulk update to Elasticsearch
-
----
-
-#### Deep-Dive D: Two-Phase Ranking System (7 minutes)
-
-**Phase 1: Elasticsearch Retrieval**
-
-Retrieve top 500 candidates, return top 20 final results.
-
-**Query Building:**
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   Elasticsearch Query Structure                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│  must:                                                                   │
-│  └── multi_match on content, hashtags, author_name                      │
-│      ├── type: best_fields                                              │
-│      ├── fuzziness: AUTO                                                │
-│      └── field boosts: content^2, hashtags^1.5                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│  filter:                                                                 │
-│  ├── terms: visibility_fingerprints (CRITICAL - privacy)               │
-│  ├── range: created_at (if date range specified)                        │
-│  └── term: post_type (if type filter specified)                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  should (boosting):                                                      │
-│  ├── range: created_at > now-7d (boost: 2.0 for recent)                 │
-│  └── range: engagement_score > 100 (boost: 1.5)                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**Phase 2: ML Re-Ranking**
-
-**Ranking Features:**
-
-| Feature | Description |
-|---------|-------------|
-| textRelevance | BM25 score from Elasticsearch |
-| engagementScore | likes + 3*comments + 5*shares |
-| recencyScore | exp(-ageHours / 168) - half-life of 1 week |
-| authorAffinityScore | Past interaction history with author |
-| socialProximity | 1.0=friend, 0.5=FOF, 0.1=stranger |
-| queryMatchType | exact, partial, or semantic match |
-
-**Score Combination:**
-
-Final score = (esScore * 0.3) + (mlScore * 0.4) + (socialProximity * 0.2) + (recencyScore * 0.1)
-
----
-
-### 4. Data Flow Example
-
-**Search Request Flow:**
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│              Search: "vacation photos" by user 123                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. GET /api/search?q=vacation+photos&user_id=123                       │
-│                                                                          │
-│  2. Search Service:                                                      │
-│     ├── Query Parser: normalize, spell-check, extract entities         │
-│     ├── Visibility Service: get user's visibility set from Redis       │
-│     │   └── Cache miss: compute from PostgreSQL, cache for 5 min       │
-│     └── Build ES query with privacy filter                              │
-│                                                                          │
-│  3. Elasticsearch (Phase 1):                                            │
-│     ├── Query hot/warm/cold indices                                     │
-│     ├── BM25 scoring on content fields                                  │
-│     ├── Filter by visibility_fingerprints                               │
-│     └── Return top 500 candidates                                       │
-│                                                                          │
-│  4. Ranking Service (Phase 2):                                          │
-│     ├── Compute features (affinity, recency, engagement)                │
-│     ├── ML model predicts relevance scores                              │
-│     └── Re-rank and return top 20                                       │
-│                                                                          │
-│  5. Response Assembly:                                                   │
-│     ├── Highlight matching text                                         │
-│     ├── Add author profiles                                             │
-│     └── Return to client                                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 5. Trade-offs Analysis
-
-| Decision | Pros | Cons |
-|----------|------|------|
-| Precomputed visibility fingerprints | Fast query-time filtering, single ES query | Visibility changes require re-indexing |
-| Two-tier indexing (hot/warm/cold) | Cost-efficient storage, fast recent queries | Cross-tier queries slower |
-| Kafka indexing pipeline | Reliable, scalable, decoupled | Adds 5-30s latency to searchability |
-| Redis visibility cache | Sub-ms lookup, reduces DB load | Cache invalidation complexity |
-| Two-phase ranking | Combines speed of ES with ML quality | Extra latency (~50ms for ML) |
-| Bloom filters for large visibility sets | Compact representation, fast checks | False positives require verification |
-
----
-
-### 6. Failure Modes and Mitigation
-
-**Circuit Breaker Configuration:**
-- failureThreshold: 5 consecutive failures
-- recoveryTimeout: 30000ms
-
-**Degraded Search Mode:**
-
-When circuit opens or timeout occurs:
-1. Skip ML re-ranking, use ES scores only
-2. Query only hot index (recent posts)
-3. Return cached results if available
-4. Fall back to simpleElasticsearchSearch without personalization
-
----
-
-### 7. Monitoring and Observability
-
-**Key Metrics:**
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Metrics Dashboard                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Latency:                                                                │
-│  ├── search_latency_p50, search_latency_p99                             │
-│  └── indexing_latency_seconds                                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Throughput:                                                             │
-│  ├── searches_total (per second)                                        │
-│  └── indexed_posts_total (per second)                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Cache:                                                                  │
-│  └── visibility_cache_hit_rate                                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Errors:                                                                 │
-│  ├── privacy_violations_total (SHOULD ALWAYS BE 0)                      │
-│  └── search_errors_total                                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Quality:                                                                │
-│  ├── zero_result_rate                                                   │
-│  └── click_through_rate                                                 │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 8. Future Enhancements
-
-1. **Semantic Search**: Add vector embeddings for semantic similarity (dense retrieval)
-2. **Personalized Typeahead**: User-specific query suggestions based on history
-3. **Federated Search**: Search across multiple content types (posts, photos, events)
-4. **Real-time Trending**: Detect and boost currently trending topics
-5. **Query Understanding**: Intent classification, entity extraction, query rewriting
-6. **A/B Testing Infrastructure**: Compare ranking algorithms at scale
-
----
-
-### Summary
-
-> "The Facebook Post Search backend is built around three key innovations:
->
-> 1. **Visibility fingerprints** - Precomputed tokens that enable privacy filtering at query time without per-post permission checks
->
-> 2. **Two-phase ranking** - Elasticsearch retrieves 500 candidates with BM25, then ML re-ranks with social signals for top 20
->
-> 3. **Kafka indexing pipeline** - Decouples post creation from search indexing with < 30s latency
->
-> The main trade-off is between indexing latency and query performance. By precomputing fingerprints, we shift work to index time but achieve sub-200ms P99 search latency with zero privacy leakage."
+The source database owns post content, audience, revisions, relationships, and operation
+results. An asynchronous pipeline maintains Elasticsearch as a retrieval projection. Redis
+caches graph-derived token sets and explicitly scoped suggestion data.
+
+Search serving combines efficient index filtering with a bounded current authorization
+check. The goal is to avoid scoring millions of irrelevant candidates while refusing to
+treat stale copied ACLs as final authority.
+
+| Record | Key fields / invariant | Access pattern |
+|--------|------------------------|----------------|
+| Post | ID, author, content, audience, revision, tombstone | Current hydration and updates |
+| Relationship | User pair, accepted state, revision | Viewer friends and reverse lookup |
+| Operation receipt | Actor/key unique, payload digest, result | Resolve retried creation/update |
+| Outbox event | Post ID and revision, publication progress | Recover index work after a crash |
+| Search document | Post/revision, text, author, audience tokens, rank fields | Retrieval and sorting |
+| Search session | Viewer, fixed query/ranking context, PIT, expiry | Stable continuation |
+
+I would start with PostgreSQL for the transactional authority. Large deployments can
+partition source records and relationship access paths, but sharding by user does not make
+both directions of the graph local automatically.
+
+Elasticsearch supplies inverted-index retrieval and text ranking. Redis is a disposable
+accelerator when reconstruction and authorization fallback are explicitly defined. A
+dependency is not disposable merely because its product category is “cache.”
+
+I would draw only these boundaries initially. A separate ML service, graph database, or
+thousand-shard layout needs workload evidence; it should not appear just to make the
+diagram look larger.
+
+## 🔍 Deep Dive 1: Fast Retrieval Without Stale Authorization — 10 minutes
+
+### Stable audience tokens reduce write amplification
+
+For a friends post, store FRIENDS:author in the index. A viewer supplies that token for
+each accepted friend, plus tokens for public and their own private content. The query can
+intersect those tokens with text matches inside Elasticsearch.
+
+If the author gains a friend, the post's token remains the same. The viewer's eligible
+token set changes. This avoids storing and rewriting every recipient ID in every
+historical post document.
+
+Changing the post itself from public to private is different: its copied audience fields
+must change. Conflating these two changes leads either to unnecessary mass reindexing or
+to missed privacy updates.
+
+| Approach | Strength | Cost/failure |
+|----------|----------|--------------|
+| ✅ Stable audience tokens | Small post-side audience representation | Viewer token list and graph freshness |
+| ❌ Per-post recipient arrays | Simple membership filter | Friendship changes rewrite many documents |
+| ✅ Current batch validation | Handles stale index and cache copies | Additional bounded source/graph reads |
+| ❌ Index ACL as sole authority | Cheapest serving path | Failed restrictions/deletions can disclose content |
+
+Token filtering is not O(1) for an arbitrary graph. A viewer with thousands of friends
+sends a larger set; posting-list intersections, term lookup, candidate density, and shard
+fan-out all affect cost. Measure those distributions.
+
+A Bloom filter can help reject obvious nonmatches, but false positives cannot grant
+access. If introduced, it is a preliminary approximation followed by an exact decision,
+not a replacement privacy mechanism.
+
+### Why I still validate after retrieval
+
+Consider a public post changed to private. SQL commits, but the index update fails. The
+old document still matches anonymous searches. A perfect filter over stale data returns
+the wrong answer.
+
+Retrieve a bounded candidate batch, then check current records and accepted relationships
+in batches. Require the indexed content revision to match the canonical revision before
+exposing the indexed snippet. Otherwise an old snippet can disclose text the author
+removed even if the current post is still public.
+
+The final check does not mean retrieving every matching document and issuing a SQL query
+for each. It is a small batch at the response boundary, after efficient coarse filtering
+has already removed most unsuitable candidates.
+
+If many candidates fail, scan forward with an explicit work budget. A short page with a
+continuation or partial-work indication is more honest than an unbounded loop trying to
+fill exactly twenty slots.
+
+The continuation must advance through the last examined candidate, including rejected
+rows. Advancing only through displayed rows can repeatedly revisit the same inaccessible
+boundary.
+
+### Counts and suggestions are also disclosures
+
+An Elasticsearch total computed before current validation is not necessarily the number of
+readable posts. A facet or suggested hashtag can reveal a hidden topic even when the
+result card is removed.
+
+I would omit exact totals initially and return verified loaded counts plus continuation.
+Any later total/facet feature needs the same authorization semantics and a stated
+approximation or snapshot boundary.
+
+Shared suggestions should come from a public-safe dictionary or corpus. Personal history
+remains viewer-scoped. Directory suggestions use the directory's policy rather than
+inheriting whatever user happened to populate a prefix cache first.
+
+Global trends require a deliberate publication policy. Repeated page requests are not
+independent user interest, and raw queries may contain private information. A time window
+and distinct-user threshold help reduce noise and accidental disclosure, but they do not
+alone prove privacy.
+
+### The availability trade-off
+
+If the authoritative privacy dependency is unavailable, I fail protected searches closed
+or offer an explicit narrower public mode backed by current trustworthy data. Silently
+removing the filter to preserve availability changes the product's security contract.
+
+Newly granted content may be absent until indexing/token refresh catches up. That is a
+visible freshness cost, not a reason to tolerate stale revocations. I would make grant lag
+and authorization drops separately observable.
+
+> “I use the index to decide what is worth checking. I use current authority to decide what may leave the service. That extra boundary is worth the latency because stale privacy is not an acceptable relevance error.”
+
+## 🔍 Deep Dive 2: Durable Indexing and Safe Rebuilds — 10 minutes
+
+### Acceptance must survive the index being down
+
+A sequential SQL insert followed by an Elasticsearch write has two commits. If the second
+operation fails, either the API reports failure after saving a post or it reports success
+without durable repair work.
+
+I would commit the post mutation, actor-scoped operation receipt, and outbox event
+together. The response confirms the canonical operation; it does not claim that every
+search node can already retrieve it.
+
+1. Authenticate and validate the actor's operation and requested audience.
+2. Resolve the operation ID against its request digest.
+3. Commit source state, monotonic revision, receipt, and outbox work.
+4. Return the canonical result.
+5. Let workers apply the projection and report index progress separately.
+
+A lost HTTP response is resolved by retrying the same operation. A new UUID generated by
+the server for every retry does not deduplicate creation; it simply makes every duplicate
+row have a valid unique key.
+
+### Delivery duplication and event reordering are different
+
+Using the post ID as the ES document ID prevents multiple index documents for the same
+source post. It does not stop revision 8 from arriving after revision 9 and overwriting a
+newer restriction.
+
+The worker applies a monotonic version check. A stale or duplicate event is a no-op after
+confirming which source revision is current. Poison records need a visible repair path
+instead of retrying forever and blocking unrelated work.
+
+Deletes need retained version state too. If physical deletion removes the only record of
+revision 10, a delayed revision 9 can recreate the document. Keep a tombstone or
+equivalent durable high-water mark for the supported replay horizon, and define safe
+compaction separately.
+
+A post-partitioned stream helps ordering, but it does not eliminate retries, manual
+reindex races, or cross-pipeline writes. Revision enforcement belongs at the projection
+boundary as well.
+
+### Bulk transport is not batch correctness
+
+Index in bounded batches to reduce round trips and refresh overhead. A successful bulk
+HTTP response can contain failed individual items, so inspect every result and retry only
+the affected work according to error class.
+
+Do not acknowledge an entire event batch merely because the request returned 200. Keep
+enough durable progress to recover after a worker dies between partial success and its
+checkpoint.
+
+Refresh is a search-visibility mechanism. Forcing a refresh per write can improve
+immediate local testing but costs indexing throughput. Waiting for a refresh does not
+bound upstream queue lag or guarantee one second under every configuration.
+
+| Choice | Why it fits | Trade-off |
+|--------|-------------|-----------|
+| ✅ Transactional outbox and receipt | Saved operation and repair work survive together | Relay/worker operations and storage |
+| ✅ Versioned idempotent projection | Retries cannot regress newer state | Revision/tombstone lifecycle |
+| ❌ Inline SQL then ES as one implied transaction | Small happy-path implementation | Ambiguous saved-but-failed outcomes |
+| ❌ Ignore bulk item status | Easy success reporting | Missing/rejected documents remain invisible |
+
+### Reindexing is a migration, not just a loop
+
+For a new mapping/analyzer, build a new index generation. Backfill from a defined source
+boundary, then replay changes and tombstones through a catch-up point. Validate counts,
+sampled content/revisions, and representative searches before switching the read alias.
+
+An alias swap is useful because readers move together, but it does not capture writes that
+happened during backfill. That requires the change stream/outbox boundary and replay
+procedure.
+
+Existing PITs may refer to the old generation. Retain it for a bounded overlap or expire
+those sessions explicitly. Deleting it immediately after the swap can break readers midway
+through a search.
+
+A bulk upsert of all current SQL rows cannot remove orphaned ES documents whose source
+rows were deleted. Reconciliation must compare absence/tombstones as well as overwrite
+rows that still exist.
+
+> “I am not promising exactly-once transport. I am making duplicate and delayed delivery harmless, and making accepted work recoverable. Those are the invariants the user actually depends on.”
+
+## 🔍 Deep Dive 3: Ranking and Pagination Share a Contract — 9 minutes
+
+### Start with an understandable relevance baseline
+
+Use analyzed text for prose and exact keyword fields for hashtags/IDs/audience tokens.
+Define phrase syntax explicitly. Fuzzy matching can tolerate typos, but it does not make
+ordinary keyword queries exact-phrase searches.
+
+The local implementation uses BM25 field boosts and friend/self should clauses within the
+same ES query. Those clauses add score contributions; they are not a universal
+multiplication of the entire score by two or three.
+
+Engagement is a secondary sort: likes + twice comments + three times shares. It matters
+after equal relevance, followed by creation time. There is no time decay or application
+reranker in the demo.
+
+For a production baseline, I would measure text relevance first, then calibrate social and
+engagement features with judged queries. An old viral post should not win merely because
+raw counts are large. Scores are not probabilities and are not directly comparable across
+different viewers' queries.
+
+A later reranker can use richer features over a bounded overfetched window. It cannot
+promote a relevant post absent from that window, and reranking each independent page does
+not create a coherent global order.
+
+### Why an offset string is not enough
+
+Offset paging skips a number of current hits. If refreshed results move between page
+requests, items can repeat or disappear. A cursor containing score and ID fixes tie
+ordering only; it does not freeze moving scores or changing query context.
+
+For the first in-engine ranking design, I would use a short-lived PIT with search_after.
+Keep the query, sort, social ranking context, and any time-based scoring reference fixed
+for that session. Bind its opaque cursor to the viewer and contract version.
+
+The server retains the latest PIT identifier and uses the complete returned sort tuple,
+including its tie-breaker. A changed filter or ranking context starts a new session.
+Expiry yields an explicit reset, not a best-effort reinterpretation of the old cursor.
+
+Permissions remain current. Keep the retrieval context fixed, validate each candidate
+against current authority, and expire the session if a graph-context change requires a new
+query. Stability cannot mean preserving permission to old private text.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Bounded PIT/search_after session | Stable index view and continuation | Retained index resources and expiry |
+| ❌ Offset over refreshed results | Simple shallow-page implementation | Deep-page work and shifting boundaries |
+| ❌ ID tie-breaker without fixed context | Deterministic equal-score order | Does not prevent score/index movement |
+| ✅ Frozen reranked window if ML is added | Coherent application order | Candidate/window storage and limited horizon |
+
+### What breaks first at scale
+
+Broad queries and long friend lists can dominate search CPU. Time partitioning helps
+queries with date bounds, but a query across five years still fans out across many shards.
+Replicas spread read load and provide redundancy; they do not erase the number of logical
+shards a broad query must visit.
+
+Shard sizing depends on recovery speed, storage expansion, and query distribution. A fixed
+thousand-shard recommendation without measurements can create excessive coordination
+overhead on a small corpus.
+
+Limit open PITs and their lifetimes. An abandoned search should not retain old segments
+indefinitely. Client cancellation and explicit session close help, but expiry is still
+required when the browser disappears.
+
+## 🧪 Operations and Failure Tests — 5 minutes
+
+| Interface | Contract |
+|-----------|----------|
+| POST /api/v1/search | Query/filters, viewer context from auth, bounded page request |
+| Search continuation | Same session/query context and opaque cursor |
+| Suggestions | Explicit scope/type and safe publication policy |
+| Post mutation | Durable operation result plus index-progress distinction |
+| Admin rebuild | Observable job/generation status, not an optimistic input count |
+
+Runtime validation must reject malformed enum arrays, invalid dates, oversized queries,
+and negative/noninteger limits before constructing ES queries. Shared types alone cannot
+validate network data.
+
+A breaker should protect capacity and allow recovery probes. The timeout must also be
+connected to underlying cancellation or concurrency bounds; returning early while every
+old search continues can still exhaust the dependency.
+
+Useful failure tests include:
+
+1. SQL commits a privacy restriction while ES is unavailable: no old content is returned.
+2. A worker dies after partial bulk success: missing items retry without regressing versions.
+3. An old event arrives after deletion: it cannot resurrect the post.
+4. A friendship is revoked while a PIT remains open: current validation denies the result.
+5. A new index catches up during live writes: alias switch preserves acknowledged changes.
+6. The breaker cooldown expires: a bounded probe can actually execute.
+
+Observe source-to-search lag, item failures, revision mismatch, authorization drops,
+partial results, query fan-out, and PIT resources. Search latency and browser first-result
+latency are different measurements.
+
+Search logs and history themselves need a retention/access policy. Ordinary telemetry
+should avoid raw private terms; hashing a predictable phrase does not make it anonymous.
+Administrative inspection should be explicit and auditable.
+
+## 📝 Close and Local Boundary — 2 minutes
+
+> “My design uses exact tokens to narrow retrieval, current authority to protect disclosure, and a versioned asynchronous projection to keep indexing recoverable. A bounded search session connects ranking with predictable pagination.”
+
+The local app implements one ES query with social boosts, cached visibility sets,
+synchronous indexing, bearer sessions, and a Cockatiel wrapper. It has no outbox, creation
+receipt, revision guard, PIT, or authoritative result hydration.
+
+Create/update can commit SQL then fail indexing; deletion swallows index errors, and
+reindex ignores bulk item failures/orphan documents. Search and health pre-checks can
+prevent breaker recovery. Suggestions, author lists, detail, feed, and likes do not share
+one privacy rule.
+
+The [architecture](./architecture.md#implementation-notes) records these findings against
+source. The [README](./README.md) distinguishes fixtures and setup. The review used
+isolated source checks; no full-stack or load benchmark established the targets above.

@@ -1,452 +1,394 @@
-# AirTag - System Design Answer (Backend Focus)
+# AirTag — Backend System Design
 
-*45-minute system design interview format - Backend Engineer Position*
+*A 45-minute discussion of private report contents, durable ingestion and bounded retrieval.*
 
----
+This answer proposes an item-finding backend that cannot decrypt location reports.
+The repository's backend does hold secrets and decrypt locations; its actual design
+is described in [architecture.md](./architecture.md).
 
-## 📋 Introduction
+## 📋 Establish the trust model and scale — 4 minutes
 
-**Interviewer prompt:** "Design the backend infrastructure for AirTag, Apple's item tracking system that uses a crowd-sourced network of billions of Apple devices to locate lost items."
+> “I would begin by asking which parties are allowed to know an item's location.
+> If the report service must not learn it, that changes key custody, queries,
+> notifications and even how we approach unwanted-tracker detection.”
 
-**Candidate response:**
+A nearby finder observes a tag, encrypts an approximate location for its owner and
+uploads the report. The owner retrieves reports and decrypts them on an authorized
+device. The backend stores and serves ciphertexts.
 
-"This is a fascinating privacy-first system design challenge. AirTag relies on a global mesh of 1 billion+ Apple devices to detect lost items, but the critical constraint is that Apple itself cannot see where items are located. The backend must store encrypted location reports, serve them to owners for local decryption, and detect stalking patterns - all while maintaining zero-knowledge of actual locations.
+The finder necessarily knows its own observation. The owner learns the location.
+The service sees some metadata, such as request timing and lookup tokens. Protecting
+report contents does not automatically make all those interactions anonymous.
 
-Let me walk through the key backend challenges:
-1. Privacy-preserving storage where Apple cannot decrypt locations
-2. High-volume ingestion of 100K+ encrypted reports per second
-3. Key rotation and identifier management at scale
-4. Anti-stalking detection with real-time pattern analysis
-5. Exactly-once semantics to prevent duplicate reports"
+I would exclude radio firmware and a new cryptographic protocol from this interview.
+We need a reviewed pairing/encryption protocol with explicit interfaces, not a
+hand-written curve implementation on the whiteboard.
 
----
+Assume one billion reports/day, roughly one kilobyte each, with a peak of one hundred
+thousand reports per second. Average load is about 11,600 per second and raw storage
+is about one terabyte/day. These are sizing assumptions, not deployed usage figures.
 
-## 🎯 Requirements
+At seven days of retention, payloads occupy about seven terabytes before replication
+and indexes. I would target regional durable acceptance below 300 ms at p99 and
+bounded retrieval below 500 ms at p95, then validate those targets under load.
 
-### Functional Requirements
+Time to find an item has no fixed bound: no nearby finder means no new observation.
+Our backend latency target starts when a report reaches us, not when the owner
+first notices that the item is missing.
 
-| Priority | Requirement | Description |
-|----------|-------------|-------------|
-| P0 | Report Ingestion | Receive encrypted location reports from Find My network devices |
-| P0 | Location Queries | Serve encrypted blobs to device owners for local decryption |
-| P1 | Anti-Stalking | Detect unknown trackers following users |
-| P1 | Lost Mode | Store and serve contact information for found devices |
-| P2 | Notifications | Alert users when devices are found or unknown trackers detected |
-
-### Non-Functional Requirements
-
-| Metric | Target | Rationale |
-|--------|--------|-----------|
-| Privacy | End-to-end encryption | Apple cannot decrypt locations |
-| Throughput | 100K+ reports/second | Global device network |
-| Ingestion Latency | < 50ms | Real-time location updates |
-| Query Latency | < 100ms | Responsive Find My app |
-| Retention | 7 days | Balance findability vs storage |
-
-### Scale Estimates
-
-"Let me do some back-of-envelope math:"
-
-- 1 billion+ Apple devices in Find My network
-- ~100M active AirTags generating ~1B reports/day
-- Key rotation every 15 minutes = 96 periods per day
-- Each encrypted report: ~1KB
-- Daily storage: ~1TB of encrypted reports
-
----
-
-## 🏗️ High-Level Design
-
-"Let me draw the main components:"
+## 🏗️ Architecture and responsibility — 4 minutes
 
 ```
-+-----------------------------------------------------------+
-|              Find My Network (1B+ devices)                 |
-|           (iPhones, iPads, Macs detect AirTags)           |
-+-----------------------------------------------------------+
-                           |
-                           | Encrypted Reports
-                           v
-+-----------------------------------------------------------+
-|                   API Gateway Layer                        |
-|      (Rate limiting, validation, regional routing)        |
-+-----------------------------------------------------------+
-              |                              |
-              v                              v
-+------------------------+       +---------------------------+
-|  Report Ingestion API  |       |  Location Query Service   |
-|    (Express/Node.js)   |       |     (Express/Node.js)     |
-+------------------------+       +---------------------------+
-              |                              |
-              v                              v
-+------------------------+       +---------------------------+
-|     Redis/Valkey       |       |       PostgreSQL          |
-| - Idempotency (24h)    |       | - location_reports        |
-| - Rate limiting        |       | - registered_devices      |
-| - Query cache          |       | - notifications           |
-+------------------------+       +---------------------------+
-              |
-              v
-+-----------------------------------------------------------+
-|                       RabbitMQ                             |
-| - location.reports (ingestion workers)                     |
-| - antistalk.analyze (pattern detection)                    |
-| - notifications.push (alert delivery)                      |
-+-----------------------------------------------------------+
-              |
-              v
-+-----------------------------------------------------------+
-|               Anti-Stalking Workers                        |
-|    (Pattern analysis, alert generation)                    |
-+-----------------------------------------------------------+
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│ Finder devices  │─────▶│ Ingestion API   │─────▶│ Durable log     │
+│ Encrypted report│      │ Validate, admit │      │ Stable identity │
+└─────────────────┘      └─────────────────┘      └────────┬────────┘
+                                                           ▼
+                                                  ┌─────────────────┐
+                                                  │ Storage workers │
+                                                  │ Idempotent sink │
+                                                  └────────┬────────┘
+                                                           ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│ Owner device    │◀────▶│ Query API/cache │◀────▶│ Report store    │
+│ Derive, decrypt │      │ Bounded batches │      │ Token/time index│
+└─────────────────┘      └─────────────────┘      └─────────────────┘
 ```
 
----
+Account and pairing metadata can live in PostgreSQL. Report storage has a different
+access pattern: append opaque envelopes and retrieve them by rotating token and
+bounded time range. Its partitioning can evolve independently.
 
-## 🔍 Deep Dive
+The durable log absorbs bursts and gives workers a replay source. At a smaller scale,
+a direct transactional report insert is a simpler valid acceptance boundary. I would
+choose between them based on measured burst handling and replay requirements.
 
-### Privacy-Preserving Storage Architecture
+A cache accelerates queries but does not decide whether a report was durably accepted.
+Notification work has its own identity and consumer. Safety detection belongs in a
+nearby device/platform path, not in a worker that supposedly reads encrypted coordinates.
 
-"The core challenge is storing location reports without Apple being able to read them. Let me explain the schema design."
+The key manager is intentionally on the owner side of the diagram. Adding a server
+helper that derives all owner keys would invalidate the central confidentiality claim,
+even if the report table still contained only encrypted JSON.
 
-**Key Database Tables:**
+## 💾 Data model and service contracts — 4 minutes
 
-| Table | Purpose | Key Fields |
-|-------|---------|------------|
-| location_reports | Encrypted location blobs | identifier_hash, encrypted_payload, created_at |
-| registered_devices | User device ownership | user_id, device_id, master_secret_hash |
-| tracker_sightings | Anti-stalking data | user_id, identifier_hash, lat, lon, seen_at |
-| notifications | User alerts | user_id, type, message, data |
+| Record | Key fields | Purpose |
+|--------|------------|---------|
+| Account / pairing metadata | Account, item reference, authorized endpoints and lifecycle state | Manage ownership without storing report decryption secrets |
+| Report envelope | Stable report ID, lookup token, protocol version and ciphertext | Preserve one report identity across retries |
+| Stored report | Envelope plus server receipt time and storage bucket | Bounded retrieval and retention |
+| Ingestion progress | Durable position and sink outcome | Replay and visibility lag |
+| Notification intent | Notification ID, subscription scope, event version and expiry | Independent delivery/recovery lifecycle |
+| Consumer receipt | Consumer identity and event identity | Avoid repeating that consumer's database effect |
 
-**Encrypted Payload Contents (only owner can decrypt):**
-- Latitude/longitude coordinates
-- Accuracy radius in meters
-- Timestamp of detection
-- Reporter device region (coarse)
+The encrypted observation contains its claimed observation time, location and accuracy.
+The server records receipt time independently. It cannot validate an encrypted time
+by checking the time on its own clock.
 
----
+| Contract | Required semantics |
+|----------|--------------------|
+| Submit report | Validate envelope, preserve identity, acknowledge a defined durable boundary |
+| Query reports | Cap tokens, time span, result count and bytes; provide continuation |
+| Manage pairing | Verify the relevant ownership/possession transition |
+| Update lost mode | Define contact visibility and concurrent-edit behavior |
+| Subscribe for hints | Define token association, expiry and notification scope |
 
-### Why No Foreign Key from Reports to Devices?
+An authenticated request can support quotas without proving ownership of every lookup
+token. Confidentiality still depends on decryption keys, and the privacy cost of
+linking a query batch to an account must be acknowledged.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **No FK (chosen)** | Privacy by design, zero-knowledge, supports key rotation | Cannot query "all reports for device X" server-side |
-| FK to devices | Easier queries, referential integrity | Server can correlate reports to devices, breaks privacy model |
+I would keep cryptographic envelope versioning explicit so validation and client
+support can evolve without accepting arbitrary unbounded JSON as a protocol.
 
-**Decision: No Foreign Key**
+## 🔧 Deep dive: Protect contents without claiming complete anonymity — 9 minutes
 
-"I'm choosing no foreign key because the entire privacy model depends on the server not knowing which reports belong to which device. The identifier_hash changes every 15 minutes due to key rotation, and only the device owner can derive which hashes belong to their AirTag. If we had a foreign key, Apple could trivially track any AirTag's location history - defeating the entire privacy design."
+> “The privacy boundary is about who has decryption capability. A missing foreign
+> key is useful schema separation, but it is not a cryptographic guarantee.”
 
----
+### Key custody decides the boundary
 
-### Why JSONB for Encrypted Payloads Over Normalized Columns?
+Pairing establishes key material on the trusted item/owner endpoints. A nearby finder
+can encrypt to the item's broadcast public material without receiving the owner's
+private decryption secret.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **JSONB (chosen)** | Schema flexibility, encryption format can evolve, no parsing needed | Slightly larger storage, no column-level indexing |
-| Normalized columns | Smaller storage, can index fields | Requires schema changes when format evolves, breaks abstraction |
+The service stores the envelope under a lookup token. The owner derives the required
+tokens and corresponding private capability for the requested period, retrieves
+ciphertexts and decrypts locally.
 
-**Decision: JSONB**
+I would use a reviewed protocol and implementation. Merely hashing a master secret
+and adding a random “ephemeral key” field does not create asymmetric encryption.
+The encryption and lookup derivation must have their intended security relationships.
 
-"I'm choosing JSONB because the encrypted payload is an opaque blob to the server anyway - we cannot index or query its contents since they're encrypted. Storing it as JSONB allows the encryption format to evolve (new fields, different ciphers) without database migrations. The payload contains: ephemeral public key, IV, ciphertext, and auth tag."
+If the server stores the master secret, it can derive report identities and decrypt.
+Encrypting that secret with a server-accessible KMS improves some storage protections,
+but the running service still has the capability. It remains a server-trusted design.
 
----
+The price of endpoint custody is recovery complexity. Losing every authorized copy
+of the keys can make historical reports unreadable. Account recovery and encrypted
+key recovery must be designed separately, not assumed to be the same operation.
 
-### Why Redis for Idempotency Over Database Unique Constraints?
+### Rotation limits one kind of linkage
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Redis SET NX (chosen)** | Sub-millisecond checks, auto-expiry via TTL, distributed | No durability, memory cost |
-| DB unique constraint | Durable, no extra infrastructure | Slower (disk I/O), no auto-expiry, lock contention |
+Rotating broadcasts removes a persistent radio identifier. It can make passive
+linkage harder, but observations close in time and space may still be correlated.
+A strong privacy claim needs a threat model rather than a statement that rotation
+makes tracking impossible.
 
-**Decision: Redis SET NX**
+The service also sees request timing, sizes and network metadata. An owner sending
+many tokens in one authenticated batch associates them within that request, even
+when no database foreign key connects them to a device.
 
-"I'm choosing Redis because idempotency checks happen on every single report submission - at 100K reports/second, we cannot afford disk I/O latency. The 24-hour TTL provides automatic cleanup, and if Redis loses data, the worst case is duplicate processing which the database can handle with ON CONFLICT DO NOTHING."
+I would avoid logging token lists together with account identifiers unless there is
+a specific need and retention policy. Aggregate latency and processing measurements
+should not become an easier location-correlation dataset than the report store.
 
-**Idempotency Key Generation:**
-- Combine: identifier_hash + rounded_timestamp + payload_hash
-- Round timestamp to minute to handle clock drift
-- SHA-256 hash the combination
-- Store in Redis with 24-hour TTL
+More frequent rotation increases the number of query tokens and the work needed
+for historical retrieval. It does not require discarding a valid observation just
+because its broadcast period has ended.
 
----
+### Separate confidentiality from authenticity
 
-### Why RabbitMQ Over Kafka for Report Processing?
+A finder encrypting a location does not prove that it was physically at that location.
+If anyone with public beacon material can submit an envelope, fabricated observations
+are possible even when ciphertext integrity is correct.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **RabbitMQ (chosen)** | Simpler operations, built-in dead letter queues, per-message acks | Lower throughput ceiling (~50K/sec) |
-| Kafka | Higher throughput (1M+/sec), replay capability, exactly-once semantics | More complex operations, requires Zookeeper, overkill for initial scale |
+Admission credentials, rate limits and plausibility checks can reduce abuse, but
+each has limits and privacy costs. I would not promise a universal way for the
+backend to verify physical truth without seeing the encrypted observation.
 
-**Decision: RabbitMQ**
+The owner client validates decrypted shape, timestamps and accuracy, and can compare
+multiple reports before presenting a confident estimate. A report is evidence,
+not an authoritative command to move the item on a map.
 
-"I'm choosing RabbitMQ because our initial scale of 100K reports/second is well within RabbitMQ's capabilities, and the operational simplicity is valuable. The dead letter queue pattern handles failed messages gracefully, and per-message acknowledgments give us precise delivery guarantees. If we exceed 500K/second sustained, we'd migrate to Kafka."
+Bind the relevant protocol context to authenticated encryption so a valid ciphertext
+cannot silently be interpreted under a different envelope version or lookup context.
+The precise mechanism belongs in the reviewed protocol rather than improvised API logic.
 
----
+### Keep safety processing compatible with privacy
 
-### Why 15-Minute Cache TTL?
+An opaque-report backend cannot calculate a person's travel distance from hidden
+coordinates. A centralized plaintext sighting service would be a new trust decision,
+not a free feature of the same encrypted pipeline.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **15-minute TTL (chosen)** | Matches key rotation period, natural invalidation boundary | Slightly higher cache miss rate |
-| Shorter TTL (5 min) | Fresher data | More database load, unnecessary refreshes |
-| Longer TTL (1 hour) | Better cache hit rate | Stale data across rotation boundaries |
+I would keep nearby unwanted-tracker observations in the platform's protected local
+safety path. That path needs protocol support for repeated proximity despite identifier
+rotation, and evaluation against both missed cases and ordinary shared-item use.
 
-**Decision: 15-Minute TTL**
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Endpoint key custody with minimized service metadata | Excludes service from location contents | Recovery, sharing and client security work |
+| ❌ Server-held secrets described as “zero knowledge” | Convenient queries and notifications | Service compromise exposes decryption and correlation capability |
 
-"I'm choosing a 15-minute cache TTL because it exactly matches the AirTag key rotation period. When a key rotates, the identifier hash changes, so cached data for old identifiers becomes irrelevant anyway. This creates a natural cache invalidation boundary without requiring explicit invalidation logic."
+The chosen design also limits server features. Location-based analytics or geofencing
+cannot simply be added to opaque storage; they must run on an authorized endpoint
+or change the stated trust model.
 
----
+## 🔧 Deep dive: Durable acceptance and idempotent effects — 8 minutes
 
-### Why PostgreSQL Over Cassandra for Location Reports?
+> “I would define exactly what an accepted report means before choosing a broker.
+> A client write buffer accepting bytes is not the same as durable storage.”
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **PostgreSQL (chosen)** | ACID transactions, familiar tooling, read replicas, JSON support | Write throughput ceiling (~100K/sec with partitioning) |
-| Cassandra | Linear write scaling, built for time-series | Eventual consistency, more complex operations, no joins |
-
-**Decision: PostgreSQL with Time-Based Partitioning**
-
-"I'm choosing PostgreSQL because our write volume of 100K/second is achievable with partitioning and proper indexing. The 7-day retention with automatic partition dropping is straightforward. We need ACID guarantees for the anti-stalking detection system, and PostgreSQL's JSONB support handles encrypted payloads well. If writes exceed 200K/second, we'd consider Cassandra."
-
----
-
-### Why Time-Based Partitioning for Reports?
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Time-based partitioning (chosen)** | Efficient retention cleanup, fast range queries, partition pruning | Requires partition management |
-| Single table with DELETE | Simpler schema | Slow deletes, table bloat, index fragmentation |
-| Hash partitioning | Even data distribution | Cannot efficiently drop old data |
-
-**Decision: Daily Partitions with Auto-Drop**
-
-"I'm choosing time-based partitioning because our primary access pattern is 'get reports for these identifiers in the last N hours' - which naturally aligns with time partitions. More importantly, our 7-day retention policy becomes a simple DROP PARTITION operation instead of massive DELETE queries that would cause table bloat and index fragmentation."
-
----
-
-### Why Async Anti-Stalking Processing?
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Async via queue (chosen)** | Decoupled from ingestion, can scale independently, doesn't block writes | Slight delay in alerts |
-| Synchronous processing | Immediate alerts | Blocks report ingestion, harder to scale, latency spikes |
-
-**Decision: Async Processing**
-
-"I'm choosing async processing because anti-stalking analysis is computationally expensive - it requires querying recent sightings, calculating distances, and detecting patterns. This work shouldn't block the hot path of report ingestion. A few seconds of delay in stalking alerts is acceptable; blocking 100K writes/second is not."
-
-**Anti-Stalking Detection Algorithm:**
-1. Track sightings per user per identifier_hash
-2. Alert if: 3+ sightings AND (>500m traveled OR >1 hour together)
-3. 1-hour cooldown between alerts per tracker
-4. Queue push notification on alert
-
----
-
-## 📊 Data Flow
-
-### Report Ingestion Flow
-
-```
-+-------------+     +----------+     +-------+     +----------+
-|  iPhone     |     |  API     |     | Redis |     | RabbitMQ |
-|  (reporter) |     | Gateway  |     |       |     |          |
-+------+------+     +----+-----+     +---+---+     +----+-----+
-       |                 |               |              |
-       | POST /report    |               |              |
-       |---------------->|               |              |
-       |                 | Check idem key|              |
-       |                 |-------------->|              |
-       |                 |    miss       |              |
-       |                 |<--------------|              |
-       |                 | Queue report  |              |
-       |                 |----------------------------->|
-       |   202 Accepted  |               |              |
-       |<----------------|               |              |
-       |                 |               |              |
-```
-
-```
-+----------+     +------------+     +-------+     +----------+
-| RabbitMQ |     |  Worker    |     | Redis |     | Postgres |
-|          |     |            |     |       |     |          |
-+----+-----+     +------+-----+     +---+---+     +----+-----+
-     |                  |               |              |
-     | Consume msg      |               |              |
-     |----------------->|               |              |
-     |                  | Set idem key  |              |
-     |                  |-------------->|              |
-     |                  | INSERT report |              |
-     |                  |----------------------------->|
-     |                  |     OK        |              |
-     |                  |<-----------------------------|
-     |        ACK       |               |              |
-     |<-----------------|               |              |
-     |                  |               |              |
-```
-
-### Location Query Flow
-
-```
-+-------------+     +----------+     +-------+     +----------+
-|  Owner's    |     |  Query   |     | Redis |     | Postgres |
-|  iPhone     |     | Service  |     | Cache |     |          |
-+------+------+     +----+-----+     +---+---+     +----+-----+
-       |                 |               |              |
-       | Query hashes    |               |              |
-       | [h1, h2, h3...] |               |              |
-       |---------------->|               |              |
-       |                 | Cache lookup  |              |
-       |                 |-------------->|              |
-       |                 |    miss       |              |
-       |                 |<--------------|              |
-       |                 | SELECT        |              |
-       |                 |----------------------------->|
-       |                 | encrypted     |              |
-       |                 | blobs         |              |
-       |                 |<-----------------------------|
-       |                 | Cache result  |              |
-       |                 |-------------->|              |
-       | Encrypted blobs |               |              |
-       |<----------------|               |              |
-       |                 |               |              |
-       | [Local decrypt] |               |              |
-       | [Show on map]   |               |              |
-```
-
-### Anti-Stalking Detection Flow
-
-```
-+----------+     +------------+     +----------+     +-----------+
-| RabbitMQ |     | AntiStalk  |     | Postgres |     | RabbitMQ  |
-| (reports)|     |  Worker    |     |          |     | (notifs)  |
-+----+-----+     +------+-----+     +----+-----+     +-----+-----+
-     |                  |               |                  |
-     | report.stored    |               |                  |
-     |----------------->|               |                  |
-     |                  | Get sightings |                  |
-     |                  |-------------->|                  |
-     |                  | Recent 3hrs   |                  |
-     |                  |<--------------|                  |
-     |                  |               |                  |
-     |                  | [Analyze      |                  |
-     |                  |  pattern]     |                  |
-     |                  |               |                  |
-     |                  | IF stalking:  |                  |
-     |                  | INSERT alert  |                  |
-     |                  |-------------->|                  |
-     |                  | Queue push    |                  |
-     |                  |----------------------------->|   |
-     |        ACK       |               |                  |
-     |<-----------------|               |                  |
-```
-
----
-
-## 📐 Scalability Strategy
-
-### Horizontal Scaling
-
-| Component | Strategy | Trigger |
-|-----------|----------|---------|
-| Report Ingestion API | Stateless, add instances behind LB | CPU > 70% |
-| Location Query Service | Stateless, add instances behind LB | Latency > 50ms |
-| Anti-Stalking Workers | Consumer groups, partition by user_id | Queue depth > 10K |
-| PostgreSQL | Read replicas, time-based partitioning | Read latency > 20ms |
-| Redis | Cluster mode, sharded by key prefix | Memory > 70% |
-| RabbitMQ | Cluster with quorum queues | Queue depth > 500K |
-
-### Regional Deployment
-
-```
-                    +------------------+
-                    |   Global LB      |
-                    |  (Anycast DNS)   |
-                    +--------+---------+
-                             |
-        +--------------------+--------------------+
-        |                    |                    |
-        v                    v                    v
-+---------------+    +---------------+    +---------------+
-|   US-West     |    |   EU-West     |    |   AP-East     |
-|    Region     |    |    Region     |    |    Region     |
-+-------+-------+    +-------+-------+    +-------+-------+
-        |                    |                    |
-        +--------------------+--------------------+
-                             |
-                   Cross-Region Async
-                      Replication
-```
-
-"Each region handles local traffic, with async replication for global queries. Reports are written to the nearest region, and owners can query globally."
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Key Rationale |
-|----------|--------|-------------|---------------|
-| No FK on reports | Privacy-first | FK to devices | Server cannot correlate reports to devices |
-| JSONB payload | Schema flexibility | Normalized columns | Encryption format may evolve |
-| Redis idempotency | Sub-ms checks | DB unique constraint | Cannot afford disk I/O at 100K/sec |
-| RabbitMQ | Simpler ops | Kafka | Sufficient throughput, better DLQ support |
-| 15-min cache TTL | Natural boundary | Shorter/longer TTL | Matches key rotation period |
-| PostgreSQL | ACID + partitioning | Cassandra | Manageable scale, familiar tooling |
-| Async anti-stalking | Decoupled | Synchronous | Don't block hot path |
-| Time partitions | Easy retention | Single table | DROP vs DELETE for cleanup |
-
----
-
-## 🚀 Future Enhancements
-
-| Enhancement | Trigger | Description |
-|-------------|---------|-------------|
-| Kafka migration | > 500K reports/sec | Replace RabbitMQ for higher throughput |
-| ClickHouse analytics | Growth analysis needs | Aggregate statistics without exposing locations |
-| Global database | Multi-region consistency | CockroachDB or Spanner |
-| ML anti-stalking | False positive complaints | Anomaly detection beyond rules |
-| HSM integration | Security audit | Hardware security modules for key derivation |
-| Bloom filters | Memory pressure | Probabilistic deduplication |
-
----
-
-## 📝 Summary
-
-"To summarize the AirTag backend design:
-
-1. **Privacy is the foundation**: We store encrypted blobs that Apple cannot decrypt. No foreign keys link reports to devices. Only device owners can derive identifier hashes to query their locations.
-
-2. **Scale through async processing**: Reports are accepted quickly via Redis idempotency checks, queued in RabbitMQ, and processed by background workers. This achieves 100K+/second throughput.
-
-3. **Anti-stalking runs independently**: Pattern detection is decoupled from ingestion, allowing both systems to scale separately.
-
-4. **Time-based partitioning**: Makes 7-day retention efficient - just drop old partitions instead of slow DELETE operations.
-
-5. **15-minute boundaries everywhere**: Cache TTL, key rotation, and identifier changes all align to simplify the system.
-
-The key insight is that privacy constraints actually simplify the backend - since we cannot see locations, we just store opaque blobs with content-derived keys. The complexity moves to client-side cryptography."
-
----
-
-### Retention Policy Reference
-
-| Data Type | Retention | Cleanup Method |
-|-----------|-----------|----------------|
-| Location reports | 7 days | DROP partition |
-| Tracker sightings | 24 hours | Scheduled DELETE |
-| Idempotency keys | 24 hours | Redis TTL expiry |
-| Rate limit counters | 1 minute | Redis TTL expiry |
-| Query cache | 15 minutes | Redis TTL expiry |
-
----
-
-### Key Metrics to Monitor
-
-| Metric | Alert Threshold | Meaning |
-|--------|-----------------|---------|
-| Report ingestion p95 | > 100ms | Ingestion bottleneck |
-| Queue depth (reports) | > 100K | Workers falling behind |
-| Queue depth (antistalk) | > 10K | Analysis backlogged |
-| Duplicate rate | > 20% | Idempotency layer issue |
-| Cache hit rate | < 80% | Sizing or TTL problem |
+### Give a report one retry identity
+
+The finder creates an ID for an observation and retains the same encrypted envelope
+while retrying. If it re-encrypts with new random values for each attempt, a content
+hash alone may treat every retry as a new report.
+
+At the durable sink, the report identity has a uniqueness rule and a payload
+fingerprint. The same identity and payload converge to one stored report. Conflicting
+reuse is rejected rather than silently replacing an earlier observation.
+
+An identity based on the server's current minute is not stable across network delay.
+The same upload retried just after a minute boundary must not acquire a new logical
+identity merely because the service received it later.
+
+### Choose and expose the durable boundary
+
+With a direct database path, return success after the report transaction commits.
+With a log-based path, return accepted after the log confirms the required durability,
+and expose that indexing may still be pending.
+
+The worker writes the idempotent report effect, then acknowledges its log position
+or queue delivery. If it crashes after storage but before acknowledgement, replay
+finds the existing report instead of inserting another row.
+
+The client may also lose the acknowledgement after acceptance. It retries the same
+identity. The protocol must remain correct whether the first attempt reached the
+service, reached storage, or only lost its response.
+
+### Why a Redis claim is insufficient
+
+Consider setting a cache marker before the database insert. If the insert fails,
+a later retry can be labelled duplicate even though no report was stored. If the
+marker contains no completed result, the duplicate response cannot prove success.
+
+Setting the marker after the insert reverses the gap: a crash after insert but
+before marking allows another insert. These are two sides of the same missing atomic
+boundary between Redis and the durable database.
+
+A cache can accelerate completed-result lookup, but the sink establishes whether
+the effect exists. I would not replace that rule with an unmeasured claim that durable
+uniqueness is too slow for the workload.
+
+### Retry failures without silently discarding evidence
+
+Transient failures need bounded retries and delay. Permanently invalid envelopes
+should be classified, counted and placed in controlled diagnostic/dead-letter storage
+where appropriate, with retention and privacy limits.
+
+A queue only has dead-letter behavior if its configuration actually routes rejected
+or expired messages somewhere. Rejecting with no requeue and no destination discards
+work; logging the error is not a replay mechanism.
+
+On reconnect, consumers must resubscribe and become ready again. Resetting a connection
+variable does not restart an already registered consumer. Shutdown should stop new
+work and drain or release active deliveries predictably.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Durable report identity and idempotent sink | Safe replay after lost responses and worker crashes | Indexing, replay horizon and recovery tooling |
+| ❌ Independent cache claim plus ordinary insert | Simple fast-looking path | Lost unfinished work or duplicate durable effects |
+
+If a stored report creates notification work, write a notification intent with that
+effect or through a recoverable event pipeline. Each consumer deduplicates within
+its own scope. A global “processed” marker cannot stand for several different effects.
+
+Broker choice follows measured partitioning, replay and operational needs. There is
+no universal throughput threshold at which one named product stops working and
+another guarantees correctness.
+
+## 🔧 Deep dive: Retrieve useful history with bounded cost — 8 minutes
+
+> “Rotating identifiers make the owner do more than request one device row. I would
+> bound that fan-out and design freshness around report arrivals, not around a
+> coincidentally equal cache TTL.”
+
+### Bound the lookup window
+
+With a hypothetical 15-minute period, one day contains 96 intervals, plus possible
+boundary coverage. A week is hundreds of lookup tokens. Arbitrarily long requests
+can become expensive before the database is even queried.
+
+Cap the token batch, time span, result count and bytes. Use continuation tied to
+the query identity and storage order. A limit applied after fetching and decrypting
+all matches does not bound server work.
+
+Separate latest-location refresh from full historical retrieval. The owner can keep
+known reports locally and fetch newer server arrivals, then insert their observations
+into the correct historical order.
+
+Use receipt-time progress for incremental delivery. If progress is based only on
+the latest observation timestamp, a late-uploaded older observation can be skipped.
+The client selects its latest location separately by observation time.
+
+### Route reports independently of plaintext geography
+
+A finder may upload in one region and the owner may query from another. Routing only
+by reporter region requires a way to discover every region that may hold a matching
+report, which can create expensive global fan-out.
+
+I would route a token to a deterministic storage owner, or maintain an explicit
+index directory. Regional ingress can forward to that owner while preserving the
+report identity and the chosen durable-acceptance semantics.
+
+Within storage, use token-based distribution and receipt-time buckets. This spreads
+many tokens while allowing retention cleanup. Very hot tokens may need subpartitioning
+or per-token caps, with a query strategy that knows about those subdivisions.
+
+The owner cannot query on latitude if the service does not have it. That privacy
+constraint shapes the index; it cannot be wished away by adding a spatial database.
+
+### Cache by query and freshness
+
+Stable time windows and cursors make cache reuse possible. Including freshly generated
+millisecond timestamps in every key can produce a new cache entry on every poll.
+Canonicalization needs to preserve the actual requested bounds.
+
+Recent negative results should have a short lifetime because a delayed finder can
+upload a useful report at any moment. A key-period boundary does not mean reports
+for that period are complete or irrelevant.
+
+Longer historical caching needs an explicit late-arrival policy or version. Otherwise
+an owner querying yesterday can continue seeing an old incomplete bucket after a
+new report arrives for it.
+
+If any endpoint serves account-private derived data, authorization precedes cache
+return. A device-keyed cache hit does not prove the requesting user owns the device.
+The same rule applies after ownership changes or device deletion.
+
+### Retention is storage behavior
+
+A default seven-day query window is not a retention policy. Old rows remain until
+an actual cleanup process removes them. Include raw reports, diagnostic queues,
+backups and logs in the intended lifecycle.
+
+Use controlled bucket expiration where appropriate, and monitor that cleanup runs.
+Dropping data earlier than the promised recovery window can make otherwise correct
+retry and historical-query semantics impossible to honor.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Token routing, receipt-time progress and bounded queries | Predictable cost and late-report recovery | Directory/partition management and explicit freshness policy |
+| ❌ Full-history polling with rotation-matched cache expiry | Simple initial query | Repeated work, stale misses and missed late data |
+
+I would begin with PostgreSQL at local scale and validate its indexes and query plans.
+A distributed wide-column store becomes a candidate when measured volume warrants
+it; changing storage does not remove query bounds or replay requirements.
+
+## 🛡️ Lost mode, safety and operational access — 4 minutes
+
+Lost mode has two distinct features: publishing chosen contact information for a
+physical finder, and notifying the owner that useful new reports may exist.
+Neither requires exposing the owner's entire location history publicly.
+
+For notifications, the owner can poll for new reports or register scoped short-lived
+token subscriptions. The latter reduces polling but lets the service associate those
+tokens with a delivery destination. That metadata trade-off must be explicit.
+
+Contact settings need versioned updates or a clear conflict policy. Ownership checks
+apply on every change. Disabling lost mode should not accidentally retain an active
+subscription indefinitely, and a late notification should resolve against current state.
+
+Unwanted-tracker safety uses platform-supported nearby observations and maintained
+actions. Do not equate a simple count/distance heuristic with calibrated protection,
+or report an alert count as the number of actual stalking incidents.
+
+Admin access should expose the operational information needed to run the service,
+not owner decryption keys. UUIDs and missing foreign keys are not authorization
+controls. Logs and metrics must not recreate the private associations the data model
+was meant to avoid.
+
+A report service also needs bounded admission and a trusted proxy policy. Authentication,
+per-client quotas and envelope limits should work together; accepting arbitrary
+forwarding headers as authoritative undermines IP-based controls.
+
+## 🧪 Validate guarantees and failure modes — 4 minutes
+
+I would test the trust and durability boundaries with real components:
+
+1. Verify that backend storage, logs and APIs contain no owner decryption secrets.
+2. Retry one envelope across time boundaries and lost acknowledgements.
+3. Crash a worker after insert but before acknowledgement and replay it.
+4. Receive an old observation after the owner's newest known observation.
+5. Query across rotation boundaries with bounded pages and continuation.
+6. Exercise broker reconnection, poison messages and retention cleanup.
+7. Change ownership while a private cache entry exists.
+
+Crypto test vectors and review establish protocol compatibility; a successful
+round-trip with the same buggy helper does not establish a secure protocol.
+Radio and safety behavior require platform/hardware validation beyond HTTP tests.
+
+Track durable acceptance latency, storage lag, retry outcomes, query cost and cache
+freshness separately. A healthy HTTP process does not mean workers are connected or
+that accepted reports are becoming queryable.
+
+The local repository is useful for studying these boundaries precisely because its
+server-held keys, separate synchronous/queued semantics, unfinished deduplication
+and stale-cache behavior differ from this proposal. Those differences belong in
+the implementation document instead of being hidden by a production diagram.
+
+> “The backend can be simple about location contents because it stores opaque
+> reports. It still needs careful identities, bounded queries and recoverable
+> delivery. Privacy changes what it may know; it does not remove distributed-system
+> failure modes.”

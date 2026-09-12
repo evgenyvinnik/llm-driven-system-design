@@ -1,555 +1,386 @@
-# AI Code Assistant - Architecture
+# AI Code Assistant — Architecture
 
 ## System Overview
 
-An AI-powered command-line interface that helps developers write, debug, and understand code through natural language interaction. The system orchestrates LLM capabilities with local file system and shell access to provide an intelligent coding assistant. Core challenges involve agentic loop design, tool orchestration, context window management, and safe code execution.
+A coding assistant translates a developer's request into model conversations and
+local file or command operations. The model proposes actions; an execution system
+must determine what is authorized, apply changes without losing user work, and
+report what happened. The learning goals are agent orchestration, context
+selection, permissions, terminal interaction, and recovery across interruptions.
 
-**Learning Goals:**
-- Design agentic loop architecture with tool use
-- Implement permission and safety systems for file/shell access
-- Build streaming terminal interfaces
-- Abstract across multiple LLM providers
-- Handle context window management and summarization
-
----
+**Scope of this document:** requirements and the high-level architecture describe
+a proposed production-quality local assistant. The final Implementation Notes map
+that design to this repository's `evylcode` prototype. The current application is
+one Node.js process, with no database service or browser frontend. Production
+quality here means dependable operation on developer machines, not adding a fleet
+of microservices to a local CLI.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Converse**: Natural language interaction for code tasks (write, debug, explain, refactor)
-2. **Tool Use**: Read/write files, search codebases, execute shell commands
-3. **Permissions**: Layered safety system controlling file and command access
-4. **Sessions**: Persist conversation history across CLI invocations
-5. **Streaming**: Real-time display of LLM responses as tokens arrive
-6. **Multi-Provider**: Support Anthropic, OpenAI, and local LLM backends
+1. Accept a coding request and preserve its constraints through multiple model calls.
+2. Read and search authorized project content with bounded output.
+3. Propose file changes, obtain any required approval, apply them, and report checks.
+4. Execute bounded commands with controlled filesystem and network access.
+5. Show incremental progress and allow cancellation and later recovery.
+6. Support provider adapters while retaining each provider's message semantics.
 
-### Non-Functional Requirements
+### Non-functional requirements
 
-- **Latency**: First token within 1 second of sending request (streaming)
-- **Safety**: Never execute destructive commands without explicit approval
-- **Context**: Efficient use of 128K-200K token context windows
-- **Portability**: Run on macOS, Linux, Windows via Node.js
-- **Offline**: Demo mode with mock LLM for testing without API keys
-- **Extensibility**: Plugin system for custom tools and MCP server integration
+| Requirement | Proposed target or invariant |
+|-------------|------------------------------|
+| Responsiveness | Local acknowledgement within 100 ms; measure provider first-output latency separately |
+| Correctness | No execution from incomplete tool arguments or a stale approval |
+| Recovery | Persist every completed side effect before treating the task as safely checkpointed |
+| Resource bounds | Explicit budgets for model calls, context, execution time, and output |
+| Containment | Enforce authorized resources outside the model's instruction-following behavior |
+| Portability | Tested terminal and execution adapters for each supported OS |
 
----
+These are acceptance criteria, not measured capabilities of the current CLI.
+No universal subsecond provider response or fixed model context size is assumed.
+
+## Capacity Estimation
+
+The primary scaling unit is a local task. Suppose a task makes 20 model requests
+with an average 20,000 input tokens: that is 400,000 input tokens processed across
+the task, even if its final conversation is much smaller. A per-request context
+limit alone does not bound total cost.
+
+For a hypothetical 128,000-token model context, reserve 8,000 for output, 8,000 for
+system/tool instructions, and 12,000 for uncertainty and upcoming results. This
+leaves 100,000 for selected history and source evidence. Actual limits and token
+accounting belong to the selected provider; character counts are only estimates.
+
+A 100,000-file repository calls for ignored-directory filtering and targeted
+search. Cap the work and bytes read, not only the number of lines displayed after
+a full traversal. Large logs should live in local output artifacts with references
+in the conversation. Most machines should comfortably run one active task; higher
+parallelism needs explicit process and memory limits.
 
 ## High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        AI Code Assistant (CLI)                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐             │
-│  │     CLI      │───▶│    Agent     │───▶│   LLM API    │             │
-│  │   Interface  │    │  Controller  │    │   Provider   │             │
-│  │              │    │              │    │              │             │
-│  │  - Prompt    │    │  - Agentic   │    │  - Anthropic │             │
-│  │  - Stream    │    │    loop      │    │  - OpenAI    │             │
-│  │  - Confirm   │    │  - Tool      │    │  - Mock      │             │
-│  │  - Spinner   │    │    dispatch  │    │  - Local     │             │
-│  └──────────────┘    └──────────────┘    └──────────────┘             │
-│         │                   │                    │                      │
-│         │                   ▼                    │                      │
-│         │           ┌──────────────┐             │                      │
-│         │           │    Tool      │             │                      │
-│         │           │   Registry   │             │                      │
-│         │           └──────────────┘             │                      │
-│         │                   │                    │                      │
-│         │     ┌──────┬──────┼──────┬──────┐     │                      │
-│         │     ▼      ▼      ▼      ▼      ▼     │                      │
-│         │  ┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐                   │
-│         │  │ Read ││ Edit ││ Bash ││ Glob ││ Grep │                   │
-│         │  │ Tool ││ Tool ││ Tool ││ Tool ││ Tool │                   │
-│         │  └──────┘└──────┘└──────┘└──────┘└──────┘                   │
-│         │     │      │      │      │      │                            │
-│         ▼     ▼      ▼      ▼      ▼      ▼                           │
-│  ┌────────────────────────────────────────────────────┐               │
-│  │              Permission & Safety Layer              │               │
-│  │  - Blocked patterns (.env, .ssh, rm -rf /)         │               │
-│  │  - Auto-approve (reads), session-approve (writes)  │               │
-│  │  - Always-ask (arbitrary commands)                 │               │
-│  └────────────────────────────────────────────────────┘               │
-│         │             │             │                                   │
-│         ▼             ▼             ▼                                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                             │
-│  │   File   │  │  Shell   │  │ Session  │                             │
-│  │  System  │  │ Sandbox  │  │  Store   │                             │
-│  └──────────┘  └──────────┘  └──────────┘                             │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Core Components
-
-### 1. Agent Controller (Agentic Loop)
-
-The heart of the system: an iterative loop that coordinates between user, LLM, and tools.
-
-**Loop mechanics:**
-1. User types a natural language request
-2. Agent builds message array (system prompt + conversation history) and sends to LLM
-3. LLM streams text response and optionally requests tool calls
-4. If no tool calls: loop ends, display final response
-5. If tool calls present: execute tools (with permission checks), append results to context, return to step 2
-6. Safety limit: max 10 iterations per request to prevent infinite loops
-
-**Key design decisions:**
-- **Single-threaded loop**: Predictable execution order; no race conditions between tool calls
-- **Streaming-first**: Text tokens display in real-time as the LLM generates them, so users see progress immediately
-- **Parallel safe tools**: Auto-approved tools (Read, Glob, Grep) execute concurrently via `Promise.all`; approval-required tools (Write, Edit, Bash) execute sequentially with user confirmation
-- **Context prepend**: System prompt is prepended to every LLM call, not stored in message history
-
-### 2. Tool System
-
-Six core tools covering file system and shell operations:
-
-| Tool | Description | Approval | Key Detail |
-|------|-------------|----------|------------|
-| **Read** | Read file contents with optional offset/limit | Auto-approve | Line numbers in output (`cat -n` style) |
-| **Write** | Create new files | Requires approval | Full file content as parameter |
-| **Edit** | String replacement in files | Requires approval | `old_string` must be unique unless `replace_all` is set |
-| **Bash** | Execute shell commands | Pattern-based | Safe patterns auto-approved (git status, npm test); dangerous commands always blocked |
-| **Glob** | Find files by pattern | Auto-approve | Uses `glob` library, returns matching paths |
-| **Grep** | Search file contents | Auto-approve | Regex support with line context |
-
-**Edit tool design**: Uses string replacement rather than line numbers. Line numbers change as files are edited, making them unreliable for multi-step edits. String matching forces the LLM to provide enough surrounding context for unique matches. If the string appears multiple times, the tool returns an error suggesting `replace_all` or more context.
-
-**Bash tool safety**: Commands are validated against a blocklist before execution:
-- **Always blocked**: `rm -rf /`, `sudo`, `chmod 777`, fork bombs, `curl | sh`
-- **Pattern-blocked**: Recursive delete from root/home, block device writes, `mkfs`, `dd`
-- **Auto-approved**: `ls`, `pwd`, `cat`, `git status/log/diff`, `npm run dev/build/test/lint`
-- **Requires approval**: Everything else
-
-### 3. Permission System
-
-Four-tier permission model:
-
-| Level | Description | Examples | Persistence |
-|-------|-------------|----------|-------------|
-| **Auto-approve** | Always allowed without asking | File reads, safe shell commands | Built-in |
-| **Session-approve** | Ask once, remember for session | File writes to working directory | Session lifetime |
-| **Always-ask** | Prompt every time | Arbitrary shell commands | Per-invocation |
-| **Never-allow** | Permanently blocked | `.env` files, `.ssh/`, credentials, `rm -rf /` | Built-in |
-
-Permissions use glob pattern matching: granting write access to `/project/**/*` covers all files in the project directory. The permission manager maintains both a grant list and a denial set; previously denied operations are not re-prompted.
-
-### 4. Context Window Management
-
-With 128K-200K token context windows, efficient context management is critical for long coding sessions:
-
-**Compression strategies (applied when context reaches 90% capacity):**
-
-1. **Summarization**: Older messages (all except the last 10) are compressed into a summary by the LLM. The summary replaces the original messages, preserving key decisions and context while reducing tokens.
-2. **Tool output truncation**: Tool results longer than 10K characters are truncated to first 5K + last 2K characters with a `[truncated]` marker. This preserves the beginning (usually the most relevant) and end (often error messages).
-3. **Selective retention**: System prompt + last 10 messages are always preserved in full. Older content gets progressively summarized.
-4. **Rolling window**: As a last resort, the oldest messages are dropped entirely, keeping only the most recent turns.
-
-### 5. LLM Provider Abstraction
-
-A common interface abstracts across LLM backends:
-
-**Provider interface:**
-- `complete(request)` -- Synchronous completion returning full response
-- `stream(request)` -- Async iterator yielding text chunks and tool call events
-- `countTokens(text)` -- Approximate token count for context management
-
-**Implemented providers:**
-- **AnthropicProvider**: Real Claude API integration with streaming, tool use, model selection (Sonnet, Opus)
-- **MockProvider**: Pattern-based intent detection for demo/testing without API keys
-
-**Message format translation**: Each provider translates the internal `Message[]` format to its API's expected format (Anthropic uses `role: 'user'/'assistant'` with content blocks; OpenAI uses `role: 'user'/'assistant'/'tool'` with function calls).
-
-### 6. Session Management
-
-Sessions persist conversation history and permissions to disk:
-
-- **Storage**: JSON files in `~/.ai-assistant/sessions/{sessionId}.json`
-- **Create**: New session on each CLI invocation (or resume with `--resume`)
-- **Resume**: Load conversation history and re-establish context
-- **List**: Show all saved sessions with message count and working directory
-
----
-
-## Data Flow
-
-### Agentic Loop Sequence
+Proposed production architecture; the execution boundary is absent from the local
+prototype.
 
 ```
-┌──────┐          ┌───────┐          ┌─────┐          ┌───────┐
-│ User │          │ Agent │          │ LLM │          │ Tools │
-└──┬───┘          └───┬───┘          └──┬──┘          └───┬───┘
-   │                  │                 │                 │
-   │  "Fix auth bug"  │                 │                 │
-   │─────────────────▶│                 │                 │
-   │                  │                 │                 │
-   │                  │  messages[]     │                 │
-   │                  │────────────────▶│                 │
-   │                  │                 │                 │
-   │                  │  [Read auth.ts] │                 │
-   │                  │◀────────────────│                 │
-   │                  │                 │                 │
-   │                  │                 │  Read auth.ts   │
-   │                  │────────────────────────────────▶│
-   │                  │                 │                 │
-   │                  │                 │  file contents  │
-   │                  │◀────────────────────────────────│
-   │                  │                 │                 │
-   │                  │  messages[] +   │                 │
-   │                  │  tool result    │                 │
-   │                  │────────────────▶│                 │
-   │                  │                 │                 │
-   │                  │  [Edit auth.ts] │                 │
-   │                  │◀────────────────│                 │
-   │                  │                 │                 │
-   │  Approve edit?   │                 │                 │
-   │◀─────────────────│                 │                 │
-   │                  │                 │                 │
-   │  Yes             │                 │                 │
-   │─────────────────▶│                 │                 │
-   │                  │                 │  Edit file      │
-   │                  │────────────────────────────────▶│
-   │                  │                 │                 │
-   │                  │                 │  success        │
-   │                  │◀────────────────────────────────│
-   │                  │                 │                 │
-   │                  │  messages[] +   │                 │
-   │                  │  edit result    │                 │
-   │                  │────────────────▶│                 │
-   │                  │                 │                 │
-   │                  │  "Fixed the bug"│                 │
-   │◀─────────────────│◀────────────────│                 │
-   │                  │                 │                 │
+┌──────────────┐       ┌───────────────────┐       ┌────────────────┐
+│ Terminal UI  │◀─────▶│ Task coordinator  │◀─────▶│ Model adapter  │
+└──────────────┘       └────────┬──────────┘       └───────┬────────┘
+                               │                          ▼
+                    ┌──────────▼──────────┐       ┌────────────────┐
+                    │ Policy + scheduler  │       │ Provider API   │
+                    └──────────┬──────────┘       └────────────────┘
+                               ▼
+                    ┌─────────────────────┐       ┌────────────────┐
+                    │ Restricted executor │◀─────▶│ Workspace      │
+                    └──────────┬──────────┘       └────────────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │ Task journal        │
+                    └─────────────────────┘
 ```
 
----
+The coordinator owns task ordering and budgets. Policy makes authorization
+choices; the executor enforces granted capabilities. The journal records task and
+operation outcomes. None of these responsibilities is delegated to generated text.
+
+## Core Components / Request Flows
+
+### Task and model flow
+
+1. Assign a task identity and record the user request and explicit constraints.
+2. Select relevant history and file evidence within the provider's input budget.
+3. Translate system instructions, messages, and tool definitions into provider format.
+4. Stream displayable text while assembling tool calls by call identity.
+5. Validate complete arguments and persist the requested calls, even when there is
+   no accompanying assistant prose.
+6. Apply policy, schedule independent work, and obtain approvals where required.
+7. Persist outcomes and send matching tool results back to the model.
+8. Stop on completion, cancellation, exhausted budget, or repeated failure.
+
+Provider errors, truncated output, denied operations, and successful completion
+need distinct states. A maximum-token stop is not evidence that the task finished.
+
+### Tool execution
+
+Use file reads, directory search, exact-text edits, full-file writes, and commands
+as small primitives. Validate types, lengths, output limits, and operation-specific
+preconditions at the executor boundary. A schema sent to a model is not runtime
+validation.
+
+Parallelize only operations with known independent inputs and effects. A read
+followed by an edit of the same file may be order-sensitive even when the read
+needs no approval. Command effects are usually too broad to infer from their names;
+treat unknown effects conservatively. Serialize terminal approval presentation
+without requiring every unrelated computation to stop.
+
+### Edit flow
+
+Prepare the proposed replacement against a known file revision and show the actual
+diff. An approval binds to that revision, target, and replacement. Recheck before
+applying; if the file changed, prepare a new proposal. A per-file lock coordinates
+assistant writers, but does not stop an external editor that ignores the lock.
+For concurrent human editing, prefer isolated workspaces and a conflict-aware
+apply step rather than claiming a hash comparison removes every race.
+
+Write a prepared replacement to a temporary file on the same filesystem and
+rename it into place. Preserve intended metadata and define a flush policy if
+power-loss durability is required. Atomic replacement protects against partial
+content; it does not make a multi-file refactor transactional.
+
+### Terminal flow
+
+Render task events through one output owner. Keep the prompt stable, buffer ordinary
+progress during an approval, and distinguish assistant text from authoritative tool
+status. A slow output destination needs backpressure or bounded display coalescing.
+Never drop approval or completion events just to keep up with text rendering.
+
+## Database Schema
+
+### Current persisted document
+
+There is no SQL database. [SessionManager](./src/session/manager.ts) writes one
+plaintext JSON document under `~/.ai-assistant/sessions/<uuid>.json`.
+
+| Field | Actual contents |
+|-------|-----------------|
+| id | Random UUID |
+| workingDirectory | Directory supplied when creating the record |
+| startedAt | Creation date serialized as text |
+| messages | Role, text, timestamp, optional tool calls/results |
+| permissions | Permission records; runtime does not populate this array |
+| settings | Theme/output/confirmation/history preferences; many are not wired |
+
+Model, temperature, and token limit are not fields of the current SessionSettings.
+Session loading restores date objects but does not initialize controller history.
+
+### Proposed durable records
+
+| Record | Key and contents | Constraint |
+|--------|------------------|------------|
+| Task | Task ID, workspace identity, request, status, revision | One authoritative owner per running task |
+| Event | Task ID + sequence, type, payload reference | Ordered append with unique sequence |
+| Operation | Local operation ID, provider call ID, arguments hash, state | Same ID cannot be reused for different intent |
+| Approval | Operation ID, target revision, scope, decision | Execution must match the approved proposal |
+| Artifact | Content hash, path, size, retention | Referenced outputs survive transcript compaction |
+
+A local transactional store is an option once ordered events and recovery queries
+justify it. It does not require Redis or a network database. Raw model call IDs
+alone are insufficient: regeneration may assign new IDs to the same action.
 
 ## API Design
 
-### CLI Arguments
+### Actual CLI interface
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-d, --directory <path>` | Working directory | Current directory |
-| `-k, --api-key <key>` | Anthropic API key | `$ANTHROPIC_API_KEY` |
-| `-m, --model <model>` | Claude model | `claude-sonnet-4-20250514` |
-| `-r, --resume <id>` | Resume session | None |
-| `--demo` | Mock LLM mode | Off |
-| `--list-sessions` | List saved sessions | N/A |
+| Input | Behavior |
+|-------|----------|
+| `--directory`, `-d` | Resolve the base path from current CLI arguments |
+| `--api-key`, `-k` | Anthropic credential, otherwise environment |
+| `--model`, `-m` | Model string, otherwise pinned source default |
+| `--demo` | Use mock provider with real local tools |
+| `--resume`, `-r` | Load full-UUID JSON record, with incomplete restoration |
+| `--list-sessions` | Display summaries with shortened IDs |
+| `/clear` | Clear message arrays, not permission grants |
+| `/exit` | Save current record and close readline |
 
-### Slash Commands
+The [README](./README.md) lists remaining flags, commands, and setup details.
 
-| Command | Description |
-|---------|-------------|
-| `/help` | Show available commands |
-| `/clear` | Clear conversation history |
-| `/session` | Show current session info |
-| `/sessions` | List saved sessions |
-| `/tools` | List available tools |
-| `/exit` | Save session and exit |
+### Tool and provider contracts
 
-### Tool Definition Schema
+| Tool | Principal arguments | Current result |
+|------|---------------------|----------------|
+| Read | file_path, offset, limit | Numbered text and line counts |
+| Write | file_path, content | Creation message, size, line count |
+| Edit | file_path, old_string, new_string, replace_all | Replacement count or mismatch error |
+| Glob | pattern, path | Sorted paths and total matches |
+| Grep | pattern, path, glob_pattern, case_insensitive | Matching lines and search metadata |
+| Bash | command, timeout, working_directory | Output or error and command metadata |
 
-Each tool is defined with a JSON Schema for parameter validation, consumed by the LLM to understand available capabilities:
-
-```
-Tool {
-  name: string           -- Tool identifier (e.g., "Read", "Edit")
-  description: string    -- What the tool does (sent to LLM)
-  parameters: JSONSchema -- Input schema for validation
-  requiresApproval: bool | (params) => bool  -- Permission check
-  execute(params, context) => ToolResult     -- Implementation
-}
-```
-
----
+[Types](./src/types/index.ts) define completion, streaming, and token-estimation
+methods. Anthropic and Mock implement them; no other provider is implemented.
+Production adapters should advertise supported capabilities and preserve system
+instructions, tool-result linkage, and stop reasons without silently dropping data.
 
 ## Key Design Decisions
 
-### 1. String Replacement vs. Line-Number Editing
+### Explicit policy plus containment
 
-**Chosen**: String replacement (`old_string` -> `new_string`).
+Approvals answer whether an action is intended. Execution restrictions answer what
+it can access. Both matter: prompting on every read creates fatigue, while approving
+an arbitrary test script grants execution of whatever that repository defines.
+Permit ordinary work within a scoped environment and require explicit expansion
+for additional access. Deny-pattern matching alone cannot describe all equivalent
+shell expressions or indirect file access.
 
-Line numbers change after every edit, making them unreliable for multi-step modifications. If the LLM reads a file, edits line 15, then tries to edit line 30, the target has shifted because the prior edit changed line counts. String replacement forces the LLM to specify enough context for a unique match, which is inherently stable across edits. The trade-off: if `old_string` appears multiple times, the edit fails and requires more context or `replace_all`. In practice, providing 2-3 lines of surrounding code is almost always sufficient for uniqueness.
+The cost is an OS-specific execution layer and occasional blocked workflows that
+need narrower, explainable resource grants. The current project has interactive
+checks but none of that containment.
 
-### 2. Layered Permissions vs. Blanket Allow/Deny
+### Context selection plus a durable history
 
-**Chosen**: Four-tier permission system (auto, session, always-ask, never).
+Preserve the task's constraints and evidence references separately from the model's
+working context. Old file contents can often be fetched again; a rejected approach
+or user restriction cannot safely be reconstructed by guessing. Summaries are
+fallible and must not acquire the authority of system instructions.
 
-A blanket "allow all" approach is dangerous -- one hallucinated `rm -rf` could destroy a project. A blanket "ask every time" approach is unusable -- reading 50 files during code exploration would require 50 approvals. The layered system matches risk to control: reads are always safe, writes to the working directory need one-time approval, and shell commands are scrutinized individually. The trade-off is implementation complexity: the permission manager needs glob matching, denial tracking, and different persistence scopes.
+This costs retrieval work and summary evaluation. Keeping every byte until the
+provider rejects the request is simpler but creates abrupt failure and repeatedly
+pays to resend irrelevant content. Context selection also reduces that repeated
+input cost; response caching does not solve stale workspace facts.
 
-### 3. Mock Provider for Demo Mode
+### Recoverable operations before automatic replay
 
-**Chosen**: Built-in mock LLM provider with pattern-based intent detection.
+Persist operation intent and outcomes, then classify recovery by effect. Reads can
+be repeated against current state. File replacements can compare before/after
+revisions and identify a previously applied result. A command that may have sent a
+network request cannot be safely repeated merely because no result was recorded.
 
-Testing the full agentic loop (tool calls, permissions, session persistence) without an API key is essential for development and demonstration. The mock provider detects intent from keywords ("read" -> Read tool, "edit" -> Edit tool) and generates plausible responses. The trade-off is maintenance: the mock must be updated when new tools or behaviors are added, and it cannot replicate the nuance of real LLM reasoning.
-
----
+The journal adds writes and recovery states. An in-memory result cache is simpler,
+but disappears at the exact crash where evidence is needed. Even a durable journal
+cannot atomically commit arbitrary external shell effects together with its record;
+uncertain outcomes must remain explicit.
 
 ## Consistency and Idempotency
 
-### Consistency Model
+| Boundary | Proposed guarantee | Current behavior |
+|----------|--------------------|------------------|
+| Task history | Ordered, durable event/checkpoint state | Two message arrays; direct whole-file saves |
+| File replacement | Revision-bound proposal and atomic file replacement | String match followed by direct write |
+| Multi-file task | Per-file outcomes with conflict-aware recovery | Independent writes, no rollback |
+| Command retry | Repeat only with known-safe semantics or explicit decision | No application replay ledger |
+| Approval | Bound to operation content and scope | In-memory path/glob or command-prefix grants |
+| Context summary | Versioned derivative of history | No summarization |
 
-| Operation | Model | Rationale |
-|-----------|-------|-----------|
-| Session state | Strong | All writes (messages, permissions) are synchronous and immediately visible |
-| File edits | Atomic (write-then-rename) | Prevents partial writes from corrupting files |
-| Permission grants | Immediate | Once approved, permission is enforced on next check |
-| Context summarization | Eventual | Background compression of old messages can lag |
+A matching old string prevents some misdirected edits. It does not prove that the
+file is unchanged since the model read it. There is no checksum cache or tool-call
+result cache in the current implementation.
 
-### Idempotency Handling
+## Security / Auth
 
-- **Tool calls**: Each tool call has a unique ID from the LLM. On retry, cached results are returned instead of re-executing.
-- **File edits**: Conflict detection via content comparison. If a file changed since it was last read, the edit fails with a suggestion to re-read.
-- **LLM API calls**: Automatic retry with exponential backoff (3 attempts, 1s/2s/4s delays) for rate limits, overload, and timeouts.
+The local developer is the intended user; there is no login or tenant service.
+Production design must account for untrusted source files, tool output, and model
+arguments. Reading a repository can expose instruction-like text; that text must
+remain evidence rather than authorization to read secrets or run commands.
 
-### Retry Semantics
+The current process inherits host privileges. Bash uses a shell with the inherited
+environment and no network restrictions. File reads and search results enter the
+conversation sent to Anthropic and are saved locally in plaintext. Do not describe
+this as a sandbox or as a system that keeps all code local.
 
-| Operation | Retry Behavior | Notes |
-|-----------|---------------|-------|
-| File Read | Safe to retry | Always returns current state |
-| File Write | Idempotent (same content = no-op) | Content-based comparison |
-| File Edit | Conflict detection | Fails if file changed since last read |
-| Bash Command | Not automatically retried | User must approve re-execution |
-| LLM API Call | Auto-retry with backoff | 3 attempts for transient errors |
+Actual path checks use globs, not canonical resource confinement. Reads generally
+allow non-blocked paths outside the working directory. Search checks only the root;
+Grep does not recheck each file before reading it. Symlink targets are not resolved
+for policy. Execute grants use string prefixes, and any write grant enables the
+additional working-directory string-prefix condition in `hasGrant`.
 
----
-
-## Security
-
-### File System Guards
-
-- **Scope restriction**: All file operations scoped to working directory by default
-- **Blocked patterns**: `.env`, `.ssh/`, `credentials`, `secrets`, `.git/config` (regex-matched)
-- **Path traversal prevention**: All paths resolved to absolute before access check
-
-### Command Sandbox
-
-- **Explicit blocklist**: Fork bombs, `curl | sh`, `sudo`, write to block devices
-- **Pattern blocklist**: `rm -rf` from root/home, `mkfs`, `dd if=`
-- **Timeout**: Default 120 seconds, configurable per command
-- **Output limit**: 10 MB max buffer to prevent memory exhaustion
-
----
+The UI's `y` and `always` choices are indistinguishable booleans; both create a
+session grant. Blocked patterns are checked by individual tools after the approval
+path, so a displayed approval does not guarantee the tool will run.
 
 ## Observability
 
-### Metrics (In-Memory)
+Proposed task events should include task/operation identity, state transition,
+duration, result status, and bounded usage information. Measure provider waiting,
+user approval waiting, tool execution, and rendering separately. Record unknown
+command outcomes distinctly from confirmed failures.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `tool_execution_duration` | Histogram | Track tool performance (p50/p95/p99) |
-| `llm_response_time` | Histogram | LLM API latency monitoring |
-| `tool_execution_count` | Counter | Tool usage frequency by tool name |
-| `llm_api_errors` | Counter | Failed API calls for reliability tracking |
-| `context_tokens_used` | Gauge | Context window utilization |
-| `cache_hit_ratio` | Gauge | Cache effectiveness |
-| `permission_denials` | Counter | Security audit trail |
-
-### Structured Logging
-
-- JSON-formatted log entries with session ID, tool name, trace ID
-- Console output: human-readable with color coding
-- File output (optional): JSON for parsing by log aggregation tools
-- Audit logging: All permission grants/denials and file writes logged to append-only audit file
-
-### Distributed Tracing
-
-For multi-tool operations, span-based tracing tracks the flow:
-- Parent span: `agent.run` (entire user request)
-- Child spans: `agent.executeTool` (each tool call with duration and status)
-- Trace ID propagated through all log entries for correlation
-
----
-
-## Caching Strategy
-
-### Cache Layers
-
-| Cache | Strategy | TTL | Invalidation |
-|-------|----------|-----|--------------|
-| File checksums | Cache-aside (LRU) | 5 min | On file write/edit |
-| LLM responses | Cache-aside (LRU) | 10 min | Manual only |
-| Tool execution results | Write-through | Session | On session end |
-| Session state | Write-through | Persistent | Explicit save |
-| Glob results | Cache-aside (LRU) | 30 sec | On any file change |
-| Grep results | Cache-aside (LRU) | 1 min | On file write/edit |
-
-Local implementation uses in-memory LRU cache. Production extension would add Redis for shared caching across multiple instances.
-
----
+Avoid logging raw source, credentials, or unrestricted shell output as default
+telemetry. The local implementation uses colored console output and spinners;
+there are no Prometheus metrics, structured trace spans, audit files, or LRU caches.
+Verbose mode displays at most ten lines of successful tool output, cut to 80
+characters each; this display limit does not bound model context or session size.
 
 ## Failure Handling
 
-| Failure | Strategy | Recovery |
-|---------|----------|----------|
-| LLM API timeout | Retry 3x with exponential backoff | Show error after exhausting retries |
-| LLM rate limit (429) | Backoff with jitter | Auto-retry, respecting Retry-After header |
-| Tool execution error | Report error to LLM as tool result | LLM adjusts approach based on error |
-| Context overflow | Force compression (summarize + truncate) | Retry with reduced context |
-| Permission denied | Report to LLM | LLM skips operation and explains why |
-| File not found | Return error as tool result | LLM uses Glob to find correct path |
-| Invalid edit (non-unique) | Return error with occurrence count | LLM provides more context |
-| Session save failure | Log warning, continue | Session recoverable from memory |
+| Failure | Current handling | Proposed behavior |
+|---------|------------------|-------------------|
+| Tool throws | Registry/tool returns an error result | Typed error plus bounded recovery policy |
+| Provider fails | Print error, end current run | Classify retryable errors and account for partial output |
+| Context exceeds provider limit | Ordinary error; no recovery | Select/compact context before retrying |
+| Ten iterations reached | Print limit message and save | Explicit budget-exhausted state with completed effects |
+| Session write fails | Error propagates to caller | Preserve last valid checkpoint and report unsaved state |
+| Process interrupted | SIGINT exits without explicit save | Cancel work, reconcile outcomes, checkpoint |
+| Command exceeds timeout | exec rejects and returns error | Terminate owned process tree and report partial effects |
 
----
-
-## Extensibility
-
-### Plugin System (Designed)
-
-Plugins can contribute tools, hooks (onSessionStart, onBeforeToolCall, onAfterToolCall, onMessage), and slash commands. The plugin interface allows third-party extensions without modifying core code.
-
-### MCP (Model Context Protocol) Support (Designed)
-
-MCP servers provide additional tools via stdio or HTTP transport. Tools from MCP servers are namespaced (`server:toolName`) to avoid collisions. The MCP client manages connections and translates between the internal tool interface and MCP protocol.
-
----
+The application does not configure a three-attempt 1/2/4-second retry policy.
+Any Anthropic SDK request retries follow the installed SDK's behavior; they are
+separate from tool replay. The source permits a configurable command timeout,
+defaulting to 120 seconds, and uses a 10 MiB exec buffer. Successful command output
+is cut to roughly 50,000 characters; failure output is not passed through that same
+truncation path. No overall task deadline or abort signal is wired.
 
 ## Scalability Considerations
 
-As a single-user CLI tool, traditional horizontal scaling does not apply. Scaling considerations focus on:
+Bound repository traversal, file bytes, concurrent reads, model context, and total
+request cost before adding parallelism. The present controller runs all
+non-prompted calls concurrently without a configured concurrency cap, then all
+prompted calls sequentially. It does not analyze read/write dependencies.
 
-1. **Context window limits**: At 128K tokens, long coding sessions hit the limit after ~30 tool calls with large file contents. Summarization and truncation extend effective session length.
-2. **File system scale**: Large monorepos (100K+ files) make Glob and Grep slow. Future optimization: file watcher for incremental indexing, ignore patterns for node_modules/.git.
-3. **Multi-provider load**: For cloud deployments of the assistant, load balance across providers (Anthropic, OpenAI) based on availability and rate limits.
-4. **Concurrent tool execution**: Currently limited to safe-tool parallelism. Future: dependency graph for optimal parallel execution order.
-
----
+A team service could later centralize policy and billing, but that changes the
+privacy and isolation model. Remote tool servers or plugins are additional trust
+boundaries, not just names added to a tool registry. Neither is implemented here.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| File editing | String replacement | Line-number based | Stable across multi-step edits; line numbers shift |
-| Permissions | Four-tier layered system | Blanket allow/deny | Matches risk to control level |
-| CLI framework | Custom (readline + chalk) | Ink (React for CLI) | Full control over streaming UX |
-| Demo mode | Mock LLM provider | Always require API key | Enables testing and demos without cost |
-| Session storage | JSON files | SQLite / Redis | Simple, portable, no dependencies |
-| LLM default | Claude Sonnet | GPT-4, local models | Best balance of speed, capability, and cost |
-| Streaming | Token-by-token display | Wait for complete response | Better UX -- users see progress immediately |
-
----
+| Deployment | Local coordinator and restricted executor | Hosted workspace service | Start from local developer workflow |
+| Authorization | Scoped policy plus enforced capabilities | Command denylist alone | Bound indirect effects |
+| Editing | Revision-bound exact-text replacement | Unversioned line offsets | Detect stale intent before applying |
+| Recovery | Durable operation journal | Session result cache | Retain evidence after crashes |
+| Context | Selected evidence plus task summary | Unbounded transcript | Bound cost without discarding intent |
+| Rendering | Incremental transcript with single output owner | Independently printing workers | Stable prompts and ordered status |
 
 ## Implementation Notes
 
-This project is a **standalone CLI application** (not client-server). There is no backend service, database, or Docker infrastructure.
+### Patterns actually implemented
 
-### Local Architecture
+- **Bounded agent loop:** [controller.ts](./src/agent/controller.ts) permits ten
+  completion iterations, executes registered tools, and sends their results back.
+  This bounds iteration count, though not tools per iteration or overall cost.
+- **Tool errors as data:** [registry](./src/tools/index.ts) catches execution failures
+  so the model can observe an error and try another approach.
+- **Exact-text editing:** [edit.ts](./src/tools/edit.ts) rejects zero matches and
+  ambiguous non-global replacements. It writes directly and has no prior revision.
+- **Permission prompts:** [manager.ts](./src/permissions/manager.ts) tracks grants
+  and denials. Its broad matching and conflicting Bash checks limit guarantees.
+- **Session records:** [session manager](./src/session/manager.ts) saves JSON on
+  creation, successful run completion, and `/exit`; no atomic checkpoint is used.
+- **Provider substitution:** [Anthropic](./src/llm/anthropic-provider.ts) and
+  [Mock](./src/llm/mock-provider.ts) share an interface and use the same tool loop.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    evylcode CLI Process                       │
-│                                                              │
-│  ┌────────────────┐                                         │
-│  │  index.ts      │  Entry point, CLI arg parsing           │
-│  │  (Commander)   │  --api-key, --model, --demo, --resume   │
-│  └───────┬────────┘                                         │
-│          │                                                   │
-│          ▼                                                   │
-│  ┌────────────────┐    ┌────────────────┐                   │
-│  │ CLIInterface   │───▶│ AgentController│                   │
-│  │ (chalk, ora,   │    │ (agentic loop) │                   │
-│  │  readline)     │    └───────┬────────┘                   │
-│  └────────────────┘            │                             │
-│                                ▼                             │
-│               ┌────────────────────────────┐                │
-│               │      ToolRegistry          │                │
-│               │  Read │ Write │ Edit │     │                │
-│               │  Bash │ Glob  │ Grep │     │                │
-│               └───────────┬────────────┘                    │
-│                           │                                  │
-│          ┌────────────────┼───────────────┐                 │
-│          ▼                ▼               ▼                  │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐       │
-│  │ Permission   │ │ Session      │ │ LLM Provider │       │
-│  │ Manager      │ │ Manager      │ │ (Anthropic/  │       │
-│  │              │ │ (~/.ai-      │ │  Mock)       │       │
-│  │ Blocked      │ │ assistant/   │ │              │       │
-│  │ patterns,    │ │ sessions/)   │ │ Streaming,   │       │
-│  │ grants,      │ │              │ │ tool use     │       │
-│  │ denials      │ │ JSON files   │ │              │       │
-│  └──────────────┘ └──────────────┘ └──────────────┘       │
-│                                          │                   │
-│                                          ▼                   │
-│                                  Anthropic API               │
-│                                  (api.anthropic.com)         │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
+### Wiring gaps that affect behavior
 
-### Source File Map
+1. The controller calls `complete`, never `stream`; streaming UI claims are false.
+2. Anthropic conversion discards system messages without passing a top-level system
+   parameter. The controller's guidance does not reach the real provider.
+3. An assistant message is recorded only when text is nonempty. Tool-only responses
+   can therefore leave tool results without their corresponding tool-use message.
+4. Resume loads SessionManager, but the controller initializes empty history and
+   uses the current CLI directory. Session permissions are neither populated nor
+   restored by the runtime. Short IDs in listings are not accepted as prefixes.
+5. Bash's auto-approval classifier bypasses prompting, while execution still needs
+   a grant. Fresh-session commands labeled safe fail permission checks.
+6. `/clear` clears messages but retains permission grants; SIGINT exits directly.
+7. Tool schemas are exposed to the model but not validated by the registry. The
+   optional abort signal in types is not supplied or honored by the execution path.
+8. Read's offset is zero-based in code despite a one-based schema description. Grep
+   checks its 200-match threshold between files, so the last file can overshoot it.
+9. The mock handles edit intent by reading only. Its continuation aggregates all
+   historical tool results, so prior errors can contaminate later status messages.
 
-| Module | Files | Responsibility |
-|--------|-------|---------------|
-| Entry point | `src/index.ts` | CLI argument parsing (Commander), provider selection, session init, REPL loop |
-| CLI | `src/cli/interface.ts` | Terminal I/O: prompt, streaming output, spinners (ora), colors (chalk), welcome/goodbye banners |
-| Agent | `src/agent/controller.ts` | Agentic loop, tool dispatch, permission-aware execution, context management |
-| Tools | `src/tools/read.ts`, `write.ts`, `edit.ts`, `bash.ts`, `glob.ts`, `grep.ts`, `index.ts` | Six core tools with parameter validation and execution |
-| LLM | `src/llm/anthropic-provider.ts`, `mock-provider.ts`, `index.ts` | Anthropic SDK integration (streaming, tool use), mock provider for demo mode |
-| Permissions | `src/permissions/manager.ts` | Four-tier permission checking, glob pattern matching, blocked patterns |
-| Session | `src/session/manager.ts` | JSON file persistence in `~/.ai-assistant/sessions/` |
-| Types | `src/types/index.ts` | All interfaces: Message, ToolCall, ToolResult, Permission, Session, LLMProvider, etc. |
+### Simplified or omitted
 
-### Production-Grade Patterns Actually Implemented
+There is no execution sandbox, atomic save, operation journal, conflict-aware
+multi-file apply, context compression, tokenizer enforcement, output artifact
+store, provider routing, plugin loader, MCP client, tracing, or production metrics.
+The CLI uses Commander, readline, Chalk, and Ora; it has no advanced markdown parser,
+resize layout engine, approval diff viewer, persistent command history, or tested
+screen-reader announcement protocol.
 
-1. **Agentic loop with tool use** -- Full implementation of the LLM -> tool call -> result -> LLM cycle with max-iteration safety limit (`src/agent/controller.ts`)
-2. **Streaming responses** -- Real-time token display using Anthropic SDK's streaming API (`src/llm/anthropic-provider.ts`)
-3. **Permission system** -- Blocked patterns, auto-approve for reads, approval prompts for writes/commands (`src/permissions/manager.ts`)
-4. **Session persistence** -- JSON-based session save/resume with conversation history (`src/session/manager.ts`)
-5. **String-based file editing** -- Unique string matching with `replace_all` fallback (`src/tools/edit.ts`)
-6. **Command safety** -- Blocklist and safe-pattern matching for shell commands (`src/tools/bash.ts`)
-7. **Multi-provider abstraction** -- Common interface for Anthropic and Mock providers (`src/types/index.ts`, `src/llm/`)
-
-### Simplifications vs. Production
-
-| Area | Production | Local Implementation |
-|------|-----------|---------------------|
-| Context management | Summarization with LLM + truncation + rolling window | Simple message array (no compression) |
-| Caching | LRU cache for file checksums, LLM responses, tool results | No caching implemented |
-| Metrics | Prometheus-compatible counters/histograms/gauges | No metrics collection |
-| Logging | Structured JSON with tracing | Console output only |
-| Providers | Anthropic, OpenAI, Google, local models | Anthropic + Mock |
-| Plugin system | Dynamic plugin loading with hooks | Not implemented |
-| MCP support | stdio/HTTP MCP server connections | Not implemented |
-| Audit logging | Append-only audit trail for file writes and permissions | No audit logging |
-| Context overflow | Force compression + retry | Error thrown, no recovery |
-| File watching | chokidar for cache invalidation | No file watching |
-
-### What Was Omitted
-
-- Context window summarization and compression
-- In-memory caching (file checksums, LLM responses, glob/grep results)
-- Prometheus metrics and structured logging
-- Plugin system and MCP server integration
-- OpenAI/Google/local LLM providers
-- Distributed tracing and audit logging
-- Git integration (automatic commits, branch management)
-- Multi-file coordinated editing
-- IDE integration (VS Code extension)
-- Autonomous mode (run complex tasks with minimal interaction)
-
-### Running Locally
-
-```bash
-# With real Claude API
-export ANTHROPIC_API_KEY=your-key
-cd ai-code-assistant
-npm install && npm run dev
-
-# With demo mode (no API key needed)
-npm run dev -- --demo
-
-# With specific model
-npm run dev -- --model claude-opus-4-20250514
-
-# Resume a previous session
-npm run dev -- --resume abc12345
-
-# List saved sessions
-npm run dev -- --list-sessions
-```
+The pinned default model is retired according to Anthropic's
+[model lifecycle page](https://platform.claude.com/docs/en/about-claude/model-deprecations),
+checked 2026-09-09. Select a supported model explicitly; adapter correctness still
+needs separate repair. [README](./README.md) contains executable setup paths and
+known limitations. This audit was based on source, not live API or terminal tests.

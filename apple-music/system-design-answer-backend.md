@@ -1,646 +1,366 @@
-# Apple Music - System Design Answer (Backend Focus)
+# Apple Music — backend system design interview
 
-*45-minute system design interview format - Backend Engineer Position*
+> “I would separate moving audio bytes from deciding what can be played and
+> maintaining the listener's library. Media delivery needs enormous bandwidth;
+> library synchronization needs a precise ordering and recovery contract.”
 
----
+This is a proposed production design for a 45-minute interview, not a description
+of Apple's internal services. The repository's current implementation is smaller
+and is described in the final section.
 
-## 📋 Opening Statement (1 minute)
+## 🧭 Scope and targets — 4 minutes
 
-> "I'll design Apple Music's backend infrastructure, focusing on audio streaming at scale, library synchronization across devices, and the recommendation engine. The key technical challenges are adaptive bitrate delivery with gapless playback, efficient delta-based library sync using sync tokens, and hybrid recommendation combining collaborative and content-based filtering.
->
-> For a music streaming platform serving 100M+ subscribers with 10M concurrent streams, we need strong consistency for library operations, eventual consistency for listening history, and highly available audio delivery through CDN."
+I would include online music playback, catalog search, personal libraries,
+playlists, and basic recommendations. User-upload matching, offline licenses,
+lyrics, and collaborative editing are extensions. They should not crowd out the
+core playback and synchronization problems in a single interview.
 
----
+A user can select a track, obtain authorized playable media, save it, and see that
+library edit on another device. Listening events inform history and discovery,
+but delayed analytics must not interrupt the current track.
 
-## 🎯 Requirements Clarification (3 minutes)
+| Discussion | Minutes |
+|------------|---------|
+| Scope and targets | 4 |
+| Capacity and architecture | 5 |
+| Data and API contracts | 4 |
+| Deep dive: authorized media delivery | 10 |
+| Deep dive: complete and recoverable library sync | 11 |
+| Deep dive: listening events and recommendations | 8 |
+| Failure priorities and local boundary | 3 |
+| Total | 45 |
 
-### Functional Requirements (Backend Scope)
+I would target p99 authorization below 200 ms and p95 audible playback start below
+one second on supported networks. Availability is a successful authorized playback
+start, not merely an HTTP response containing a URL. A proposed 99.99% target
+needs to include failures in both the API and media paths.
 
-- **Streaming API**: Serve audio files with quality selection based on subscription/network
-- **Library Service**: CRUD operations with cross-device synchronization
-- **Catalog Service**: Song/album/artist metadata with search
-- **Recommendation Engine**: Personalized "For You" sections and radio stations
-- **Play History**: Record and aggregate listening events
+An acknowledged library edit must be durable. Discovery can be eventually updated,
+but a sync cursor must never silently hide an earlier committed edit.
 
-### Non-Functional Requirements
+## 🏗️ Capacity and architecture — 5 minutes
 
-| Requirement | Target |
-|-------------|--------|
-| Stream start latency | < 200ms |
-| Catalog size | 100M songs |
-| Concurrent streams | 10M |
-| Library consistency | Strong |
-| Play history consistency | Eventual |
-| Streaming availability | 99.9% |
+Assume a 100-million-track catalog and ten million concurrent listeners.
+At 256 kbit/s, those listeners require 2.56 Tbit/s of media egress before overhead.
+Even perfect API caching would not remove that delivery workload.
 
-### Scale Estimates
+A three-minute track at that bitrate occupies about 5.76 MB. One rendition of the
+catalog is therefore roughly 576 TB before replication. Lossless sizes vary with
+the recording; a fixed multiplier is only a sizing assumption, not a codec guarantee.
 
-```
-Audio Storage:
-├── 100M songs × 5MB avg = 500 TB (lossy)
-├── Multiple quality tiers = 2 PB total
-│   ├── AAC 256kbps (lossy)
-│   ├── ALAC lossless (CD quality)
-│   └── Hi-Res lossless (192kHz/24-bit)
-└── Bandwidth: 10M streams × 256kbps = 2.5 Tbps egress
-```
+With one new track every three minutes per active listener, authorization averages
+about 55,600 requests/s. Skips and retries increase that. Progress every 15 seconds
+would create roughly 667,000 reports/s, so I would not casually persist each report
+through the same transactional path as a library edit.
 
----
-
-## 🏗️ High-Level Architecture (5 minutes)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Client Devices                            │
-│              (iOS, Android, macOS, Web, CarPlay)                │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                           CDN                                   │
-│            (Audio files, artwork, static assets)                │
-│         [Signed URLs with 1-hour expiry from MinIO]             │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       API Gateway                               │
-│           (Rate limiting, auth validation, routing)             │
-└─────────────────────────────────────────────────────────────────┘
-                    │           │           │
-         ┌──────────┘           │           └──────────┐
-         ▼                      ▼                      ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐
-│    Streaming    │  │     Library     │  │      Discovery      │
-│     Service     │  │     Service     │  │       Service       │
-├─────────────────┤  ├─────────────────┤  ├─────────────────────┤
-│ Quality select  │  │ CRUD operations │  │ Recommendations     │
-│ URL generation  │  │ Sync tokens     │  │ Radio stations      │
-│ Prefetch queue  │  │ Conflict resolve│  │ Play history        │
-└────────┬────────┘  └────────┬────────┘  └──────────┬──────────┘
-         │                    │                      │
-         └─────────────┬──────┴──────────────────────┘
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Data Layer                               │
-├────────────────┬────────────────┬────────────────┬──────────────┤
-│   PostgreSQL   │     Redis      │  Elasticsearch │    MinIO     │
-│   (metadata,   │   (sessions,   │   (full-text   │   (audio,    │
-│    library)    │    cache)      │    search)     │   artwork)   │
-└────────────────┴────────────────┴────────────────┴──────────────┘
-```
-
-### Core Backend Services
-
-| Service | Responsibilities |
-|---------|------------------|
-| Streaming | Quality selection, signed URL generation, DRM licensing |
-| Library | User library CRUD, sync token management, conflict resolution |
-| Catalog | Metadata storage, search indexing, popularity aggregation |
-| Discovery | Recommendations, radio generation, listening history |
-| Fingerprint | Audio matching for user uploads (future) |
-
----
-
-## 🔊 Deep Dive: Streaming Service (8 minutes)
-
-### Adaptive Quality Selection
+My first diagram keeps media delivery independent of the control API:
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│                    Quality Selection Flow                         │
-└───────────────────────────────────────────────────────────────────┘
-                              │
-                    Request: GET /stream/:trackId
-                    Headers: X-Network-Type, X-Preferred-Quality
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  1. Check Subscription Tier                      │
-├─────────────────────────────────────────────────────────────────┤
-│ Free         ──▶ max: 128_aac                                   │
-│ Individual   ──▶ max: lossless                                  │
-│ Voice        ──▶ max: 256_aac                                   │
-│ Premium      ──▶ max: hi_res_lossless                           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               2. Apply Network Constraints                       │
-├─────────────────────────────────────────────────────────────────┤
-│ WiFi    ──▶ allow hi_res_lossless                               │
-│ 5G      ──▶ allow lossless                                      │
-│ LTE/4G  ──▶ limit to 256_aac                                    │
-│ 3G      ──▶ limit to 128_aac                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                3. Select Final Quality                           │
-│   final = min(preferred, subscription_max, network_max)         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│            4. Generate Signed URL from MinIO                     │
-├─────────────────────────────────────────────────────────────────┤
-│ Response:                                                        │
-│   url: "https://cdn.../track-uuid/lossless.m4a?sig=..."         │
-│   quality: "lossless"                                            │
-│   format: "alac"                                                 │
-│   bitrate: 1411                                                  │
-│   expiresAt: now + 3600s                                         │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────┐    ┌────────────────────────────┐
+│ Clients                    │───▶│ CDN + private media origin │
+└──────────────┬─────────────┘    └────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────────┐
+│ API edge: identity, validation, bounded admission            │
+└─────────┬─────────────────────┬─────────────────────┬────────┘
+          ▼                     ▼                     ▼
+┌──────────────────┐ ┌────────────────────┐ ┌──────────────────┐
+│ Playback grants  │ │ Library/playlist   │ │ Catalog/search   │
+│ Allowed assets   │ │ State + revisions  │ │ Discovery reads  │
+└──────────────────┘ └────────────────────┘ └─────────▲────────┘
+                                                      │
+┌─────────────────────────────────────────────────────┴────────┐
+│ Durable events → aggregates → recommendations                │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Quality Tiers Reference
-
-| Tier | Codec | Bitrate | Sample Rate | Use Case |
-|------|-------|---------|-------------|----------|
-| 128_aac | AAC | 128 kbps | 44.1 kHz | Voice plan, cellular |
-| 256_aac | AAC | 256 kbps | 44.1 kHz | Standard streaming |
-| lossless | ALAC | 1411 kbps | 44.1 kHz | CD-quality |
-| hi_res_lossless | ALAC | 9216 kbps | 192 kHz/24-bit | Audiophile |
-
-### Gapless Playback via Prefetching
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                   Queue Prefetch Strategy                        │
-└──────────────────────────────────────────────────────────────────┘
-
-Current playback: Track A (3:45 duration)
-                                │
-                     At 3:15 (30s remaining)
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Prefetch Request for Track B                        │
-├─────────────────────────────────────────────────────────────────┤
-│ 1. Get next track from queue                                    │
-│ 2. Generate signed URL (same quality as current)                │
-│ 3. Return URL to client for background download                 │
-│ 4. Client buffers first 10s of Track B                          │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                     At 3:45 (Track A ends)
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│            Seamless Transition to Track B                        │
-│     (No audible gap - audio crossfades at sample level)         │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📚 Deep Dive: Library Sync Service (8 minutes)
-
-### Sync Token Architecture
-
-The library sync system uses monotonically increasing sync tokens for efficient delta updates. Each change (add, remove, update) generates a new token from a PostgreSQL sequence.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Sync Token Flow                               │
-└─────────────────────────────────────────────────────────────────┘
-
-Device A (offline)                    Server
-     │                                   │
-     │  Last sync: token 1000            │
-     │                                   │
-     │  [User adds 5 albums offline]     │
-     │                                   │
-     ├────── Reconnect ─────────────────▶│
-     │  POST /sync                       │
-     │  Body: lastToken=1000             │
-     │        changes=[5 albums]         │
-     │                                   │
-     │                     ┌─────────────┴─────────────┐
-     │                     │ Query: SELECT * FROM      │
-     │                     │ library_changes           │
-     │                     │ WHERE user_id = ?         │
-     │                     │ AND sync_token > 1000     │
-     │                     └─────────────┬─────────────┘
-     │                                   │
-     │◀──── Response ───────────────────┤
-     │  serverChanges: [3 items]         │
-     │  (tokens 1001-1003)               │
-     │  newSyncToken: 1008               │
-     │  (5 client + 3 server = 8 new)    │
-     │                                   │
-```
-
-### Change Event Structure
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    library_changes Table                         │
-├──────────────┬──────────────┬───────────────────────────────────┤
-│ sync_token   │ change_type  │ Meaning                           │
-├──────────────┼──────────────┼───────────────────────────────────┤
-│ 1001         │ add          │ User added album to library       │
-│ 1002         │ remove       │ User removed track from library   │
-│ 1003         │ update       │ Playlist reordered                │
-└──────────────┴──────────────┴───────────────────────────────────┘
-
-Index: (user_id, sync_token) for efficient range queries
-Sequence: sync_token_seq ensures monotonic ordering
-```
-
-### Conflict Resolution
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                Conflict Resolution Strategy                      │
-└─────────────────────────────────────────────────────────────────┘
-
-When client and server both modified same item:
-
-Client change (offline):               Server change:
-├── item: album-123                    ├── item: album-123
-├── type: remove                       ├── type: update
-└── timestamp: 10:05 AM                └── timestamp: 10:02 AM
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Last-Write-Wins Resolution                          │
-├─────────────────────────────────────────────────────────────────┤
-│ Compare timestamps:                                              │
-│   Client: 10:05 AM > Server: 10:02 AM                           │
-│   ──▶ Client wins, album is removed                             │
-│                                                                  │
-│ If server wins:                                                  │
-│   ──▶ Return { action: 'reject', serverState: {...} }           │
-│   ──▶ Client updates local state to match server                │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🎵 Deep Dive: Recommendation Engine (5 minutes)
-
-### Hybrid Recommendation Approach
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                "For You" Section Generation                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              GET /api/recommendations/for-you
-                              │
-         ┌────────────────────┴────────────────────┐
-         ▼                                         ▼
-┌─────────────────────┐                 ┌─────────────────────────┐
-│  Collaborative      │                 │    Content-Based        │
-│  Filtering          │                 │    Filtering            │
-├─────────────────────┤                 ├─────────────────────────┤
-│ - Heavy Rotation    │                 │ - Audio features        │
-│   (most played in   │                 │   (tempo, energy,       │
-│   last 14 days)     │                 │   valence, danceability)│
-│                     │                 │                         │
-│ - New Releases      │                 │ - Genre-based mixes     │
-│   (from followed    │                 │   (user's top 3 genres) │
-│   artists)          │                 │                         │
-│                     │                 │ - Personal radio        │
-│ - Similar listeners │                 │   (seed track matching) │
-└─────────────────────┘                 └─────────────────────────┘
-         │                                         │
-         └────────────────────┬────────────────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Section Assembly                              │
-├─────────────────────────────────────────────────────────────────┤
-│ 1. Heavy Rotation (albums)                                       │
-│ 2. New Releases (albums)                                         │
-│ 3. {Top Genre #1} Mix (playlist)                                │
-│ 4. {Top Genre #2} Mix (playlist)                                │
-│ 5. Made For You (personalized radio)                            │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Personal Radio Station Generation
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│               Radio Station Algorithm                            │
-└─────────────────────────────────────────────────────────────────┘
-
-Input: Seed track (e.g., "Bohemian Rhapsody")
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              1. Extract Audio Features                           │
-├─────────────────────────────────────────────────────────────────┤
-│ tempo: 72 BPM                                                    │
-│ energy: 0.78                                                     │
-│ valence: 0.42                                                    │
-│ danceability: 0.35                                               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│          2. Find Similar Tracks (Euclidean Distance)            │
-├─────────────────────────────────────────────────────────────────┤
-│ Weighted distance formula:                                       │
-│   0.2 × |tempo_diff| +                                          │
-│   0.3 × |energy_diff| +                                         │
-│   0.3 × |valence_diff| +                                        │
-│   0.2 × |danceability_diff|                                     │
-│                                                                  │
-│ SELECT top 100 by smallest distance                              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              3. Diversify Results                                │
-├─────────────────────────────────────────────────────────────────┤
-│ - Max 3 tracks per artist (avoid repetition)                    │
-│ - Final count: 25 tracks                                         │
-│ - Shuffle order with seed track first                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 💾 Database Schema (5 minutes)
-
-### Entity Relationship Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Core Schema                                   │
-└─────────────────────────────────────────────────────────────────┘
-
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│   artists    │──1:N─│   albums     │──1:N─│    tracks    │
-├──────────────┤      ├──────────────┤      ├──────────────┤
-│ id (PK)      │      │ id (PK)      │      │ id (PK)      │
-│ name         │      │ title        │      │ title        │
-│ verified     │      │ artist_id(FK)│      │ album_id (FK)│
-│ monthly_list │      │ release_date │      │ duration_ms  │
-└──────────────┘      │ artwork_url  │      │ track_number │
-                      └──────────────┘      │ play_count   │
-                                            └──────┬───────┘
-                                                   │
-                              ┌─────────────────────┴──────────────┐
-                              │                                    │
-                              ▼                                    ▼
-                   ┌──────────────────┐              ┌──────────────────┐
-                   │   audio_files    │              │  audio_features  │
-                   ├──────────────────┤              ├──────────────────┤
-                   │ id (PK)          │              │ track_id (PK,FK) │
-                   │ track_id (FK)    │              │ tempo            │
-                   │ quality          │              │ energy           │
-                   │ format           │              │ valence          │
-                   │ bitrate          │              │ danceability     │
-                   │ sample_rate      │              │ acousticness     │
-                   │ minio_key        │              └──────────────────┘
-                   └──────────────────┘
-```
-
-### Library Sync Tables
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  Sync Infrastructure                             │
-└─────────────────────────────────────────────────────────────────┘
-
-SEQUENCE: sync_token_seq (monotonically increasing)
-
-┌──────────────────────────────────────────────────────────────────┐
-│                     library_changes                              │
-├───────────────┬──────────────────────────────────────────────────┤
-│ id            │ BIGSERIAL PRIMARY KEY                            │
-│ user_id       │ UUID REFERENCES users(id)                        │
-│ change_type   │ VARCHAR(20) -- 'add', 'remove', 'update'         │
-│ item_type     │ VARCHAR(20) -- 'track', 'album', 'playlist'      │
-│ item_id       │ UUID                                             │
-│ data          │ JSONB (optional metadata)                        │
-│ sync_token    │ BIGINT DEFAULT nextval('sync_token_seq')         │
-│ created_at    │ TIMESTAMP DEFAULT NOW()                          │
-├───────────────┴──────────────────────────────────────────────────┤
-│ INDEX: (user_id, sync_token) for efficient delta queries         │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Listening History
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    listening_history                             │
-├───────────────┬──────────────────────────────────────────────────┤
-│ id            │ BIGSERIAL PRIMARY KEY                            │
-│ user_id       │ UUID REFERENCES users(id)                        │
-│ track_id      │ UUID REFERENCES tracks(id)                       │
-│ played_at     │ TIMESTAMP DEFAULT NOW()                          │
-│ duration_ms   │ INTEGER (how long played)                        │
-│ context_type  │ VARCHAR(50) -- 'album', 'playlist', 'radio'      │
-│ context_id    │ UUID                                             │
-│ completed     │ BOOLEAN DEFAULT FALSE (>80% = complete)          │
-├───────────────┴──────────────────────────────────────────────────┤
-│ INDEX: (user_id, played_at DESC) for recent history              │
-│ DEDUP: Ignore replays within 30-second window                    │
-└──────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔐 Authentication and Authorization (3 minutes)
-
-### Session-Based Auth with Redis
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Auth Flow                                     │
-└─────────────────────────────────────────────────────────────────┘
-
-Login Request                      Server
-     │                                │
-     ├── POST /auth/login ──────────▶│
-     │   {username, password}         │
-     │                                │
-     │                     ┌──────────┴──────────┐
-     │                     │ Verify credentials  │
-     │                     │ Create session ID   │
-     │                     │ Store in Redis:     │
-     │                     │   sess:abc123 = {   │
-     │                     │     userId,         │
-     │                     │     role,           │
-     │                     │     tier            │
-     │                     │   }                 │
-     │                     │ TTL: 30 days        │
-     │                     └──────────┬──────────┘
-     │                                │
-     │◀── Set-Cookie: sid=abc123 ─────┤
-```
-
-### RBAC Permissions
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Role Permissions                              │
-├─────────────────┬────────────────────────────────────────────────┤
-│ user            │ catalog:read, library:own, stream:basic        │
-│ premium_user    │ + stream:lossless, stream:download             │
-│ curator         │ + playlist:public                              │
-│ admin           │ * (all permissions)                            │
-└─────────────────┴────────────────────────────────────────────────┘
-```
-
-### Rate Limiting
-
-| Endpoint | Limit | Window | Rationale |
-|----------|-------|--------|-----------|
-| /stream/* | 300 req | 1 min | High for audio segments |
-| /search | 30 req | 1 min | Expensive operation |
-| /library | 100 req | 1 min | Moderate CRUD |
-| /recommendations | 20 req | 1 min | CPU-intensive |
-
----
-
-## 📊 Observability (3 minutes)
-
-### Key Metrics
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   Prometheus Metrics                             │
-├─────────────────────────────────────────────────────────────────┤
-│ Histograms:                                                      │
-│   stream_start_latency_seconds  [0.05, 0.1, 0.2, 0.5, 1, 2]     │
-│                                                                  │
-│ Gauges:                                                          │
-│   active_streams{quality="lossless"}                            │
-│   active_streams{quality="256_aac"}                             │
-│                                                                  │
-│ Counters:                                                        │
-│   library_operations_total{operation="add", item_type="album"}  │
-│   cache_hits_total{cache="metadata", result="hit|miss"}         │
-│   streams_total{quality="lossless", tier="premium"}             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Alert Thresholds
-
-| Metric | Warning | Critical |
-|--------|---------|----------|
-| Stream start p99 | > 500ms | > 1s |
-| Error rate | > 1% | > 5% |
-| Active streams drop | > 20% in 5min | > 50% in 5min |
-| Cache hit rate | < 80% | < 60% |
-
----
-
-## ⚖️ Trade-offs and Alternatives (5 minutes)
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Audio matching | Fingerprinting | Metadata matching | Accurate with wrong/missing metadata |
-| Library sync | Sync tokens | Full refresh | Bandwidth efficient, handles offline |
-| Quality selection | Server-side | Client-side | Server enforces subscription tier |
-| Recommendations | SQL-based | ML embeddings | No ML infrastructure for demo |
-| Session storage | Redis | JWT | Instant revocation capability |
-| Play history | Eventual consistency | Strong | Write throughput for high volume |
-
----
-
-## 🔍 Trade-off Deep Dive 1: Sync Tokens vs Full Library Refresh
-
-**The Decision**: Use monotonically increasing sync tokens for library synchronization rather than full library refresh on each sync.
-
-### Why Sync Tokens Work
-
-Sync tokens solve the fundamental problem of keeping multiple devices in sync efficiently. When a user has 10,000 songs in their library and modifies 5 items, fetching all 10,000 records wastes 99.95% of the bandwidth. With sync tokens, the client sends its last known token (e.g., 1000), and the server returns only changes where `sync_token > 1000`. This reduces sync payloads from megabytes to kilobytes.
-
-The PostgreSQL sequence guarantees monotonically increasing tokens without gaps. Every library modification atomically increments the sequence and records the change. This creates a perfect audit trail: tokens 1001-1005 represent exactly the 5 changes made since the client last synced. The client can request any range, making it trivial to recover from partial sync failures.
-
-Offline support becomes straightforward. The client queues changes locally with timestamps while offline. Upon reconnection, it sends its local changes along with its last sync token. The server detects conflicts by checking if any server-side changes touch the same items. Last-write-wins resolution preserves user intent: if they explicitly removed an album at 10:05, that should override an earlier server metadata update at 10:02.
-
-### Why Full Refresh Fails at Scale
-
-Full refresh appears simpler: just fetch the entire library and replace local state. But this approach collapses under real-world constraints. A power user with 50,000 library items generates a 5MB+ response per sync. With 100M users syncing periodically, this becomes 500TB+ of redundant data transfer daily.
-
-More critically, full refresh cannot handle offline editing. When a user adds songs on their phone during a flight and modifies playlists on their laptop, what happens when both reconnect? With full refresh, whichever device syncs last wins entirely, potentially erasing hours of curation from the other device. Users discover their carefully organized playlists reverted to an older state.
-
-Full refresh also lacks partial recovery. If sync fails mid-transfer, the client has corrupted state—some items updated, others stale. With sync tokens, the client simply retries with the same token; already-applied changes are idempotent, and the remaining changes apply cleanly.
-
-### The Trade-off Accepted
-
-Sync tokens require maintaining the `library_changes` table indefinitely, growing with every modification. Purging old changes risks breaking clients that haven't synced in months. The solution is a hybrid: keep granular changes for 90 days, then offer full refresh as fallback for extremely stale clients. This bounds storage growth while preserving efficiency for active users.
-
----
-
-## 🔍 Trade-off Deep Dive 2: Redis Sessions vs JWT for Authentication
-
-**The Decision**: Store sessions in Redis with opaque session IDs rather than stateless JWT tokens.
-
-### Why Redis Sessions Work
-
-Redis sessions provide instant revocation—the critical capability for a subscription-based service. When a user downgrades from Premium to Free tier, their next API request must enforce the new limits. With Redis, we update the session's `tier` field immediately. The next request reads the updated session and restricts them to 256kbps audio. No race conditions, no waiting for token expiry.
-
-Device management becomes trivial. Users can view all active sessions ("iPhone 15 Pro, last active 2 hours ago") and revoke specific devices. Each session is a Redis key; deletion is O(1). For security-conscious users who suspect unauthorized access, they can "sign out everywhere" by deleting all session keys matching their user ID pattern.
-
-Session data can evolve freely. Need to track streaming quality preference per session? Add a field. Want to record the last 5 played tracks for quick resume? Store them in the session hash. JWT's payload is immutable once issued; any schema change requires reissuing all tokens. Redis sessions update in-place.
-
-### Why JWT Fails for This Use Case
-
-JWT's fundamental value proposition—stateless verification—becomes a liability for subscription services. A valid JWT proves identity, but cannot convey real-time authorization state. The token might claim "premium" while the user downgraded minutes ago. Checking authorization requires a backend call anyway, negating JWT's stateless benefit.
-
-Short-lived JWTs with frequent refresh mitigate staleness but introduce UX problems. A 15-minute token means the client must refresh silently during long listening sessions. If the refresh fails (network blip during a commute), playback stops abruptly. Longer expiry improves UX but widens the window where revoked access remains valid.
-
-JWT blacklists attempt to solve revocation but recreate the state Redis sessions provide natively. You now have Redis for the blacklist, JWT parsing overhead, and blacklist lookup overhead—more complexity than just storing the session in Redis directly. The cryptographic verification that makes JWT attractive becomes pure overhead.
-
-### The Trade-off Accepted
-
-Redis sessions require Redis availability for every authenticated request. If Redis fails, all users are effectively logged out. We mitigate this with Redis Sentinel for automatic failover and short-lived local session caches (5-second TTL) to survive brief Redis unavailability. The operational overhead is modest compared to the authorization flexibility gained.
-
----
-
-## 🔍 Trade-off Deep Dive 3: SQL-Based Recommendations vs ML Embeddings
-
-**The Decision**: Generate recommendations using SQL queries over listening history and audio features rather than vector similarity with ML-generated embeddings.
-
-### Why SQL-Based Recommendations Work
-
-SQL recommendations leverage existing infrastructure without additional complexity. The database already stores listening history, track metadata, and audio features (tempo, energy, valence). Calculating "Heavy Rotation" is a simple `GROUP BY` query: find albums with the most completed plays in the last 14 days. No model training, no embedding storage, no vector database.
-
-Explainability comes free. When a user asks "Why did you recommend this?", we can trace exactly: "Because you played 23 songs from this artist last month" or "Because this has similar tempo and energy to tracks you've been playing." With ML embeddings, the 512-dimensional vector captures something, but explaining what is nearly impossible.
-
-Cold start handles naturally. New users see genre-based picks from popularity charts while we collect listening data. After a few sessions, SQL queries have enough history to generate personalized results. ML embeddings require substantial interaction data before generating meaningful vectors—the bootstrapping problem remains unsolved.
-
-### Why ML Embeddings Fail for This Stage
-
-ML embedding systems require significant infrastructure: model training pipelines, vector databases (Pinecone, Milvus), regular retraining as the catalog grows, and monitoring for embedding drift. For a demo/learning project, this is months of infrastructure work before generating a single recommendation.
-
-The marginal improvement may not justify complexity. Spotify's research shows that simple collaborative filtering ("users who liked X also liked Y") captures 80% of recommendation value. The remaining 20% requires sophisticated ML, but that 20% matters more at their 500M user scale than for our use case.
-
-Embeddings also struggle with the "filter bubble" problem—they're too good at finding similar content. Users discover they've been listening to the same mood for months. SQL-based recommendations can explicitly inject diversity: "Include 2 tracks from genres outside the user's top 3." This rule-based diversity is awkward to encode in embedding space.
-
-### The Trade-off Accepted
-
-SQL recommendations cannot capture the nuanced similarity that embeddings provide. A song might have identical tempo/energy but completely different vibe—embeddings trained on actual listener behavior would cluster them differently. We accept this limitation for the demo, noting that production systems would layer ML on top of this SQL foundation rather than replacing it entirely.
-
----
-
-## ✅ Closing Summary (1 minute)
-
-> "The Apple Music backend is built around three core systems:
->
-> 1. **Streaming Service** - Network-aware quality selection with subscription enforcement, signed URL generation for CDN delivery, and gapless playback through prefetching.
->
-> 2. **Library Sync** - Monotonically increasing sync tokens enable efficient delta updates across devices, with conflict resolution favoring more recent changes while preserving user intent.
->
-> 3. **Recommendation Engine** - Hybrid approach combining play history analysis (collaborative signals) with audio features (content-based filtering) for personalized mixes and radio stations.
->
-> The main scalability lever is CDN offload for audio delivery, with the backend focused on metadata, authorization, and personalization. Strong consistency for library operations ensures users never lose saved content, while eventual consistency for play history prioritizes write throughput."
-
----
-
-## 🚀 Future Enhancements
-
-1. **Audio Fingerprinting** - Chromaprint-based matching for user uploads to catalog
-2. **Vector Embeddings** - ML-based track similarity for better recommendations
-3. **Real-time Sync** - WebSocket connections for instant library updates
-4. **Geo-distributed** - Multi-region PostgreSQL replicas for lower latency
-5. **Offline Queue** - Server-side queue for changes made while offline
+Catalog metadata is shared and read-heavy. Personal libraries are partitioned by
+owner so their state and revisions remain together. Media objects are immutable
+and independently cached. Listening events feed asynchronous projections.
+
+I would begin with clear module boundaries and a small deployable system, then
+separate services where their scaling and failure characteristics demand it.
+The diagram describes ownership; it does not require a network hop for every box.
+
+## 💾 Data and API contracts — 4 minutes
+
+The data model separates a recording, a playable rendition, and a playlist entry.
+Those identities have different lifetimes and cannot safely be collapsed into
+one track ID everywhere.
+
+| Record | Main fields | Important invariant |
+|--------|-------------|---------------------|
+| Track/catalog item | ID, artist, album, metadata, availability | Stable identity despite metadata edits |
+| Rendition | Track ID, codec/container, quality, object/version, state | Only verified compatible assets are published |
+| Library membership | Owner, item type, item ID | One desired membership state per owner/item |
+| Library head/change | Owner, revision, operation, affected item | Revisions follow committed owner edits |
+| Operation receipt | Actor, operation ID, payload hash, result | A retry recovers one logical outcome |
+| Playlist entry | Entry ID, playlist ID, track ID, position | Duplicate recordings have distinct occurrences |
+| Playback event | Event ID, playback ID, track, eligible duration | Repeated delivery does not count another play |
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | /catalog/search | Search with bounded query/filter/page parameters |
+| POST | /playback/grants | Authorize a specific track and compatible rendition set |
+| PUT / DELETE | /library/items/:type/:id | Set desired membership with operation identity |
+| GET | /library/snapshot | Obtain a consistent initial library and revision |
+| GET | /library/changes | Fetch a bounded page after an applied revision |
+| POST | /playlists/:id/operations | Edit entries against an expected playlist revision |
+| POST | /listening/events | Durably accept a bounded batch of identified events |
+| GET | /recommendations | Read eligible personalized or fallback candidates |
+
+These are proposed contracts, not the exact local endpoints. The local inventory
+is in the README. Availability, unsupported format, bad input, authorization
+failure, stale revision, and transient dependency failure need distinct outcomes.
+
+## 🔧 Deep dive 1: authorized media delivery — 10 minutes
+
+### Publish a playable asset before granting access
+
+I would ingest source media into a private staging area, validate it, and produce
+supported renditions. Each rendition records its actual codec, container, duration,
+object version, and processing status.
+
+Publication verifies that the object exists and matches its metadata. An atomic
+catalog-state transition then makes it eligible for playback. Failed or incomplete
+encodes remain unavailable rather than being represented by plausible filenames.
+
+A catalog item can exist before every quality is ready. The authorization path
+must intersect requested preference, entitlement, supported formats, and available
+renditions. A missing high-quality encode can use an allowed lower quality, or
+return a clear unavailable result when no compatible asset exists.
+
+### Keep bytes away from the control service
+
+> “I would issue a bounded delivery grant and let the client fetch media from
+> the delivery tier. That keeps an API replica's capacity tied to authorization
+> requests rather than the duration and bitrate of every listening session.”
+
+A private origin prevents bypassing the authorization path through an unsigned
+object URL. The delivery layer validates the grant and serves immutable content.
+Its caching policy should share common bytes without sharing one user's authorization.
+
+For example, a CDN can verify access before serving a cached object whose key is
+based on media identity/version. If every user's signature unnecessarily becomes
+part of the cache identity, the same recording may be fetched repeatedly from origin.
+
+A grant expires, and a cached client URL must not outlive it. The client can obtain
+a fresh grant for an active playback intent when reuse or a new range request
+requires it. Issuing a grant does not create a permanent account entitlement.
+
+| Approach | Benefit | Cost for this workload |
+|----------|---------|------------------------|
+| ✅ Authorized direct media delivery | Independent bandwidth scaling and shared object caching | Delivery policy, expiry, and client outcome telemetry |
+| ❌ Proxy all audio through the main API | One apparent authorization and byte path | Long transfers dominate sockets/bandwidth and couple API failures |
+| ❌ Public media with protected metadata only | Very simple delivery | Knowing the object URL bypasses playback authorization |
+
+Proxying can be reasonable for a small internal file service. At ten million
+listeners, its operational cost would be driven by media transfer even though
+most API business logic is lightweight. That is the specific scaling mismatch.
+
+The cost of direct delivery is reduced immediate control after issuance. A session
+revocation cannot erase bytes already buffered, and a grant may remain usable until
+its expiry or an explicit delivery-side revocation mechanism takes effect.
+
+### Separate entitlement from network adaptation
+
+The server enforces content rights and subscription capabilities. The client sees
+buffer depth, download performance, codec support, and user data-saving choices.
+A self-reported network label is a hint; it is not evidence of bandwidth or fraud.
+
+For a first version, selecting a whole file per track keeps the implementation
+small. It is a defensible trade-off if measured startup and stall rates meet our
+targets. The server cannot guarantee the connection remains unchanged for the song.
+
+Segmented streaming permits adaptation at compatible boundaries and more controlled
+prefetch. It adds packaging, manifests, rendition alignment, and request volume.
+I would introduce it for measured delivery needs rather than claim music never
+benefits from client-driven adaptation.
+
+True gapless playback also depends on timing, encoding boundaries, and the client
+pipeline. A prefetch endpoint that returns a URL can reduce lookup latency, but
+cannot by itself guarantee a seamless audible transition.
+
+### Measure the entire playback attempt
+
+The authorization service records grant latency and rejection reason. The delivery
+tier records object errors and transfer performance. The client records whether
+playback actually began, buffering, and its terminal outcome.
+
+A playback-instance ID connects those events. A user/track key is insufficient:
+the same listener can retry, use multiple devices, or intentionally replay the
+same recording while an earlier report is still arriving.
+
+I would not increment a “currently listening” gauge for every URL request and trust
+clients to decrement it exactly once. Active-session estimates need leases or
+aggregation with defined expiry and duplicate handling.
+
+## 🔧 Deep dive 2: complete and recoverable library sync — 11 minutes
+
+### Put the state change and its receipt in one transaction
+
+For an edit, I would lock the owning library's head row. Inside the transaction,
+check the operation receipt, validate the target, update membership, increment the
+owner's revision, append the change, and record the result.
+
+The lock remains held until commit. Another edit for that owner cannot allocate
+a later committed revision while this one is unfinished. Different owners still
+proceed independently, matching the natural partition key.
+
+If the operation already exists with the same payload, return its prior result.
+If the same ID is reused for a different edit, reject it. The response cache may
+speed up replay, but the durable receipt remains authoritative after cache loss.
+
+> “I would serialize edits within one person's library because their edit rate
+> is modest and correctness is visible. I would not serialize every listener
+> behind a global counter.”
+
+### Explain why a sequence alone is insufficient
+
+Suppose transaction A allocates token 100 but has not committed. Transaction B
+allocates 101 and commits first. A sync client sees 101 and advances. When A later
+commits, a query for tokens above 101 can never deliver change 100.
+
+PostgreSQL sequence allocation is distinct from transactional visibility and may
+also leave gaps after aborted work. The issue is not that a client needs every
+integer; it needs every committed change before its cursor.
+[Sequence behavior](https://www.postgresql.org/docs/16/functions-sequence.html)
+
+A separate race exists if the server reads change rows and then queries a newer
+maximum token. A change committed between those two reads can be omitted from the
+response even when only one writer is active at a time.
+
+The cursor must describe the returned page, with a consistent upper boundary.
+A transactional per-owner counter addresses ordering, while snapshot/page rules
+address what the reader actually observed. We need both.
+
+### Bootstrap, page, and recover explicitly
+
+A new device obtains a consistent membership snapshot and revision. It stages the
+snapshot locally, then adopts it atomically before applying later changes.
+A partial download should not replace a complete local library with half a new one.
+
+For deltas, the server returns ordered pages and advances only to the last delivered
+revision. The client applies each page before persisting its cursor. Reapplying an
+already delivered change must be harmless or detectable by revision/operation ID.
+
+A retention floor bounds log growth. A client below that floor receives an explicit
+reset-required response and obtains a new snapshot. Pending local operations remain
+identified so reconnect does not erase unsent user intent.
+
+Push notifications can announce that newer data exists. They do not replace the
+change feed, since connections break and notifications can be missed. Foreground
+and reconnect checks provide recovery even when the notification path fails.
+
+| Approach | Benefit | Cost for this problem |
+|----------|---------|-----------------------|
+| ✅ Per-owner transactional revisions plus snapshots/deltas | Complete recoverable sync with bounded retention | Owner contention and careful paging/reset protocol |
+| ❌ Sequence allocation plus a later MAX query | Short implementation | Cursor can silently skip committed edits |
+| ❌ Replace server state with a device's entire old library | Simple upload semantics | Offline devices can erase unrelated newer edits |
+
+A full snapshot is still useful for initial sync and recovery. It does not inherently
+lose data; the unsafe choice is treating a stale device snapshot as authoritative
+for every concurrent edit without a merge or revision policy.
+
+### Use the same discipline for ordered playlists
+
+Playlist entries have occurrence IDs because duplicate tracks can be intentional.
+An edit is applied against an expected revision, with serialized position updates
+or another ordering representation whose uniqueness rules are maintained.
+
+An uncoordinated MAX(position)+1 append can choose the same position twice. Ignoring
+the resulting conflict and returning success loses one user's requested entry.
+Likewise, moving entry A directly into entry B's occupied unique position can fail
+before a transaction gets to move B out of the way.
+
+I would choose a simple serialized single-owner protocol first, with a safe position
+update procedure and explicit stale-revision conflicts. Fractional ordering keys
+or collaborative structures have their own compaction/conflict costs and should
+follow a real need for concurrent editing.
+
+## 🔧 Deep dive 3: listening events and recommendations — 8 minutes
+
+### Define one logical play
+
+A playback attempt, periodic progress, a qualifying listen, and a completed track
+are different events. I would define the product's qualifying-listen policy and
+track accumulated eligible listening time rather than trusting a seek position.
+
+The client sends stable event IDs. The ingestion layer validates bounded input and
+acknowledges durable acceptance. Consumers apply duplicate-safe effects to history
+and popularity projections, with a replay mechanism after interruption.
+
+A Redis response cache alone does not guarantee one effect: concurrent cache misses
+can execute twice, and a crash after the database write but before caching the
+response leaves an ambiguous retry. Durable identity must cover the actual effect.
+
+I would keep short-lived resume progress separate from durable qualified events.
+That reduces write amplification while preserving the important history contract.
+If financial settlement were in scope, it would require stronger independent
+validation and reconciliation than self-reported client events.
+
+### Start with understandable candidates
+
+Initial recommendation sections can use frequently played albums, followed-artist
+releases, genre matches, and tracks the user has not heard. Popularity can supply
+fallbacks for accounts without history.
+
+These queries are understandable and inexpensive to develop, but they still need
+quality evaluation. Counting one user's history is not collaborative filtering,
+and storing tempo/energy fields does not make a query use acoustic similarity.
+
+Learned candidate retrieval and ranking can improve nuanced discovery later.
+They introduce training, evaluation, feature consistency, and freshness work.
+Cold start and diversity need explicit policies under either SQL or learned ranking.
+
+| Approach | Benefit | Cost for this stage |
+|----------|---------|---------------------|
+| ✅ Simple candidates with measured ranking improvements | Explainable baseline and fast iteration | Limited similarity and eventual need for separate serving |
+| ❌ Build a full ML platform before a baseline | Broad modeling options | Large operational scope before proving incremental value |
+| ❌ Recompute all history aggregates on every page | Immediately reflects current rows | Expensive repeated work under read-heavy discovery traffic |
+
+> “I would accept a bounded recommendation delay and cache or materialize sections.
+> Playback should not wait while we recompute a user's taste profile.”
+
+Cache identity includes the user and relevant version. Listening can trigger a
+coalesced invalidation or schedule a refresh, rather than making every event cause
+an immediate expensive rebuild. A popular cached fallback preserves discovery
+availability when personalization is delayed.
+
+### Preserve query meaning as data grows
+
+Recently played means the most recent distinct tracks globally within that user's
+history. Limiting an intermediate result ordered by track ID and then sorting the
+subset by time does not answer that question once more candidates exist.
+
+Similarly, a recommendation section called new releases needs an explicit date
+window and eligibility filters. A finite randomly generated station is not a live
+radio service; continuous radio needs refill, diversity, and repeat-history rules.
+
+I would compare output against reference datasets and measure successful listening,
+skips, diversity, and freshness. A universal claim that simple SQL gives “80% of
+ML value” is not evidence about this product or catalog.
+
+## ⚖️ Failure priorities and local implementation boundary — 3 minutes
+
+The first priorities are playable asset publication, complete library revisions,
+and identified listening events. A healthy process and valid database connection
+cannot establish any of those promises by themselves.
+
+I would test a missing rendition, an expired grant, a retry after commit, out-of-order
+transaction completion, a sync page interrupted by another edit, duplicate playlist
+occurrences, and event replay after consumer failure.
+
+The local repository runs one Express API with PostgreSQL, Valkey, and MinIO.
+It selects whole-file qualities, but the seed provides neither audio rows nor objects.
+Missing media produces a fabricated URL. Search uses PostgreSQL LIKE; Elasticsearch
+is declared but unused.
+
+Library membership and its log are separate writes, and the sync cursor can skip
+changes. Playlist replay caching has no in-flight lock or durable receipt. History
+has no event deduplication; recommendations are SQL sections with TTL caching.
+Session caches can retain old entitlements after admin changes.
+
+Those source boundaries are detailed in the [architecture](./architecture.md#implementation-notes).
+I would establish the three correctness contracts before adding a CDN rollout,
+segmented playback, or a more sophisticated recommendation system.

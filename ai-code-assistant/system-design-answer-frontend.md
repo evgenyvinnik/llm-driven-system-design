@@ -1,316 +1,355 @@
-# AI Code Assistant - System Design Answer (Frontend Focus)
+# AI Code Assistant — Frontend System Design
 
-*45-minute system design interview format - Frontend Engineer Position*
+*A 45-minute conversation about the terminal interface for a coding agent.*
 
----
+This is a proposed design. The repository implements a simpler readline CLI with
+complete-response output; streaming, diff approval, and task cancellation below
+are design choices to explain, not claims about existing features.
 
-## 📋 Problem Statement
+## 📋 Clarify the workflow — 5 minutes
 
-Design the terminal user interface for an AI-powered command-line coding assistant. The CLI must handle real-time streaming of LLM responses, render markdown and syntax-highlighted code, display interactive permission prompts, show progress indicators during tool execution, and support keyboard navigation with command history. The primary challenge is building a responsive, accessible terminal UI that handles the inherent complexity of streaming partial content -- including incomplete markdown, mid-render code blocks, and interleaved tool call events.
+> “I would start with a developer asking the assistant to fix a failing test.
+> They need to understand what it is doing, inspect proposed changes, and regain
+> control if it gets stuck. The interface is a terminal, so my frontend concerns
+> are input ownership, readable output, and truthful task state.”
 
----
+I would establish three assumptions with the interviewer:
 
-## 📋 Requirements Clarification
+1. The developer works in a local checkout and can also edit files outside the CLI.
+2. A task can contain several model calls and local tool operations.
+3. Some operations require approval, and the developer can cancel an active task.
 
-### Functional Requirements
+The first version supports text requests, incremental replies, tool status,
+change previews, and resuming a saved task. I would postpone split panes, embedded
+images, and a plugin widget system until the basic workflow is dependable.
 
-1. **Input handling** -- multi-line text input, command history with arrow keys, slash-command autocomplete
-2. **Streaming output** -- render LLM response tokens as they arrive with zero perceptible lag
-3. **Code formatting** -- syntax highlighting for code blocks in the response stream
-4. **Permission prompts** -- clear, interactive approval dialogs for file writes and shell commands
-5. **Progress indicators** -- spinners and status messages while tools execute
-6. **Session display** -- show conversation history, context usage, and active model
+The key experience is a sequence the user can follow:
 
-### Non-Functional Requirements
+- The request was accepted.
+- The agent is gathering evidence or waiting for the provider.
+- A concrete operation needs a decision, if applicable.
+- An operation succeeded, failed, or has an uncertain outcome.
+- The task ended with an explanation of changes and validation.
 
-1. **Responsiveness** -- no input lag; immediate visual feedback on every keypress
-2. **Cross-platform** -- consistent behavior on macOS, Linux, and Windows terminals
-3. **Accessibility** -- WCAG AA contrast ratios, screen reader announcements, keyboard-only navigation
-4. **Customization** -- light/dark theme support, configurable keybindings
+A spinner only communicates activity. It cannot establish that a file was changed
+or a test passed. Those statements must come from tool outcomes.
 
-### Terminal Constraints
+I would target immediate local acknowledgement, within roughly 100 milliseconds.
+Provider first-output latency is measured separately. The frontend cannot promise
+that a remote model will always begin responding in half a second.
 
-- Styling limited to ANSI escape codes (no DOM, no CSS)
-- Keyboard-only interaction (no mouse events in most terminals)
-- Variable terminal widths from 80 to 200+ columns
-- Color support varies: 8-color, 16-color, 256-color, or true color depending on terminal emulator
+For accessibility, text labels carry status even without color. We need a usable
+plain-output mode and testing with actual terminal/screen-reader combinations.
+Terminal title escape sequences are not a general accessibility announcement API.
 
----
+## 🏗️ Draw the interface boundary — 5 minutes
 
-## 🏗️ High-Level Architecture
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                          CLI Interface                            │
-├───────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │                      Input Layer                            │  │
-│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌─────────┐ │  │
-│  │  │ Readline  │  │ History   │  │ Autocmp   │  │Shortcut │ │  │
-│  │  │ Handler   │  │ Manager   │  │ Engine    │  │ Handler │ │  │
-│  │  └───────────┘  └───────────┘  └───────────┘  └─────────┘ │  │
-│  └────────────────────────┬────────────────────────────────────┘  │
-│                           │                                       │
-│                           ▼                                       │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │                    Rendering Layer                           │  │
-│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌─────────┐ │  │
-│  │  │ Markdown  │  │ Syntax    │  │ Spinner   │  │ Dialog  │ │  │
-│  │  │ Renderer  │  │ Highlight │  │ Animator  │  │ Builder │ │  │
-│  │  └───────────┘  └───────────┘  └───────────┘  └─────────┘ │  │
-│  └────────────────────────┬────────────────────────────────────┘  │
-│                           │                                       │
-│                           ▼                                       │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │                     Output Layer                            │  │
-│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌─────────┐ │  │
-│  │  │ ANSI      │  │ Color     │  │ Layout    │  │Terminal │ │  │
-│  │  │ Encoder   │  │ Theme     │  │ Engine    │  │ Adapter │ │  │
-│  │  └───────────┘  └───────────┘  └───────────┘  └─────────┘ │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                                                                   │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-> "I split the CLI into three distinct layers -- input, rendering, and output -- because each has fundamentally different concerns. The input layer deals with raw keypresses and readline state. The rendering layer transforms structured data (markdown, code, tool results) into styled text. The output layer handles the low-level ANSI encoding and terminal adaptation. This separation means I can swap rendering strategies without touching input handling, or adapt to a new terminal without changing how we parse markdown."
-
----
-
-## 🔧 Deep Dive: Streaming Response Rendering
-
-### The Streaming Challenge
-
-When LLM responses stream token-by-token, the renderer must display text immediately as it arrives, handle incomplete markdown (a code fence may arrive across two chunks), apply syntax highlighting progressively, and manage cursor position for multi-line content -- all without flickering or losing state.
-
-### Streaming Renderer Pipeline
+I would draw one small diagram:
 
 ```
-┌─────────────┐     ┌─────────────────┐     ┌──────────────────┐
-│ Token chunk │────▶│ Accumulate in   │────▶│ Split on newline │
-│ arrives     │     │ line buffer     │     │ and render lines  │
-└─────────────┘     └─────────────────┘     └──────────────────┘
-                                                     │
-                                                     ▼
-                                            ┌──────────────────┐
-                                            │ Line Classifier  │
-                                            └────────┬─────────┘
-                                                     │
-                                          ┌──────────┴──────────┐
-                                          ▼                     ▼
-                                    ┌──────────┐         ┌──────────┐
-                                    │ Code     │         │ Markdown │
-                                    │ Block?   │         │ Format   │
-                                    │ Syntax   │         │ Bold,    │
-                                    │ Highlight│         │ italic,  │
-                                    └──────────┘         │ headers  │
-                                                         └──────────┘
+┌──────────────┐       ┌──────────────────┐       ┌─────────────────┐
+│ Input owner  │──────▶│ Task controller  │──────▶│ Agent runtime   │
+└──────────────┘       └────────┬─────────┘       └────────┬────────┘
+                               │                          │ events
+                               ▼                          ▼
+                      ┌──────────────────────────────────────────┐
+                      │ Transcript state + terminal renderer     │
+                      └──────────────────────────────────────────┘
 ```
 
-The renderer maintains a small state machine: a line buffer accumulating partial text, a boolean tracking whether we are inside a fenced code block, and the current code language for syntax highlighting. When a newline arrives, the completed line is classified and rendered. If the line begins with a triple backtick, we toggle code block state and extract the language hint. Inside a code block, lines go through syntax highlighting. Outside, lines go through markdown formatting (bold, italic, inline code, headers).
+The runtime decides what has happened. The frontend turns its events into a
+transcript and sends user decisions back. Neither a renderer nor an approval
+button gets to declare a tool successful.
 
-### Token-by-Token Cursor Management
+The input owner knows whether keystrokes belong to the composer, an approval,
+or a cancellation decision. Independent components must not compete for stdin.
 
-Each token writes directly to stdout. When a newline arrives, the current line is flushed and the line counter increments. To support re-rendering the current line (for example, when a bold marker completes mid-line), the renderer issues a carriage return followed by the ANSI clear-line escape, then re-outputs the line with updated formatting applied. This approach avoids full-screen repaints and keeps rendering cost proportional to the content being updated.
+The task controller tracks identity and lifecycle. Every runtime event includes
+the task it belongs to, so late events from an interrupted task cannot change the
+status of a newly started one.
 
-> "I chose line-by-line rendering over full-screen terminal UI frameworks like Ink because it is simpler to reason about, works in every terminal, and avoids the overhead of a virtual DOM diff for what is fundamentally a scrolling text stream. The trade-off is that I cannot re-render previously output lines -- once a line scrolls up, it is final. But for a streaming assistant, this matches user expectations: you read the response top to bottom as it appears."
+The transcript stores assistant text, tool events, and decisions as different
+kinds of records. Rendering them all as undifferentiated chat would make generated
+claims look like authoritative execution evidence.
 
-### Markdown Formatting Rules
+The renderer owns stdout and transient terminal controls. Workers publish events;
+they do not print directly over an input prompt.
 
-| Markdown Pattern | Terminal Rendering |
-|------------------|--------------------|
-| **bold** | ANSI bold attribute |
-| *italic* | ANSI italic/dim attribute |
-| \`inline code\` | Cyan foreground, monospace |
-| # Header | Bold + underline |
-| ## Subheader | Bold only |
-| Fenced code block | Full syntax highlighting with language detection |
+I would begin with a scrolling transcript and one active input region. A full TUI
+framework can support richer interaction, but it adds layout and focus decisions
+that this initial workflow does not require.
 
----
+## 💾 State and event contracts — 4 minutes
 
-## 🔧 Deep Dive: Permission Prompt UX
+The interface has durable task facts and temporary presentation state.
 
-### The Permission Dialog
+| State | Owner | Example |
+|-------|-------|---------|
+| Task outcome | Runtime | Running, completed, cancelled, budget exhausted |
+| Operation outcome | Runtime | Pending approval, running, failed, unknown |
+| Transcript | Event-backed client state | Text and linked tool results |
+| Draft input | Input owner | A partially typed request |
+| Active approval | Input owner plus runtime identity | Proposal ID and displayed revision |
+| Rendering buffer | Renderer | Partial line and incomplete formatting |
 
-When the agent requests a file write or shell command, the CLI must interrupt the streaming flow and present a clear, unambiguous prompt. The dialog shows what tool is requesting access, what operation it will perform, and the specific details (file path, diff preview, or command string).
+I would keep rendering buffers out of the durable transcript. A crash should not
+restore half an ANSI escape sequence or a spinner frame as conversation content.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                                                          │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   │
-│    Permission Required                                   │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   │
-│                                                          │
-│    Tool:      Edit                                       │
-│    Operation: Modify file                                │
-│                                                          │
-│    Details:                                              │
-│        /path/to/file.ts                                  │
-│                                                          │
-│    Changes:                                              │
-│        - old line (red)                                  │
-│        + new line (green)                                │
-│          context line (gray)                             │
-│                                                          │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   │
-│    [y] Yes  [n] No  [a] Always allow (session)           │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
+A minimal event contract contains task ID, event sequence, event kind, and its
+payload. Tool events also contain an operation ID. The sequence supports replay
+without duplicating completed transcript entries.
 
-The dialog renders a bordered box with the tool name, operation description, and a unified diff preview using red for deletions and green for additions. The user responds with a single keypress: y (approve once), n (deny), or a (approve all similar operations for the rest of the session). The "always allow" option reduces prompt fatigue for repetitive operations like editing multiple files in the same directory.
+Text arriving from the model is provisional until that response finishes. The UI
+can display it immediately while retaining its interrupted/completed status.
 
-> "I made permission prompts synchronous and blocking by design. While the LLM stream is paused waiting for approval, no other output can appear. This prevents the confusing situation where tool results interleave with pending approval prompts. The cost is latency -- the LLM sits idle while the user decides -- but for destructive operations, clarity matters more than speed."
+Approval responses identify the proposal and its revision. A plain unqualified
+“yes” crossing an asynchronous boundary is not a sufficient execution contract.
 
----
+For a local in-process prototype, these events need no network protocol. The same
+separation still prevents rendering code from accumulating execution policy.
 
-## 🔧 Deep Dive: Terminal UI Components
+## 🔧 Deep dive 1: Stream useful text without taking over the terminal — 10 minutes
 
-### Spinner Animation
+> “I would use incremental transcript rendering with bounded buffering. The goal
+> is for the user to read progress while retaining normal terminal scrollback.
+> I would avoid redrawing the entire conversation for every arriving fragment.”
 
-The spinner cycles through braille dot frames at 80ms intervals, providing visual feedback during tool execution. It hides the cursor on start and restores it on stop, replacing the spinner line with a green checkmark and completion message, or a red X on failure.
+Provider chunks are not semantic units. A chunk can end halfway through a word,
+a formatting marker, or a tool argument. Rendering cannot assume one event equals
+one line or one complete action.
 
-### Progress Bar
+I would accumulate text into a small active buffer and flush on a short interval
+or a completed line. This makes output responsive without requiring one terminal
+write per token.
 
-For longer operations like large file reads, a horizontal bar renders using filled and empty block characters with a percentage label. It updates in-place using carriage return, avoiding scroll.
+The renderer tracks incomplete fences and inline formatting. Completed lines can
+be committed to scrollback. A small active tail may be repainted while its format
+is still ambiguous.
 
-### Conversation Layout
+There is an explicit limit on that tail. A model could emit a very long line or
+never close a code fence. We fall back to readable plain text instead of retaining
+an unbounded formatting buffer.
 
-The conversation renderer distinguishes user messages, assistant messages, tool execution indicators, and tool results through color coding and indentation. Tool results longer than 20 lines are truncated to the first 10 and last 10 lines with an ellipsis separator. Error results display in red with the error message.
+Syntax highlighting is an enhancement. An unrecognized language or malformed
+fence should still produce readable code. I would not block the entire response
+waiting for a perfect parse.
 
----
+For a large markdown table, terminal width limits matter more than faithfully
+recreating browser formatting. A readable row-oriented presentation is an
+acceptable fallback when columns will not fit.
 
-## ⌨️ Input Handling
+### Compare the alternatives
 
-### Readline and History
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Incremental transcript | Early reading, normal scrollback | Limited revision of old output |
+| ❌ Wait for complete response | Simple formatting | Long silence during generation |
+| ❌ Full-screen interface for the first version | Rich navigation and panels | More focus, layout, and terminal-state complexity |
 
-The input layer wraps Node.js readline with custom keypress handling. Ctrl+C cancels the current operation (not the process). Ctrl+D exits the session. Up and down arrows navigate command history stored in a circular buffer of 100 entries. History persists to disk between sessions.
+The full-screen alternative does not inherently flicker, and a framework is not
+inherently slow. It is less attractive here because our first workflow is mostly
+a sequential conversation. If users need persistent file panes and many concurrent
+tasks, I would revisit that choice.
 
-### Multi-Line Input
+The cost of committing text to scrollback is that earlier formatting cannot always
+be repaired. A response interrupted halfway through a sentence also remains
+visible. I would mark it interrupted instead of pretending it never appeared.
 
-Two submission modes are supported. The default mode submits on an empty line -- the user types their message across multiple lines and presses Enter twice to send. The alternative mode uses a delimiter: the user types "<<<" on a new line to submit. This accommodates pasting code blocks that contain empty lines.
+### Handle slow output and large logs
 
-### Slash Command Autocomplete
+A local terminal is usually fast, but an SSH connection or redirected pipe can be
+slow. If we ignore output backpressure, queued text can grow without bound even
+though individual chunks are small.
 
-When the user types "/", the autocomplete engine offers completions: /help, /clear, /history, /exit, /model. Tab completion cycles through matching options. This is implemented via the readline completer callback.
+The renderer batches output and respects the destination's ability to accept it.
+Repeated transient progress updates can be coalesced. Approval requests, errors,
+and final operation outcomes must retain their ordering and identity.
 
----
+Large tool logs need a separate policy: show a short bounded preview and provide
+a path to the complete local artifact. The transcript records that truncation
+occurred. It must not silently turn “first ten lines shown” into “all tests passed.”
 
-## 🎨 Theming System
+Display limits and model-context limits are different. Hiding a log in the UI
+should not imply that sending the entire log to the model is acceptable.
 
-### Theme Structure and Detection
+### Terminal capability and untrusted output
 
-Each theme defines five color categories: base colors (primary, secondary, accent, background, foreground), semantic colors (success, warning, error, info), UI element colors (prompt, user message, assistant message, tool output, code block), and syntax highlighting colors (keyword, string, number, comment, function, variable, operator).
+Detect whether the output is interactive before using cursor movement or spinners.
+Plain output should contain stable text records, useful in a saved transcript.
+Color and Unicode can improve display but need fallbacks.
 
-The theme manager auto-detects terminal background by reading the COLORFGBG environment variable. If the background value exceeds 6, it selects the light theme; otherwise, it defaults to dark. The user can override this with explicit configuration.
+Measure display width rather than string length: wide characters, combining
+characters, and embedded styling affect cursor placement. On resize, repaint the
+active region within the new width without rewriting all historical scrollback.
 
-| Theme | Primary | Secondary | Accent | Background |
-|-------|---------|-----------|--------|------------|
-| Dark | Coral (#FF6B6B) | Teal (#4ECDC4) | Yellow (#FFE66D) | #1a1a1a |
-| Light | Deep Red (#e53935) | Teal (#00897b) | Amber (#ffc107) | #ffffff |
+Treat model text and command output as untrusted terminal content. Filter control
+sequences so a log cannot move the cursor and impersonate an approval prompt.
+Only the renderer should emit the terminal controls used for UI structure.
 
-### Color Capability Detection
+The performance question is therefore about bounded work and output ownership,
+not a speculative token-per-second threshold at which terminals stop working.
 
-The output layer detects the terminal's color support level (8, 16, 256, or true color) and degrades gracefully. True color terminals get full hex color rendering. 256-color terminals get the nearest palette match. 8-color terminals fall back to bold/dim attributes for differentiation.
+## 🔧 Deep dive 2: Make an approval mean one understandable thing — 9 minutes
 
----
+Consider an edit to the authentication module. A prompt that shows only the file
+path leaves the developer unable to evaluate the change.
 
-## 📐 Layout Engine
+I would display the operation, target, relevant diff, and approval scope. If the
+diff is large, the user can inspect the full proposal before deciding. Truncation
+must be visible, and hidden content must remain inspectable.
 
-### Terminal Width Handling
+For a command, show the command, working directory, and requested access. A label
+such as “run tests” is insufficient because repository scripts can do more than
+their names imply.
 
-The layout engine reads terminal width from stdout columns (defaulting to 80) and listens for resize events. All text output passes through a word-wrap function that respects the current width minus any indentation. Long strings without natural break points are truncated with an ellipsis.
+The available decisions should have distinct meanings:
 
-### Box Drawing
+- Approve this exact proposal once.
+- Grant a clearly described scope for the current task or session.
+- Deny the proposal.
 
-The box drawing function renders bordered content using Unicode box characters, with an optional title embedded in the top border. This is used for permission dialogs, error messages, and session status displays.
+A broader grant is an explicit choice, not an interpretation of “yes.” The user
+should be able to inspect and revoke it later.
 
----
+### Own the prompt, not necessarily every background operation
 
-## ♿ Accessibility
+While an approval is active, it owns interactive input and the visible decision
+region. Ordinary progress from independent work can be buffered or summarized.
+The user must not see a different proposal silently replace the one they read.
 
-### Color Contrast
+The runtime can continue independent authorized reads if they do not invalidate
+the proposal. There is no fundamental need to halt all computation merely because
+stdin is waiting for a decision.
 
-All theme color pairs are validated against WCAG AA requirements (4.5:1 contrast ratio). The accessibility checker computes relative luminance for foreground and background colors and rejects combinations that fail the threshold. This runs at theme load time, not at render time.
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ One visible, identified approval | Clear decision and scope | Serializes human decisions |
+| ❌ Overlapping unqualified prompts | Easy to emit from workers | Keystrokes can approve the wrong operation |
+| ❌ Prompt for every small read | Simple policy presentation | Repetition encourages habitual approval |
 
-### Screen Reader Support
+An asynchronous queue can be correct if it preserves identity and focus. The
+problem is uncontrolled overlapping prompts, not asynchronous programming itself.
 
-Terminal announcements use the OSC title sequence to push status updates to screen readers. A plain-text extraction function strips all ANSI escape codes from formatted output. Semantic descriptions are generated for non-text elements: "Code block: first 50 characters...", "Permission required: Edit /path/to/file.ts", "Tool output: 15 lines".
+### Revalidate what the user saw
 
-### Keyboard Navigation
+Suppose the user opens the file in an editor while reading the proposed diff.
+The frontend sends approval for the displayed revision. The runtime checks that
+the operation still matches and the target has not changed underneath it.
 
-All interactive elements (permission prompts, option menus) support Tab/Shift+Tab navigation between focusable elements. The focused element renders with inverted colors. Enter activates the focused element.
+If it changed, the proposal becomes stale and must be refreshed. The old approval
+cannot silently authorize a different replacement.
 
----
+This matters even with a single agent. The human editor, a formatter, or a build
+watcher can modify the workspace independently.
 
-## 🔧 Deep Trade-off: Line-by-Line Streaming vs Full Terminal UI Framework
+A resolved approval event closes the prompt. Duplicate keypresses or replayed
+responses cannot execute the proposal twice; the runtime enforces the transition.
+The UI disables a resolved decision and presents the resulting operation status.
 
-**Decision**: Render streamed content line-by-line using raw ANSI escape codes rather than adopting a full terminal UI framework like Ink (React for CLI) or Blessed.
+### Keep the policy boundary visible
 
-**Why line-by-line works for this problem**: An AI coding assistant produces a linear stream of text. The user reads top-to-bottom as tokens arrive. Line-by-line rendering maps naturally to this consumption pattern. It requires minimal state (just "am I in a code block?"), works in every terminal emulator, and adds zero framework overhead. Startup time is near-instant because there is no virtual DOM to initialize.
+The frontend presents and collects a decision. It does not replace enforcement.
+A malicious repository can contain text asking the model to access credentials;
+that text never becomes a user approval just because it appears in the transcript.
 
-**Why a full TUI framework fails here**: Ink re-renders the entire visible area on every state change, which creates visible flickering during fast token streaming (100+ tokens/second). Blessed adds 2-3MB to bundle size and has known compatibility issues with Windows Terminal. Both frameworks assume a "screen" metaphor (fixed viewport, cursor positioning) that fights against the natural scrolling behavior users expect from a CLI tool. When the assistant produces a 200-line response, the user expects it to scroll like any other terminal output -- not be trapped in a paged viewport.
+The trade-off is additional state around proposal identity and revision. For an
+interface that can change the user's files, this state is part of correctness,
+not merely dialog styling.
 
-**What we give up**: We cannot retroactively update previously rendered lines. If the assistant's response contains a markdown table, we cannot re-align columns after seeing the widest cell. We also cannot implement features like collapsible sections or clickable links without mouse support. For a future web terminal interface, a component-based framework would be the right choice -- but for native terminal usage, raw ANSI is simpler and more robust.
+## 🔧 Deep dive 3: Cancellation and recovery must describe actual effects — 8 minutes
 
----
+> “Cancel is a request to stop future work. It is not a promise that the workspace
+> returned to its starting state. The UI needs to explain that distinction through
+> concrete operation outcomes.”
 
-## 🔧 Deep Trade-off: Synchronous Permission Prompts vs Async Queue
+I would define a first interrupt as cancellation of the active task. A separate
+exit action can close the application. Exact key behavior should be visible in
+help and consistent across the supported terminal adapters.
 
-**Decision**: Block all output while waiting for user permission approval rather than queuing prompts and continuing to stream.
+The task enters a cancelling state while the runtime stops model requests and
+owned child processes. The UI stays responsive, but it does not immediately mark
+all operations cancelled.
 
-**Why blocking works**: When the LLM requests a file edit, the user needs full context to make a safety decision. If we continued streaming the assistant's explanation while simultaneously showing "Approve edit to auth.ts? [y/n]", the user might approve without reading because the prompt scrolled past. Blocking creates a clear modal moment: everything stops, the user reads the diff, and makes an informed decision. This is critical because permission prompts gate destructive operations.
+Some operations may already have finished. Others may have produced effects before
+being terminated. A network command can even have an unknown outcome after its
+local process disappears.
 
-**Why async queuing fails**: In an async model, multiple tool calls could stack up approval prompts. The user would see "Approve edit to auth.ts?" followed immediately by "Approve edit to router.ts?" before having time to evaluate either. Worse, if the user types "y" intending to approve the first prompt, it might be consumed by the second. The interaction becomes unpredictable and dangerous for write operations.
+| Situation | What the UI should say |
+|-----------|------------------------|
+| Edit completed before cancellation | File changed; show the recorded diff |
+| Proposal never executed | Cancelled before execution |
+| Test process stopped midway | Test run interrupted; no passing result |
+| Command outcome cannot be established | Outcome unknown; inspect before retrying |
 
-**What we give up**: Latency. The LLM sits idle during approval, wasting potential computation time. For sessions with many file edits, this creates a stop-and-go rhythm that some users find frustrating. The "always allow for session" option (the "a" key) mitigates this for trusted directories, letting users opt into faster flow after the first approval.
+An optimistic “everything cancelled” message is simple but can hide work that
+already happened. Waiting forever for certainty is also poor interaction. Present
+known outcomes and identify remaining uncertainty.
 
----
+### Resume from facts rather than repainting an old screen
 
-## 🔧 Deep Trade-off: ANSI Escape Codes vs Terminal-Specific APIs
+On resume, reconstruct the task from stored events. Restore its workspace identity,
+request, completed operations, and outstanding state. Recompute the terminal layout
+for the current window.
 
-**Decision**: Use portable ANSI escape codes exclusively rather than terminal-specific features (iTerm2 inline images, Kitty graphics protocol, Sixel).
+Old pending approvals need revalidation. Files and policies may have changed since
+the session was saved. The interface should show a new proposal when needed.
 
-**Why ANSI works**: ANSI escape codes are supported by every terminal emulator on every platform. The same escape sequence for bold text works in macOS Terminal, Windows Terminal, Linux xterm, and SSH sessions. This universality is essential for a developer tool that must work in CI environments, remote servers, and containerized development setups.
+A resumed transcript is historical evidence. It does not mean old file contents
+are current or an old test run validates today's working tree.
 
-**Why terminal-specific APIs fail at this stage**: Adopting Kitty's graphics protocol would enable inline image rendering -- useful for displaying charts or screenshots. But it would work in exactly one terminal emulator. Users on VS Code's integrated terminal, iTerm2, or any SSH session would see garbage characters or nothing. Supporting multiple protocols multiplies testing surface without benefiting most users.
+If the runtime cannot restore context, the UI should not claim seamless resume.
+Showing an archive is still useful, but continuing the task requires the original
+constraints and operation state to reach the agent.
 
-**What we give up**: Rich media rendering. We cannot show inline images, clickable hyperlinks (some terminals support OSC 8, but not universally), or proportional fonts. For a code-focused tool, these are acceptable losses -- the primary output is text and code, which ANSI handles well.
+### Error handling without losing the next request
 
----
+Provider errors leave the user's draft and visible transcript intact. A retry
+starts a new response attempt linked to the same task, rather than silently
+appending duplicated text to the prior attempt.
 
-## ⚖️ Trade-offs Summary
+Output after cancellation is tagged to its original task. New user input cannot
+inherit an earlier task's approval or completion event.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Line-by-line streaming | Immediate feedback, simple state, universal compatibility | Cannot re-render previous lines, no retroactive formatting |
-| ❌ Ink/React TUI framework | Component model, declarative rendering | Flickering on fast streams, startup overhead, viewport metaphor |
-| ✅ Synchronous permission prompts | Clear UX, no race conditions, safe decisions | Blocks LLM computation, stop-and-go rhythm |
-| ❌ Async permission queue | Non-blocking, higher throughput | Confusing overlap, risk of mis-approval |
-| ✅ ANSI escape codes | Universal support, zero dependencies | No rich media, limited styling palette |
-| ❌ Terminal-specific APIs | Inline images, clickable links | Fragmented support, testing burden |
-| ✅ Built-in readline | Standard, cross-platform, zero setup | Less control over input handling |
-| ❌ Custom input handler | Full control, custom key sequences | Platform-specific edge cases, maintenance |
-| ✅ Theme auto-detection | Works out of the box for most users | COLORFGBG not universally set |
-| ❌ Manual theme selection only | Always correct | Extra configuration step, worse defaults |
+For plain input from a pipe, interactive approval cannot depend on a hidden prompt.
+The runtime should report that a decision is required or use an explicitly supplied
+policy; end-of-input is never interpreted as consent.
 
----
+These choices cost more state than a simple readline loop, but they make failures
+understandable and prevent an interface event from triggering the wrong effect.
 
-## 🚀 Scalability and Future Enhancements
+## 🧪 Verification and growth — 4 minutes
 
-**What breaks first**: Terminal rendering becomes the bottleneck when LLM providers increase streaming speed. At 500+ tokens/second, the current line-by-line renderer may struggle to keep up with the rate of ANSI encoding and stdout writes. The mitigation is to batch tokens into larger chunks before rendering, sacrificing some real-time granularity for throughput.
+I would test the boundaries where rendering and execution can disagree:
 
-**What to build next**:
+1. Split formatting markers and long lines across arbitrary stream chunks.
+2. Slow stdout while tool completion and approval events arrive.
+3. Resize during output, including wide and combining characters.
+4. Deliver two proposals and repeated input; only the intended one is approved.
+5. Change a file while its diff is awaiting approval.
+6. Cancel during an edit or command, then restore the task from its saved record.
+7. Replay events and confirm that text and operation outcomes are not duplicated.
+8. Use plain output, keyboard-only interaction, and actual screen-reader setups.
 
-1. **Split pane view** -- show file preview alongside conversation using terminal multiplexing
-2. **Rich diff rendering** -- side-by-side file comparison for edit approval
-3. **Web terminal option** -- browser-based interface using xterm.js for environments where native terminal is limiting
-4. **Mouse support** -- click-to-approve in terminals that support mouse events
-5. **Custom keybindings** -- user-configurable keyboard shortcuts for power users
-6. **Plugin widgets** -- third-party UI components for specialized tool output
+A mock event source makes these scenarios deterministic. It does not replace
+end-to-end testing of the real provider adapter and executor.
 
----
+The first growth issues are likely large outputs, long transcripts, and interrupted
+state transitions. I would measure memory, prompt responsiveness, rendering delay,
+and cancellation completion before adding a richer interface.
 
-## 💬 Closing Summary
+A future GUI could reuse the task events and approval contract. Its components and
+virtualization would differ, but the execution facts should remain the same.
 
-> "The AI code assistant's frontend is a terminal UI built on three layers: input handling via readline with history and autocomplete, a streaming markdown renderer that processes tokens line-by-line with syntax highlighting, and an ANSI output layer that adapts to terminal capabilities. The key design tension is between richness and portability -- I consistently chose portable, simple solutions (ANSI over terminal-specific APIs, line-by-line over full TUI frameworks, synchronous prompts over async queues) because a developer tool must work everywhere: local terminals, SSH sessions, CI environments, and containerized setups. The permission prompt system is deliberately blocking to prevent accidental approval of destructive operations. Theming auto-detects terminal background and validates contrast ratios for accessibility. The main scalability concern is rendering throughput as LLM streaming speeds increase, addressable by batching tokens before rendering."
+## ⚖️ Decisions to leave on the whiteboard
+
+| Decision | Choice | Cost accepted |
+|----------|--------|---------------|
+| Rendering | ✅ Incremental transcript | Limited correction of historical formatting |
+| Approval | ✅ One identified proposal in focus | Serial human decisions |
+| Cancellation | ✅ Reconcile individual outcomes | More states than success/failure |
+| Portability | ✅ Plain text baseline | Rich features depend on capabilities |
+
+> “My frontend makes the agent understandable without treating generated text as
+> proof. One input owner keeps approvals precise, bounded rendering preserves a
+> usable terminal, and operation-based recovery tells the developer what changed.
+> Those contracts matter more than how elaborate the terminal decoration becomes.”

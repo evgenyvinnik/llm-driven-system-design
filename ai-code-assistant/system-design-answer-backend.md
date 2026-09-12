@@ -1,502 +1,353 @@
-# AI Code Assistant - System Design Answer (Backend Focus)
+# AI Code Assistant — Backend System Design
 
-*45-minute system design interview format - Backend Engineer Position*
+*A 45-minute discussion of a local agent runtime, its execution boundary, and recovery.*
 
----
+This answer proposes a dependable coding assistant. The checked-in project is a
+smaller Node.js prototype; its implemented behavior and missing safeguards are
+mapped in [architecture.md](./architecture.md).
 
-## 📋 Problem Statement
+## 📋 Establish the scope — 5 minutes
 
-Design the backend infrastructure for an AI-powered command-line coding assistant. The system must orchestrate an agentic loop where an LLM autonomously invokes tools (file read, file edit, shell commands), manage a finite context window of 128K-200K tokens, abstract over multiple LLM providers, enforce a layered permission system for safe file and command access, persist session state for recovery, and cache file content and tool results for performance. The primary challenge is building a reliable tool orchestration engine that handles retries, permission checks, and context compression without losing conversation coherence.
+> “For this problem, backend means the engine behind the terminal. I would start
+> with one developer, one workspace, and one active coding task. The difficult
+> boundary is between a model proposing an action and a process actually changing
+> files or running a command.”
 
----
+The assistant should investigate code, propose edits, execute authorized tools,
+run checks, and explain results. It must retain the user's constraints through
+multiple model calls and recover sensibly if a call or process fails.
 
-## 📋 Requirements Clarification
+I would clarify whether the assistant edits the current checkout or a separate
+workspace. For this design, I prefer an isolated task workspace with an explicit
+apply step when changes need to enter the developer's current checkout.
 
-### Functional Requirements
+That choice makes intermediate edits easier to inspect and prevents an unfinished
+refactor from immediately disturbing the user's running application. It does not
+isolate arbitrary processes by itself; execution restrictions are separate.
 
-1. **LLM integration** -- support multiple LLM providers (Anthropic, OpenAI, local models) through a unified interface
-2. **Tool system** -- extensible framework for file operations (Read, Write, Edit, Glob, Grep) and shell commands (Bash)
-3. **Context management** -- handle token limits with summarization, truncation, and selective retention
-4. **Session persistence** -- store and resume conversation state across process restarts
-5. **Permission system** -- enforce layered security policies for file access and command execution
+The first version needs one real provider adapter plus a deterministic substitute
+for testing the loop. A tool plugin ecosystem and shared cloud sessions can wait.
 
-### Non-Functional Requirements
+I would state four invariants before choosing infrastructure:
 
-1. **Latency** -- first token streamed to terminal in under 500ms
-2. **Portability** -- single-user local application running on macOS, Linux, and Windows
-3. **Reliability** -- graceful degradation on API failures with automatic retry
-4. **Extensibility** -- plugin system for custom tools and MCP (Model Context Protocol) servers
+1. Model output and repository content do not grant execution authority.
+2. Every executed operation has complete, validated arguments and a recorded identity.
+3. A successful response is backed by an observed outcome, not generated confidence.
+4. Recovery never silently repeats an operation with an uncertain external effect.
 
-### Scale Estimates
+A local acknowledgement should be fast. Provider latency, shell duration, and human
+approval time vary, so I would measure them separately rather than promise one
+universal task latency.
 
-- Context window: 128K-200K tokens depending on model
-- File handling: files up to 10MB
-- Session history: thousands of messages across sessions
-- Tool execution cache: 500 entries per session
-- Concurrent tool executions: up to 5 independent read operations in parallel
-
----
-
-## 🏗️ High-Level Architecture
-
-```
-┌───────────────────────────────────────────────────────────────────────┐
-│                          AI Code Assistant                            │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐            │
-│  │     CLI      │───▶│    Agent     │───▶│   LLM API    │            │
-│  │   Interface  │    │  Controller  │    │  (Provider)  │            │
-│  └──────────────┘    └──────┬───────┘    └──────────────┘            │
-│                             │                                         │
-│                             ▼                                         │
-│                      ┌──────────────┐                                 │
-│                      │    Tool      │                                 │
-│                      │   Router     │                                 │
-│                      └──────┬───────┘                                 │
-│                             │                                         │
-│               ┌─────────────┼─────────────┐                          │
-│               ▼             ▼             ▼                          │
-│         ┌──────────┐  ┌──────────┐  ┌──────────┐                    │
-│         │   Read   │  │   Edit   │  │   Bash   │                    │
-│         │   Tool   │  │   Tool   │  │   Tool   │                    │
-│         └──────────┘  └──────────┘  └──────────┘                    │
-│               │             │             │                          │
-│               ▼             ▼             ▼                          │
-│  ┌────────────────────────────────────────────────────────┐          │
-│  │              Permission & Safety Layer                  │          │
-│  └────────────────────────────────────────────────────────┘          │
-│               │             │             │                          │
-│               ▼             ▼             ▼                          │
-│        ┌──────────┐  ┌──────────┐  ┌──────────┐                    │
-│        │   File   │  │  Shell   │  │ Session  │                    │
-│        │  System  │  │ Sandbox  │  │  Store   │                    │
-│        └──────────┘  └──────────┘  └──────────┘                    │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
-```
-
-> "The architecture is organized around the Agent Controller at the center, which runs the agentic loop. It talks upward to the LLM via a provider abstraction and downward to tools via a router. Every tool invocation passes through the Permission & Safety Layer before touching the file system or shell. Session state flows to disk through the Session Store. This layering means I can change LLM providers, add new tools, or modify permission rules independently."
-
----
-
-## 🔧 Deep Dive: The Agentic Loop and Tool Orchestration
-
-### Loop Design
-
-The agentic loop is the heart of the system. After receiving user input, the agent enters a while-true loop: send messages to the LLM, stream the response to the terminal, check if the response contains tool calls, execute them with permission checks, append results to the context, and loop back for the LLM's next turn. The loop exits only when the LLM produces a response with no tool calls -- meaning it has finished its task and is ready for the next user message.
+## 🏗️ Architecture and request flow — 5 minutes
 
 ```
-User Input
-    │
-    ▼
-┌───────────────────────────────────┐
-│      Add message to context       │
-└───────────────────┬───────────────┘
-                    │
-                    ▼
-┌───────────────────────────────────┐
-│        LLM Inference              │◀────────────┐
-│  - Stream text to terminal        │             │
-│  - Collect tool call requests     │             │
-└───────────────────┬───────────────┘             │
-                    │                              │
-               Has tool calls?                     │
-                    │                              │
-              ┌─────┴─────┐                        │
-              ▼           ▼                        │
-            [Yes]        [No]                      │
-              │           │                        │
-              │           ▼                        │
-              │     Done (await next input)        │
-              │                                    │
-              ▼                                    │
-┌───────────────────────────────────┐             │
-│     Check Permissions             │             │
-│  - Auto-approve reads             │             │
-│  - Prompt user for writes/cmds    │             │
-└───────────────────┬───────────────┘             │
-                    │                              │
-                    ▼                              │
-┌───────────────────────────────────┐             │
-│     Execute Tools                 │             │
-│  - Safe tools in parallel         │             │
-│  - Approval-required sequentially │             │
-└───────────────────┬───────────────┘             │
-                    │                              │
-                    ▼                              │
-┌───────────────────────────────────┐             │
-│     Add results to context        │─────────────┘
-└───────────────────────────────────┘
+┌──────────────┐      ┌──────────────────┐      ┌─────────────────┐
+│ Terminal     │◀────▶│ Task coordinator │◀────▶│ Provider adapter│
+└──────────────┘      └───────┬──────────┘      └─────────────────┘
+                             │
+                    ┌────────▼─────────┐      ┌─────────────────┐
+                    │ Policy/scheduler │─────▶│ Restricted tools│
+                    └────────┬─────────┘      └────────┬────────┘
+                             ▼                         │ outcomes
+                    ┌─────────────────────────────────▼────────┐
+                    │ Durable task and operation journal       │
+                    └──────────────────────────────────────────┘
 ```
 
-### Tool Execution Strategy
-
-Tool calls are grouped by approval requirements. Auto-approved tools (Read, Glob, Grep) execute in parallel via concurrent promises, because they are pure reads with no side effects. Tools requiring approval (Write, Edit, Bash with non-safe commands) execute sequentially, because each needs an explicit user decision before proceeding. If the user denies a tool call, an error result ("User denied permission") is added to the context so the LLM can adapt its strategy rather than retrying the same denied operation.
-
-### Idempotent Tool Execution
-
-Each tool call carries a unique ID assigned by the LLM provider. This ID serves as an idempotency key: if the agent retries a request due to a network error, it checks the execution cache before re-running a tool. For read operations, re-execution is harmless. For write operations, the cache prevents applying the same edit twice. The cache persists for the session duration and is cleaned up when the session ends.
-
----
-
-## 🔧 Deep Dive: LLM Provider Abstraction
-
-### Provider Interface
-
-> "I designed a provider abstraction layer that normalizes the differences between LLM APIs. Each provider implements a common interface with methods for streaming completion, token counting, and tool definition formatting. This lets us swap providers without changing any agent logic."
-
-```
-┌──────────────────────┐
-│   LLMProvider        │◀──── Common Interface
-│   Interface          │
-├──────────────────────┤
-│  stream()            │
-│  complete()          │
-│  countTokens()       │
-│  formatMessages()    │
-│  formatTools()       │
-└──────────┬───────────┘
-           │
-           ├──────────────────┬──────────────────┐
-           ▼                  ▼                  ▼
-    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-    │  Anthropic   │   │   OpenAI     │   │    Local     │
-    │  Provider    │   │   Provider   │   │   Provider   │
-    └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
-           ▼                  ▼                  ▼
-    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-    │  Claude API  │   │  GPT-4 API   │   │ Ollama /     │
-    │              │   │              │   │ LM Studio    │
-    └──────────────┘   └──────────────┘   └──────────────┘
-```
-
-**Key responsibilities of each provider**:
-
-- **stream()** -- returns an async iterable yielding text chunks and tool call events, normalized into a common StreamChunk format regardless of provider-specific event shapes
-- **complete()** -- non-streaming completion for operations like context summarization where we need the full result before proceeding
-- **countTokens()** -- estimates token count for context budget calculations; each provider uses its own tokenizer
-- **formatMessages()** -- converts internal message format to provider-specific API format (Anthropic uses content blocks, OpenAI uses a flat content string)
-- **formatTools()** -- converts tool definitions to provider-specific schema (Anthropic uses input_schema, OpenAI uses function parameters)
-
-### Stream Chunk Processing
-
-The stream from the LLM provider yields four types of events:
-
-| Chunk Type | Agent Action |
-|------------|--------------|
-| text | Write to terminal via streaming renderer |
-| tool_call_start | Store tool call ID and name, show spinner |
-| tool_call_delta | Accumulate JSON parameters incrementally |
-| tool_call_end | Push completed tool call to pending queue |
-
-After the stream completes, if the pending queue has tool calls, the agent executes them and loops. If the queue is empty, the turn is done.
-
-### Retry Configuration
-
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| maxRetries | 3 | Balance reliability vs user wait time |
-| initialDelayMs | 1000 | Allow transient rate limits to clear |
-| maxDelayMs | 10000 | Cap wait to avoid user abandonment |
-| backoffMultiplier | 2 | Exponential backoff prevents thundering herd |
-| retryableErrors | rate_limit, overloaded, timeout | Only retry errors that are likely transient |
-
----
-
-## 🔧 Deep Dive: Context Window Management
-
-### The Problem
-
-> "LLM context windows are large but finite -- 128K to 200K tokens depending on the model. Long coding sessions easily exceed limits. A single large file read can consume 40K tokens. Tool outputs accumulate rapidly. We need a multi-strategy approach to stay within budget while preserving the conversation's intent and the LLM's ability to reason about recent work."
-
-### Token Budget Allocation
-
-```
-┌────────────────────────────────────────────────────────────┐
-│              Token Budget (128K Total)                      │
-├────────────────────────────────────────────────────────────┤
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ System prompt                             2K tokens  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ Tool definitions                          5K tokens  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ Context summary (compressed history)     10K tokens  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ Recent messages (last 10 turns)          30K tokens  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ File cache (recently read files)         40K tokens  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ Response buffer (for LLM output)         40K tokens  │  │
-│  └──────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────┘
-```
-
-### Compression Pipeline
-
-When adding a new message would push the context past 90% capacity, the compression pipeline fires. It applies four strategies in order:
-
-1. **Summarize old messages** -- take all messages except the last 10 turns, send them to the LLM with a summarization prompt, and replace them with a single system message containing the summary. This preserves the *intent* of earlier conversation while dramatically reducing token count.
+The coordinator owns task state, model context, and budgets. The adapter owns
+provider message semantics. Policy and the executor decide what may run and what
+resources it can access. The journal keeps evidence across process failure.
 
-2. **Truncate large tool outputs** -- any tool result exceeding 10,000 characters is cut to the first 5,000 characters, a "[truncated]" marker, and the last 2,000 characters. Head and tail are both kept because file beginnings often contain imports/declarations and endings contain the code the user asked about.
+A turn follows a short sequence:
 
-3. **Deduplicate file reads** -- if the same file was read multiple times, keep only the most recent version. Earlier reads of the same path are removed from context.
+1. Record the user's request and select relevant context.
+2. Ask the provider for the next response.
+3. Assemble complete tool calls and validate them.
+4. Record intent, check policy, and obtain required approval.
+5. Execute authorized operations and record outcomes.
+6. Return matching results to the model and continue within budget.
 
-4. **Compress edit diffs** -- replace full file edit results with a summary: "Edited /path/to/file.ts: replaced X with Y (3 lines changed)."
+Text can stream to the terminal while arguments are assembled. Tools cannot run
+from a partial argument fragment. A response containing only tool calls still needs
+an assistant record before its tool results are returned.
 
-```
-┌──────────────┐
-│ New Message   │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐    No     ┌──────────────┐
-│ Over 90%     │──────────▶│ Add to       │
-│ capacity?    │           │ context      │
-└──────┬───────┘           └──────────────┘
-       │ Yes
-       ▼
-┌────────────────────────────────────────────┐
-│          Compression Pipeline              │
-├────────────────────────────────────────────┤
-│ 1. Summarize messages older than 10 turns  │
-│ 2. Truncate tool outputs > 10K chars       │
-│ 3. Deduplicate file reads (keep latest)    │
-│ 4. Compress edit diffs to summaries        │
-└────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────┐
-│ Add message  │
-└──────────────┘
-```
-
----
-
-## 💾 Data Model
-
-### Session Structure
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| id | UUID | Unique session identifier |
-| workingDirectory | string | Absolute path to project root |
-| startedAt | timestamp | Session creation time |
-| messages | Message[] | Full conversation history |
-| permissions | Permission[] | Granted permission records |
-| settings | SessionSettings | Model, temperature, max tokens |
-
-### Message Structure
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| role | "user" / "assistant" / "tool" | Message author |
-| content | string | Text content |
-| toolCalls | ToolCall[] (optional) | Tool invocations requested by assistant |
-| toolResults | ToolResult[] (optional) | Results of tool executions |
-| timestamp | ISO 8601 | When the message was created |
+The adapter must preserve system instructions and explicit stop reasons. A provider
+that reports output truncation is not reporting successful task completion.
 
-### Permission Record
+I would keep these modules local initially. A network queue between every module
+would add failure boundaries without helping a single-machine workflow.
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| type | "read" / "write" / "execute" | Operation category |
-| pattern | string | Glob pattern or command prefix matched |
-| scope | "session" / "permanent" | How long the grant lasts |
-| grantedAt | timestamp | When the user approved |
+## 💾 Data and resource budget — 4 minutes
 
-### Session Storage
+A transcript is useful for display, but recovery also needs structured operation
+state. I would use a local transactional journal once that requirement exists.
 
-Sessions are stored as JSON files at ~/.ai-assistant/sessions/{id}.json. The session manager uses the atomic write pattern for crash safety: write to a temp file with a timestamp suffix, fsync to disk, then atomic rename to the final path. If the rename fails, the temp file is cleaned up. This guarantees the session file is never partially written.
+| Record | Important fields | Why it exists |
+|--------|------------------|---------------|
+| Task | ID, workspace identity, request, constraints, status | Defines the work and its authority |
+| Event | Task ID, sequence, type, payload reference | Ordered history and UI replay |
+| Operation | Local ID, provider call ID, arguments hash, state | Tracks intent and observed effects |
+| Approval | Operation ID, scope, proposal revision, decision | Binds consent to a concrete action |
+| Artifact | Content identity, location, size, retention | Keeps large outputs outside model context |
 
----
+A tool definition contains a name, argument schema, and description. Execution also
+needs limits and effect classification. The model-facing schema does not replace
+runtime validation of paths, types, sizes, or timeouts.
 
-## 🔌 API Design -- Tool Definitions
+For capacity, suppose a task makes 20 calls averaging 20,000 input tokens. That is
+400,000 input tokens across the task. A context window limits one request, while
+a task budget must account for all requests and outputs.
 
-The tools are registered with the LLM as function definitions. Each tool specifies its name, description, parameter schema, and approval requirements.
+A large repository also consumes local resources. Reading 100 files in parallel
+may overwhelm memory if each read loads the entire file. I would bound both active
+operations and total bytes, with smaller default slices for investigation.
 
-| Tool | Parameters | Approval | Purpose |
-|------|-----------|----------|---------|
-| Read | file_path (required), offset, limit | Auto | Read file contents with line numbers |
-| Write | file_path (required), content (required) | Required | Create or overwrite a file |
-| Edit | file_path, old_string, new_string, replace_all | Required | String-based file modification |
-| Glob | pattern (required), path | Auto | Find files matching a glob pattern |
-| Grep | pattern (required), path, include | Auto | Search file contents with regex |
-| Bash | command (required), timeout, working_directory | Pattern-based | Execute shell command |
+The useful constraints are measurable resource budgets, not a hard-coded claim
+that every repository fits after a fixed number of calls.
 
-### Edit Tool: String Replacement Semantics
+## 🔧 Deep dive 1: Authorize capabilities and enforce them — 10 minutes
 
-The Edit tool uses string-based replacement rather than line-number-based editing. The execution flow is: read the file, count occurrences of old_string, reject if zero occurrences (string not found) or more than one occurrence (ambiguous -- provide more context or use replace_all), perform the replacement, and write the updated file atomically.
+> “I would treat the model as a planner that can make mistakes. A text instruction
+> to be careful is useful guidance, but execution safety comes from policy and an
+> enforceable resource boundary.”
 
-> "I chose string replacement over line numbers because line numbers change as files are edited. If the LLM reads a file, identifies a bug on line 42, and then edits line 30, the bug is no longer on line 42. String matching forces the LLM to provide enough context for a unique match, making edits robust to prior changes in the same session."
+A tool request first becomes a typed operation. We validate its arguments, resolve
+its target, determine required capabilities, and check those against current
+policy. Only then can it enter the execution queue.
 
-### Bash Tool: Safety Patterns
+Normal reads within the authorized workspace can proceed without repeated prompts.
+Access outside it, network use, and consequential commands require whatever
+additional authority the task's policy specifies.
 
-The Bash tool uses pattern matching to determine approval requirements. Safe read commands (ls, pwd, cat, head, tail, git status, git log, git diff, npm run dev/build/test/lint) are auto-approved. All other commands require explicit user approval.
+For files, policy must apply to the actual resource, including symlink behavior.
+Checking that a path string begins with a directory name is insufficient. Directory
+search must enforce the same rules on each file it exposes or reads.
 
----
+For commands, a familiar prefix does not establish harmless behavior. A test script
+is code defined by the repository; a shell expression may combine several effects.
+I would prefer structured commands where practical and still execute them inside
+an environment with controlled files, network, and inherited credentials.
 
-## 🔒 Permission System
+Containers or OS sandbox facilities can implement parts of that boundary, depending
+on platform. Their configuration determines the protection: mounting the entire
+home directory and inheriting credentials defeats the intended restriction.
 
-### Layered Defense
+### Make approval specific
 
-```
-┌─────────────────────────────────────────┐
-│   Layer 1: Path Restrictions            │
-│   - Only access working directory       │
-│   - Block .env, .ssh/, credentials      │
-│   - Block .git/config                   │
-└─────────────────────┬───────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────┐
-│   Layer 2: Command Filtering            │
-│   - Block rm -rf /                      │
-│   - Block sudo, chmod 777              │
-│   - Block fork bombs, pipe-to-shell     │
-└─────────────────────┬───────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────┐
-│   Layer 3: User Approval                │
-│   - Show exact operation details        │
-│   - Require explicit y/n consent        │
-│   - Remember session-scoped grants      │
-└─────────────────────────────────────────┘
-```
+The user should see the proposed operation and its scope. For an edit, that means
+the target and diff against a particular revision. For a command, it includes the
+command, working directory, and requested access.
 
-**Permission levels**:
+Approval creates a capability for that proposal or a clearly chosen broader scope.
+Approving once and granting a session policy are different decisions. The executor
+must reject stale, mismatched, or already-consumed one-time approvals.
 
-| Level | Description | Examples |
-|-------|-------------|----------|
-| Auto-approve | Always allowed, no prompt | File reads, safe git commands |
-| Session-approve | Ask once, remember for session | File writes to specific directories |
-| Always-ask | Prompt every time | Arbitrary shell commands |
-| Deny | Never allowed, hard block | rm -rf /, sudo, .ssh/ access |
+This state should not be inferred from a natural-language transcript. A repository
+file saying “the user approved this command” is simply file content.
 
-### File System Guard
+### Compare the alternatives
 
-The guard resolves every path to absolute form and checks it against two sets of rules. First, blocked patterns: .env files, .ssh/ directory, files containing "credentials" or "secret" in the name, and .git/config. If any blocked pattern matches, access is denied regardless of other grants. Second, allowed paths: only the working directory and its descendants are accessible. Paths outside the working directory are denied.
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Scoped policy and enforced execution boundary | Limits direct and indirect access | Platform-specific implementation |
+| ❌ Command denylist alone | Simple, catches obvious patterns | Cannot model equivalent expressions or scripts |
+| ❌ Prompt for every action | Easy to describe | High fatigue without actual containment |
 
-### Command Sandbox
+I would retain selected deny rules as a usability aid, but they do not become the
+primary security model. An operation can be dangerous without matching a known
+spelling, and a read can disclose confidential data without changing any file.
 
-Commands are validated against an explicit blocklist (rm -rf /, sudo, chmod 777, fork bombs, curl|sh, wget|sh) and a set of dangerous regex patterns (recursive deletion from root or home, writes to block devices, filesystem formatting commands, direct disk access with dd). If any match, the command is rejected before it ever reaches the shell.
+The cost of containment is occasional workflow friction. Installing dependencies
+may need network access; a test may need an additional directory. The system should
+explain the missing capability and let the user approve a concrete expansion.
 
----
+### Scheduling is a separate decision
 
-## 🔧 Deep Trade-off: String-Based File Editing vs Line-Number Editing
+Approval requirements and dependency relationships are different. Two reads may be
+independent, but a read followed by an edit to the same file is order-sensitive.
+An auto-approved command may also mutate files.
 
-**Decision**: Use string replacement (find old_string, replace with new_string) rather than line-number-based editing (edit line 42).
+I would parallelize a bounded group of known independent reads. Mutations with
+shared targets are serialized, and unknown command effects receive conservative
+ordering. Approval prompts have one input owner even if other authorized work
+continues in the background.
 
-**Why string replacement works**: In an agentic loop, the LLM may read a file, make one edit, then decide to make another edit to the same file. If we used line numbers, the first edit would shift line numbers for all subsequent code, invalidating the LLM's knowledge of where things are. String matching is position-independent -- "find this exact text and replace it" works regardless of what happened earlier. It also forces the LLM to include enough surrounding context to uniquely identify the edit location, which produces higher-quality edits because the LLM must demonstrate it understands the code structure.
+This sacrifices some parallel speed but keeps the model's observations consistent
+with the actions that produced them. A faster scheduler that reads the wrong
+revision can produce a slower and less reliable overall task.
 
-**Why line-number editing fails**: Consider a file where the LLM inserts 5 lines at line 10. Every line number after line 10 has shifted by 5. If the LLM's next edit targets "line 50," it is actually hitting what was originally line 45. The LLM would need to re-read the file after every edit to get accurate line numbers, doubling the number of tool calls and context tokens consumed. Some systems try to track line offsets, but this adds complexity and can still fail when multiple edits interact.
+## 🔧 Deep dive 2: Recover edits without replaying unknown effects — 10 minutes
 
-**What we give up**: String matching fails when the target string appears multiple times in the file. The mitigation is the uniqueness check: if old_string appears more than once, the tool returns an error asking the LLM to provide more context (include surrounding lines) or use the replace_all flag. In practice, this is rare because the LLM typically provides multi-line strings with enough context for uniqueness.
+The critical failure is not a rejected model request. It is a crash after a tool
+changed something but before the assistant recorded or displayed the result.
 
----
+An in-memory cache of tool-call IDs disappears in that crash. Even a durable cache
+cannot make every shell command safe to replay, because the external effect may
+have happened before the cache was updated.
 
-## 🔧 Deep Trade-off: LLM-Based Summarization vs Static Truncation for Context Compression
+I would record an operation state machine with pending, approved, running,
+succeeded, failed, and unknown states. A crash with an operation marked running
+triggers reconciliation, not unconditional execution.
 
-**Decision**: Use the LLM itself to summarize old conversation history rather than simply truncating to the most recent N messages.
+Local operation IDs remain stable when resuming the same operation. Provider IDs
+are retained for message linkage. A newly generated call may have a new provider
+ID, so semantic duplicate protection also needs operation-specific preconditions.
 
-**Why summarization works**: A coding session builds up important context over time. The user might say "I'm working on the authentication module" in message 3, then not mention it again for 20 messages. Static truncation would lose this framing context once message 3 scrolls past the window. LLM summarization can identify and preserve key facts: "User is refactoring the auth module. We've already fixed the login endpoint and updated the middleware. Remaining work: the registration flow." This compressed representation preserves intent in 50 tokens instead of 5,000.
+### Use revision-aware file changes
 
-**Why static truncation fails**: Truncation to the last N messages creates a jarring loss of context. The LLM suddenly forgets what the user asked it to do. It might re-read files it already analyzed, suggest changes the user already rejected, or lose track of multi-step plans. Users report this as "the AI forgot what we were doing," which undermines trust.
+For an exact-text edit, the proposal includes the expected file revision, the text
+to replace, and its replacement. We reject ambiguous matches or a stale revision
+instead of guessing where the model intended to write.
 
-**What we give up**: Summarization has its own costs. It consumes an LLM API call (latency and money). The summary might miss details that turn out to be important later. And it introduces a chicken-and-egg problem: we need context space to generate the summary, which means we must reserve tokens for the summarization response buffer. The mitigation is to trigger summarization at 90% capacity rather than 100%, leaving headroom for the summarization call itself.
+This is more robust than unversioned line offsets, which shift after earlier
+insertions. Exact text alone is still incomplete: a unique fragment can remain
+while other relevant parts of the file change.
 
----
+The prepared replacement is written separately, then installed atomically on the
+same filesystem. A durability requirement may additionally need appropriate file
+and directory flushing. Renaming alone is not a universal power-loss guarantee.
 
-## 🔧 Deep Trade-off: In-Memory Caching vs Persistent Cache for Tool Results
+After a crash, compare the target with the recorded before and after revisions.
+If it matches the intended result, record that result rather than apply the edit
+again. If it matches neither, report a conflict and inspect current state.
 
-**Decision**: Use an in-memory LRU cache with session-scoped lifetime for tool results and file checksums, rather than a persistent on-disk or Redis-based cache.
+### Account for the human editor
 
-**Why in-memory works**: The assistant is a single-user local application. There is no shared state between instances. The cache only needs to survive within a single session. An LRU cache in memory has sub-microsecond lookup times and zero I/O overhead. File checksums (5-minute TTL, 1000 entries), glob results (30-second TTL, 200 entries), and tool execution results (session lifetime, 500 entries) all fit comfortably in a few megabytes of memory.
+A checksum check followed by a write still has a race if another process can write
+between those steps. An internal lock coordinates our own tools, not every editor
+or formatter on the machine.
 
-**Why persistent or Redis caching fails here**: A Redis instance adds infrastructure complexity (users must install and run Redis) for a single-user CLI tool. Disk-based caching introduces I/O latency for what should be instant lookups. Cross-session caching is actually harmful for file checksums because files change between sessions -- a stale cached checksum could cause the Edit tool to skip conflict detection.
+That is one reason to work in an isolated task workspace. Applying results to the
+user's checkout needs a conflict-aware merge against its current revision and a
+short coordinated apply step. If concurrent writers cannot be excluded, do not
+claim unconditional protection from lost updates.
 
-**What we give up**: No cache warming on session restart. When the user resumes a session, all file checksums and glob results must be recomputed. In practice, the first tool call in a resumed session takes slightly longer, but subsequent calls benefit from the freshly populated cache. For a future multi-instance deployment (shared coding environment), Redis would become necessary, but it is premature optimization for a local CLI tool.
+Multi-file edits are also not one atomic filesystem transaction. Record individual
+outcomes and preserve a reviewable diff. Recovery may finish the operation or help
+the user restore selected changes; it must not erase unrelated user work.
 
-### Cache Configuration
+### Treat commands differently
 
-| Cache Type | Strategy | TTL | Max Size | Invalidation |
-|------------|----------|-----|----------|--------------|
-| File checksums | Cache-aside | 5 min | 1000 entries | On file write/edit |
-| LLM responses | Cache-aside | 10 min | 100 entries | Manual only |
-| Tool results | Write-through | Session | 500 entries | On session end |
-| Session state | Write-through | Persistent | N/A | Never (explicit save) |
-| Glob results | Cache-aside | 30 sec | 200 entries | On any file change |
+A read can be repeated to observe current state, but the new result may differ.
+A build often can be repeated within a disposable workspace. A command that sends
+a deployment request or changes an external service may have an irreversible or
+unknown effect.
 
----
+The executor cannot atomically commit that external effect with a local journal
+entry. If the process disappears before an outcome is known, inspect the external
+state or require a new decision. Never label a missing response as proof of failure.
 
-## 📊 Observability
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Journal plus effect-specific reconciliation | Preserves evidence through crashes | Recovery states and extra writes |
+| ❌ Retry every unfinished tool | Fast apparent recovery | Can duplicate external effects |
+| ❌ Session-only result cache | Simple within one process | Loses evidence on restart |
 
-### Metrics
+The trade-off is that some tasks pause with an unknown outcome. That is a more
+honest and recoverable state than silently doing a consequential operation twice.
 
-| Metric | Type | Description | Alert Threshold |
-|--------|------|-------------|-----------------|
-| tool_execution_duration_seconds | Histogram | Time to execute each tool | p99 > 30s |
-| llm_response_time_seconds | Histogram | LLM API latency per provider | p95 > 10s |
-| llm_api_errors_total | Counter | Failed LLM API calls | > 5/minute |
-| tool_execution_errors_total | Counter | Failed tool executions | > 10/minute |
-| context_tokens_used | Gauge | Current context window usage | > 90% capacity |
-| cache_hit_ratio | Gauge | Cache effectiveness | < 50% |
-| permission_denials_total | Counter | User-denied operations | Informational |
+## 🔧 Deep dive 3: Keep useful context without losing authority — 7 minutes
 
-### Structured Logging
+> “I would separate durable task history from the context sent to the model.
+> The history preserves what happened. The context is a bounded selection of what
+> the next decision needs.”
 
-Log entries include timestamp (ISO 8601), level (debug/info/warn/error), message, and a context object containing sessionId, toolName, traceId, and spanId. Console output is human-readable with color coding. File output is JSON lines format for parsing and aggregation. For a local CLI tool, verbose logs write to ~/.ai-assistant/logs/ and can be inspected with standard Unix tools.
+A provider adapter exposes its context constraints and usage accounting. Before
+requesting another response, reserve room for system/tool instructions, output,
+and expected tool results. Character estimates can be an early warning, not an
+exact token budget.
 
-### File Edit Conflict Detection
+The selection policy keeps the current request, explicit user constraints, recent
+complete exchanges, and relevant source evidence. Older file output is often the
+best candidate to replace with a reference because it can be read again.
 
-When the Edit tool receives a request, it reads the current file, computes a SHA256 checksum, and compares it to the expected checksum from the last Read. If they differ, the file was modified externally since the LLM last read it, and the edit is rejected with a suggestion to re-read the file. This prevents silent data loss from stale-read edits.
+A summary preserves decisions and remaining work. It should cite source events and
+be treated as a fallible derivative. It must not turn quoted repository text into
+higher-priority instructions or invent permission grants.
 
-### Retry Semantics
+Complete tool exchanges should remain internally valid. Removing a tool-use record
+while keeping its result can break a provider's message protocol even if the prose
+still appears understandable.
 
-| Operation | Retry Behavior | Idempotency |
-|-----------|---------------|-------------|
-| File Read | Safe to retry | Always returns current state |
-| File Write | Idempotent via checksum | Same content produces no-op |
-| File Edit | Conflict detection | Fails if file changed since read |
-| Bash Command | Not auto-retried | User must approve re-execution |
-| LLM API Call | 3 attempts, exponential backoff | Cached by tool call ID |
+### Compare selection, summaries, and truncation
 
----
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Selected evidence plus compact task summary | Preserves intent with bounded input | Retrieval and summary evaluation |
+| ❌ Keep all output until rejected | Simple initially | Sudden failure and repeated input cost |
+| ❌ Keep only the latest fixed message count | Cheap | Can drop the original constraint or tool linkage |
 
-## ⚖️ Trade-offs Summary
+Summarization adds latency and can omit useful facts. I would trigger it before
+exhaustion, preserve the original record, and leave the agent able to retrieve
+specific evidence again.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ String-based file editing | Robust to line shifts, forces context | Fails on non-unique strings |
-| ❌ Line-number editing | Simple, direct addressing | Invalidated by prior edits, fragile |
-| ✅ LLM summarization for context | Preserves intent, compresses intelligently | Extra API call cost, possible information loss |
-| ❌ Static truncation (last N messages) | Zero cost, instant | Loses framing context, "AI forgets" |
-| ✅ Provider abstraction layer | Vendor independence, easy switching | Lowest-common-denominator feature set |
-| ❌ Direct provider integration | Full feature access per provider | Vendor lock-in, code duplication |
-| ✅ In-memory LRU cache | Sub-microsecond lookups, zero infra | No cross-session persistence |
-| ❌ Redis/disk cache | Cross-session warming, shared state | Infrastructure overhead for single-user tool |
-| ✅ Atomic file writes for sessions | Prevents corruption on crash | Requires temp files, slight I/O overhead |
-| ❌ Direct file writes | Simpler code path | Partial writes on crash corrupt state |
-| ✅ Idempotent tool execution | Safe retries, replay capability | Memory overhead for execution cache |
-| ❌ Fire-and-forget execution | Simpler, lower memory | Double-execution on retry, data corruption risk |
+The summary itself must fit its request budget. Sending an already oversized
+history to the same model to summarize it does not solve context overflow.
 
----
+File caches need revision identities or invalidation. A time-based cache alone can
+return stale code after the user edits it. A successful execution record also has
+a different purpose from a read cache: one records an effect, the other accelerates
+an observation. Combining them encourages unsafe replay assumptions.
 
-## 🚀 Scalability and Future Enhancements
+### Bound the whole task
 
-**What breaks first**: Context window exhaustion is the first bottleneck. Long coding sessions with large files can fill 128K tokens in 15-20 tool calls. The summarization pipeline is the primary mitigation, but extremely large codebases may need semantic search (vector embeddings) to find relevant code without reading entire files.
+A ten-iteration cap is a useful first stop mechanism, but a single iteration can
+request many tools or a long-running command. I would also enforce elapsed-time,
+model-usage, output, and concurrency budgets.
 
-**What to build next**:
+Repeated identical failures are a useful signal to stop and explain a blocker.
+The signal should include the relevant revision; retrying a test after fixing code
+is expected progress, not a loop merely because the command text repeats.
 
-1. **Model routing** -- use cheaper/faster models (Haiku) for simple tasks like file search, reserve expensive models (Opus) for complex reasoning
-2. **MCP server mode** -- expose the tool system via Model Context Protocol so external agents can use it
-3. **Background summarization** -- async context compression triggered before the user hits the limit
-4. **Vector embeddings** -- semantic search over codebase and session history
-5. **Audit logging** -- append-only log of all file writes and command executions for compliance
-6. **Rate limiting** -- per-model quotas to control API costs in team deployments
+Budget exhaustion preserves completed work and pending state. The assistant should
+explain what remains instead of claiming the task completed because generation
+has stopped.
+
+## 🧪 Failure tests and operational growth — 4 minutes
+
+I would start with a deterministic provider that can emit text-only, tool-only,
+malformed, truncated, and repeated responses. It should drive the actual coordinator
+and policy boundary, with side effects restricted to test fixtures.
+
+The most valuable scenarios cross component boundaries:
+
+1. A tool-only response retains the matching tool-use record on the next request.
+2. Provider conversion preserves system instructions and error outcomes.
+3. A file changes while approval is pending and execution rejects the stale proposal.
+4. A crash occurs before and after file replacement and before result persistence.
+5. A command has an uncertain outcome and is not blindly replayed.
+6. Resume restores workspace, task constraints, and operation state.
+7. Context compaction preserves valid tool exchanges and explicit user restrictions.
+8. Cancellation stops future scheduling and reports already completed effects.
+
+Provider request retries are distinct from tool retries. For a transient failure,
+use a bounded backoff policy that respects provider guidance and the remaining
+task budget. Invalid arguments and authentication failures need correction rather
+than repeated identical requests.
+
+If output was already displayed, a new generation is a new attempt and may differ.
+Keep that attempt identity visible, and never execute the same previously completed
+operation merely because the response text is being generated again.
+
+Operational events should identify task, operation, duration, and outcome without
+logging every source file or credential. Provider waiting, approval waiting, and
+tool execution need separate timing so diagnostics point to the right boundary.
+
+As repository size grows, improve ignored paths, targeted retrieval, and bounded
+reads before adding a vector index. As usage grows, control per-task cost before
+adding multiple concurrent agents or a hosted control plane.
+
+## ⚖️ Decisions to leave on the whiteboard
+
+| Decision | Choice | Cost accepted |
+|----------|--------|---------------|
+| Execution | ✅ Scoped capabilities with containment | Platform-specific work |
+| Recovery | ✅ Journal and reconciliation by effect | Unknown states sometimes need intervention |
+| Editing | ✅ Revision-bound proposals | Conflicts require renewed inspection |
+| Context | ✅ Selected evidence and task summary | Extra retrieval and summarization |
+
+> “The runtime earns trust by separating model suggestions from authority and
+> observed effects. I would first make execution bounded, changes recoverable,
+> and context faithful to the task. Provider choice and parallelism can then improve
+> the experience without weakening those contracts.”

@@ -1,517 +1,388 @@
-# Apple Music - System Design Answer (Fullstack Focus)
+# Apple Music — full-stack system design interview
 
-*45-minute system design interview format - Fullstack Engineer Position*
+> “I would follow a listener through three actions: play a song, save it to their
+> library, and discover something new. Each action crosses the browser/backend
+> boundary, but each needs a different consistency and recovery policy.”
 
-## Opening Statement (1 minute)
+This is a proposed 45-minute production design, not a description of Apple's
+internal architecture. The final section identifies which parts exist in the
+repository's smaller learning implementation.
 
-"I'll design Apple Music as a fullstack system, focusing on the end-to-end flows that connect the React frontend to the backend services. The key technical challenges span both layers: adaptive streaming with quality negotiation between client and server, library synchronization that handles offline changes with conflict resolution, and personalized recommendations that update dynamically as users listen.
+## 🧭 Scope and targets — 4 minutes
 
-For a music streaming platform, I'll demonstrate how frontend state management coordinates with backend APIs to deliver gapless playback, instant library updates through optimistic UI, and real-time sync across devices."
+I would include online web playback, browsing/search, personal libraries,
+ordered playlists, and basic personalized sections. Offline media licensing,
+user-upload matching, lyrics, and simultaneous collaborative playlist editing
+would expand the scope and are not assumed here.
 
----
+A user can select a track, continue listening while navigating, save an album,
+and see that edit from another device. Playback should remain usable when a
+recommendation request fails or a library edit is still awaiting confirmation.
 
-## Requirements Clarification (3 minutes)
+| Discussion | Minutes |
+|------------|---------|
+| Scope and targets | 4 |
+| Architecture and shared contracts | 5 |
+| Deep dive: Play to audible audio | 10 |
+| Deep dive: Save to cross-device convergence | 10 |
+| Deep dive: Listening to discovery | 8 |
+| Failure handling and validation | 5 |
+| Trade-offs and local boundary | 3 |
+| Total | 45 |
 
-### Functional Requirements (End-to-End)
-- **Streaming**: Quality negotiation, gapless transitions, network adaptation
-- **Library Sync**: Add/remove with optimistic UI, cross-device synchronization
-- **Search**: Instant autocomplete with backend catalog queries
-- **Recommendations**: Personalized sections updated by listening behavior
-- **Playlists**: CRUD with collaborative editing support
+I would propose p95 audible start within one second on supported networks and
+p99 playback authorization below 200 ms. These are separate measurements.
+A successful response containing an audio URL does not prove that music started.
 
-### Non-Functional Requirements
-- **E2E Latency**: < 200ms for stream start (URL fetch + buffer)
-- **Sync Consistency**: Library changes visible across devices in < 5 seconds
-- **Offline Resilience**: Queue changes locally, sync on reconnect
-- **Error Recovery**: Graceful degradation with retry mechanisms
+Library edits should feel immediate, while acknowledged results must survive
+retries. Recommendation freshness can be bounded rather than instantaneous.
+For playback availability, I would propose 99.99% successful authorized starts
+and measure the entire media path rather than only API uptime.
 
-### Integration Points
-- Frontend audio player with backend stream URL generation
-- Library store with delta sync API
-- Search UI with catalog search endpoint
-- Recommendation cards with personalization API
+## 🏗️ Architecture and shared contracts — 5 minutes
 
----
-
-## System Architecture (5 minutes)
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            Frontend (React)                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │    Player    │  │    Library   │  │    Search    │  │   Discovery  │     │
-│  │    Store     │  │    Store     │  │      UI      │  │    Cards     │     │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘     │
-│         │                 │                 │                 │              │
-│         └─────────────────┴─────────────────┴─────────────────┘              │
-│                                    │                                         │
-│                            TanStack Query                                    │
-│                                    │                                         │
-└────────────────────────────────────┼─────────────────────────────────────────┘
-                                     │ HTTP/REST
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            Backend (Express)                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Streaming  │  │    Library   │  │    Catalog   │  │   Discovery  │     │
-│  │    Routes    │  │    Routes    │  │    Routes    │  │    Routes    │     │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘     │
-│         │                 │                 │                 │              │
-│  ┌──────┴─────────────────┴─────────────────┴─────────────────┴──────┐      │
-│  │                        Shared Services                             │      │
-│  │      Auth  │  Rate Limit  │  Cache  │  Metrics  │  Logger         │      │
-│  └────────────────────────────────────────────────────────────────────┘      │
-└────────────────────────────────────┬─────────────────────────────────────────┘
-                                     │
-                  ┌──────────────────┼──────────────────┐
-                  │                  │                  │
-           ┌──────┴──────┐    ┌──────┴──────┐    ┌──────┴──────┐
-           │ PostgreSQL  │    │    Redis    │    │    MinIO    │
-           │  (catalog,  │    │  (sessions, │    │   (audio,   │
-           │   library)  │    │    cache)   │    │   artwork)  │
-           └─────────────┘    └─────────────┘    └─────────────┘
-```
-
----
-
-## Deep Dive: Streaming Flow (8 minutes)
-
-### End-to-End Sequence
+My first diagram separates media delivery, user state, and event processing:
 
 ```
-┌──────────┐      ┌──────────┐      ┌───────────┐      ┌──────────┐      ┌──────────┐
-│ Frontend │      │   API    │      │ Streaming │      │  MinIO   │      │   CDN    │
-│  Player  │      │ Gateway  │      │  Service  │      │          │      │          │
-└────┬─────┘      └────┬─────┘      └─────┬─────┘      └────┬─────┘      └────┬─────┘
-     │                 │                  │                 │                 │
-     │ GET /stream/    │                  │                 │                 │
-     │   {trackId}     │                  │                 │                 │
-     ├────────────────▶│                  │                 │                 │
-     │                 │ Forward +        │                 │                 │
-     │                 │ auth context     │                 │                 │
-     │                 ├─────────────────▶│                 │                 │
-     │                 │                  │ Check sub,      │                 │
-     │                 │                  │ select quality  │                 │
-     │                 │                  ├─────────────────┤                 │
-     │                 │                  │                 │                 │
-     │                 │                  │ Generate        │                 │
-     │                 │                  │ signed URL      │                 │
-     │                 │                  ├────────────────▶│                 │
-     │                 │                  │                 │ presignedUrl    │
-     │                 │                  │◀────────────────┤                 │
-     │ {url, quality}  │                  │                 │                 │
-     │◀────────────────┼──────────────────┤                 │                 │
-     │                 │                  │                 │                 │
-     │ Fetch audio     │                  │                 │                 │
-     ├─────────────────┼──────────────────┼─────────────────┼────────────────▶│
-     │                 │                  │                 │                 │
-     │ Audio stream    │                  │                 │                 │
-     │◀────────────────┼──────────────────┼─────────────────┼─────────────────┤
-     │                 │                  │                 │                 │
+┌──────────────────────────────────────────────────────────────┐
+│ Browser: persistent player, routed pages, library state      │
+└─────────┬─────────────────────┬─────────────────────┬────────┘
+          ▼                     ▼                     ▼
+┌───────────────────┐ ┌───────────────────┐ ┌──────────────────┐
+│ Playback grants   │ │ Catalog/library   │ │ Listening        │
+│ Available assets  │ │ Queries + edits   │ │ Event ingestion  │
+└─────────┬─────────┘ └─────────┬─────────┘ └─────────┬────────┘
+          ▼                     ▼                     ▼
+┌───────────────────┐ ┌───────────────────┐ ┌──────────────────┐
+│ CDN/media origin  │ │ State + revisions │ │ History +        │
+│ Client gets bytes │ │ Edit receipts     │ │ Recommendations  │
+└───────────────────┘ └───────────────────┘ └──────────────────┘
 ```
 
-### Frontend: Audio Player with Quality Selection
+The browser's playback controller lives outside routed page content. It owns
+one active playback instance and the media lifecycle. A small store exposes
+state to the player bar and track rows without making each page own an audio element.
 
-> "I'm using dual audio refs for gapless playback—one for the current track, one preloaded with the next track. When the current ends, we swap refs instantly without any buffering pause."
+Catalog and recommendation results live in a request cache. The library model
+holds a confirmed base plus pending edits. Query caches and pending operations
+are scoped to the signed-in account, with explicit cleanup on account changes.
 
-The streaming player hook manages audio playback with quality-aware URL fetching:
+The backend owns authorization, catalog publication, and committed library state.
+Media bytes come from the delivery tier. A durable event pipeline feeds history
+and recommendation projections independently of the playback request.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                       useStreamPlayer Hook                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌──────────────────┐           ┌──────────────────┐                │
-│  │   audioRef       │           │   nextAudioRef   │                │
-│  │   (current)      │           │   (preloaded)    │                │
-│  └────────┬─────────┘           └────────┬─────────┘                │
-│           │                              │                           │
-│           └────────────┬─────────────────┘                          │
-│                        │                                             │
-│  ┌─────────────────────┴──────────────────────────────────────┐     │
-│  │                    Player Store                             │     │
-│  │  currentTrack │ isPlaying │ queue │ queueIndex             │     │
-│  └─────────────────────────────────────────────────────────────┘     │
-│                                                                      │
-│  Workflow:                                                           │
-│  1. useQuery fetches /stream/{trackId} with network headers          │
-│  2. Load audio when stream URL received                              │
-│  3. Prefetch next track for gapless playback                        │
-│  4. On track end, swap refs for seamless transition                 │
-└─────────────────────────────────────────────────────────────────────┘
-```
+At ten million concurrent listeners and 256 kbit/s, audio egress is 2.56 Tbit/s.
+If each listener starts a three-minute song, authorization averages roughly
+55,600 requests/s before skips and retries. Scaling the API cannot substitute
+for scaling media delivery.
 
-**Key Behaviors:**
-- Sends X-Network-Type header (wifi, 4g, 3g) for quality negotiation
-- Sends X-Preferred-Quality header from localStorage
-- 30-minute staleTime prevents re-fetching recently played tracks
-- Prefetches next track in queue via queryClient.prefetchQuery
+### Agree on identity before implementing screens
 
-### Backend: Streaming Service
+| Concept | Shared identity | Why it matters |
+|---------|-----------------|----------------|
+| Recording | Catalog track ID | Metadata may change while the recording stays the same |
+| Media rendition | Track, format/quality, immutable asset version | Client knows which compatible bytes it received |
+| Playback | Playback-instance ID and client generation | Replays, retries, and late events remain distinguishable |
+| Queue/playlist occurrence | Entry ID | The same track may intentionally appear twice |
+| Library edit | Actor, operation ID, expected/accepted revision | Retry and reconciliation preserve one logical edit |
+| Listening event | Stable event ID within a playback instance | Network retries do not inflate popularity |
 
-> "I'm selecting quality server-side because subscription enforcement belongs in the backend. The client sends network hints, but the server makes the final decision based on subscription tier and fraud prevention."
+These contracts are more useful on a whiteboard than a full database schema.
+They let us reason about what happens when requests arrive twice or finish in
+an unexpected order.
 
-The streaming endpoint selects quality based on subscription and network:
+## 🔧 Deep dive 1: Play to audible audio — 10 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     GET /stream/:trackId                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  1. Extract user context:                                           │
-│     ┌────────────────────────────────────────────────────────┐      │
-│     │ userId from session                                     │      │
-│     │ networkType from X-Network-Type header                  │      │
-│     │ preferredQuality from X-Preferred-Quality header        │      │
-│     └────────────────────────────────────────────────────────┘      │
-│                                                                      │
-│  2. Get subscription tier ──▶ determines maxQuality                 │
-│                                                                      │
-│  3. Select quality = min(preferred, maxForTier, maxForNetwork)      │
-│                                                                      │
-│     ┌──────────────────────────────────────────────────────┐        │
-│     │  Quality Ladder:                                      │        │
-│     │  256_aac ──▶ lossless ──▶ hi_res_lossless            │        │
-│     │                                                       │        │
-│     │  Network Max:                                         │        │
-│     │  wifi: hi_res_lossless │ 5g: lossless                │        │
-│     │  4g: 256_aac           │ 3g: 256_aac                 │        │
-│     └──────────────────────────────────────────────────────┘        │
-│                                                                      │
-│  4. Query audio_files for track + quality                           │
-│                                                                      │
-│  5. Generate presigned URL (1 hour expiry) from MinIO               │
-│                                                                      │
-│  6. Record metrics and return:                                      │
-│     { url, quality, format, bitrate, expiresAt }                    │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+### Follow one playback intent
 
----
+1. The user selects a queue occurrence; the browser creates a new intent generation.
+2. The API authenticates and intersects entitlement, available renditions, and
+   supported formats, considering preference and useful network hints.
+3. It returns a bounded delivery grant, selected rendition, and expiry.
+4. The browser accepts the response only if that generation is still current.
+5. The media controller loads the source and observes whether playback actually starts.
+6. Client and delivery telemetry report success, stalls, or failure for that instance.
 
-## Deep Dive: Library Sync Flow (8 minutes)
+If the user selects B while A's authorization is delayed, A's later response must
+not replace B. Cancellation saves work, but a completion-time identity check is
+what prevents an obsolete response from becoming current playback.
 
-### End-to-End Sync Architecture
+The UI can acknowledge the click immediately while showing resolving/loading.
+It moves to playing when media confirms that state, not when a fetch returns JSON.
+Permission, unsupported format, missing media, and buffering need distinct recovery
+messages. [Browser playback behavior](https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/play)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                               Device A                                       │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                          Library Store                                 │  │
-│  │   syncToken: 42  │  tracks: [...]  │  pendingChanges: []              │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                     │                                        │
-│                           User adds track                                    │
-│                                     │                                        │
-│                            ┌────────┴────────┐                              │
-│                            │ Optimistic      │                              │
-│                            │ Update UI       │                              │
-│                            └────────┬────────┘                              │
-│                                     │                                        │
-└─────────────────────────────────────┼────────────────────────────────────────┘
-                                      │ POST /library
-                                      ▼
-                         ┌─────────────────────────┐
-                         │      Backend API        │
-                         │                         │
-                         │  Transaction:           │
-                         │  1. Insert library_item │
-                         │  2. Insert sync_change  │
-                         │  3. Notify devices      │
-                         └────────────┬────────────┘
-                                      │
-               ┌──────────────────────┼──────────────────────┐
-               │                      │                      │
-               ▼                      ▼                      ▼
-        ┌────────────┐         ┌────────────┐         ┌────────────┐
-        │ PostgreSQL │         │   Redis    │         │    Push    │
-        │            │         │   (cache   │         │  Service   │
-        │ library_   │         │  invalidate)│        │            │
-        │ changes    │         │            │         │            │
-        └────────────┘         └────────────┘         └─────┬──────┘
-                                                            │
-                                      ┌─────────────────────┘
-                                      │ Push notification
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                               Device B                                       │
-│                                     │                                        │
-│                            ┌────────┴────────┐                              │
-│                            │ Receive push    │                              │
-│                            │ "library_changed"│                             │
-│                            └────────┬────────┘                              │
-│                                     │                                        │
-│                            ┌────────┴────────┐                              │
-│                            │ GET /library/   │                              │
-│                            │ sync?token=35   │                              │
-│                            └────────┬────────┘                              │
-│                                     │                                        │
-│                            ┌────────┴────────┐                              │
-│                            │ Apply delta     │                              │
-│                            │ changes to UI   │                              │
-│                            └─────────────────┘                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+### Publish real assets and protect the byte path
 
-### Frontend: Library Store with Optimistic Updates
+Before a rendition becomes available, an ingestion process verifies its object,
+codec/container, duration, and metadata. A track may have only some qualities ready.
+Authorization must choose from what really exists and is allowed.
 
-> "I'm using optimistic updates with rollback for library operations. The user sees their track added immediately, and we reconcile with the server in the background. If it fails, we roll back and show an error toast."
+A signed URL for a nonexistent key is still a failed playback attempt. A fabricated
+filename is not a fallback. If a lower compatible rendition is available, the
+response should identify the actual selected quality; otherwise return unavailable.
 
-The library store uses Zustand with persistence for offline resilience:
+> “I would keep the media origin private and issue an access grant for immutable
+> media. Protecting only the API is insufficient if anyone can fetch the same
+> bytes directly from a public object URL.”
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        LibraryState                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│  tracks: Track[]                                                     │
-│  albums: Album[]                                                     │
-│  syncToken: number | null                                           │
-│  isSyncing: boolean                                                 │
-│  pendingChanges: LibraryChange[]                                    │
-└─────────────────────────────────────────────────────────────────────┘
+Direct delivery keeps multi-minute byte transfers out of the API's request pool.
+It also lets common media share delivery-cache entries while access checks remain
+per request. The expiry policy and CDN cache identity must support both goals.
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                     addToLibrary Flow                                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  1. Generate optimisticId                                           │
-│  2. Optimistic update: add item with _optimistic: true              │
-│  3. Add to pendingChanges                                           │
-│  4. POST to backend                                                 │
-│       │                                                              │
-│       ├──▶ Success: remove _optimistic flag, update syncToken       │
-│       │                                                              │
-│       └──▶ Failure: rollback item, remove from pendingChanges       │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+| Approach | Benefit | Cost for this journey |
+|----------|---------|-----------------------|
+| ✅ Authorized direct delivery with explicit player states | Independent delivery scaling and truthful UI | Grant expiry, asset publication, and client telemetry |
+| ❌ Proxy all media through the main application API | One apparent request path | Bandwidth and long transfers couple playback to unrelated API work |
+| ❌ Treat a returned URL as successful playback | Easy metrics and UI | Missing objects or browser rejection look falsely successful |
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                     syncLibrary Flow                                 │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Guard: Skip if pendingChanges.length > 0                           │
-│                                                                      │
-│  1. GET /library/sync?syncToken={current}                           │
-│  2. For each change:                                                │
-│     ├──▶ add + track: push to tracks (if not duplicate)            │
-│     ├──▶ add + album: push to albums (if not duplicate)            │
-│     ├──▶ remove + track: filter out from tracks                    │
-│     └──▶ remove + album: filter out from albums                    │
-│  3. Update syncToken from response                                  │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The cost of a grant is a bounded revocation window. Signing out cannot erase
+already buffered bytes, and a previously issued grant may remain valid until
+expiry unless the delivery system supports stronger revocation.
 
-**Visibility Change Sync**: useLibrarySync hook triggers sync when tab becomes visible.
+### Adapt within the allowed set
 
-### Backend: Library Sync Endpoint
+The server decides eligibility; the browser observes buffer depth and transfer
+performance. A declared Wi-Fi connection can be slow or change midway through a
+track. It should not serve as a trusted measurement or an entitlement decision.
 
-> "I'm using monotonically increasing sync tokens rather than timestamps. This avoids clock skew issues and gives us a clear ordering of changes for delta sync."
+Whole-file selection is a reasonable first version if it meets measured startup
+and stall targets. It is operationally simpler than segment packaging and manifest
+management, but adapts poorly after a connection change and can waste bytes on skips.
 
-**POST /library** - Add to library:
-1. Transaction: INSERT library_item (idempotent via ON CONFLICT)
-2. Transaction: INSERT library_change with nextval sync_token
-3. Invalidate Redis cache
-4. Push notification to other devices
-5. Return new syncToken
+Segmented delivery allows more controlled buffering and rendition changes at
+compatible boundaries. It adds a packaging/player contract that must be tested
+on supported browsers. There is no general reason that music cannot benefit from
+adaptation merely because its tracks are shorter than movies.
 
-**GET /library/sync?syncToken=N** - Delta sync:
-1. Query library_changes WHERE sync_token > N
-2. JOIN with tracks/albums to get full item data
-3. Return changes array + current max syncToken + hasMore flag
+Gapless playback is another contract: a URL prefetch removes one possible delay,
+but does not guarantee sample-accurate transitions. Encoding boundaries, decoding,
+and scheduling matter. Crossfade is an optional effect with different behavior.
 
----
+### Keep the queue independent of page navigation
 
-## Deep Dive: Recommendation Flow (5 minutes)
+The playback controller remains mounted while routed pages change. Queue entries
+have stable occurrence IDs, and removing an earlier entry leaves the current
+playback instance intact.
 
-### Frontend: For You Page
+Explicit Skip, automatic completion, repeat-one, and Previous need deliberate
+semantics. Shuffle should keep a traversal history so Previous reflects what the
+listener heard rather than simply decrementing an unrelated array index.
 
-> "I'm caching recommendations with a 5-minute staleTime since personalization doesn't need to be real-time. The user's listening history from the last few minutes won't dramatically change their recommendations."
+Listeners and prefetch tasks are cleaned up on replacement/unmount. Duplicate
+end handlers can advance twice; stale media errors can damage the new player's
+state unless the controller associates them with the correct generation.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         ForYouPage                                   │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  useQuery(['forYou'], staleTime: 5 min)                             │
-│                                                                      │
-│  ┌───────────────────────────────────────────────────────────┐      │
-│  │                    Section Layout                          │      │
-│  ├───────────────────────────────────────────────────────────┤      │
-│  │  type: 'albums'   ──▶  Grid of AlbumCard components       │      │
-│  │  type: 'playlist' ──▶  PlaylistRow horizontal scroll      │      │
-│  │  type: 'songs'    ──▶  TrackList vertical list            │      │
-│  └───────────────────────────────────────────────────────────┘      │
-│                                                                      │
-│  Loading state: ForYouSkeleton                                      │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep dive 2: Save to cross-device convergence — 10 minutes
 
-### Backend: Recommendation Engine
+### Make a pending edit visible and recoverable
 
-> "I'm generating recommendations with SQL-based queries rather than ML embeddings. For a fullstack demo, SQL aggregations over listening history give us 80% of the value with 20% of the infrastructure complexity."
+Saving a track can update the UI optimistically. The client records the desired
+membership and a stable operation ID, then sends the edit. A brief pending state
+is useful if confirmation is slow; it does not have to block browsing or playback.
 
-**GET /discover/for-you** generates personalized sections:
+The backend validates the target and serializes edits for the owning library.
+One transaction changes membership, advances a per-owner revision, appends the
+change, and records the operation result. It acknowledges after commit.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Recommendation Sections                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  1. Heavy Rotation                                                  │
-│     ├──▶ Query listening_history last 14 days                      │
-│     ├──▶ Group by album, count plays                                │
-│     └──▶ Return top 10 most played albums                          │
-│                                                                      │
-│  2. Genre Mixes (for top 3 genres)                                  │
-│     ├──▶ Query track_genres from listening_history (30 days)       │
-│     ├──▶ For each genre:                                            │
-│     │    └──▶ Find tracks not played in 7 days                     │
-│     │    └──▶ Sort by global play_count                            │
-│     └──▶ Return 25 tracks per genre                                │
-│                                                                      │
-│  3. New Releases                                                    │
-│     ├──▶ Find artists from user's library                          │
-│     ├──▶ Query albums released in last 30 days                     │
-│     └──▶ Return up to 10 new releases                              │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+If the response disappears after commit, a retry with the same identity returns
+the same result. A successful-response cache can accelerate this, but cannot replace
+a durable receipt or prevent concurrent execution on a cache miss.
 
----
+The API distinguishes definitive rejection from an ambiguous timeout. On rejection,
+the client corrects the relevant pending operation. On timeout, it retains the
+operation and retries or checks its outcome rather than assuming nothing happened.
 
-## Error Handling and Recovery (3 minutes)
+### Reconcile operations, not whole stale arrays
 
-### Frontend: Retry with Exponential Backoff
+Suppose Save is followed immediately by Remove. If Save fails later, restoring
+a previous entire library array can erase Remove or unrelated edits.
+The client should keep a confirmed base and apply ordered pending operations over it.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Axios Retry Interceptor                          │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  On response error:                                                 │
-│                                                                      │
-│  1. Check retry count < 3                                           │
-│  2. Only retry if:                                                  │
-│     ├──▶ No response (network error)                                │
-│     └──▶ Status >= 500 (server error)                               │
-│  3. Wait with exponential backoff: 1s, 2s, 4s                       │
-│  4. Retry request                                                   │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+When an acknowledgement or remote change arrives, update the confirmed base,
+remove acknowledged operations, and reapply the remainder under the agreed rules.
+This makes the current display a projection of explicit user intent.
 
-### Backend: Circuit Breaker for External Services
+> “I would choose optimistic membership edits with identified operations because
+> users repeat them often and expect quick feedback. I am accepting reconciliation
+> complexity to avoid making network delay the pace of ordinary interaction.”
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     MinIO Circuit Breaker                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Configuration:                                                      │
-│  ├──▶ timeout: 5000ms                                               │
-│  ├──▶ errorThresholdPercentage: 50                                  │
-│  └──▶ resetTimeout: 30000ms                                         │
-│                                                                      │
-│  States:                                                            │
-│  ├──▶ CLOSED: normal operation                                      │
-│  ├──▶ OPEN: all requests fail fast, fallback to cache              │
-│  └──▶ HALF-OPEN: test request, close if success                    │
-│                                                                      │
-│  Fallback: Return cached presigned URL if available                 │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| Approach | Benefit | Cost for this journey |
+|----------|---------|-----------------------|
+| ✅ Optimistic operations plus transactional server receipts | Responsive and recoverable after ambiguous failures | Client reconciliation and durable operation storage |
+| ❌ Roll back the whole library on any failed request | Small initial implementation | Can erase later edits or contradict a committed timeout |
+| ❌ Cache a response after an uncoordinated mutation | Fast sequential replay when cached | Concurrent misses and crash windows still duplicate effects |
 
----
+For a complex bulk edit, a server-confirmed preview may be a better initial product
+choice. Optimism is an interaction policy, not a requirement to pretend every
+operation has already succeeded.
 
-## Trade-offs and Alternatives (5 minutes)
+### The sync feed must deliver every committed edit
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Data Fetching | ✅ TanStack Query | ❌ Redux Toolkit Query | Better cache control, simpler setup |
-| Optimistic Updates | ✅ Zustand + rollback | ❌ Server-first | Instant feedback, better UX |
-| Sync Strategy | ✅ Delta with tokens | ❌ Full refresh | Bandwidth efficient |
-| Audio Delivery | ✅ Presigned URLs | ❌ Proxy streaming | CDN offload, simpler backend |
-| Quality Selection | ✅ Server decides | ❌ Client decides | Subscription enforcement |
-| Session Storage | ✅ Redis | ❌ JWT | Instant revocation |
+A new device gets a consistent snapshot and revision. It then reads ordered pages
+of changes, applying each page before advancing its local cursor. Changes include
+stable identity and enough data to update or resolve the item.
 
-### Why Optimistic Updates with Rollback
+A database sequence is not sufficient ordering. An earlier token can belong to
+an uncommitted transaction while a later one becomes visible. Returning the later
+token can make the earlier committed change invisible to all future delta requests.
 
-1. **Instant Feedback**: User sees change immediately (< 50ms)
-2. **Network Resilient**: Works on slow connections
-3. **Rollback Safety**: Revert on failure with user notification
-4. **Trade-off**: Complexity in handling conflicts
+The server also cannot fetch a page and then independently return a newer maximum
+token. A commit between those reads would advance the client past an undelivered
+change. The cursor must describe the actual returned page and its consistency boundary.
 
-### Why Server-Side Quality Selection
+A per-owner counter held under a transaction lock can order that owner's writes.
+Paging uses the last delivered revision and a consistent upper boundary. This
+separates ordering correctness from the client's page-application rules.
 
-"The server determines streaming quality because:
-- **Subscription Enforcement**: Only premium users get lossless
-- **Fraud Prevention**: Client can't lie about network type
-- **Trade-off**: Extra round-trip for quality info"
+When retention removes old changes, the server explicitly requires a new snapshot.
+The browser stages and replaces the confirmed base atomically, preserving pending
+local operations for reconciliation. Full snapshots are useful recovery tools.
 
----
+Push can announce newer revisions; the delta API remains the recovery mechanism.
+The client also checks on foreground/reconnect because notifications can be missed.
+An offline operation queue and offline playable media are separate features.
 
-## Observability (3 minutes)
+### Handle ordered playlists as a different edit shape
 
-### End-to-End Request Tracing
+A playlist contains occurrences, so deleting by track ID can remove more than the
+user intended. The API should address entry IDs and reject or reconcile edits
+based on a stale playlist revision.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Tracing Middleware                               │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  1. Get or generate X-Request-Id                                    │
-│  2. Attach to request for logging                                   │
-│  3. Add to response headers                                         │
-│  4. Create child logger with { requestId, userId }                  │
-│  5. Log request start with method, path, query                      │
-│  6. On finish: log statusCode, durationMs                           │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Appending with an unlocked maximum position can collide with another append.
+Sequentially swapping occupied unique positions can fail even inside a transaction.
+The server needs a safe ordering update procedure, not only a BEGIN/COMMIT wrapper.
 
-### Frontend Error Boundary with Reporting
+The UI can preview a drag, then acknowledge the accepted revision or explain a
+conflict. I would start with single-owner serialized edits rather than claiming
+collaboration simply because the API accepts requests from multiple devices.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     ErrorBoundary Component                          │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  getDerivedStateFromError: Set hasError = true                      │
-│                                                                      │
-│  componentDidCatch:                                                 │
-│  ├──▶ POST /errors with:                                            │
-│  │    message, stack, componentStack, url, userAgent                │
-│  └──▶ Fire and forget (don't fail on reporting failure)            │
-│                                                                      │
-│  Render fallback: "Something went wrong" + Reload button            │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep dive 3: Listening to discovery — 8 minutes
 
----
+### Distinguish progress from a qualified event
 
-## Closing Summary (1 minute)
+Position is not listening time. Seeking to the last minute of a track does not
+mean the user heard its first three minutes. Pausing or buffering should not
+satisfy a wall-clock timer used as a play threshold.
 
-"Apple Music as a fullstack system is built around three key end-to-end flows:
+The controller accumulates eligible listening intervals for a playback instance.
+When it meets the product's stated policy, it sends one identified event with
+bounded fields. Retries retain the same event ID.
 
-1. **Streaming Flow** - The frontend requests a stream URL with network context, the backend selects quality based on subscription and network, generates a presigned CDN URL, and the frontend prefetches the next track for gapless transitions.
+The server validates and durably accepts that event before acknowledging it.
+Consumers update history and popularity projections with duplicate-safe effects.
+A consumer crash can replay accepted input without inventing another play.
 
-2. **Library Sync Flow** - Optimistic updates give instant feedback, the backend records changes with monotonically increasing sync tokens, and other devices receive push notifications to trigger delta sync.
+Resume position can be short-lived and replaceable; a qualified play has a stronger
+history contract. At ten million active listeners, reporting every 15 seconds
+would produce roughly 667,000 reports/s, so treating every report as a permanent
+transactional history row is an expensive default.
 
-3. **Recommendation Flow** - The backend aggregates listening history into personalized sections, the frontend caches results with TanStack Query, and stale-while-revalidate keeps recommendations fresh without blocking.
+> “I would let progress be lightweight while making qualified listening events
+> recoverable. That gives personalization useful evidence without putting every
+> player tick through the library's strong-consistency path.”
 
-The main fullstack trade-off is between consistency and responsiveness. We choose optimistic updates with rollback for library operations to maximize perceived speed, while sync tokens ensure eventual consistency across all devices."
+### Build a useful baseline before adding learned ranking
 
----
+Initial sections can include frequent albums, followed-artist releases, genre
+candidates, unseen tracks, and general popular picks. The frontend renders typed
+sections and can retain a useful cached section during refresh.
 
-## Future Enhancements
+A history count is not collaborative filtering. Genre overlap is not acoustic
+fingerprinting, and merely storing audio features does not mean recommendations
+use them. I would name the actual signals and evaluate the output they produce.
 
-1. **Real-time Sync** - WebSocket connections for instant library updates without push
-2. **Collaborative Playlists** - Operational transformation for concurrent edits
-3. **Offline Downloads** - Service worker with IndexedDB for cached audio files
-4. **Audio Fingerprinting** - Upload matching to catalog tracks
-5. **Social Features** - Friend activity feed with listening history
+Learned ranking can follow when it improves measurable discovery quality. It adds
+feature consistency, training, evaluation, and serving work. Diversity, cold start,
+and unavailable-content filtering remain product concerns under either approach.
+
+| Approach | Benefit | Cost for this journey |
+|----------|---------|-----------------------|
+| ✅ Cached explainable sections fed by identified events | Understandable results and independent playback availability | Bounded delay before recent listening changes discovery |
+| ❌ Recompute personalized aggregates on every request | Fresh database view | Repeated expensive history scans under heavy read traffic |
+| ❌ Block playback until event processing finishes | Immediate downstream consistency | Analytics failures become audible interruptions |
+
+I would coalesce refresh work or publish recommendation generations periodically.
+The exact delay follows the product's freshness needs. We should not invent an
+“80% of ML value” estimate to justify a simpler implementation.
+
+### Make discovery failures local to discovery
+
+If one personalized section fails, the page can show cached or general eligible
+content with a retry option. The current track, queue, and pending library edits
+remain intact. Account-specific results must never be reused under another account.
+
+Search uses a query generation as well as debounce. Old results cannot overwrite
+new text. Empty results, unavailable search, and stale cached results are different
+states that should lead to different explanations.
+
+Genre/search parameters should be part of validated route state when users expect
+them to survive sharing or navigation. A URL that changes without changing the
+query is not a functioning filter.
+
+Large library pages need both pagination and virtualization. Paging bounds transfer;
+virtualization bounds rendered rows. A small discovery shelf does not need those
+extra mechanics simply because a large library does.
+
+## 🛠️ Failure handling and validation — 5 minutes
+
+### Make cross-layer recovery observable
+
+| Failure | Browser behavior | Backend/delivery responsibility |
+|---------|------------------|---------------------------------|
+| Media missing or unsupported | Explain unavailability; retain queue | Publish only real compatible renditions |
+| Playback request becomes obsolete | Discard old completion | Return request/playback identity |
+| Library response lost | Keep pending operation and reconcile | Replay durable result |
+| Delta cursor expires | Stage a new snapshot | Explicit retention floor and reset response |
+| Recommendations delayed | Keep current listening usable | Serve eligible fallback or recoverable error |
+| Account changes mid-request | Isolate caches and cancel old work | Enforce actor ownership and current entitlement |
+
+Session caches need an invalidation/version policy for role or tier changes.
+Deleting a database session while leaving an accepted cached snapshot can preserve
+access. Conversely, a Redis outage should have a deliberately designed policy
+rather than an accidental exception before the intended database fallback.
+
+The delivery grant has its own lifetime. A successful session revocation does
+not imply already issued media access disappears immediately. The UI and operational
+expectations should reflect that boundary.
+
+### Test promises across both layers
+
+I would use controlled responses and fixtures to test:
+
+- A Play request for A finishes after the user has selected B.
+- The browser refuses playback after authorization succeeds.
+- A real compatible asset is fetched and decoded, not just represented by a URL.
+- Save commits but its response is lost, then the same operation is retried.
+- Two library transactions complete out of allocation order.
+- A sync page is read while another edit commits.
+- Playlist duplicates and reorder conflicts preserve occurrence identity.
+- Duplicate listening events do not increase history/popularity twice.
+
+Measure audible-start latency, stalls, sync completeness, operation replay outcomes,
+and recommendation age. URL-handler timing cannot measure audio first byte, and
+an active-stream gauge based on issued URLs cannot establish actual concurrency.
+
+## ⚖️ Trade-offs and local implementation boundary — 3 minutes
+
+The proposed design separates playback generations, library operations, and listening
+events because their recovery needs differ. Its cost is explicit identity and
+lifecycle management across the browser and backend.
+
+The repository runs React, TanStack Router, Zustand, Express, PostgreSQL, Valkey,
+and MinIO. It has catalog/library/playlist APIs and a single-element player, but
+the seed includes no playable audio objects or audio-file records.
+
+Quality is chosen once per track; there is no ABR or gapless pipeline. Search uses
+PostgreSQL substring queries; Elasticsearch is unused. The browser has no delta-sync
+consumer, offline operation queue, query cache, or virtualization. Some settings,
+playlist-editing, and admin controls are display-only.
+
+Library state and change logs are separate writes, sync cursors can skip changes,
+and playlist idempotency only caches completed responses. Listening events lack
+deduplication. These limitations are traced in the
+[architecture](./architecture.md#implementation-notes).
+
+I would first establish a real playable fixture, reliable playback lifecycle,
+and recoverable library operations. Those foundations make later improvements to
+delivery scale and discovery quality meaningful to the listener.

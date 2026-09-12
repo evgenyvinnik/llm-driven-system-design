@@ -1,275 +1,139 @@
-# Design APNs - Architecture
+# APNs-inspired push notification service
 
 ## System Overview
 
-A push notification service modeled after Apple Push Notification service (APNs), delivering notifications from application providers to iOS/macOS devices. Core challenges involve reliable delivery to millions of concurrent device connections, store-and-forward for offline devices, and efficient battery utilization through priority-based delivery.
+This design studies how a push service accepts provider requests, locates connected devices, retains useful work while devices are offline, and reports what actually happened. The production proposal emphasizes durable acceptance, bounded retention, and truthful status. It is an independent design exercise, not a description of Apple's internal architecture.
 
-**Learning Goals:**
-- Build push notification infrastructure
-- Design connection pooling at scale
-- Implement store-and-forward delivery
-- Handle device token lifecycle
+The repository implements a smaller simulator: one Express process combines APIs and WebSocket connections, PostgreSQL stores state, Valkey routes messages, and a React console polls administrative data. The final [Implementation Notes](#implementation-notes) trace that implementation and its gaps. Production components below are proposed unless explicitly identified as implemented.
+
+### Boundary with Apple's public protocol
+
+Apple's provider interface uses HTTP/2 over TLS and authenticates providers. Delivery is best effort; notifications can be reordered or omitted. Offline storage selects one notification for a device and bundle ID. An explicit zero expiration requests no storage. `apns-id` identifies a request; the documentation does not establish this simulator's 24-hour deduplication contract. Normal payloads allow 4096 bytes, VoIP 5120, and collapse identifiers 64 bytes. Priorities include 10, 5, and 1, with push-type-specific rules; background pushes use 5. See [Apple's current request reference](https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns).
+
+Tokens identify an app on a device and must be refreshed through platform registration. A provider needs the raw token to address Apple; hashing is useful inside a registry but cannot replace the provider's stored addressing material. See [Apple's registration guidance](https://developer.apple.com/documentation/usernotifications/registering-your-app-with-apns). The simulator's fixed 64-hex validator is a local convention, not a universal token-size rule.
+
+The local subscription names such as `news.sports` are custom fan-out groups. They are distinct from `apns-topic`, which identifies an app topic, and do not implement Apple's separate broadcast channel API. The local feedback polling endpoint is also a teaching interface.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed production service
 
-1. **Push** - Deliver notifications to specific devices via device token, with support for alert, badge, sound, and silent push
-2. **Register** - Manage device token lifecycle: registration, re-registration, invalidation, and cleanup
-3. **Topics** - Subscribe devices to named topics for broadcast notifications
-4. **Feedback** - Report invalidated tokens to providers so they stop sending to uninstalled apps
-5. **Priority** - Handle immediate (user-facing), power-nap, and low-priority (background) notifications with different delivery guarantees
+1. Authenticate providers and bind every request to an application and environment.
+2. Register and revoke device destinations without exposing raw addressing tokens in logs.
+3. Accept a bounded notification with an identity, delivery class, expiry policy, and optional collapse group.
+4. Attempt prompt delivery to reachable devices and retain eligible offline work until acknowledged, superseded, or expired.
+5. Distinguish acceptance, gateway handoff, device receipt, and application action.
+6. Let authorized operators inspect status and send narrowly scoped tests.
+7. Bound bulk fan-out, storage, and retries so one provider cannot exhaust the service.
 
-### Non-Functional Requirements
+### Non-functional targets — assumptions, not measurements
 
-| Requirement | Target (Production) |
-|-------------|-------------------|
-| Latency (high-priority) | < 500ms from provider send to device delivery |
-| Scale | 50B+ notifications per day (580K/second sustained) |
-| Delivery reliability | 99.99% for online devices |
-| Battery efficiency | Minimize wake-ups; batch low-priority notifications |
-| Token lookup | < 10ms p99 (cached), < 50ms p99 (cold) |
-| Connection density | 1M+ concurrent device connections per edge server |
-| Availability | 99.99% for notification acceptance, 99.9% for delivery |
+| Concern | Proposed target and boundary |
+|---------|------------------------------|
+| Acceptance availability | 99.99% for valid, authorized requests within tenant quota |
+| Acceptance latency | p99 below 100 ms in the receiving region under admitted load |
+| Online handoff | p99 below 500 ms from acceptance to healthy gateway handoff |
+| Retention | Explicit maximum expiry and per-device/provider queue budgets |
+| Recovery | Accepted retained work survives a gateway crash; repeated attempts are possible |
+| Isolation | Provider/app/environment authorization enforced on every access path |
+| Console freshness | Aggregate observations normally less than 30 seconds old, with visible timestamps |
+
+A device may be asleep, disconnected, revoked, or unable to display content. The service cannot offer a universal device-delivery latency or claim that transport receipt means a person saw the notification. Pushes should normally tell an app to fetch authoritative state.
 
 ## Capacity Estimation
 
-### Production Scale
+Use an illustrative workload of 100 million registered destinations, 10 million concurrent connections, and one billion requests per day. That is roughly 11,600 requests/second on average; plan a first stress scenario at ten times that rate. These are interview assumptions, not Apple traffic figures or local benchmark results.
 
-| Metric | Estimate |
-|--------|----------|
-| Registered devices | 2B tokens |
-| Active devices (daily) | 500M |
-| Concurrent connections | 200M |
-| Notifications per day | 50B |
-| Peak notifications per second | 1M |
-| Token table size | ~200 GB (2B rows x 100 bytes avg) |
-| Pending queue size | ~50M notifications at peak |
-| Notification history (30 days) | ~50 TB |
+At an assumed 1 KB average payload, average ingress is about 12 MB/second and burst ingress about 116 MB/second before transport overhead. Keeping every payload for 24 hours would approach 1 TB/day before indexes, metadata, replicas, and backups. At 5% retained offline work lasting four hours on average, the steady backlog is roughly 8.3 million messages, or 8.3 GB of payload alone. Burstiness and devices offline for days require quotas even when the average looks manageable.
+
+Connection memory must include socket buffers, TLS state, runtime objects, kernel limits, and load-balancer overhead. Measure a gateway's safe connection density and send rate under representative traffic before choosing a node count. Connection count and message throughput are separate scaling dimensions.
 
 ### Local Development Scale
 
-| Metric | Estimate |
-|--------|----------|
-| Registered devices | 5-20 seeded |
-| Simulated connections | 1-5 WebSocket clients |
-| Notifications per test | 10-50 |
-| Storage | < 10 MB |
+Run one to three API processes, one PostgreSQL instance, one Valkey instance, and a few simulated sockets. Each API process has a PostgreSQL pool capped at 20 connections. The small fixture set supports functional exploration, not load claims. Compose runs no Kafka, RabbitMQ, Prometheus server, or Grafana dashboard.
 
 ## High-Level Architecture
 
+Proposed production layout:
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Provider Layer                               │
-│          App servers sending notifications via HTTP/2            │
-│          (JWT-authenticated, multiplexed streams)                │
-└─────────────────────────────────────────────────────────────────┘
-                              │ HTTP/2 (TLS 1.3)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Global Load Balancer                           │
-│        (Geographic routing, TLS termination, DDoS protection)   │
-└─────────────────────────────────────────────────────────────────┘
-          │                   │                   │
-          ▼                   ▼                   ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│  APNs Gateway   │ │  APNs Gateway   │ │  APNs Gateway   │
-│  (us-east)      │ │  (eu-west)      │ │  (ap-southeast) │
-│                 │ │                 │ │                 │
-│ - Auth (JWT)    │ │ - Auth (JWT)    │ │ - Auth (JWT)    │
-│ - Rate limiting │ │ - Rate limiting │ │ - Rate limiting │
-│ - Validation    │ │ - Validation    │ │ - Validation    │
-│ - Deduplication │ │ - Deduplication │ │ - Deduplication │
-└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-         │                   │                   │
-         └───────────────────┼───────────────────┘
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Routing Layer                                  │
-│       (Token lookup, device-to-shard mapping, topic fanout)     │
-└─────────────────────────────────────────────────────────────────┘
-         │                   │                   │
-         ▼                   ▼                   ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│  Push Service   │ │  Store Service  │ │  Token Registry │
-│  (Shard 1..N)   │ │                 │ │                 │
-│                 │ │ - Pending queue │ │ - Registration  │
-│ - Device conns  │ │ - Retry logic   │ │ - Invalidation  │
-│ - Delivery      │ │ - Expiration    │ │ - Topic subs    │
-│ - Collapse      │ │ - Collapse      │ │ - Feedback gen  │
-│ - QoS           │ │ - Dead letter   │ │ - Cache layer   │
-└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-         │                   │                   │
-         ▼                   ▼                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                   │
-│                                                                   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐       │
-│  │ PostgreSQL   │  │ Redis Cluster│  │ Kafka             │       │
-│  │ (Sharded)    │  │              │  │                   │       │
-│  │              │  │ - Token cache│  │ - Notification    │       │
-│  │ - Tokens     │  │ - Conn state │  │   routing         │       │
-│  │ - History    │  │ - Rate limits│  │ - Delivery events │       │
-│  │ - Delivery   │  │ - Dedup keys │  │ - Feedback stream │       │
-│  │ - Feedback   │  │              │  │                   │       │
-│  └──────────────┘  └──────────────┘  └───────────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Device Layer                                 │
-│    Persistent connections (TLS over TCP) to all active devices   │
-│    Sharded by device_id hash across connection servers           │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│   App provider   │────▶│Auth + acceptance │────▶│ Durable work log │
+└──────────────────┘     └─────────┬────────┘     └─────────┬────────┘
+                                   │                        ▼
+                         ┌─────────▼────────┐     ┌──────────────────┐
+                         │  Token registry  │     │ Delivery workers │
+                         │   Lookup cache   │     │  Retained work   │
+                         └──────────────────┘     └─────────┬────────┘
+                                                            │ route lookup
+                         ┌──────────────────┐     ┌─────────▼────────┐
+                         │Connection leases │◀───▶│  Gateway fleet   │
+                         └──────────────────┘     └─────────┬────────┘
+                                                            ▼
+                                                  ┌──────────────────┐
+                                                  │ Device transport │
+                                                  └──────────────────┘
+
+Lifecycle events ──▶ status/metrics projection ──▶ operator console
 ```
 
-## Core Components
+Gateways own persistent connections. Acceptance servers can scale independently. The durable work log and retained-state owner establish recovery; connection presence only suggests a route. Operators read a projection so scanning notification history does not compete with live delivery.
 
-### APNs Gateway (Provider API)
+## Core Components / Request Flows
 
-The gateway accepts notifications from application providers via HTTP/2:
+### Acceptance and destination resolution
 
-1. **Authentication**: Providers authenticate with JWT tokens signed with their app-specific private key. The gateway validates the JWT signature against the provider's registered public key and checks the `iss` (team ID) and `topic` (bundle ID) claims
-2. **Payload validation**: Notifications must include a valid `aps` dictionary. Alert payloads are capped at 4 KB. VoIP and complication payloads allow 5 KB
-3. **Rate limiting**: Per-provider rate limiting prevents a single app from overwhelming the system. Burst allowance for topic broadcasts
-4. **Deduplication**: Provider-supplied `apns-id` headers enable idempotent delivery. Duplicate IDs within 24 hours return the original response
+The gateway authenticates the provider, validates its app/environment scope, and checks payload bytes, delivery class, expiration, and quotas. A scoped operation ID plus a request fingerprint binds retries to the same destination and content. Reusing an ID for different content is a conflict.
 
-### Token Registry
+A token lookup maps provider-supplied addressing material to an internal destination. Partition by the scoped lookup key, or maintain an explicit token-to-home-shard index. Hashing by internal device UUID alone does not solve the initial lookup when the request contains only a raw token.
 
-Manages the lifecycle of 2B+ device tokens:
+Persist the accepted operation and publishable work in one recoverable boundary, such as a PostgreSQL transaction with an outbox at moderate scale. Return acceptance after that boundary succeeds. A relay can retry publishing without creating a second logical operation. At larger scale, a replicated log can become the acceptance authority, with an explicit deduplication owner for each partition.
 
-- **Registration**: Device tokens are SHA-256 hashed before storage (the raw token is never persisted). Registration is idempotent: re-registering updates `last_seen` and `device_info`
-- **Invalidation**: Tokens are marked invalid (not deleted) when apps are uninstalled, tokens expire, or users opt out. Invalid tokens generate feedback entries for the provider
-- **Topic subscriptions**: Devices subscribe to named topics (e.g., `/topics/breaking-news`). Topic fanout queries all valid devices subscribed to a topic
+Local mapping: token lookup and notification inserts exist, but no atomic outbox or recoverable acceptance state joins subsequent routing/storage.
 
-Token lookups use a cache-aside pattern with Redis:
-1. Check Redis for `token:{hash}` (1-hour TTL)
-2. On miss, query PostgreSQL and populate cache
-3. Negative results cached for 5 minutes to prevent repeated DB hits for invalid tokens
-4. On invalidation, immediately delete from cache and add to negative cache
+### Online attempt and acknowledgement
 
-### Push Delivery Service
+A worker reads the current connection owner and generation, then requests delivery through that gateway. The gateway verifies it still owns the generation and has buffer capacity. A stale mapping causes rerouting or retained retry, not successful delivery.
 
-Sharded by device ID hash. Each shard manages connections to a subset of devices:
+An acknowledgement is authenticated to the destination and operation. Receipt updates durable state idempotently; only then can retained payloads be removed. A lost acknowledgement may produce a repeat attempt. Device-side handling needs a stable logical ID to suppress repeated presentation or effects where required.
 
-- **Online delivery**: If the device has an active connection, push immediately. The device acknowledges receipt. Priority 10 (immediate) notifications wake the device; priority 5 (power nap) notifications are held until the next device wake cycle; priority 1 (background) notifications are batched
-- **Offline delivery (store-and-forward)**: If the device is offline, store the notification in `pending_notifications`. When the device reconnects, deliver all pending notifications ordered by priority (descending) then creation time (ascending). Remove from pending after successful delivery
-- **Collapse**: If a notification has a `collapse_id`, it replaces any existing pending notification with the same collapse_id for the same device. Implemented via `UNIQUE (device_id, collapse_id)` with `ON CONFLICT DO UPDATE`
-- **Expiration**: Pending notifications with `expiration < NOW()` are not delivered. A background cleanup job purges expired entries
+Local mapping: all sends use Valkey pub/sub, including same-process delivery. Publishing is reported as `delivered`; the subscriber does not confirm socket receipt to the sender.
 
-### Feedback Service
+### Offline retention, expiry, and collapse
 
-Providers poll for feedback about their invalidated tokens:
+Retained messages have a deadline and count/byte budgets per destination and provider. A scheduler retries eligible work when the destination reconnects. It uses bounded batches, fair scheduling, and rate limits so a reconnect wave does not starve new traffic.
 
-1. When a token is invalidated, an entry is added to `feedback_queue` with `app_bundle_id` and reason
-2. Providers query `GET /feedback?bundle_id=com.example.app&since=<timestamp>` to get recent invalidations
-3. Feedback is kept for 30 days, then purged
+Collapse applies to replaceable state, such as the newest score update. An atomic replacement changes payload, ID, generation, priority, and expiry together, and marks the old operation superseded. Do not collapse unrelated events simply because they share a destination. A strict event history belongs in the application's database.
 
-This enables providers to stop sending to uninstalled apps, reducing wasted server resources and improving delivery metrics.
+Check expiry before scheduling and again before handoff. Garbage collection reclaims storage; it is not the only mechanism preventing stale work from being sent. For no-storage requests, an unavailable destination produces an explicit outcome rather than indefinite retention.
 
-### Quality of Service Manager
+Local mapping: PostgreSQL pending rows and reconnect ordering exist; priority lists have no consumer, collapse replacement is not atomic, and zero expiry becomes unlimited retention.
 
-Priority-based delivery scheduling:
+### Console and bulk sends
 
-| Priority | Behavior | Use Case |
-|----------|----------|----------|
-| 10 (Immediate) | Deliver instantly, wake device | User-visible alerts, incoming calls |
-| 5 (Power nap) | Deliver when device is naturally awake | Content updates, email summaries |
-| 1 (Background) | Batch and deliver during maintenance window | Metrics, analytics, non-urgent sync |
+Operators inspect an observed state with timestamps and a bounded history page. Aggregate freshness and transport health are separate. A test request returns an operation ID; its status can be read after a timeout rather than blindly creating another send.
 
-Per-device rate limiting prevents notification spam: max 100 notifications per minute per device. Per-app rate limiting prevents a single provider from consuming disproportionate resources.
+Bulk sends create a durable parent job with an audience snapshot or a documented membership cutoff. Children get stable IDs derived from the job and destination. Progress distinguishes accepted children, expired/rejected children, and known receipts. Local topic/broadcast loops instead run sequentially inside one HTTP request.
 
 ## Database Schema
 
-### Entity-Relationship Diagram
+The complete local schema is [backend/src/db/init.sql](./backend/src/db/init.sql). It contains eight tables. The following summarizes the actual constraints; production additions are listed separately.
 
-```
-┌──────────────────────────┐         ┌──────────────────────────┐
-│      admin_users         │         │        sessions          │
-├──────────────────────────┤         ├──────────────────────────┤
-│ id (PK)              UUID│◄────────│ admin_id (FK)        UUID│
-│ username         VARCHAR │   1:N   │ id (PK)              UUID│
-│ password_hash    VARCHAR │         │ token              VARCHAR│
-│ role             VARCHAR │         │ expires_at       TIMESTAMP│
-│ created_at      TIMESTAMP│         │ created_at       TIMESTAMP│
-│ last_login      TIMESTAMP│         └──────────────────────────┘
-└──────────────────────────┘
+| Table | Key data | Actual constraints and indexes |
+|-------|----------|--------------------------------|
+| `device_tokens` | UUID `device_id`, SHA-256 `token_hash`, bundle, JSONB metadata, validity and timestamps | Device PK, unique token hash, app index, partial valid-token index |
+| `topic_subscriptions` | Device UUID, topic, subscribed timestamp | Composite PK; device FK cascades; topic index |
+| `pending_notifications` | UUID, device, JSONB payload, priority, expiry, collapse ID, creation time | PK, device FK cascades, unique `(device_id, collapse_id)`, device and expiry indexes |
+| `notifications` | UUID, device, topic, payload, priority, expiry, collapse ID, status and timestamps | PK; device FK sets null; separate device/topic/status/created indexes |
+| `delivery_log` | Notification UUID, device, status, receipt time | Notification ID PK; device FK sets null; device/status/created indexes |
+| `feedback_queue` | Sequence ID, token hash, bundle, reason, event timestamp | PK and `(app_bundle_id, timestamp)` index |
+| `admin_users` | UUID, unique username, password hash, role, login timestamp | PK and unique username |
+| `sessions` | UUID, admin UUID, token, expiry | PK, admin FK cascades, unique token and expiry indexes; unused at runtime |
 
-┌──────────────────────────┐         ┌──────────────────────────┐
-│      device_tokens       │◄────────│   topic_subscriptions    │
-├──────────────────────────┤   1:N   ├──────────────────────────┤
-│ device_id (PK)       UUID│         │ device_id (PK,FK)    UUID│
-│ token_hash       VARCHAR │         │ topic (PK)         VARCHAR│
-│ app_bundle_id    VARCHAR │         │ subscribed_at    TIMESTAMP│
-│ device_info        JSONB │         └──────────────────────────┘
-│ is_valid          BOOLEAN│
-│ invalidated_at  TIMESTAMP│         ┌──────────────────────────┐
-│ invalidation_reason      │◄────────│  pending_notifications   │
-│   VARCHAR                │   1:N   ├──────────────────────────┤
-│ created_at      TIMESTAMP│         │ id (PK)              UUID│
-│ last_seen       TIMESTAMP│         │ device_id (FK)       UUID│
-└────────────┬─────────────┘         │ payload             JSONB│
-             │                       │ priority           INTEGER│
-             │                       │ expiration       TIMESTAMP│
-             │                       │ collapse_id       VARCHAR│
-             │ 1:N                   │ created_at       TIMESTAMP│
-             │                       │ UNIQUE(device_id,         │
-             │                       │        collapse_id)       │
-             ▼                       └──────────────────────────┘
-┌──────────────────────────┐
-│       notifications      │         ┌──────────────────────────┐
-├──────────────────────────┤         │       delivery_log       │
-│ id (PK)              UUID│         ├──────────────────────────┤
-│ device_id (FK)       UUID│────────▶│ notification_id (PK) UUID│
-│ topic              VARCHAR│   1:1   │ device_id (FK)       UUID│
-│ payload             JSONB │         │ status             VARCHAR│
-│ priority           INTEGER│         │ delivered_at     TIMESTAMP│
-│ expiration       TIMESTAMP│         │ created_at       TIMESTAMP│
-│ collapse_id        VARCHAR│         └──────────────────────────┘
-│ status             VARCHAR│
-│ created_at       TIMESTAMP│         ┌──────────────────────────┐
-│ updated_at       TIMESTAMP│         │      feedback_queue      │
-└──────────────────────────┘         ├──────────────────────────┤
-                                     │ id (PK)          BIGSERIAL│
-                                     │ token_hash         VARCHAR│
-                                     │ app_bundle_id      VARCHAR│
-                                     │ reason             VARCHAR│
-                                     │ timestamp        TIMESTAMP│
-                                     │ created_at       TIMESTAMP│
-                                     └──────────────────────────┘
-```
-
-### Complete SQL Schema
+The key local pending-table definition is:
 
 ```sql
--- Device Tokens
-CREATE TABLE device_tokens (
-  device_id UUID PRIMARY KEY,
-  token_hash VARCHAR(64) UNIQUE NOT NULL,
-  app_bundle_id VARCHAR(200) NOT NULL,
-  device_info JSONB,
-  is_valid BOOLEAN DEFAULT TRUE,
-  invalidated_at TIMESTAMP,
-  invalidation_reason VARCHAR(50),
-  created_at TIMESTAMP DEFAULT NOW(),
-  last_seen TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_tokens_app ON device_tokens(app_bundle_id);
-CREATE INDEX idx_tokens_valid ON device_tokens(is_valid) WHERE is_valid = true;
-
--- Topic Subscriptions
-CREATE TABLE topic_subscriptions (
-  device_id UUID REFERENCES device_tokens(device_id) ON DELETE CASCADE,
-  topic VARCHAR(200) NOT NULL,
-  subscribed_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (device_id, topic)
-);
-
-CREATE INDEX idx_subscriptions_topic ON topic_subscriptions(topic);
-
--- Pending Notifications (store-and-forward queue for offline devices)
-CREATE TABLE pending_notifications (
+CREATE TABLE IF NOT EXISTS pending_notifications (
   id UUID PRIMARY KEY,
   device_id UUID REFERENCES device_tokens(device_id) ON DELETE CASCADE,
   payload JSONB NOT NULL,
@@ -279,576 +143,196 @@ CREATE TABLE pending_notifications (
   created_at TIMESTAMP DEFAULT NOW(),
   UNIQUE (device_id, collapse_id)
 );
-
-CREATE INDEX idx_pending_device ON pending_notifications(device_id);
-CREATE INDEX idx_pending_expiration ON pending_notifications(expiration);
-
--- Notifications History
-CREATE TABLE notifications (
-  id UUID PRIMARY KEY,
-  device_id UUID REFERENCES device_tokens(device_id) ON DELETE SET NULL,
-  topic VARCHAR(200),
-  payload JSONB NOT NULL,
-  priority INTEGER DEFAULT 10,
-  expiration TIMESTAMP,
-  collapse_id VARCHAR(100),
-  status VARCHAR(20) DEFAULT 'pending',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_notifications_device ON notifications(device_id);
-CREATE INDEX idx_notifications_topic ON notifications(topic);
-CREATE INDEX idx_notifications_status ON notifications(status);
-CREATE INDEX idx_notifications_created ON notifications(created_at);
-
--- Delivery Log (audit trail)
-CREATE TABLE delivery_log (
-  notification_id UUID PRIMARY KEY,
-  device_id UUID REFERENCES device_tokens(device_id) ON DELETE SET NULL,
-  status VARCHAR(20) NOT NULL,
-  delivered_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_delivery_device ON delivery_log(device_id);
-CREATE INDEX idx_delivery_status ON delivery_log(status);
-CREATE INDEX idx_delivery_created ON delivery_log(created_at);
-
--- Feedback Queue (for providers to poll invalidated tokens)
-CREATE TABLE feedback_queue (
-  id BIGSERIAL PRIMARY KEY,
-  token_hash VARCHAR(64) NOT NULL,
-  app_bundle_id VARCHAR(200) NOT NULL,
-  reason VARCHAR(50),
-  timestamp TIMESTAMP NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_feedback_app ON feedback_queue(app_bundle_id, timestamp);
-
--- Admin Users (dashboard authentication)
-CREATE TABLE admin_users (
-  id UUID PRIMARY KEY,
-  username VARCHAR(100) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  role VARCHAR(20) DEFAULT 'admin',
-  created_at TIMESTAMP DEFAULT NOW(),
-  last_login TIMESTAMP
-);
-
--- Sessions
-CREATE TABLE sessions (
-  id UUID PRIMARY KEY,
-  admin_id UUID REFERENCES admin_users(id) ON DELETE CASCADE,
-  token VARCHAR(255) UNIQUE NOT NULL,
-  expires_at TIMESTAMP NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_sessions_token ON sessions(token);
-CREATE INDEX idx_sessions_expires ON sessions(expires_at);
 ```
 
-### Foreign Key Design Rationale
+Null collapse IDs allow multiple pending rows for a device. Neither pending rows nor delivery-log IDs have a foreign key to `notifications`. That permits the sample pending records to exist without matching history, and makes reconciliation an application concern. There are no database checks restricting priority, status transitions, payload size, or per-device backlog. Timestamps use `TIMESTAMP`, not a timezone-aware type.
 
-| Relationship | ON DELETE | Rationale |
-|-------------|-----------|-----------|
-| topic_subscriptions -> device_tokens | CASCADE | Subscriptions are meaningless without the device |
-| pending_notifications -> device_tokens | CASCADE | Cannot deliver to a deleted device; clean up queue |
-| notifications -> device_tokens | SET NULL | Preserve notification history for analytics after device deletion |
-| delivery_log -> device_tokens | SET NULL | Preserve audit trail for compliance even after device cleanup |
-| sessions -> admin_users | CASCADE | Invalidate sessions immediately when admin is deleted |
+### Production additions
 
-### Index Strategy
+| Record or constraint | Purpose |
+|----------------------|---------|
+| Scoped token identity and registration generation | Bind destination to provider/app/environment and order revocation/re-registration |
+| Operation identity and request fingerprint | Durable retry lookup and mismatched-request rejection |
+| Outbox/work-log record | Recover work after acceptance and before delivery |
+| Retained-work generation and deadline | Atomic collapse, expiry, and exact acknowledgement cleanup |
+| Connection lease with owner generation | Reject stale disconnects and stale routing hints |
+| Appendable lifecycle events and bounded status projection | Explain attempts without overwriting all evidence |
+| Fan-out job and child identity | Resume partial broadcasts with bounded concurrency |
 
-| Index | Query Pattern | Notes |
-|-------|---------------|-------|
-| `idx_tokens_valid` (partial) | Token lookups for valid tokens only | Partial index (`WHERE is_valid = true`) is smaller and faster than full index |
-| `idx_tokens_app` | List all devices for an app | Used for topic broadcast and feedback queries |
-| `idx_pending_device` | Deliver pending on reconnect | Low cardinality per device (few pending per device) |
-| `idx_pending_expiration` | Cleanup expired notifications | Background job queries `WHERE expiration < NOW()` |
-| `idx_notifications_created` | Recent notification dashboard | High cardinality, supports `ORDER BY created_at DESC` |
-| `idx_feedback_app` | Provider feedback poll | Compound index on (app_bundle_id, timestamp) for efficient range scans |
-
-### Key Schema Design Decisions
-
-**Token hashing**: Raw device tokens are sensitive -- if leaked, attackers could send spam notifications. Storing SHA-256 hashes protects the tokens while allowing deterministic lookups. Trade-off: cannot recover original tokens from the database (intentional).
-
-**Separate pending vs. notifications tables**: `pending_notifications` is a hot queue (frequent insert/delete), while `notifications` is append-mostly history. Separating them optimizes each for its access pattern -- the pending table stays small and fast, while the history table can be partitioned by time for analytics.
-
-**Collapse ID unique constraint**: `UNIQUE (device_id, collapse_id)` enables atomic replace semantics via `ON CONFLICT DO UPDATE`. NULL collapse_ids do not participate in uniqueness (PostgreSQL behavior), so notifications without collapse_id accumulate normally.
-
-**No FK on feedback_queue.token_hash**: Feedback entries reference tokens that may have already been purged from `device_tokens`. Storing `token_hash` as a value (not a foreign key) preserves the feedback even after the device record is deleted.
+At moderate scale, keep operation, outbox, and pending-state changes in the same PostgreSQL transaction. Partition workload by destination ownership as volume grows; partition/expire history by time. Do not imply the current UUID primary keys alone implement those transitions.
 
 ## API Design
 
-### Provider API (Notification Sending)
+Local endpoints and executable examples are in the [README](./README.md#api-reference). The main request shapes are:
 
-| Method | Endpoint | Headers | Description |
-|--------|----------|---------|-------------|
-| POST | `/3/device/{device_token}` | `apns-id`, `apns-priority`, `apns-expiration`, `apns-topic`, `apns-collapse-id` | Send notification to specific device |
-| POST | `/3/topic/{topic}` | Same as above | Broadcast to all topic subscribers |
+```json
+{
+  "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "app_bundle_id": "com.example.test",
+  "device_info": { "platform": "iOS" }
+}
+```
 
-### Device Management
+Registration returns `device_id` and `is_new`. A REST device send accepts a wrapper:
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/devices/register` | Register device token |
-| DELETE | `/api/v1/devices/:token` | Invalidate device token |
-| POST | `/api/v1/devices/:token/topics` | Subscribe to topic |
-| DELETE | `/api/v1/devices/:token/topics/:topic` | Unsubscribe from topic |
+```json
+{
+  "payload": { "aps": { "alert": { "title": "Local test", "body": "Hello" } } },
+  "priority": 10,
+  "collapse_id": "current-score"
+}
+```
 
-### Feedback
+The result contains `notification_id` and `status`. On a successful topic loop, `queued_count` is the number of child calls that completed without throwing, including online sends. Its returned parent UUID is not a persisted notification that can be queried. Broadcast returns counts for valid devices among the first 10,000 registrations it fetched, not a durable job handle.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/feedback` | Poll invalidated tokens by app bundle ID |
+The `/3/device/:token` variant takes the bare payload and reads `apns-priority`, `apns-expiration`, `apns-collapse-id`, and `apns-id`. It returns a JSON success body and the ID header, or a simplified 410/500 error. It ignores provider authorization, app topic, push type, and most protocol validation. REST sends do not forward an idempotency key.
 
-### Notification Status
+WebSocket clients send `connect` with `device_id`; notifications contain `type: notification`, `id`, `payload`, and `priority`. Acknowledgements use `type: ack` and `notification_id`. The `connected` response's `pending_delivered` is a publish count, not a receipt count. No console WebSocket endpoint exists.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/notifications/:id/status` | Check delivery status |
-
-### Admin Dashboard
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/admin/stats` | Device counts, notification stats, topic subscriber counts |
-| GET | `/api/v1/admin/devices` | List registered devices with filters |
-| GET | `/api/v1/admin/notifications` | Recent notification history |
-| POST | `/api/v1/admin/devices/:id/invalidate` | Manually invalidate a token |
+For the proposed service, use a stable accepted-operation resource, structured retriable/permanent errors, authenticated receipt messages, and a separate bulk-job resource. Do not retrofit these guarantees into the meaning of the current simulator response.
 
 ## Key Design Decisions
 
-### HTTP/2 for Provider API
+### Durable acceptance before opportunistic routing
 
-**Chosen:** HTTP/2 with multiplexed streams for the provider-facing API.
+Choose durable acceptance with retryable delivery. A presence entry can become stale between lookup and send; a gateway can crash after acceptance. An ephemeral publish cannot bridge those failures even if Valkey itself uses persistent storage. Durable work lets a new worker recover the operation and try the current route.
 
-**Why:** A single provider (e.g., a messaging app) may send thousands of notifications per second. HTTP/1.1 would require thousands of TCP connections. HTTP/2 multiplexes all requests over a single connection with binary framing and header compression (HPACK). A single connection handles 100+ concurrent streams, reducing TLS handshake overhead from once-per-request to once-per-connection.
+The cost is a storage/log write before returning success and duplicate-attempt handling after uncertain outcomes. For expendable telemetry, immediate best-effort publication may be sufficient. For a service promising retained offline work, reporting success while silently losing the only delivery path violates its own contract.
 
-**Trade-off:** HTTP/2 requires TLS and more complex connection management. Debugging is harder (binary protocol). For local development, we simplify to HTTP/1.1 with Express, which preserves the request/response semantics while avoiding certificate management.
+### Bounded retained state and scoped collapse
 
-### Store-and-Forward for Offline Devices
+Choose explicit retention budgets and per-group atomic replacement. A score refresh can discard an old value, reducing reconnect traffic and avoiding stale alerts. A message that represents a distinct event cannot be merged safely without application semantics.
 
-**Chosen:** Queue notifications in `pending_notifications` when devices are offline, deliver on reconnect.
+The alternative of keeping every notification indefinitely turns long-offline devices into unbounded queues and creates a reconnect storm. The chosen approach gives up complete push history and requires clear expiration/supersession outcomes. Authoritative business events remain in the app's store and are fetched after reconnection.
 
-**Why:** Mobile devices are frequently offline (subway, airplane mode, power off). Without store-and-forward, notifications sent during offline periods are permanently lost. This is unacceptable for messaging apps where users expect to see all missed messages. The pending queue holds notifications until the device reconnects, then delivers in priority order.
+### Connection leases as hints, durable state as authority
 
-**Trade-off:** The pending queue grows with offline duration. A device offline for a week accumulates hundreds of notifications. Mitigation: expiration timestamps (providers set `apns-expiration` header) and collapse IDs (only the latest sports score, not every intermediate update). Background cleanup job purges expired entries.
+Choose short renewable leases with owner generations, backed by persistent gateway sockets. They allow fast routing and clean handoff without coordinating every read through a global consensus service. A gateway must still confirm ownership and delivery capacity.
 
-**Alternative:** "Fire and forget" (drop if offline) is simpler and used by some analytics-focused push services. Unacceptable for APNs where delivery guarantee is a core promise.
-
-### Collapse IDs for Notification Replacement
-
-**Chosen:** Notifications with the same `collapse_id` replace each other in the pending queue.
-
-**Why:** Some notifications are inherently "latest value wins" -- a sports score, a ride ETA, a stock price. Without collapse, a device coming online after 3 hours of a basketball game receives 200 score update notifications. With collapse, it receives only the final score.
-
-**Implementation:** `UNIQUE (device_id, collapse_id)` constraint with `ON CONFLICT DO UPDATE SET payload = $new` atomically replaces the old notification. No application-level locking needed.
-
-### Token Hashing
-
-**Chosen:** Store SHA-256 hash of device tokens, never the raw token.
-
-**Why:** Device tokens are bearer credentials. If the token database is compromised, attackers could send spam notifications to millions of devices. Hashing the token means a database leak does not compromise the ability to abuse the push channel. The 64-character hex hash is deterministic, allowing efficient lookups via unique index.
-
-**Trade-off:** Cannot recover the original token from the database. This is intentional -- tokens should only flow from device to provider to APNs, never be read back from storage.
+A bare global mapping is simpler but cannot distinguish a dead owner from a live replacement. A disconnect from the old connection can erase the new route. Leases add heartbeat load and brief rerouting delays; these are preferable to interpreting an old routing entry as proof of receipt.
 
 ## Consistency and Idempotency
 
-### Token Registration: Strong Consistency
-- `ON CONFLICT` upserts ensure no duplicate tokens
-- Re-registration updates `last_seen` and `device_info` atomically
-- `token_hash` UNIQUE constraint is the source of truth
+For the proposed service, registration/revocation and operation acceptance require an authoritative conditional write. Console aggregates may lag. Attempts can occur more than once; repeat attempts must use the same logical identity. An acknowledgement does not establish that an app completed a business action.
 
-### Notification Delivery: At-Least-Once
-- Notifications may be delivered more than once (device reconnects mid-delivery, network failures)
-- Clients handle duplicates using the `notification_id` (dedup on device)
-- The delivery log records final status but may lag actual delivery
+The local idempotency path uses Valkey `SET NX` before token validation and the history insert. A failed request can therefore retain a claim for 24 hours without any notification record. A retry may return `duplicate` while doing no work. Claims are global, are not bound to payload or destination, and are allowed through when Valkey fails.
 
-### Provider Idempotency
-- Providers supply `apns-id` header (UUID) for idempotent sends
-- Redis-based deduplication window: `SET cache:idem:{id} 1 NX EX 86400`
-- Retry within 24 hours returns original notification status
-- Without `apns-id`, each request is treated as unique
+The notification UUID primary key stops a second row with the same UUID, but there is no conflict handler that resumes an incomplete operation. Redis eviction/expiry followed by a retry can fail at that insert. Marking processed before queueing means a later routing/storage failure is also not repaired by retry. This is not exactly-once delivery or a complete durable idempotency protocol.
 
-### Pending Notification Consistency: Last-Write-Wins
-- With `collapse_id`: newer notification atomically replaces older via `ON CONFLICT DO UPDATE`
-- Without `collapse_id`: each notification is independent
-- Expiration checked at delivery time, not queue time
+## Security / Auth
 
-## Caching Strategy
+The production service needs provider credentials, app/environment binding, authenticated device transport, scoped operator permissions, per-tenant quotas, and protected payload retention. Hashing a high-entropy token reduces raw-token exposure in one database; it neither authorizes a sender nor prevents access through other identifiers. An APNs provider still needs secure access to raw addressing tokens.
 
-### Cache-Aside for Token Lookups
+Locally, login verifies an unsalted SHA-256 password and stores a 24-hour random bearer session in Valkey. `/admin/me` reads that session. Other admin routes—including account creation, broadcast, and cleanup—have no authentication middleware. Device, notification, and feedback APIs are public. Role labels do not enforce permissions.
 
-Token lookups are in the critical path for every notification. Without caching, 50B daily notifications means 50B database queries just for token resolution.
-
-| Cache Key | TTL | Rationale |
-|-----------|-----|-----------|
-| `token:{hash}` | 1 hour | Tokens are stable; long TTL reduces DB load |
-| `token:{hash}:invalid` | 5 min | Negative caching prevents repeated failed lookups |
-| `conn:{deviceId}` | 5 min | Connection server location; short TTL handles reconnects |
-| `rate:device:{id}` | 1 min | Sliding window for per-device rate limiting |
-| `rate:app:{bundleId}` | 1 min | Sliding window for per-app rate limiting |
-| `dedup:{notificationId}` | 24 hours | Idempotency window for provider retries |
-
-### Write-Through for Connection State
-
-Device connection state must be immediately consistent -- if a device just connected to shard 3, the routing layer must know within milliseconds. Write-through pattern: on connect, write to Redis immediately; on disconnect, delete immediately. No TTL-based staleness.
-
-### Cache Invalidation Rules
-
-1. **Token changes**: Invalidate on registration update or token invalidation
-2. **Connection changes**: Write-through on connect, delete on disconnect
-3. **Rate limits**: TTL-based expiration only (no manual invalidation)
-4. **Deduplication**: TTL-based expiration only
-
-## Security
-
-### Provider Authentication
-- JWT tokens signed with provider's private key (ES256 recommended)
-- Gateway validates signature against registered public key
-- Claims validated: `iss` (team ID), `iat` (issued at), `topic` (bundle ID)
-- Token expiration enforced (max 1 hour)
-
-### Token Security
-- Device tokens hashed with SHA-256 before storage
-- Raw tokens never logged or stored
-- API responses never expose token hashes to unauthorized parties
-
-### Admin Dashboard
-- Session-based auth with bcrypt password hashing
-- Sessions stored in PostgreSQL with expiration
-- Admin operations logged for audit trail
+A WebSocket client can claim any device UUID or acknowledge any notification UUID without proof of ownership. Invalidating a token does not terminate its socket or remove all existing pending work. CORS is unrestricted and HTTP has no TLS. URLs contain raw tokens on token routes; request logging and current HTTP metric labels can expose them. These are concrete local limitations, not implemented production protections.
 
 ## Observability
 
-### Metrics (Prometheus via prom-client)
+Implemented hooks expose HTTP totals/durations, send-path outcomes, token operations/cache timings, active local connection counts, connection events, idempotency decisions, process metrics, and dependency health. Structured Pino records include token-audit events and publish/delivery-path events.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `apns_notifications_sent_total` | Counter | Throughput by priority and status (delivered/queued/expired/failed) |
-| `apns_notification_delivery_seconds` | Histogram | Delivery latency distribution by priority |
-| `apns_active_device_connections` | Gauge | WebSocket connection count |
-| `apns_pending_notifications` | Gauge | Pending queue depth |
-| `apns_cache_operations_total` | Counter | Cache hit/miss ratio for TTL tuning |
-| `apns_circuit_breaker_state` | Gauge | Circuit breaker health (0=closed, 1=open, 2=half-open) |
-| `apns_dependency_health` | Gauge | Database and Redis connectivity |
-| `apns_token_operations_total` | Counter | Token register/invalidate/lookup_hit/lookup_miss |
+Interpret them at their measurement boundaries:
 
-### Structured Logging (Pino)
-- JSON output with request IDs for correlation
-- HTTP request/response logging with timing
-- Notification delivery events with priority, status, latency
-- Audit logging for token lifecycle and admin operations
-- Separate audit log stream for security-relevant events
+- `apns_notification_delivery_seconds` ends after publication or queue storage, not after device acknowledgement.
+- `apns_notifications_sent_total` labels published attempts `delivered`; expired-before-send work is returned/counts as `queued` by the caller.
+- `apns_pending_notifications` is declared but never updated. Invalid-device paths decrement the in-flight gauge before throwing and again in the catch path.
+- Token timing measures cache access, not the full database lookup. Negative-cache hits are counted even though the caller still queries PostgreSQL.
+- HTTP route labels are captured before route matching and fall back to the raw path, causing per-token/per-ID cardinality and disclosure.
+- Circuit-breaker and auth/admin audit helpers exist but have no business-path call sites. Health gauges update only when `/health` is requested.
 
-### SLI Dashboard (Grafana)
-
-Key queries:
-- **Delivery success rate** (target 99.99%): `sum(rate(apns_notifications_sent_total{status="delivered"})) / sum(rate(apns_notifications_sent_total))`
-- **High-priority p99 latency** (target < 500ms): `histogram_quantile(0.99, rate(apns_notification_delivery_seconds_bucket{priority="10"}))`
-- **Cache hit ratio** (target > 90%): `sum(rate(apns_cache_hits_total)) / (sum(rate(apns_cache_hits_total)) + sum(rate(apns_cache_misses_total)))`
-
-### Alert Thresholds
-
-| Alert | Threshold | Severity |
-|-------|-----------|----------|
-| Delivery success rate < 99% | 2 minutes sustained | Warning |
-| High-priority p99 > 500ms | 5 minutes sustained | Critical |
-| Pending backlog > 10,000 | 10 minutes sustained | Warning |
-| Cache hit ratio < 80% | 5 minutes sustained | Warning |
-| No active connections | 5 minutes | Info |
+Production metrics should separate acceptance, handoff, authenticated receipt, expiry, supersession, and terminal failure. Track oldest retained work and retry age, not only counts. Aggregate centrally across instances; do not compute fleet p99 from ten recent console rows. Payloads and raw tokens do not belong in high-cardinality labels.
 
 ## Failure Handling
 
-### Circuit Breaker (Opossum)
-- Wraps Redis pub/sub calls (cross-server notification routing)
-- Opens at 50% error rate, resets after 15-30 seconds
-- Fallback: store notification for later delivery rather than failing immediately
-- Separate circuit breakers per dependency (Redis, PostgreSQL)
+| Failure | Proposed response | Local behavior |
+|---------|-------------------|----------------|
+| Token cache unavailable | Bound fallback load to registry | Cache reads/writes catch errors; token lookup can reach PostgreSQL |
+| Routing Valkey unavailable | Retain accepted operation and retry | Direct route lookup/publication throws; no connected breaker/outbox |
+| Stale connection owner | Reject generation and resolve again | Publish succeeds without checking subscriber/socket delivery |
+| Device disconnects before receipt | Keep work until ack or expiry | Online sends lack pending rows; reconnect deletes rows before ack |
+| Provider retries after timeout | Find/resume same scoped operation | Global Redis claim can suppress unfinished work |
+| Duplicate acknowledgement | Idempotent terminal transition | Duplicate delivery-log insert can throw after history was updated |
+| Concurrent collapse | Replace one complete generation atomically | Separate delete/insert; conflict update omits ID and expiration |
+| Process termination | Drain sockets, preserve work, release owned leases | SIGTERM closes listeners and DB/main Redis then exits; no ack drain |
 
-### Connection Resilience
-- WebSocket connections include heartbeat mechanism to detect stale connections
-- On disconnect, device ID removed from connection map and Redis
-- Pending notifications preserved for delivery on reconnect
-- Exponential backoff for client reconnection (device-side)
-
-### Graceful Shutdown
-- Stop accepting new HTTP requests and WebSocket connections
-- Allow in-flight notification deliveries to complete (30-second timeout)
-- Close database and Redis connections after draining
-- Log shutdown reason and pending notification count
+The subscriber connection is not retained for graceful shutdown, and no application heartbeat refreshes device leases. Reconnecting underlying Redis does not replay lost pub/sub messages. A health endpoint that passes database/Valkey probes does not prove transport delivery works.
 
 ## Scalability Considerations
 
-### Connection Sharding
-At 200M concurrent connections, no single server can handle all devices. Connections are sharded by `hash(device_id) % shard_count`:
-- Each shard server handles ~1M connections (with epoll/kqueue for efficient I/O)
-- Redis stores the mapping: `conn:{deviceId}` -> `shard_server_id`
-- The routing layer looks up the shard before delivery
-- Adding shards requires a rebalancing migration (consistent hashing minimizes movement)
+Scale acceptance, delivery, and connection fleets independently. Assign a stable owner for each destination's retained-state transitions while allowing device connections to move. Add bounded fan-out workers, outbox relays, and history projections before increasing frontend polling or adding API processes indiscriminately.
 
-### Database Sharding
-- Token table sharded by `hash(device_id)` across PostgreSQL instances
-- Notification history partitioned by `created_at` (monthly) for efficient archival
-- Pending notifications stay on a single hot instance (small working set)
+The current implementation's first constraints include sequential fan-out requests, full-count history scans, unbounded per-device reconnect reads, one shared connection hash, and unused lists that grow for every offline enqueue. More Express instances multiply cleanup loops and connection pools; they do not provide recovery or correct lease ownership.
 
-### Geographic Distribution
-- Gateway instances in each major region (US, EU, APAC)
-- Devices connect to the nearest gateway (DNS-based routing)
-- Cross-region notification delivery via Kafka (async, eventual consistency)
-- Token registry replicated across regions with async replication (< 1s lag)
+A production gateway needs bounded socket buffers and fair batching. Priorities should reserve service for urgent traffic while guaranteeing some progress to ordinary traffic. Strictly draining high priority forever can starve older work; blindly flushing a large offline queue can delay new urgent sends.
 
-### What Breaks First
-1. **Single database for tokens** - At 2B tokens, a single PostgreSQL instance cannot handle the lookup QPS. Solution: shard by device_id hash
-2. **Connection server memory** - 1M WebSocket connections per server requires ~4 GB RAM for connection state. Solution: connection servers are stateless (state in Redis), horizontally scale
-3. **Pending queue during mass offline** - A regional outage takes millions of devices offline simultaneously. Solution: pending queue backed by Kafka (distributed, durable), not single PostgreSQL instance
+Multi-region ownership should have an explicit home region, replication policy, and failover fence. Running two active owners without coordinating retained-state generations produces conflicting collapse and acknowledgement decisions. Local pub/sub routing is only a demonstration of cross-process dispatch.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Provider protocol | HTTP/2 | WebSocket | Standard HTTP semantics, multiplexing, header compression, broad tooling |
-| Device connection | Long-lived TCP (WebSocket) | Polling | Sub-second latency, minimal battery drain, bidirectional |
-| Offline handling | Store-and-forward | Drop if offline | Delivery guarantee is core to the service contract |
-| Token storage | SHA-256 hash | Plaintext | Security -- database leak does not compromise push channel |
-| Notification history | Separate table from pending | Single table with status | Optimizes hot queue (small, fast) vs. analytics (large, partitioned) |
-| Cache pattern | Cache-aside for tokens | Write-through | Tokens change rarely; cache-aside is simpler and sufficient |
-| Connection state | Write-through Redis | Cache-aside | Must be immediately consistent for routing decisions |
-| Auth (admin) | Session-based | JWT | Simpler for dashboard; immediate revocation on logout |
+| Acceptance | Durable operation plus recoverable work | Publish-only success | Survive the gap between acceptance and gateway delivery |
+| Delivery semantics | Repeatable attempts and explicit receipts | Universal exactly-once promise | Network uncertainty prevents inferring receipt from a timeout |
+| Offline work | Bounded retention with scoped collapse | Keep everything indefinitely | Bound memory, storage, and reconnect load |
+| Connection routing | Renewable lease and owner generation | Unversioned presence map | Reject stale routing and disconnects |
+| Console data | Timestamped aggregate projection | Every raw delivery event in browser | Bound load and preserve meaningful status |
+| Fan-out | Durable job with bounded children | Sequential HTTP loop | Resume partial sends and isolate bulk traffic |
 
 ## Implementation Notes
 
-### Local Architecture
+### Production patterns actually connected
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Browser                                    │
-│   React + TanStack Router + Zustand + Tailwind                   │
-│   http://localhost:5173                                           │
-│                                                                   │
-│   Pages: Dashboard, Devices, Send Notification, Notifications    │
-└──────────────────────────┬───────────────────────────────────────┘
-                           │ fetch (proxied)
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                 Express API Server                                │
-│                 http://localhost:3000                              │
-│                                                                   │
-│  Routes: devices, notifications, feedback, admin                 │
-│  Services: tokenRegistry, pushService, feedbackService           │
-│  Shared: logger, metrics, cache, circuitBreaker                  │
-│                                                                   │
-│  WebSocket server on same port (ws://)                           │
-│  Simulates device connections for push delivery                  │
-└──────┬───────────────────────────────────────────┬───────────────┘
-       │                                           │
-       ▼                                           ▼
-┌──────────────────────┐              ┌────────────────────────┐
-│  PostgreSQL          │              │   Valkey (Redis)       │
-│  :5432               │              │   :6379                │
-│                      │              │                        │
-│  apns DB             │              │   Token cache          │
-│  (device_tokens,     │              │   Idempotency keys     │
-│   topic_subs,        │              │   Connection state     │
-│   pending_notifs,    │              │   Rate limiting        │
-│   notifications,     │              │                        │
-│   delivery_log,      │              │                        │
-│   feedback_queue,    │              │                        │
-│   admin_users,       │              │                        │
-│   sessions)          │              │                        │
-└──────────────────────┘              └────────────────────────┘
+**Token cache with database fallback.** [shared/cache.ts](./backend/src/shared/cache.ts) reads positive entries for one hour and catches cache failures. [tokenRegistry.ts](./backend/src/services/tokenRegistry.ts) queries PostgreSQL on misses and invalidates cached records on updates. This reduces repeated successful lookups, but does not establish measured hit rates or immediate revocation under races.
+
+```typescript
+const cached = await getTokenFromCache(tokenHash);
+if (cached) return cached;
 ```
 
-### Production-Grade Patterns Implemented
+Negative entries return the same null as a cache miss, so the caller still queries the database. An invalidation racing an older lookup can repopulate stale positive state. Registration is read-then-insert, not an atomic upsert; concurrent first registrations can conflict. Re-registration reactivates a token without changing its bundle or clearing old invalidation metadata. Hashing the original hex string also treats upper/lowercase spellings differently.
 
-| Pattern | File | Why It Matters |
-|---------|------|----------------|
-| Prometheus Metrics | `src/shared/metrics.ts` | Notification throughput, delivery latency, connection count, cache hit ratio, circuit breaker state, dependency health. Enables SLO monitoring. |
-| Structured Logging (Pino) | `src/shared/logger.ts` | JSON logs with request IDs, HTTP timing, delivery events. Audit logging for token lifecycle and admin operations. |
-| Redis Caching (cache-aside) | `src/shared/cache.ts` | Token lookup caching with 1h TTL, negative caching for invalid tokens, idempotency key storage with 24h TTL. Reduces DB load by ~20x. |
-| Circuit Breaker (Opossum) | `src/shared/circuitBreaker.ts` | Protects Redis pub/sub and per-device WebSocket circuits. Opens at 50% error rate, fallback stores notifications for later delivery. |
-| Idempotency | `src/services/pushService.ts` | Provider-supplied `apns-id` checked against Redis. Duplicate sends within 24h return original response. Prevents double notifications on retry. |
-| Token Registry with Cache | `src/services/tokenRegistry.ts` | Registration, invalidation, lookup with cache-aside pattern. SHA-256 token hashing, topic subscription management. |
-| WebSocket Push Delivery | `src/services/pushService.ts` | Simulates persistent device connections. Store-and-forward for offline devices, collapse ID replacement, priority-ordered delivery on reconnect. |
-| Health Check with Dependencies | `src/index.ts` | Reports database and Redis status, updates Prometheus dependency gauges. Supports load balancer integration. |
+**Request and token logging.** [shared/logger.ts](./backend/src/shared/logger.ts) supplies Pino HTTP logging and token audit records. These make local flows inspectable, but audit hooks for login/admin actions are not called and request IDs are not propagated through every lifecycle operation. URLs still need redaction; storing a token hash alone does not cover log exposure.
 
-### Simplifications
+**Prometheus and health endpoints.** [shared/metrics.ts](./backend/src/shared/metrics.ts) and [index.ts](./backend/src/index.ts) connect middleware and expose `/metrics` and `/health`. Health sequentially probes PostgreSQL and Valkey and returns 200 or 503. No monitoring server or alert rules ship in Compose. The measurement gaps described above prevent treating these metrics as a delivery SLO implementation.
 
-| Production Design | Local Substitute | Why Acceptable |
-|-------------------|------------------|----------------|
-| HTTP/2 with TLS + JWT auth | HTTP/1.1 with Express + session auth | Same request/response semantics; avoids certificate management |
-| Persistent TCP connections from devices | WebSocket connections from browser | Demonstrates store-and-forward, priority delivery, collapse without real device SDK |
-| Kafka for notification routing | Direct in-process delivery | Single server needs no cross-server message passing |
-| Sharded connection servers (1M conns each) | Single Express with ws library | Demonstrates the connection/delivery pattern at toy scale |
-| PostgreSQL sharded by device_id | Single PostgreSQL instance | All tables fit in memory at development scale |
-| Redis Cluster | Single Valkey instance | No HA or sharding needed for < 20 devices |
-| Geographic distribution (multi-region gateways) | Single localhost server | Latency is not meaningful in development |
+**Best-effort duplicate claim.** The connected Redis claim illustrates single-key atomic reservation:
 
-### Omitted
-
-- HTTP/2 binary framing and stream multiplexing
-- TLS 1.3 and certificate-based provider authentication
-- Real iOS device SDK integration (APNs binary protocol)
-- Connection sharding with consistent hashing
-- Geographic routing and multi-region deployment
-- Kafka-based notification routing and delivery event streaming
-- Database sharding for token and notification tables
-- Kubernetes orchestration and auto-scaling
-- Battery-aware delivery scheduling (power nap integration)
-- VoIP and complication push types
-- Silent push for background app refresh
-- Provider certificate management and rotation
-
----
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-__root.tsx (root layout with navigation)
-├── login.tsx (admin login form)
-├── index.tsx (Dashboard - system overview)
-│   └── (stat cards: total devices, notifications sent, delivery rate, pending queue)
-├── devices.tsx (Device management)
-│   └── (device list with token hash, app bundle ID, validity status, topics, last seen)
-├── send.tsx (Send notification form)
-│   └── (target device selector, payload editor, priority picker, collapse ID, expiration)
-└── notifications.tsx (Notification history)
-    └── (notification list with status, priority, device, created time, payload preview)
+```typescript
+const result = await redis.set(key, "1", "EX", CACHE_TTL.IDEMPOTENCY, "NX");
 ```
 
-### Zustand Stores
+It is called before validation, is not coupled to durable work, and has no recovery state. Its limits belong to the current implementation; the production outbox/idempotency proposal is additional work.
 
-**`useAuthStore`** (`stores/authStore.ts`) -- Admin authentication state with persistence:
+### Actual routing and storage behavior
 
-- **`user`**: Authenticated admin user (id, username, role) or null
-- **`token`**: Session token persisted in localStorage via Zustand's `persist` middleware (only the token is persisted, not the full user object)
-- **`isAuthenticated`**: Whether a valid session exists
-- **Actions**: `login(username, password)`, `logout()`, `checkAuth()` (validates stored token on page load)
+[db/redis.ts](./backend/src/db/redis.ts) stores all routes in one `device:connections` hash. Every connection sets a **one-hour TTL on the whole hash**. There is no per-device lease refresh. With no new registrations of sockets, even live routes disappear together; steady new connections can keep crashed-device entries alive. The separate five-minute `cache:conn:*` helpers are unused.
 
-**`useDashboardStore`** (`stores/dashboardStore.ts`) -- Dashboard statistics state:
+[index.ts](./backend/src/index.ts) maps a device ID to one socket. Replacing a connection has no ownership generation, so an old socket closing can delete the replacement's local and Redis route. A single socket can also send multiple connect identities without cleaning all older mappings. There is no heartbeat, device credential check, or acknowledgement ownership check.
 
-- **`notifications`**: Aggregate counts by status (total, pending, queued, delivered, failed, expired)
-- **`devices`**: Aggregate counts by validity (total, valid, invalid)
-- **`topics[]`**: Per-topic subscriber counts
-- **`recentNotifications[]`**: Activity feed showing the latest notifications with status, payload, and timestamps
-- **Actions**: `fetchStats()` loads all dashboard data from `/api/v1/admin/stats` in a single request
+[pushService.ts](./backend/src/services/pushService.ts) inserts history, marks the ID processed, and then routes or stores. Online publication returns `delivered` without updating history; history remains `pending` until ack. Subscriber absence, a closed socket, and lack of receipt have no retained fallback. Initial expiry sets history to `expired`, yet the caller reports `queued` because it tests only the delivered flag.
 
-### Routing
+Offline storage deletes an older collapse row separately from inserting its replacement. Under concurrent inserts, the conflict handler changes payload, priority, and creation time but retains the existing ID and expiration. Old history records are not marked superseded. This can associate new content with an old identity/deadline. Appending the device UUID to topic collapse IDs can also exceed the local 100-character column limit.
 
-TanStack Router with file-based routing:
+Reconnect reads every unexpired pending row ordered by priority descending then age, publishes them sequentially, and deletes **all pending rows for the device**. That deletion precedes ack and can remove a concurrently inserted row that was not in the fetched batch. Ack handling updates history, inserts delivery log, then deletes pending in separate statements; a duplicate-log failure can prevent the final delete. The fixture pending IDs have no matching history to update.
 
-| Route | File | Description |
-|-------|------|-------------|
-| `/login` | `routes/login.tsx` | Admin login form |
-| `/` | `routes/index.tsx` | Dashboard with device and notification statistics |
-| `/devices` | `routes/devices.tsx` | Device token list with registration, invalidation, topic management |
-| `/send` | `routes/send.tsx` | Notification composer with priority, payload, collapse ID |
-| `/notifications` | `routes/notifications.tsx` | Notification history with status and delivery details |
+The expiry task runs every minute in every API process, marks eligible history rows expired, and deletes expired pending rows. Null expiry is never collected. Redis priority lists are only appended; no code calls the dequeue helper or removes entries on delivery/expiry. Priority affects reconnect sorting, not an active battery-aware scheduler.
 
-The root layout (`__root.tsx`) provides navigation links between Dashboard, Devices, Send, and Notifications pages. All routes except `/login` require authentication.
+Topic sends read all valid subscribers, create separate child notifications sequentially, and return a generated but unpersisted parent ID. Child history does not populate its `topic` field. Broadcast only examines the newest 10,000 registered devices before filtering valid ones. Neither flow is resumable, idempotent as a batch, or accurately described as proof of delivery.
 
-### Data Fetching
+### Validation and feedback limits
 
-All data fetching goes through a centralized API service (`services/api.ts`) with an `adminApi` namespace:
+The REST helper checks for an object-like `aps` and counts JavaScript string length, not UTF-8 bytes. A payload with 3,000 `é` characters is 3,020 code units but 6,020 bytes and passes that size check. Invalid REST priority values default to 10; the `/3` route bypasses those validators altogether. Local `apns-expiration: 0` is converted to null and can be stored indefinitely. There is no push-type-specific priority validation.
 
-- **`adminApi.login(username, password)`** / **`adminApi.logout()`**: Session management
-- **`adminApi.getMe()`**: Session validation
-- **`adminApi.getStats()`**: Fetches aggregate dashboard statistics (devices, notifications, topics, recent activity) in a single request
-- **Device operations**: Register, list, invalidate, manage topic subscriptions
-- **Notification operations**: Send to device or topic, check delivery status, list history
+[feedbackService.ts](./backend/src/services/feedbackService.ts) returns at most 1,000 entries after a strict timestamp, without a tie-breaking cursor. If many entries share a timestamp, advancing by timestamp can skip unseen rows. Clearing without a cutoff removes all feedback for the bundle. Reads and deletes have no provider binding. Invalidation, cache deletion, and feedback insertion are separate writes; re-registering a token does not retract old feedback or pending messages.
 
-The API service reads the auth token from localStorage and includes it in request headers. Failed auth requests trigger automatic logout and redirect to the login page.
+### Frontend and local substitutions
 
-### Key UI Patterns
+The React console uses TanStack Router, Zustand for session/dashboard state, and component state for paginated lists and the send form. [services/api.ts](./frontend/src/services/api.ts) centralizes fetch and attaches the localStorage bearer token. There is no TanStack Query, virtualization, chart library, form schema library, SSE, or console WebSocket stream.
 
-- **Admin-only interface**: This is a dashboard for system operators, not end users. All pages require authentication. The login page uses the `useAuthStore` to persist the session token
-- **Stat cards on dashboard**: The dashboard displays notification delivery statistics as color-coded cards (green for delivered, yellow for pending, red for failed), giving operators an at-a-glance system health view
-- **Notification composer**: The send page provides a form for constructing APNs payloads with JSON editing for the `aps` dictionary, priority selection (10/5/1), optional collapse ID, and expiration time
-- **Token persistence**: Using Zustand's `persist` middleware with `partialize` to store only the token (not the full user object), keeping localStorage minimal and avoiding stale user data
+The dashboard polls every 30 seconds, can overlap requests, and lacks a last-successful-refresh timestamp. Lists use 20-row offset pages; notification filters reset the page but have no abort or stale-response guard. Dashboard state survives logout because it is a separate store, and in-flight responses are not bound to the current session. API failures do not centrally expire authentication. `checkAuth` treats any failure, including a transient outage, as logout.
 
----
+The send form disables submit during a request but allows fields/mode/clear to change. Its eventual result can appear beside a different draft. It provides no operation key, uncertain-outcome recovery, expiry/collapse controls, or receipt subscription. Broadcast is a direct submit. Navigation links disappear below the small-screen breakpoint without replacement navigation. Table identifiers are truncated without a detail/copy path.
 
-## Deep Pattern Explanations
+Compose supplies persistent PostgreSQL and Valkey only. The host runs APIs and Vite; ports 3001–3003 select server IDs for manual multi-process experiments. There is no load balancer, native iOS transport, HTTP/2/TLS provider server, provider JWT/certificate verification, durable message broker, connected circuit breaker, connected rate limiter, sharding, multi-region deployment, or complete delivery-recovery loop.
 
-This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
-
-### Redis Cache-Aside
-
-**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for reading from and writing to the cache. The cache does not communicate with the database directly -- the application sits between them and orchestrates data flow.
-
-**How it works**: When a notification needs to be delivered, the system must look up the device token to verify it is valid and find the device's connection shard. The lookup path is:
-1. Check Redis for `token:{hash}` (1-hour TTL). If found, use the cached device info.
-2. If not in Redis (cache miss), query PostgreSQL's `device_tokens` table. If found, write the result to Redis and return it.
-3. If the token is not in PostgreSQL either, cache a negative result (`token:{hash}:invalid`) with a 5-minute TTL to prevent repeated database queries for the same invalid token.
-
-On token invalidation, the cache entry is immediately deleted and a negative cache entry is created. This ensures that notifications to invalidated tokens fail fast rather than being delivered to an uninstalled app.
-
-**Why it matters**: At production scale, 50B daily notifications means 50B token lookups. Without caching, every notification delivery would require a PostgreSQL query. With 2B tokens in the database, each lookup would take 1-5ms even with an index. At 580K notifications per second, the database would need to handle 580K queries per second just for token lookups -- far beyond a single PostgreSQL instance's capacity. Redis serves cached lookups in ~0.1ms, reducing database load by 95%+. The negative caching is equally important: without it, every notification to an uninstalled app would hit the database, and providers who have not cleaned up their token lists could flood the database with failed lookups.
-
-**When to use it**: Cache-aside is appropriate when the cached data changes infrequently relative to how often it is read (tokens are registered once but looked up thousands of times), when a cache miss is tolerable (the database is the source of truth), and when the cache and database can be temporarily inconsistent (a 1-hour TTL means a newly invalidated token could still be considered valid for up to 1 hour in edge cases, but the immediate cache deletion on invalidation minimizes this window).
-
-### Circuit Breaker (Opossum)
-
-**What it is**: A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing service. When failures exceed a threshold, the circuit "opens" and calls fail immediately with a fallback response rather than waiting for timeouts.
-
-**How it works**: In this project, separate circuit breakers wrap Redis pub/sub calls and per-device WebSocket delivery:
-- **Redis circuit**: Monitors pub/sub operations for cross-server notification routing. Opens at 50% error rate, resets after 15-30 seconds. When open, notifications are stored in the pending queue for later delivery rather than attempting pub/sub distribution.
-- **Per-device circuit**: Each WebSocket connection has its own circuit state. If delivery to a specific device fails repeatedly (device disconnected but connection not yet cleaned up), the circuit opens and the notification is queued as pending.
-
-**Why it matters**: In a push notification system, cascading failures are especially dangerous. If Redis pub/sub becomes unavailable, every notification delivery attempt would block for the connection timeout. With hundreds of thousands of notifications per second, this would quickly exhaust the server's thread pool, causing the entire system to hang. The circuit breaker's fallback (store in pending queue for later delivery) ensures that notifications are not lost -- they are just delayed. This aligns with APNs' store-and-forward promise: the notification will be delivered when conditions improve.
-
-**When to use it**: Around any call to an external service that could fail. In notification systems, circuit breakers are critical because the service must remain operational even when some components are degraded. A notification system that crashes when Redis is temporarily unavailable fails its core promise of reliable delivery.
-
-### Prometheus Metrics (prom-client)
-
-**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. The application exposes a `/metrics` HTTP endpoint with metrics in Prometheus text format.
-
-**How it works**: This project tracks eight custom metrics:
-- **`apns_notifications_sent_total`** (Counter, labels: priority, status): Tracks throughput by delivery outcome. Enables calculating delivery success rate.
-- **`apns_notification_delivery_seconds`** (Histogram, labels: priority): Distribution of end-to-end delivery latency. The P99 for priority-10 notifications must stay below 500ms per the SLA.
-- **`apns_active_device_connections`** (Gauge): Current WebSocket connection count. Indicates system load and capacity.
-- **`apns_pending_notifications`** (Gauge): Pending queue depth. High values indicate offline devices or delivery bottlenecks.
-- **`apns_cache_operations_total`** (Counter, labels: operation): Cache hit/miss ratio for token lookups. Drives TTL tuning decisions.
-- **`apns_circuit_breaker_state`** (Gauge): Numeric encoding of circuit state (0=closed, 1=open, 2=half-open). Enables alerting when circuits open.
-- **`apns_dependency_health`** (Gauge): Database and Redis connectivity status. Binary health signal for monitoring dashboards.
-- **`apns_token_operations_total`** (Counter, labels: operation): Token lifecycle events (register, invalidate, lookup_hit, lookup_miss).
-
-**Why it matters**: A push notification system's primary SLI is delivery success rate. The combination of `apns_notifications_sent_total{status="delivered"}` and total notifications enables computing this rate. If it drops below 99%, the system is failing its core promise. The `apns_circuit_breaker_state` metric enables proactive alerting -- when a circuit opens, operators can investigate the failing dependency before it causes widespread delivery failures.
-
-**When to use it**: In any production system, but push notification services have particularly strong monitoring requirements because failures are invisible to the sender. A provider sending notifications does not know if they are being delivered unless the monitoring system reports it.
-
-### Structured Logging (Pino)
-
-**What it is**: Structured logging produces log entries as machine-parseable JSON objects with consistent field names. This project adds a separate audit log stream for security-relevant events.
-
-**How it works**: Every HTTP request is logged with method, path, status code, duration, and request ID via `pino-http`. Notification delivery events include priority, status, latency, and device ID. Token lifecycle events (registration, invalidation) are logged at the audit level with the admin user who performed the action. The audit log stream enables compliance with security review requirements and incident investigation.
-
-**Why it matters**: Push notification systems handle sensitive operations: registering tokens (which are bearer credentials), invalidating tokens (which affects users' ability to receive notifications), and delivering payloads (which may contain personal messages). Audit logging of these operations is essential for security incident investigation. If an unauthorized party gains access to the admin dashboard and invalidates thousands of tokens, the audit log provides the evidence needed to identify the attacker and assess the blast radius.
-
-**When to use it**: Always in production. Audit logging is especially important for systems that handle bearer credentials (tokens, API keys) or that can affect user-facing functionality (invalidating push tokens prevents users from receiving notifications).
-
-### Idempotency
-
-**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once.
-
-**How it works**: Providers supply an `apns-id` header (UUID) with each notification. The server checks Redis for `cache:idem:{apns-id}` using `SET NX EX 86400` (set if not exists, 24-hour expiry). If the key already exists, the notification is a duplicate and the original response is returned. If the key does not exist, the notification is processed normally and the result is cached. Token registration is also idempotent: re-registering with the same token hash updates `last_seen` and `device_info` via an `ON CONFLICT` upsert rather than creating a duplicate.
-
-**Why it matters**: Providers retry failed notification sends. Without idempotency, a retry would create a duplicate notification, and the user would receive the same message twice. For messaging apps, this is confusing. For e-commerce apps sending order confirmations, it could cause user panic ("was I charged twice?"). The 24-hour deduplication window covers the typical retry window for most provider implementations.
-
-**When to use it**: For any notification or message delivery system where duplicate delivery is worse than missed delivery. The idempotency key should be provider-controlled (not server-generated) so that the provider can retry with the same key.
-
-### Health Checks
-
-**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly.
-
-**How it works**: This project's health check tests both PostgreSQL and Redis connectivity, and updates Prometheus dependency gauges (`apns_dependency_health`) with the results. The gauge values (0 for down, 1 for up) enable Grafana alerts when dependencies become unavailable.
-
-**Why it matters**: For a push notification system, the health check must verify both the database (for token lookups and notification persistence) and Redis (for caching, connection state, and idempotency). A server that has lost its Redis connection can still serve some requests from the database, but its cache hit rate will drop to zero and its idempotency checks will fail, potentially causing duplicate deliveries. The health check integration with Prometheus metrics means that dependency failures are both detected by the load balancer (via HTTP status) and visible in dashboards (via gauge metrics).
-
-**When to use it**: Every production service needs health checks. For notification systems, the health check should verify all dependencies in the critical delivery path (database, cache, message queue) because degradation in any one of them affects the system's ability to deliver notifications reliably.
+This document reflects a source review. The [five smoke tests](./tests/smoke.spec.ts) check login/page shells and do not establish delivery, authorization, or failure recovery. No application build, database startup, or browser suite was run for this documentation-only revision.

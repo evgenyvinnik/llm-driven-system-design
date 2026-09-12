@@ -1,294 +1,414 @@
-# Bitly (URL Shortener) - System Design Answer (Backend Focus)
+# 🔗 Design a URL shortener: backend interview
 
-*45-minute system design interview format - Backend Engineer Position*
+> “I would separate three decisions: publishing a unique mapping, resolving a mapping
+> that is still allowed to redirect, and retaining an observation for analytics. A
+> cache and a queue help with load, but each introduces a different failure boundary.”
 
-## Problem Statement
+This is a proposed production design, not a claim about Bitly's private architecture.
+It extends the local learning project; the [Implementation
+Notes](./architecture.md#implementation-notes) distinguish implemented paths from
+these guarantees.
 
-Design the backend infrastructure for a URL shortening service that:
-- Generates unique 7-character short codes at scale
-- Handles 100:1 read-to-write ratio with sub-50ms redirect latency
-- Tracks analytics (clicks, referrers, devices, geography)
-- Supports custom short codes and link expiration
+| Time | Discussion |
+|------|------------|
+| 5 minutes | Requirements and capacity |
+| 5 minutes | Architecture, data, and API |
+| 8 minutes | Deep dive: namespace ownership and creation recovery |
+| 8 minutes | Deep dive: cached redirects and revocation |
+| 9 minutes | Deep dive: retained analytics and repeated delivery |
+| 6 minutes | Failure isolation, security, and growth |
+| 4 minutes | Verification and design boundaries |
 
-## Requirements Clarification
+## 🎯 Requirements and capacity — 5 minutes
 
-### Functional Requirements
-1. **URL Shortening**: Generate short codes from long URLs
-2. **URL Redirection**: Fast lookup and redirect to original URL
-3. **Custom Short Codes**: User-specified short codes with validation
-4. **Analytics Tracking**: Click counts, referrers, device types, timestamps
-5. **Link Expiration**: Optional TTL for short URLs
-6. **User Management**: Session-based authentication, URL ownership
+I would support generated short links, optional custom aliases and expiration, owner
+management, administrative deactivation, and basic click reports. Destination editing,
+custom domains, and paid campaign accounting are outside the first design. I would
+clarify those early because they change cache and durability requirements.
 
-### Non-Functional Requirements
-1. **Latency**: < 50ms p99 for redirects, < 200ms for API calls
-2. **Throughput**: 40,000 RPS for redirects at peak
-3. **Availability**: 99.99% uptime for redirect service
-4. **Consistency**: Strong for URL creation, eventual for analytics
+A short code has one owner and one destination. Once retired, it is not reassigned to
+someone else. Otherwise an old email could unexpectedly direct people to an unrelated
+destination years later. Code-space conservation is not worth that behavior.
 
-### Scale Estimates
-- 100M URLs created/month (~40 writes/second)
-- 10B redirects/month (~4,000 reads/second)
-- 6B URLs stored (5-year retention)
-- 100:1 read-to-write ratio
+The main product is navigation. I would target 99.99% redirect availability and
+regional p99 resolution under 50 ms, excluding the destination server. Creation can
+tolerate a larger budget, such as 300 ms p99. These are design targets that require
+measurement, not results from this repository.
 
-## High-Level Architecture
+Analytics can normally lag by a minute. During collection failures, I would prefer
+continued redirects with disclosed report gaps. If the interviewer instead requires
+every successful redirect to have a retained event, I would acknowledge that durable
+event admission becomes part of the redirect's critical path.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Load Balancer (nginx/GeoDNS)                        │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-            │ API Server  │ │ API Server  │ │ API Server  │
-            │   (Node)    │ │   (Node)    │ │   (Node)    │
-            └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-                   │               │               │
-                   └───────────────┼───────────────┘
-                                   │
-            ┌──────────────────────┼──────────────────────┐
-            │                      │                      │
-            ▼                      ▼                      ▼
-    ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-    │    Valkey    │      │  PostgreSQL  │      │   RabbitMQ   │
-    │   (Cache +   │      │   (Primary   │      │  (Analytics  │
-    │   Sessions)  │      │   Sharded)   │      │    Queue)    │
-    └──────────────┘      └──────────────┘      └──────────────┘
-                                                       │
-                                                       ▼
-                                               ┌──────────────┐
-                                               │  ClickHouse  │
-                                               │  (Analytics) │
-                                               └──────────────┘
-```
+Assume 50 million new links and five billion redirect requests per day. That is about
+580 creations and 58,000 redirects per second on average. I would provision and test
+representative peaks around 5,000 creations and 200,000 redirects per second, then
+refine those assumptions from traffic shape.
 
-## Deep Dive: Database Schema
+At an assumed 500 bytes per mapping, one year adds about 9.1 TB before indexes and
+replication. At 200 bytes per request event, analytics adds about 1 TB per day. The
+event store therefore becomes a storage and retention problem much sooner than the
+mapping namespace fills.
 
-### Core Tables
+Seven base62 characters provide about 3.52 trillion possibilities. At 50 million
+allocations per day, that is roughly 193 years of raw capacity. Random selection still
+collides before exhaustion; the unique constraint, retry policy, and retirement policy
+are part of the design.
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| **users** | id (UUID PK), email (unique), password_hash, role (user/admin) | — | Standard user table with role-based access |
-| **key_pool** | short_code (VARCHAR(7) PK), is_used (boolean), allocated_to (server instance ID), allocated_at | idx_key_pool_unused (partial: WHERE is_used = FALSE) | Pre-generated short codes for allocation to server instances |
-| **urls** | id (UUID PK), short_code (unique VARCHAR(7)), long_url (text), user_id (FK), is_custom, is_active, expires_at, click_count (bigint) | idx_urls_short_code, idx_urls_user_id, idx_urls_expires (partial: WHERE expires_at IS NOT NULL) | Main URL mapping table with optional expiration |
-| **click_events** | id (UUID PK), url_id (FK cascade), short_code, referrer, user_agent, device_type (mobile/tablet/desktop), country_code, ip_hash (SHA-256) | idx_clicks_short_code, idx_clicks_time (clicked_at) | Click tracking for analytics, IP hashed for privacy |
-| **sessions** | id (UUID PK), user_id (FK cascade), token (unique), expires_at | idx_sessions_token | Session-based authentication |
+> “I would spend more time on a viral link, stale deactivation, and event recovery
+> than on inventing a complicated identifier scheme. Those are more likely to
+> determine whether this service behaves correctly.”
 
-### Why PostgreSQL?
+## 🏗️ Architecture, data, and API — 5 minutes
 
-| Consideration | PostgreSQL | Cassandra | DynamoDB |
-|---------------|------------|-----------|----------|
-| ACID transactions | Full | Limited | Limited |
-| Custom code validation | Easy (unique constraint) | Complex | Complex |
-| Query flexibility | Excellent | Limited | Limited |
-| Sharding | Manual but predictable | Automatic | Automatic |
-
-**Decision**: PostgreSQL with manual sharding by short_code prefix. The unique constraint on short_code ensures no collisions between custom codes and generated codes.
-
-## Deep Dive: Short Code Generation
-
-### Pre-generated Key Pool Service
-
-Each API server maintains a local in-memory cache of pre-allocated short codes. The process works as follows:
-
-1. **Get a short code** - Pop a code from the local cache. If the cache drops below 20 entries, trigger a background refill.
-2. **Refill the cache** - Atomically fetch a batch of 100 unused, unallocated codes from the key_pool table using a CTE with `FOR UPDATE SKIP LOCKED` to avoid contention between servers. Mark the fetched codes as allocated to this server instance.
-3. **Generate new keys** - A background process generates random 7-character codes from a base-62 alphabet (a-z, A-Z, 0-9), batch-inserts them into the key_pool table, and uses `ON CONFLICT DO NOTHING` to skip any collisions with existing codes.
-
-### Why Pre-generated Pool?
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| Hash-based | Deterministic, dedup built-in | Collisions, predictable, privacy issues |
-| Counter-based | Simple, guaranteed unique | Single point of failure, predictable |
-| **Pre-generated pool** | No coordination, random, unique | Slight complexity, key management |
-
-**Decision**: Pre-generated pool with batch allocation to each server instance.
-
-## Deep Dive: Redirect Service
-
-### Cache-Aside Pattern with Fallback
-
-The redirect service uses a three-tier lookup strategy to resolve short codes to long URLs:
-
-1. **Tier 1 - Local LRU cache** (in-memory, 10K entries max, 60-second TTL): Check the local in-process cache first. This avoids any network call for hot URLs and provides sub-millisecond lookups.
-
-2. **Tier 2 - Redis cache** (shared across servers, 24-hour TTL): On local cache miss, check Redis. If found, populate the local cache and return. Redis errors are caught and treated as cache misses (the system continues to the database).
-
-3. **Tier 3 - PostgreSQL** (source of truth, wrapped in a circuit breaker): Query the urls table by short_code. Check that the URL is active and not expired. On success, populate both Redis (24-hour TTL) and local cache.
-
-If the URL is not found at any tier, return null. The circuit breaker prevents cascading database failures from overwhelming the system.
-
-### Redirect Endpoint
-
-The redirect handler at `GET /:shortCode` works as follows:
-
-1. Look up the long URL via the three-tier cache (local, Redis, database).
-2. If not found, return 404.
-3. If found, immediately return a **302 redirect** to the long URL.
-4. **After** sending the response, asynchronously (non-blocking) track the click by publishing an analytics event with the short code, referrer, user agent, and IP address. Analytics errors are logged but never block the redirect.
-5. Record redirect latency and cache hit/miss metrics.
-
-### Why 302 vs 301?
-
-| Response Code | Behavior | Analytics Impact |
-|---------------|----------|------------------|
-| 301 Permanent | Browser caches, never hits server again | Loses all future clicks |
-| **302 Temporary** | Browser always requests server | Captures every click |
-
-**Decision**: Use 302 for accurate analytics tracking, accepting slightly higher server load.
-
-## Deep Dive: Analytics Pipeline
-
-### Async Processing with RabbitMQ
-
-**Analytics Producer:** When a click occurs, the service enriches the raw event with a UUID, parsed device type (mobile/tablet/desktop based on user-agent regex), geolocated country code from the IP address, and a SHA-256 hash of the IP (for privacy). The enriched event is published to the "click_events" routing key on the "analytics" exchange in RabbitMQ.
-
-**Analytics Worker:** The worker consumes click events from the queue and performs two database operations: (1) Insert the click event into the click_events table, joining with the urls table to resolve the url_id from the short_code. (2) Increment the denormalized click_count on the urls table for fast read access.
-
-### ClickHouse for Analytics (Production)
-
-At production scale, click events are stored in ClickHouse for high-volume analytical queries.
-
-| Table | Key Columns | Engine | Notes |
-|-------|-------------|--------|-------|
-| **click_events** | short_code (String), clicked_at (DateTime), referrer (String), device_type (LowCardinality String), country_code (LowCardinality String), url_id (UUID) | MergeTree, partitioned by month (toYYYYMM), ordered by (short_code, clicked_at) | Raw click events optimized for time-range queries |
-| **clicks_daily_mv** (materialized view) | short_code, date, clicks (count), unique_visitors (uniqExact of ip_hash) | SummingMergeTree, ordered by (short_code, date) | Pre-aggregated daily summaries that update automatically as new events arrive |
-
-## Deep Dive: Caching Strategy
-
-### Multi-Tier Cache Architecture
+I would draw the redirect path separately from management and analytics:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Request Flow                            │
-│                                                              │
-│  Redirect ──► Local LRU (60s) ──► Redis (24h) ──► PostgreSQL│
-│  Session  ──► Redis (7d) ──► PostgreSQL                     │
-│  Rate Limit ──► Redis (1m sliding window)                   │
-│  Idempotency ──► Redis (24h)                                │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────┐       ┌────────────────┐
+│ Management API │──────▶│ Mapping store  │
+└────────────────┘       └───────┬────────┘
+                                 │ revisions
+                                 ▼
+┌────────────────┐       ┌────────────────┐
+│ Link request   │──────▶│ Resolver/cache │──────▶ Destination
+└────────────────┘       └───────┬────────┘
+                                 ▼
+                         ┌────────────────┐
+                         │ Event log      │
+                         └───────┬────────┘
+                                 ▼
+                         ┌────────────────┐
+                         │ Report workers │──────▶ Analytics API
+                         │ and store      │
+                         └────────────────┘
 ```
 
-### Cache Key Design
+The mapping store is authoritative for ownership and lifecycle. Regional caches hold
+read representations. A retained event pipeline feeds an analytics store so report
+queries and click aggregation do not compete with mapping writes.
 
-| Cache Key Pattern | Purpose | TTL |
-|-------------------|---------|-----|
-| `url:{shortCode}` | URL lookup (hot path) | 24h |
-| `session:{token}` | Session storage | 7d |
-| `rate:{ip}:{endpoint}` | Rate limiting | 1 min |
-| `idempotency:{fingerprint}` | Idempotency for URL creation | 24h |
+I would start with PostgreSQL for link management because unique claims and operation
+receipts fit a transaction. Logical separation does not require six deployments on day
+one. The redirect and analytics workloads get separate capacity and pools as soon as
+their interference becomes measurable.
 
-### Cache Invalidation
+| Record | Key information | Access pattern |
+|--------|-----------------|----------------|
+| Link | Code, owner, target, status, expiry, revision | Resolve by code; list by owner and creation cursor |
+| Creation receipt | Caller, operation ID, request digest, resulting code | Recover one accepted creation |
+| Change outbox | Link revision and pending propagation | Resume invalidation after a publisher crash |
+| Session | Opaque token reference, user, authoritative expiry | Check current access and revoke it |
+| Observation | Event ID, code, time, selected dimensions | Retain, replay, and aggregate by time |
+| Report projection | Code, bucket, metric version, count | Read bounded summaries with freshness |
 
-Cache invalidation follows three patterns:
+| Method | Resource | Purpose |
+|--------|----------|---------|
+| POST | `/api/v1/urls` | Create or recover one caller-scoped attempt |
+| GET | `/api/v1/urls` | List the caller's links with a stable cursor |
+| PATCH | `/api/v1/urls/:code` | Change permitted lifecycle fields against a revision |
+| GET | `/:code` | Resolve an eligible mapping |
+| GET | `/api/v1/analytics/:code` | Read authorized aggregate activity |
+| GET | Proposed creation-operation resource | Recover an outcome after a lost response |
 
-- **URL deactivated or expired**: Delete the key from both Redis and the local LRU cache immediately.
-- **URL updated** (long URL changed): Write-through update -- set the new value in Redis with a fresh 24-hour TTL and update the local cache simultaneously.
+I would require consistent URL, alias, and duration validation before allocation. The
+service accepts HTTP(S) destinations but does not fetch them as part of creation.
+Syntactic acceptance and destination reputation are different capabilities.
 
-## Deep Dive: Rate Limiting
+An anonymous creator receives a narrowly scoped operation-recovery context rather than
+account ownership. A signed-in creator gets a link owned by that account.
+Authentication infrastructure failure must not silently turn an intended owned
+creation into an anonymous one.
 
-### Sliding Window Counter in Redis
+## 🔧 Deep dive: namespace ownership and creation recovery — 8 minutes
 
-The rate limiter uses a Redis sorted set to implement a sliding window counter:
+The first invariant is that one code cannot point to two owners' destinations. For the
+initial production implementation, I would generate a cryptographic random candidate
+and let a unique insert claim it. A collision causes a bounded retry with a new
+candidate.
 
-1. **Remove old entries** - Use ZREMRANGEBYSCORE to remove all entries with timestamps before the window start (current time minus window duration).
-2. **Add current request** - ZADD the current timestamp with a unique member (timestamp + UUID to avoid collisions).
-3. **Count requests in window** - ZCOUNT entries between the window start and now.
-4. **Set key expiry** - Set the sorted set TTL to the window duration to auto-clean up.
+The key word is bounded. If collisions unexpectedly become frequent, the request
+should fail predictably and emit a useful signal. An unbounded loop turns a namespace
+or generator problem into an availability problem.
 
-All four operations run in a single Redis pipeline for atomicity.
+At roughly 0.5% occupancy after a year under these assumptions, most independent draws
+still succeed on the first attempt. That does not prove a particular database meets
+the peak workload, but it gives me a simpler design to benchmark before adding a
+reservation service.
 
-**Rate limit configuration:**
+Custom aliases use the same namespace authority. A preflight availability check is
+only a hint: two concurrent callers can both observe absence. The transaction that
+claims the unique code decides the winner, and the loser receives a conflict while
+retaining its proposed destination.
 
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| Create URL | 10 requests | 60 seconds |
-| Redirect | 1,000 requests | 60 seconds |
-| Auth (login) | 5 requests | 60 seconds |
+I would define the namespace completely: supported characters, case sensitivity,
+maximum length, reserved service paths, and no reuse after retirement. Generated keys
+and custom aliases must not have independent ownership rules that can drift apart.
 
-## Deep Dive: Database Sharding
+The local project uses a preallocated pool. That is a legitimate alternative for
+amortizing reservation work. Workers can claim batches using row locks that skip
+already locked candidates, then consume their local batches without asking an
+allocator for every candidate.
 
-### Sharding Strategy by Short Code Prefix
+But a batch is not free coordination. The database still grants it, and each mapping
+still needs durable publication. The pool introduces unused reservations, refill
+bursts, ownership records, and recovery when a holder disappears. Concurrent refill
+calls should be coalesced and kept off the normal path while capacity remains.
 
-The shard router maintains a pool of PostgreSQL connections for each shard. Routing is determined by the first character of the short code:
+A timed-out lease cannot simply be returned to the pool. The old holder might resume
+and publish one of its remembered keys. Safe reclamation needs fencing that prevents
+the old allocation generation from committing, or a policy that permanently retires
+abandoned keys.
 
-| Shard | Character Range |
-|-------|----------------|
-| shard_0 | 0-9, a-f |
-| shard_1 | g-m |
-| shard_2 | n-t |
-| shard_3 | u-z |
-| shard_4 | A-Z |
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Random candidate with unique insert initially | Small authoritative write path | Collision retries and namespace occupancy monitoring |
+| ❌ Preallocated pool before a measured need | Amortized reservation and local headroom | Stranded keys, refill coordination, and fencing |
+| ❌ Unchecked random fallback | Avoids waiting for allocation | Can collide without a controlled recovery path |
 
-Given a short code, the router extracts the first character, maps it to the appropriate shard, and returns the corresponding database connection pool.
+A counter with blocks is another credible design. A single round trip for every
+increment can become a bottleneck, but block allocation changes that calculation.
+Sequential identifiers are enumerable, and base62 encoding does not conceal that
+sequence. I would compare these operational properties without claiming one approach
+is universally unscalable.
 
-### Why Shard by Short Code?
+The second invariant is that retrying a creation attempt does not produce a second
+result. I would commit a caller-scoped operation receipt and the mapping in the same
+transaction. The receipt includes an input digest so a caller cannot reuse one key for
+a different destination.
 
-- **Primary access pattern**: All redirects query by short_code
-- **Even distribution**: Base62 characters are uniformly distributed
-- **Simple routing**: First character determines shard
-- **Future growth**: Add shards by splitting existing ones
+If the connection drops after commit, a retry returns the stored code. If the
+transaction did not commit, the same attempt can safely continue. Two simultaneous
+retries arbitrate on the receipt's unique identity rather than each allocating a
+separate link.
 
-## API Design
+The response may be lost even when every database operation succeeded. That is why a
+disabled button or a short Redis lock is not sufficient. The result must remain
+discoverable after the process holding the lock has died.
 
-### RESTful Endpoints
+At sharded scale, I would choose a layout that keeps the receipt and namespace claim
+under one transaction authority, or explicitly design a recoverable coordination
+protocol. Merely adding a receipt table on another shard would invalidate the
+atomicity I just relied on.
 
-```
-# URL Operations
-POST   /api/v1/shorten              Create short URL
-GET    /api/v1/urls/:code           Get URL metadata
-GET    /api/v1/urls/:code/stats     Get click analytics
-DELETE /api/v1/urls/:code           Deactivate URL
+> “The trade-off is paying for a durable receipt on a comparatively infrequent write
+> path. I accept that cost because it prevents duplicate links and makes timeout
+> recovery understandable.”
 
-# Redirect (no /api prefix)
-GET    /:short_code                 302 redirect to long URL
+## 🔧 Deep dive: cached redirects and revocation — 8 minutes
 
-# Authentication
-POST   /api/v1/auth/register        Create account
-POST   /api/v1/auth/login           Start session
-POST   /api/v1/auth/logout          End session
+A viral link can receive a large fraction of all traffic. Reading PostgreSQL for every
+request makes that one row's availability and the database's capacity central to
+navigation. I would put hot mappings in regional caches, with a bounded fallback for
+misses.
 
-# Admin
-GET    /api/v1/admin/stats          System statistics
-POST   /api/v1/admin/key-pool       Repopulate key pool
-```
+The cached value must include target, active state, expiration, revision, and
+freshness deadline. A destination string alone cannot tell the resolver whether a link
+is expired or has been deactivated. Cache presence is not permission to redirect
+forever.
 
-### Request/Response Examples
+Expiration is the easier case because the deadline is known in advance. The resolver
+checks it on every hit, and cache retention does not extend beyond it. I would reject
+already expired creations rather than inserting and warming a mapping that should
+never resolve.
 
-**Create Short URL**:
+Deactivation is harder because it changes after a cache entry was created. I would
+propose a five-second normal propagation bound, commit a new revision with an outbox
+event, and distribute that change to serving regions.
 
-A POST request to `/api/v1/shorten` with an Idempotency-Key header accepts a JSON body containing the long_url, an optional custom_code, and an optional expires_at timestamp. On success (201 Created), the response includes the full short_url, the short_code, the original long_url, expiration time, and creation timestamp.
+An invalidation event is not enough on its own. Consider an old database read that
+pauses, then completes after deactivation deleted the cache entry. If it blindly
+refills the target, the link becomes active again in that cache.
 
-## Monitoring and Observability
+Revision-aware tombstones prevent an old refill after a newer revision has been
+observed. A fixed freshness deadline assigned at the authoritative read bounds the
+case where invalidation has not arrived. The late read cannot reset its five-second
+lifetime when it finally reaches the cache.
 
-### Key Metrics
+Clock uncertainty must be accounted for in that deadline. I would use a conservative
+margin and refuse stale decisions once the policy budget is exhausted. Saying “TTL is
+five seconds” without defining when it starts leaves the race unresolved.
 
-Application metrics exposed via Prometheus include: total HTTP requests (by method, endpoint, status), request duration histogram (by method, endpoint), URL shortening operations (by status), redirect counts (by cache tier), cache hits and misses (by tier), available keys in the key pool, pending queue messages, and circuit breaker state (by service).
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Cache lifecycle records with bounded freshness | Low-latency hot reads and a stated revocation bound | Revision propagation and deliberate stale-data policy |
+| ❌ Cache targets for a day without lifecycle metadata | Very simple fast path | Expired and deactivated links can keep redirecting |
+| ❌ Query authority for every redirect | Simpler immediate status decisions | Viral traffic and outages directly hit the database |
 
-### Health Checks
+For emergency abuse removal, I would require acknowledgement from active serving
+regions or withdraw regions that cannot enforce the decision. If a region is
+partitioned, it cannot both keep making indefinitely stale decisions and promise
+immediate global takedown.
 
-The detailed health endpoint at `GET /health/detailed` checks connectivity to all dependencies (database, Redis, RabbitMQ) and reports the key pool local cache size and circuit breaker state. It returns 200 if all dependencies are connected, or 503 if any dependency is unhealthy.
+I would use 302 for the mutable redirect and an explicit HTTP cache policy. The
+proposal uses `no-store` for compliant browser and shared caches, while retaining an
+internal controlled mapping cache. The status code alone does not specify all storage
+behavior. [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.5)
+defines that response directive.
 
-## Trade-offs Summary
+This still does not mean one HTTP request equals one human click. Preview bots,
+retries, and downstream failures remain separate measurement questions. HTTP cache
+control is not a human-attribution mechanism.
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Pre-generated key pool | No coordination, random codes | Key management complexity |
-| 302 redirect | Accurate analytics | Higher server load |
-| Two-tier cache | Low latency, shared state | Memory overhead |
-| Async analytics | Non-blocking redirects | Slight delay in stats |
-| PostgreSQL sharding | Predictable, ACID | Manual shard management |
-| RabbitMQ for analytics | Backpressure handling | Additional infrastructure |
+On a miss, I would coalesce simultaneous lookups of the same code and limit concurrent
+database fallbacks. During a Redis outage, letting every resolver send unrestricted
+SQL requests can turn a cache incident into a database incident.
 
-## Future Backend Enhancements
+A short negative cache can reduce random-code scans. Creation must invalidate a prior
+negative entry, and the new link must be readable at the returned address after
+success. At multi-region scale, I would route immediate read-after-create to its
+authority or propagate it before advertising regional availability.
 
-1. **Bloom Filter**: Skip database lookup for non-existent codes
-2. **CDN Edge Workers**: Redirect at edge for global latency
-3. **Malicious URL Detection**: Integrate Google Safe Browsing API
-4. **Bulk API**: Create multiple short URLs in single request
-5. **Webhooks**: Notify on click thresholds
-6. **Multi-region**: Active-active deployment with cross-region replication
-7. **Event Sourcing**: Audit trail for all URL operations
+## 🔧 Deep dive: retained analytics and repeated delivery — 9 minutes
+
+I would first define the event: an eligible redirect request observed by our resolver.
+It does not establish that the destination loaded, that the visitor was human, or that
+the same person has not clicked before.
+
+Assign the observation an event ID once. If publication is retried because its
+acknowledgement was lost, keep the same ID. If the browser makes another HTTP request,
+that may be a new observation under the metric definition; transport deduplication and
+unique-visitor estimation are different problems.
+
+The admission boundary determines the durability promise. Scheduling a callback after
+the response is fast, but a process can crash before the callback publishes anything.
+A queue cannot recover an event that never reached durable storage.
+
+If lossless admitted observations are required, wait for a durable acknowledgement
+before treating the event as retained. For this product, I would continue redirects
+when the admission path fails within its budget and expose that interval as incomplete
+analytics. That is an explicit availability choice.
+
+Publisher confirms and consumer acknowledgements serve different purposes: one
+establishes broker acceptance, the other marks consumer handling. Neither makes a
+database side effect occur only once. [RabbitMQ's acknowledgement
+documentation](https://www.rabbitmq.com/docs/confirms) describes those separate
+boundaries.
+
+Once retained, events can be delivered more than once. A worker can apply an update
+and crash before acknowledging. Retrying is necessary for recovery, so the consumer
+must make repeated processing safe.
+
+For a small implementation, I would transactionally insert the event identity if
+unseen and apply its aggregate contribution only for a new identity. Commit both
+before acknowledging. An atomic ingestion contract in a larger analytics system can
+provide the same property, but it must be stated rather than inferred from the word
+“streaming.”
+
+The deduplication horizon must cover the supported replay horizon. If IDs are
+forgotten after a day but operators can replay a month, an old replay can count again.
+Retention and recovery policies need to be designed together.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Retained events with repeatable aggregate effects | Recoverable processing and consistent replays | Event identity, retention, and atomic contribution logic |
+| ❌ Insert event then separately increment mapping row | Straightforward local implementation | Partial updates, duplicate effects, and hot-row contention |
+| ❌ Assume durable queue means exactly-once totals | Little application logic | Ignores publisher loss and consumer crash windows |
+
+I would avoid updating one mapping counter for every click at high scale. A viral link
+serializes those updates even with many workers. Partitioned event ingestion and
+bucketed projections distribute the write load, while dashboard queries read compact
+aggregates.
+
+Batching can improve throughput, but a consumer prefetch setting is not batch
+insertion. I would define the batch's commit and acknowledgement behavior, cap its
+size, and measure the delay it adds to report freshness. Increasing concurrency
+without changing a hot row does not remove the bottleneck.
+
+Bad messages need a different path from transient failures. Invalid schema, impossible
+timestamps, or a missing referenced mapping should not produce an immediate endless
+requeue loop. Use bounded retries, quarantine with a reason, and an operator-visible
+count.
+
+Reconnect must restore subscriptions as well as the network connection. A healthy
+socket with no consumer can leave a growing backlog while every basic health check
+remains green. I would monitor oldest-event age and actual committed progress.
+
+Report APIs return the processed-through watermark, query range, timezone, and known
+admission gaps. A total is meaningful only with its metric and coverage. Do not
+silently equate an event-derived count with a separate mutable counter on the mapping
+row.
+
+For daily reports, group by explicit day boundaries in the agreed timezone. For hourly
+reports, retain date as well as hour. Missing buckets are zero only if the covered
+interval is known to contain no eligible observations; unprocessed intervals are
+incomplete.
+
+> “I can make the effect of retained events repeatable. I cannot use deduplication to
+> prove that every human visit was observed, or to recover an event lost before
+> admission.”
+
+## 🛡️ Failure isolation, security, and growth — 6 minutes
+
+I would isolate management writes, redirect fallbacks, and analytics work with
+separate budgets and pools. Otherwise a backlog recovery or a heavy report can exhaust
+the same connections needed to publish links and answer cold redirects.
+
+A circuit breaker can reduce repeated calls to a failing dependency, but its timeout
+does not automatically cancel a database statement. A creation may commit after the
+caller receives an error. Operation recovery remains necessary even when a breaker is
+present.
+
+Health checks should distinguish an alive process, readiness for its role, and
+progress of background work. A broker connection flag is insufficient for a worker; a
+metrics endpoint should remain available when a business database is unavailable.
+
+For authentication, use opaque server-managed sessions with authoritative expiry.
+Cache only for the remaining lifetime and make revocation robust against concurrent
+repopulation. Role and user-active changes should affect the next authorized
+operation.
+
+Owners can read and mutate their own links and analytics. Administrators get explicit
+moderation access. Raw event endpoints require particularly careful scope because IPs,
+user agents, and referrers can reveal information unrelated to the public destination.
+
+I would minimize retained personal data and define a deletion/retention policy before
+collecting more dimensions. Destination syntax checks do not prevent malicious links,
+so reporting and takedown need a separate process. Avoid logging raw session tokens or
+full sensitive query parameters.
+
+Creation and expensive reports get shared limits across replicas. Redirect protection
+should consider bot traffic and large shared networks rather than applying a small
+universal per-IP quota that breaks legitimate campaigns. Metrics labels should use
+route templates, not arbitrary short codes or unmatched paths.
+
+At the assumed storage growth, mappings eventually need code-based partitioning and an
+owner-list index. I would add that when measured storage, maintenance, or write
+throughput warrants it. Regional read replicas also need an explicit lag policy for
+newly created links and takedowns.
+
+The cache working set is determined by active links, not all historical mappings. A
+million entries at an assumed 600 bytes each is roughly 600 MB before replication and
+overhead. Measure real entry sizes and traffic skew before choosing cache capacity.
+
+For analytics, raw-event retention dominates cost. Keep detailed data for a bounded
+period and longer-lived aggregates where useful. Provision enough consumer capacity to
+catch up after an outage; matching average arrival rate exactly leaves no recovery
+headroom.
+
+## 🧪 Verification and design boundaries — 4 minutes
+
+I would test concurrent custom-alias claims and response loss immediately after
+creation commit. Exactly one namespace owner should win, and retrying a committed
+attempt should recover the same code.
+
+For cache correctness, pause an old read, deactivate the link, then release the read.
+It must not resurrect an accepted old revision. Also test a link expiring while warm
+and a region unable to receive takedown updates.
+
+For analytics, crash a worker after applying an event but before acknowledgement,
+replay it, and verify one contribution. Then fail between event insertion and
+aggregate update, inject a poisoned event, and interrupt the broker to verify
+subscription restoration.
+
+I would load-test a single viral code and a large stream of random invalid codes.
+Those expose different bottlenecks from a uniform happy-path benchmark. Observe
+fallback concurrency and oldest-event age alongside latency.
+
+The local code currently differs substantially: it caches only targets for 24 hours,
+has no active creation idempotency middleware, and writes click events and counters
+separately. Its worker reconnects without restoring consumption. Those are limitations
+to study, not evidence that the proposed guarantees already exist.
+
+> “The design is defensible when I can name the authority for a code, the maximum age
+> of a redirect decision, and the point after which an event can be recovered. I would
+> validate those three boundaries before expanding the feature set.”

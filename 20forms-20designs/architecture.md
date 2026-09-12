@@ -1,336 +1,322 @@
-# 20 Forms, 40 Designs - Architecture Design
+# 20 Forms, 40+ Designs — Architecture
 
 ## System Overview
 
-A form library comparison platform that renders identical forms across 41 React design systems with complete CSS isolation, enabling side-by-side visual comparison of component libraries. The platform is deployed as a static site, requiring no backend server.
+A form comparison application places independently built React component-library
+examples inside a shared browser shell. Its central requirement is rendering
+fidelity: a preview should use its library's native controls and styles without
+another preview changing them. The important system-design problems are document
+isolation, browser resource management, state synchronization, and reliable static
+releases.
 
-**Learning goals:** CSS isolation strategies, monorepo build orchestration, iframe-based micro-frontend architecture, static site deployment at scale.
+This is a documentation-only entry in this repository. The **production design**
+below describes a robust version of the application. The final **Implementation
+Notes** document what the external source actually does, including gaps. Proposed
+features and performance targets are not claims about the deployed demo.
+
+The source review used upstream commit
+[`bc34aba76a4cabe9bfe545bc8dccf3689808e482`](https://github.com/evgenyvinnik/20forms-20designs/tree/bc34aba76a4cabe9bfe545bc8dccf3689808e482)
+on 2026-09-09. Paths in the implementation section refer to that repository.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-- Display 20 common form types across 41 design system libraries
-- Side-by-side comparison of any library combination
-- Theme switching (light/dark) for supported libraries
-- Grouping by form or by library
-- Deep linking to specific form/library combinations
+- Compare selected form types across multiple component libraries.
+- Group previews by form or library and identify unsupported themes.
+- Share the exact comparison through a URL and retain personal preferences locally.
+- Keep each library independently runnable for debugging and review.
+- Publish a complete static release without introducing a form-submission backend.
 
-### Non-Functional Requirements
+### Non-functional requirements — proposed targets
 
-- **CSS Isolation:** Zero style bleed between design systems -- each library must render identically to its standalone behavior
-- **Performance:** Shell FCP < 1.5s, individual iframe load < 500ms, LCP < 2.5s
-- **Build Time:** Full 42-app build completes in < 5 minutes with retry resilience
-- **Static Deployment:** Entire platform served from CDN with zero server-side compute
-- **Bundle Budgets:** Shell JS < 50 KB gzipped, per-library JS < 150 KB gzipped, total dist < 25 MB
+| Concern | Target | Validation |
+|---------|--------|------------|
+| Style fidelity | No cross-document stylesheet effects | Cross-library visual tests |
+| Shell responsiveness | p75 LCP below 2.5 seconds on a defined device/network profile | Browser measurement |
+| Interaction | p75 INP below 200 ms | Browser measurement under realistic selections |
+| Preview resources | Mount only visible and nearby frames, with a bounded retained set | Memory and scrolling profiles |
+| Delivery availability | 99.9% successful static retrieval as a starting SLO | Synthetic requests to actual assets |
+| Release integrity | Every advertised preview exists and references available assets | Artifact validation before promotion |
+
+No current benchmark establishes these targets. The shell must remain usable even
+when a library preview is slow or unavailable; an arbitrary iframe count is not a
+useful capacity guarantee without a device profile.
+
+## Capacity Estimation
+
+For planning, use approximately 50 comparison entries and 20 forms: 1,000 possible
+previews. Mounting one iframe per combination gives 1,000 active documents even
+though there are only about 50 independently built applications. These are different
+resource counts.
+
+If six visible documents each need an illustrative 150 KB of compressed JavaScript,
+first-use library transfer is about 900 KB plus the shell, styles, and fonts. That
+estimate is a budget exercise, not a measurement. Browser caching may reuse bytes
+for multiple forms from one library, but each document still creates its own DOM
+and application state. Lazy loading delays work; eviction is needed to bound memory
+after a user scrolls through the whole catalog.
+
+### Local development scale
+
+The reviewed source exposes 46 entries, including the no-CSS baseline, and 20 forms:
+920 selectable pairs across 47 app packages including the shell. Defaults select
+three forms and three libraries, creating nine preview documents.
 
 ## High-Level Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              CDN (Fastly / Cloudflare)                       │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │  Edge Cache: HTML (no-cache) │ Assets *-[hash].js/css (immutable, 1y) │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────┬───────────────────────────────────────────────┘
-                               │ HTTPS
-                               ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                          Static Origin (GitHub Pages)                        │
-│                                                                              │
-│  dist/                                                                       │
-│  ├── index.html              ─── Shell Application                           │
-│  ├── assets/shell-[hash].js                                                  │
-│  ├── mui/index.html          ─── MUI Library App                             │
-│  ├── mui/assets/mui-[hash].js                                                │
-│  ├── chakra/index.html       ─── Chakra Library App                          │
-│  ├── antd/index.html         ─── Ant Design Library App                      │
-│  └── ... (41 library apps total)                                             │
-└──────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────┐    ┌────────────────────┐
+│ Source + catalog│───▶│ Build and validation│
+└─────────────────┘    └─────────┬──────────┘
+                                 │ complete versioned release
+                                 ▼
+                       ┌────────────────────┐
+                       │ Static origin + CDN│
+                       └─────────┬──────────┘
+                                 │ HTML, JS, CSS, fonts
+                                 ▼
+┌─────────────────────────────────────────────────┐
+│ Browser                                         │
+│ ┌─────────────────────────────────────────────┐ │
+│ │ Shell: URL state, selection, preview manager │ │
+│ └──────────────────┬──────────────────────────┘ │
+│             ┌──────┴──────┐                     │
+│             ▼             ▼                     │
+│       ┌───────────┐ ┌───────────┐               │
+│       │ Library A │ │ Library B │               │
+│       │ document  │ │ document  │               │
+│       └───────────┘ └───────────┘               │
+└─────────────────────────────────────────────────┘
 ```
 
-### Shell + Iframe Architecture
+The origin serves static artifacts; there is no dynamic application server. CDN
+cache misses still require an origin. Build concurrency and browser frame
+concurrency are separate controls.
 
-The shell application orchestrates 41 independent library applications via iframes. Each iframe is a separate browsing context with its own CSS cascade, ensuring complete style isolation.
+## Core Components / Request Flows
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                     Shell Application (Host)                          │
-│                                                                      │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                       Control Panel                            │  │
-│  │  [Form: Login ▼]  [Libraries: MUI, Chakra ...]  [Theme: ☀/🌙] │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-│                                                                      │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                       Preview Grid                             │  │
-│  │                                                                │  │
-│  │  ┌─────────────────────┐    ┌─────────────────────┐           │  │
-│  │  │     <iframe>        │    │     <iframe>        │           │  │
-│  │  │  src="/mui/?form=   │    │  src="/chakra/?form=│           │  │
-│  │  │    login&theme=dark" │    │    login&theme=dark" │           │  │
-│  │  │                     │    │                     │           │  │
-│  │  │  ┌───────────────┐  │    │  ┌───────────────┐  │           │  │
-│  │  │  │  MUI Login    │  │    │  │ Chakra Login  │  │           │  │
-│  │  │  │  Form         │  │    │  │ Form          │  │           │  │
-│  │  │  └───────────────┘  │    │  └───────────────┘  │           │  │
-│  │  └─────────────────────┘    └─────────────────────┘           │  │
-│  │                                                                │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
-```
+### Shell and preview manager
 
-### Communication Flow
+The shell owns selected form IDs, library IDs, theme, and grouping. It validates
+incoming URLs against the catalog, chooses defaults, and derives preview descriptors.
+Each descriptor has a stable identity based on its library and form.
 
-```
-Shell App                           Library App (iframe)
-    │                                     │
-    │  1. Render <iframe src="...">       │
-    │────────────────────────────────────▶│
-    │                                     │
-    │  2. iframe loads standalone app     │
-    │                                     │
-    │  3. URL params determine content    │
-    │     ?form=login&theme=dark          │
-    │                                     │
-    │  4. Library app renders form        │
-    │     with its own isolated CSS       │
-    │                                     │
-```
+The proposed preview manager reserves layout space, mounts visible or nearby frames,
+and retains only a limited number of recently used documents. It must not evict the
+focused frame. A card distinguishes pending, ready, and unavailable states, with a
+standalone link and retry action when appropriate.
 
-No postMessage coordination is needed. The shell communicates with library apps entirely through URL query parameters, which enables deep linking and browser history support for free.
+### Library application
 
-## Core Components
+A library app reads its initial form and theme from its URL, validates those values,
+and renders the matching form under the library's own styling setup. Shared form
+specifications describe fields and validation expectations; per-library components
+retain their native composition. Metadata types alone do not prove equivalent
+runtime validation across implementations.
 
-### 1. Shell Application
+### Configuration and theme flow
 
-The host application that provides the control panel (form selector, library selector, theme toggle) and renders a responsive grid of iframes. Each iframe's `src` encodes the selected form and theme as query parameters.
+1. Parse and validate the comparison URL. Explicit URL fields override saved preferences.
+2. Derive one preview descriptor for each selected form/library pair.
+3. Load nearby previews with a form ID and initial theme in their URL.
+4. After a child reports readiness, send the latest theme without navigating the frame.
+5. Validate message origin, sending window, message type, and value on receipt.
+6. Keep the shell URL current so a fresh load can reconstruct the comparison.
 
-**Responsibilities:**
-- Render library/form selection UI
-- Manage URL state for deep linking
-- Lazy-load iframes via Intersection Observer (only load when scrolled into view)
-- Cache iframe DOM elements to avoid re-fetching on form/library changes
+URL initialization and live messaging have complementary roles. Sending a theme
+message while also changing the iframe `src` still navigates the document and does
+not guarantee that typed form data survives.
 
-### 2. Library Applications (41 total)
+## Database Schema
 
-Each library app is a standalone React + Vite application that reads `?form=<id>&theme=<light|dark>` from the URL and renders the corresponding form using its native design system components. Each app includes its own React instance, CSS reset, and theme provider.
+There is no server database. The relevant data is a static catalog plus browser
+preferences. A relational schema would add no value to this workload.
 
-**Form standardization:** All 20 forms share identical field labels, validation rules, and placeholder text across libraries. A TypeScript interface defines the contract:
+| Entity | Fields | Ownership and validation |
+|--------|--------|--------------------------|
+| Library | Stable ID, display name, asset path, theme support | Build-time catalog; validate path exists |
+| Form | Stable ID, label, expected field behavior | Form specification; tested against implementations |
+| Comparison | Library IDs, form IDs, theme, grouping | Shell; validate before rendering |
+| Preview status | Identity, readiness, last use | Runtime only; omit from shareable state |
+| Release | Revision, available library artifacts | Proposed build manifest; validate before publish |
 
-- Same fields, same labels, same validation
-- Different styling, components, and UX patterns
-- Each library uses its native form components (TextField, Input, FormControl, etc.)
+Empty, all-selected, and omitted URL values must have distinct meanings. Otherwise
+local preferences can change the result of a shared link.
 
-### 3. Build Orchestration
+## API Design
 
-A parallel build script compiles all 42 applications (1 shell + 41 libraries) in batches of 4 concurrent builds to prevent memory exhaustion. Each build has a 2-minute timeout and up to 2 retries with exponential backoff.
+The public interface consists of static GET requests and a small browser message
+contract. These examples use the implementation's form-ID convention.
 
-**Build pipeline:**
-1. Install dependencies (hoisted via Bun workspaces)
-2. Build in batches of 4 (with retry logic and GC between batches)
-3. Copy all `dist/` outputs to a unified deployment folder
-4. Validate bundle size budgets
+| Interface | Purpose |
+|-----------|---------|
+| `GET /20forms-20designs/?forms=user-login&libraries=mui,chakra&theme=dark` | Load a comparison |
+| `GET /20forms-20designs/mui/index.html?form=user-login&theme=dark` | Load a standalone preview |
+| `GET /20forms-20designs/mui/assets/<content-hash>.js` | Fetch a built asset; exact filename comes from HTML |
+| Child readiness message | Proposed application-ready signal with preview identity |
+| `SET_THEME` message | Set an absolute theme value on a loaded preview |
+
+There are no login, payment, or submission API endpoints for the demonstration forms.
 
 ## Key Design Decisions
 
-### 1. Iframe-Based Isolation vs Alternatives
+### Iframes for style fidelity
 
-**Decision:** Use iframes for complete CSS isolation.
+An iframe supplies a separate document and CSS cascade, allowing each library's
+reset and style-injection behavior to operate as it normally would. CSS Modules
+scope selected class names but do not rewrite every third-party global stylesheet.
+Shadow DOM can work with adapted styles and correctly targeted overlays, but every
+library would need compatibility work for inherited properties and document-level
+assumptions.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Iframe** (chosen) | Complete isolation, true rendering fidelity, separate React trees | Larger total bundle, more network requests |
-| Shadow DOM | Lighter weight | CSS custom properties leak through, React context does not cross shadow boundary |
-| CSS Modules | Simple setup | Only scopes class names, not resets or CSS variables |
-| CSS-in-JS isolation | Programmatic scoping | Complex across heterogeneous libraries, no global reset isolation |
+React context is not inherently broken by a shadow root: it follows the React tree,
+and portals preserve access to parent context. That distinction prevents blaming
+React for a CSS integration problem. See the [React portal reference](https://react.dev/reference/react-dom/createPortal).
 
-Design systems rely on global CSS resets (CssBaseline, preflight), CSS custom properties, and React context providers. Only iframes provide true browsing context isolation where none of these mechanisms can leak between libraries. The overhead of duplicated React bundles (~40 KB gzipped x 41) is acceptable because the alternative -- style corruption between libraries -- defeats the entire purpose of the platform.
+The cost of iframes is extra documents, application instances, focus boundaries,
+and memory. Style isolation alone does not make same-origin code untrusted-safe.
 
-### 2. Monorepo with Separate Builds
+### URLs for reproducibility, messages for live updates
 
-**Decision:** Each library is a separate Vite application within a Bun workspaces monorepo.
+A URL makes a preview independently reproducible. Live theme messages can preserve
+its input state if the parent avoids changing its `src`. A URL-only approach is
+simpler but reloads the document on theme changes; a message-only approach needs a
+separate initialization and sharing mechanism. The combined design pays for a small
+readiness protocol and validation at the boundary.
 
-This means each library can pin its own dependency versions (some require React 18, others work with 19), has independent build caching, and produces a standalone bundle. The trade-off is duplicated React bundles and longer total build time (~3 minutes vs. seconds for a single app), but this is offset by the clean dependency isolation and parallel build capability.
+### Bounded build workers and complete releases
 
-### 3. URL-Based Configuration over postMessage
+Independent builds avoid forcing every component library into one dependency and
+styling environment. A worker pool limits simultaneous compiler processes. Choose
+its size from measured memory, not a fixed “optimal” number. Parent-process garbage
+collection cannot release memory still owned by active compiler children.
 
-**Decision:** Pass form and theme via URL query parameters rather than postMessage.
+Build into a clean staging area, validate all advertised previews, and publish only
+a complete artifact. Partial releases can be reasonable if their catalog explicitly
+omits failed previews, but silently retaining broken entries undermines comparison.
 
-URL parameters provide deep linking for free -- a user can bookmark or share `/20forms-20designs/?form=login&libraries=mui,chakra&theme=dark` and see exactly the same comparison. There is no message coordination complexity, and browser caching works naturally because each iframe URL is a stable, cacheable resource. The trade-off is that configuration changes require an iframe `src` update (triggering a reload), but with iframe DOM caching this cost is minimal.
+## Consistency and Idempotency
 
-### 4. Static Deployment on GitHub Pages
+The consistency problem is release and UI state, rather than database transactions.
+A shell must reference previews and assets from a compatible release. Content hashes
+avoid overwriting asset bytes under the same name, but do not prevent missing assets
+when old files are deleted too early.
 
-**Decision:** Deploy as static files to GitHub Pages with Fastly CDN.
+An absolute theme-setting message is naturally idempotent: applying “dark” twice
+has the same result as applying it once. A toggle message is not. A child should
+receive the latest state after readiness, including changes made while it loaded.
 
-No server costs, automatic HTTPS, global CDN distribution, and deployment via `git push` to the `gh-pages` branch. The entire platform runs at $0/month. The trade-off is no server-side logic (no analytics endpoint, no A/B testing), but for a comparison showcase this is not needed.
+## Security / Auth
 
-## CSS Isolation Deep Dive
+The application has no authentication. Demo form inputs should remain within the
+preview; persisted comparison preferences should contain IDs and presentation
+settings, not entered credentials or personal data.
 
-The core technical challenge: rendering 41 design systems without style conflicts.
-
-**Why coexistence fails:** When MUI's `CssBaseline` and Tailwind's `preflight` run in the same document, they fight over `box-sizing`, `margin`, and `font-family` defaults. CSS custom properties like `--primary-color` collide across libraries. React context providers (ThemeProvider, ChakraProvider) cannot nest cleanly when they assume global scope.
-
-**Why iframes work:** Each iframe creates a separate browsing context with its own `<head>`, stylesheet cascade, and JavaScript global scope. MUI's resets cannot reach Chakra's iframe, and vice versa. This is the only browser-native mechanism that provides complete CSS isolation without polyfills or build-time transformations.
-
-**Cost of isolation:** Each iframe loads its own React bundle (~40 KB gzipped), its library's CSS (10-200 KB), and its form components. With 41 iframes visible, this could mean 41 parallel network requests. Mitigations include lazy loading (Intersection Observer), iframe DOM caching, and aggressive CDN caching with content-hash fingerprinting.
-
-## Caching and CDN Strategy
-
-### Asset Fingerprinting
-
-Vite produces content-hashed filenames for all JS and CSS assets (`shell-a1b2c3d4.js`). HTML files are served with `no-cache, must-revalidate` to ensure users always get the latest shell. Hashed assets are served with `immutable, max-age=31536000` (1 year) since any content change produces a new hash.
-
-### Cache Headers
-
-| Asset Type | Cache-Control | TTL | Reasoning |
-|------------|---------------|-----|-----------|
-| `*.html` | `no-cache, must-revalidate` | 0 | Always fetch latest version |
-| `*-[hash].js` | `public, max-age=31536000, immutable` | 1 year | Hash changes on content change |
-| `*-[hash].css` | `public, max-age=31536000, immutable` | 1 year | Hash changes on content change |
-| Images/fonts | `public, max-age=604800` | 1 week | Rarely change |
-
-### CDN Behavior
-
-GitHub Pages uses Fastly CDN with automatic edge caching. Assets are served from the nearest edge location. Pushing to the `gh-pages` branch triggers global cache invalidation.
-
-## Performance Considerations
-
-### Bundle Budgets
-
-| Metric | Budget | Warning | Typical |
-|--------|--------|---------|---------|
-| Shell app JS (gzipped) | < 50 KB | > 40 KB | ~35 KB |
-| Shell app CSS (gzipped) | < 10 KB | > 8 KB | ~5 KB |
-| Library app JS (gzipped) | < 150 KB | > 120 KB | 50-140 KB |
-| Library app CSS (gzipped) | < 50 KB | > 40 KB | 10-45 KB |
-| Total dist size | < 25 MB | > 20 MB | ~18 MB |
-
-Bundle sizes are enforced in CI -- builds exceeding budgets fail the pipeline.
-
-### Load Time Targets
-
-| Metric | Target | Measurement |
-|--------|--------|-------------|
-| Shell FCP | < 1.5s | Lighthouse |
-| Shell LCP | < 2.5s | Lighthouse |
-| Iframe load (per library) | < 500ms | Performance API |
-| Time to Interactive | < 3.0s | Lighthouse |
-| Total Blocking Time | < 200ms | Lighthouse |
-
-### Runtime Optimizations
-
-1. **Lazy iframe loading:** Iframes are only loaded when they scroll into the viewport (Intersection Observer). This prevents 41 simultaneous network requests on initial page load.
-2. **Iframe DOM caching:** Once an iframe is loaded, its DOM element is preserved in memory. Switching between forms updates the `src` attribute rather than destroying and recreating the iframe.
-3. **CSS Grid layout:** The preview grid uses CSS Grid for responsive layout, avoiding JavaScript-based layout calculations.
-
-## Build Pipeline Resilience
-
-### Parallel Build with Retry
-
-The build script processes 42 applications in batches of 4 concurrent builds. Each build has a 2-minute timeout and up to 2 retries with 2-second delays. Garbage collection is forced between batches to prevent OOM on CI runners.
-
-### Failure Handling
-
-| Failure Type | Detection | Recovery |
-|-------------|-----------|----------|
-| Single app timeout | 2-minute `execAsync` timeout | Retry up to 2x |
-| OOM during batch | Process exit code | Reduce concurrency to 2 |
-| Dependency install fail | bun install exit code | Retry with cache clear |
-| Majority failure | < 35 successful builds | Block deployment |
-
-**Graceful degradation:** If some library apps fail but the shell and at least 35 of 42 apps succeed, the pipeline can proceed with a warning. A notice is generated listing the broken libraries.
-
-### Rollback Strategy
-
-**Primary (git-based):** The `gh-pages` branch maintains deployment history. Roll back by resetting to a previous commit and force-pushing.
-
-**Granular (per-app):** If only one library app is broken, rebuild just that app, copy its output to the `dist/` folder, and redeploy.
-
-**Artifact preservation:** CI uploads `dist/` as a GitHub Actions artifact with 14-day retention, enabling rollback to any recent build without rebuilding.
+For curated same-origin apps, the current sandbox is a compatibility setting, not
+a hostile-code boundary. Combining scripts and same-origin access permits behavior
+that defeats strong isolation. If arbitrary third-party code becomes a requirement,
+use a separate origin and reconsider permissions. See the [iframe sandbox reference](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe).
 
 ## Observability
 
-### Real User Monitoring (RUM)
+Proposed measurements are shell responsiveness, mounted frame count, preview
+readiness latency, failed preview loads, and build failures by library. An iframe
+`load` event is insufficient evidence that the application rendered successfully.
+Prefer a readiness message and a smoke check of the assembled release.
 
-The shell application uses the `web-vitals` library to capture Core Web Vitals (CLS, FCP, LCP, TTFB) from real user sessions. In development, metrics are logged to the console. In production, they can be beaconed to a lightweight analytics service.
+Monitor transfer size separately from document initialization and memory. A warm
+HTTP cache can hide network cost while hundreds of React roots still consume CPU.
+There is no verified RUM or centralized error pipeline in the reviewed shell.
 
-### Iframe Load Tracking
+## Failure Handling
 
-Each iframe card tracks its load time using the Performance API. Iframes exceeding the 500ms budget are flagged with a console warning. This helps identify which library apps are the heaviest and may need optimization.
-
-### Error Tracking
-
-The shell listens for `error` and `unhandledrejection` events. Library apps forward their errors to the shell via `postMessage`, enabling centralized error visibility. In production, errors can be sampled (10%) and sent to Sentry's free tier.
+| Failure | Proposed behavior |
+|---------|-------------------|
+| Unknown URL IDs | Explain invalid selection and offer known forms/libraries |
+| One preview fails | Keep other comparisons usable; retry or open standalone |
+| Storage unavailable | Use URL and in-memory defaults |
+| Theme changes before readiness | Deliver latest absolute theme after readiness |
+| Preview compiler fails | Fail release validation or explicitly remove it from release catalog |
+| Broken deployment | Restore a previously validated complete artifact |
 
 ## Scalability Considerations
 
-### Adding New Libraries
+Browser memory is likely to become a constraint before static request throughput.
+Control mounted frames first, then consider per-form code splitting and representative
+performance budgets. Supporting more libraries also increases maintenance and visual
+verification work; building more assets does not prove consistent form behavior.
 
-Adding a new design system requires creating a new Vite app under `apps/`, implementing the 20 forms using the library's native components, and adding metadata to the shell's library registry. The build script auto-discovers apps in the `apps/` directory.
+For distribution, content-hashed assets can receive a long cache lifetime where the
+hosting configuration supports it. HTML should revalidate or use a suitably short
+freshness period. `no-cache` permits storage but requires validation before reuse;
+it does not mean “never stored.” See [Cache-Control semantics](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control).
 
-### Build Time Scaling
-
-With 42 apps and 4-way parallelism, full builds take ~3 minutes. If the library count grows significantly:
-- Increase CI runner memory and parallelism
-- Implement incremental builds (only rebuild changed apps based on git diff)
-- Use build artifact caching to skip unchanged apps entirely
-
-### Traffic Scaling
-
-As a static site behind a CDN, the platform scales horizontally with no server changes. If traffic exceeds GitHub Pages' bandwidth limits (~100 GB/month), migrate to Cloudflare Pages (unlimited bandwidth, free tier) with the same deployment model.
-
-## Hosting Cost Analysis
-
-| Platform | Free Tier | Best For |
-|----------|-----------|----------|
-| **GitHub Pages** (chosen) | Unlimited for public repos | This project -- zero cost, simple deployment |
-| Cloudflare Pages | Unlimited bandwidth | High traffic migration path |
-| Netlify | 100 GB/month | Custom headers, form handling |
-| Vercel | 100 GB/month | Edge functions (not needed) |
-
-**Current monthly cost: $0.** GitHub Actions provides 2,000 free build minutes/month, sufficient for ~660 builds at 3 minutes each.
+The exact CDN policy depends on the host. This repository does not configure custom
+one-year headers for GitHub Pages, and hashing does not cause instantaneous global
+cache invalidation. Retain referenced assets through a defined compatibility period.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| CSS isolation | Iframes | Shadow DOM | Only iframes provide complete browsing context isolation for CSS resets, custom properties, and context providers |
-| App structure | Separate Vite apps | Single SPA | Clean dependency isolation per library, independent versioning |
-| Communication | URL query params | postMessage | Deep linking, bookmarkability, no coordination complexity |
-| Hosting | GitHub Pages | Netlify/Vercel | Free, sufficient for static showcase, CDN included |
-| Package manager | Bun workspaces | npm/pnpm workspaces | Faster installs, native workspace support |
-| Build strategy | Batched parallel (4) | Fully parallel | Memory-bounded; 42 concurrent Vite builds exhaust RAM |
+| Style boundary | Separate iframe documents | Adapt every library to Shadow DOM | Preserve native resets and overlays with less integration work |
+| Configuration | URL initialization plus live theme messages | Reload on every change | Reproducible entry point with less input loss |
+| Browser resources | Visible frames plus bounded retention | Keep every visited frame alive | Bound memory at the cost of some remounts |
+| Build execution | Measured worker pool | Unbounded parallel builds | Avoid exhausting build-machine memory |
+| Publishing | Complete validated artifact | Silent partial deployment | Keep catalog and available previews consistent |
+| Data storage | Static catalog and local preferences | Application database | No server-owned user records in scope |
 
 ## Implementation Notes
 
-This project is a **design-only entry** in this repository. The implementation lives in an external repository:
+### Source-verified behavior
 
-**External Repository:** [github.com/evgenyvinnik/20forms-20designs](https://github.com/evgenyvinnik/20forms-20designs)
+| Area | Actual implementation | Source path in the reviewed upstream commit |
+|------|-----------------------|---------------------------------------------|
+| Catalog | 46 enabled entries, including no-CSS baseline; 20 form IDs | `apps/shell/src/config.ts` |
+| State | Zustand with manual localStorage reads/writes; URL overrides saved fields | `apps/shell/src/store.ts` |
+| URL updates | Immediate `replaceState`; no debounce or shell `popstate` listener | `apps/shell/src/App.tsx` |
+| Rendering | Selected form/library Cartesian product, mounted eagerly | `apps/shell/src/components/PreviewSection.tsx` |
+| Frames | Form-specific fixed heights; theme in `src` and `SET_THEME` messages | `apps/shell/src/components/PreviewCard.tsx` |
+| Example preview | MUI eagerly imports 20 forms; reads URL and listens for theme messages | `apps/mui/src/App.jsx` |
+| Demo submission | MUI login prevents submission and calls an alert | `apps/mui/src/forms/UserLoginForm.jsx` |
+| Build | Shell first, then up to 14 workers; 46 existing consolidated preview apps | `scripts/build-all.mjs` |
+| Assembly | Clean aggregate output, copy existing app builds, warn about missing builds | `scripts/copy-builds-to-dist.mjs` |
+| Deployment | Main/manual workflow, Node 22 and Bun, Pages artifact upload/deploy | `.github/workflows/deploy.yml` |
+| Tests | Chromium in deployment; tests run against shell Vite server | `apps/shell/playwright.config.ts`, `apps/shell/tests/shell.spec.ts` |
+| Local serving | Assembled static preview, project base path, port fallback | `scripts/serve-preview.mjs` |
 
-### What the External Implementation Covers
+The build allowlist also names `heroui` and `gluestack`, but filters against existing
+app directories; those apps are absent in this snapshot. The older shared-package
+catalog differs from the shell catalog, so the shell imports are the source of truth
+for user-visible entries.
 
-Based on the architecture document and the project's CLAUDE.md, the external repository implements:
+### Simplifications and gaps
 
-- **Shell application** with form selector, library selector, theme toggle, and responsive iframe grid
-- **41 library apps** as separate Vite applications in a Bun workspaces monorepo, each rendering 20 forms with native design system components
-- **Iframe-based CSS isolation** for zero style bleed between libraries
-- **URL-based configuration** with deep linking via query parameters (`?form=login&theme=dark`)
-- **Parallel build script** (`scripts/build-all.mjs`) with batched 4-way concurrency, retry logic, and GC between batches
-- **Static deployment** to GitHub Pages via GitHub Actions CI/CD pipeline
-- **Playwright E2E tests** for shell functionality and visual regression
+- No Intersection Observer loading, frame eviction, or retained iframe cache exists
+  in the shell. Deselecting removes previews; changing grouping can remount them.
+- Theme messages use wildcard targets. The reviewed MUI receiver does not validate
+  origin or sender. Updating the URL as well as messaging can reset input state.
+- Partial selections are encoded in URLs, while empty and all-selected lists are
+  omitted. Missing theme/grouping fields can also fall back to saved preferences;
+  exact sharing semantics are therefore incomplete.
+- Unknown form IDs in the reviewed MUI entry point have no fallback component.
+- The build script does not implement per-app timeouts, retries, forced GC, or a
+  minimum-success deployment threshold. A failed preview build is reported, but
+  does not by itself make the orchestrator exit unsuccessfully.
+- Assembly reads existing per-app output directories, so a failed local rebuild
+  can leave stale preview assets available for copying.
+- Shell browser tests assert controls and frame elements; they do not validate all
+  preview documents in the assembled artifact. CI report retention is 30 days;
+  there is no configured 14-day rollback-artifact policy in the workflow.
 
-### What Is Simplified or Substituted
+### Omitted production features
 
-- **No RUM in production:** Web Vitals metrics are logged to console only; no analytics backend
-- **No Sentry integration:** Error tracking is console-based
-- **No incremental builds:** Full rebuild on every deployment (sufficient at 42 apps / ~3 minutes)
-- **No custom CDN headers:** Relies on GitHub Pages' default caching via Fastly; Netlify `_headers` configuration is documented but not deployed
+The reviewed source does not provide the proposed release manifest, complete-artifact
+validation gate, incremental build cache, runtime readiness protocol, performance
+budget gate, RUM collector, or centralized preview error forwarding. It also has no
+server-side accounts, database, or form-processing service. These are explicit scope
+boundaries, not missing microservices that must be added to a static showcase.
 
-### What Is Omitted
-
-- Server-side logic (the platform is entirely static)
-- A/B testing or feature flags
-- User authentication or personalization
-- Performance budgets enforced in CI (documented but may not be implemented)
-- Iframe error forwarding via postMessage (described in architecture, may not be fully wired)
+Setup commands are in [README.md](./README.md). This review inspected source and
+configuration; it did not execute the upstream build, deploy, or browser suite.

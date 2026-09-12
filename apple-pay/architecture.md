@@ -1,838 +1,400 @@
-# Design Apple Pay - Architecture
+# Apple Pay: architecture and implementation
 
 ## System Overview
 
-Apple Pay is a mobile payment system using tokenization and biometric authentication. Core challenges involve secure tokenization, NFC transactions, and network integration.
+A mobile wallet connects device-bound payment credentials, user authorization, merchant checkout, and existing payment networks. The central design challenge is preserving one payment intent across device interaction, external authorization, retries, and delayed results. Token provisioning and revocation have different latency and failure requirements from checkout.
 
-**Learning Goals:**
-- Build payment tokenization systems
-- Design hardware-backed security
-- Implement NFC payment protocols
-- Handle multi-network integration
+This document first describes a **proposed production design**, then maps it to this repository's **local HTTP simulator** in Implementation Notes. The proposal is an interview-scale design, not a description of Apple's private infrastructure. Production targets are assumptions, not measured repository results.
 
----
+The local application runs one Express process, PostgreSQL, Valkey, and React. It contains simulated tokenization and authorization, but no hardware security, NFC transport, actual network credentials, money movement, settlement, or native Apple Pay integration.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed production
 
-1. **Provision**: Add cards to wallet
-2. **Pay**: NFC and in-app payments
-3. **Authenticate**: Biometric verification
-4. **Track**: Transaction history
-5. **Manage**: Card lifecycle
+- Enroll an eligible card on a specific device, including issuer verification when necessary.
+- Show display-safe card metadata and device-specific availability.
+- Support a merchant checkout with a fixed amount, currency, and order identity.
+- Convey a payment credential through the appropriate native/contactless or app/web integration.
+- Record merchant-side authorization outcomes and reconcile uncertain results.
+- Suspend one token or all tokens on a lost device; expose propagation status.
+- Provide authorized transaction history and refund status.
 
-### Non-Functional Requirements
+We separate three actors: the wallet manages credentials; the merchant/processor owns checkout and authorization attempts; the issuer decides whether to authorize. Authorization, capture, settlement, reversal, and refund remain distinct concepts.
 
-- **Security**: Hardware-backed token storage
-- **Latency**: < 500ms for NFC payment
-- **Availability**: 99.99% for transactions
-- **Privacy**: Card number never shared with merchant
+### Non-functional requirements — proposed production
 
----
+| Requirement | Design target / invariant |
+|-------------|---------------------------|
+| Wallet interaction | Visible selection feedback within 100 ms; responsive accessible controls |
+| Owned online API | p99 under 200 ms excluding issuer/network waits and human verification |
+| Checkout | Illustrative two-second response deadline; pending outcome if external status is unresolved |
+| Availability | 99.99% for owned payment orchestration, measured separately from issuer approval |
+| Correctness | One durable logical operation per checkout attempt; no duplicate external submission without a safe provider contract |
+| Security | Minimize credential exposure; bind authorization to the intended operation and authorized actor |
+| Revocation | Acknowledge request separately from confirmed enforcement at the credential authority |
+| History | Eventual projection with read-after-write visibility for a known operation |
+
+A sub-500 ms NFC exchange target would describe only a particular measured boundary. It must not be presented as a universal issuer-approval guarantee or a benchmark of this Express server.
+
+## Capacity Estimation
+
+Use 100 million daily authorizations as a planning example: about 1,160 per second on average and 11,600 per second at a tenfold peak. These figures describe the merchant/processor subsystem if it observes that volume; an ordinary wallet backend does not automatically receive every contactless authorization.
+
+At roughly 1 KB per authorization record, raw history grows by about 100 GB/day before indexes, replicas, and separate attempt/audit records. A 90-day hot window would be about 9 TB raw. Retention must follow the applicable product and records policy; seven years is not a universal requirement for every row.
+
+Assume 100 million users, two devices, and two cards per device: up to 400 million token associations. Device-specific tokens make lost-device operations narrow but increase enrollment and lifecycle traffic.
+
+Provisioning peaks around device launches; authorization peaks around shopping activity. Separate resource budgets prevent a slow enrollment surge from starving checkout. Shard counts follow measured write, storage, and recovery limits rather than a fixed number chosen from request rate alone.
 
 ## High-Level Architecture
 
+The diagram separates wallet control from merchant payment processing. Lines describe logical responsibility, not the precise Apple protocol.
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     iPhone/Apple Watch                          │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐       │
-│  │  Wallet App   │  │ Secure Element│  │   NFC Radio   │       │
-│  │               │  │               │  │               │       │
-│  │ - Cards       │  │ - Token store │  │ - Contactless │       │
-│  │ - History     │  │ - Crypto ops  │  │ - Reader comm │       │
-│  └───────────────┘  └───────────────┘  └───────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                  │
-│        (TLS termination, rate limiting, auth routing)           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Provisioning  │    │  Transaction  │    │  Token        │
-│ Service       │    │  Service      │    │  Lifecycle    │
-│               │    │               │    │  Service      │
-│ - Card add    │    │ - NFC pay     │    │               │
-│ - Network TSP │    │ - In-app pay  │    │ - Suspend     │
-│ - SE provisn  │    │ - Cryptogram  │    │ - Reactivate  │
-│               │    │ - Auth route  │    │ - Refresh     │
-└───────────────┘    └───────────────┘    │ - Lost device │
-         │                    │            └───────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │   Redis/Valkey    │   External Networks       │
-│   - Cards       │   - Sessions      │   - Visa TSP              │
-│   - Transactions│   - Token cache   │   - Mastercard TSP        │
-│   - Audit logs  │   - ATC watermark │   - Amex TSP              │
-│   - Merchants   │   - Rate limits   │   - Issuing banks         │
-│   - ATC table   │   - Idempotency   │                           │
-└─────────────────┴───────────────────┴───────────────────────────┘
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Wallet + device          │───────▶│ Wallet control API       │
+│ Protected credential     │        │ Enrollment / lifecycle   │
+└────────────┬─────────────┘        └────────────┬─────────────┘
+             ▼                                   ▼
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Merchant / terminal      │        │ Token authority / TSP    │
+│ Checkout identity        │        │ Enroll / revoke          │
+└────────────┬─────────────┘        └──────────────────────────┘
+             ▼
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Merchant processor       │───────▶│ Network / issuer         │
+│ Durable payment attempts │        │ Authorization outcome    │
+└──────────────────────────┘        └──────────────────────────┘
 ```
 
----
+The wallet control API also integrates with the token service provider (TSP) for enrollment and lifecycle requests. Its database stores associations and operation status; the processor keeps authorization attempts, provider references, and reconciliation work. Durable outboxes feed notification/history consumers. Static browser assets can use a CDN; neither cached assets nor metadata authorize spending.
 
-## Core Components
+Apple documents an NFC path involving the device and terminal, while app/web credentials involve Apple servers and merchant-specific encryption. These are different edge protocols; a single wallet REST endpoint should not be drawn as a mandatory intermediary for every physical tap. [Apple's payment flows](https://support.apple.com/en-euro/guide/security/secfbd5c0e54/web).
 
-### 1. Card Provisioning
+## Core Components / Request Flows
 
-When a user adds a card to Apple Pay, the provisioning flow:
+### Card provisioning
 
-1. **Card validation**: Identify the card network (Visa/Mastercard/Amex) from the PAN prefix (BIN range)
-2. **Network TSP request**: Send encrypted PAN to the network's Token Service Provider, which returns a device-specific token (DPAN) and cryptographic key material
-3. **Store token reference**: The server stores only the `token_ref` (reference ID), `last4`, `network`, and `card_type`. The actual token and cryptographic keys are stored in the device's Secure Element
-4. **Secure Element provisioning**: Token data is sent to the device's SE through an encrypted channel, establishing a secure session with ephemeral keys
+1. The authenticated user selects a target device and starts a durable enrollment operation.
+2. A supported payment integration handles card data and device evidence according to its provider contract.
+3. The TSP/issuer evaluates eligibility and risk; additional verification can leave enrollment pending.
+4. Protected credential delivery and activation are confirmed before the wallet presents the token as usable.
+5. Metadata and the enrollment result become visible to the owner; failures are resumable by operation ID.
 
-Each device gets a unique token for the same physical card. Losing one device does not compromise tokens on other devices. Per-device revocation is immediate.
+Do not use last four digits as card identity. Unrelated cards can share them. A provider-approved reference and device association distinguish enrollments without retaining the original PAN in the ordinary wallet catalog.
 
-### 2. NFC Payment Flow
+Tokenization constrains use of a substitute credential to permitted domains such as device, merchant, or scenario. It reduces exposure; it is not proof that every database field is harmless or that all compliance obligations disappear. [EMVCo tokenisation overview](https://www.emvco.com/emv-technologies/payment-tokenisation/).
 
-The NFC payment completes in under 500ms:
+### Device authorization and credential use
 
-1. Device detects payment terminal via NFC
-2. Terminal sends merchant data (amount, currency, merchant ID, unpredictable number)
-3. Device requests biometric authentication (Face ID / Touch ID)
-4. Secure Element generates a one-time cryptogram using the token's key and transaction data
-5. Device transmits EMV payment data via NFC: the device-specific token (not the real PAN), the cryptogram, ECI (Electronic Commerce Indicator), and Application Transaction Counter (ATC)
-6. Terminal forwards to acquirer, then to card network
-7. Network validates the cryptogram with its TSP, de-tokenizes to the real PAN, and routes authorization to the issuing bank
-8. Authorization response flows back through the chain
+For ordinary user-confirmed payments, the secure device boundary verifies intent and authentication before releasing payment credentials. Apple describes cryptograms derived from a key and transaction counter, with additional scheme-dependent inputs such as terminal unpredictability or an app/web anti-replay value. Validation belongs with the participating network/issuer, not a made-up wallet hash check. [Apple's authorization description](https://support.apple.com/guide/security/payment-authorization-with-apple-pay-secc1f57e189/web).
 
-The cryptogram is a MAC computed over the amount, merchant ID, unpredictable number, and ATC using 3DES or AES with a key that never leaves the Secure Element. The ATC increments monotonically, providing natural replay protection -- any reused cryptogram with a stale ATC is rejected.
+The proposal uses these roles, without claiming to reproduce the cryptographic protocol. Exact fields, counter handling, and replay policy follow the approved integration. A complete transaction-bound cryptogram cannot generally be computed before the inputs it authenticates are known.
 
-### 3. In-App Payment
+### Merchant checkout and authorization
 
-For in-app purchases, the merchant's app presents a payment sheet. The flow:
+1. The merchant persists the order and authoritative total.
+2. A checkout attempt fixes order version, currency, amount, and selected credential context.
+3. The customer confirms the displayed intent through the supported platform flow.
+4. An authenticated merchant/processor request claims a durable operation identity.
+5. A worker or request handler sends the provider request with a stable external reference and a bounded deadline.
+6. A conclusive provider response advances the operation and writes an outbox event transactionally.
+7. A timeout after possible submission leaves the operation unresolved; reconciliation queries the provider using the existing reference.
+8. The client reads the same operation until it has a conclusive outcome.
 
-1. Merchant creates a payment session with supported networks and total amount
-2. User authenticates with biometric
-3. Device generates a payment token encrypted with the merchant's public key
-4. Merchant's server decrypts the token, extracts the DPAN and cryptogram
-5. Merchant sends authorization request to their payment processor
-6. Processor routes through the network for de-tokenization and bank authorization
+The processor does not hold a database transaction open during an issuer call. Durable preparation, external submission, and durable finalization are separate stages. No local SQL isolation level makes the external authorization part of the database commit.
 
-The merchant never sees the real card number -- they receive only the device-specific token, which is useless without the per-transaction cryptogram.
+### Revocation and refunds
 
-### 4. Token Lifecycle Management
+Revocation first records the requested token/device scope, then dispatches lifecycle work. A lost phone should not suspend the user's watch credential. A local status update can block local requests immediately, but external enforcement requires acknowledgement from the token authority.
 
-Tokens require active management:
+A refund is its own durable operation linked to an original captured payment. Reserve available refundable value atomically before provider submission; retain pending refund reservations during uncertainty. A partial refund does not imply that the whole original payment was refunded.
 
-- **Suspend**: When a user reports a card lost/stolen, all tokens for that card are suspended across all devices. The network and SE are notified.
-- **Reactivate**: After verification (e.g., bank confirms card is found), tokens are reactivated.
-- **Refresh**: Tokens have expiration dates. Before expiry, the system requests new token material from the network and provisions it to the SE.
-- **Lost device**: All tokens on the lost device are suspended immediately. Other devices' tokens remain active. This is the key advantage of per-device tokenization.
-- **Card update**: When the physical card is reissued (new expiry, new PAN), the network pushes token updates to all provisioned devices.
-
-### 5. Transaction Processing (Server-Side)
-
-The server-side transaction service:
-
-1. Looks up the token in the vault to identify the card and user
-2. Validates the cryptogram with the card network's TSP
-3. Verifies the ATC is strictly greater than the last known value (replay prevention)
-4. Routes the authorization to the issuing bank via the card network
-5. Logs the transaction with audit trail
-6. Updates the ATC watermark in both Redis (fast reads) and PostgreSQL (durability)
-
----
+The repository combines these actors into one server and has no capture or settlement state. Its negative transaction rows demonstrate a refund display, not this accounting model.
 
 ## Database Schema
 
-```sql
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  name VARCHAR(255) NOT NULL,
-  role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
+### Proposed production model
 
--- Devices table (simulates iPhone/Apple Watch)
-CREATE TABLE IF NOT EXISTS devices (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  device_name VARCHAR(255) NOT NULL,
-  device_type VARCHAR(50) NOT NULL, -- iphone, apple_watch, ipad
-  secure_element_id VARCHAR(100) UNIQUE NOT NULL, -- Simulated SE identifier
-  status VARCHAR(20) DEFAULT 'active',
-  last_active_at TIMESTAMP DEFAULT NOW(),
-  created_at TIMESTAMP DEFAULT NOW()
-);
+| Entity | Important fields / constraints | Access pattern |
+|--------|--------------------------------|----------------|
+| Wallet account | ID, identity reference, account state | Authenticate and list owned devices |
+| Device | Owner, device reference, status, version | Fetch a user's devices; revoke a device |
+| Token association | Owner/device, provider reference, display metadata, activation/lifecycle state | Unique provider association; indexes on owner/device |
+| Enrollment operation | Actor, operation key, request fingerprint, provider reference, current step | Resume enrollment without requesting another token |
+| Checkout | Merchant, order/version, amount in minor units, currency, state | Verify total and intent before confirmation |
+| Payment attempt | Checkout, operation key, request fingerprint, provider reference, outcome/version | Unique actor + operation namespace + key |
+| Refund operation | Original payment, amount, pending/final outcome, provider reference | Lock original payment's refundable balance |
+| Provider inbox | Provider + event ID, verified payload reference, processing status | Deduplicate and order callbacks |
+| Outbox | Event ID, aggregate ID/version, payload, delivery state | Recover publication after database commit |
+| History projection | Owner, effective time, stable ID, display-safe result | Keyset pagination by time and ID |
 
-CREATE INDEX idx_devices_user ON devices(user_id);
+Store integer minor units with currency rules or validated decimal representations. A currency code's length alone does not establish validity or precision. Keep sensitive payloads out of general history; use access-controlled references if protocol records must be retained.
 
--- Provisioned Cards (tokens)
-CREATE TABLE IF NOT EXISTS provisioned_cards (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  token_ref VARCHAR(100) UNIQUE NOT NULL, -- Reference to token
-  token_dpan VARCHAR(16) NOT NULL, -- Device PAN (tokenized)
-  network VARCHAR(20) NOT NULL, -- visa, mastercard, amex
-  last4 VARCHAR(4) NOT NULL,
-  card_type VARCHAR(20), -- credit, debit
-  card_holder_name VARCHAR(255),
-  expiry_month INTEGER NOT NULL,
-  expiry_year INTEGER NOT NULL,
-  card_art_url VARCHAR(500),
-  is_default BOOLEAN DEFAULT false,
-  status VARCHAR(20) DEFAULT 'active',
-  suspended_at TIMESTAMP,
-  suspend_reason VARCHAR(100),
-  provisioned_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
+### Existing local schema
 
-CREATE INDEX idx_cards_user ON provisioned_cards(user_id);
-CREATE INDEX idx_cards_device ON provisioned_cards(device_id);
-CREATE INDEX idx_cards_token_ref ON provisioned_cards(token_ref);
+The executable schema is [backend/src/db/init.sql](./backend/src/db/init.sql). This inventory describes it without suggesting that proposed tables already exist.
 
--- Merchants
-CREATE TABLE IF NOT EXISTS merchants (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name VARCHAR(200) NOT NULL,
-  category_code VARCHAR(4),
-  merchant_id VARCHAR(50) UNIQUE NOT NULL,
-  public_key TEXT, -- For encrypting payment tokens
-  webhook_url VARCHAR(500),
-  status VARCHAR(20) DEFAULT 'active',
-  created_at TIMESTAMP DEFAULT NOW()
-);
+| Table | Existing columns / indexes | Material limitation |
+|-------|---------------------------|---------------------|
+| `users` | UUID, unique email, password hash, name, role, timestamps | Role is text; admin middleware is unused |
+| `devices` | Owner FK, unique `secure_element_id`, type/status; owner index | Simulated identifier, not attestation |
+| `provisioned_cards` | Owner/device FKs, unique `token_ref`, full `token_dpan`, last4, expiry, default/status; owner/device/token indexes | No uniqueness for active enrollment or one default; no status checks |
+| `merchants` | Unique external-style merchant ID, name/category, optional public key/webhook, status | No merchant account ownership relation |
+| `transactions` | Card/merchant FKs, token reference, cryptogram, decimal amount, currency, status/type, auth/decline text | No operation key, external reference, refund parent, capture, or reconciliation state |
+| `biometric_sessions` | User/device FKs, challenge, status, five-minute expiry | No payment binding or consumed state |
+| `audit_logs` | Actor, action/resource/result, request/session IDs, metadata; several audit indexes | Ordinary mutable table; no append-only enforcement |
+| `token_atc` | Token reference PK, last counter, update time | Created/seeded but never read or updated by application logic |
 
--- Transactions
-CREATE TABLE IF NOT EXISTS transactions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  card_id UUID NOT NULL REFERENCES provisioned_cards(id),
-  merchant_id UUID REFERENCES merchants(id),
-  token_ref VARCHAR(100) NOT NULL,
-  cryptogram VARCHAR(100),
-  amount DECIMAL(12, 2) NOT NULL,
-  currency VARCHAR(3) NOT NULL DEFAULT 'USD',
-  status VARCHAR(20) NOT NULL, -- pending, approved, declined, refunded
-  auth_code VARCHAR(20),
-  decline_reason VARCHAR(100),
-  transaction_type VARCHAR(20) NOT NULL, -- nfc, in_app, web
-  merchant_name VARCHAR(200),
-  merchant_category VARCHAR(100),
-  location VARCHAR(200),
-  created_at TIMESTAMP DEFAULT NOW()
-);
+Transaction indexes cover card/time, token/time, and merchant; there is no time partitioning or sharding. Most timestamps are `TIMESTAMP` without time zone. PostgreSQL returns `DECIMAL` values as strings by default, although frontend interfaces declare transaction amounts as numbers.
 
-CREATE INDEX idx_transactions_card ON transactions(card_id, created_at DESC);
-CREATE INDEX idx_transactions_token ON transactions(token_ref, created_at DESC);
-CREATE INDEX idx_transactions_merchant ON transactions(merchant_id);
-
--- Biometric Auth Sessions (simulated)
-CREATE TABLE IF NOT EXISTS biometric_sessions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  auth_type VARCHAR(20) NOT NULL, -- face_id, touch_id, passcode
-  status VARCHAR(20) NOT NULL, -- pending, verified, failed
-  challenge VARCHAR(100),
-  created_at TIMESTAMP DEFAULT NOW(),
-  verified_at TIMESTAMP,
-  expires_at TIMESTAMP DEFAULT NOW() + INTERVAL '5 minutes'
-);
-
-CREATE INDEX idx_biometric_user ON biometric_sessions(user_id);
-
--- Audit Logs (PCI-DSS compliance)
-CREATE TABLE IF NOT EXISTS audit_logs (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-  user_email VARCHAR(255),
-  action VARCHAR(100) NOT NULL, -- 'payment.approved', 'card.suspended'
-  resource_type VARCHAR(50) NOT NULL, -- 'transaction', 'card', 'user'
-  resource_id VARCHAR(100),
-  result VARCHAR(20) NOT NULL, -- 'success', 'failure', 'error'
-  ip_address VARCHAR(45),
-  user_agent TEXT,
-  session_id VARCHAR(100),
-  request_id VARCHAR(100), -- Correlation with application logs
-  metadata JSONB DEFAULT '{}', -- Additional context (redacted)
-  error_message TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_audit_user ON audit_logs(user_id, created_at DESC);
-CREATE INDEX idx_audit_action ON audit_logs(action, created_at DESC);
-CREATE INDEX idx_audit_resource ON audit_logs(resource_type, resource_id);
-CREATE INDEX idx_audit_created ON audit_logs(created_at DESC);
-CREATE INDEX idx_audit_result ON audit_logs(result, created_at DESC);
-
--- Token ATC (Application Transaction Counter)
--- Write-through caching: updated in both Redis and PostgreSQL
-CREATE TABLE IF NOT EXISTS token_atc (
-  token_ref VARCHAR(100) PRIMARY KEY,
-  last_atc INTEGER NOT NULL DEFAULT 0,
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_token_atc_updated ON token_atc(updated_at DESC);
-```
-
-### Schema Design Rationale
-
-**Device table**: Simulates the hardware inventory. The `secure_element_id` is unique per device, modeling the real SE that stores cryptographic keys. Device status enables lost-device flows.
-
-**Provisioned cards with token_ref**: The server never stores the actual DPAN cryptographic material -- only a reference (`token_ref`) used to communicate with the card network's TSP. The real token lives in the Secure Element. `token_dpan` is stored for display purposes (the tokenized PAN, not the real PAN).
-
-**Audit logs with ON DELETE SET NULL**: Audit records survive user deletion. `metadata` is JSONB for flexible context but is automatically redacted of sensitive data (PAN, CVV) before storage.
-
-**ATC table with write-through**: The ATC is critical for replay prevention. Write-through ensures both Redis (for fast reads during payment validation) and PostgreSQL (for durability across restarts) are always in sync.
-
----
+The schema accepts `'refund'` transaction types despite TypeScript unions omitting them. Text state columns also accept seed values such as a device status of `'suspended'` that do not match the device union. Neither comments nor TypeScript constrain SQL writers.
 
 ## API Design
 
-### Authentication
+### Proposed contract principles
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/api/auth/register` | Register user account |
-| POST | `/api/auth/login` | Login, create session |
-| POST | `/api/auth/logout` | Destroy session |
-| GET | `/api/auth/me` | Current user profile |
-| POST | `/api/auth/devices` | Register device |
+Every financial/enrollment operation has a stable identity and an authorized status lookup. Merchant identity comes from authenticated credentials, never an arbitrary route parameter alone. Reusing a key for a different canonical request returns a conflict; retrying the same operation returns its existing status.
 
-### Cards
+A response distinguishes confirmed approval, confirmed decline, pending reconciliation, and failure before submission. An HTTP timeout or generic server error cannot alone establish which financial outcome occurred.
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/cards` | List provisioned cards |
-| POST | `/api/cards` | Provision new card |
-| GET | `/api/cards/:id` | Card details |
-| POST | `/api/cards/:id/suspend` | Suspend card token |
-| POST | `/api/cards/:id/reactivate` | Reactivate suspended token |
-| DELETE | `/api/cards/:id` | Remove card from wallet |
-| POST | `/api/cards/:id/default` | Set as default payment card |
+Example proposed operation response:
 
-### Payments
+```json
+{
+  "operation_id": "op_example",
+  "status": "pending_reconciliation",
+  "amount_minor": 2499,
+  "currency": "USD",
+  "status_url": "/api/payment-operations/op_example"
+}
+```
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/api/payments/pay` | Process NFC or in-app payment |
-| GET | `/api/payments/transactions` | Transaction history |
-| GET | `/api/payments/transactions/:id` | Transaction details |
-| POST | `/api/payments/biometric` | Initiate biometric auth session |
-| POST | `/api/payments/biometric/verify` | Verify biometric challenge |
+This is a proposed API shape, not the local response format.
 
-### Merchants
+### Implemented local routes
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/merchants` | List merchants |
-| GET | `/api/merchants/:id` | Merchant details with transactions |
-| POST | `/api/merchants/:id/refund` | Process refund |
+| Method / route | Access and behavior |
+|----------------|---------------------|
+| `POST /api/auth/register`, `/login` | Public; Zod inputs; login returns `sessionId` and user |
+| `GET /api/auth/me`; `POST /api/auth/logout` | User session |
+| `GET/POST /api/auth/devices` | List/register owned simulated devices |
+| `DELETE /api/auth/devices/:deviceId`; `POST .../:deviceId/lost` | Owner checks; multi-statement state changes |
+| `GET /api/cards`, `/:cardId` | Owner reads with explicit safe card projection |
+| `POST /api/cards` | Session plus required idempotency key; receives plaintext PAN/CVV in parsed JSON |
+| `POST /api/cards/:cardId/suspend`, `/reactivate`, `/default`; `DELETE /api/cards/:cardId` | Session plus required key |
+| `POST /api/payments/biometric/initiate`, `/verify` | Session plus required key |
+| `POST /api/payments/biometric/simulate`; `GET .../biometric/:sessionId` | Session, but no ownership check on supplied biometric session ID |
+| `POST /api/payments/pay` | User auth, biometric middleware, idempotency middleware, then validation/service |
+| `GET /api/payments/transactions`, `/transactions/:transactionId` | Owner-scoped SQL reads |
+| `GET /api/merchants`, `/:merchantId`, `/:merchantId/transactions` | Public reads; history exposes transaction fields |
+| `POST /api/merchants/:merchantId/sessions`, `/process`, `/refund` | Public mutations requiring an idempotency key |
 
----
+User history accepts `limit`, `offset`, `card_id`, and `status`; numeric pagination is parsed without bounds/strict validation. Lists sort by creation time without an ID tie-breaker, and count/page are separate queries. There is no operation-key lookup for recovering a lost payment response.
 
 ## Key Design Decisions
 
-### 1. Device-Specific Tokens
+### Delegate credential authority to the payment ecosystem
 
-**Decision**: Each device gets a unique token for the same physical card, rather than sharing one token across devices.
+A wallet needs device-specific payment use and revocation. A real provider integration supplies that domain policy and issuer relationship. Keeping ordinary wallet storage limited to associations reduces the number of services that need payment secrets.
 
-**Why it works**: When a user loses their iPhone, only that device's token is suspended. Their Apple Watch continues to work. The card network knows exactly which device transacted, enabling per-device fraud analysis. Revocation is instant and targeted.
+A custom server token vault can be legitimate in a processor design, but it would add key custody and provider obligations to this wallet's scope. A random string generator alone supplies neither token acceptance nor replay protection. The cost of delegation is dependence on provider capabilities, onboarding, lifecycle callbacks, and recovery procedures.
 
-**Why shared tokens fail**: A single shared token means losing any device compromises all devices. Suspending the token disables payments everywhere. The user must re-provision all devices after finding the lost one. This is unacceptable UX for a payment system where availability directly impacts daily life.
+### Make the operation record durable before external work
 
-**Trade-off**: More tokens to manage per card (one per device). The provisioning service must handle token-per-device creation, and the lifecycle service must track which devices have which tokens. Storage cost is negligible (a few KB per token reference).
+A Redis lock can suppress concurrent requests while the key exists. It cannot explain an issuer approval after the server crashes before caching the result. The chosen design keeps operation identity and external reference in durable storage and retains uncertainty until reconciliation resolves it.
 
-### 2. Hardware Secure Element Storage
+Database uniqueness serializes competing claims; short state transitions prevent two workers from creating separate attempts. Provider idempotency or lookup is still required at the external boundary. This adds explicit recovery machinery and a pending UX, but avoids pretending that a cache TTL decides whether a charge happened.
 
-**Decision**: Store tokens and cryptographic keys in the device's hardware Secure Element, not in software.
+### Treat revocation as a versioned workflow
 
-**Why it works**: Keys in the SE cannot be extracted even with root access to the OS. Cryptogram generation happens in tamper-resistant hardware. This is the foundation of Apple Pay's security model -- the SE is a separate chip with its own processor and encrypted memory.
+A token's authority may be external and the device may be unreachable. We record a versioned lifecycle request and show whether it is requested, locally blocked, or externally confirmed. Replayed/out-of-order events cannot reactivate a later suspension.
 
-**Why software storage fails**: Software keystores can be compromised by OS-level exploits, jailbreaks, or malware. A compromised cryptographic key allows an attacker to generate valid payment cryptograms indefinitely. For a payment system handling billions of dollars, this risk is unacceptable.
-
-**Trade-off**: SE operations are slower than software crypto (~50ms vs ~1ms). We mitigate this with pre-generated cryptograms: the SE generates the next cryptogram before the user taps, so NFC payment feels instant.
-
-### 3. Dynamic One-Time Cryptograms
-
-**Decision**: Generate a unique cryptogram for every transaction rather than reusing static credentials.
-
-**Why it works**: Even if an attacker intercepts the NFC communication, they capture a token + cryptogram pair that is valid for only one transaction. The cryptogram is bound to the specific amount, merchant, and an unpredictable number from the terminal. Replaying it fails because the ATC has advanced.
-
-**Why static credentials fail**: Static card credentials (PAN + expiry + CVV) can be reused for any transaction once captured. This is why card skimming works with magnetic stripe cards. Dynamic cryptograms make each transaction cryptographically unique.
-
-**Trade-off**: Requires the card network to validate every cryptogram, adding a network round-trip (~20ms) to the authorization flow. For the NFC use case (< 500ms budget), this is acceptable. The ATC watermark in Redis provides sub-millisecond replay detection locally.
-
----
+A single local update with cache deletion is easier, but can leave the external credential usable and can race a reader that repopulates stale state. Version checks and acknowledgement-based state require more coordination. They give the user an accurate account of what has been enforced.
 
 ## Consistency and Idempotency
 
-### Consistency Model
+### Proposed production guarantees
 
-| Operation | Consistency Level | Rationale |
-|-----------|------------------|-----------|
-| Card provisioning | Strong (serializable) | Must prevent duplicate tokens |
-| Transaction authorization | Strong (serializable) | Financial accuracy |
-| Transaction history reads | Eventual (read-your-writes) | Performance acceptable |
-| Token status updates | Strong | Security-critical |
+- Authenticate and authorize the actor before looking up an operation result.
+- Bind the key to actor, operation namespace, canonical request, and authoritative checkout version.
+- Persist intent and provider reference before submission; use atomic claim/state transitions.
+- Keep unknown outcomes pending. A lock expiry means a worker lease expired, not that external work failed.
+- Reconcile the same external reference before initiating a replacement authorization.
+- Publish notifications via a durable outbox, and deduplicate provider callbacks by event ID.
+- Use short SQL transactions for local invariants, including refundable amount reservations.
 
-### Idempotency Implementation
+Protocol replay protection is a separate concern from an HTTP retry. Returning an already-authorized actor's stored result does not generate another credential or another authorization. Network replay rules should follow the payment scheme rather than a blanket wallet-side counter comparison.
 
-All mutation endpoints require an `Idempotency-Key` header. The flow:
+### What local middleware actually guarantees
 
-1. Client provides unique `Idempotency-Key`
-2. Middleware checks Redis for existing result
-3. Found + completed: return cached response (`X-Idempotency-Replayed: true`)
-4. Found + in-progress: return 409 Conflict
-5. Not found: acquire Redis lock (60s TTL), execute operation, cache result for 24 hours
-6. On failure: release lock, allowing retry
+[shared/idempotency.ts](./backend/src/shared/idempotency.ts) requires the exact `Idempotency-Key` header, length 16–128. It checks a Redis response record, otherwise claims an in-progress record with `SET NX EX 60`. Completed JSON responses are written asynchronously with a 24-hour TTL. In-progress requests return 409; a different stored body hash returns 422.
 
-**Protected endpoints:**
-- `POST /api/payments/pay` -- prevents double-charging
-- `POST /api/cards` -- prevents duplicate card provisioning
-- `POST /api/merchants/:id/refund` -- prevents double-refunds
-- All card state mutations (suspend, reactivate, remove)
+The limitations matter:
 
-### Conflict Resolution
+1. The key uses `req.path` and the supplied key, without user, HTTP method, or router mount prefix. Separate actors and routes can collide; authorized users must not share private response caches this way.
+2. The body fingerprint is a 32-bit string hash, not a collision-resistant canonical request digest.
+3. SQL writes and Redis results do not commit together. A payment row can exist even when the caller receives 500 after a Redis failure.
+4. Redis check errors allow the handler to proceed. User authentication still depends on Redis; this fallback does not make the entire API Redis-independent.
+5. All JSON statuses are initially cached, while a finish handler deletes records for 4xx/5xx responses. Errors therefore are not retained as durable operation outcomes.
+6. An expired lease allows another execution; completion/cleanup are not conditional on lease ownership.
+7. Biometric middleware runs before replay lookup, so a completed payment cannot be replayed through this route after the biometric session expires without renewed verification.
+8. The browser never sends the key, so it does not reach these protected handlers normally.
 
-- **Same card on same device**: Reject (unique constraint on user_id + device_id + last4 + network)
-- **Same card on different device**: Allow (per-device tokens by design)
-- **Concurrent provisioning**: First-write-wins via database unique constraint
-- **Suspend vs. active payment**: Suspend takes precedence (security)
-- **Multiple suspend requests**: Idempotent (no-op if already suspended)
+The separate `executeIdempotent` helper is exported but unused. There is no transaction-row unique constraint backing idempotency and no durable reconciliation worker.
 
-### Application Transaction Counter (ATC)
+## Security / Auth
 
-The ATC in the Secure Element provides natural replay protection:
+### Proposed production boundary
 
-- Each transaction increments the ATC monotonically
-- The server stores the last known ATC per token (Redis + PostgreSQL write-through)
-- If a claimed ATC is less than or equal to the stored value, the transaction is rejected as a replay
-- ATC gaps are allowed (the SE may have been used for failed transactions locally)
+Use authenticated device/user and merchant identities, least-privilege data projections, TLS, protected credential handling, and narrowly scoped authorization. Treat local display metadata as untrusted for payment eligibility. Device revocation and account-session revocation are separate operations.
 
----
+For a browser account surface, an HttpOnly cookie can reduce JavaScript access to the session credential; CSRF and XSS defenses still matter. Native payment authorization uses the supported platform boundary. A JavaScript animation or a reusable server boolean is not evidence of biometric verification.
 
-## Caching Strategy
+### Local behavior and gaps
 
-### Cache Architecture
+- Passwords use bcrypt cost 10. A UUID session is stored only in Redis with a one-hour sliding TTL.
+- The client stores the session in localStorage and sends `X-Session-Id`; there is no session cookie or `express-session` middleware.
+- Login accepts an optional device ID without proving it belongs to the account before writing it into the session. Later device activity updates include ownership, but their result is not checked.
+- Biometric initiation requires an owned active device, generates a random challenge, and writes SQL plus Redis separately.
+- Verification accepts the literal response `'verified'` or a string containing the challenge's first ten characters. Verify/simulate/status access does not check ownership of the supplied session.
+- The Redis verification path does not enforce pending status or original SQL expiry. Successful verification extends only Redis TTL; payment middleware uses the original SQL expiry.
+- Payment requires a verified SQL session owned by the current user, but does not bind it to the selected card's device, amount, merchant, or a single use.
+- Card status is read before payment; device status is not rechecked, and suspension is not serialized with authorization. Reactivating a suspended card does not require its device to be active.
+- Merchant history, authorization simulation, and refunds have no authentication. `adminMiddleware` exists but is not mounted.
+- There is no rate limiter, device attestation, issuer step-up, payment signature verification, encrypted token storage, or compliance certification.
 
-```
-   Client Request
-         │
-         ▼
-┌─────────────────┐    Cache Miss    ┌─────────────────┐
-│   Edge Cache    │ ───────────────▶ │   Application   │
-│   (CDN Layer)   │                  │     Server      │
-│                 │ ◀─────────────── │                 │
-│ Static assets   │    Cache Fill    │                 │
-│ Card art images │                  │                 │
-└─────────────────┘                  └────────┬────────┘
-                                              │
-                                              ▼
-                                     ┌─────────────────┐
-                                     │  Valkey/Redis   │
-                                     │  (L2 Cache)     │
-                                     │                 │
-                                     │ - Token lookups │
-                                     │ - Sessions      │
-                                     │ - ATC watermarks│
-                                     │ - Rate limits   │
-                                     └────────┬────────┘
-                                              │ Cache Miss
-                                              ▼
-                                     ┌─────────────────┐
-                                     │   PostgreSQL    │
-                                     │  (Source of     │
-                                     │   Truth)        │
-                                     └─────────────────┘
-```
-
-### Caching by Data Type
-
-| Data Type | Pattern | TTL | Invalidation |
-|-----------|---------|-----|--------------|
-| Active token lookup | Cache-aside | 5 min | On status change |
-| Suspended token | No cache | - | - |
-| User's card list | Cache-aside | 2 min | On add/remove |
-| Transaction history | Cache-aside | 30 sec | On new transaction |
-| Card art images | CDN/write-through | 24 hours | On card update |
-| ATC watermarks | Write-through | No expiry | On every transaction |
-
-**Critical rule**: Suspended tokens are never cached. A cached "active" status for a suspended token could allow a fraudulent payment to proceed.
-
----
-
-## Security and Auth
-
-### Authentication Flow
-
-Session-based authentication with express-session backed by Redis. Cookies are `httpOnly` to prevent XSS access. Sessions enable immediate revocation on security events.
-
-### Biometric Simulation
-
-The system simulates the biometric authentication flow:
-1. Client requests a biometric challenge
-2. Server generates a challenge token with 5-minute expiry
-3. Client "verifies" biometric (simulated) and returns signed challenge
-4. Server validates the challenge and marks the session as authenticated
-
-In production, this happens entirely on-device in the Secure Element with Face ID / Touch ID.
-
-### PCI-DSS Considerations
-
-- **Cardholder data**: The server never stores full PANs. Only `last4` and `token_ref` are persisted. The real PAN exists only at the card network's TSP.
-- **Audit trail**: All card access and payment operations are logged to `audit_logs` with IP, user agent, and request correlation.
-- **Sensitive data redaction**: Logs automatically mask any PAN, CVV, or token data that might appear in error messages or request bodies.
-
----
+PAN/CVV are not persisted by the provisioning service, but the API receives them and stores full simulated DPANs. Card reads project safe fields; user and public merchant transaction reads return token references and cryptograms. Data minimization must be assessed per endpoint, not inferred from a single card projection.
 
 ## Observability
 
-### Prometheus Metrics
+### Proposed production signals
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_request_duration_seconds` | Histogram | API latency (p50/p95/p99) |
-| `payment_transactions_total` | Counter | Transactions by status, type, network |
-| `payment_duration_seconds` | Histogram | End-to-end payment latency |
-| `circuit_breaker_state` | Gauge | Network health (0=closed, 1=half-open, 2=open) |
-| `idempotency_cache_operations_total` | Counter | Cache hit/miss rates |
-| `card_provisioning_total` | Counter | Provisioning by network, result |
+Track owned latency, provider latency, conclusive declines, failures before submission, unresolved attempts, reconciliation age, duplicate suppression, lifecycle acknowledgement delay, and refundable-balance conflicts. Approval rate is a business/risk signal, not equivalent to service availability.
 
-### SLI/SLO Targets
+Use durable IDs to correlate checkout, attempt, provider request, callback, refund, and notification. Avoid amounts, customer IDs, arbitrary paths, and credential material as unbounded metric labels. Audit completion needs durable capture plus an explicit retention policy.
 
-| SLI | Target | Alert Threshold |
-|-----|--------|-----------------|
-| NFC payment latency (p99) | < 500ms | > 500ms for 2 min |
-| Transaction approval rate | > 95% | < 90% for 5 min |
-| API availability | 99.99% | < 99.9% for 5 min |
-| Idempotency cache hit rate (retries) | > 99% | < 95% for 10 min |
+### Existing instrumentation
 
-### Structured Logging
+| Implementation | What it measures / misses |
+|----------------|--------------------------|
+| `metrics.ts` | HTTP duration/count; payment duration/result/amount; provisioning and Redis idempotency counters |
+| Payment route labels | Successful payments are labeled `visa` regardless of actual card; declined labels use `unknown` |
+| Amount metric | Named USD even though API accepts arbitrary three-character currencies |
+| Circuit gauges | Created at startup; 0 closed, 0.5 half-open, 1 open; actual payment handlers do not fire them |
+| Declared gauges/histograms | Active-card count, DB pool, and DB query instruments are not updated by the DB helper |
+| Request logger | Request/response records with supplied/generated request ID; service logs generally use module loggers instead of `req.log` |
+| Audit helper | Selected provisioning, suspension, biometric, payment, and refund events; not every auth/device/card operation |
 
-JSON-formatted logs via Pino with request correlation. Sensitive data redaction prevents PAN, CVV, or token material from appearing in log output. Separate audit logger for compliance-grade event tracking.
+`audit_logs` persistence errors are swallowed after logging. Events are outside the financial write transaction, and the table is not immutable. Audit metadata redaction covers selected top-level keys; Pino redaction covers configured paths, not arbitrary nested objects or error strings. The audit row stores the session ID itself. These are partial diagnostics, not a complete compliance control.
 
----
+HTTP route labels omit mounted prefixes when `req.route.path` exists; fallback paths normalize UUID-looking values but can still have unbounded variants. Health and metrics are public.
 
 ## Failure Handling
 
-### Circuit Breaker for Payment Networks
+| Failure | Local behavior | Proposed production handling |
+|---------|----------------|------------------------------|
+| Redis unavailable at startup | Server does not listen | Readiness and bounded recovery according to service role |
+| Redis auth failure | Protected requests return 500 | Refuse unauthorized work; preserve already-durable attempts |
+| Redis write after payment insert | Request can fail after transaction is recorded | Resume by durable operation; no blind resubmission |
+| Simulated network error | Recorded as a decline with a retry message | Distinguish known decline from unknown provider outcome |
+| Audit insert failure | Operation continues; log records failure | Outbox-backed retry and backlog alerting |
+| Default-card removal | Card deleted and Redis keys removed, then invalid SQL fails | Atomic lifecycle/default transition |
+| Concurrent refunds | Both can pass the initial approved check | Serialize refundable balance reservation |
+| Process termination | SIGTERM closes dependencies and exits | Stop accepting HTTP, drain bounded work, preserve recovery state |
 
-Each card network has an independent circuit breaker:
+Three Opossum breakers are instantiated with 10-second timeout, 50% error threshold, minimum volume five, and 30-second reset. They wrap separate simulator functions, but `authorizeWithNetwork` is unused by routes/services. Consequently, healthy breaker statistics say nothing about actual payment traffic.
 
-| Network | Timeout | Error Threshold | Reset Timeout |
-|---------|---------|-----------------|---------------|
-| Visa | 10s | 50% errors | 30s |
-| Mastercard | 10s | 50% errors | 30s |
-| Amex | 10s | 50% errors | 30s |
-
-When a circuit opens, the system returns a graceful decline:
-
-```
-{ approved: false, network: "visa", responseCode: "CB", declineReason: "Network temporarily unavailable" }
-```
-
-This prevents cascading failures: without circuit breakers, requests to a failing network queue up, exhaust connection pools, and bring down the entire system. With circuit breakers, only the affected network's transactions fail fast while other networks continue normally.
-
-### Health Checks
-
-| Endpoint | Purpose | Checks |
-|----------|---------|--------|
-| `/health/live` | Liveness probe | Process is running |
-| `/health/ready` | Readiness probe | PostgreSQL + Redis connectivity |
-| `/health` or `/health/deep` | Detailed status | Component latency, circuit breaker state |
-
----
+Readiness/deep health query PostgreSQL and Redis, including Redis memory info, without an overall deadline. They do not check schema, fixtures, operation recovery, or credential availability. The HTTP server is not retained for graceful close; SIGINT has no custom handler.
 
 ## Scalability Considerations
 
-### What Breaks First
+The production proposal first separates enrollment, lifecycle, merchant attempts, and history workloads. It then measures database contention, provider concurrency, outbox lag, and history query costs before adding shards.
 
-1. **Transaction write volume**: Flash sales (e.g., iPhone launch day) spike payment volume 10-100x. Solution: horizontal scaling of stateless transaction service instances, sharding by `token_ref` hash.
+Partition large historical records by time and route writes by a stable ownership key. Keep uniqueness for operation identity enforceable within its partition or a dedicated registry. A user's cross-token history should be an authorized projection rather than repeated scatter-gather over payment shards.
 
-2. **ATC validation reads**: Every transaction reads the ATC watermark. Solution: Redis as primary read path with write-through to PostgreSQL for durability.
+Use bounded concurrency per provider and per workload as well as circuit breakers. A breaker alone does not prevent exhaustion before it trips. Apply deadlines that fit the checkout budget and respect provider retry/reconciliation contracts.
 
-3. **Token vault lookups**: Token validation on every payment. Solution: cache-aside with 5-minute TTL for active tokens.
+For regional failure, fence the prior operation writer before promoting another. Asynchronous replicas can serve history but must not independently authorize the same unresolved attempt. Availability during a partition is constrained by the correctness boundary and provider contract.
 
-### Sharding Strategy
-
-At production scale (500M daily transactions):
-- **Primary shard key**: `token_ref` hash (distributes across token usage patterns)
-- **Time-based partitioning**: Monthly partitions for `transactions` table
-- **Shard count**: 16 shards handles 500M daily transactions
-- Audit logs partitioned by month with 7-year retention
-
-### Horizontal Scaling Path
-
-- **API servers**: Stateless; scale behind load balancer
-- **PostgreSQL**: Shard by token_ref; read replicas for transaction history queries
-- **Redis**: Redis Cluster with 16+ shards
-- **Network integration**: Connection pooling to each TSP; independent scaling per network
-
----
+The local multi-instance scripts share PostgreSQL and Redis but introduce no load balancer, fenced workers, durable operation identity, or atomic counter handling. Running more processes exposes races; it does not demonstrate a safe distributed payment service.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Token storage | Secure Element | Software keychain | Hardware tamper resistance |
-| Token scope | Per-device | Shared across devices | Targeted revocation |
-| Auth method | Biometric + SE | PIN only | Security + UX |
-| Cryptogram | Dynamic (one-time) | Static credentials | Replay protection |
-| Token cache | Cache-aside, 5 min TTL | No cache | Latency vs freshness |
-| ATC storage | Write-through Redis+PG | Cache-aside | Durability critical for replay prevention |
-| Idempotency | Redis with 24h TTL | Database only | Performance for high-frequency payment retries |
-| Transaction consistency | Serializable | Read-committed | Financial accuracy required |
-
----
-
-## Frontend Architecture
-
-This section documents the React frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
-
-### Component Hierarchy
-
-```
-__root.tsx (RootComponent)
-└── Outlet ─── child route content
-    ├── index.tsx (Wallet) ─── card carousel, card management
-    │   ├── CreditCard ─── visual card rendering (network logo, last4, status)
-    │   └── AddCardForm ─── card provisioning form with test card buttons
-    ├── pay.tsx (PayPage) ─── payment flow
-    │   ├── CreditCard ─── selected card display
-    │   └── BiometricModal ─── Face ID / Touch ID simulation
-    ├── transactions.tsx ─── transaction history with filtering
-    │   └── TransactionItem ─── individual transaction row
-    ├── merchant.tsx ─── merchant terminal simulation
-    ├── login.tsx ─── email/password login
-    └── Layout ─── shared layout wrapper (header, navigation tabs)
-```
-
-The application uses a `Layout` component that provides a consistent header with the page title and a bottom tab bar for navigation between Wallet, Pay, Transactions, and Merchant views. This mimics the iOS tab bar navigation pattern used in the real Apple Wallet app.
-
-### Zustand Stores
-
-The stores are all defined in a single file (`frontend/src/stores/index.ts`) and organized by domain:
-
-**`authStore`** -- Manages user session and device registration. Uses `zustand/middleware/persist` to save the `sessionId` to localStorage for session recovery across page reloads. Unlike the cookie-based auth used by Apple Music and Apple TV, this project uses an explicit `X-Session-Id` header, which the API service attaches to every request. Actions include `login`, `register`, `logout`, `loadUser` (session recovery), `loadDevices`, and `registerDevice`. Device management is critical because each card is provisioned to a specific device.
-
-**`walletStore`** -- Manages the user's provisioned payment cards. Holds `cards` array and `selectedCard`. Actions include `loadCards`, `addCard` (provisions a new card to a device), `suspendCard`, `reactivateCard`, `removeCard`, `setDefaultCard`, and `selectCard`. Most mutation actions call the API and then call `loadCards()` to refresh the full card list from the server, ensuring consistency after operations that change card status.
-
-**`transactionStore`** -- Manages transaction history with pagination. Holds `transactions` array, `total` count, and loading state. The `loadTransactions` action accepts optional filter parameters (`limit`, `offset`, `card_id`, `status`) for paginated and filtered transaction queries.
-
-**`paymentStore`** -- Manages the biometric authentication and payment processing flow. Holds `biometricSession` (the current authentication session ID), `isAuthenticating`, and `isProcessing` flags. Actions include `initiateBiometric` (starts a biometric challenge), `simulateBiometric` (simulates successful biometric verification for demo purposes), `processPayment` (sends the payment to the backend), and `clearBiometricSession`. The biometric session ID is stored in `sessionStorage` (not localStorage) so it expires when the browser tab closes, matching the transient nature of a real biometric authentication.
-
-### Routing
-
-Uses TanStack Router with file-based routing. The route structure is flat (no nested dynamic routes) since the app is wallet-centric rather than content-centric. The root route (`__root.tsx`) attempts to load the user from the stored session on mount via `authStore.loadUser()`.
-
-### Data Fetching
-
-API calls go through `services/api.ts`, which exports a single `api` object with methods grouped by resource (Auth, Devices, Cards, Payments, Merchants). The `request` helper function automatically attaches two custom headers from browser storage:
-- `X-Session-Id` from localStorage -- identifies the authenticated user session
-- `X-Biometric-Session` from sessionStorage -- proves the user completed biometric authentication for the current tab session
-
-This header-based approach (as opposed to httpOnly cookies) is used because the real Apple Pay system uses device-specific authentication tokens rather than browser cookies.
-
-### Key UI Pattern: Payment Flow
-
-The payment flow is the core user interaction, simulating the Apple Pay in-app purchase experience. It orchestrates four stores and a modal dialog across multiple async steps.
-
-**Payment flow sequence:**
-1. **Card selection** -- The `PayPage` loads all active cards via `walletStore.loadCards()`. The default card is pre-selected. If the user has multiple cards, a dropdown allows switching.
-2. **Merchant selection** -- Available merchants are fetched from the backend on mount. The user selects who they are paying.
-3. **Amount entry** -- A large currency input with quick-select buttons ($5, $10, $25, $50, $100). Test amounts trigger specific scenarios ($666.66 = insufficient funds, $999.99 = declined, >$10,000 = limit exceeded).
-4. **Biometric authentication** -- Clicking "Pay with Apple Pay" initiates the biometric flow:
-   a. `paymentStore.initiateBiometric(deviceId, 'face_id')` creates a biometric session on the server
-   b. The `BiometricModal` opens, showing a Face ID scanning animation (SVG with CSS animation)
-   c. The user clicks "Simulate Success" (since real biometrics are not available in a browser)
-   d. `paymentStore.simulateBiometric(sessionId)` verifies the biometric session on the server
-   e. The session ID is stored in `sessionStorage` so subsequent API calls include it in the `X-Biometric-Session` header
-5. **Payment processing** -- After biometric success, `paymentStore.processPayment` sends the card ID, amount, currency, merchant ID, and transaction type to `/api/payments/pay`. The backend validates the biometric session, generates a cryptogram, checks the ATC, and processes the payment.
-6. **Result display** -- Success shows the auth code; failure shows the decline reason. Transaction history is refreshed to include the new transaction.
-
-**BiometricModal component:**
-The modal simulates three authentication types: Face ID (SVG face with scanning animation), Touch ID (fingerprint icon), and passcode (asterisks). It follows a two-phase interaction: first showing the authentication prompt with a "Simulate Success" button, then briefly showing a green checkmark before calling the `onSuccess` callback. The 1-second delay on success provides visual feedback that authentication was verified.
-
-**CreditCard component:**
-Renders a styled card display showing the network logo (Visa/Mastercard/Amex), last 4 digits, card type (credit/debit), holder name, and status. Suspended cards display a visual indicator. The component is used in both the Wallet page (card carousel) and the Pay page (selected card display).
-
-**AddCardForm component:**
-Provides a card provisioning form with PAN input (auto-formatted with spaces every 4 digits), expiry month/year dropdowns, CVV input, and holder name. Includes "test card" buttons that pre-fill valid test numbers for Visa (4111...), Mastercard (5555...), and Amex (3782...) to streamline demo usage.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers who may not have encountered these patterns before.
-
-### Role-Based Access Control (RBAC)
-
-**What it is:** RBAC is a method of restricting system access based on the roles assigned to individual users. Instead of granting permissions directly to each user, you assign users to roles, and roles carry predefined sets of permissions. When the system needs to decide whether a user can perform an action, it checks the user's role against the required permission.
-
-**How it works in this project:** Users have a `role` column (`'user'` or `'admin'`). Regular users can provision cards, make payments, and view their own transaction history. Admin access would enable user management, merchant onboarding, and system-wide transaction monitoring. The audit log records the role of the user performing each action for compliance tracing.
-
-**Why it matters at scale:** In a payment system, access control is not just a convenience feature -- it is a regulatory requirement. PCI-DSS mandates that access to cardholder data be restricted on a need-to-know basis. RBAC provides the auditable structure to prove that only authorized personnel can access sensitive operations (e.g., viewing transaction details, suspending cards across users, modifying merchant configurations).
-
-### Redis Cache-Aside
-
-**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache before querying the primary database. If the data is in the cache (a "hit"), the cached value is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL, and returns it.
-
-**How it works in this project:** The caching strategy is documented in the Caching Strategy section above. Token lookups are cached for 5 minutes with a critical exception: suspended tokens are never cached. The ATC watermark uses a different pattern -- write-through caching rather than cache-aside -- because both Redis (for fast reads) and PostgreSQL (for durability) must always reflect the current ATC value. Transaction history is cached for 30 seconds. The user's card list is cached for 2 minutes with invalidation on add/remove operations.
-
-**Why it matters at scale:** Every NFC payment requires a token lookup to validate the DPAN and check the card's status. At 500M daily transactions, that is ~5,800 lookups per second. Without caching, this would saturate the database's connection pool. Redis serves these lookups in sub-millisecond time. The "never cache suspended tokens" rule is critical for security: if a suspended token were served from cache, a stolen device could complete fraudulent transactions during the cache TTL window.
-
-### Circuit Breaker (Opossum)
-
-**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly trying to execute an operation that is likely to fail. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and subsequent calls fail immediately without attempting the operation. After a timeout period, the circuit enters "half-open" state where test requests are allowed through. If they succeed, normal operation resumes.
-
-The three states are:
-- **Closed** (normal): requests pass through. If the failure rate exceeds the threshold, the circuit opens.
-- **Open** (failing fast): all requests immediately return a fallback response without contacting the downstream service.
-- **Half-open** (testing): a limited number of requests are allowed through to test recovery.
-
-**How it works in this project (`backend/src/shared/circuit-breaker.ts`):** Each card network (Visa, Mastercard, Amex) has an independent circuit breaker with 10s timeout, 50% error threshold, and 30s reset. When a network's circuit opens, transactions for that network fail with a graceful decline (`responseCode: "CB"`, `declineReason: "Network temporarily unavailable"`). Transactions on other networks continue normally. Circuit state is exposed via the `/health` endpoint and as a Prometheus gauge metric.
-
-**Why it matters at scale:** Payment networks occasionally experience outages. Without circuit breakers, if the Visa network goes down, every Visa transaction hangs for 10 seconds (the timeout), consuming a connection and a thread. Under load, all connections are consumed waiting for the dead network, and Mastercard and Amex transactions also start failing -- not because those networks are down, but because the application has no resources left to process them. This is cascading failure. The per-network circuit breaker isolates the blast radius: only Visa transactions fail fast, while other networks continue operating normally.
-
-### Structured Logging (Pino)
-
-**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text strings. Each log entry contains a consistent set of fields that log aggregation systems can index and search.
-
-**How it works in this project (`backend/src/shared/logger.ts`):** Pino outputs JSON with `requestId` correlation, service context, and user identification. A critical addition for a payment system is automatic sensitive data redaction: the logger filters out PAN (card numbers), CVV, and token material from any log output. This prevents cardholder data from appearing in log files, which would be a PCI-DSS violation. Audit events (payment approved, card suspended, login attempt) are logged to a separate audit channel backed by the `audit_logs` database table.
-
-**Why it matters at scale:** Payment systems have strict compliance requirements. PCI-DSS requires that all access to cardholder data be logged, but also requires that cardholder data not be stored in log files. Structured logging with automatic redaction satisfies both requirements: the audit log records who accessed what and when, while the redaction middleware ensures that no PAN or CVV appears in application logs. During incident investigation, the `requestId` correlation traces a payment through the entire chain (biometric auth, token lookup, ATC check, network authorization) across log entries.
-
-### Prometheus Metrics
-
-**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals and stores them for querying and alerting.
-
-**How it works in this project (`backend/src/shared/metrics.ts`):** Key metrics include: `http_request_duration_seconds` (histogram for API latency), `payment_transactions_total` (counter by status, type, and network), `payment_duration_seconds` (histogram for end-to-end payment latency), `circuit_breaker_state` (gauge per network: 0=closed, 1=half-open, 2=open), `idempotency_cache_operations_total` (counter for cache hit/miss), and `card_provisioning_total` (counter by network and result). The SLO targets -- NFC payment p99 < 500ms, transaction approval rate > 95%, API availability 99.99% -- are only enforceable because these metrics exist.
-
-**Why it matters at scale:** A payment system that processes 500M daily transactions must detect problems in seconds, not minutes. If the Visa circuit breaker opens, the `circuit_breaker_state{network="visa"}` gauge changes from 0 to 2, and an alert fires within the next Prometheus scrape interval (15 seconds). If payment latency p99 exceeds 500ms, the team investigates before the SLO is breached. Without metrics, the first signal of a problem is merchants calling to report that their customers' payments are failing.
-
-### Rate Limiting
-
-**What it is:** Rate limiting restricts how many requests a client can make within a given time window. When exceeded, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header.
-
-**How it works in this project:** Rate limits protect the payment API from abuse. Critical endpoints like `/api/payments/pay` and `/api/cards` have strict per-user limits to prevent automated attacks. Login attempts are rate-limited per IP to prevent brute-force password attacks. Redis backs the rate limit store for consistency across server instances.
-
-**Why it matters at scale:** Payment systems are high-value targets for attackers. A brute-force attack testing stolen card numbers by attempting small transactions can be detected and blocked by rate limiting the payment endpoint. Without rate limiting, an attacker could test thousands of stolen card numbers per minute, each generating a real authorization attempt to the card network. Rate limiting caps the damage to a handful of attempts before the attacker is blocked.
-
-### Idempotency
-
-**What it is:** An idempotent operation produces the same result whether executed once or multiple times. For APIs, this means that retrying a request (due to network timeout, client retry, or double-click) does not cause duplicate side effects.
-
-**How it works in this project (`backend/src/shared/idempotency.ts`):** All mutation endpoints require an `Idempotency-Key` header. The middleware checks Redis for a cached response. Found + completed: return cached response. Found + in-progress: return 409 Conflict. Not found: acquire lock, execute, cache result for 24 hours. Protected endpoints include payment processing (prevents double-charging), card provisioning (prevents duplicate tokens), refunds (prevents double-refunds), and card state mutations (suspend, reactivate, remove).
-
-**Why it matters at scale:** In a payment system, idempotency is not a nice-to-have -- it is essential for financial correctness. Consider: a user taps their phone at a terminal, the NFC payment completes, but the response is lost due to a network glitch. The terminal retries the payment. Without idempotency, the user is charged twice. With idempotency, the retry returns the cached result from the first successful payment, and the user is charged once. The ATC (Application Transaction Counter) provides a second layer of replay protection at the protocol level: each cryptogram includes a monotonically increasing counter, so even without the idempotency middleware, the network rejects cryptograms with stale ATC values.
-
-### Health Checks
-
-**What it is:** Health checks are HTTP endpoints consumed by infrastructure systems (load balancers, Kubernetes) to determine whether an application instance can serve traffic.
-
-**How it works in this project (`backend/src/shared/health.ts`):** Three tiers: `GET /health/live` returns 200 if the process is running (liveness probe). `GET /health/ready` checks PostgreSQL and Redis connectivity, returning 503 if either is unreachable (readiness probe). `GET /health` (or `/health/deep`) performs a detailed check including component latency measurements (PostgreSQL query time, Redis ping time) and circuit breaker state for all payment networks. The deep check returns a structured response showing which components are healthy and which are degraded.
-
-**Why it matters at scale:** A payment system with 99.99% availability target (< 4.3 minutes downtime per month) cannot afford to route traffic to broken instances. Health checks enable automatic remediation: if a server loses its Redis connection (which stores idempotency keys and ATC watermarks), the readiness check fails, the load balancer stops sending traffic, and users are seamlessly redirected to healthy instances. The deep health check additionally detects degraded states -- for example, if the Visa circuit breaker is open, the system is technically "running" but unable to process Visa transactions. The monitoring system uses this information to page the on-call engineer before the SLO is breached.
-
----
+| Credential authority | Approved TSP/platform integration | Wallet-owned token generator | Provider policy and acceptance are essential |
+| Operation identity | Durable actor-scoped record | Redis-only response cache | Survives response loss and cache eviction |
+| External uncertainty | Pending state plus reconciliation | Declare decline after timeout | Avoids conflicting outcomes and duplicate attempts |
+| Revocation | Versioned acknowledged workflow | Local flag plus cache deletion | Separates requested and enforced state |
+| Refund correctness | Atomic remaining-value reservation | Check then separate inserts | Bounds concurrent partial refunds |
+| History | Eventual authorized projection | Global synchronous payment joins | Keeps reads off authorization resources |
+| Provider resilience | Per-provider budgets and deadlines | Shared unrestricted pool | Limits cascading failures |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation.
+### What runs locally
 
-### Local Architecture
+[backend/src/index.ts](./backend/src/index.ts) mounts four route groups on port 3000. PostgreSQL and Valkey use their Compose defaults; React/Vite runs on 5173 and proxies `/api`. Setup and seed commands are in the [README](./README.md).
 
+The backend package emits CommonJS under its current NodeNext/package settings; its TypeScript source uses import syntax with `.js` local specifiers. There is no separately deployed tokenization service or processor: service classes execute in the same Express process.
+
+### Provisioning and token lifecycle
+
+[services/tokenization.ts](./backend/src/services/tokenization.ts) checks Luhn, simplified network prefixes, expiry, and an owned active device. It checks duplicate active cards by last4 and counts active cards to choose a default, then inserts SQL and writes Redis separately. Concurrent requests can pass both checks; different cards with the same last4 can be rejected incorrectly.
+
+[utils/crypto.ts](./backend/src/utils/crypto.ts) generates a random token reference and a prefix plus random **hexadecimal** DPAN suffix. The latter can contain letters and is not an EMV-valid card-number generator. No issuer verifies the CVV, eligibility, or ownership.
+
+Provisioning stores `token:{tokenRef}` and `se:{deviceId}:{tokenRef}` for one year. The latter contains DPAN and counter zero. These are server-readable JSON values, not protected hardware secrets.
+
+Suspending a card updates SQL and an existing token cache entry, dropping that key's TTL. Reactivation changes SQL only. Removing a card deletes its Redis entries; removing a default then executes `UPDATE ... ORDER BY ... LIMIT`, which PostgreSQL does not support in that form. Prior writes have already committed. [PostgreSQL UPDATE syntax](https://www.postgresql.org/docs/16/sql-update.html).
+
+Device removal/loss updates cards and device status in separate SQL statements without clearing Redis token/SE state or account sessions. A removed card can be suspended again because suspension excludes only already-suspended cards; it can then be reactivated. Default selection clears all user defaults and sets one in separate statements, with no uniqueness constraint.
+
+### Payment, counters, and refunds
+
+[services/payment.ts](./backend/src/services/payment.ts) reads card ownership/status and an active merchant, computes a truncated unkeyed SHA-256 digest, executes its private amount/expiry/random simulator, and inserts an approved/declined transaction. It then updates Redis state and a recent-transaction list before returning.
+
+The digest includes token reference, amount, merchant identifier, and timestamp, but no secret, currency, or ATC. `validateCryptogram` is unused and has no buffer-length guard before `timingSafeEqual`. The payment simulator ignores its cryptogram argument.
+
+Counter updates read/modify/write the Redis JSON, can lose concurrent increments, remove its TTL, and return zero if the key is absent. Counters are neither included in the cryptogram nor validated against a watermark. Seeded SQL counters do not initialize Redis and do not provide replay protection.
+
+Refunds read an approved transaction, insert a negative approved row with type `'refund'`, and mark the original fully refunded in separate statements. There is no refund parent link, remaining-balance reservation, or provider call. Partial refunds still close the original; concurrent different keys can over-refund. Even an approved refund row can be passed back as an original because the query does not restrict payment type.
+
+[Merchant routes](./backend/src/routes/merchants.ts) implement a separate simulator: `/process` accepts any cryptogram/token string and approves amounts below 10000 without a transaction insert. Its checkout-session object is not persisted, checked for expiry, or tied to payment submission.
+
+### Wired infrastructure and its boundaries
+
+The Redis lease illustrates concurrent exclusion:
+
+```typescript
+// Pattern in shared/idempotency.ts; not a durable payment guarantee.
+await redis.set(cacheKey, JSON.stringify(inProgress), 'EX', 60, 'NX');
 ```
-┌─────────────────┐         ┌─────────────────┐
-│   React + Vite  │────────▶│  Express API    │
-│   :5173         │  HTTP   │  :3000          │
-│                 │◀────────│                 │
-│ - Wallet (cards)│         │ - Auth + Devices│
-│ - Pay Screen    │         │ - Card CRUD     │
-│ - Transactions  │         │ - Payment Proc  │
-│ - Merchant View │         │ - Merchants     │
-│ - Login         │         │ - Biometric sim │
-└─────────────────┘         └────────┬─────────┘
-                                     │
-              ┌──────────────────────┴──────────────────────┐
-              ▼                                             ▼
-     ┌─────────────────┐                           ┌─────────────────┐
-     │   PostgreSQL    │                           │  Valkey/Redis   │
-     │   :5432         │                           │  :6379          │
-     │                 │                           │                 │
-     │ - All tables    │                           │ - Sessions      │
-     │ - Audit logs    │                           │ - Idempotency   │
-     │ - Token ATC     │                           │ - ATC cache     │
-     └─────────────────┘                           └─────────────────┘
-```
 
-### Production Patterns Actually Implemented
+Its limitations are traced in [Consistency and Idempotency](#consistency-and-idempotency). [Logging](./backend/src/shared/logger.ts), [metrics](./backend/src/shared/metrics.ts), [audit](./backend/src/shared/audit.ts), and [health](./backend/src/shared/health.ts) are mounted/used to varying extents. [Circuit-breaker helpers](./backend/src/shared/circuit-breaker.ts) are initialized but not wired into the authorization path. No rate limiter, message queue, or background reconciler exists.
 
-**1. Prometheus Metrics** (`backend/src/shared/metrics.ts`)
+Card lists and history query PostgreSQL directly. Redis's seven-day recent-transaction list and token lookup entries are not read by these endpoints. There is no two-minute card cache, 30-second history cache, or SQL-backed ATC write-through behavior.
 
-Full `/metrics` endpoint with HTTP request duration histogram, payment transaction counters (by status, type, network), payment duration histogram, circuit breaker state gauge, idempotency cache counters, and card provisioning counters. Includes Node.js default metrics.
+### Frontend behavior
 
-**2. Structured Logging with Pino** (`backend/src/shared/logger.ts`)
+[stores/index.ts](./frontend/src/stores/index.ts) defines auth, wallet, transaction, and payment stores. Only the session ID is persisted; cards/history are memory-only. [services/api.ts](./frontend/src/services/api.ts) reads session IDs from browser storage, sends two custom auth headers, and throws away structured error details such as declined transaction IDs. It never sends `Idempotency-Key` and has no abort/deadline or operation-recovery contract.
 
-JSON-formatted request logging with `requestId` correlation. Sensitive data redaction prevents PAN/CVV/token material from appearing in logs. Child loggers with service context.
+The root restores authentication; `Layout` waits for `authChecked` before redirecting. Page effects still start independently. Logout clears auth/browser session fields but does not reset wallet, history, or payment stores, so stale account data can remain during a subsequent account's load. Requests have no account-generation guard.
 
-**3. Idempotency Middleware** (`backend/src/shared/idempotency.ts`)
+Wallet cards form a vertical list with CSS hover transforms, not a gesture carousel. Add Card is a single form; PAN/CVV live transiently in component state. There is no issuer-verification step, camera scan, offline cache, service worker, Framer Motion, or TanStack Virtual.
 
-`Idempotency-Key` header support with Redis-backed response caching. 24-hour TTL. Concurrent duplicate detection via Redis NX lock. Protects payment, provisioning, and refund endpoints.
+[pay.tsx](./frontend/src/routes/pay.tsx) uses several booleans and mutable form fields. It does not freeze the reviewed intent, disable the Pay button during biometric initiation, or preserve a recoverable operation ID. The [biometric modal](./frontend/src/components/BiometricModal.tsx) displays “Authenticated” for one second **before** calling the server verification callback. Its timeout lacks cleanup, and it has no focus trap, dialog semantics, reduced-motion handling, or status announcements. There is no actual biometric API call.
 
-**4. Circuit Breaker (Opossum)** (`backend/src/shared/circuit-breaker.ts`)
+The final payment banner waits for the HTTP result, but an error becomes a generic failure message even if a transaction was already inserted. Biometric session storage is not cleared after payment; the server also allows repeated use until SQL expiry.
 
-Per-network circuit breakers (Visa, Mastercard, Amex) using the `opossum` library. Configured with 10s timeout, 50% error threshold, 30s reset. Graceful decline fallback when circuit is open. State exposed via health checks and Prometheus metrics.
+History groups by display dates and Load More requests the first N+50 records again. Different years can share a month/day group. There is no filter/search UI or pagination cursor. Merchant selection requests can resolve out of order; session-creation errors are console-only. The merchant page displays ten records from the default 50-row response and does not initiate a customer payment or refund.
 
-**5. Audit Logging** (`backend/src/shared/audit.ts`)
+### Fixtures, substitutions, and omissions
 
-Database-backed audit trail for all financial and security operations. Logs authentication events, card operations (provision, suspend, reactivate, remove), payment transactions, refunds, device operations, and biometric authentication. Metadata is redacted before storage.
+The SQL seed creates four users, seven devices/cards/merchants, ten transactions, six ATC rows, and six audit examples. Shared password `password123` was verified against the seed hash. It supplies no Redis token/SE data. Several card expiries and the login form's demo credentials are stale; Alice has two default markers. The seed can append audit rows on rerun and conflict with independently created identities.
 
-**6. Enhanced Health Checks** (`backend/src/shared/health.ts`)
+Software JSON/hash simulation substitutes for TSP, hardware credentials, and cryptograms. A React button substitutes for device authentication. HTTP type labels substitute for NFC/app/web transports. These substitutions demonstrate shapes of interactions while omitting their security guarantees.
 
-Three-tier health checks: `/health/live` (liveness), `/health/ready` (DB + Redis connectivity), `/health/deep` (detailed component status with latency and circuit breaker state).
-
-**7. Simulated Tokenization** (`backend/src/services/tokenization.ts`)
-
-Simulates the Token Service Provider interaction: generates fake DPANs, token references, and cryptographic material. In production, this would call Visa/Mastercard/Amex TSP APIs.
-
-**8. Simulated Biometric Auth** (`backend/src/services/biometric.ts`)
-
-Challenge-response flow simulating Face ID / Touch ID verification. Creates a biometric session with 5-minute TTL.
-
-**9. Input Validation (Zod)** (`backend/src/routes/*.ts`)
-
-Request body validation using Zod schemas for card provisioning, payment processing, and merchant operations.
-
-### What Was Simplified or Substituted
-
-| Production Component | Local Substitute | Rationale |
-|----------------------|------------------|-----------|
-| Visa/Mastercard/Amex TSP | Simulated token generation | No real network access |
-| Hardware Secure Element | Software simulation | No physical SE available |
-| NFC radio communication | HTTP POST simulating tap | No NFC hardware |
-| Face ID / Touch ID | Challenge-response simulation | No biometric hardware |
-| HSM (Hardware Security Module) | Node.js crypto | No HSM available locally |
-| CDN for card art | No CDN | Direct PostgreSQL URLs |
-| Multi-region deployment | Single PostgreSQL | One machine |
-| Message queue | Synchronous processing | No Kafka needed locally |
-
-### What Was Omitted
-
-- **Real card network integration** -- no actual TSP calls to Visa/Mastercard/Amex
-- **Hardware Secure Element** -- token storage and cryptogram generation simulated in software
-- **NFC communication** -- payments submitted via HTTP API, not NFC radio
-- **Real biometric authentication** -- Face ID/Touch ID simulated with challenge-response
-- **FairPlay / hardware attestation** -- no device integrity verification
-- **Receipt/notification delivery** -- no push notifications after payment
-- **Card art rendering** -- no real card issuer artwork
-- **PCI-DSS compliant infrastructure** -- no network segmentation, encryption at rest, or HSM
-- **Kubernetes / auto-scaling** -- runs as single-process Express server
-- **Multi-network routing intelligence** -- all networks treated identically in simulation
+Omitted production components include real network/issuer integration, secure provisioning, merchant authentication, atomic financial state, durable idempotency, reconciliation, capture/settlement, provider callbacks, outboxes, notifications, rate limiting, multi-region recovery, and an administrative interface.

@@ -1,353 +1,379 @@
-# DocuSign (E-Signature Platform) — System Design Answer (Frontend Focus)
+# Design an electronic signature platform — frontend interview
 
-*45-minute system design interview format — Frontend Engineer Position*
+A 45-minute discussion of a proposed design. This is not a claim that the local demo already
+provides these guarantees. I would draw one architecture and expand the three hardest
+decisions as the interviewer asks questions.
 
----
+## 🎯 Scope and promises — 4 minutes
 
-## 📋 Opening Statement
+> “I would organize this around a promise to the signer: the document you review, the fields you complete, and the action the server records must refer to the same document revision.”
 
-"An e-signature client is unusual among frontend problems because **the UI is part of the legal record.** When someone clicks Sign, what they saw on screen at that moment is evidence. That inverts several defaults I'd normally reach for: I can't render optimistically, I can't let a retry produce a second signature, and I can't show a document that might not be the document that was signed.
+There are two main journeys. The sender prepares an envelope with PDFs, recipients, and
+fields. The signer arrives through an invitation, reviews the documents, fills their
+assigned fields, and confirms or declines. An administrator needs a separate investigation
+interface.
 
-There are also two completely different applications sharing a codebase — a sender's authoring tool and a recipient's signing experience — with opposite constraints. The sender is a logged-in power user placing fields on a PDF. The signer is a stranger following an emailed link on an unknown device, who may never use the product again.
+I would clarify whether we support collaborative preparation, which PDF formats and page
+counts we accept, and whether completion includes a downloadable artifact. I will assume one
+active draft editor, ordinary PDFs, and a final artifact produced asynchronously after all
+required signers finish.
 
-I'll go deep on three things: rendering a PDF with interactive fields positioned correctly at any zoom, making the signing action exactly-once from the client's side, and designing for a signer who has no account and no second chance."
+The sender can recover through their account. A signer may have only the invitation, so
+recovery must work without sending them to an unrelated account login. That affects
+navigation, authentication errors, and how we preserve input during a failed request.
 
----
+| Requirement | Proposed scope |
+|-------------|----------------|
+| Preparation | Upload, place/resize fields, assign recipients, preview routing stages |
+| Signing | Review the frozen revision, draw/type a signature, fill text/date/checkbox fields |
+| Workflow | Show waiting, active, completed, declined, withdrawn, and expired states |
+| Confirmation | Distinguish recorded actions from final artifact availability |
+| Usability | Keyboard completion, usable narrow layout, clear required-field navigation |
+| Performance | First page within two seconds for a defined ordinary PDF/device/network scenario |
 
-## 🎯 Requirements
+I would exclude offline submission and simultaneous editing initially. We can retain a
+drawing while a request fails, but we cannot record a server-authorized action while
+disconnected. Local input and recorded evidence are different things.
 
-### Functional
+I would also ask for the intended identity and consent requirements. The UI must collect the
+product's specified confirmation and display it accurately. I would not infer legal
+compliance from a signature image, timestamp, or audit badge.
 
-1. **Authoring** — upload a PDF, place typed/signature/date fields by dragging onto pages, assign each to a recipient
-2. **Sending** — define recipients and routing order, then dispatch
-3. **Signing** — open a magic link, read the document, complete required fields, draw or type a signature, submit
-4. **Tracking** — see envelope status and a tamper-evident audit trail
-5. **Terminal states** — decline, void, completion, each with its own screen
+## 🏗️ Client architecture — 5 minutes
 
-### Non-functional
-
-| Requirement | Target | Why |
-|-------------|--------|-----|
-| Field position accuracy | Exact at every zoom, every viewport | A signature rendered in the wrong place is a legal defect, not a visual one |
-| Double-submit safety | Guaranteed exactly-once | Two signatures on one field is legally ambiguous |
-| Signer completion on mobile | Fully usable | Most signers open from email on a phone; they don't get a second chance |
-| Time to first page | < 2s | A blank viewer reads as "broken link" and signers abandon |
-| Accessibility of signing | Keyboard-completable | An unsignable document is a legal-access problem |
-
-### Non-goals
-
-No collaborative real-time authoring, no in-browser PDF editing, no offline signing. Offline in particular is a deliberate exclusion — a signature captured without a server round trip has no trustworthy timestamp.
-
----
-
-## 🏗️ Two Applications, One Codebase
+I would draw the sender and signer experiences separately because their interactions differ,
+while sharing a tested document geometry and field-rendering layer.
 
 ```
-   SENDER (authenticated, repeat user)     SIGNER (magic link, one-time)
-   ┌──────────────────────────────┐        ┌──────────────────────────────┐
-   │  Envelope list               │        │  /sign/:accessToken          │
-   │  Authoring                   │        │                              │
-   │   ├─ documents               │        │   ├─ read-only PDF           │
-   │   ├─ recipients + order      │        │   ├─ only *my* fields        │
-   │   ├─ field placement (drag)  │        │   ├─ signature capture       │
-   │   └─ audit trail             │        │   └─ submit / decline        │
-   └───────────────┬──────────────┘        └───────────────┬──────────────┘
-                   │  session cookie                       │  token in URL
-                   └───────────────┬───────────────────────┘
-                                   ▼
-                        ┌────────────────────┐
-                        │   API (Express)    │
-                        └─────────┬──────────┘
-                     ┌────────────┼────────────┐
-                 Postgres      MinIO        Redis
-              (state machine) (PDFs)     (sessions)
+┌──────────────────┐     ┌───────────────────┐
+│ Sender workspace │     │ Signer ceremony   │
+│ Draft and stages │     │ Review and action │
+└──────────────────┘     └───────────────────┘
+          │                        │
+          ▼                        ▼
+┌───────────────────────────────────────────┐
+│ Shared viewer and geometry contract       │
+│ PDF page, accessible fields, input panels │
+└───────────────────────────────────────────┘
+                       │
+                       ▼
+             ┌────────────────────┐
+             │ Typed API boundary │
+             │ Auth, revisions,   │
+             │ operation receipts │
+             └────────────────────┘
+                       │
+                       ▼
+             ┌────────────────────┐
+             │ Server authority   │
+             │ State and objects  │
+             └────────────────────┘
 ```
 
-**The split is the first architectural decision.** These could share a document viewer, and mostly do — but their requirements diverge sharply enough that treating them as one app produces a bad version of both.
-
-| | Sender | Signer |
-|---|--------|--------|
-| Auth | Session, persistent | URL token, single envelope |
-| Bundle tolerance | High — a tool they use daily | Low — first paint on cellular decides completion |
-| Field interaction | Create, move, delete | Fill only their own |
-| Failure cost | Retry later | May never return |
-
-The signer route should therefore be **independently code-split and never import authoring code.** A signer downloading the drag-and-drop field editor to read a two-page contract is paying for capability they're forbidden to use.
-
----
-
-## 🧭 Questions I'd Ask First
-
-Three answers would reshape this design:
-
-**"Can two senders edit one envelope at once?"** If yes, field placement becomes a collaborative-editing problem — presence, conflict resolution, and probably CRDTs — and it dominates everything else. I'm assuming single-editor drafts, which is what the state machine implies.
-
-**"Which PDFs must we support?"** Scanned images, forms with existing AcroFields, and 300-page documents are three different rendering problems. A PDF that already contains form fields raises a real question: do we use them or overlay our own? Overlaying is more consistent; reusing them is what signers expect.
-
-**"What's the legal bar — evidence, or a self-contained signed artifact?"** This decides whether overlays are acceptable or flattening is mandatory, and it's the difference between a rendering choice and a compliance requirement. I'll design for evidence-plus-audit-trail and flag flattening as the gap.
-
----
-
-## 🔍 Deep Dive 1: Positioning Fields on a PDF That Can Be Any Size (11 minutes)
-
-This is the hardest rendering problem in the product, and getting it wrong is a legal defect.
-
-### The coordinate problem
-
-A field is stored against the document — page 2, x 0.31, y 0.62. The browser renders that page as a canvas whose pixel dimensions depend on zoom, viewport width, and device pixel ratio. Between "where the field is" and "where to draw it" sits a coordinate transform that must be exactly invertible, because the same transform runs backwards when the sender *places* a field by dragging.
-
-**If placement and rendering disagree by even a few pixels, a signature drifts out of its box** — and it drifts differently on the signer's phone than on the sender's laptop.
-
-### Options
-
-| Coordinate system | Zoom behavior | Risk |
-|-------------------|---------------|------|
-| ❌ Absolute pixels at authoring zoom | Breaks at every other zoom level | Silent misalignment; the classic bug |
-| ❌ CSS pixels of the rendered canvas | Breaks on different viewport widths | Sender and signer see different placements |
-| ✅ **Normalized 0–1 fractions of page dimensions** | Scales exactly | Requires care with PDF's bottom-left origin |
-| ✅ PDF points (72/inch) with explicit scale factor | Matches the PDF spec | Must track the render scale everywhere |
-
-### What I'd build
-
-**Store normalized fractions relative to page width and height.** Rendering multiplies by the current rendered page size; placement divides by it. One transform, one inverse, defined in one module that both the authoring overlay and the signing overlay import. The rule I'd enforce is that **no component computes a coordinate itself** — every position goes through that module, because the moment two places implement the transform, they drift.
-
-Two details that bite:
-
-- **PDF's origin is bottom-left; the DOM's is top-left.** The Y flip has to live inside the transform, not be remembered by each caller. This is the single most common source of "the signature is mirrored vertically" bugs.
-- **Fields are overlaid, not embedded.** The PDF renders to a canvas and absolutely-positioned DOM elements sit on top. That's what makes fields focusable, keyboard-accessible, and styleable — a canvas-drawn field would be invisible to assistive technology and impossible to tab into.
-
-### What we give up
-
-Because signatures are overlays rather than flattened into the PDF, **the downloaded file is not self-contained proof.** The evidence lives in the stored signature objects plus the audit chain. That's a defensible position — the audit trail is the legal artifact — but it means the client must never imply that "download PDF" produces a signed document. The copy has to be honest about what the file is.
-
-> "I'd put the coordinate transform behind a single tested module before writing any drag interaction. It's twenty lines that everything depends on, and it's the one place where a rounding error becomes a legal problem rather than a visual one."
-
----
-
-## 🔍 Deep Dive 2: Making "Sign" Exactly-Once From the Client (10 minutes)
-
-The server enforces idempotency with keys and row locks. The client's job is to make sure it participates correctly, and there's a subtle failure that pure server-side protection doesn't cover.
-
-### The failure the server can't see
-
-A signer taps Sign on a slow connection. Nothing visibly happens. They tap again. Without a client-supplied key, those are two independent requests carrying identical content, and the server has no basis to recognize the second as a retry — idempotency requires a *client-generated* identifier, because only the client knows the two attempts are the same intent.
-
-### The rule: mint the key when the intent forms, not when it's sent
-
-| When the key is generated | Behavior on double-tap |
-|---------------------------|------------------------|
-| ❌ At request time | Two keys, two signatures — idempotency defeated |
-| ✅ **When the signing session opens** | One key, second request returns the first result |
-| ✅ Per completed signature, before submit | Same, and survives a page reload if persisted |
-
-This is the same reasoning I'd apply to any payment form, and it's worth stating plainly: **the idempotency key identifies the user's intent, so it must be created when the intent is formed.**
-
-### Client-side layers on top
-
-The key is the correctness mechanism; these prevent the situation from arising:
-
-- **Disable and label the button on submit** — "Signing…", not a spinner alone, because a spinner beside an enabled-looking button invites a second tap.
-- **Treat a 409 as success, not error.** If the server reports the signature already exists, the correct UI is the completion screen. Showing an error for an action that succeeded is how signers end up signing twice through a different path.
-- **Never optimistically render the completed state.** Everywhere else I'd argue for optimism; here the signature isn't real until the server has it, and showing "Signed" before that is a lie with legal weight.
-
-### What this costs
-
-A guaranteed round trip before the signer sees confirmation — on a bad connection, several seconds of a disabled button. I'd accept that and invest in making the wait legible rather than shortening it: progress text, an explicit timeout with a retry that reuses the same key, and never a silent failure.
-
-> "The distinction I keep coming back to is that a signature isn't a UI state, it's an event that either happened or didn't. Optimistic UI is a bet that the server will agree with you, and that's not a bet to take on a legal record."
-
----
-
-## 🔍 Deep Dive 3: Designing for a Signer With No Account and One Attempt (9 minutes)
-
-The signing route is the highest-stakes screen in the product and the one with the least context about its user.
-
-### What's different
-
-The signer arrives from an email, on an unknown device, authenticated only by a token in the URL. They have no account, no prior session, no support relationship, and often no reason to try twice. **Every friction point converts directly into an unsigned contract.**
-
-That produces constraints the sender's app doesn't have:
-
-**The URL is the credential.** A token in the address bar leaks through screenshots, shared links, and browser history. The client should treat it accordingly: exchange it for a session immediately and remove it from the visible URL via history replacement, so the page can be reloaded without the raw token sitting in the address bar. It also means "share this page" is never a supported action.
-
-**Mobile is the primary case, not the responsive afterthought.** Signing on a phone means a pinch-zoomable PDF, a signature pad sized for a finger, and fields the user can jump between without hunting. The "next required field" affordance isn't a nicety — on a small screen, a required field on page 7 is otherwise undiscoverable, and the signer submits, gets rejected, and doesn't know why.
-
-**Errors must be recoverable in place.** A signer who hits an error has no account to log back into. Losing their drawn signature and typed entries to a failed submit means starting over — the moment most abandonment happens. Captured input should survive an error and a reload, held locally against the signing session, right up until the server confirms.
-
-### Terminal states are screens, not toasts
-
-Completion, decline, and "this envelope was voided" are separate routes. A signer who lands on an expired link needs an explanation and a path forward — usually "contact the sender" — and a toast on a broken document viewer doesn't provide that. These states are also where signers arrive *later*, re-clicking the emailed link days after signing, so they have to be meaningful out of context.
-
----
-
-## 🗄️ State: Three Lifetimes, Three Homes
-
-The authoring app and the signing app hold different state, and the useful frame is how long each piece must survive.
-
-| State | Lifetime | Home | Why |
-|-------|----------|------|-----|
-| Envelope + fields (server truth) | Until changed on the server | Fetched, never locally mutated as truth | Two clients editing one envelope must not diverge |
-| In-progress field placement | The authoring session | Local store, flushed on save | Dragging shouldn't produce a request per pixel |
-| Signer's entries and drawn signature | Until the server confirms | Local, keyed to the signing session | Survives an error or reload; the abandonment fix from Deep Dive 3 |
-| Zoom, current page, selected field | This tab | Component/URL | Pure view state; sharing a link to page 4 is useful |
-| Session / access token | Session | Cookie, not JavaScript-readable | It's a credential |
-
-The row worth defending is the second. **Field placement is buffered locally and saved explicitly, rather than persisted on every drag.** A save-per-drag would produce hundreds of writes for one layout pass, and each is a state transition on a legally-tracked object — polluting the audit trail with noise that obscures the events that matter. Explicit save also gives the sender an undo boundary that matches their mental model.
-
-The cost is a lost-work window if the tab closes mid-layout. I'd mitigate with a local draft rather than by writing through to the server, because the audit-trail argument doesn't go away.
-
-> "I want the audit trail to record decisions, not mouse movements. That pushes me toward explicit saves even though continuous autosave would be friendlier."
-
----
-
-## 🔀 Making Routing Order Comprehensible
-
-Recipients sign in a defined order, which can be serial or parallel. This is where senders make their most consequential mistakes, and it's a pure UI problem — the backend model is simple, the mental model isn't.
-
-The failure is specific: a sender adds three recipients, assumes they'll all be notified now, and only discovers days later that recipient two was never emailed because recipient one hasn't signed. Nothing was broken; the UI just let them assume the wrong thing.
-
-| Presentation | What it communicates | Problem |
-|--------------|---------------------|---------|
-| ❌ A flat list with an order column | Nothing about *waiting* | Reads as "these people will be notified" |
-| ❌ Drag-to-reorder list | Sequence, but not concurrency | Can't express "these two in parallel, then this one" |
-| ✅ **Grouped stages, each stage parallel within it** | Both sequence and concurrency, visually | More complex to build; needs a clear empty/single-stage case |
-
-**Stages are the right primitive** because they match the underlying model exactly — a routing order value is a stage number, and recipients sharing one sign concurrently. Rendering them as vertical groups makes "who is waiting on whom" a spatial fact rather than something inferred from a number in a column.
-
-Two supporting details matter as much as the layout. The UI should **preview who gets notified immediately** — "Sending now: Alice. Bob and Carol will be notified after Alice signs" — in plain language before dispatch, because that sentence is what corrects the wrong assumption. And **status should render onto the same stage layout** after sending, so the tracking view and the authoring view are the same picture. A sender who arranges recipients in one shape and then tracks them in a different one has to rebuild the model twice.
-
----
-
-## 📜 Showing a Hash Chain Without Requiring Cryptography Knowledge
-
-The audit trail is a hash-chained event log, and the temptation is to display it as one — hashes, previous-hashes, a verification badge.
-
-That's the wrong default, because **the audience is a person in a dispute, not a cryptographer.** What they need is a readable narrative: who did what, when, from where. The chain is the *mechanism* that makes the narrative trustworthy, not the content.
-
-So the primary view is a timeline in plain language, and verification is a single honest statement — "integrity verified, 47 events" — with the hashes available behind a disclosure for anyone who wants them.
-
-The part worth getting right is failure. If verification fails, the UI must not degrade into a red badge on an otherwise-normal timeline. **A broken chain means the record cannot be trusted**, and the interface should say that prominently and identify the first event where the chain breaks, because that's the forensically useful fact. Treating tamper-evidence as a minor status indicator wastes the entire mechanism.
-
----
-
-## 🔒 Rendering Someone Else's PDF Safely
-
-The client renders arbitrary user-uploaded PDFs, and PDFs are an executable format.
-
-**Rendering with `react-pdf`/PDF.js rather than an `<iframe>` or the browser's plugin viewer is a security decision as much as a functional one.** PDF.js parses and paints to a canvas in JavaScript, so embedded JavaScript actions, auto-launching links and embedded files never execute. Handing the same file to a native viewer inside an iframe gives up that control.
-
-Two further precautions worth naming: PDF.js should run with its worker so parsing a large or malicious file can't lock the main thread, and documents should be fetched from storage with a short-lived signed URL rather than a permanent public one — otherwise a leaked document URL outlives the envelope's access controls entirely.
-
----
-
-## ♿ An Unsignable Document Is an Access Problem
-
-Accessibility here has legal weight beyond the usual: if a signer cannot complete the document with assistive technology, they cannot enter the agreement.
-
-- **Fields are DOM elements, not canvas drawings** — the overlay approach in Deep Dive 1 is what makes them focusable and labeled at all. This is the concrete payoff of that choice.
-- **Tab order follows reading order**, not the order fields were placed by the sender. Someone dragging fields around a page must not be able to produce an incoherent keyboard path.
-- **Drawing a signature can't be the only option.** A signature pad requires a pointer and fine motor control. Typed signatures with a rendered font are a genuine alternative, not a lesser fallback, and must carry the same legal weight in the UI's presentation.
-- **Required-field errors are announced**, not just outlined in red — and they name the field and page, because "3 required fields remaining" is unactionable on a long document.
-
----
-
-## 🧪 Testing What Has Legal Consequences
-
-The valuable tests here aren't render assertions — they're the ones that would catch a defect a court could care about.
-
-| Scenario | How | What it protects |
-|----------|-----|------------------|
-| Coordinate round-trip | Place a field, re-read it, at several zoom levels and viewport widths | The Deep Dive 1 drift bug — a pure function, so this is cheap and exhaustive |
-| Y-axis origin | Assert a field placed at the visual top of a page stores a *high* normalized Y | Catches the flip that mirrors signatures vertically |
-| Double submit | Fire the submit action twice concurrently | One signature recorded; second returns the first result |
-| 409 on retry | Server reports already-signed | Completion screen, not an error |
-| Signer input survives failure | Fail the submit, reload | Entries and drawn signature still present |
-| Required-field guard | Submit with a required field on an unrendered page | Blocked *and* the user is navigated to it |
-| Expired / voided token | Load a dead link | Explanatory terminal screen, not a broken viewer |
-
-The first two are the highest-value tests in the codebase and cost almost nothing, because the transform is a pure function of page dimensions. **That's an argument for the shared-module design on its own** — a coordinate transform buried in a drag handler can only be tested through the UI, which means in practice it isn't tested at all.
-
-I'd also snapshot-test the field overlay against a fixed page size, so an unintended change to positioning shows up as a diff rather than as a signature slightly outside its box six months later.
-
----
-
-## 🧯 Failure States That Have to Be Right
-
-Ordinary apps can treat network errors generically. Here several of them carry meaning the user must understand.
-
-| Failure | Wrong response | Right response |
-|---------|---------------|----------------|
-| Document fetch fails | Blank viewer | Explicit "couldn't load the document" with retry — never let a signer sign something they can't see |
-| Envelope voided while signing | Generic error on submit | Terminal screen explaining the sender withdrew it |
-| Token expired mid-session | Redirect to login (there is no login) | Explanation plus "request a new link" |
-| Field save fails | Silent | Inline, non-destructive — the value stays in the input |
-| Signature upload fails | Discard the drawing | Keep the drawn signature; retry the upload |
-
-The first row is the one with legal weight. **A signing UI must never allow submission when the document didn't render.** It's an easy bug to write — the fields load from a separate request and are perfectly functional while the PDF canvas is empty — and it produces exactly the scenario e-signature law exists to prevent. The submit control should be gated on the document having rendered, not merely on required fields being complete.
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Rejected | Rationale |
-|----------|--------|----------|-----------|
-| Field coordinates | ✅ Normalized 0–1 fractions | ❌ Absolute pixels | Only representation stable across zoom, viewport and device |
-| Transform location | ✅ One shared module | ❌ Per-component math | Two implementations drift; drift is a legal defect |
-| Field rendering | ✅ DOM overlay on canvas | ❌ Drawn into canvas | Focusable, labelable, keyboard-navigable |
-| Idempotency key | ✅ Minted at session start | ❌ Generated per request | Key must identify intent, not transmission |
-| Signature feedback | ✅ Wait for server | ❌ Optimistic "Signed" | A signature is an event, not a UI state |
-| 409 handling | ✅ Render success | ❌ Render error | The action did succeed; an error invites a second attempt |
-| App split | ✅ Separate signer bundle | ❌ One shared app | Signer pays for authoring code they're forbidden to use |
-| PDF rendering | ✅ PDF.js to canvas | ❌ iframe / native viewer | Embedded JavaScript and actions never execute |
-| Token in URL | ✅ Exchange, then strip | ❌ Leave in address bar | Screenshots and history leak the credential |
-| Draft input | ✅ Persist until confirmed | ❌ Discard on error | A signer who loses their work abandons |
-
----
-
-## 🚀 What Breaks First
-
-**Large documents, before anything else.** A 200-page PDF rendered eagerly blocks the main thread and exhausts memory on a phone. The fix is rendering only visible pages with a small buffer — and it interacts with Deep Dive 1, because a field on an unrendered page still needs a known position for "jump to next required field" to work. That's the argument for keeping field geometry in normalized data rather than deriving it from rendered DOM.
-
-**Then field density.** A page with 60 fields is 60 absolutely-positioned elements re-laid-out on every zoom. Batching the transform and avoiding per-field layout reads matters well before page count does.
-
-**Then the audit trail**, which grows unbounded per envelope and is currently rendered as a list. Pagination, and eventually virtualization.
-
-**Not a concern:** the envelope list, and the state machine's complexity. Those are ordinary CRUD problems with well-understood solutions — worth saying explicitly, because they look like the hard parts and aren't.
-
----
-
-## 📶 Performance Where It Decides Completion
-
-Worth separating the two apps, because their performance problems are different in kind.
-
-**The sender's app has a throughput problem.** Dragging a field must stay at 60fps while a PDF page is rendered beneath it. The fix is standard: transform-based movement during the drag, committing position only on drop, and never triggering a React re-render per pointer move.
-
-**The signer's app has a first-paint problem, and it's the one that matters commercially.** A signer on cellular staring at a blank viewer assumes the link is broken. Three things move that number, in order of impact:
-
-1. **Don't ship authoring code.** The biggest win is the code split — the signer's bundle should contain a viewer, a signature pad and a form, nothing else.
-2. **Render page one before fetching the rest.** Progressive rendering means the signer sees a document while later pages stream, which converts "broken" into "loading".
-3. **Fetch the document and the field definitions in parallel.** They're independent, and serializing them doubles time-to-interactive for no reason.
-
-The measurement I'd hold the team to isn't Lighthouse — it's **completion rate by connection type.** A signing flow that works beautifully on office wifi and loses a quarter of mobile signers is failing at the only thing it's for.
-
----
-
-## 🔭 What I'd Build Next
-
-Three gaps I'd name unprompted, because they're the difference between this and a product:
-
-**Flattened PDFs.** Today the signed document is "original PDF + overlay data + audit trail". That's defensible as evidence and confusing as a deliverable — the file someone downloads doesn't show the signatures. Embedding them with `pdf-lib` at completion, and digitally signing the resulting bytes, turns the artifact into something a recipient can forward without explanation.
-
-**Real-time status for the sender.** Envelope status is fetched on load, so a sender watching for a signature refreshes. This is the one place I'd add a push channel — and I'd use SSE for the same reasons as elsewhere: one-directional, free reconnection, no upgrade handshake.
-
-**Templates.** The data model has them; there's no UI. For anyone sending the same agreement repeatedly, re-placing fields every time is the dominant cost of using the product, and it's pure frontend work on an existing table.
-
----
-
-## 📝 Summary
-
-Three ideas carry this design:
-
-1. **The UI is evidence.** That single fact rules out optimistic rendering of signatures, forbids client-invented coordinates, and turns a rounding error into a legal defect rather than a cosmetic one.
-2. **Two users, two applications.** A daily-use authoring tool and a one-shot signing experience have opposite tolerances for bundle size, friction and failure. Sharing a viewer is right; sharing a bundle is not.
-3. **Exactly-once is a client responsibility too.** The server enforces it, but only the client knows that two taps were one intent — which is why the idempotency key is minted when the intent forms, and why a 409 is a success screen.
+The signer route should load its viewer and input controls without requiring the full
+preparation editor. I would measure the generated bundle before asserting that route files
+automatically provide that separation. Heavy PDF parsing belongs in its supported worker,
+with a maintained parser and resource limits.
+
+The API boundary validates response shapes and converts database representations into client
+types. Declaring a coordinate as a TypeScript number does not make a JSON string a number.
+It also preserves structured errors such as expired invitation, revision conflict, or
+unknown operation outcome.
+
+| State | Owner | Reason |
+|-------|-------|--------|
+| Envelope revision, fields, permissions | Server, with a client cache | Must be revalidated before recording actions |
+| Selected document/page/zoom | Component or route | Navigation state does not change the agreement |
+| Drag preview and unsaved layout edits | Editor state | Pointer movement should not produce server writes |
+| Drawn image and typed input | Ceremony memory until acknowledged | Preserve work through a request failure |
+| Operation ID and receipt | Client identifier, server result | Reconnect must recover the same action |
+| Session credential | Secure cookie after invitation exchange | Keep ongoing authority out of ordinary application state |
+
+I would use a query cache for server resources and a small local store for editor
+interactions. Zustand is sufficient for the latter; using it does not automatically provide
+cancellation, stale-response protection, or revision checks.
+
+A response can arrive after navigation to another envelope. Bind it to the envelope ID,
+revision, and request generation before applying it. Clear or invalidate resources when
+authorization changes. A single global loading boolean cannot represent several independent
+page and save requests safely.
+
+## 🧭 Preparation and recipient flow — 4 minutes
+
+The preparation sequence is upload, recipients, placement, review, and send. Upload progress
+covers byte transfer; processing status covers server validation. Those are separate
+indicators, since finishing a transfer does not mean the file is ready to sign.
+
+I would show recipients in stages. People within one stage act in parallel; later stages
+wait. Before sending, the interface says who is notified now and who will wait. A flat
+numbered list hides this distinction, especially when two recipients have equal routing
+order.
+
+The preview also shows any participant who is copied rather than required to sign. That
+person should not accidentally hold up the signing stage. The server owns these rules, but
+the preparation UI should make them understandable before the sender commits.
+
+For draft layout, pointer movement updates a local preview. A drop becomes a versioned
+layout mutation, or part of an explicit saved revision. If another client changed the draft,
+show a conflict and preserve the local edits for review rather than silently overwriting
+them.
+
+Sending freezes the document and field revision on the server. I would disable further
+editing while the request is unresolved, then reconcile its operation receipt. Hiding the
+controls after a successful response is useful feedback; preventing a concurrent edit
+requires the backend's revision guard.
+
+This is also where I would stop unsupported PDFs. A parser failure or unsupported page
+geometry should produce an actionable preparation error. Letting a broken document reach a
+recipient moves a recoverable authoring problem into the signing ceremony.
+
+## 🔧 Deep dive: coordinates that survive different devices — 9 minutes
+
+> “The difficult part is not drawing a rectangle. It is ensuring that a rectangle placed on a laptop identifies the same area when reviewed on a phone and later written into the final PDF.”
+
+I would choose a versioned PDF-page coordinate contract. Each field references an immutable
+document revision and page, while the page metadata supplies its crop box, rotation, and
+coordinate units. The browser uses the page viewport's transform to move between that space
+and CSS display coordinates.
+
+For placement, take the pointer location relative to the rendered page itself. Apply the
+inverse viewport transform, then store a rectangle in the agreed document space. For
+display, transform the rectangle's corners back into the current viewport. The final
+artifact renderer consumes the same document-space rectangle.
+
+I would explicitly separate three spaces: document coordinates, CSS display pixels, and
+canvas backing pixels. Device-pixel ratio makes the canvas sharper; it must not double the
+field's stored position. Padding and a centered canvas add an offset that is not part of the
+PDF.
+
+| Approach | Strength | Cost or failure |
+|----------|----------|-----------------|
+| ✅ Versioned PDF-page geometry | Common reference for editor, signer, and output | Requires transform and parser-version tests |
+| ❌ Container CSS pixels | Easy for a fixed demo layout | A different width, padding, or zoom shifts the field |
+| Alternative: normalized page fractions | Convenient responsive rendering | Still needs a defined crop, rotation, and origin contract |
+
+Normalized fractions are a reasonable alternative, not a universal solution. A value such as
+“halfway down the page” is ambiguous if the authoring and output systems disagree about
+which page box is visible. I would choose the representation that the PDF pipeline can
+reproduce consistently.
+
+The PDF origin is often described as bottom-left, but I would not scatter manual Y flips
+through components. Rotation and nonzero crop-box origins complicate that shorthand. The
+shared transform should account for those cases, and a round-trip test should prove that
+placement survives a change in viewport.
+
+For a concrete example, imagine a 90-degree rotated page with a field near its visible
+top-right. A width/height-only scaling rule can move that field to a different corner.
+Transforming the rectangle's corners through the actual viewport keeps the interpretation
+consistent.
+
+On the client, I would put both the PDF page and its field overlay inside one page-sized
+positioning context. Observe that page's size, compute one transform for the frame, and
+apply it to all fields. Avoid reading each field's layout separately during a zoom gesture.
+
+The overlay should use real controls with names, required status, and keyboard behavior.
+Being in the DOM is not enough: a clickable div still needs semantics and focus handling. A
+checklist offers a second path to the same field when the visual page is hard to navigate.
+
+I would render one page or a small visible window, depending on the reading experience.
+Field metadata remains available even when its page is unmounted, so “next required field”
+can navigate to it. Do not allocate hundreds of canvases just to preserve navigation
+targets.
+
+For scale, a US-letter-sized canvas at approximately 816 by 1,056 CSS pixels and
+device-pixel ratio two needs roughly 13 MiB for one RGBA bitmap. Several hundred pages can
+consume gigabytes before parser and text-layer overhead. This is a sizing illustration, not
+a browser benchmark.
+
+The cost of the shared geometry contract is upfront complexity and compatibility work when
+the parser changes. I would accept that cost because an isolated fixed-width implementation
+becomes expensive to correct once the same field must survive mobile rendering and final
+artifact generation.
+
+My acceptance cases include portrait and landscape pages, rotation, crop offsets, different
+device-pixel ratios, narrow widths, and placement near each edge. I would compare the
+generated artifact as well as the interactive overlay; a visually correct browser alone does
+not prove correct output.
+
+## 🔧 Deep dive: a retry must preserve the same intent — 8 minutes
+
+> “A disabled button reduces double taps. A server receipt tells us whether the action was actually recorded. We need both, and they solve different problems.”
+
+When a signer confirms an input, create a stable operation ID for that field action and bind
+it to the document revision and input digest. Reuse it when retrying the same payload. A
+different field or deliberately changed input gets a different operation ID; one key for the
+entire session would collapse unrelated actions.
+
+The server must claim that scoped operation and commit the field action and receipt
+atomically. The frontend cannot create exactly-once behavior by generating UUIDs. It can
+participate in a protocol that makes a repeated request refer to the same accepted effect.
+
+| UI state | What the signer sees | Meaning |
+|----------|-----------------------|---------|
+| Editing | Input controls | Nothing submitted yet |
+| Submitting | Action disabled, descriptive progress | Request in flight |
+| Outcome unknown | Input preserved, checking status | Transport failed; commit may have happened |
+| Recorded | Server-confirmed field value/check | Matching operation receipt obtained |
+| Conflict | Explanation and current state | Input or workflow differs from the requested action |
+
+Suppose the server commits, but the response is lost. Displaying “failed” and generating a
+fresh operation encourages a second action. Instead, retain the original ID and query its
+status or replay that same request. If the receipt confirms the matching revision and input,
+the UI can safely show it as recorded.
+
+A 409 response is not automatically success. It might mean that another tab completed the
+field, the sender withdrew the envelope, or this operation ID was reused with different
+input. Fetch the authoritative state and distinguish those cases before updating the
+display.
+
+I would keep the drawn image in memory while a request fails, and disable changing it while
+its outcome is unknown. Let the signer resolve that operation first, then start a new edit
+if the product permits it. Otherwise the client can accidentally attach an old response to a
+new drawing.
+
+For reload recovery, preserve a small non-secret operation identifier when allowed, then ask
+the authenticated server for the result. I would not default to retaining signatures and
+document content indefinitely in local storage on a shared device. If reload loses
+unsubmitted input, say so clearly; persistence needs an explicit privacy and expiry policy.
+
+The trade-off is extra waiting before a field becomes green. I would use optimistic feedback
+for pointer movement and local text entry, but require a matching server acknowledgment for
+recorded actions. The user still gets immediate interaction feedback without being told the
+server accepted something it has not confirmed.
+
+| Choice | Why it fits | What we give up |
+|--------|-------------|----------------|
+| ✅ Confirmed receipt before “recorded” | Survives response loss and rejection | A network round trip and reconciliation state |
+| ❌ Optimistic recorded status | Feels immediate | Can mislead after void, conflict, or server failure |
+| ❌ Fresh operation ID on every retry | Easy request helper | Turns one intent into multiple logical actions |
+
+Finish is its own operation. It rechecks all required fields on the server, including fields
+on pages never mounted in the current view. The client can guide the signer to missing
+inputs, but cannot decide that the workflow is complete.
+
+Once Finish is recorded, the page says that this recipient's action is complete. Other
+recipients may still be waiting, and final document generation may still be pending. Those
+distinctions prevent a success screen from promising an artifact that does not exist.
+
+## 🔧 Deep dive: invitation access and recoverable signing — 7 minutes
+
+A signer may arrive from a forwarded email, a link scanner, or a second device. I would
+treat the invitation as a credential with a limited scope and explicit lifetime. The server
+decides whether additional authentication is required before granting signing authority.
+
+I would exchange the invitation for a secure session and replace the credential-bearing URL.
+The exchange must account for email scanners: merely fetching a page should not consume the
+only invitation and lock out the person. A user-initiated step can establish the session
+while the server retains the intended invitation policy.
+
+That session remains subordinate to current envelope state. Withdrawal, expiration, and
+stage changes must be enforced by the action endpoints even if the browser has not
+refreshed. A long-lived cached “active” flag is convenient, but would let stale state
+authorize an action after circumstances change.
+
+| Approach | Why choose it | Cost |
+|----------|---------------|------|
+| ✅ Scoped session plus live action checks | Limits ongoing token exposure and respects state changes | Session lifecycle, recovery, and backend lookups |
+| ❌ Reusable URL token as the only authority | Simple invitation flow | URL leaks and stale permission are difficult to contain |
+| ❌ Require every signer to create an account | Reuses sender authentication | Adds friction unrelated to a one-envelope task |
+
+In the ceremony, I would show loading, PDF failure, waiting for an earlier stage, expired
+invitation, withdrawn envelope, and already-completed recipient as distinct states. The
+recovery action must fit the state. A waiting signer does not need to reset their password;
+an expired invitation may require contacting the sender.
+
+Do not enable signing while the document failed to load. Bind render readiness to the exact
+document revision, clear it on document changes, and show retry next to the failure.
+Successful rendering is a useful interaction prerequisite, though it does not prove that a
+human read or understood the document.
+
+On narrow screens, move the field checklist into a compact navigator or input panel. Keep
+the page readable and let a field jump open a large enough input control instead of asking
+someone to hit a tiny box. Preserve document/page context when the keyboard opens.
+
+The signature modal needs a focus trap, accessible title, close behavior, and restoration to
+the field that opened it. Typed capture provides a keyboard-accessible alternative to
+drawing. Drawing must account for canvas display scale and pointer input; a fixed backing
+canvas stretched by CSS can distort strokes.
+
+A required-field error should announce which field remains and offer navigation. A generic
+“three fields left” counter is insufficient on a long document. Progress should count
+completed required fields against required fields, not include optional fields only in the
+numerator.
+
+The cost of these explicit states is more UI work and more contract testing. I would
+prioritize them over animation because this journey has a meaningful terminal action and
+often no account-based recovery path.
+
+## 📜 Tracking and evidence display — 3 minutes
+
+The sender view can start with bounded polling while visible, backing off when hidden or
+after errors. If low-latency tracking becomes important, SSE can send invalidation hints;
+reconnect still requires fetching an authoritative snapshot. A push message should not
+replace revision-aware state reconciliation.
+
+I would show invitation queued, provider accepted, recipient opened, recipient finished, all
+signers finished, and artifact ready according to the evidence actually available.
+“Delivered” is particularly easy to misuse if the backend merely attempted to enqueue an
+email.
+
+The audit timeline should lead with actor, action, time, and document revision.
+Cryptographic details can be expanded. A verification result should identify the covered
+sequence and verification time, and say whether it was checked against an independently
+protected checkpoint.
+
+A failed verification is not automatically proof of malicious alteration. Serialization bugs
+and incomplete exports can also cause it. Show an unresolved evidence problem clearly and
+preserve the records for investigation; do not silently turn a failed check into a green
+success badge.
+
+An original PDF download and a final signed artifact need different labels. A browser
+overlay is not embedded in the original bytes. Only show the final-artifact action when the
+server returns a ready version with its identity and authorization.
+
+## 🧪 Verification and performance — 3 minutes
+
+I would spend testing effort at the boundaries where an apparently successful screen can be
+wrong.
+
+| Scenario | Required result |
+|----------|-----------------|
+| Slow response after switching envelopes | Old data cannot replace the current revision |
+| Rotated/cropped page at several scales | Browser placement and final output agree |
+| Commit followed by response loss | Same operation reconciles to one recorded action |
+| Conflict from another tab | UI presents the actual conflict, not assumed success |
+| Withdrawn envelope during review | Server rejects action; input and explanation remain available |
+| PDF load failure | No false review-ready state or enabled submission |
+| Keyboard-only ceremony | Every field and modal can be completed and exited |
+| Artifact job failure | Recipient completion remains distinct from artifact availability |
+
+Performance metrics should include first usable page, input delay while rendering, save
+acknowledgment latency, and recovery success. Segment by document size and device class. A
+fast landing page score says little about filling a field on a large scanned PDF.
+
+I would keep canvases bounded, avoid per-field layout reads on zoom, and load the
+preparation editor separately. Larger envelope lists need actual pagination controls; adding
+virtualization to the first twenty rows does not make the remaining envelopes reachable.
+
+## ⚖️ Trade-offs and local implementation — 2 minutes
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Geometry | ✅ Shared page contract | ❌ Container pixels | Same field survives viewport and output changes |
+| Recorded feedback | ✅ Durable receipt | ❌ Optimistic completion | Handles ambiguous outcomes accurately |
+| Signer access | ✅ Scoped session, live checks | ❌ Token plus cached status | Respects current workflow authority |
+| PDF rendering | ✅ Small mounted page window | ❌ All canvases at once | Controls memory while retaining field navigation |
+| Tracking | ✅ Bounded refresh first | ❌ Mandatory push infrastructure | Fits initial freshness needs with simpler recovery |
+
+The local project uses React, TanStack Router, Zustand, a one-page 700-pixel viewer, and
+draw/type capture. It saves placement clicks immediately in container pixels, has no
+zoom/drag editor or request-generation guard, and hides PDF text layers. Its signing
+overlays are clickable divs, and no stable operation IDs are sent.
+
+More fundamentally, session bootstrap caches different identifier names from those expected
+by signer writes, so the normal field request fails. The worker and audit formats also
+mismatch, and final artifact generation is absent. These are documented in
+[architecture.md](./architecture.md); they are not capabilities I would claim in this
+proposed interview design.
+
+> “The three decisions I would defend are a shared geometry contract, an honest action-reconciliation state, and an invitation journey whose authority remains with the server. Together they keep the interface understandable when the document, device, or network becomes difficult.”

@@ -1,286 +1,172 @@
-# Figma - Collaborative Design and Prototyping Platform
+# Figma — collaborative design editor learning project
 
-A real-time collaborative design tool with vector graphics editing, inspired by Figma.
+A browser design editor for studying interactive canvas rendering, optimistic edits, WebSocket collaboration, and document snapshots. The local application combines a file browser, a PixiJS canvas, and React layers/properties panels. It is a teaching implementation with significant persistence and synchronization gaps, rather than a complete Figma clone.
 
-## Codebase Stats
+**Current demo limitations:** the browser generates a random user ID, but the operations table requires an existing user. With the supplied schema and seed, normal browser edits therefore fail database insertion while still appearing locally. Seeded objects also omit `visible`, which makes them appear in SVG file thumbnails but disappear from the editor canvas. These conclusions follow from the checked-in source; successful collaboration or persistence is not implied by a rendered page.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 8,080 |
-| Source Files | 58 |
-| .ts | 4,552 |
-| .md | 1,580 |
-| .tsx | 1,383 |
-| .sql | 193 |
-| .json | 160 |
+## What you can explore
 
-## Features
+| Flow | What exists | Practical boundary |
+|---|---|---|
+| Browse, create, delete files | REST-backed grid, name input, soft delete | Seed the fixed demo owner first; deleted files remain accessible by ID |
+| Draw and inspect | Rectangle, ellipse, text, selection, drag, pan/zoom | Local optimistic changes; persistence has the identity defect above |
+| Layers and properties | Visibility, lock, order, numeric/style/text controls | Flat object array; locks are UI hints and numeric limits are not enforced |
+| Presence | Cursor positions and collaborator badges | Same-process broadcasts; expiration is not propagated to existing clients |
+| History | Save/restore database canvas snapshots | Does not save unsent browser state or broadcast restores |
+| Undo/redo | Browser snapshot history and buttons | Incorrect history indexing, local-only changes, history survives file switches |
 
-- **Real-time Collaboration**: Multiple users can edit the same design simultaneously
-- **Multiplayer Cursors**: See collaborators' cursors and selections in real-time
-- **Vector Graphics**: Create rectangles, ellipses, and text objects
-- **Layers Panel**: Manage object visibility, locking, and z-order
-- **Properties Panel**: Edit object properties including position, size, colors, and opacity
-- **Version History**: Save and restore design versions
-- **File Management**: Create, browse, and delete design files
+Share is a placeholder button. Frame/group/image types exist in the model or renderer, but there are no corresponding creation tools, nested scene management, asset upload, prototype playback, comments UI, exports, authentication flow, or admin interface. Resize handles are visual; dimensions are edited in the properties panel. File navigation uses React state, so browser refresh returns to the file browser.
 
-## Architecture
+## Stack and reading guide
 
-The application consists of:
+- React 19, TypeScript, Vite 6, Zustand 5, Tailwind CSS 3, and PixiJS 8.
+- Node.js, Express 4, `ws`, PostgreSQL 16, and Redis-compatible Valkey 7.
+- Pino logging, Prometheus metrics, one Opossum broadcast circuit, and scheduled retention cleanup.
 
-- **Frontend**: React 19 + TypeScript + Vite + Zustand + Tailwind CSS
-- **Backend**: Node.js + Express + WebSocket (ws)
-- **Database**: PostgreSQL for persistence
-- **Cache/Pub-Sub**: Redis for presence updates and real-time coordination
-
-See [architecture.md](./architecture.md) and [system-design-answer-fullstack.md](./system-design-answer-fullstack.md) for detailed system design documentation.
+Read [architecture.md](./architecture.md) for the production proposal and the source-backed local implementation. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) answers are proposed interview designs, each paced for 45 minutes. [CLAUDE.md](./CLAUDE.md) contains historical development notes; feature claims there are not a substitute for the current source.
 
 ## Prerequisites
 
-- Node.js 20+
-- Docker and Docker Compose (for running PostgreSQL and Redis)
-- Or: PostgreSQL 16+ and Redis 7+ installed locally
+Use Node.js 22 or 24, npm, and either Docker Compose or native PostgreSQL/Valkey. The repository minimum is Node 20; the installed Opossum 9 engine range supports Node 20, 22, and 24. Commands below start in this project's directory, `figma/`, unless a different directory is shown. Leave ports 3000, 5173, 5432, and 6379 available.
 
-## Quick Start with Docker
-
-1. **Start the infrastructure services**:
-
-   ```bash
-   docker-compose up -d
-   ```
-
-   This starts PostgreSQL (port 5432) and Redis (port 6379).
-
-2. **Install backend dependencies**:
-
-   ```bash
-   cd backend
-   npm install
-   ```
-
-3. **Start the backend server**:
-
-   ```bash
-   npm run dev
-   ```
-
-   The server runs on http://localhost:3000.
-
-4. **Install frontend dependencies** (in a new terminal):
-
-   ```bash
-   cd frontend
-   npm install
-   ```
-
-5. **Start the frontend**:
-
-   ```bash
-   npm run dev
-   ```
-
-   The frontend runs on http://localhost:5173.
-
-6. **Open your browser** to http://localhost:5173
-
-## Running with Native Services
-
-If you prefer to run PostgreSQL and Redis natively:
-
-### macOS (with Homebrew)
+## Option A: Docker Compose (recommended)
 
 ```bash
-# Install services
-brew install postgresql@16 redis
+docker compose up -d
+docker compose ps
+docker compose exec -T postgres pg_isready -U figma -d figma_db
+docker compose exec -T redis redis-cli ping
+```
 
-# Start services
+Compose starts infrastructure only. It mounts [init.sql](./backend/src/db/init.sql) into PostgreSQL's initialization directory, which runs only for a fresh database volume. The schema uses unguarded `CREATE TABLE` statements; it is not a rerunnable migration. There is no `db:migrate` script.
+
+**Seed once after a fresh initialization:**
+
+```bash
+docker compose exec -T postgres psql -U figma -d figma_db -v ON_ERROR_STOP=1 --single-transaction < backend/db-seed/seed.sql
+```
+
+The [seed](./backend/db-seed/seed.sql) creates the fixed demo user, one team/project, and three files: Mobile App — Login Screen, Dashboard Wireframe, and Brand Color Palette. There is no login screen or usable login credential to enter. The user row is required for REST file/version creation. The seed has no conflict guards, so repeating it fails; do not use it as an update script for an existing database.
+
+```bash
+# Stop containers and retain data.
+docker compose down
+# Optional complete reset: deletes this project's PostgreSQL and Valkey volumes.
+docker compose down -v
+```
+
+After a deliberate reset, start Compose and run the seed again.
+
+## Option B: Native installation (macOS, no Docker)
+
+Do not run these services alongside Compose on the same ports.
+
+```bash
+brew install postgresql@16 valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
 brew services start postgresql@16
-brew services start redis
-
-# Create database and user
-createuser -s figma
-createdb -O figma figma_db
-psql -d figma_db -c "ALTER USER figma WITH PASSWORD 'figma_password';"
-
-# Initialize the database schema
-psql -U figma -d figma_db -f backend/src/db/init.sql
+brew services start valkey
+pg_isready -h localhost -p 5432
+valkey-cli ping
 ```
 
-### Linux (Ubuntu/Debian)
+For a fresh local installation, create a regular database owner using your local PostgreSQL administrator connection. Enter `figma_password` at the password prompt:
 
 ```bash
-# Install services
-sudo apt update
-sudo apt install postgresql postgresql-contrib redis-server
-
-# Start services
-sudo systemctl start postgresql
-sudo systemctl start redis-server
-
-# Create database and user
-sudo -u postgres createuser -s figma
-sudo -u postgres createdb -O figma figma_db
-sudo -u postgres psql -d figma_db -c "ALTER USER figma WITH PASSWORD 'figma_password';"
-
-# Initialize the database schema
-sudo -u postgres psql -U figma -d figma_db -f backend/src/db/init.sql
+createuser --pwprompt figma
+createdb --owner=figma figma_db
+PGPASSWORD=figma_password psql -h localhost -U figma -d figma_db -v ON_ERROR_STOP=1 --single-transaction -f backend/src/db/init.sql -f backend/db-seed/seed.sql
+PGPASSWORD=figma_password psql -h localhost -U figma -d figma_db -c 'SELECT count(*) FROM files;'
 ```
 
-## Environment Variables
+The final count is three on the untouched seed. These initialization commands assume the role/database do not already exist. Use the existing configured role for an existing installation instead of recreating its schema.
 
-### Backend
+## Start the application
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3000` | Server port |
-| `DB_HOST` | `localhost` | PostgreSQL host |
-| `DB_PORT` | `5432` | PostgreSQL port |
-| `DB_USER` | `figma` | PostgreSQL user |
-| `DB_PASSWORD` | `figma_password` | PostgreSQL password |
-| `DB_NAME` | `figma_db` | PostgreSQL database |
-| `REDIS_HOST` | `localhost` | Redis host |
-| `REDIS_PORT` | `6379` | Redis port |
-| `FRONTEND_URL` | `http://localhost:5173` | CORS origin |
-
-## Running Multiple Backend Instances
-
-For testing distributed scenarios:
-
-```bash
-# Terminal 1
-cd backend
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
-```
-
-Note: You'll need a load balancer (like nginx) to distribute connections between instances for full distributed testing.
-
-## Project Structure
-
-```
-figma/
-├── backend/
-│   ├── src/
-│   │   ├── db/             # Database connections and schema
-│   │   ├── routes/         # REST API routes
-│   │   ├── services/       # Business logic
-│   │   ├── types/          # TypeScript definitions
-│   │   ├── websocket/      # WebSocket handler
-│   │   └── index.ts        # Main entry point
-│   ├── package.json
-│   └── tsconfig.json
-├── frontend/
-│   ├── src/
-│   │   ├── components/     # React components
-│   │   ├── hooks/          # Custom hooks
-│   │   ├── services/       # API client
-│   │   ├── stores/         # Zustand stores
-│   │   └── types/          # TypeScript definitions
-│   ├── package.json
-│   └── vite.config.ts
-├── docker-compose.yml
-├── architecture.md
-├── system-design-answer-fullstack.md
-├── claude.md
-└── README.md
-```
-
-## API Endpoints
-
-### REST API
-
-- `GET /api/files` - List all files
-- `POST /api/files` - Create a new file
-- `GET /api/files/:id` - Get file details
-- `PATCH /api/files/:id` - Update file name
-- `DELETE /api/files/:id` - Delete a file
-- `GET /api/files/:id/versions` - List version history
-- `POST /api/files/:id/versions` - Create a named version
-- `POST /api/files/:id/versions/:versionId/restore` - Restore a version
-
-### WebSocket (ws://localhost:3000/ws)
-
-- `subscribe` - Join a file editing session
-- `unsubscribe` - Leave a file editing session
-- `operation` - Send design operations
-- `presence` - Send cursor/selection updates
-- `sync` - Request current state
-
-## Keyboard Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `V` | Select tool |
-| `R` | Rectangle tool |
-| `O` | Ellipse tool |
-| `T` | Text tool |
-| `H` | Hand (pan) tool |
-| `Delete` / `Backspace` | Delete selected objects |
-| `Ctrl/Cmd + D` | Duplicate selected objects |
-| `Ctrl/Cmd + Z` | Undo |
-| `Ctrl/Cmd + Shift + Z` | Redo |
-
-## Development
-
-### Backend
+In one terminal, from `figma/`:
 
 ```bash
 cd backend
-npm run dev         # Start development server
-npm run build       # Build for production
-npm run lint        # Run linter
-npm run type-check  # TypeScript check
+npm install
+NODE_ENV=production ENABLE_CLEANUP=false npm run dev
 ```
 
-### Frontend
+`NODE_ENV=production` selects JSON logging while `tsx watch` still reloads the server. Setting `NODE_ENV=development` selects `pino-pretty`, which is referenced but missing from this backend's declared dependencies. `ENABLE_CLEANUP=false` disables scheduled deletion while exploring the demo; its default is enabled.
+
+In another terminal, from `figma/`:
 
 ```bash
 cd frontend
-npm run dev         # Start development server
-npm run build       # Build for production
-npm run lint        # Run linter
-npm run type-check  # TypeScript check
+npm install
+npm run dev -- --host 127.0.0.1
 ```
 
-## Testing Real-time Collaboration
+Open [the file browser](http://localhost:5173). Vite proxies `/api` and `/ws` to port 3000. Inspect [backend health](http://localhost:3000/health) and [metrics](http://localhost:3000/metrics) directly; those paths are not Vite proxies. Dependency health does not test editing, authorization, or convergence.
 
-1. Open the application in two browser windows
-2. Create or select the same file in both
-3. You should see:
-   - Each user's cursor in a different color
-   - Objects created by one user appear for the other
-   - Selection highlights visible to collaborators
+## Configuration
 
-## Future Enhancements
+The backend reads exported environment variables directly. It has no dotenv loader or `.env.example`; creating a `.env` file alone changes nothing. Neither `DATABASE_URL` nor `REDIS_URL` is consumed.
 
-- [ ] More shape tools (lines, polygons, pen tool)
-- [ ] Image upload and embedding
-- [ ] Components and instances
-- [ ] Prototyping and interactions
-- [ ] Comments and feedback
-- [ ] Export to PNG/SVG/PDF
-- [ ] Offline support with sync
-- [ ] Plugin system
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | HTTP and WebSocket listener |
+| `FRONTEND_URL` | `http://localhost:5173` | Allowed HTTP CORS origin |
+| `DB_HOST`, `DB_PORT` | `localhost`, `5432` | PostgreSQL address |
+| `DB_USER`, `DB_PASSWORD`, `DB_NAME` | `figma`, `figma_password`, `figma_db` | PostgreSQL credentials/database |
+| `REDIS_HOST`, `REDIS_PORT` | `localhost`, `6379` | Valkey/Redis address |
+| `LOG_LEVEL` | `info` | Pino level |
+| `NODE_ENV` | unset | Only exact `development` enables the missing pretty transport |
+| `ENABLE_CLEANUP` | enabled unless exactly `false` | Schedule retention tasks |
 
-## References
+For example, `DB_PORT=5433 REDIS_PORT=6380 NODE_ENV=production npm run dev` overrides backend connections. It does not change infrastructure ports. Frontend API/socket addresses are same-origin; there are no configured `VITE_API_URL` overrides.
 
-- [system-design-answer-fullstack.md](./system-design-answer-fullstack.md) - Full system design explanation
-- [architecture.md](./architecture.md) - Architecture documentation
-- [claude.md](./claude.md) - Development notes and iteration history
+## API and controls
 
-## References & Inspiration
+All current routes are unauthenticated. REST creation uses the fixed demo user; sockets trust the identity in `subscribe`.
 
-- [How Figma's Multiplayer Technology Works](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/) - Figma's engineering blog on real-time collaboration
-- [Building a Professional Design Tool on the Web](https://www.figma.com/blog/building-a-professional-design-tool-on-the-web/) - Figma's approach to WebGL rendering
-- [Realtime Editing of Ordered Sequences](https://www.figma.com/blog/realtime-editing-of-ordered-sequences/) - Fractional indexing for layer ordering
-- [Livegraph: A Faster Way to Check Live Reachability](https://www.figma.com/blog/livegraph-real-time-data-fetching-at-figma/) - Figma's real-time data architecture
-- [CRDTs and the Quest for Distributed Consistency](https://www.youtube.com/watch?v=B5NULPSiOGw) - Martin Kleppmann's talk on CRDTs
-- [A Conflict-Free Replicated JSON Datatype](https://arxiv.org/abs/1608.03960) - Academic paper on JSON CRDTs
-- [Yjs: Shared Editing with CRDTs](https://yjs.dev/) - Popular CRDT library for collaborative applications
-- [WebGL Fundamentals](https://webglfundamentals.org/) - Learning WebGL for high-performance rendering
-- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book on distributed systems
+| Method | Path | Behavior |
+|---|---|---|
+| GET | `/api/files` | All non-deleted files, including complete canvas data |
+| POST | `/api/files` | Create with `name`; optional `projectId`, `teamId` |
+| GET | `/api/files/:id` | File and same-process subscriber count, including soft-deleted files |
+| PATCH | `/api/files/:id` | Rename; missing ID can return `null` |
+| DELETE | `/api/files/:id` | Soft delete; missing ID still returns 204 |
+| GET | `/api/files/:id/versions` | Full snapshots, default limit 50 |
+| POST | `/api/files/:id/versions` | Snapshot current database state, optional `name` |
+| POST | `/api/files/:id/versions/:versionId/restore` | Replace database canvas and add a restore version |
+
+`/ws` accepts `subscribe`, `unsubscribe`, `operation`, `presence`, and `sync`. The browser sends single-operation arrays, ignores ACKs, and retries socket connections after a fixed three seconds. It has no operation queue or revision replay and drops outgoing edits while disconnected. See the architecture's [local implementation](./architecture.md#implementation-notes) before interpreting socket traffic as reliable collaboration.
+
+| Control | Action |
+|---|---|
+| V / R / O / T / H | Select / rectangle / ellipse / text / hand tool |
+| Shift-click | Add/remove selection |
+| Hand drag or plain wheel | Pan |
+| Ctrl/Cmd + wheel | Cursor-centered zoom, 10–500% |
+| Delete / Backspace | Delete selected unlocked objects through canvas shortcut |
+| Ctrl/Cmd + D | Duplicate selection |
+| Ctrl/Cmd + Z / Shift+Z | Local undo / redo, subject to the history defect |
+
+Canvas shortcuts do not exclude focused text inputs. Layer-panel deletion and properties can also modify locked objects. Use small disposable designs when inspecting these interactions.
+
+## Verification and troubleshooting
+
+From each of `figma/backend/` and `figma/frontend/`, the available checks are `npm run type-check`, `npm run build`, and `npm run lint`. These are suggested development checks, not a claim that they passed during this documentation review. Application dependencies were not upgraded and the stack was not started.
+
+The project-level Playwright script is `npm run test:e2e` after `npm install` in `figma/` and browser installation with `npx playwright install chromium`. It starts/reuses the frontend but requires the backend/database to be ready. The single smoke test checks that a file grid is visible; it does not test saving, reconnects, or two-client convergence.
+
+| Symptom | Source-backed explanation |
+|---|---|
+| File creation fails on fresh Compose | Seed is separate; the fixed owner row is absent until seeded |
+| Thumbnail visible, editor blank | All 23 seed shapes omit `visible`; the editor tests its truthiness |
+| Shape appears then disappears on reload | Browser author ID fails the operations foreign key; socket errors are console-only |
+| Two clients disagree after concurrent edits | Whole-canvas writes race; own operations are never canonically reconciled |
+| Undo or another file shows unexpected content | Incorrect local history indexing; store/history is not reset between files |
+| Restore affects only one browser | HTTP restore changes storage and caller state, with no WebSocket restore event |
+| Startup fails only with development logging | `pino-pretty` is not a declared dependency |
+
+`dev:server1`, `dev:server2`, and `dev:server3` bind ports 3001–3003. They share storage, but there is no supplied load balancer or cross-process operation delivery; the Vite proxy still targets 3000. Starting more instances does not establish distributed collaboration.
+
+Cleanup defaults to 03:00 in the server's timezone: autosaves older than 90 days are pruned while keeping ten per file; operation rows and soft-deleted files expire after 30 days. No autosave producer is wired, and named versions remain unless their file is purged. `npm run cleanup` invokes the same destructive retention logic and catches errors internally, so its exit status alone does not prove success.
+
+The `db:backup` script assumes a `backups/` directory and authentication setup; `db:restore` is an incomplete redirection command. Use explicit `pg_dump`/`psql` commands with a chosen path for backup work. Source size can be calculated from the repository root with `npm run sloc figma`; no stale generated size table is maintained here.

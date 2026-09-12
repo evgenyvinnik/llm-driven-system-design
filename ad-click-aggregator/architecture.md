@@ -1,732 +1,472 @@
-# Ad Click Aggregator - Architecture Design
+# Ad Click Aggregator — Architecture
 
 ## System Overview
 
-A real-time analytics system for aggregating ad clicks with fraud detection capabilities. The system handles high-volume click events, deduplicates them for exactly-once semantics, detects fraudulent patterns, and provides real-time analytics through pre-computed aggregations. This project explores time-series data ingestion, OLAP query optimization, and billing-accuracy guarantees.
+An advertising analytics service receives click events, records evidence, assigns
+fraud signals, and serves time-bucketed reports. Its central problem is keeping
+counts explainable under retries, partial failures, late events, and corrections.
+Fast dashboard queries and authoritative accounting have different requirements.
+
+This document separates a **proposed production design** from the **implemented local
+system**. The production sections describe desired behavior; the final Implementation
+Notes trace the current Express, PostgreSQL, Redis, and ClickHouse code. The local
+system is an analytics demonstration and does not guarantee exactly-once counting,
+a complete audit history, or billing-ready reports.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — production design
 
-1. **Click Tracking**: Record every ad click with metadata (ad_id, campaign_id, user_id, timestamp, geo, device)
-2. **Real-time Aggregation**: Aggregate clicks by various dimensions (per ad, per campaign, per hour, per geo) with minute-level freshness
-3. **Reporting API**: Query aggregated data for dashboards and billing reconciliation
-4. **Fraud Detection**: Identify and filter suspicious click patterns based on velocity and behavioral signals
+- Accept clicks with stable event identity, event time, and ad/campaign context.
+- Return a durable acceptance result that can be retrieved safely after retries.
+- Report total, flagged, and eligible clicks by supported dimensions and time range.
+- Distinguish provisional dashboard data from reconciled reporting periods.
+- Preserve raw evidence and versioned fraud decisions so reports can be corrected.
+- Support advertiser-scoped queries and administrative diagnostics.
 
-### Non-Functional Requirements
+### Non-functional requirements — proposed targets
 
-- **Throughput**: 10,000 clicks/second sustained ingestion across all collectors
-- **Availability**: 99.9% uptime for ingestion path; 99.5% for analytics queries
-- **Latency**: Writes p99 < 50ms; aggregation queries p95 < 200ms
-- **Consistency**: Exactly-once semantics for click counting (billing accuracy)
-- **Durability**: Zero data loss for raw click events; aggregates rebuildable from raw data
+| Concern | Target or invariant |
+|---------|---------------------|
+| Ingestion | 10,000 events/second sustained as a planning workload |
+| Acceptance latency | p95 below 50 ms on an agreed deployment and payload profile |
+| Query latency | p95 below 200 ms for bounded, pre-aggregated queries |
+| Freshness | Typical dashboard data available within one minute |
+| Availability | 99.9% ingestion, 99.5% reporting as initial SLOs |
+| Durability | Acknowledge only after the authoritative record commits under the chosen replication policy |
+| Correctness | A repeated event has one logical counting effect; corrections retain history |
 
-### Out of Scope
-
-- Impression tracking and viewability measurement
-- Real-time bidding (RTB) integration
-- ML-based fraud detection (rule-based only)
-- Multi-tenant advertiser isolation
+These are design objectives, not measured local capabilities. Durability must name
+its failure model: a local disk acknowledgement alone does not survive losing a
+whole region. Impression tracking, auctions, conversion attribution, and ML training
+are outside this design's initial scope.
 
 ## Capacity Estimation
 
-### Production Scale
+At a sustained 10,000 events/second, daily volume is 864 million events. At an
+illustrative 500 bytes per event, that is 432 GB/day, about 13 TB per 30 days, and
+5 MB/second before replication, indexes, protocol overhead, or compression. If
+10,000/second is only the peak, daily volume must instead use the average rate.
 
-| Metric | Value |
-|--------|-------|
-| Daily Active Users (DAU) | 50M |
-| Write RPS (peak) | 10,000 clicks/sec |
-| Read RPS (analytics) | 100 queries/sec |
-| Raw event size | ~500 bytes |
-| Daily raw storage | ~430 GB |
-| Monthly raw storage | ~13 TB |
-| Inbound bandwidth | ~5 MB/s |
+A five-minute dedup cache at that rate holds up to three million IDs. At an assumed
+100 bytes per entry it needs roughly 300 MB before additional overhead, replication,
+and fraud state. This cache estimate does not define the durable replay window.
 
-### Storage Breakdown
+Aggregate volume depends on active combinations of campaign, ad, country, device,
+time bucket, and any sharding dimension. Precomputing every combination can explode
+cardinality; define a small supported query set and measure sparsity.
 
-| Data Tier | Volume | Retention |
-|-----------|--------|-----------|
-| Raw clicks (hot) | ~3 TB (7 days) | 7 days in PostgreSQL |
-| Raw clicks (warm) | ~13 TB (30 days) | 30 days compressed |
-| Raw clicks (cold) | ~156 TB/year | 1 year in S3/MinIO (Parquet) |
-| Minute aggregates | ~10 GB | 7 days (auto-TTL in ClickHouse) |
-| Hourly aggregates | ~50 GB | 1 year |
-| Daily aggregates | ~5 GB | Indefinite |
-| Redis dedup keys | ~200 MB peak | 5-minute TTL |
+### Local development scale
+
+Run one to three Express instances with one PostgreSQL, one Valkey, and one ClickHouse
+container. The UI defaults to a one-hour chart and refreshes every 30 seconds. There
+is no measured 10,000-RPS capacity result or queue-backed burst buffer in the source.
 
 ## High-Level Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Ad Servers    │     │   Ad Servers    │     │   Ad Servers    │
-│ (Click Sources) │     │ (Click Sources) │     │ (Click Sources) │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                        ┌────────▼────────┐
-                        │   CDN / L7 LB   │
-                        │  (GeoDNS, TLS)  │
-                        └────────┬────────┘
-                                 │
-              ┌──────────────────┼──────────────────┐
-              │                  │                  │
-     ┌────────▼────────┐ ┌──────▼────────┐ ┌───────▼───────┐
-     │ Click Collector │ │Click Collector│ │Click Collector│
-     │   Instance 1    │ │  Instance 2   │ │  Instance N   │
-     └────────┬────────┘ └──────┬────────┘ └───────┬───────┘
-              │                 │                   │
-    ┌─────────┴─────────────────┴───────────────────┘
-    │
-    ├──────────────────────────┐
-    │                          │
-    ▼                          ▼
-┌─────────────────┐   ┌─────────────────┐
-│  Redis Cluster  │   │  Kafka Cluster  │
-│ (Dedup, Rate    │   │ (Event Stream)  │
-│  Limit, HLL)    │   │                 │
-└─────────────────┘   └────────┬────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-           ┌───────▼───────┐    ┌────────▼────────┐
-           │  PostgreSQL   │    │   ClickHouse    │
-           │  (Entities,   │    │  (Analytics,    │
-           │   Audit Trail)│    │   Materialized  │
-           └───────────────┘    │   Views)        │
-                                └────────┬────────┘
-                                         │
-                                ┌────────▼────────┐
-                                │  Query Service  │
-                                │  (Analytics)    │
-                                └────────┬────────┘
-                                         │
-                                ┌────────▼────────┐
-                                │   Dashboard     │
-                                │   (React)       │
-                                └─────────────────┘
+┌───────────────────┐      ┌───────────────────┐
+│ Trusted click SDK │─────▶│ Edge + collectors │
+└───────────────────┘      └─────────┬─────────┘
+                                    │ durable acceptance transaction
+                                    ▼
+                          ┌─────────────────────┐
+                          │ Event records       │
+                          │ + transactional outbox│
+                          └──────────┬──────────┘
+                                     │ relay; retries allowed
+                                     ▼
+                          ┌─────────────────────┐
+                          │ Durable event stream│
+                          └──────────┬──────────┘
+                            ┌────────┴────────┐
+                            ▼                 ▼
+                  ┌─────────────────┐ ┌─────────────────┐
+                  │ Fraud + rollups │ │ Raw archive     │
+                  │ durable progress│ │ replay evidence │
+                  └────────┬────────┘ └─────────────────┘
+                           │ versioned aggregate snapshots
+                           ▼
+                  ┌─────────────────┐   ┌─────────────────┐
+                  │ ClickHouse      │──▶│ Query service   │
+                  │ read projection │   └────────┬────────┘
+                  └─────────────────┘            ▼
+                                        ┌─────────────────┐
+                                        │ Dashboard       │
+                                        └─────────────────┘
 ```
 
-## Core Components
+PostgreSQL is a candidate for authoritative event acceptance and metadata. At the
+planning volume, partitioning, batching, retention, and potentially sharding need
+measurement; a single unpartitioned local table is not the production sizing plan.
+Redis is optional acceleration and fraud state, outside the durable acceptance
+invariant. A queue does not replace idempotency at the projection boundary.
 
-### 1. Click Collector Service
+## Core Components / Request Flows
 
-Stateless HTTP service that receives click events and feeds them into the pipeline.
+### Acceptance and replay
 
-**Request flow:**
-1. Receive click event via `POST /api/v1/clicks`
-2. Validate payload with schema validation (required fields, types, ranges)
-3. Generate `click_id` if not provided by caller
-4. Check Redis for duplicate `click_id` (SETEX with 5-minute TTL)
-5. Run fraud detection rules (IP velocity, user velocity, device fingerprint)
-6. If idempotency-key header present, check Redis for cached response
-7. Write raw event to PostgreSQL (audit trail) and ClickHouse (analytics) in parallel
-8. Return 202 Accepted with click metadata
+1. Validate the caller, event identity, timestamp bounds, and permitted ad hierarchy.
+2. Map ad ownership from trusted metadata rather than trusting arbitrary advertiser IDs.
+3. In one authoritative-store transaction, create the unique event and its outbox record.
+4. If the identity already exists, compare the canonical payload and return its result;
+   reject conflicting reuse rather than silently accepting different data under one key.
+5. Return acceptance after commit. This does not mean the dashboard already contains it.
+6. Relay committed outbox records to the stream, retrying safely after ambiguous sends.
 
-**Scaling strategy:** Stateless instances behind a load balancer. Each instance connects to Redis for dedup and both databases for writes. At 10K clicks/sec, 5-10 collector instances handle the load with headroom.
+A relay can publish twice if it crashes between send and progress update. Consumers
+must expect replay. Marking a Redis key before a durable commit cannot safely stand
+in for this transaction: it can suppress recovery of an event that was never stored.
 
-### 2. Redis Cache Layer
+### Fraud and aggregation
 
-Redis provides the sub-millisecond operations needed in the ingestion hot path.
+A consumer records an event's processed identity and updates its authoritative
+aggregate state atomically, or uses a stream processor with an equivalent durable
+state/checkpoint contract. A repeated delivery does not add another contribution.
+Fraud decisions include rule version and reason; later reclassification produces
+a correction rather than silently replacing the evidence.
 
-| Operation | Key Pattern | TTL | Purpose |
-|-----------|-------------|-----|---------|
-| Deduplication | `dedup:{click_id}` | 5 min | Prevent double-counting |
-| IP rate limit | `ratelimit:ip:{ip_hash}` | 1 min | Fraud velocity detection |
-| User rate limit | `ratelimit:user:{user_id}` | 1 min | Fraud velocity detection |
-| Unique users | `hll:{ad_id}:{hour}` | 2 hours | HyperLogLog cardinality |
-| Idempotency cache | `idempotency:{key}` | 5 min | Cached responses for retries |
+To avoid retrying an additive insert into the analytics sink, publish versioned
+absolute bucket snapshots. The logical key includes every grouping dimension and
+any partial-aggregation shard. Queries select the latest revision for each logical
+key before combining buckets. Replaying an identical revision is harmless; an older
+revision must not overwrite a newer one. This is a proposed sink contract, not the
+current SummingMergeTree implementation.
 
-**Why Redis over in-memory:** Dedup state must be shared across all collector instances. An in-memory set per instance would allow duplicates when the same click hits different instances via the load balancer.
+Keep raw data independently available for reconciliation and rebuild. Do not sum
+multiple snapshot revisions or replay raw events into additive rollups without
+first addressing their existing contribution.
 
-### 3. PostgreSQL (Relational Data + Audit Trail)
+### Time and distinct-user semantics
 
-Stores business entities (advertisers, campaigns, ads) with referential integrity and raw click events for billing dispute resolution.
+Store both event time and received time. Event time determines the reporting bucket;
+received time supports lag measurements and plausibility checks. Use UTC internally
+and half-open query intervals, with explicit timezone conversion at the API boundary.
 
-**Why PostgreSQL for raw clicks:** ACID transactions ensure every click is durably stored. The audit trail survives even if ClickHouse loses data during a merge or compaction. Billing disputes require provable, transactionally-consistent records.
+A watermark describes expected completeness, not certainty that no event will ever
+arrive later. Recent buckets remain provisional. Beyond a defined lateness horizon,
+route events and fraud changes through versioned corrections and reconciled reports.
 
-### 4. ClickHouse (Time-Series Analytics)
-
-Columnar OLAP database optimized for high-write throughput and aggregation queries.
-
-**Key features leveraged:**
-- **MergeTree engine**: Ordered data with efficient range scans on time columns
-- **SummingMergeTree**: Automatic aggregation during background merges
-- **Materialized views**: Real-time aggregation on insert (minute, hour, day)
-- **LowCardinality**: Dictionary encoding for enum-like columns (device_type, country)
-- **TTL**: Automatic data expiration per table (90 days for raw, 7 days for minute aggregates)
-- **Partitioning**: Monthly partitions enable efficient pruning for time-range queries
-
-### 5. Query Service
-
-Reads from ClickHouse materialized views to serve dashboard and reporting queries. Supports flexible aggregation by time granularity, campaign, ad, country, and device type.
-
-### 6. Dashboard (React + Recharts)
-
-Real-time metrics display with time-series charts, campaign analytics, geographic distribution, and a test click generator for development.
+Click counts are additive over disjoint event sets. Distinct users are not: a user
+who clicks in two hours is still one user for the two-hour interval. Store mergeable
+sets/sketch states when union queries are required, or compute distinct counts from
+canonical raw events. Label approximate results; do not add scalar distinct counts.
 
 ## Database Schema
 
-### PostgreSQL Schema
+The complete **implemented** DDL is in
+[PostgreSQL init.sql](./backend/src/db/init.sql) and
+[ClickHouse clickhouse-init.sql](./backend/db/clickhouse-init.sql).
+These files, not illustrative snippets, define local tables and retention.
 
-The complete schema is defined in `backend/src/db/init.sql`.
+### Local PostgreSQL model
 
-```sql
--- Core entity hierarchy: Advertiser → Campaign → Ad
-CREATE TABLE advertisers (
-    id VARCHAR(50) PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+| Table | Key fields and constraints | Current role |
+|-------|----------------------------|--------------|
+| `advertisers` | `id` PK, name | Metadata |
+| `campaigns` | `id` PK, advertiser FK, status | Metadata |
+| `ads` | `id` PK, campaign FK, creative URL, status | Metadata |
+| `click_events` | Unique `click_id`; optional unique idempotency key; event/fraud metadata | Raw event rows |
+| `click_aggregates_minute/hour/day` | Unique bucket/ad/country/device combination | Legacy tables, not maintained by current ingestion |
 
-CREATE TABLE campaigns (
-    id VARCHAR(50) PRIMARY KEY,
-    advertiser_id VARCHAR(50) NOT NULL REFERENCES advertisers(id),
-    name VARCHAR(255) NOT NULL,
-    status VARCHAR(20) DEFAULT 'active',  -- 'active', 'paused', 'completed'
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+Raw click ad/campaign/advertiser columns do not have foreign keys to the metadata
+hierarchy. Their presence does not prove that a caller supplied a consistent chain.
+The event's `processed_at` is set at PostgreSQL insertion, before downstream work
+finishes, so it is not a reliable projection-completion marker.
 
-CREATE TABLE ads (
-    id VARCHAR(50) PRIMARY KEY,
-    campaign_id VARCHAR(50) NOT NULL REFERENCES campaigns(id),
-    name VARCHAR(255) NOT NULL,
-    creative_url TEXT,
-    status VARCHAR(20) DEFAULT 'active',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Raw click events (audit trail for billing disputes)
-CREATE TABLE click_events (
-    id SERIAL PRIMARY KEY,
-    click_id VARCHAR(50) UNIQUE NOT NULL,
-    ad_id VARCHAR(50) NOT NULL,
-    campaign_id VARCHAR(50) NOT NULL,
-    advertiser_id VARCHAR(50) NOT NULL,
-    user_id VARCHAR(100),
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    device_type VARCHAR(20),
-    os VARCHAR(50),
-    browser VARCHAR(50),
-    country VARCHAR(3),
-    region VARCHAR(50),
-    ip_hash VARCHAR(64),
-    is_fraudulent BOOLEAN DEFAULT FALSE,
-    fraud_reason VARCHAR(255),
-    idempotency_key VARCHAR(64),
-    processed_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Aggregation tables (minute, hour, day) with UPSERT support
-CREATE TABLE click_aggregates_minute (
-    id SERIAL PRIMARY KEY,
-    time_bucket TIMESTAMP WITH TIME ZONE NOT NULL,
-    ad_id VARCHAR(50) NOT NULL,
-    campaign_id VARCHAR(50) NOT NULL,
-    advertiser_id VARCHAR(50) NOT NULL,
-    country VARCHAR(3),
-    device_type VARCHAR(20),
-    click_count BIGINT DEFAULT 0,
-    unique_users BIGINT DEFAULT 0,
-    fraud_count BIGINT DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(time_bucket, ad_id, country, device_type)
-);
--- Identical structure for click_aggregates_hour and click_aggregates_day
-```
-
-#### Index Strategy
-
-| Index | Purpose |
-|-------|---------|
-| `UNIQUE(click_id)` on click_events | Database-level dedup (last line of defense) |
-| `UNIQUE(idempotency_key) WHERE NOT NULL` | Partial index for request-level idempotency |
-| `(advertiser_id, timestamp)` | Advertiser-scoped time-range queries |
-| `(is_fraudulent, timestamp) WHERE is_fraudulent = true` | Fraud analysis on flagged clicks only |
-| `(time_bucket)` on aggregation tables | Time-range aggregation queries |
-| `(campaign_id)` on aggregation tables | Campaign-level filtering |
-| `(created_at)` on all tables | Retention cleanup queries |
-
-### ClickHouse Schema
-
-Defined in `backend/db/clickhouse-init.sql`.
+The durable uniqueness constraints actually include:
 
 ```sql
--- Raw events with columnar storage
-CREATE TABLE click_events (
-    click_id String,
-    ad_id String,
-    campaign_id String,
-    advertiser_id String,
-    user_id Nullable(String),
-    timestamp DateTime64(3),
-    device_type LowCardinality(String) DEFAULT 'unknown',
-    country LowCardinality(String) DEFAULT 'unknown',
-    is_fraudulent UInt8 DEFAULT 0,
-    fraud_reason Nullable(String),
-    processed_at DateTime64(3) DEFAULT now64(3)
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (campaign_id, ad_id, timestamp, click_id)
-TTL timestamp + INTERVAL 90 DAY
-SETTINGS index_granularity = 8192;
-
--- Auto-aggregation via materialized views
-CREATE TABLE click_aggregates_minute (
-    time_bucket DateTime,
-    ad_id String,
-    campaign_id String,
-    advertiser_id String,
-    country LowCardinality(String),
-    device_type LowCardinality(String),
-    click_count UInt64,
-    unique_users UInt64,
-    fraud_count UInt64
-) ENGINE = SummingMergeTree((click_count, fraud_count))
-PARTITION BY toYYYYMM(time_bucket)
-ORDER BY (time_bucket, ad_id, campaign_id, country, device_type)
-TTL time_bucket + INTERVAL 7 DAY;
-
-CREATE MATERIALIZED VIEW click_aggregates_minute_mv
-TO click_aggregates_minute
-AS SELECT
-    toStartOfMinute(timestamp) AS time_bucket,
-    ad_id, campaign_id, advertiser_id, country, device_type,
-    count() AS click_count,
-    uniqExact(user_id) AS unique_users,
-    countIf(is_fraudulent = 1) AS fraud_count
-FROM click_events
-GROUP BY time_bucket, ad_id, campaign_id, advertiser_id, country, device_type;
-
--- Similar tables and views for hour and day granularity
+CREATE UNIQUE INDEX IF NOT EXISTS idx_click_events_idempotency_key
+ON click_events(idempotency_key)
+WHERE idempotency_key IS NOT NULL;
 ```
+
+A unique `click_id` is also declared on the raw table. These protect rows in that
+database; they do not make external Redis increments or ClickHouse inserts atomic.
+
+### Local ClickHouse model
+
+| Table | Engine/aggregation | Declared TTL |
+|-------|--------------------|--------------|
+| `click_events` | MergeTree, monthly partitions, ordered by campaign/ad/time/click | 90 days |
+| `click_aggregates_minute` | SummingMergeTree plus insert-triggered MV | 7 days |
+| `click_aggregates_hour` | SummingMergeTree plus insert-triggered MV | 30 days |
+| `click_aggregates_day` | SummingMergeTree plus insert-triggered MV | 365 days |
+| `campaign_daily_summary` | SummingMergeTree; breakdown arrays initialized empty | 365 days |
+
+Each time-granularity view reads raw inserted blocks directly; hourly and daily
+views are not cascades of the minute view. The analytics service reads these
+rollups, and campaign summaries use the hourly table. TTL deletion happens through
+ClickHouse's lifecycle processing, not an exact per-row deletion timer.
+
+The existing minute/hour/day target engines sum only `click_count` and `fraud_count`.
+Their `unique_users` column contains a block-local `uniqExact` result but is neither
+a grouping key nor a summed/mergeable state. Background merges can retain an
+arbitrary value for that column. Summing its surviving values in queries does not
+recover distinct users. See [SummingMergeTree semantics](https://clickhouse.com/docs/reference/engines/table-engines/mergetree-family/summingmergetree).
+
+`advertiser_id` is grouped in the view but omitted from the target sorting key. If
+an inconsistent caller reuses an ad/campaign under another advertiser, merges can
+also collapse that attribution. Production validation and complete keys are needed.
+
+### Production additions — not implemented
+
+The proposal needs event/request payload fingerprints, transactional outbox records,
+durable consumer progress, versioned fraud decisions, aggregate revisions, and
+report-completeness metadata. Keeping these additions explicit avoids implying that
+the current raw table is already a full audit ledger or a replay protocol.
 
 ## API Design
 
-### Click Ingestion
+### Implemented endpoints
 
-```
-POST /api/v1/clicks
-Headers: Idempotency-Key: <optional-uuid>
-Body: { ad_id, campaign_id, advertiser_id, device_type, country, ... }
-Response: 202 Accepted { click_id, is_duplicate, is_fraudulent }
-```
+| Method | Path | Behavior |
+|--------|------|----------|
+| POST | `/api/v1/clicks` | Zod validation; optional `Idempotency-Key`; 202 or 200 when click-ID duplicate is detected |
+| POST | `/api/v1/clicks/batch` | 1–1,000 events processed sequentially; 202 with per-event outcomes |
+| GET | `/api/v1/analytics/aggregate` | ISO range, entity filters, minute/hour/day granularity, country/device grouping |
+| GET | `/api/v1/analytics/realtime` | ClickHouse minute rollups for requested lookback |
+| GET | `/api/v1/analytics/realtime/global` | Redis global counter hash |
+| GET | `/api/v1/analytics/realtime/campaign/:id` | Redis campaign counter hash |
+| GET | `/api/v1/analytics/realtime/ad/:id` | Redis ad counter hash |
+| GET | `/api/v1/analytics/campaign/:id/summary` | ClickHouse hourly totals and breakdowns |
+| GET | `/api/v1/admin/stats` | PostgreSQL raw-event and metadata counts |
+| GET | `/api/v1/admin/recent-clicks` | PostgreSQL event log |
+| GET | `/api/v1/admin/campaigns`, `/api/v1/admin/ads`, `/api/v1/admin/advertisers` | Metadata lists |
 
-### Analytics Query
+Single-click input requires nonempty ad, campaign, and advertiser IDs. `country` is
+an optional string of at most three characters, not validated as an ISO code.
+`device_type` is optional but, when supplied, must be desktop, mobile, or tablet.
+Validation errors contain `error` and `details`; this is not a flattened form-error API.
 
-```
-GET /api/v1/analytics/aggregate
-    ?campaign_id=camp_789
-    &start_time=2024-01-15T00:00:00Z
-    &end_time=2024-01-15T23:59:59Z
-    &group_by=hour,country
-    &granularity=hour
-Response: { data: [...], total_clicks, query_time_ms }
-```
+An aggregate response contains `data` rows with `time_bucket`, optional country/device,
+`clicks`, `unique_users`, and `fraud_rate`, plus totals and service-measured
+`query_time_ms`. That duration includes application work, not only database execution.
+There is no country-equality filter, billing total, projection watermark, or report
+revision in the current contract. `granularity` selects the time table; `group_by`
+adds country/device dimensions.
 
-### Admin and Monitoring
+### Proposed reporting contract
 
-```
-GET  /health              → Service health (database, redis, clickhouse)
-GET  /health/ready        → Readiness probe
-GET  /health/live         → Liveness probe
-GET  /metrics             → Prometheus metrics
-GET  /api/v1/admin/stats  → System statistics
-```
+Production responses should identify the requested interval, timezone, data-complete
+through time, report revision, metric definitions, and approximation status. Totals
+should describe the whole requested set, independently of chart downsampling or row
+pagination. An accepted test event should show “awaiting analytics” until projection
+visibility is established rather than optimistically increasing an authoritative KPI.
 
 ## Key Design Decisions
 
-### 1. Exactly-Once Semantics via Defense-in-Depth Idempotency
+### Durable acceptance before derived stores
 
-Ad click billing is based on click counts. A 1% duplicate rate on 10M daily clicks means 100K phantom clicks and significant overbilling. We implement three layers of deduplication:
+A synchronous multi-store write is easy to follow locally, but failure after the
+first write leaves partially applied effects. Running those writes in parallel
+would not supply a distributed transaction either. The proposed outbox adds relay
+and replay complexity in exchange for a durable record of work still to be done.
+Redis may accelerate retries, but its TTL cannot define accounting correctness.
 
-1. **Idempotency-Key header (request level)**: Clients include a unique key per logical request. The key is stored in Redis with the response for 5 minutes. Subsequent requests with the same key return the cached response. This catches load balancer retries and network timeouts.
+### Separate operational data from analytical reads
 
-2. **click_id deduplication (click level)**: Redis SETEX with 5-minute TTL tracks processed click IDs. O(1) lookups in the hot path catch duplicate click IDs from different requests.
+PostgreSQL provides transactional constraints and metadata relationships. ClickHouse
+organizes scans and rollups for analytical access patterns. This workload distinction
+motivates the split; it does not mean PostgreSQL cannot aggregate, ClickHouse cannot
+join, or ordinary ClickHouse merges inherently lose raw data. Performance must be
+measured against actual queries, dimensions, batching, and hardware.
 
-3. **PostgreSQL UPSERT (storage level)**: `ON CONFLICT (click_id) DO NOTHING` provides database-level idempotency. This catches edge cases where Redis TTL expires but the click exists in the DB.
+The cost is managing a projection and its lag. At lower volume, PostgreSQL-only
+aggregation may be a better starting point. At sustained high volume, a separate
+analytics path can isolate reporting scans from acceptance writes.
 
-**Why three layers:** Each layer covers a different failure mode. Redis covers the common case (fast, distributed). PostgreSQL covers the edge case where Redis TTL expires. The idempotency header covers the case where the same logical request is retried with a new click_id.
+### Explainable initial fraud rules with correction support
 
-### 2. Hybrid PostgreSQL + ClickHouse Storage
-
-| Data Type | Storage | Rationale |
-|-----------|---------|-----------|
-| Business entities | PostgreSQL | Referential integrity, ACID transactions, joins |
-| Raw click events | PostgreSQL + ClickHouse | PG for audit/billing disputes, CH for analytics |
-| Aggregations | ClickHouse (MVs) | Automatic aggregation, columnar storage, 10-100x faster |
-
-**Why not ClickHouse for everything?** ClickHouse lacks foreign keys, transactions, and UPDATE semantics needed for business entity management. Advertiser account changes need ACID guarantees that ClickHouse cannot provide.
-
-**Why not PostgreSQL for everything?** At 10K writes/sec, PostgreSQL aggregation queries over raw events would require seconds to minutes. ClickHouse's columnar storage and materialized views deliver sub-second aggregations at this scale with 10-100x compression.
-
-### 3. Rule-Based Fraud Detection
-
-**Detection rules:**
-- IP velocity: > 100 clicks/minute from same IP hash flags as fraud
-- User velocity: > 50 clicks/minute from same user flags as fraud
-- Missing device info: clicks without device fingerprint are suspicious
-- Regular timing: clicks at exact intervals suggest bot activity
-
-**Why rule-based over ML:** Rule-based detection is deterministic, auditable, and explainable for billing disputes. ML models would improve detection rates but require training data, model serving infrastructure, and are harder to explain to advertisers disputing charges. Rule-based is the right starting point; ML is a future enhancement.
-
-**Key design choice:** Fraudulent clicks are flagged but stored, never discarded. This preserves the audit trail and allows retroactive analysis if fraud rules are tuned.
+Velocity and missing-metadata rules are a useful starting point because their inputs
+and reasons are inspectable. They can still flag legitimate shared-IP traffic and
+miss distributed abuse. Store the evidence and rule version, keep “flagged” distinct
+from final billing eligibility, and evaluate false positives. ML is an extension
+when evidence and operational needs justify it, not automatically too slow or
+inherently unexplainable.
 
 ## Consistency and Idempotency
 
-### Idempotency Flow
+The current system's guarantees are narrower than the production requirements:
 
-```
-Client Request
-      │
-      ▼
-┌─────────────────┐     ┌─────────────────┐
-│ Check Idempotency│────▶│ Redis: GET      │
-│ Key Header       │     │ idempotency:{key}│
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-    (cache miss)            (cache hit)
-         │                       │
-         ▼                       ▼
-┌─────────────────┐     Return cached
-│ Check click_id  │     response
-│ Redis dedup     │
-└────────┬────────┘
-         │
-    (not duplicate)
-         │
-         ▼
-┌─────────────────┐
-│ Process click   │
-│ PG + ClickHouse │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Cache response  │
-│ in Redis        │
-└─────────────────┘
-```
+| Boundary | What current code does | Consequence |
+|----------|------------------------|-------------|
+| Request key | Read/caches response in Redis for 300 seconds | No atomic request claim or payload comparison |
+| Click ID | Redis `EXISTS`, then later `SETEX` | Concurrent requests can both proceed |
+| PostgreSQL row | `ON CONFLICT (click_id) DO NOTHING` | At most one raw row for a click ID |
+| Downstream effects | Run even if PostgreSQL inserted no row | Duplicate Redis/ClickHouse counts remain possible |
+| Completion | Redis click marker precedes ClickHouse insertion | A retry can skip a missing analytics write |
+| ClickHouse acknowledgement | `async_insert=1`, `wait_for_async_insert=0` | Buffered acknowledgement does not confirm persistence |
 
-### Consistency Guarantees
+The ClickHouse return-mode distinction is documented in its
+[asynchronous-insert reference](https://clickhouse.com/docs/concepts/features/operations/insert/asyncinserts).
+The Compose image is 23.8; newer version-specific deduplication features must not be
+assumed to exist or be configured in this local system.
 
-| Operation | Guarantee | Mechanism |
-|-----------|-----------|-----------|
-| Click ingestion | Exactly-once counting | 3-layer dedup (Redis + PG UPSERT + idempotency key) |
-| Aggregation updates | Atomic increment | PostgreSQL UPSERT with ON CONFLICT; ClickHouse SummingMergeTree |
-| Fraud flagging | Consistent with raw event | Written in same transaction as raw click storage |
+If an idempotency response expires and a retry uses a new click ID with the same
+request key, the PostgreSQL unique request-key index can raise a conflict. The code
+only handles click-ID conflicts, so it does not recover the original result.
 
-## Security
+Flagged events contribute to `click_count` as well as `fraud_count`. The current
+system does not exclude them from a billable ledger. Neither approximate dashboard
+counts nor a total-minus-flags expression is a substitute for reconciled eligibility.
 
-- **IP hashing**: Raw IPs are never stored; SHA-256 hashes used for velocity tracking
-- **Input validation**: Zod schemas validate all incoming click payloads
-- **Rate limiting**: Per-client rate limits prevent ingestion abuse
-- **CORS**: Configured for frontend origin only
-- **Idempotency key validation**: Keys are length-limited and sanitized
+## Security / Auth
+
+Production needs authenticated ingestion, advertiser-scoped authorization, trusted
+metadata resolution, bounded/parameterized queries, and explicit proxy trust.
+The local API has no authentication or tenant isolation. `cors()` is unrestricted,
+`trust proxy` is true, and ClickHouse filters interpolate caller-provided strings.
+Zod type validation does not make interpolated SQL safe.
+
+The single-click route derives a simple noncryptographic IP hash when one is not
+provided; it is not SHA-256 or a claim of anonymization. Clients may provide their
+own hash. Batch ingestion does not perform the same server-side enrichment. Treat
+these as demo fraud inputs, not trustworthy identity or compliance guarantees.
 
 ## Observability
 
-### Prometheus Metrics
+Implemented Pino logging and prom-client metrics cover requests, ingestion outcomes,
+PostgreSQL queries/pool state, some Redis operations, and health checks. Request logs
+carry request IDs, while ingestion creates its own service logger rather than
+propagating a request-scoped logger through every function.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `clicks_received_total` | Counter | Total clicks received (pre-dedup) |
-| `clicks_processed_total` | Counter | Successfully processed clicks |
-| `clicks_deduplicated_total` | Counter | Duplicate clicks caught |
-| `clicks_fraud_detected_total` | Counter | Fraudulent clicks flagged |
-| `click_ingestion_duration_seconds` | Histogram | Ingestion latency distribution |
-| `click_queue_size` | Gauge | Backpressure detection |
-| `click_queue_lag_ms` | Gauge | Processing lag (oldest unprocessed) |
-| `aggregation_updates_total` | Counter | Aggregation table updates by granularity |
-| `aggregation_update_duration_seconds` | Histogram | Aggregation latency |
-| `db_query_duration_seconds` | Histogram | Database query latency by operation |
-| `db_pool_size` | Gauge | Connection pool utilization |
-| `redis_operation_duration_seconds` | Histogram | Redis operation latency |
-| `http_requests_total` | Counter | HTTP requests by method/path/status |
-| `http_request_duration_seconds` | Histogram | HTTP request latency |
+`/health` returns an unconditional process status. `/health/live` adds uptime and
+memory. `/health/ready` pings the three stores, but successful connectivity does not
+validate schema completeness or count agreement.
 
-### Health Checks
+Queue gauges and alert thresholds are declared in
+[shared/metrics.ts](./backend/src/shared/metrics.ts) and
+[shared/config.ts](./backend/src/shared/config.ts). There is no queue worker populating
+queue depth/lag, no Prometheus scraping service in Compose, and no configured alert
+rules. Exporting threshold values is not the same as deploying alerts.
 
-```
-GET /health → { status, services: { database, redis, clickhouse } }
-GET /health/ready → readiness probe (all dependencies connected)
-GET /health/live → liveness probe (process healthy)
-```
-
-### SLI/SLO Targets
-
-| Metric | SLI | SLO Target | Alert Threshold |
-|--------|-----|------------|-----------------|
-| Ingestion latency | p95 of /api/v1/clicks | < 50ms | > 100ms for 5 min |
-| Query latency | p95 of /api/v1/analytics | < 200ms | > 500ms for 5 min |
-| Availability | Successful / total requests | 99.9% | < 99% for 5 min |
-| Dedup accuracy | Duplicates caught / actual | > 99.9% | Audit weekly |
-| Cache hit rate | Redis hits / (hits + misses) | > 95% | < 90% for 15 min |
+Production should measure durable acceptance, oldest unprojected event, projection
+lag, reconciliation mismatches, and late corrections. Dedup cache hit rate should
+reflect retry traffic; a healthy stream of new clicks should mostly miss that cache.
 
 ## Failure Handling
 
-### Redis Failure
+| Failure | Current behavior | Required production behavior |
+|---------|------------------|------------------------------|
+| Redis unavailable | Some cache helpers swallow errors, but dedup/fraud/counter calls can fail ingestion | Explicit degraded policy backed by durable event identity |
+| PostgreSQL write fails | Single route returns 500; later writes do not run | Retryable acceptance failure; no false success |
+| Failure after PostgreSQL commit | Partial raw/counter/analytics state possible | Outbox replay completes pending projection |
+| ClickHouse unavailable at boot | Server startup fails on connection initialization | Read/ingest failure domains separated where appropriate |
+| ClickHouse schema application fails | Error logged; server may still start | Schema validation before readiness |
+| Analytics query fails | Error response; no PostgreSQL fallback | Explicit unavailable/stale data, never fabricated zero |
+| Aggregate correction | No rebuild worker or atomic publication procedure | Build a new revision and switch readers after validation |
 
-**Impact:** Dedup and fraud velocity checks fail. Risk of duplicate counting.
-
-**Mitigation:**
-1. PostgreSQL UPSERT provides backup dedup via `ON CONFLICT (click_id) DO NOTHING`
-2. Log warning and increment `redis_errors_total` metric
-3. Continue ingestion with degraded dedup accuracy
-4. On recovery, warm up Redis from recent PostgreSQL click_ids
-
-### PostgreSQL Failure
-
-**Impact:** Raw click storage and entity lookups fail.
-
-**Mitigation:**
-1. Return 503 to clients (clicks are retryable with idempotency keys)
-2. If Kafka is present, buffer events in the topic for replay after recovery
-3. ClickHouse continues receiving events independently
-
-### ClickHouse Failure
-
-**Impact:** Aggregation queries fail; materialized views stop updating.
-
-**Mitigation:**
-1. Aggregation queries fall back to PostgreSQL aggregation tables (slower but functional)
-2. Raw events continue to PostgreSQL
-3. On recovery, ClickHouse materialized views automatically catch up from buffered inserts
-
-### Data Corruption Recovery
-
-If aggregates drift from raw events (detected by reconciliation checks), rebuild aggregates from raw data:
-1. Identify affected time range via `SUM(raw)` vs `SUM(aggregate)` comparison
-2. Delete affected aggregates
-3. Rebuild from raw events using INSERT...SELECT with GROUP BY
-4. Verify counts match
+ClickHouse does not automatically read missing events from PostgreSQL after recovery.
+A proposed rebuild should use a stable input boundary, reconcile counts, account for
+concurrent arrivals, and publish a new version. Deleting active aggregate ranges and
+blindly replaying while live writes continue can lose or double-count contributions.
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+Measure collector latency, authoritative-store write pressure, stream lag, and query
+cost separately. At sustained high volume, use batched projection writes, retention
+management, and partitions appropriate to query access. Read replicas do not increase
+a PostgreSQL primary's write capacity.
 
-| Component | Scaling Strategy | Bottleneck |
-|-----------|-----------------|------------|
-| Collectors | Stateless, add instances behind LB | Network I/O |
-| Redis | Redis Cluster, shard by click_id hash | Memory |
-| PostgreSQL | Read replicas for analytics; partition click_events by day | Write throughput |
-| ClickHouse | ReplicatedMergeTree + sharding by campaign_id | Disk I/O |
-| Query Service | Stateless, add instances | ClickHouse query capacity |
+Hot campaigns can dominate one aggregation key. Partial aggregation across stable
+subkeys can distribute additive work, with a final combine step; distinct states
+must be unioned, not summed. Sharding only by campaign can still leave the hottest
+campaign on one worker.
 
-### What Breaks First
-
-At 50K clicks/sec, PostgreSQL becomes the bottleneck for raw event writes. Mitigation: partition click_events by day, archive old partitions, consider write-ahead to Kafka with batch inserts.
-
-At 100K clicks/sec, a single Redis instance hits memory limits for dedup keys. Mitigation: Redis Cluster with consistent hashing on click_id.
-
-### Data Lifecycle
-
-```
-Raw Clicks ──▶ Hot (7 days, PG) ──▶ Warm (30 days, compressed) ──▶ Cold (1 year, S3 Parquet) ──▶ Delete
-                    │
-                    ▼
-           Aggregates (permanent, ClickHouse MVs)
-```
+Limit query time ranges, grouping cardinality, result sizes, and concurrent work.
+For charts, return an appropriate time resolution instead of all raw clicks. Start
+with polling at a cadence supported by data freshness; push transport cannot make
+an unprocessed event appear in a report.
 
 ## Trade-offs Summary
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Analytics DB | ClickHouse | PostgreSQL only | 10-100x faster OLAP, auto-aggregation via MVs |
-| Relational DB | PostgreSQL | ClickHouse for all | ACID for business entities, referential integrity |
-| Dedup strategy | Redis + PG UPSERT | Redis only | Defense-in-depth covers Redis TTL expiry edge case |
-| Event processing | Synchronous | Kafka + Flink | Simpler; Kafka is the clear next step for >10K RPS |
-| Fraud detection | Rule-based | ML model | Deterministic, auditable, explainable for billing disputes |
-| Cache | Redis | In-memory | Shared state across collector instances |
-| IP privacy | SHA-256 hash | Raw storage | GDPR compliance, sufficient for velocity tracking |
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-RootLayout (__root.tsx: Navigation + Outlet)
-├── Dashboard (/)
-│   ├── StatCard (x7: total clicks, 24h clicks, 1h clicks, fraud rate, campaigns, ads, advertisers)
-│   ├── ClickChart (Recharts line chart: clicks over last 60 minutes)
-│   ├── StatCard (x2: clicks per minute avg, total last 60 min)
-│   └── ClickTable (last 10 click events with fraud indicators)
-├── Analytics (/analytics)
-│   ├── Query Form (time range pickers, granularity selector, group-by toggles)
-│   ├── StatCard (x3: total clicks, unique users, query time)
-│   ├── ClickChart (time-series results)
-│   ├── BarChart (top countries, conditional on group-by)
-│   └── Results Table (scrollable, dynamically columns based on group-by)
-├── Campaigns (/campaigns)
-│   ├── Campaign List (selectable sidebar with status badges)
-│   ├── StatCard (x4: total clicks, unique users, fraud clicks, fraud rate)
-│   ├── BarChart (clicks by country)
-│   └── PieChart (clicks by device type)
-├── Clicks (/clicks)
-│   ├── Filter controls (limit selector, fraud-only checkbox, refresh button)
-│   └── ClickTable (full click event list with fraud flags)
-└── Test (/test)
-    ├── TestClickForm (single click and batch generation forms)
-    └── Documentation cards (usage instructions and testing tips)
-```
-
-### Routing
-
-TanStack Router with file-based routing (auto-generated `routeTree.gen.ts`). The root layout in `__root.tsx` renders a `Navigation` bar and an `<Outlet />` for child routes:
-
-| Route | Component | Purpose |
-|-------|-----------|---------|
-| `/` | Dashboard | KPI overview with auto-refresh (30-second interval) |
-| `/analytics` | Analytics | Interactive OLAP query builder with chart visualization |
-| `/campaigns` | Campaigns | Campaign selection with detail panels and breakdowns |
-| `/clicks` | Clicks | Raw click event viewer with fraud filtering |
-| `/test` | Test | Click generation tools for development testing |
-
-### Zustand Store
-
-A single store (`useDashboardStore`) in `frontend/src/stores/dashboardStore.ts` manages all dashboard state:
-
-| State Field | Type | Source Endpoint |
-|-------------|------|-----------------|
-| `stats` | `SystemStats` | `GET /api/v1/admin/stats` |
-| `realTimeStats` | `RealTimeStats` | `GET /api/v1/analytics/realtime` |
-| `campaigns` | `Campaign[]` | `GET /api/v1/admin/campaigns` |
-| `ads` | `Ad[]` | `GET /api/v1/admin/ads` |
-| `recentClicks` | `ClickEvent[]` | `GET /api/v1/admin/recent-clicks` |
-
-A `refreshAll()` action fetches all five data sources in parallel using `Promise.all()`. The Dashboard calls `refreshAll()` on mount and every 30 seconds. The store also tracks `isLoading`, `error`, and `lastUpdated` for user feedback.
-
-Unlike the web-crawler store which has per-domain loading states, this store uses a single `isLoading` flag for the full refresh cycle, which simplifies the implementation but means partial refreshes are not independently trackable.
-
-### Data Fetching
-
-API functions are exported individually from `frontend/src/services/api.ts` (not as a single object). A generic `fetchJson<T>()` wrapper handles JSON parsing and error extraction. The API client covers three categories: admin endpoints (stats, campaigns, ads, recent clicks), analytics endpoints (aggregate queries, campaign summaries, real-time stats), and click ingestion (single and batch test clicks).
-
-### Key UI Patterns
-
-- **Recharts visualizations**: Line charts (`ClickChart`) for time-series data, bar charts for geographic distribution, and pie charts for device type breakdowns
-- **Query builder**: The Analytics page provides an interactive form with datetime pickers, granularity dropdown (minute/hour/day), and toggle buttons for group-by dimensions (country, device_type). Results include query execution time for performance visibility
-- **Master-detail layout**: The Campaigns page uses a sidebar list pattern -- selecting a campaign loads a detail view with stats and charts in the main panel
-- **Fraud highlighting**: Click tables color-code fraud rate values (red above 5%, green below) and provide a "fraud only" filter checkbox
-- **Batch test generation**: The Test page allows sending multiple randomized clicks for populating sample data, with inline documentation cards explaining fraud detection behavior
-- **Auto-refresh with timestamp**: The Dashboard shows "Last updated: HH:MM:SS" and a manual refresh button alongside the auto-refresh interval
-
-## Deep Pattern Explanations
-
-This section explains the production-grade patterns used in this project for readers unfamiliar with them.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the primary database. On a "hit," data is returned from cache immediately. On a "miss," the application queries the database, stores the result in the cache with a TTL (time-to-live expiration), and then returns it. The cache is never populated proactively -- it fills up as data is requested.
-
-In this project, Redis serves as the cache layer for click deduplication. When a click arrives, the collector checks Redis for the `click_id` using `SETEX` with a 5-minute TTL. If the key exists, the click is a duplicate. If not, the key is set and the click proceeds to processing. The 5-minute TTL balances memory usage against the window in which duplicate clicks are likely to arrive. After TTL expiry, the PostgreSQL `UNIQUE(click_id)` constraint serves as the backup dedup layer.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In ad click billing, this is critical -- a duplicated click means overcharging an advertiser. Network timeouts, load balancer retries, and client-side retries can all cause the same click event to arrive at the server multiple times.
-
-This project implements three-layer idempotency: (1) An optional `Idempotency-Key` HTTP header allows clients to tag requests with a unique key. The server caches the response in Redis; subsequent requests with the same key return the cached response without reprocessing. (2) Redis `SETEX` on the `click_id` prevents the same click from being processed twice within a 5-minute window. (3) PostgreSQL `INSERT ... ON CONFLICT (click_id) DO NOTHING` catches any duplicates that slip through after the Redis TTL expires. Each layer covers a different failure mode, providing defense-in-depth.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Instead of `"Processed click abc123 for campaign xyz in 12ms"`, a structured log entry looks like `{"level":"info","clickId":"abc123","campaignId":"xyz","durationMs":12,"event":"click_processed"}`. Each field is independently searchable and filterable.
-
-This project uses Pino, a high-performance Node.js JSON logger. Request-scoped child loggers carry contextual fields (clickId, adId, campaignId, durationMs) through the entire processing pipeline. In development, `pino-pretty` reformats JSON into colored human-readable output. In production, the raw JSON would be ingested by a log aggregation system like Elasticsearch, enabling queries like "show all clicks for campaign xyz where durationMs > 100."
-
-### Prometheus Metrics
-
-Prometheus is a pull-based monitoring system that collects numerical time-series data by periodically scraping an HTTP endpoint. The application exposes metrics at `GET /metrics` in Prometheus exposition format. A Prometheus server fetches this endpoint (typically every 15-30 seconds) and stores the data, enabling dashboards (Grafana) and alerting rules.
-
-Four metric types exist: Counter (monotonically increasing, like `clicks_received_total`), Gauge (can go up or down, like `click_queue_size`), Histogram (distribution of values in buckets, like `click_ingestion_duration_seconds`), and Summary (calculates quantiles client-side). This project uses `prom-client` and exposes 20+ metrics covering click ingestion throughput, deduplication counts, fraud detection rates, aggregation performance, database query latency, Redis operation latency, and HTTP request patterns.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether a service is functioning correctly. They are called by load balancers (to decide whether to route traffic to an instance), container orchestrators (to decide whether to restart a container), and monitoring systems (to trigger alerts).
-
-This project exposes three health endpoints: `GET /health` (comprehensive status of all dependencies), `GET /health/ready` (readiness probe -- are all databases connected and ready to accept traffic?), and `GET /health/live` (liveness probe -- is the process itself healthy?). The readiness probe checks PostgreSQL, Redis, and ClickHouse connectivity. The distinction matters in Kubernetes: a failing liveness probe restarts the container, while a failing readiness probe temporarily removes it from the load balancer without restarting -- useful during database maintenance windows when the service is alive but cannot serve requests.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. In an ad click system, rate limiting serves double duty: it protects the ingestion service from being overwhelmed, and it doubles as the first layer of fraud detection (high click velocity from a single IP is a strong fraud signal).
-
-This project uses Redis-backed rate limiting with `INCR` and `EXPIRE` commands. For each client IP, a counter key `ratelimit:ip:{ip_hash}` is incremented with a 1-minute TTL. If the count exceeds 100 clicks per minute, the click is flagged as potentially fraudulent. The same pattern applies per-user with a 50 clicks/minute threshold. Critically, rate-limited clicks are not rejected -- they are flagged as fraudulent and stored, preserving the audit trail for billing dispute resolution.
-
-### Circuit Breaker
-
-A circuit breaker is a pattern that detects repeated failures to an external service and stops sending requests to it, preventing wasted resources and cascading failures. It has three states: Closed (normal, requests pass through), Open (failures exceeded threshold, requests immediately fail without attempting the call), and Half-Open (after a cooldown, one test request is allowed to check if the service recovered).
-
-While this project's architecture document notes circuit breakers as a production recommendation, they are not implemented in the local version. The reason is pragmatic: the local setup has a single ClickHouse and single PostgreSQL instance, and circuit-breaking would provide little value with only one downstream target. In production with multiple collector instances writing to multiple database shards, a circuit breaker on each database connection would prevent a single slow shard from backing up all collectors.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is a method of restricting system access based on assigned roles rather than individual user permissions. Roles like "advertiser," "analyst," and "admin" each carry a defined set of permissions. When a user authenticates, their role determines which API endpoints they can access.
-
-This project does not implement RBAC in the local version (the API is open), but the production architecture calls for it. The key reason is advertiser isolation: advertiser A should only see click data for their own campaigns, not advertiser B's data. RBAC would be implemented as Express middleware that extracts the user's role from a session or JWT, checks it against the required role for the endpoint, and returns 403 Forbidden if unauthorized.
+| Decision | Chosen in production proposal | Alternative | Rationale |
+|----------|-------------------------------|-------------|-----------|
+| Acceptance | Authoritative transaction plus outbox | Direct writes to several stores | Preserve retryable work across partial failure |
+| Analytics | Rebuildable ClickHouse projection | PostgreSQL-only reporting | Isolate analytical access at sustained volume |
+| Sink updates | Versioned absolute bucket snapshots | Replayed additive increments | Make retries and late revisions distinguishable |
+| Distinct users | Mergeable state or canonical distinct query | Sum scalar per-bucket counts | Preserve set-union semantics |
+| Fraud | Versioned rules with later corrections | Treat a live flag as final billing | Retain evidence and allow false-positive review |
+| Dashboard updates | Poll with freshness metadata | Immediate push of every click | Match aggregate freshness and bound UI work |
 
 ## Implementation Notes
 
-This section maps the production architecture to what actually runs locally with Docker + Node.js + React.
+### What actually runs
 
-### Local Architecture
+One [Express entry point](./backend/src/index.ts) serves all route groups. PostgreSQL,
+Valkey, and ClickHouse are single instances with named volumes in
+[docker-compose.yml](./docker-compose.yml). The backend default is port 3000; explicit
+multi-instance scripts use 3001–3003. Vite serves 5173 and proxies `/api` to 3000.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Local Machine                               │
-│                                                                  │
-│  ┌─────────────┐    ┌──────────────────────────────────────┐    │
-│  │  Frontend    │    │         Backend (Express)             │    │
-│  │  Vite :5173  │───▶│  :3001 (dev) or :3001-3003           │    │
-│  │  React +     │    │                                      │    │
-│  │  Recharts    │    │  Routes: clicks, analytics, admin     │    │
-│  └─────────────┘    └──────────┬───────────┬───────────┬────┘    │
-│                                │           │           │         │
-│                       ┌────────▼──┐  ┌─────▼─────┐ ┌──▼───────┐ │
-│                       │ PostgreSQL│  │   Redis   │ │ClickHouse│ │
-│                       │   :5432   │  │   :6379   │ │  :8123   │ │
-│                       │ adclick   │  │  (Valkey) │ │  :9000   │ │
-│                       └───────────┘  └───────────┘ └──────────┘ │
-│                                                                  │
-│                       docker-compose up -d                       │
-└─────────────────────────────────────────────────────────────────┘
+[click-ingestion.ts](./backend/src/services/click-ingestion.ts) performs this sequence:
+request-cache lookup, click-ID check, fraud assessment, PostgreSQL insert, Redis
+processed marker, Redis counters/HLL, ClickHouse insertion, then response caching.
+The PostgreSQL write is not parallel with ClickHouse and its affected-row result is
+not used to gate later steps.
+
+```typescript
+// Existing row-level protection; later effects still run after this call.
+await storeClickEvent(clickEvent, idempotencyKey);
+await markClickProcessed(clickId);
 ```
 
-### Production-Grade Patterns Implemented
+The transaction helper in [database.ts](./backend/src/services/database.ts) is not
+used to make this ingestion sequence atomic. The batch route loops through events
+sequentially and catches individual errors; its HTTP 202 can contain failed results.
 
-| Pattern | File(s) | Description |
-|---------|---------|-------------|
-| Prometheus metrics (prom-client) | `src/shared/metrics.ts` | 20+ metrics covering ingestion, aggregation, cache, HTTP, and health. Exposed at `GET /metrics`. |
-| Structured JSON logging (Pino) | `src/shared/logger.ts` | Request-scoped child loggers with structured fields (clickId, adId, campaignId, durationMs). Pretty-print in dev, JSON in production. |
-| Idempotency (3-layer dedup) | `src/routes/clicks.ts`, `src/services/redis.ts`, `src/services/click-ingestion.ts` | Idempotency-Key header + Redis SETEX dedup + PostgreSQL UPSERT. |
-| Fraud detection | `src/services/fraud-detection.ts` | IP and user velocity checks via Redis INCR with TTL. |
-| Health checks | `src/index.ts` | `/health`, `/health/ready`, `/health/live` endpoints checking PG, Redis, and ClickHouse connectivity. |
-| Configurable thresholds | `src/shared/config.ts` | Retention policies, alert thresholds, SLO targets, and idempotency config as typed constants. |
-| ClickHouse materialized views | `backend/db/clickhouse-init.sql` | Auto-aggregation at minute, hour, and day granularity using SummingMergeTree. |
-| Zod validation | `src/routes/clicks.ts` | Schema validation on all click ingestion payloads. |
-| Multi-instance support | `package.json` scripts | `dev:server1` (:3001), `dev:server2` (:3002), `dev:server3` (:3003) for testing distributed behavior. |
+### Implemented patterns and their boundaries
 
-### Simplifications from Production Design
+| Pattern | Source | Why it matters and local limit |
+|---------|--------|--------------------------------|
+| Row uniqueness and response caching | `services/click-ingestion.ts`, `services/redis.ts` | Reduce common retries; do not cover all side effects |
+| Fraud velocity counters | `services/fraud-detection.ts`, `services/redis.ts` | Explainable signals; fixed expiry from first event, not a sliding window |
+| Columnar rollups | `backend/db/clickhouse-init.sql` | Avoid repeated raw scans; current distinct-user representation is incorrect |
+| Structured logging | `shared/logger.ts` | Searchable service/request context; no complete cross-service trace |
+| Prometheus exposition | `shared/metrics.ts`, `src/index.ts` | Observable local request behavior; no deployed collector or alerts |
+| Input schemas | `routes/clicks.ts`, `routes/analytics.ts` | Validate payload shape; no complete ownership or SQL-safety enforcement |
 
-| Production Design | Local Substitute | Impact |
-|-------------------|-----------------|--------|
-| CDN + L7 Load Balancer | Direct HTTP to Express | No TLS termination, no geographic routing |
-| Kafka event stream | Synchronous writes | Higher per-request latency; no event replay |
-| Redis Cluster (sharded) | Single Valkey instance (:6379) | No sharding; single point of failure |
-| PostgreSQL with read replicas | Single PostgreSQL (:5432) | No read scaling; same instance for writes and analytics |
-| ClickHouse cluster (ReplicatedMergeTree) | Single ClickHouse (:8123/:9000) | No replication; data loss risk on container restart |
-| S3/MinIO for cold storage | Not implemented | No archival pipeline; all data stays in hot storage |
-| Prometheus + Grafana dashboards | Metrics endpoint only | Metrics exposed but no scraping or visualization infrastructure |
-| OAuth/JWT authentication | No authentication | API is open; no user/advertiser isolation |
-| Circuit breakers (Opossum) | Not implemented | No automatic failure isolation for downstream calls |
+Fraud thresholds are hard-coded at more than 100 IP clicks or 50 user clicks within
+a 60-second first-event expiry window. Timing checks flag millisecond values 0 and
+500, not repeated inter-click intervals. Missing device, OS, and browser together
+also trigger a signal. Known-bad sets are process-local. The generic rate-limit
+helper is unused by the routes; fraud flags do not reject traffic.
 
-### What Was Omitted
+Redis HLL keys are per ad/minute with a two-hour TTL. Real-time counters are hashes
+whose whole-key TTL is renewed on every event; old bucket fields can remain as long
+as a key stays active. Declared retention constants do not trim those fields or
+schedule PostgreSQL archival.
 
-- **Kafka**: Would sit between collectors and databases, enabling async writes, replay, and backpressure. The clear next scaling step.
-- **Stream processing (Flink/Spark)**: For complex aggregations, windowed fraud detection, and late-arriving event handling.
-- **Multi-region deployment**: Geographic distribution with per-region collectors and cross-region replication.
-- **Data archival pipeline**: S3/Parquet export for cold storage with partition management.
-- **ML fraud detection**: Model training pipeline, feature engineering, and real-time scoring.
-- **User authentication and authorization**: Advertiser-scoped access control and API key management.
-- **Kubernetes/container orchestration**: Auto-scaling, rolling deployments, health-based routing.
-- **Grafana dashboards**: Visual monitoring of the Prometheus metrics already being collected.
+### Frontend behavior
+
+[dashboardStore.ts](./frontend/src/stores/dashboardStore.ts) refreshes five sources
+concurrently: PostgreSQL stats, ClickHouse recent rollups, campaign/ad metadata, and
+PostgreSQL recent events. Each fetch catches its own errors. A later successful
+fetch can clear a prior error, and `lastUpdated` advances even after a partial failure;
+it is a client refresh timestamp, not a data-completeness watermark.
+
+The [home route](./frontend/src/routes/index.tsx) refreshes every 30 seconds and uses
+a whole-store subscription. [ClickChart](./frontend/src/components/ClickChart.tsx)
+is a Recharts line chart with local-time tick labels; it has no implemented zoom,
+LTTB downsampling, or chart-specific accessibility summary. The analytics route owns
+its own form/results state and supports country/device grouping. Campaign selection
+fetches a seven-day summary. The test component sends a single event or a fixed-size
+batch, not a continuously rate-controlled stream.
+
+### Setup and omitted pieces
+
+PostgreSQL's first-start schema and the explicit SQL paths are documented in
+[README.md](./README.md). There is no backend migration or unit-test script. The
+historical seed populates PostgreSQL only and contains a country value longer than
+the raw table allows; the README uses minimal valid entity inserts followed by
+API-generated events so the documented demo does not depend on that seed.
+
+No Kafka, outbox, durable retry worker, projection reconciliation, fraud revision
+ledger, archival pipeline, authentication, circuit breaker, or automatic analytics
+fallback is wired into the local app. Single-node ClickHouse data persists through
+ordinary container restarts via its volume, but replication and backups are absent.
+Its SQL TTLs, not the unused longer-duration constants, govern analytics retention.
+
+This review traced source and configuration. It did not run the stack or establish
+throughput, latency, durability, billing correctness, or successful failure recovery.

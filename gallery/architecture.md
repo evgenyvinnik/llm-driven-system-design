@@ -1,532 +1,339 @@
-# Gallery - Architecture
+# Gallery architecture
 
 ## System Overview
 
-A production-scale image gallery service supporting billions of images with multiple layout paradigms, real-time uploads, and global delivery. The learning focus is on image storage pipelines, responsive layouts, CDN distribution, and frontend rendering performance.
+Gallery is a **frontend-only layout demonstration**: 50 hardcoded image IDs, three views, a shared overlay, and direct browser requests to an external placeholder service. There is no backend, database, processing worker, or API client in this project. Its main learning value is comparing layout, image-loading, state, and keyboard behavior.
 
-**Learning Goals:**
-- Design image storage and processing pipelines at scale
-- Implement performant gallery layouts (slideshow, masonry, tiles)
-- Handle responsive image delivery with appropriate sizing
-- Build keyboard-accessible, mobile-responsive UI components
-
----
+This document separates a proposed production growth path from the exact local implementation in the final section. The proposed service would replace the fixed manifest with owned gallery metadata and a processing/delivery pipeline; it is not software already present in the repository. [README.md](./README.md) is the setup and feature guide.
 
 ## Requirements
 
-### Functional Requirements
+### Proposed production scope
 
-1. **Browse**: View images in three layout modes (slideshow, masonry, tiles)
-2. **Upload**: Users upload images with automatic resizing and format conversion
-3. **Lightbox**: Full-screen image viewing with keyboard navigation
-4. **Search**: Find images by metadata, tags, and visual similarity
-5. **Organize**: Albums, favorites, and tag management
-6. **Share**: Public/private sharing with link generation
+Browse galleries in tiles, masonry, and slideshow modes; open a keyboard-operable lightbox; upload supported still images; generate useful display variants; and expose processing/failed/ready states. Owners manage their galleries, which may be private or public under a defined revocation policy. Search, visual similarity, social features, arbitrary editing, and collaborative albums are separate extensions.
 
-### Non-Functional Requirements
+| Requirement | Proposed target |
+|---|---|
+| Metadata API | p95 below 150 ms within one region at admitted load |
+| First visible image | p75 LCP below 2.5 s on a specified mobile/network benchmark |
+| Layout stability | p75 CLS below 0.1, with space reserved before image arrival |
+| Interaction | p95 navigation response below 100 ms locally, excluding uncached image transfer |
+| Publication | Typical supported 5 MB still image ready within 10 s at admitted load |
+| Availability | 99.9% for browsing; uploads may queue during transient processing outages |
+| Correctness | A ready image references verified durable variants; retries do not duplicate publication/quota charges |
+| Accessibility | Modal focus containment/restoration, meaningful controls, controlled autoplay, reduced-motion behavior |
 
-- **Scale**: 10B+ images, 100M daily active users
-- **Latency**: p99 < 200ms for gallery page load (above-the-fold)
-- **Availability**: 99.9% for reads, 99.5% for uploads
-- **Storage**: Efficient multi-resolution storage with WebP/AVIF conversion
-- **Bandwidth**: Serve appropriate image sizes per device (responsive images)
-- **Accessibility**: Full keyboard navigation, screen reader support, ARIA labels
-
----
+These are proposed engineering objectives, not measurements or certification. “Page load below 200 ms globally” is not a useful promise without device, network, bytes, and percentile boundaries.
 
 ## Capacity Estimation
 
-| Metric | Value |
-|--------|-------|
-| Total images | 10B |
-| Daily uploads | 50M |
-| Daily views | 5B |
-| Average original image size | 5 MB |
-| Resized variants per image | 5 (thumbnail, small, medium, large, original) |
-| Total raw storage | 50 PB (originals) + 25 PB (variants) |
-| CDN egress/day | ~2 PB |
-| Read QPS (peak) | 500K |
-| Write QPS (peak) | 5K |
+Example production assumptions: 100 million stored originals, one million uploads/day, 100 million delivered images/day, 5 MB per original, and 200 KB average delivered variant. Use decimal units and a 5× traffic peak for this sketch.
 
----
+| Quantity | Calculation | Planning consequence |
+|---|---|---|
+| Original storage | 100M × 5 MB = 500 TB | Add variant, index, backup, and replication budgets separately |
+| Original ingress | 1M × 5 MB = 5 TB/day | Upload bytes should bypass the metadata API |
+| Upload rate | 1M / 86,400 ≈ 11.6/s average, 58/s peak | Admit by bytes and decoded pixels as well as request count |
+| Image delivery | 100M / 86,400 ≈ 1,157/s average, 5,787/s peak | CDN reduces origin traffic, not client bandwidth |
+| Delivered bytes | 100M × 200 KB = 20 TB/day | Measure real codec/crop distributions before projecting cost |
+| Optional eight variant outputs | 1M × 8 = 8M/day | This is an output count, not a requirement for eight independent jobs |
+
+Variant storage cannot be inferred as a fixed percentage of originals. Photo content, dimensions, codec, quality, and crop profile change the result. No provider prices or universal compression ratios are assumed.
+
+### Local Development Scale
+
+There are 50 image IDs, 10–59. Tiles/masonry each mount all 50 image buttons. Slideshow mounts a main image plus 50 eager thumbnail images. There is no pagination, virtualized DOM, owned image cache, upload traffic, or local data service.
 
 ## High-Level Architecture
 
+The proposed API authenticates users, returns authorized metadata, and creates durable upload sessions. Browsers upload directly to staging storage. Finalization binds a verified immutable input version and records processing work in a transactional outbox. Workers decode and transform the input, publish a variant manifest, and expose ready images through authorized CDN delivery.
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│          Browser │ Mobile App │ Embedded Widget                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         CDN                                     │
-│        (Resized images, thumbnails, WebP/AVIF variants)         │
-│        CloudFront + 300 edge locations                          │
-│        Cache-Control: public, max-age=31536000, immutable       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway / Load Balancer                   │
-│               Rate limiting, auth, routing                      │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Gallery Service│    │Upload Service │    │Search Service │
-│               │    │               │    │               │
-│ - Browse      │    │ - Receive     │    │ - Tag search  │
-│ - Albums      │    │ - Validate    │    │ - Metadata    │
-│ - Favorites   │    │ - Queue       │    │ - Visual sim  │
-└───────────────┘    └───────────────┘    └───────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Image Processing Pipeline                     │
-│     ┌──────────┐    ┌──────────┐    ┌──────────┐              │
-│     │ Resize   │───▶│ Convert  │───▶│ Optimize │              │
-│     │ (5 sizes)│    │(WebP,AVIF)│   │(quality) │              │
-│     └──────────┘    └──────────┘    └──────────┘              │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌──────────────┬──────────────┬──────────────┬────────────────────┐
-│  PostgreSQL  │    Redis     │Elasticsearch │   Object Storage   │
-│  (metadata,  │  (cache,     │  (search,    │   (S3: originals   │
-│   albums,    │   sessions,  │   tags)      │    + variants)     │
-│   users)     │   rate limit)│              │                    │
-└──────────────┴──────────────┴──────────────┴────────────────────┘
+┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
+│     Browser gallery     │ ──▶ │  Metadata / upload API  │ ──▶ │   PostgreSQL + outbox   │
+└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
+
+┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
+│  Staged object storage  │ ──▶ │    Processing workers   │ ──▶ │      Variants + CDN     │
+└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
 ```
 
----
+The upper row is the metadata/coordination path; the lower row is the image-byte path. An outbox dispatcher feeds the processing queue from committed SQL rows. The browser obtains upload authority from the API and sends bytes to staging storage directly. Display requests travel to the CDN, which retrieves verified variants from private origin storage.
 
-## Core Components
+## Core Components / Request Flows
 
-### 1. Image Storage Pipeline
+### Browse and display — proposed
 
-Uploaded images go through a multi-stage processing pipeline:
+1. Authorize the gallery and fetch a bounded metadata page in stable order.
+2. Return image ID, generation, alt/caption, oriented dimensions, available variant descriptors, and opaque next cursor.
+3. Reserve each layout slot before fetching image bytes. Use square crops for tiles and aspect-preserving variants for masonry/lightbox.
+4. Let the browser select a candidate from format-specific responsive sources using an accurate display-size hint.
+5. Load the first visible/hero image eagerly, defer offscreen grid images, and keep an error/retry placeholder within the reserved slot.
 
-1. **Receive** -- Upload service accepts the original file, validates format (JPEG, PNG, HEIC, WebP) and size (<50 MB), generates a unique content-addressed key (SHA-256 hash of content)
-2. **Store original** -- Write original to S3 with content-addressed key (enables deduplication)
-3. **Queue for processing** -- Publish message to image processing queue
-4. **Resize** -- Generate 5 size variants:
-   - Thumbnail: 80x60 (gallery grid)
-   - Small: 300x300 (tiles view)
-   - Medium: 800x600 (masonry view)
-   - Large: 1920x1080 (lightbox/slideshow)
-   - Original: preserved as-is
-5. **Convert** -- Generate WebP and AVIF variants for each size (60-70% smaller than JPEG)
-6. **Optimize** -- Apply perceptual quality optimization (target SSIM > 0.95)
-7. **Update metadata** -- Write image record to PostgreSQL with all variant URLs
-8. **CDN invalidation** -- Push variants to CDN edge locations
+Metadata requests and image requests have separate timing/error states. A successful gallery API response does not imply every picture decoded. Slideshow navigation can update controls immediately while a new image loads; stale load events are ignored using image ID and request generation.
 
-### 2. Gallery Layouts
+### Upload and publication — proposed
 
-Three layout paradigms serve different browsing needs:
+The upload session reserves quota atomically and binds owner, gallery, request digest, maximum bytes, expiry, and a generated staging key. A repeated owner-scoped request key returns the same session, while changed content under the same key is rejected. The client never chooses another tenant's object key.
 
-**Slideshow View:**
-- Full-screen single image display with left/right navigation
-- Thumbnail strip for quick jumping
-- Auto-play with configurable interval (3-10 seconds)
-- Keyboard: arrows for navigation, space for play/pause, escape to exit
-- Preloads adjacent images for instant transitions
+After transfer, finalization verifies ownership, actual bytes, and an immutable object version. A mutable staging URL cannot remain a source the worker trusts after verification: capture a storage version or copy the verified input to an immutable private key. The session transition and outbox event commit together; SQL commit alone cannot roll back an earlier object upload.
 
-**Masonry Grid View:**
-- Pinterest-style variable-height columns using CSS `columns` property
-- Column count responsive to viewport (1 on mobile, 2-4 on desktop)
-- `break-inside: avoid` prevents image splitting across columns
-- Lazy loading with native `loading="lazy"` attribute
-- Column-first ordering (acceptable trade-off: simpler than JS-computed row-first masonry)
+Workers validate decoded type, pixel/frame limits, orientation, and resource budgets before publishing. Generate a small fixed catalog of output profiles and version their transformations. JPEG/PNG fallback and selected WebP profiles can be required initially; AVIF is an optional optimization based on measured benefit. A slow optional codec should not block all useful display variants.
 
-**Tiles Grid View:**
-- Uniform square grid using CSS Grid with `aspect-ratio: 1`
-- Responsive column count via `repeat(auto-fill, minmax(200px, 1fr))`
-- Images cropped with `object-fit: cover`
-- Hover effect with scale transform for interactivity
+Write outputs before committing their verified manifest. Publication conditionally checks the current image generation/state so a late worker cannot revive a deleted or superseded image. In that transaction, mark ready, record dimensions/variants, and convert reserved quota to used bytes once. Duplicate delivery sees the completed generation. Orphan input/output objects require delayed cleanup and reconciliation.
 
-### 3. Responsive Image Delivery
+### Gallery ordering — proposed
 
-Serving the right image size per context minimizes bandwidth:
+Use keyset pagination over immutable creation order plus unique image ID for the initial product. Bind the opaque cursor to gallery, sort, viewer/access context, and a listing revision policy. For an exact browsing session, reject/reset when membership/order revision changes; immutable published manifests are another option. A cursor alone does not freeze a changing collection.
 
-| Context | Resolution | Format Priority |
-|---------|-----------|-----------------|
-| Thumbnail strip | 80x60 | WebP > JPEG |
-| Tiles grid | 300x300 | WebP > JPEG |
-| Masonry grid | 400xVariable | WebP > JPEG |
-| Slideshow main | 1200x675 | AVIF > WebP > JPEG |
-| Lightbox full | 1920x1080 | AVIF > WebP > JPEG |
-
-The frontend uses `<picture>` elements with `<source>` tags for format negotiation, and `srcset` with `sizes` for resolution selection. The CDN caches each variant independently.
-
-### 4. Search and Discovery
-
-- **Tag search**: Elasticsearch index on image tags, titles, descriptions
-- **Visual similarity**: Feature vectors extracted by a CNN (ResNet-50), stored in a vector database for approximate nearest neighbor search
-- **Temporal browsing**: Images organized by date with efficient range queries
-
----
+The frontend keeps a selected image ID, not merely an array offset. Loading the next page, changing layout, or removing an item must not silently select a different photo. Lightbox navigation fetches neighbors through the same listing context and does not wrap from the end of one loaded page to its beginning as if the entire gallery ended there.
 
 ## Database Schema
 
+**No local schema exists.** The following is a compact proposed PostgreSQL foundation for a future upload-backed gallery. It is illustrative design DDL, not an existing migration or a requirement for running the frontend. Authorization, outbox claiming, worker leases, object verification, and quota transitions still need application transactions.
+
 ```sql
--- Users
 CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  username VARCHAR(100) UNIQUE NOT NULL,
-  email VARCHAR(200) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  avatar_url VARCHAR(500),
-  storage_quota_bytes BIGINT DEFAULT 10737418240, -- 10 GB
-  storage_used_bytes BIGINT DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW()
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  quota_bytes BIGINT NOT NULL CHECK (quota_bytes >= 0),
+  used_bytes BIGINT NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
+  reserved_bytes BIGINT NOT NULL DEFAULT 0 CHECK (reserved_bytes >= 0),
+  CHECK (used_bytes + reserved_bytes <= quota_bytes)
 );
 
--- Images
+CREATE TABLE galleries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id UUID NOT NULL REFERENCES users(id),
+  title TEXT NOT NULL,
+  visibility TEXT NOT NULL DEFAULT 'private'
+    CHECK (visibility IN ('private', 'public')),
+  listing_revision BIGINT NOT NULL DEFAULT 0 CHECK (listing_revision >= 0),
+  access_revision BIGINT NOT NULL DEFAULT 0 CHECK (access_revision >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX galleries_owner_created ON galleries(owner_id, created_at DESC, id DESC)
+  WHERE deleted_at IS NULL;
+
 CREATE TABLE images (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id),
-  content_hash VARCHAR(64) NOT NULL, -- SHA-256 for dedup
-  original_filename VARCHAR(500),
-  mime_type VARCHAR(50) NOT NULL,
-  width INTEGER NOT NULL,
-  height INTEGER NOT NULL,
-  size_bytes BIGINT NOT NULL,
-  title VARCHAR(200),
-  description TEXT,
-  tags TEXT[],
-  exif_data JSONB,
-  variants JSONB NOT NULL, -- { "thumbnail": "url", "small": "url", ... }
-  is_public BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  gallery_id UUID NOT NULL REFERENCES galleries(id),
+  generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'processing', 'ready', 'failed', 'deleted')),
+  original_key TEXT,
+  input_version TEXT,
+  content_sha256 TEXT,
+  width INTEGER CHECK (width > 0),
+  height INTEGER CHECK (height > 0),
+  original_bytes BIGINT CHECK (original_bytes >= 0),
+  alt_text TEXT NOT NULL DEFAULT '',
+  caption TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at TIMESTAMPTZ,
+  CHECK (status <> 'ready' OR
+    (original_key IS NOT NULL AND input_version IS NOT NULL AND
+     width IS NOT NULL AND height IS NOT NULL AND original_bytes IS NOT NULL))
+);
+CREATE INDEX images_gallery_ready ON images(gallery_id, created_at DESC, id DESC)
+  WHERE status = 'ready' AND deleted_at IS NULL;
+
+CREATE TABLE image_variants (
+  image_id UUID NOT NULL REFERENCES images(id),
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  transform_version INTEGER NOT NULL CHECK (transform_version > 0),
+  profile TEXT NOT NULL,
+  format TEXT NOT NULL CHECK (format IN ('jpeg', 'png', 'webp', 'avif')),
+  object_key TEXT NOT NULL UNIQUE,
+  width INTEGER NOT NULL CHECK (width > 0),
+  height INTEGER NOT NULL CHECK (height > 0),
+  size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+  checksum TEXT NOT NULL,
+  PRIMARY KEY (image_id, generation, transform_version, profile, format)
 );
 
-CREATE INDEX idx_images_user ON images(user_id, created_at DESC);
-CREATE INDEX idx_images_tags ON images USING GIN(tags);
-CREATE INDEX idx_images_public ON images(is_public, created_at DESC) WHERE is_public = TRUE;
-
--- Albums
-CREATE TABLE albums (
+CREATE TABLE upload_sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id),
-  title VARCHAR(200) NOT NULL,
-  description TEXT,
-  cover_image_id UUID REFERENCES images(id),
-  is_public BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW()
+  owner_id UUID NOT NULL REFERENCES users(id),
+  image_id UUID NOT NULL REFERENCES images(id),
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  client_key TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  staging_key TEXT NOT NULL UNIQUE,
+  reserved_bytes BIGINT NOT NULL CHECK (reserved_bytes > 0),
+  state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (state IN ('pending', 'processing', 'ready', 'failed', 'expired', 'cancelled')),
+  expires_at TIMESTAMPTZ NOT NULL,
+  result JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, client_key),
+  UNIQUE (image_id, generation)
 );
+CREATE INDEX upload_sessions_expiry ON upload_sessions(expires_at)
+  WHERE state = 'pending';
 
--- Album-Image junction
-CREATE TABLE album_images (
-  album_id UUID REFERENCES albums(id) ON DELETE CASCADE,
-  image_id UUID REFERENCES images(id) ON DELETE CASCADE,
-  sort_order INTEGER DEFAULT 0,
-  PRIMARY KEY (album_id, image_id)
+CREATE TABLE outbox (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  image_id UUID NOT NULL REFERENCES images(id),
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  event_type TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  published_at TIMESTAMPTZ,
+  UNIQUE (image_id, generation, event_type)
 );
-
--- Favorites
-CREATE TABLE favorites (
-  user_id UUID REFERENCES users(id),
-  image_id UUID REFERENCES images(id),
-  created_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (user_id, image_id)
-);
+CREATE INDEX outbox_pending ON outbox(created_at, id) WHERE published_at IS NULL;
 ```
 
----
+Six tables and four explicit secondary indexes are shown. Unique and primary-key constraints create additional indexes. There is no global hash uniqueness: a checksum verifies content, while a durable owner-scoped client key identifies a retry. Cross-user deduplication and reference-counted blob deletion are deliberately deferred. Ready-state constraints cannot prove an object exists in storage; publication/reconciliation must verify that boundary.
 
 ## API Design
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/images?page=&limit=&tags=` | List images (paginated) |
-| GET | `/api/v1/images/:id` | Get image metadata + variant URLs |
-| POST | `/api/v1/images` | Upload image (multipart) |
-| DELETE | `/api/v1/images/:id` | Delete image and variants |
-| GET | `/api/v1/albums` | List user albums |
-| POST | `/api/v1/albums` | Create album |
-| GET | `/api/v1/albums/:id/images` | Images in album |
-| POST | `/api/v1/albums/:id/images` | Add image to album |
-| GET | `/api/v1/search?q=&tags=` | Search images |
-| POST | `/api/v1/favorites/:imageId` | Toggle favorite |
+These routes are **proposed**; the local app only serves `/` and static assets.
 
----
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/v1/galleries/:id/images` | Authorized metadata page with bounded opaque cursor |
+| GET | `/api/v1/images/:id` | Current image state and permitted variant descriptors |
+| POST | `/api/v1/galleries/:id/uploads` | Reserve quota and create/replay an upload session |
+| POST | `/api/v1/uploads/:id/complete` | Verify uploaded input, record processing work |
+| GET | `/api/v1/uploads/:id` | Pending/processing/ready/failed outcome |
+| DELETE | `/api/v1/images/:id` | Mark unavailable, advance generation, enqueue cleanup |
+| PATCH | `/api/v1/galleries/:id` | Owner metadata/visibility change with expected revision |
+
+Example display metadata separates image identity from one resolution's URL:
+
+```json
+{"id":"image-uuid","generation":2,"width":1600,"height":1200,"alt":"A wooded lakeshore","variants":[{"profile":"display-800","format":"webp","width":800,"height":600,"url":"https://images.example.test/image-uuid/g2/display-800.webp"}]}
+```
+
+URLs and IDs are illustrative. A private/revocable image requires authorized delivery in addition to metadata access. Responses also carry pagination/status/error fields appropriate to the endpoint; no single image response is a promise that every optional variant exists.
 
 ## Key Design Decisions
 
-### 1. CSS Columns for Masonry vs. JavaScript Layout
+### CSS layout with an explicit order contract
 
-**Chosen**: CSS `columns` property.
+CSS columns suit the local fixed, unordered collection because they avoid application positioning logic. They still require browser layout and can rebalance after image arrival, resize, or appended content. The visual flow is down each column; it is not row-major masonry. Known slot dimensions reduce shifts but do not turn column balancing into an immutable feed order.
 
-JavaScript-based masonry (e.g., react-masonry-css, Packery) computes item positions manually, leading to layout recalculation on every resize and scroll. CSS `columns` is browser-native, requires zero JavaScript computation, and handles responsive column counts with a single `columns: 4 300px` declaration. The trade-off is column-first ordering (images flow top-to-bottom within columns rather than left-to-right across rows), which means chronological ordering is not perfectly left-to-right. For a gallery where browsing order is less critical than visual density, this is acceptable.
+For a chronological/infinite feed, start with row-major tiles or a positioned layout using metadata dimensions and an explicit reading-order policy. A JavaScript layout is not inherently prone to thrashing: batch measurements/writes and avoid measuring intrinsic sizes after every image load. The trade-off is greater implementation and focus/virtualization complexity in exchange for more stable placement.
 
-### 2. Content-Addressed Storage vs. Sequential IDs
+### Pre-generated profiles versus arbitrary transforms
 
-**Chosen**: SHA-256 content hash as the storage key.
+Generate a finite set of useful variants so repeated requests share cache keys and the first viewer avoids transformation work. Keep aspect-preserving display profiles separate from deliberate square crops. Every candidate within a responsive source set must describe the same crop/aspect ratio. Its width descriptor reports actual encoded width; the client supplies the rendered slot size.
 
-When the same image is uploaded multiple times (common in social/gallery apps), content-addressed storage automatically deduplicates at the object storage level. Two users uploading the same photo produce the same hash and share the same storage. The trade-off is an extra hash computation on upload (~10ms for a 5 MB image), and the need to handle reference counting for deletion (cannot delete an object if other users reference it).
+The cost is processing/storage for profiles some users never request. On-demand processing can suit rare dimensions, but needs a strict parameter catalog, shared generation lock, and resource limits. Do not expose unrestricted width/height/quality requests as a cheap CDN API. Codec savings depend on content and quality; measure them rather than promise a universal percentage.
 
-### 3. Multi-Format Delivery (AVIF > WebP > JPEG) vs. Single Format
+### Publication state instead of a cross-system transaction
 
-**Chosen**: Serve multiple formats with `<picture>` negotiation.
+SQL cannot atomically roll back object uploads. Choose durable sessions, an outbox, idempotent generation-specific jobs, and conditional manifest publication. The user sees transfer completion followed by processing, then ready or a recoverable failure. This is more state than a synchronous upload endpoint, but it explains worker failure and lost responses without holding a database transaction open during decoding.
 
-AVIF provides ~50% size reduction over JPEG; WebP provides ~30%. For a gallery serving 5B views/day, this translates to petabytes of saved bandwidth per month. The trade-off is 3x storage per image (JPEG + WebP + AVIF for each size) and processing pipeline complexity. Storage cost (~$0.023/GB/month on S3) is far lower than bandwidth cost (~$0.085/GB for CDN egress), making this trade-off strongly favorable.
-
----
+Content hashes do not replace authorization or request idempotency. Two uploads of identical bytes may intentionally be separate gallery entries. Global deduplication needs ownership/reference tracking and a confidentiality model; generated per-image keys are the initial choice.
 
 ## Consistency and Idempotency
 
-| Operation | Model | Rationale |
-|-----------|-------|-----------|
-| Image upload | Idempotent via content hash | Re-uploading same image returns existing record |
-| Album operations | Strong consistency | User sees changes immediately |
-| Image deletion | Eventual (soft-delete) | Variants cleaned up asynchronously |
-| Tag updates | Read-your-writes | Search index updates within ~5s |
-| View counts | Eventual | Approximate counts acceptable |
+Upload initiation reserves quota and creates records in one transaction keyed by owner plus client key. Finalization verifies the immutable input and records the pending job in the same transaction as the state transition. The dispatcher retries publication, and the worker checks image generation and terminal state before publishing a manifest or changing quota.
 
----
+If storage succeeds but SQL fails, outputs are unreferenced and eligible for later cleanup. If SQL commits but an ACK is lost, the client polls/retries the same session to recover its result. If deletion races processing, advancing the generation/status prevents late publication; asynchronous deletion retries remove the original and all generation outputs. Cleanup must wait beyond signed-upload and worker lease horizons to avoid deleting still-owned work.
+
+Listing revisions provide an explicit change/reset boundary for exact browsing sessions. Permission and deletion are checked under current authority even if a browsing session uses older order metadata. A cached cursor is not a permission grant, and invalidating Redis only after returning stale private content is too late.
+
+## Security / Auth
+
+The proposal validates sessions on metadata, upload, status, and mutation routes. Signed upload authority binds a server-generated object key, byte constraints where supported, and a short expiry. The worker verifies actual encoded/decoded content, strips sensitive metadata from published variants, normalizes orientation, and enforces resource budgets. Original files remain private unless explicitly exposed under an appropriate download policy.
+
+For revocable galleries, authorize CDN requests before cache hits, keep origin objects private, and issue short-lived capabilities with an explicit maximum revocation delay, for example 60 seconds. Browser responses use a revalidation/no-store policy consistent with that promise; internal edge caching of bytes does not bypass authorization. New capabilities stop after a privacy change. Previously downloaded bytes cannot be recalled.
+
+Long-lived publicly cacheable immutable URLs are appropriate only when the product accepts persistent public copies. Do not give revocable private media a one-year public browser cache policy and imply that a later database flag or CDN purge can undo it. No auth, sharing, quotas, or signed delivery is implemented locally.
 
 ## Observability
 
-- **Metrics**: Upload latency, processing pipeline duration, CDN hit ratio, storage utilization
-- **Logging**: Structured JSON logs for upload pipeline, processing errors, CDN misses
-- **Health checks**: Object storage connectivity, processing queue depth, database health
-- **Alerting**: Processing queue backlog > 10K, CDN hit ratio < 95%, storage quota exceeded
+Production measurements should distinguish metadata latency, first visible image decode, delivered bytes, layout shift, lightbox navigation, upload transfer, queue age, processing duration, publication failures, and orphan/quota reconciliation. Avoid high-cardinality image labels or logging signed URLs and private EXIF. Metadata API health, object delivery, and worker backlog have different failure meanings.
 
----
+The local project has no Pino, Prometheus, health endpoint, monitoring client, or custom image error handler. Vite serving the HTML does not prove Picsum is reachable. Existing screenshot scripts wait for elements and fixed delays rather than asserting successful decoding or accessibility.
 
 ## Failure Handling
 
-| Component | Failure | Strategy |
-|-----------|---------|----------|
-| Upload service | Crash during processing | Queue guarantees retry; content-addressed storage means re-processing is idempotent |
-| Object storage | S3 region outage | Cross-region replication; serve from secondary region |
-| Processing pipeline | Worker crash | Dead letter queue for failed jobs; manual retry |
-| CDN | Edge cache miss | Origin shield (intermediate cache) reduces origin load |
-| Database | Connection exhaustion | Connection pooling, circuit breaker, read replicas |
-
----
+| Failure | Proposed behavior | Current local behavior |
+|---|---|---|
+| One image fails | Reserved placeholder, retry, usable navigation | Browser's native broken-image/alt behavior |
+| Slow next image | Loading status, ignore stale decode, bounded adjacent preload | Immediately changes src with no custom state |
+| Upload response lost | Recover the durable session using the same key | Upload absent |
+| Worker fails | Retry bounded job, preserve failed/processing state | Worker absent |
+| Metadata page fails | Retain loaded items and show a next-page retry | Metadata paging absent |
+| Listing/order changes | Refresh/reset explicitly, preserve selected ID where valid | Fixed list only |
+| Privacy changes | Block new delivery capabilities and honor bounded expiry | Sharing absent |
 
 ## Scalability Considerations
 
-### What Breaks First
+The local 50-image manifest is intentionally small. Browser lazy loading is sufficient to demonstrate deferred fetches, but not memory/windowing for a million-image feed. Responsive selection, reserved dimensions, bounded decode/prefetch queues, and stable selection should precede a complex virtualized masonry engine.
 
-1. **Storage** -- 50M uploads/day at 5 MB = 250 TB/day. S3 scales horizontally; cost is the constraint (~$5.75M/month for 75 PB).
-2. **Processing pipeline** -- 50M images x 5 sizes x 3 formats = 750M processing jobs/day. Horizontally scale workers with auto-scaling groups.
-3. **CDN bandwidth** -- 5B views x 400 KB average = 2 PB/day egress. Multi-CDN strategy (CloudFront + Akamai) for cost optimization and redundancy.
-
-### Horizontal Scaling
-
-- **Gallery service**: Stateless, scale behind load balancer
-- **Upload service**: Scale workers independently from API servers
-- **Processing pipeline**: Auto-scaling worker fleet consuming from SQS/Kafka
-- **Database**: Read replicas for gallery reads; write primary for uploads
-
----
+At service scale, direct uploads separate ingress bytes from metadata CPU. Workers scale by queue age and pixel/codec cost, not request count alone. CDN hit rates reduce origin work but do not remove client egress. Partition metadata by gallery/owner when needed, bound listing pages, and avoid storing complete signed-URL lists in broadly shared caches.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Masonry layout | CSS `columns` | JS masonry (Packery) | Zero JS computation, browser-native responsiveness |
-| Storage keys | Content-addressed (SHA-256) | Sequential UUID | Automatic deduplication saves storage at scale |
-| Image formats | AVIF + WebP + JPEG | JPEG only | Bandwidth savings (50-70%) far outweigh storage cost |
-| Image service | Dedicated processing pipeline | On-the-fly resize | Predictable latency, CDN-cacheable, no resize thundering herd |
-| State management | Zustand | React Context / Redux | Minimal boilerplate for simple gallery state |
-
----
+|---|---|---|---|
+| Local masonry | CSS columns | Positioned masonry | Small fixed collection accepts column-first reflow |
+| Long ordered browsing | Row-major layout or explicit positions | Infinite balanced columns | Keep order and scroll anchors understandable |
+| Image delivery | Finite versioned profiles | Arbitrary per-request transforms | Bound work and share cache keys |
+| Publication | Session/outbox/conditional manifest | One presumed SQL+storage transaction | Recover partial success across systems |
+| Idempotency | Owner-scoped session key | Content hash alone | A retry and a duplicate photo are different intents |
+| Revocable media | Authorized cache hits, short capabilities | One-year public browser cache | Enforce an honest revocation window |
+| Selection | Stable image ID | Global array index | Survive pagination and list changes |
 
 ## Implementation Notes
 
-This project is a **frontend-only implementation** demonstrating gallery layout patterns. There is no backend service, database, or image processing pipeline.
-
-### Local Architecture
+### Actual local architecture
 
 ```
-┌────────────────────────────────────────────────────┐
-│              Browser (localhost:5173)                │
-│    Vite Dev Server + React 19 + TanStack Router     │
-│    Zustand + Tailwind CSS                           │
-├────────────────────────────────────────────────────┤
-│                                                     │
-│  ┌──────────────┐  ┌──────────┐  ┌──────────────┐ │
-│  │ GalleryTabs  │  │  Store   │  │  Lightbox    │ │
-│  │ (tab switch) │  │ (Zustand)│  │  (modal)     │ │
-│  └──────────────┘  └──────────┘  └──────────────┘ │
-│         │                                           │
-│  ┌──────┴──────────────┬──────────────┐            │
-│  │                     │              │            │
-│  ▼                     ▼              ▼            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
-│  │Slideshow │  │Masonry   │  │Tiles     │        │
-│  │View      │  │Grid      │  │Grid      │        │
-│  └──────────┘  └──────────┘  └──────────┘        │
-│         │                                           │
-│         ▼                                           │
-│  ┌──────────────────────────────────────────────┐  │
-│  │           picsum.photos (external)            │  │
-│  │  https://picsum.photos/id/{id}/{w}/{h}       │  │
-│  └──────────────────────────────────────────────┘  │
-│                                                     │
-└────────────────────────────────────────────────────┘
+┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
+│   React gallery views   │ ──▶ │   Browser image loader  │ ──▶ │      picsum.photos      │
+└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
 ```
 
-### What Is Actually Implemented
+The SPA uses React 19, TanStack Router, Zustand, Tailwind CSS 3, and Vite 6. [main.tsx](./frontend/src/main.tsx) mounts StrictMode and one generated `/` route. The [root layout](./frontend/src/routes/__root.tsx) provides a header, main content, and an inline Lightbox sibling. The [index route](./frontend/src/routes/index.tsx) mounts exactly one view based on `activeTab`.
 
-| Component | File | Description |
-|-----------|------|-------------|
-| Tab navigation | `frontend/src/components/gallery/GalleryTabs.tsx` | Switches between three layout views |
-| Slideshow | `frontend/src/components/gallery/Slideshow.tsx` | Full-width image display with navigation arrows, thumbnail strip, auto-play |
-| Masonry grid | `frontend/src/components/gallery/MasonryGrid.tsx` | CSS `columns` layout with variable-height images |
-| Tiles grid | `frontend/src/components/gallery/TilesGrid.tsx` | CSS Grid with uniform square tiles, hover effects |
-| Lightbox | `frontend/src/components/gallery/Lightbox.tsx` | Full-screen overlay with keyboard navigation (arrows, escape) |
-| Gallery store | `frontend/src/stores/galleryStore.ts` | Zustand store for active tab, lightbox state, slideshow index |
-| Image URLs | `frontend/src/utils/picsum.ts` | Helper for generating picsum.photos URLs at various sizes |
-| Icons | `frontend/src/components/icons/index.tsx` | SVG icon components (arrows, play/pause, grid) |
-| Routing | `frontend/src/routes/index.tsx`, `__root.tsx` | TanStack Router file-based routing |
+### Components and state
 
-### Simplifications vs. Production
+| Component | Source-backed behavior |
+|---|---|
+| [GalleryTabs](./frontend/src/components/gallery/GalleryTabs.tsx) | Three normal buttons with selected styling, no tablist/tab semantics or arrow-key tab model |
+| [TilesGrid](./frontend/src/components/gallery/TilesGrid.tsx) | Two columns below md, three at md, four at lg, five at xl; square buttons, fixed 300×300 sources, lazy loading |
+| [MasonryGrid](./frontend/src/components/gallery/MasonryGrid.tsx) | Two columns below md, three at md, four at lg; fixed width-400 sources with six synthetic heights; lazy loading |
+| [Slideshow](./frontend/src/components/gallery/Slideshow.tsx) | In-page 16:9 area, 1200×675 main source, 50 eager 80×56 thumbnails, arrows, counter, three-second autoplay |
+| [Lightbox](./frontend/src/components/gallery/Lightbox.tsx) | Fixed z-50 inline overlay, 1920×1080 source, arrows/counter, Escape/backdrop close, body overflow toggle |
+| [galleryStore](./frontend/src/stores/galleryStore.ts) | Tiles default, lightbox ID or null, slide index zero, totalImages hardcoded 50; no persistence or validation |
 
-| Area | Production | Local Implementation |
-|------|-----------|---------------------|
-| Image source | S3 + CDN with multi-format variants | picsum.photos placeholder service |
-| Image IDs | Database-backed with content hashing | Hardcoded list of 50 IDs (10-59) |
-| Layout engine | CSS `columns` (same) | CSS `columns` (same) |
-| State management | Server state + client cache (React Query) | Zustand client-only store |
-| Auth/users | User accounts with storage quotas | None |
-| Upload | Multi-stage processing pipeline | None |
-| Search | Elasticsearch with tags | None |
-| Backend | Node.js + Express + PostgreSQL | None (frontend only) |
-| Lazy loading | Intersection Observer + skeleton loaders | Native `loading="lazy"` attribute |
-| Responsive images | `<picture>` with `srcset` and format negotiation | Fixed-size URLs from picsum.photos |
+Slideshow's `isPlaying` is component-local state, not in Zustand. Unmounting clears its interval; returning retains the store index but starts paused. Manual navigation does not stop an active interval. There is no configurable interval, focus/hover/visibility pause, reduced-motion handling, image preloader, or slideshow-main-image lightbox action.
 
-### What Was Omitted
+The store's next/previous actions wrap using its independent constant 50. `setSlideshowIndex` and `openLightbox` accept invalid indices/IDs without checks. Lightbox navigation uses `imageIds.length`, so editing only the manifest can produce inconsistent behavior between the two viewers. Lightbox and slideshow selections are independent. Whole-store subscriptions in tabs, slideshow, and lightbox are not selective; grids subscribe only to the open action. No React.memo or subscribeWithSelector middleware is used.
 
-- Backend API and database
-- Image upload and processing pipeline
-- User authentication and albums
-- Search and tag management
-- Favorites and sharing
-- Multi-format image delivery (WebP/AVIF)
-- CDN integration
-- Infinite scroll / pagination
-- Image metadata display (EXIF, author)
-- Mobile gesture support (swipe, pinch-to-zoom)
+### Image loading and layout
 
----
+[picsum.ts](./frontend/src/utils/picsum.ts) constructs `https://picsum.photos/id/{id}/{width}/{height}` URLs. The provider documents ID-based images and separate metadata endpoints, but the app does not fetch metadata or verify the hardcoded range's availability. [Picsum documentation](https://picsum.photos/).
 
-## Frontend Architecture
+`getAspectRatio` selects a height/width factor from 0.75, 1, 1.25, 1.5, 0.8, and 1.2 by ID modulo six. At width 400, the requested heights are 300, 400, 500, 600, 320, and 480. These are synthetic layout proportions, not source-photo dimensions. The random URL and info URL helpers are unused.
 
-### Component Hierarchy
+There is no `srcset`, `sizes`, format negotiation, eager hero priority hint, IntersectionObserver, blur placeholder, decode handler, load/error state, cache manager, or adjacent-image preloading. Slideshow thumbnails are eager; the main and lightbox requests are distinct larger URLs, so thumbnail downloads are not full-image preloading. Browser HTTP caching may reuse identical URLs, but the app does not control provider headers or guarantee instant tab switches.
 
-```
-__root.tsx (root layout)
-└── index.tsx (Home - single-page application)
-    ├── GalleryTabs (tab bar: Slideshow / Masonry / Tiles)
-    ├── Slideshow (full-width image display)
-    │   └── (main image, navigation arrows, thumbnail strip, play/pause, auto-advance)
-    ├── MasonryGrid (CSS columns layout)
-    │   └── (variable-height images in column-first order, click to open lightbox)
-    ├── TilesGrid (CSS Grid uniform squares)
-    │   └── (square-cropped images with hover scale, click to open lightbox)
-    ├── Lightbox (full-screen overlay)
-    │   └── (large image, left/right arrows, close button, keyboard navigation)
-    └── icons/ (SVG icon components: arrows, play/pause, grid icons)
-```
+Tiles reserve square slots and slideshow reserves a 16:9 area. Masonry images have no width/height attributes or CSS aspect ratio despite knowing the requested sizes, so their initially unknown height can cause reflow as they load. Explicit dimensions are the browser mechanism for reserving space; a blurred placeholder alone would not fix geometry. [MDN image element reference](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/img).
 
-This is a frontend-only project with no backend. All components are in `components/gallery/` with a flat, gallery-focused organization.
+### Keyboard, focus, and overlay boundaries
 
-### Zustand Store
+Lightbox has labeled arrow/close buttons and a window key handler, but no dialog role, modal state, focus entry/trap/return, inert background, or portal. It changes body overflow to hidden and clears it on close/cleanup instead of restoring an earlier inline value. Clicking the image/arrows stops backdrop propagation; the close button can also bubble to the backdrop, calling the idempotent close action twice.
 
-**`useGalleryStore`** (`stores/galleryStore.ts`) -- Single store managing all UI state:
+Slideshow arrows and Space are also window-wide, without focused-control checks. If slideshow and lightbox states coexist, both arrow handlers can run. The absence of modal focus containment lets keyboard users reach background view controls. Generic “Image ID” alt text identifies an item but does not describe its content.
 
-- **`activeTab`**: Which layout view is displayed (`'Slideshow' | 'Masonry' | 'Tiles'`). Defaults to `'Tiles'`. Switching tabs is instant (no data fetch, no animation delay).
-- **`lightboxImage`**: The image ID currently displayed in the lightbox overlay, or `null` when closed. Set by clicking any image in Masonry or Tiles views.
-- **`slideshowIndex`**: Current position in the slideshow (0-based index into the image array). Used by the Slideshow component for navigation and auto-play.
-- **`totalImages`**: Fixed at 50 (hardcoded list of picsum.photos IDs 10-59). Used by `nextSlide()` and `prevSlide()` for wraparound arithmetic.
-- **Actions**:
-  - `setActiveTab(tab)` -- switch layout view
-  - `openLightbox(imageId)` / `closeLightbox()` -- control lightbox visibility
-  - `setSlideshowIndex(index)` / `nextSlide()` / `prevSlide()` -- slideshow navigation with modular wraparound (index wraps from 49 back to 0 and vice versa)
+The proposed accessible version should implement the modal's focus/inert behavior and carousel's stop controls, including pause on focus/hover and explicit restart. These are not achieved merely by adding an Escape listener. [WAI modal pattern](https://www.w3.org/WAI/ARIA/apg/patterns/dialog-modal/), [WAI carousel pattern](https://www.w3.org/WAI/ARIA/apg/patterns/carousel/).
 
-### Routing
+A portal is an optional placement technique, not a focus manager or guaranteed top layer. React context and event propagation remain associated with the React parent tree even when the DOM node moves. The earlier claim that a portal loses React context was incorrect. [React portal reference](https://react.dev/reference/react-dom/createPortal).
 
-TanStack Router with file-based routing. This project uses a single route:
+### Operational patterns, simplifications, and omissions
 
-| Route | File | Description |
-|-------|------|-------------|
-| `/` | `routes/index.tsx` | Gallery with tab switching between Slideshow, Masonry, and Tiles |
+No backend patterns are implemented: there are no circuit breakers, rate limits, server logs, metrics, health checks, SQL, object storage, sessions, or upload jobs. Native CSS layout and native image lazy loading are the actual techniques demonstrated. The production pipeline, authorization, responsive candidates, metadata paging, virtualized lists, and upload state machine are all omitted locally.
 
-The root layout (`__root.tsx`) provides the page shell. All view switching happens via Zustand state (`activeTab`), not via routing, enabling instant transitions without URL changes.
+[package.json](./frontend/package.json) offers dev/build/preview/lint/type-check scripts. Build uses `tsc -b` and Vite. The standalone type-check script uses `tsc --noEmit` against a files-empty reference config, so it does not check the referenced app project; use an explicit project check or build mode for that purpose. No ESLint config exists in the project/repository ancestor chain. The HTML also references `/vite.svg`, but no public asset with that name is checked in.
 
-### Data Fetching
-
-**There is no data fetching.** This project loads images directly from `picsum.photos` using `<img>` tags with constructed URLs. The `utils/picsum.ts` helper generates URLs in the format `https://picsum.photos/id/{id}/{width}/{height}` for each image at the appropriate size for the current layout context.
-
-Images are loaded by the browser's native image loading mechanism. The Masonry and Tiles views use `loading="lazy"` for deferred loading of off-screen images. The Slideshow preloads adjacent images by rendering them in the DOM (hidden) so transitions are instant.
-
-### Key UI Patterns
-
-- **CSS-native layouts with zero JavaScript computation**: Masonry uses CSS `columns` with `break-inside: avoid`. Tiles uses CSS Grid with `repeat(auto-fill, minmax(200px, 1fr))` and `aspect-ratio: 1`. No layout libraries, no position calculations, no resize observers.
-- **Keyboard-accessible lightbox**: The Lightbox component listens for `ArrowLeft`, `ArrowRight`, and `Escape` keydown events on the document. This enables navigation without mouse interaction, meeting basic accessibility requirements.
-- **Auto-play slideshow**: The Slideshow component uses `setInterval` with a configurable delay (default 3 seconds) to auto-advance. The play/pause button toggles the interval. Navigation arrows and thumbnail clicks override auto-play position.
-- **Responsive column count**: The Masonry grid and Tiles grid automatically adjust column count based on viewport width using CSS breakpoints and `auto-fill`, requiring no JavaScript media query handling.
-- **Hardcoded image list**: Image IDs 10-59 are hardcoded to avoid broken/missing picsum.photos IDs. This provides a consistent, predictable experience without error handling for 404 images.
-
----
-
-## Deep Pattern Explanations
-
-This project is a frontend-only implementation and does not include backend infrastructure patterns like Redis caching, circuit breakers, or Prometheus metrics. The patterns below are the ones relevant to this project's scope. Backend patterns are described at the production-scale level in the architecture sections above and would apply if this project were extended with a backend.
-
-### Health Checks
-
-**What it is**: Health checks are dedicated HTTP endpoints that report whether an application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing traffic and restarting failed instances.
-
-**How it works**: A health check endpoint (typically `GET /health`) performs a quick diagnostic of the system's ability to serve requests. A **liveness check** simply confirms the process is running (return 200 if the server can respond to HTTP). A **readiness check** verifies that critical dependencies are available (database responds to a ping, Redis returns PONG, the search index is reachable). If any dependency is down, the readiness check returns 503, and the load balancer stops sending traffic to that instance until it recovers.
-
-**Why it matters at production scale**: For a production image gallery serving billions of views, health checks would verify that the object storage (S3) is reachable, the image processing pipeline is running, and the database for metadata is healthy. Without health checks, a server whose S3 connection is broken would serve 500 errors for every image request while the load balancer continues routing traffic to it. Health checks enable self-healing: the load balancer removes broken instances, and the orchestrator restarts them.
-
-**Not applicable locally**: This frontend-only project has no backend server, so there are no health check endpoints to implement.
-
-### Structured Logging
-
-**What it is**: Structured logging produces log entries as machine-parseable JSON objects rather than human-readable text strings. Each log entry is a flat or nested JSON object with consistent field names (level, timestamp, message, request ID, duration, status code), enabling automated parsing, filtering, indexing, and alerting by log aggregation systems like Elasticsearch, Datadog, or CloudWatch.
-
-**How it works**: Instead of writing `console.log('Image upload completed in 250ms for user abc')`, structured logging produces `{"level":"info","event":"upload_complete","userId":"abc","durationMs":250,"imageId":"img-123","format":"webp"}`. The logging library (typically Pino for Node.js) handles serialization, timestamp formatting, and log level filtering. In development, a pretty-printer makes logs human-readable. In production, raw JSON is emitted for machine consumption.
-
-**Why it matters at production scale**: A production gallery processing 50M uploads per day generates enormous log volume. When a user reports that their upload failed, operators need to find the relevant log entry among billions. Structured logs enable queries like "show all upload failures for user X in the EU region in the last hour" in seconds. Request IDs (correlation IDs) link related log entries across the upload service, processing pipeline, and storage service, enabling end-to-end tracing of a single upload through the entire system.
-
-**Not applicable locally**: This frontend-only project uses `console.log` for development debugging. A production backend would use Pino for structured JSON logging.
-
-### Prometheus Metrics
-
-**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. Applications expose a `/metrics` HTTP endpoint that Prometheus scrapes periodically. Four metric types are available: Counter (monotonically increasing, e.g., total requests), Gauge (can go up or down, e.g., active connections), Histogram (distribution of values in buckets, e.g., request latency), and Summary (pre-computed quantiles).
-
-**How it works**: At application startup, metric objects are created (e.g., a Histogram named `image_processing_duration_seconds`). During request processing, observations are recorded: `histogram.observe(0.25)` records a 250ms processing time. Prometheus scrapes the `/metrics` endpoint every 15-30 seconds and stores the time-series data. Grafana dashboards visualize trends, and alerting rules trigger notifications when metrics cross thresholds (e.g., CDN cache hit rate drops below 95%).
-
-**Why it matters at production scale**: For a production gallery, the critical metrics would be upload latency, processing pipeline throughput (images per second), CDN cache hit ratio, storage utilization, and error rates. If the processing pipeline throughput drops, the queue of unprocessed uploads grows, and users see "processing" states for minutes instead of seconds. Metrics detect this degradation long before users report it.
-
-**Not applicable locally**: This frontend-only project does not expose metrics. A production backend would use `prom-client` for request latency, image processing duration, storage utilization, and CDN hit rate metrics.
-
-### Rate Limiting
-
-**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects services from abuse (intentional or accidental) by rejecting excess requests with HTTP 429 (Too Many Requests) responses before they consume server resources.
-
-**How it works**: The server maintains a counter for each client (identified by IP address, API key, or user ID). When a request arrives, the counter is checked against the configured limit. If below the limit, the request proceeds. If above, the request is rejected with a 429 response and a `Retry-After` header indicating when the client can retry. Common algorithms include fixed window (reset counter every N seconds), sliding window (rolling counter), and token bucket (constant refill rate with burst allowance).
-
-**Why it matters at production scale**: For a production gallery, rate limiting would protect the upload endpoint (preventing a single user from consuming all processing capacity), the search endpoint (preventing scraping of the entire image catalog), and the download endpoint (preventing bandwidth abuse). Without rate limiting on uploads, a single user could upload thousands of images per minute, filling the processing pipeline queue and delaying uploads for all other users.
-
-**Not applicable locally**: This frontend-only project makes no API requests. A production backend would apply rate limiting to upload, search, and API endpoints.
-
-### Running Locally
-
-```bash
-cd frontend && npm install && npm run dev
-
-# Open http://localhost:5173
-# Switch between Slideshow / Masonry / Tiles tabs
-# Click any image to open lightbox
-# Keyboard: arrows to navigate, Escape to close
-```
+There is no project test package. The repository [screenshot configuration](../scripts/screenshot-configs/gallery.json) switches views without validating every decoded image. The 2026-09-10 documentation review read all source and used six isolated mocked source checks for IDs/heights, count drift, image attributes, simultaneous keyboard handlers, scroll restoration, and the TypeScript reference configuration. It did not start a server, download images, run a build, or measure runtime performance.

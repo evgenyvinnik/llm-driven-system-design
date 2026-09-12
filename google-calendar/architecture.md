@@ -1,114 +1,173 @@
-# Google Calendar - Architecture
+# Google Calendar architecture
 
 ## System Overview
 
-A calendar and scheduling platform that allows users to manage events across multiple calendars with conflict detection, recurring events, and sharing capabilities. The system supports multiple views (Month, Week, Day) and provides responsive, interactive event management.
+This project teaches calendar views, event persistence, ownership checks, and interval overlap queries. The running implementation is a React browser, one Express API, and one PostgreSQL database that also stores sessions. It supports private calendars and nonrecurring events. A Valkey container is declared but unused. It is not integrated with Google Calendar.
 
-**Learning goals:** Calendar UI patterns with complex grid layouts, efficient time-range queries for conflict detection, date/time handling across views, state management for interactive calendar UIs, and session-based authentication.
+The production design below is **proposed**, not a description of deployed infrastructure. Local behavior is explicitly identified in component/API sections, the exact local schema is reproduced separately, and the final Implementation Notes trace source behavior and gaps. Setup belongs in [README.md](./README.md); historical development notes remain in [CLAUDE.md](./CLAUDE.md).
 
 ## Requirements
 
-### Functional Requirements
-- Users create and manage multiple named calendars with color coding
-- Event CRUD with title, description, location, start/end time, all-day flag
-- Three calendar views: Month, Week, and Day
-- Conflict detection warns users about overlapping events
-- Toggle calendar visibility to show/hide event sets
-- Recurring events (daily, weekly, monthly, yearly with RRULE)
-- Event invitations and RSVP tracking
+### Proposed production scope
 
-### Non-Functional Requirements (Production Scale)
-- 99.99% uptime for calendar reads (users check schedules constantly)
-- p99 read latency < 100ms for fetching a month's events
-- Support 500M users with 50M daily active
-- Handle 10B events total across all users
-- Event creation/update p99 < 300ms
-- Conflict detection within 50ms for any time range query
+Users manage several private calendars, navigate month/week/day views, create timed or all-day events, and receive advisory warnings about overlaps. Read and write requests enforce ownership. Hiding a calendar changes display, not its contribution to scheduling warnings. The first release allows overlaps; it does not guarantee exclusive room or appointment reservations.
+
+| Requirement | Proposed target or invariant |
+|-------------|------------------------------|
+| Availability | 99.9% monthly for authenticated calendar reads and writes in the home region |
+| Read latency | p95 under 200 ms for an admitted, bounded range request in that region |
+| Write latency | p95 under 300 ms for ordinary event edits, excluding user interaction |
+| Browser responsiveness | Local navigation feedback under 100 ms; smooth scrolling on an agreed reference device |
+| Time semantics | Explicit instants for timed events; exclusive date boundaries for all-day events |
+| Durability | A success result means the event and its retry receipt committed |
+| Concurrency | Stale edits are rejected with the current version; overlaps remain allowed |
+| Privacy | No event or cached response crosses the account boundary |
+| Accessibility | Keyboard navigation, accessible event details, and usable save/error announcements |
+
+These targets are design assumptions, not measured results or guarantees of the local application. Sharing, invitations, notifications, external calendar synchronization, recurring series, and indefinite offline editing are extensions rather than prerequisites for this baseline. Recurrence requires an additional temporal model; a text field alone does not implement it.
 
 ## Capacity Estimation
 
-### Production Scale
+Assume 10 million registered users with 200 stored events each: **2 billion events**. At an assumed 1 KB per event including a typical description, event payload alone is about **2 TB**, before indexes, user/calendar rows, replication, backups, and database overhead. This is a planning example, not Google's usage or a benchmark.
 
-| Metric | Value | Derivation |
-|--------|-------|------------|
-| Total users | 500M | Global calendar service |
-| DAU | 50M | 10% of total users |
-| Events per user (avg) | 20/month | Mix of personal and work calendars |
-| Total events | 10B | 500M users x 20 events/month x ~12 months historical |
-| Event reads/sec (peak) | 500K | 50M DAU, ~10 views/day, concentrated in work hours |
-| Event writes/sec (peak) | 50K | 50M DAU, ~1 event creation/day |
-| Calendar data per user | ~5 KB | 20 events x 250 bytes avg |
-| Total storage | ~2.5 TB | 10B events x 250 bytes |
+With 1 million daily active users, 30 range reads and two mutations per active user give 30 million reads/day and 2 million writes/day: approximately 347 reads/s and 23 writes/s on average. A tenfold peak is roughly 3,470 reads/s and 230 writes/s. A synchronized Monday morning peak can exceed that multiplier, so admission and load testing matter more than a universal requests-per-server estimate.
+
+The query's cost depends on events examined, interval length, number of calendars, and response size. Request only the displayed date window, bound its length, and page dense results. A normal month needs at most six weeks of dates. Treat 500 events per response as an initial payload budget to test, with an explicit continuation indicator rather than silently dropping further events.
+
+### Local Development Scale
+
+The fresh seed contains two users, three calendars, and seven events, all belonging to Alice. One PostgreSQL instance and two Node processes for API/Vite are sufficient for that demonstration. Valkey can be left stopped. No production capacity or memory measurement was made during this documentation review.
 
 ## High-Level Architecture
 
-```
-┌──────────────┐         ┌──────────────┐         ┌──────────────────────────────────────┐
-│              │         │              │         │           Backend Services             │
-│   React SPA  │────────▶│  API Gateway │────────▶│                                      │
-│  (Vite/TS)   │         │  (nginx/ALB) │         │  ┌────────────┐  ┌────────────┐      │
-│              │         │              │         │  │  Calendar  │  │  Conflict  │      │
-└──────────────┘         └──────────────┘         │  │  Service   │  │  Service   │      │
-                                                  │  └─────┬──────┘  └─────┬──────┘      │
-                                                  │        │               │              │
-                                                  │  ┌─────┴──────┐  ┌────┴───────┐     │
-                                                  │  │ Recurring  │  │ Notification│     │
-                                                  │  │ Event      │  │  Service    │     │
-                                                  │  │ Expander   │  │  (Reminders)│     │
-                                                  │  └────────────┘  └────────────┘      │
-                                                  └──────────────────────┬────────────────┘
-                                                                        │
-                              ┌─────────────┐  ┌─────────────┐  ┌──────┴──────┐
-                              │ PostgreSQL   │  │   Redis     │  │  Message    │
-                              │ (Events,     │  │   (Cache)   │  │  Queue      │
-                              │  Calendars,  │  │             │  │ (Reminders) │
-                              │  Users)      │  │             │  │             │
-                              └─────────────┘  └─────────────┘  └─────────────┘
-```
+### Proposed production system
 
-## Core Components
+Draw the authenticated request path first, then the optional cache path. Static browser assets come from a CDN. The gateway and Calendar service scale across instances; PostgreSQL remains authoritative for each owner's data. The boxes describe responsibilities and can initially share a deployment.
 
-### Calendar Views and Date Range Fetching
-
-The frontend provides three views, each with different data requirements:
-
-- **MonthView**: CSS Grid 7x6 layout displaying days with event pills. Shows up to 3 events per day with a "+N more" overflow indicator. The date range extends beyond the calendar month to include padding days from adjacent months (startOfWeek of the first day to endOfWeek of the last day).
-- **WeekView**: 7-column grid with hourly rows (1440px min-height for 60px/hour). Events are positioned absolutely using percentage-based top/height calculations: `top = (startMinutes / 1440) * 100%`, `height = (durationMinutes / 1440) * 100%`.
-- **DayView**: Single column with hourly slots and full event details.
-
-Each view fetches only the events within its visible date range. The `getViewDateRange()` function returns appropriate bounds so the backend query is scoped to the minimum necessary window, keeping queries efficient as the event count grows.
-
-### Conflict Detection
-
-The conflict service checks for overlapping events using a time range overlap query:
-
-```sql
-SELECT e.id, e.title, e.start_time, e.end_time, c.name as calendar_name
-FROM events e
-JOIN calendars c ON e.calendar_id = c.id
-WHERE c.user_id = $1
-  AND e.id != COALESCE($4, 0)
-  AND e.start_time < $3
-  AND e.end_time > $2
-  AND e.all_day = false
-ORDER BY e.start_time
+```text
+┌────────────────────────┐ HTTP   ┌────────────────────────┐      ┌────────────────────────┐
+│ Browser / clients      │        │ API gateway            │      │ Session store          │
+│ Date range or command  │◀──────▶│ Auth + request limits  │◀────▶│ Shared, revocable      │
+└────────────────────────┘        └────────────────────────┘      └────────────────────────┘
+                                              ▲
+                                              │
+                                              │  authorized request / result
+                                              │
+                                              ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Calendar service (replicated, logically separate query and command paths)                │
+│ Range queries | event commands | advisory overlap checks                                 │
+│ Validate ownership, explicit time type, expected version, and operation ID               │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+                                                   ▲                                     ▲
+                                                   │                                     │
+                                                   │                                     │
+  canonical reads / atomic writes                  │           optional range cache      │
+                                                   │                                     │
+                                                   │                                     │
+                                                   ▼                                     ▼
+┌──────────────────────────────────────────────────────┐       ┌───────────────────────────┐
+│ PostgreSQL primary / owner partition                 │       │ Private range cache       │
+│ Users, calendars, events, range indexes              │       │ Owner + range + zone      │
+│ Event versions + operation receipts + outbox         │       │ Bounded TTL, disposable   │
+└──────────────────────────────────────────────────────┘       └───────────────────────────┘
+                                                   │                          ▲
+                                                   │                          │
+                                                   │                          │
+  committed outbox records                         │                          │
+                                                   │                          │
+                                                   │       evict ranges       │
+                                                   ▼                          │
+┌──────────────────────────────────────────────────────┐                      │
+│ Outbox worker (if caching is added)                  │──────────────────────▶
+│ Retry changed-range invalidation after commit        │
+└──────────────────────────────────────────────────────┘
 ```
 
-The condition `start_time < newEnd AND end_time > newStart` catches all four overlap cases: partial overlap on either end, complete containment in either direction. This is a standard interval overlap predicate.
+1. The browser sends a bounded date range or an identified mutation. The gateway validates the session and applies request limits.
+2. The Calendar service authorizes the owner and calendar, then either reads a range or validates and commits an event mutation. The overlap check is advisory; it never reserves the interval.
+3. PostgreSQL commits the event, its version, an operation receipt, and an outbox entry when downstream work is needed. The canonical result returns through the service and updates the browser's event model.
+4. If profiling justifies range caching, cache entries contain a snapshot revision. An outbox worker invalidates affected old and new ranges after writes. A writer's minimum revision forces a current read when a cached snapshot is too old.
 
-Design decision: conflicts are shown as **warnings**, not blockers. Real-world calendars allow overlapping events (two meetings at the same time happen frequently). The API returns the list of conflicting events alongside the created event, and the frontend displays a warning banner. This respects user agency while providing helpful information.
+The cache and outbox worker are optional scaling additions. They do not appear in the local application. A session store may initially use PostgreSQL, with its workload measured separately; adding another database is not justified by a user-count threshold alone.
 
-### Recurring Events
+### Implemented local topology
 
-At production scale, recurring events use the RRULE specification (RFC 5545). A recurring event stores the recurrence rule as a string (e.g., `FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20261231`). The **Recurring Event Expander** service materializes instances within a requested date range at query time rather than pre-generating all instances. This avoids storing millions of rows for a "every weekday forever" rule. Exception instances (single occurrence modifications or deletions) are stored separately and override the generated instances.
+```text
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ React browser          │       │ Express API            │       │ PostgreSQL 16          │
+│ Views + modal + store  │◀─────▶│ Calendar + event API   │◀─────▶│ Data + session table   │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
 
-### Notification and Reminder System
+                          Vite proxies /api to Express; Valkey is not used
 
-At production scale, a notification service processes event reminders. When an event is created with a reminder (e.g., "15 minutes before"), a message is enqueued with a delivery timestamp. A scheduled worker polls the queue for due reminders and dispatches push notifications, emails, or in-app alerts.
+
+Read: get range → owner-filtered SQL → replace events array → render
+
+Write: submit modal → SQL write + conflict result → update array → close modal
+```
+
+The routers and conflict service run in the same Express process. There is no gateway, cache, replica routing, outbox, background worker, WebSocket channel, or read/write service split. Both calendar data and sessions depend on the shared PostgreSQL pool.
+
+## Core Components / Request Flows
+
+### Proposed browser responsibilities
+
+The view layer renders month cells, day segments, overlap lanes, and an all-day lane. A calendar model owns server event entities and range load state; a separate editor draft owns unsubmitted text and selected time fields. Navigation owns date, view, display zone, and visible calendars. A data-access coordinator handles request identity, cancellation, errors, and canonical save results.
+
+The high-level browser diagram and walkthrough are in the [frontend answer](./system-design-answer-frontend.md). Server reads are keyed by account, calendar set, exclusive interval, and display zone where it affects interpretation. A mutation invalidates every loaded range that intersects either the old or new event interval. Hidden calendars remain available to the server's warning query.
+
+### Proposed read flow
+
+Convert the visible civil dates in the chosen zone into exact interval boundaries. Authorize the requested calendars. Query overlapping events using a half-open interval, then return stable ordering, a continuation cursor, and a snapshot revision. All-day date ranges use their own civil-date semantics instead of being shifted through UTC as if they were meetings.
+
+For paginated range reads, continuation must refer to a consistent revision. A simple initial protocol rejects a continuation if the owner's calendar revision changed and asks for a fresh range. Bound these restarts and offer a narrower day/agenda request for a very busy account. Do not append pages from unrelated snapshots and call the resulting calendar complete.
+
+**Local:** [the event router](./backend/src/routes/events.ts) joins events to calendars, filters by the session owner, and uses `start_time < requested_end AND end_time > requested_start`. It optionally filters one `calendarId`, orders only by start time, and has no pagination, stable tie-breaker, interval length limit, or revision. The browser fetches all owned calendars for the view and filters visibility locally.
+
+### Proposed create and edit flow
+
+Freeze the submitted editor revision. The API validates its temporal type, title, calendar ownership, operation ID, and expected event version for an edit. Within a database transaction, it claims or reads the operation receipt, performs the conditional mutation, advances the owner's change revision, and records the result. A duplicate request with the same payload returns the earlier result; reuse of the operation ID with different content is rejected.
+
+Obtain an advisory overlap snapshot using normalized times. If the warning subsystem is unavailable, return the committed event with an explicit warning-unavailable status; do not turn a committed edit into an ordinary failed-save response. The browser reconciles the canonical result, reports “Saved,” and leaves any overlap warning visible outside a closing modal or inside a deliberate saved-result state.
+
+**Local:** create checks overlaps **before** insertion; update persists the row **before** checking overlaps. Neither wraps the whole flow in a transaction. A failed update warning query can therefore return HTTP 500 after a successful update. Both responses carry a raw event row and optional conflicts; the browser only changes its events array after the response and then closes the modal.
+
+### Proposed rendering flow
+
+Split each timed event into the civil days it intersects, excluding an end exactly at the next day's boundary. Clip each segment before calculating its visual height. Assign horizontal lanes within connected groups of overlapping segments. Keep true times separate from minimum visual hit areas, and provide an agenda alternative when a grid becomes too dense.
+
+Use a zone-aware mapping from instants to displayed wall-clock positions. A DST transition can remove or repeat an hour; mark the gap or repeated offset explicitly, or provide an agenda presentation for that interval. A fixed denominator of 1,440 elapsed minutes with ordinary 24-hour wall-clock labels is not sufficient on those dates.
+
+**Local:** [dateUtils.ts](./frontend/src/utils/dateUtils.ts) uses browser-local date-fns operations. Month dates span whole Sunday-starting weeks and total 28, 35, or 42 cells. Day/week components use 24 fixed hourly slots, shared full-width event positioning, and no overlap lanes. Their all-day events are filtered out entirely.
 
 ## Database Schema
 
+### Proposed production additions
+
+The following model extends the local tables; it is not present in migrations.
+
+| Entity | Important fields | Constraint / purpose |
+|--------|------------------|----------------------|
+| Calendar owner | Account, home partition, change revision | Route private calendars together; scope range freshness |
+| Calendar | ID, owner, name, color | Ownership must match every associated event |
+| Timed event | ID, calendar, start/end instants, authored zone, version | End after start; explicit temporal type |
+| All-day event | ID, calendar, inclusive start date, exclusive end date, version | Whole civil dates; no synthetic 23:59:59 endpoint |
+| Operation receipt | Owner, operation ID, payload fingerprint, outcome, retention | Same identified request has one retained result |
+| Change/outbox record | Owner revision, event ID, old/new interval, event version | Invalidate both sides of moves and recover downstream work |
+| Session | Opaque ID, account, expiry | Shared session validation and revocation |
+
+For owner sharding, store the owner on event records and enforce consistency with the calendar's owner, such as a composite relationship. Ordinary foreign keys do not automatically create every lookup index. Add an owner lookup for calendars and select an event index based on measured overlap queries.
+
+A B-tree beginning with calendar ID and start time is a useful starting point for ordinary calendars. Very long events and large histories can make an overlap query examine many candidates. A matching range expression with the overlap operator can use a GiST range index; it is not enough simply to declare such an index while querying unrelated scalar predicates. See [PostgreSQL range indexing](https://www.postgresql.org/docs/16/rangetypes.html#RANGETYPES-INDEXING). Compare actual query plans before adding redundant indexes.
+
+### Exact local schema
+
+The following is [backend/src/db/init.sql](./backend/src/db/init.sql), executed by `npm run db:migrate`. It contains four tables, three explicit secondary indexes, one trigger function, and three update triggers. This is a consolidated schema initializer, not a migration history that upgrades arbitrary older table shapes.
+
 ```sql
+-- Google Calendar Schema
+
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
@@ -146,14 +205,15 @@ CREATE TABLE IF NOT EXISTS events (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
 
+  -- Ensure end time is after start time
   CONSTRAINT valid_time_range CHECK (end_time > start_time)
 );
 
--- Efficient event range queries by calendar
-CREATE INDEX idx_events_calendar_time ON events(calendar_id, start_time, end_time);
+-- Index for efficient time range queries
+CREATE INDEX IF NOT EXISTS idx_events_calendar_time ON events(calendar_id, start_time, end_time);
 
--- GiST index for range overlap queries (used by conflict detection)
-CREATE INDEX idx_events_time_range ON events USING gist (
+-- Index for fetching events within a date range
+CREATE INDEX IF NOT EXISTS idx_events_time_range ON events USING gist (
   tstzrange(start_time, end_time, '[)')
 );
 
@@ -163,9 +223,9 @@ CREATE TABLE IF NOT EXISTS "session" (
   "sess" JSON NOT NULL,
   "expire" TIMESTAMP(6) NOT NULL
 );
-CREATE INDEX "IDX_session_expire" ON "session" ("expire");
+CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");
 
--- Auto-update timestamps
+-- Trigger to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -175,348 +235,198 @@ END;
 $$ language 'plpgsql';
 
 CREATE OR REPLACE TRIGGER update_users_updated_at
-  BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+  BEFORE UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE OR REPLACE TRIGGER update_calendars_updated_at
-  BEFORE UPDATE ON calendars FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+  BEFORE UPDATE ON calendars
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE OR REPLACE TRIGGER update_events_updated_at
-  BEFORE UPDATE ON events FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+  BEFORE UPDATE ON events
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 ```
 
-Key schema design decisions:
+`recurrence_rule` is stored but unused by the API and UI. User `timezone` is returned but not applied to rendering or save conversion. There is no uniqueness constraint for one primary calendar per owner, no event version, and no operation receipt. The `updated_at` triggers do not provide conditional concurrency control.
 
-- **GiST index with `tstzrange`** enables PostgreSQL to use the range overlap operator for conflict detection, which is significantly faster than B-tree scans for interval queries at scale
-- **CHECK constraint** (`end_time > start_time`) enforces valid time ranges at the database level, preventing corrupt data regardless of application bugs
-- **Composite index** `(calendar_id, start_time, end_time)` supports the primary query pattern: fetch events for a specific calendar within a date range
-- **SERIAL primary keys** are sufficient here since calendar data is not distributed -- a single PostgreSQL instance handles the write path. At production scale, UUIDs would be used for multi-region writes.
-- **Trigger-based `updated_at`** ensures timestamps are always accurate, even for direct SQL updates
+The GiST expression index exists, but both implemented overlap queries use scalar inequalities instead of the indexed `tstzrange` expression and a range operator. Do not claim this index accelerates those statements without changing the query and examining a plan. No live `EXPLAIN` was run in this review.
 
 ## API Design
 
-### Authentication
-```
-POST /api/auth/register    → Create account (username, email, password)
-POST /api/auth/login       → Login, create session
-POST /api/auth/logout      → Destroy session
-GET  /api/auth/me          → Current user info
+### Implemented API
+
+Authentication routes are in [auth.ts](./backend/src/routes/auth.ts); protected calendar routes are in [calendars.ts](./backend/src/routes/calendars.ts), and events in [events.ts](./backend/src/routes/events.ts).
+
+| Method | Path | Request / response behavior |
+|--------|------|-----------------------------|
+| POST | `/api/auth/register` | Username, email, password, optional timezone; returns user and establishes session |
+| POST | `/api/auth/login` | Username/password; returns user and establishes session |
+| POST | `/api/auth/logout` | Destroys session; success response or 500 |
+| GET | `/api/auth/me` | Current user; 401 without a valid account/session |
+| GET | `/api/calendars` | Own calendars, primary first then name |
+| POST | `/api/calendars` | Name and optional color; non-primary calendar |
+| PUT | `/api/calendars/:id` | Name/color only; owner-scoped |
+| DELETE | `/api/calendars/:id` | Rejects primary calendar; cascade removes its events |
+| GET | `/api/events` | Required `start`, `end`; optional singular `calendarId`; overlapping event rows |
+| GET | `/api/events/:id` | Owner-scoped event with calendar name and effective color |
+| POST | `/api/events` | Required calendarId/title/startTime/endTime; optional description/location/allDay/color |
+| PUT | `/api/events/:id` | Partial event fields; no expected version |
+| DELETE | `/api/events/:id` | Deletes through owner-scoped calendar subquery |
+| GET | `/api/events/:id/conflicts` | Rechecks an existing event against owned, non-all-day events |
+| GET | `/api/health` | Static `{ "status": "ok" }`; session middleware runs before it |
+
+Example **direct API** timed-event creation, with a session cookie:
+
+```json
+{
+  "calendarId": 1,
+  "title": "Project review",
+  "startTime": "2026-09-10T14:00:00-07:00",
+  "endTime": "2026-09-10T15:00:00-07:00",
+  "allDay": false
+}
 ```
 
-### Calendars
-```
-GET  /api/calendars              → List user's calendars
-POST /api/calendars              → Create calendar (name, color)
-PUT  /api/calendars/:id          → Update calendar
-DELETE /api/calendars/:id        → Delete calendar and all events
-```
+The success response contains `event` and, only when nonempty, `conflicts`. The event row uses `calendar_id`, `start_time`, and other SQL column names. Read routes coalesce an absent event color to its calendar's color and add `calendar_name`; create/update return raw rows without that normalization. Consumers cannot assume identical metadata on every response.
 
-### Events
-```
-GET  /api/events?calendarIds=1,2&start=...&end=...  → Events in date range
-POST /api/events                 → Create event (returns conflicts if any)
-PUT  /api/events/:id             → Update event (returns conflicts if any)
-DELETE /api/events/:id           → Delete event
-```
+The existing editor sends timezone-less values instead of the offset-qualified example. Also, blank description/location become omitted fields and the update's `COALESCE` retains the old value. Conversely, `color` is assigned directly, so omission clears an event color override. Invalid date syntax and many other validation failures become generic 500 responses; only a detected `valid_time_range` violation gets the specific end-after-start 400.
+
+### Proposed contract extensions
+
+Keep read intervals exclusive at the end and require a temporal type for saves. Add runtime validation, range/payload bounds, stable continuation, event versions, and operation receipts. Define omitted, null, and empty text separately so clients can intentionally clear fields. A canonical save response should include the same display metadata as reads, plus the owner's revision and advisory status.
+
+Use a dedicated preview endpoint only if live unsaved-event warnings are required. The local `/api/events/:id/conflicts` checks a stored event and cannot preview an arbitrary editor draft. Preview results need their own draft/request identity and remain advisory because another device can write afterwards.
 
 ## Key Design Decisions
 
-### Conflict Detection: Warn, Don't Block
+### Preserve temporal meaning across the boundary
 
-Conflicts are returned as warnings, not errors. The event is created successfully, and the response includes a `conflicts` array listing overlapping events. This matches how real calendars work -- users routinely have overlapping obligations and need to see them.
+A timed meeting is an interval of instants; an all-day holiday is a range of dates. Sending an explicit offset solves instant ambiguity for an individual event, while an IANA zone preserves the authored location for future editing. PostgreSQL normalizes `timestamptz` values and does not retain the originally supplied zone; timezone-less inputs use the session `TimeZone`. See [PostgreSQL timestamp semantics](https://www.postgresql.org/docs/16/datatype-datetime.html#DATATYPE-DATETIME-INPUT-TIMESTAMPS).
 
-The trade-off is that naive users might not notice the warning. We mitigate this with prominent UI highlighting: conflicting events show a yellow warning banner in the event modal, and overlapping events in the week/day views are visually stacked with reduced opacity on the conflict.
+The local path has three potentially different interpretations: the form uses browser wall time, the conflict check constructs Node `Date` values, and SQL consumes the original timezone-less strings. The schema type alone cannot reconcile those choices. Standardize the boundary before optimizing reads.
 
-### PostgreSQL Sessions vs Redis Sessions
+For all-day data, use an exclusive end date: a one-day event on September 10 ends at September 11. That avoids precision hacks and accidental inclusion on the following day. This follows the event/date boundary model in [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545.html#section-3.6.1).
 
-We chose PostgreSQL-backed sessions (`connect-pg-simple`) instead of Redis. This simplifies infrastructure by requiring one fewer service -- sessions are transactional with user data (creating a user and establishing a session can share the same transaction context). The trade-off is higher session lookup latency (~2ms for PG vs ~0.2ms for Redis) and no built-in TTL cleanup (requires a periodic `DELETE FROM session WHERE expire < NOW()`). For a calendar application where session lookups happen once per request and the read-heavy pattern is event fetching (not session checking), this latency difference is negligible.
+If recurring series are added, persist the local recurrence rule and named zone, with exceptions keyed by the original occurrence identity. Bound expansion to the requested window. A weekly 09:00 meeting is not generated by adding fixed UTC durations forever. Explicitly document DST gap/fold behavior and use a tested standards-aware expansion library; the current text column supplies none of this.
 
-### View-Scoped Date Range Fetching
+### Warn about overlaps without promising exclusive reservations
 
-Rather than fetching all events and filtering client-side, each view calculates its visible date range and requests only those events. Month view includes padding days from adjacent months. This keeps query result sets small (typically 20-100 events per view) regardless of total event count. The trade-off is additional API calls when switching views, but each call is fast due to the composite index on `(calendar_id, start_time, end_time)`.
+Two positive-duration intervals overlap when each starts before the other ends. Adjacent meetings can touch without conflicting. A personal calendar should allow tentative and competing events; rejecting all overlaps would prevent normal usage. The trade-off is that a warning describes a snapshot, and concurrent writes can introduce additional overlaps after the check.
 
-### Percentage-Based Event Positioning
+A room reservation is a different invariant. A preflight query followed by insertion, even inside an ordinary transaction, does not by itself exclude concurrent reservations. That extension needs a database-enforced non-overlap constraint or equivalent correctly serialized resource allocation. Do not burden every personal event with that stronger restriction.
 
-Events in week/day views use CSS percentage positioning: `top = (startMinutes / 1440) * 100%`. This is pure computation with no DOM measurement, works with CSS percentage-based layouts, and is responsive to container size changes. The trade-off is that overlapping events at the same time render on top of each other rather than side-by-side -- a known limitation in the current implementation.
+The local conflict service excludes existing all-day events but still runs for a newly submitted all-day event, creating an asymmetric rule. The proposed baseline treats all-day entries as informational and checks timed busy events consistently; a future explicit busy/free property can make the policy configurable.
+
+### Bound range work before introducing a cache
+
+Querying the visible interval limits network and rendering work, but not necessarily the number of database candidates. Measure long-lived events, many calendars, and dense imported history. An index must match the access pattern; blindly adding replicas will not repair an inefficient query.
+
+A private range cache can reduce repeated reads, but moves affect both old and new ranges, and delayed fills can race invalidation. Keep entries tied to their source revision, enforce TTLs, and bypass insufficient revisions for the writer. Other devices may see bounded stale data under this optional policy. Atomic database commits remain the source of truth, so cache failures must not convert successful writes into ambiguous failures.
+
+Caching every month indefinitely gives cheap repeat navigation but expands invalidation and memory costs. The first release can read PostgreSQL directly and retain only a few bounded browser ranges. Introduce shared caching after evidence shows repeat work is the limiting factor.
 
 ## Consistency and Idempotency
 
-- **Event creation** is idempotent by content: duplicate submissions within a short window with the same title, time, and calendar are detected client-side before sending
-- **Calendar deletion** cascades to all events via `ON DELETE CASCADE` -- a single DELETE statement atomically removes the calendar and all its events
-- **Session cleanup** uses PostgreSQL's `expire` column; a periodic cleanup query removes stale sessions
-- **Conflict detection** is read-only and naturally idempotent -- querying for overlaps produces the same result regardless of how many times it runs
+**Proposed:** the write transaction combines the conditional event mutation and an owner-scoped operation receipt. Concurrent uses of the same operation ID must meet a uniqueness constraint. Validate that repeated IDs have identical content; retain results for a declared retry period. If the response is lost, retry the same frozen operation or query its result. After receipt expiry, reconcile the event rather than silently treating an old operation as a new create.
 
-## Security and Auth
+An event version prevents one editor from overwriting another. On a stale version, return the current event while the client preserves its draft. These versions detect concurrent edits; they do not prevent time overlaps. A read-after-write token also prevents the writer's next range read from regressing behind an acknowledged mutation.
 
-- Session-based authentication with PostgreSQL-backed store
-- Password hashing with bcryptjs
-- HTTP-only, SameSite=lax cookies prevent CSRF
-- CORS restricted to frontend origin
-- At production scale: OAuth2 for Google/Microsoft account federation, RBAC for shared calendars (owner, editor, viewer), rate limiting on event creation
+**Local:** single SQL inserts, updates, and cascading deletes are atomic database statements, but multi-step routes do not provide the proposed transaction. Creates can duplicate on retry, updates are last-writer-wins, registration can leave a user without a default calendar, and post-update conflict lookup can fail after persistence. There is no outbox, operation status, conditional version, or canonical range revision.
+
+## Security / Auth
+
+**Implemented:** [app.ts](./backend/src/api/app.ts) configures credentialed CORS, JSON parsing, and `connect-pg-simple` on the shared pool with table `session`. Cookies use the default `connect.sid` name, a 30-day max age, HttpOnly, SameSite=Lax, and Secure only under `NODE_ENV=production`. [requireAuth](./backend/src/shared/auth.ts) checks the session user ID. Routes use parameterized queries and owner predicates/checks; login compares bcrypt hashes and registration hashes with cost 10.
+
+The installed session library rejects expired sessions during lookup and schedules automatic cleanup around a randomized 15-minute interval. There is no application-level session query retry wrapper. Login/registration assign the user to the existing session rather than explicitly regenerating its ID. Registration's user and default-calendar inserts are separate statements.
+
+**Needed for production:** session rotation on authentication, a managed signing secret, correct HTTPS/proxy configuration, origin/CSRF defenses appropriate to cookie-authenticated writes, bounded field validation, and login/request rate limits. HttpOnly and SameSite reduce specific risks but are not a complete XSS/CSRF strategy. Calendar visibility toggles are display preferences, never authorization controls.
+
+Clear private browser state and retire in-flight callbacks when the account changes. The local auth profile is persisted under `auth-storage` and rechecked through `/me`, but the separate calendar store is not cleared on logout. A pending response or editor state can survive an account transition. Protect the client boundary as well as the SQL owner predicates.
 
 ## Observability
 
-- **Health check**: `GET /api/health` returns service status
-- At production scale: Prometheus metrics for event query latency, conflict detection rate, cache hit ratio; structured logging with request correlation; distributed tracing for multi-service flows
+**Local:** errors are written through `console.error`; there is no structured request logging, tracing, Prometheus endpoint, or dashboard. `/api/health` returns a constant body and does not explicitly probe PostgreSQL. Because session middleware runs first, a request carrying a session can still depend on a session lookup before reaching it.
+
+**Proposed:** measure range latency together with range size, candidate/returned row counts, calendar count, and cache source revision. Track write outcomes separately as committed, rejected, conflicted, or unknown to the caller. Record advisory warning failures independently of save failures. Add database pool saturation, session errors, replication lag if replicas are introduced, and outbox backlog.
+
+Browser telemetry should cover stale-response drops, missing/failed ranges, save uncertainty, editor conflict recovery, layout cost, and all-day/DST fixtures. Avoid event titles, descriptions, raw cookies, or other private contents in logs. Define readiness around required dependencies and keep a separate lightweight liveness check.
 
 ## Failure Handling
 
-- **Database connection pool**: Connection pooling via `pg.Pool` with idle timeout for resource cleanup
-- **Session store resilience**: `connect-pg-simple` retries failed session writes
-- **Input validation**: CHECK constraint at the database level prevents invalid time ranges even if application validation is bypassed
-- At production scale: circuit breakers on notification service, retry queues for failed reminder deliveries, graceful degradation (serve cached calendar data if primary DB is unreachable)
+| Failure | Proposed response | Current behavior |
+|---------|-------------------|------------------|
+| PostgreSQL unavailable | Fail authenticated reads/writes explicitly; preserve draft | Generic errors; range errors only logged in browser |
+| Save response lost | Resolve operation receipt before retrying as new intent | No receipt; duplicate creates or uncertain updates possible |
+| Warning lookup fails | Return committed result with warning status unavailable | Update can return 500 after its SQL write |
+| Old range response arrives | Reject wrong account/range/request generation | Unconditionally replaces the events array |
+| Another device edits | Return version conflict and retain both versions | Unconditional update can overwrite newer fields |
+| Optional cache unavailable | Read primary within capacity limits | No application cache exists |
+| User closes editor during save | Keep completion scoped to that editor generation | Late completion can close a newly opened editor |
+| Session expires / logout fails | Reauthenticate; clear private state only with explicit outcome | Logout wrapper ignores HTTP error status |
+
+Retries need bounded backoff and should apply only where the operation has safe semantics. A successful database update cannot be rolled back by changing a browser array after the response is lost. The UI must describe uncertainty accurately.
 
 ## Scalability Considerations
 
-**What breaks first at scale:**
+Scale stateless API instances with bounded database pools; their aggregate connection count matters. Profile range queries and owner skew first. Add read replicas only for requests that permit lag, or route using a minimum revision to a source that can satisfy it. Replicas do not provide automatic read-after-write consistency.
 
-1. **Event queries for power users** -- A user with 10 calendars and thousands of events per month. The composite index handles this efficiently up to ~100K events per calendar. Beyond that, partition events by `calendar_id` and time range.
+If event volume outgrows one database, partition private calendars by owner so ordinary range reads and mutations stay local. Maintain a directory for owner placement and plan migration/cutover with a single active writer. A large organization with shared calendars changes that partitioning problem and requires a separate access/fan-out design; it is outside this baseline.
 
-2. **Recurring event expansion** -- A "every weekday" rule spanning years generates thousands of virtual instances per query. Solution: expand only within the requested date range (never materialize all instances), cache expanded results in Redis with a short TTL.
+For browser scale, bound cached ranges, prefetch only adjacent views, memoize day grouping, and limit visible pills with a reachable agenda expansion. Virtualization can help a long agenda, but a seven-column week does not automatically need a virtualized grid. Profile layout and interaction latency on dense and DST-transition fixtures.
 
-3. **Conflict detection on busy calendars** -- Checking conflicts across 10 calendars with hundreds of events in the same week. The GiST index with `tstzrange` keeps this efficient, but at extreme scale (1000+ events/week), pre-compute a conflict bitmap per time slot.
-
-**Scaling path:**
-- Read replicas for calendar/event queries (strong consistency needed only for writes)
-- Redis caching for frequently viewed date ranges (invalidate on event create/update/delete)
-- Separate service for recurring event expansion with its own cache
-- CDN for static assets
-- Event-driven notification system with message queue for reminders
+Do not claim fixed throughput multipliers for partitioning, replicas, Valkey, or a Node process. Query shape, contention, event size, and deployment hardware determine useful capacity. The repository supplies no such benchmark.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Conflict handling | Warn, don't block | Block overlapping events | Real calendars allow overlaps; user decides |
-| Session storage | PostgreSQL | Redis | One fewer service; latency difference negligible for calendar |
-| Event fetching | View-scoped date range | Fetch all, filter client-side | Small result sets, efficient queries |
-| Event positioning | CSS percentages | DOM measurement | Pure computation, responsive, no layout thrashing |
-| Recurring events | Query-time expansion | Pre-materialized instances | Avoids storing millions of rows |
-| Primary keys | SERIAL (local) | UUID (distributed) | Single-writer DB; switch to UUID for multi-region |
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-App (TanStack Router)
-├── __root.tsx (RootLayout)
-│   ├── Header: logo, user email, logout button
-│   └── <Outlet /> ──▶ routes
-│
-├── /login (LoginPage)
-│   └── Login form (username + password)
-│
-└── / (CalendarPage)
-    ├── CalendarSidebar
-    │   ├── Create Event button
-    │   ├── MiniCalendar (date picker)
-    │   └── Calendar list with visibility toggles
-    │
-    ├── Toolbar
-    │   ├── DateNavigator (prev/next/today + current date label)
-    │   └── ViewSwitcher (month/week/day toggle)
-    │
-    ├── Calendar View (conditional rendering)
-    │   ├── MonthView (7-column CSS Grid, 6 rows)
-    │   │   └── EventCard (compact pill per event)
-    │   ├── WeekView (7-column time grid, 1440px height)
-    │   │   └── EventCard (absolute-positioned block)
-    │   └── DayView (single-column time grid)
-    │       └── EventCard (absolute-positioned block)
-    │
-    └── EventModal (create/edit form overlay)
-        ├── Title, date/time pickers, calendar selector
-        ├── Color picker (8 colors)
-        ├── Conflict warning banner (amber)
-        └── Delete button (edit mode only)
-```
-
-### Zustand Stores
-
-The frontend uses two Zustand stores that separate concerns cleanly:
-
-**`authStore`** -- Manages user session state. Uses Zustand's `persist` middleware to survive page reloads by storing the `user` object in `localStorage`. The store holds `user`, `isLoading`, and provides `setUser`, `setLoading`, and `logout` actions. The `partialize` option ensures only the user object is persisted, not the loading state.
-
-**`calendarStore`** -- The central state hub for the calendar UI. This is a non-persisted store holding:
-
-- **View state**: `currentDate` (the anchor date for the current view), `view` (month/week/day), and navigation actions (`goToToday`, `goToPrevious`, `goToNext`) that compute the next date using `date-fns` helpers (`addMonths`, `subWeeks`, etc.)
-- **Events array**: Flat list of `CalendarEvent` objects with `setEvents`, `addEvent`, `updateEvent`, `removeEvent` mutators
-- **Calendar visibility**: `calendars` array and `visibleCalendarIds` Set that controls which calendars' events are rendered. `toggleCalendarVisibility` adds or removes IDs from the Set
-- **Modal state**: `isModalOpen`, `modalMode` (create/edit), `selectedEvent`, `modalDate` -- controlled by `openCreateModal`, `openEditModal`, `closeModal` actions
-- **Computed helper**: `getViewDateRange()` returns the `{start, end}` date bounds for the current view. Month view extends from the start-of-week of the first day of the month to the end-of-week of the last day, capturing the "padding days" visible in the grid
-
-### Routing
-
-Uses TanStack Router with file-based routing. Two routes:
-- `/login` -- Login form, redirects to `/` on success
-- `/` (index) -- Main calendar view, redirects to `/login` if not authenticated
-
-The root layout (`__root.tsx`) checks authentication on mount by calling `GET /api/auth/me`. If the session is valid, the user object is stored in `authStore`; otherwise the user is cleared and the login redirect triggers.
-
-### Data Fetching
-
-All API calls go through `services/api.ts`, which provides typed async functions wrapping `fetch` with `credentials: 'include'` for cookie-based session auth. The Vite dev server proxies `/api` requests to the Express backend at port 3000.
-
-**Event loading lifecycle**: When the `CalendarPage` mounts, it loads calendars once. Then, whenever `currentDate`, `view`, or `calendars` change, a `useEffect` calls `getViewDateRange()` to compute the visible window and fetches only events within that range via `GET /api/events?start=...&end=...`. This keeps payloads small -- typically 20-100 events per view regardless of total event count.
-
-**Client-side filtering**: After events are fetched, a `useMemo` filters them by `visibleCalendarIds`. Toggling a calendar's visibility does not trigger a new API call -- it only re-filters the already-fetched events.
-
-### Key UI Patterns
-
-**Calendar grid layout (MonthView)**: A CSS Grid with `grid-cols-7 grid-rows-6` creates the familiar 7x6 month layout. `getMonthDays()` returns 42 dates starting from the start-of-week of the first day of the month, including padding days from adjacent months. Padding days are visually dimmed with `bg-gray-50` and lighter text. Today's date gets a blue circular highlight. Each day cell shows up to 3 `EventCard` pills with a "+N more" overflow indicator.
-
-**Time grid positioning (WeekView/DayView)**: The time grid uses a fixed `min-h-[1440px]` container (60px per hour x 24 hours). Events are positioned absolutely within each day column using percentage calculations: `top = (startMinutes / 1440) * 100%` and `height = (durationMinutes / 1440) * 100%`. This is a pure computation approach -- no DOM measurements, no layout thrashing, naturally responsive to container size. The `getEventPosition` utility in `utils/dateUtils.ts` handles clamping events that start before or end after the visible day.
-
-**Conflict warning display**: The `EventModal` calls `createEvent` or `updateEvent`, which return a `conflicts` array alongside the saved event. If conflicts exist, an amber banner renders inside the modal listing each overlapping event with its time range. The event is still created -- conflicts are warnings, not blockers.
-
-**Calendar visibility toggles**: The sidebar renders each calendar with a colored checkbox. Clicking toggles the calendar's ID in the `visibleCalendarIds` Set, which triggers the `useMemo` filter and instantly hides/shows events without re-fetching. The checkbox background color matches the calendar's color for visual consistency.
-
-## Production-Grade Pattern Deep Dives
-
-This section explains each production-grade pattern referenced in the architecture, written for readers encountering these concepts for the first time.
-
-### Health Checks
-
-A health check is an HTTP endpoint (typically `GET /health`) that reports whether the service is alive and capable of handling requests. Load balancers, container orchestrators (Kubernetes), and monitoring systems poll this endpoint at regular intervals (e.g., every 10 seconds). If the health check fails, the infrastructure stops routing traffic to that instance and may restart it.
-
-A basic health check just returns HTTP 200 to prove the process is running. A more useful health check tests downstream dependencies -- can the service reach the database? Is Redis responding? This prevents a "zombie" scenario where the process is running but cannot actually serve requests because its database connection died.
-
-**How it works in this project**: The Express server exposes `GET /api/health` that returns service status. A load balancer or container orchestrator can use this endpoint to determine whether to route traffic to this instance.
-
-**Why it matters at production scale**: With dozens of service instances behind a load balancer, a single instance with a broken database connection would cause a fraction of requests to fail silently. Health checks detect this and remove the broken instance from the rotation within seconds, maintaining the 99.99% uptime target.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. Without it, a single misbehaving client (or an attacker) can overwhelm the server with requests, degrading performance for everyone.
-
-**How it works**: The server tracks request counts per client (usually identified by user ID or IP address). When a request arrives, the server checks whether the client has exceeded their allowance. If they have, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. If not, the request proceeds and the counter increments.
-
-Common implementations use Redis for the counters because: (1) Redis is fast enough to check on every request without adding meaningful latency, (2) counters are shared across all server instances (a user hitting server A and server B still accumulates against the same counter), and (3) Redis TTL handles automatic counter expiry.
-
-**Why it matters for a calendar service**: Event creation at production scale could be abused -- a script creating millions of events would bloat the database and trigger excessive conflict checks. Rate limiting event creation to 100/minute per user prevents this while being invisible to normal users who create maybe 5 events per day.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is a method of restricting system access based on the roles assigned to users, rather than checking permissions for each user individually. Instead of maintaining a per-user permission list ("Alice can edit Calendar X, Bob can view Calendar X"), you define roles ("owner", "editor", "viewer") with associated permissions, and assign users to roles.
-
-**How it works**: Each resource (e.g., a shared calendar) has an access control list mapping users to roles. When a user requests an action (e.g., "edit event in Calendar X"), the system looks up their role for that resource and checks whether the role permits the action. An "owner" can do everything, an "editor" can create/modify events, a "viewer" can only read.
-
-**Why this matters for calendar sharing**: Google Calendar supports sharing calendars with different permission levels. Without RBAC, you would need to check permissions with custom logic for every API endpoint. RBAC centralizes this: add one middleware that looks up the user's role for the requested calendar, then allow or deny based on a simple role-to-permissions mapping. This is mentioned in the architecture as a production-scale feature (not implemented locally because the local version is single-user).
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it.
-
-**How it works step by step**: (1) Application receives a request for data. (2) Check Redis: `GET cache:key`. (3) If found, return the cached value -- this is typically 10-50x faster than a database query. (4) If not found, query PostgreSQL. (5) Store the result in Redis: `SET cache:key value EX 300` (5-minute TTL). (6) Return the result.
-
-**Cache invalidation**: When data changes (event created, updated, or deleted), the application deletes the relevant cache keys so the next read fetches fresh data from the database. The TTL provides a safety net -- even if invalidation is missed, the cache self-corrects within the TTL window.
-
-**Why it matters for calendar reads**: The architecture targets 500K event reads/second at peak. PostgreSQL can handle maybe 10K-50K queries/second depending on complexity. Redis cache absorbs the remaining load, serving cached event lists for frequently viewed date ranges. A user checking their calendar 10 times in a minute hits the database once and Redis 9 times.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-readable JSON objects instead of free-form text strings. Instead of `"User 123 created event 456 in 15ms"`, the log entry is `{"level":"info","userId":123,"eventId":456,"durationMs":15,"action":"event_created","timestamp":"2026-03-18T10:00:00Z"}`.
-
-**Why JSON instead of text**: Free-form text logs require regex patterns to search and analyze. JSON logs can be indexed by any field -- you can query "show me all log entries where durationMs > 1000 and action = event_created" in a log aggregation system (Elasticsearch, Datadog, CloudWatch). This is the difference between spending 30 minutes grepping logs and getting an answer in 5 seconds.
-
-**How Pino works**: Pino is a high-performance Node.js logging library that outputs JSON by default. It supports log levels (trace, debug, info, warn, error, fatal), child loggers (adding persistent context like `service: "calendar"`), and pretty-printing for local development. In production, the JSON output is piped to a log aggregation system.
-
-**Why it matters at scale**: When 50 service instances are running and a user reports "my events didn't load," you need to find the specific request across all instances. Structured logs with a request correlation ID let you filter to that exact request flow. With text logs, this investigation takes hours; with structured logs, minutes.
-
-### Prometheus Metrics
-
-Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics at a `/metrics` HTTP endpoint in a specific text format. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the time-series data for querying and alerting.
-
-**Three metric types that matter**:
-- **Counter**: A number that only goes up. Example: `events_created_total`. You query the *rate* of change to get "events created per second."
-- **Gauge**: A number that goes up and down. Example: `active_websocket_connections`. Shows current state.
-- **Histogram**: Tracks the distribution of values in configurable buckets. Example: `event_query_duration_seconds` with buckets at 0.01, 0.05, 0.1, 0.25, 0.5, 1.0 seconds. Lets you compute percentiles (p50, p95, p99) to understand latency distribution.
-
-**How prom-client works**: The `prom-client` npm package creates a Prometheus metrics registry in the Node.js process. You define metrics (counters, gauges, histograms), instrument your code to update them, and expose the registry at `GET /metrics`. Prometheus scrapes this endpoint and stores the data.
-
-**Why it matters for a calendar service**: The architecture targets p99 read latency < 100ms. Without metrics, you have no way to know if you are meeting this target. Prometheus histograms on event query duration give you exact p99 values, and you can set alerts when p99 exceeds 100ms for 5 consecutive minutes.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing downstream service. It works like an electrical circuit breaker: when failures exceed a threshold, the "circuit opens" and subsequent calls fail immediately without attempting the request. After a cooldown period, the circuit allows one test request through ("half-open"). If the test succeeds, the circuit closes and normal operation resumes. If it fails, the circuit stays open for another cooldown period.
-
-**The three states**:
-1. **Closed** (normal): Requests pass through. Failures are counted. If failures exceed the threshold (e.g., 50% of the last 10 requests), the circuit opens.
-2. **Open** (failing): All requests are immediately rejected or routed to a fallback. No calls are made to the downstream service. This prevents cascading failures.
-3. **Half-open** (testing): After the reset timeout, one request is allowed through. If it succeeds, the circuit closes. If it fails, the circuit reopens.
-
-**Why this matters**: Without a circuit breaker, if Redis goes down, every request would wait for the Redis timeout (e.g., 3 seconds) before failing. With 1000 requests/second, that is 3000 requests stacked up waiting, consuming memory and threads, potentially crashing the application server. A circuit breaker detects the failure after a few requests and starts returning fallback responses immediately, keeping the application responsive.
-
-**Opossum**: The Node.js circuit breaker library used in this repository. It wraps async functions and monitors their success/failure rate. Configuration includes error threshold percentage, timeout per request, and reset timeout. It emits events on state changes, which can drive Prometheus metrics and Pino log entries.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In the context of API design, an idempotent endpoint can safely handle duplicate requests -- if a network timeout causes the client to retry, the server does not create a duplicate resource.
-
-**How idempotency keys work**: The client generates a unique key (typically a UUID) for each operation and sends it as a header (`X-Idempotency-Key`). The server checks Redis for this key before processing: (1) If found, return the cached result from the first execution. (2) If not found, process the request, store the result in Redis with a 24-hour TTL, and return it.
-
-**Why this matters for event creation**: Without idempotency, a network timeout during event creation could cause the client to retry, creating a duplicate event. The user sees two identical meetings at the same time. With idempotency keys, the retry hits the cached result and returns the already-created event. The client cannot distinguish between "the first request succeeded" and "the retry returned the cached result," which is exactly the desired behavior.
+| Event time | Explicit instants and separate date ranges | Timezone-less timestamps for everything | Preserve meeting and all-day meaning |
+| Overlap policy | Advisory warnings | Reject every overlap | Personal calendars permit competing commitments |
+| Save correctness | Conditional versions and retained receipts | Unconditional retries | Detect stale edits and resolve uncertain outcomes |
+| Range reads | Bounded owner-scoped queries first | Unbounded histories or immediate cache complexity | Limit payload and establish measured bottlenecks |
+| Rendering | Day clipping, overlap lanes, agenda escape | Full-width overlapping blocks | Keep events discoverable under density |
+| Session storage | Shared PostgreSQL initially | Separate Valkey immediately | Reuse infrastructure until measured contention justifies a move |
 
 ## Implementation Notes
 
-### Local Setup Diagram
+### Patterns actually implemented
 
-```
-┌─────────────────┐         ┌──────────────────────────────────────┐
-│   React SPA     │         │        Express Server                │
-│  localhost:5173  │────────▶│        localhost:3000                │
-│  (Vite + TS)    │         │                                      │
-│                 │         │  Routes: auth, calendars, events     │
-│  Components:    │         │  Services: conflictService           │
-│  MonthView      │         │  Sessions: connect-pg-simple         │
-│  WeekView       │         │                                      │
-│  DayView        │         └──────────┬───────────────────────────┘
-│  EventModal     │                    │
-│  CalendarSidebar│             ┌──────┴──────┐    ┌──────────┐
-│                 │             │ PostgreSQL  │    │  Valkey   │
-│  Store: Zustand │             │   :5432     │    │  :6379    │
-│  (calendarStore)│             │google_calendar│   │(available,│
-└─────────────────┘             │             │    │ not used) │
-                                └─────────────┘    └──────────┘
+The strongest reusable patterns are simple owner checks, parameterized SQL, database constraints/cascades, and a shared session store. They matter because every calendar/event operation carries private data and because session identity must survive API process restarts. They are a foundation, not evidence that every production invariant is enforced.
+
+For example, [event listing](./backend/src/routes/events.ts) scopes the overlap query through the owning calendar:
+
+```sql
+WHERE c.user_id = $1
+  AND e.start_time < $3
+  AND e.end_time > $2
 ```
 
-### Production-Grade Patterns Implemented
+The [conflict service](./backend/src/services/conflictService.ts) adds self-exclusion and removes existing all-day events. [shared/db.ts](./backend/src/shared/db.ts) creates one pool from `DATABASE_URL`; [shared/auth.ts](./backend/src/shared/auth.ts) supplies the session guard. The database check prevents nonpositive event duration, and deleting a calendar cascades atomically to its event rows.
 
-1. **Conflict detection service** -- Server-side overlap detection using the standard interval overlap predicate. Checks across all user calendars in a single query. Returns warnings alongside the created event. See `src/services/conflictService.ts`.
+There are no wired circuit breakers, idempotency helpers, rate limiters, Pino logging, or Prometheus metrics to demonstrate. No unused package or intended future pattern should be described as implemented middleware.
 
-2. **GiST range index** -- PostgreSQL GiST index with `tstzrange` for efficient interval queries, matching production-grade calendar systems. See `src/db/init.sql`.
+### Simplifications and observable gaps
 
-3. **CHECK constraints** -- Database-level enforcement of `end_time > start_time`. Prevents invalid data regardless of application-layer validation. See `src/db/init.sql`.
+| Area | Source-grounded behavior |
+|------|--------------------------|
+| Navigation | [calendarStore.ts](./frontend/src/stores/calendarStore.ts) owns date/view, events, calendars, visibility, and modal selection; the day-range helper mutates its stored Date object |
+| Loading | [index.tsx](./frontend/src/routes/index.tsx) replaces one events array after every response; no account/range generation check, abort, range cache, or visible read error |
+| Month layout | [MonthView.tsx](./frontend/src/components/calendar/MonthView.tsx) displays up to three pills per date; the date list varies while CSS declares six rows |
+| Day/week layout | [WeekView.tsx](./frontend/src/components/calendar/WeekView.tsx) and [DayView.tsx](./frontend/src/components/calendar/DayView.tsx) hide all-day entries and give timed events the same horizontal position |
+| Date boundaries | `eventOverlapsDay` includes an event ending exactly at day start; `getEventPosition` clips top but uses the original duration, overstating an overnight segment |
+| DST geometry | Elapsed minutes since midnight are divided by 1,440 against fixed hourly labels; a spring-transition 09:00 event can be positioned at the 08:00 row |
+| Editor defaults | [EventModal.tsx](./frontend/src/components/calendar/EventModal.tsx) resets creates to 09:00–10:00 even for an hourly slot click; new event color defaults to blue |
+| Editor save | Time strings have no offset; all-day end uses 23:59:59; conflict state is set and the modal immediately closes; form changes can continue during the request |
+| Edit reconciliation | Raw mutation rows replace display-enriched reads; blank description/location remain unchanged; omitted API color clears the override |
+| Lifecycle | Calendar refetch resets visibility; the mini-calendar month does not follow all external date navigation; logout leaves calendar/editor state in memory |
+| Accessibility | Native buttons/inputs cover some controls, but date/time cells lack keyboard interaction and the modal lacks focus trapping/restoration, Escape handling, and dialog semantics |
+| Infrastructure | [docker-compose.yml](./docker-compose.yml) starts PostgreSQL and optional unused Valkey; schema migration is manual; no dotenv loading |
+| Seed | [seed.ts](./backend/src/db/seed.ts) assumes both demo users are newly inserted, uses Los Angeles event times, skips existing usernames, and is not transactional repair |
 
-4. **Trigger-based timestamps** -- `update_updated_at_column()` trigger ensures `updated_at` is always accurate. See `src/db/init.sql`.
+### Omitted production capabilities
 
-5. **Health check endpoint** -- `GET /api/health` for load balancer integration. See `src/api/app.ts`.
+The implementation has no recurring expansion, calendar sharing/ACLs, invitation delivery, reminder scheduler, external synchronization, change feed, offline queue, admin UI, CDN, multi-region routing, database sharding, cache invalidation, operation receipts, or event version conflicts. Each would require its own behavior and failure contract.
 
-6. **View-scoped data fetching** -- Frontend calculates exact date range needed per view, minimizing data transfer. See `stores/calendarStore.ts` (`getViewDateRange`).
+### Review verification
 
-### Simplifications vs Production
-
-| Component | Local Implementation | Production Equivalent |
-|-----------|---------------------|----------------------|
-| Database | Single PostgreSQL instance | Primary + read replicas, partitioned by time |
-| Sessions | PostgreSQL-backed (connect-pg-simple) | Redis Cluster with session replication |
-| Auth | Username/password with bcrypt | OAuth2 (Google, Microsoft SSO) |
-| Caching | No caching layer | Redis cache for event queries, recurring event expansion |
-| Recurring events | `recurrence_rule` column stored but not expanded | RRULE parser + query-time expansion service |
-| Notifications | Not implemented | Message queue + push/email notification service |
-| Event sharing | Not implemented | RBAC with owner/editor/viewer permissions |
-| Timezone handling | Server time only | Per-user timezone with UTC storage, client conversion |
-
-### Omitted from Local Implementation
-- CDN for static assets
-- Multi-region deployment
-- Kubernetes orchestration
-- Recurring event expansion (RRULE parsing)
-- Event invitations and RSVP
-- Drag-and-drop event moving/resizing
-- Calendar sharing with permissions
-- Push notifications and email reminders
-- Timezone conversion (uses server time)
-- Rate limiting
-- Prometheus metrics and structured logging
-- Overlapping event side-by-side layout in week/day views
+All five documents were checked against routes, schema, seed, session configuration and installed store behavior, frontend views/stores/API, build scripts, Compose, project history, and smoke/screenshot configuration. Six isolated checks with mocked dependencies reproduced month size/day mutation, boundary and DST geometry, editor submission/closing, post-update warning failure, partial seed assumptions, and automatic session pruning. No application code was changed. Builds, live database queries, browser rendering, and full-stack smoke tests were not run for this documentation-only review.

@@ -1,438 +1,194 @@
-# evylcode CLI - AI-Powered Coding Assistant
+# evylcode — AI Code Assistant
 
-A terminal-based AI coding assistant similar to Claude Code, GeminiCLI, or opencode. This project demonstrates the system design of an intelligent CLI tool that helps developers write, debug, and understand code.
+A TypeScript learning project that puts a language model inside a local coding
+agent. The terminal accepts a request, the model proposes file or shell operations,
+and the controller executes tools and returns their results to the model.
 
-```
-   _____ _    _ __     __ _        _____ ____  _____  ______
-  |  ___| |  | |\ \   / /| |      / ____/ __ \|  __ \|  ____|
-  | |__ | |  | | \ \_/ / | |     | |   | |  | | |  | | |__
-  |  __|| |  | |  \   /  | |     | |   | |  | | |  | |  __|
-  | |___| |__| |   | |   | |____ | |___| |__| | |__| | |____
-  |______\____/    |_|   |______| \_____\____/|_____/|______|
+The interesting design problems are controlling side effects, preserving useful
+context, and making tool execution understandable to the developer. This is one
+Node.js process with an Anthropic adapter and an offline mock provider. There is
+no web frontend, HTTP backend, database, or Docker infrastructure to start.
 
-  evylcode CLI v1.0.0 - AI-Powered Coding Assistant
-  Powered by Claude from Anthropic
-```
+**Implementation status:** the basic completion/tool loop and six tools exist.
+Streaming, reliable session resumption, filesystem containment, context compression,
+and crash-safe editing are not complete. Read the limitations below before using
+it on a working checkout. Demo mode uses the real tools and can modify files.
 
-## Codebase Stats
+## What you can explore
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 5,446 |
-| Source Files | 28 |
-| .ts | 3,513 |
-| .md | 1,860 |
-| .json | 73 |
+- Ask the Anthropic provider to explain code or propose changes using tool calls.
+- Read files with numbered output, find paths, and search file contents.
+- Create or overwrite files, replace matching text, and invoke shell commands.
+- Inspect permission prompts and observe tool results feeding another model call.
+- Exercise the same controller without an API key using keyword-based demo input.
+- Save conversation records to local JSON files and inspect session metadata.
 
+The CLI displays a spinner during model completion, then prints the complete text.
+The provider has a streaming method, but the controller does not call it.
 
-## Overview
+## Start locally
 
-evylcode CLI is a command-line interface that provides:
-- **Conversational coding help** - Ask questions, get explanations
-- **Code generation** - Generate code from natural language descriptions
-- **File operations** - Read, edit, and create files with AI assistance
-- **Codebase understanding** - Analyze and navigate large codebases
-- **Tool execution** - Run commands with AI orchestration
+Requires Node.js 20+ and npm. Both development and compiled execution use native
+Node.js; there are no infrastructure services requiring Docker or Homebrew setup.
 
-## Key Features
-
-- Real integration with **Claude** via the Anthropic API
-- Multi-turn conversation with context retention
-- File system access with safety controls
-- Shell command execution in sandboxed environment
-- Streaming responses for real-time feedback
-- Extensible tool/plugin system
-- Session management and history
-- Colorful, intuitive terminal UI
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js 20+
-- npm or yarn
-- **Anthropic API key** (get one at [console.anthropic.com](https://console.anthropic.com/))
-
-### Installation
+From the repository root:
 
 ```bash
-# Navigate to the project directory
 cd ai-code-assistant
-
-# Install dependencies
 npm install
-
-# Run in development mode
-npm run dev
-
-# Or build and run
-npm run build
-npm start
-```
-
-### Setting Up Your API Key
-
-evylcode requires an Anthropic API key to work with Claude. You can provide it in two ways:
-
-**Option 1: Environment Variable (Recommended)**
-```bash
-export ANTHROPIC_API_KEY=your-api-key
-evylcode
-```
-
-**Option 2: Command Line Argument**
-```bash
-evylcode --api-key your-api-key
-```
-
-**Option 3: Demo Mode (No API Key)**
-```bash
-evylcode --demo
-```
-
-### Quick Start
-
-```bash
-# Start interactive session in current directory
-npm run dev
-
-# Start in a specific directory
-npm run dev -- -d /path/to/your/project
-
-# Start with a specific Claude model
-npm run dev -- -m claude-sonnet-4-20250514
-
-# Start with an initial prompt
-npm run dev -- "Read the package.json file"
-
-# Resume a previous session
-npm run dev -- -r <session-id>
-
-# List all saved sessions
-npm run dev -- --list-sessions
-
-# Run in demo mode (no API key required)
 npm run dev -- --demo
 ```
 
-## Usage
+Try `Read the file package.json`, `Find **/*.ts`, `/tools`, and `/session`.
+Use `/exit` to save and close the session. The demo recognizes a limited set of
+patterns; it does not perform general reasoning. Its edit intent reads the target
+file and stops rather than generating an actual edit.
 
-### Commands
-
-Once the assistant is running, you can interact with it using natural language or slash commands:
-
-**Slash Commands:**
-- `/help` - Show available commands
-- `/clear` - Clear conversation history
-- `/session` - Show current session information
-- `/sessions` - List all saved sessions
-- `/tools` - List available tools
-- `/exit` - Exit evylcode
-
-**Example Prompts:**
-```
-Read the file src/index.ts
-Find all TypeScript files in src/
-Search for 'TODO' in the codebase
-Create a new config.json file
-Edit the main.ts to add error handling
-Run npm test
-Git status
-```
-
-### CLI Options
-
-```
-Usage: evylcode [options] [prompt]
-
-evylcode CLI - AI-powered command-line coding assistant
-
-Arguments:
-  prompt                    Initial prompt to send to the assistant
-
-Options:
-  -V, --version             output the version number
-  -d, --directory <path>    Working directory (default: current directory)
-  -k, --api-key <key>       Anthropic API key (or set ANTHROPIC_API_KEY env var)
-  -m, --model <model>       Claude model to use (default: "claude-sonnet-4-20250514")
-  -r, --resume <sessionId>  Resume a previous session
-  -v, --verbose             Verbose output
-  --demo                    Run in demo mode with mock LLM (no API key needed)
-  --list-sessions           List all saved sessions
-  -h, --help                display help for command
-```
-
-### Tools
-
-The assistant has access to the following tools:
-
-| Tool | Description | Approval Required |
-|------|-------------|------------------|
-| **Read** | Read file contents with line numbers | No (auto-approved) |
-| **Write** | Create new files | Yes |
-| **Edit** | Modify existing files using string replacement | Yes |
-| **Bash** | Execute shell commands | Pattern-based |
-| **Glob** | Find files matching a pattern | No (auto-approved) |
-| **Grep** | Search file contents with regex | No (auto-approved) |
-
-### Permission System
-
-evylcode uses a layered permission system:
-
-1. **Auto-approved operations** - File reads, safe commands (ls, git status, npm run)
-2. **Session-approved** - Operations approved once apply for the session
-3. **Always-ask** - Destructive operations prompt every time
-4. **Blocked** - Dangerous patterns are never allowed (.ssh, credentials, rm -rf /, etc.)
-
-When an operation requires approval, you'll see a styled prompt:
-```
-  ┌─ Permission Required ──────────────────────────────────────┐
-  │
-  │  Edit: Edit file content
-  │     Target: src/index.ts
-  │
-  └──────────────────────────────────────────────────────────────┘
-
-  Allow? [y/n/always]
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      evylcode CLI                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│   ┌──────────┐     ┌──────────┐     ┌──────────┐           │
-│   │   CLI    │────▶│  Agent   │────▶│ Anthropic│           │
-│   │Interface │     │Controller│     │ Provider │           │
-│   └──────────┘     └──────────┘     └──────────┘           │
-│        │                │                  │                 │
-│        │                │                  │ Claude API      │
-│        │                ▼                  ▼                 │
-│        │         ┌──────────┐      ┌─────────────┐         │
-│        │         │   Tool   │      │   Anthropic │         │
-│        │         │  Router  │      │     API     │         │
-│        │         └──────────┘      └─────────────┘         │
-│        │                │                                    │
-│        │    ┌───────────┼───────────┐                       │
-│        │    ▼           ▼           ▼                       │
-│        │ ┌──────┐   ┌──────┐   ┌──────┐                    │
-│        │ │ Read │   │ Edit │   │ Bash │                    │
-│        │ └──────┘   └──────┘   └──────┘                    │
-│        │    │           │           │                       │
-│        ▼    ▼           ▼           ▼                       │
-│   ┌────────────────────────────────────────┐               │
-│   │       Permission & Safety Layer        │               │
-│   └────────────────────────────────────────┘               │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Core Components
-
-- **CLI Interface** (`src/cli/`) - Colorful terminal UI with styled prompts and streaming output
-- **Agent Controller** (`src/agent/`) - Agentic loop orchestrating LLM and tools
-- **Tool System** (`src/tools/`) - Pluggable tools (Read, Edit, Bash, Glob, Grep)
-- **LLM Provider** (`src/llm/`) - Anthropic Claude API integration + mock provider for demo
-- **Permission Manager** (`src/permissions/`) - Safety layer for sensitive operations
-- **Session Manager** (`src/session/`) - Persistence of conversation history
-
-## Project Structure
-
-```
-ai-code-assistant/
-├── src/
-│   ├── index.ts           # Main entry point
-│   ├── types/             # TypeScript type definitions
-│   │   └── index.ts
-│   ├── cli/               # CLI interface
-│   │   ├── index.ts
-│   │   └── interface.ts
-│   ├── agent/             # Agent controller (agentic loop)
-│   │   ├── index.ts
-│   │   └── controller.ts
-│   ├── tools/             # Tool implementations
-│   │   ├── index.ts       # Tool registry
-│   │   ├── read.ts        # File reading
-│   │   ├── write.ts       # File creation
-│   │   ├── edit.ts        # File editing
-│   │   ├── bash.ts        # Command execution
-│   │   ├── glob.ts        # File pattern matching
-│   │   └── grep.ts        # Content search
-│   ├── llm/               # LLM provider abstraction
-│   │   ├── index.ts
-│   │   ├── anthropic-provider.ts  # Real Claude integration
-│   │   └── mock-provider.ts       # Demo mode
-│   ├── permissions/       # Permission system
-│   │   ├── index.ts
-│   │   └── manager.ts
-│   └── session/           # Session management
-│       ├── index.ts
-│       └── manager.ts
-├── package.json
-├── tsconfig.json
-├── architecture.md        # Detailed system design
-├── system-design-answer-fullstack.md # Interview-style overview
-└── CLAUDE.md              # Development notes
-```
-
-## LLM Providers
-
-### Anthropic Provider (Default)
-
-The default provider uses Claude via the Anthropic API:
-
-```typescript
-import { AnthropicProvider } from './llm/anthropic-provider.js';
-
-const llm = new AnthropicProvider({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  model: 'claude-sonnet-4-20250514',
-});
-```
-
-Supported models:
-- `claude-sonnet-4-20250514` (default) - Fast, capable
-- `claude-opus-4-20250514` - Most capable
-- `claude-3-5-haiku-20241022` - Fast and cost-effective
-
-### Mock Provider (Demo Mode)
-
-For testing without an API key, use the mock provider with `--demo`:
+To run against a disposable directory instead of the project source:
 
 ```bash
-evylcode --demo
+mkdir -p /tmp/evylcode-demo
+npm run dev -- --demo --directory /tmp/evylcode-demo
 ```
 
-The mock provider simulates AI responses for demonstration purposes.
+The directory flag sets the base path for tools. It does **not** confine filesystem
+or shell access to that directory.
 
-## Development
+### Anthropic mode
 
-### Available Scripts
+Provide `ANTHROPIC_API_KEY` in the environment, or use the supported `--api-key`
+flag. The environment avoids placing the credential in command arguments. There
+is no automatic `.env` loader.
 
 ```bash
-npm run dev        # Start with tsx (hot reload)
-npm run build      # Compile TypeScript
-npm run start      # Run compiled version
-npm run lint       # Run ESLint
-npm run type-check # TypeScript type checking
-npm run test       # Run tests
+export ANTHROPIC_API_KEY='your-api-key'
+export EVYLCODE_MODEL='your-supported-model-id'
+npm run dev -- --model "$EVYLCODE_MODEL"
 ```
 
-### Adding New Tools
+Replace both placeholders. The source still defaults to
+`claude-sonnet-4-20250514`. As checked on 2026-09-09, Anthropic lists that model as
+retired on June 15, 2026; select a supported model from its
+[model lifecycle documentation](https://platform.claude.com/docs/en/about-claude/model-deprecations).
+Changing the model flag does not repair the adapter/controller limitations listed
+below. This documentation review did not make a paid API request.
 
-1. Create a new tool file in `src/tools/`:
+### Compile and run
 
-```typescript
-import type { Tool, ToolContext, ToolResult } from '../types/index.js';
-
-export const MyTool: Tool = {
-  name: 'MyTool',
-  description: 'Description of what the tool does',
-  parameters: {
-    type: 'object',
-    properties: {
-      param1: { type: 'string', description: 'Parameter description' }
-    },
-    required: ['param1']
-  },
-  requiresApproval: false,
-
-  async execute(params, context): Promise<ToolResult> {
-    // Implementation
-    return { toolId: 'mytool', success: true, output: 'Result' };
-  }
-};
+```bash
+npm run type-check
+npm run build
+npm start -- --demo
 ```
 
-2. Register in `src/tools/index.ts`:
+Development uses `tsx src/index.ts`; it does not enable watch mode. To install the
+local `evylcode` command, build first and then run `npm link`. Without that optional
+link, use the npm commands above or `node dist/index.js`.
 
-```typescript
-import { MyTool } from './mytool.js';
+## Commands and tools
 
-// In ToolRegistry constructor:
-this.register(MyTool);
-```
+| Option | Actual behavior |
+|--------|-----------------|
+| `--demo` | Selects the mock provider; tools still execute locally |
+| `-d, --directory <path>` | Base working directory, default current directory |
+| `-k, --api-key <key>` | Overrides `ANTHROPIC_API_KEY` |
+| `-m, --model <model>` | Overrides the pinned Anthropic model identifier |
+| `-r, --resume <sessionId>` | Loads a saved JSON record; agent context restoration is incomplete |
+| `-v, --verbose` | Shows a short preview of successful tool output |
+| `--list-sessions` | Lists saved session summaries without requiring an API key |
+| Initial positional prompt | Runs that request, then enters the interactive prompt |
 
-## Key Design Decisions
+| Slash command | Purpose |
+|---------------|---------|
+| `/help` | Show help; aliases `/h`, `/?` |
+| `/clear` | Clear in-memory conversation messages; does not revoke grants |
+| `/session` | Show current record metadata |
+| `/sessions` | List up to ten saved session summaries |
+| `/tools` | List the six registered tools |
+| `/exit` | Save and exit; aliases `/quit`, `/q` |
 
-1. **Real Claude Integration** - Uses official Anthropic SDK for production-quality AI
-2. **Streaming-first** - All LLM responses stream to terminal for responsive UX
-3. **Tool-use native** - Built around Claude's tool calling with explicit tool definitions
-4. **Safety by default** - Explicit permissions for file writes and command execution
-5. **String-based edits** - Edit tool uses string replacement (not line numbers) for robustness
-6. **Session persistence** - Conversations are saved for later resumption
-7. **Colorful UI** - Modern terminal aesthetics with chalk styling
+Input is readline-based and submits on Enter. There is no implemented multiline
+composer, persistent input history, slash-command autocomplete, or task-only
+cancellation. Ctrl+C exits the process without an explicit session save.
 
-## Related Documentation
+| Tool | Implemented behavior | Caveat |
+|------|----------------------|--------|
+| Read | Read UTF-8 text with numbered lines and optional slice | Reads the whole file before slicing; offset is effectively zero-based despite its schema description |
+| Write | Create parent directories and write full content | Overwrites existing files directly |
+| Edit | Replace exact text; reject missing or ambiguous matches | No expected-version check or atomic replacement |
+| Bash | Run a shell command, capture output, apply timeout | Host process privileges; no sandbox |
+| Glob | Find paths, ignore node_modules and .git, display up to 500 | Checks search root permissions, not each result |
+| Grep | Regex search with file filtering and limited displayed matches | Reads files without per-file permission checks |
 
-- [architecture.md](./architecture.md) - Detailed system design and trade-offs
-- [system-design-answer-fullstack.md](./system-design-answer-fullstack.md) - Interview-style architecture overview
-- [CLAUDE.md](./CLAUDE.md) - Development notes and iteration history
+Tool JSON schemas describe arguments to the model. The registry does not validate
+those schemas at runtime; tools mostly cast arguments and catch execution errors.
 
-## Technology Stack
+## Permissions and data handling
 
-- **Runtime:** Node.js
-- **Language:** TypeScript
-- **LLM:** Anthropic Claude API (`@anthropic-ai/sdk`)
-- **CLI Framework:** Commander.js
-- **Terminal UI:** chalk, ora
-- **Testing:** Vitest
+The manager applies path block patterns and records grants and denials in memory.
+Writes and commands can trigger a prompt. These checks are a teaching mechanism,
+not a reliable security boundary:
 
-## Related Projects
+- `y` and `always` produce the same session grant. There is no working distinction
+  between approving once and approving similar future operations.
+- After any write grant exists, the path-grant check also accepts targets whose
+  text starts with the working-directory string. That is broader than an exact
+  file grant and is not a valid directory containment check.
+- Execute grants use the entire approved command as a string prefix. They are not
+  parsed argument policies and do not account for shell semantics.
+- Commands classified as auto-approved skip the prompt but still need an execute
+  grant inside Bash. In a fresh session, commands such as `git status` therefore
+  fail with permission denied.
+- Reads are generally allowed outside the working directory. Path matching does
+  not resolve symlinks, and directory searches do not enforce exclusions on every
+  returned file. Shell commands can access data independently of file-tool guards.
 
-- [Claude Code](https://claude.ai/code) - Anthropic's official CLI
-- [aider](https://github.com/paul-gauthier/aider) - AI pair programming
-- [Cursor](https://cursor.sh) - AI-powered IDE
+Anthropic mode sends conversation text and tool results to the provider. Session
+JSON files also contain those results in plaintext under
+`~/.ai-assistant/sessions/`. Local persistence does not make remote inference
+local-only, and the application does not implement redaction or encryption.
 
-## License
+## Known implementation limitations
 
-MIT
+| Area | Current limitation |
+|------|--------------------|
+| Provider instructions | System-role messages are removed during conversion and never passed as the API's system parameter |
+| Tool-only responses | The controller records assistant tool calls only when response text is nonempty, so a tool-only response can produce an unmatched tool result on the next API call |
+| Session resume | The manager loads the JSON, but the controller starts with empty messages and current CLI directory; old context is not restored |
+| Permission persistence | Grant APIs exist in the session manager, but runtime grants are not copied into it or restored |
+| Session identifiers | Listings show eight-character prefixes; resume expects the full filename UUID and does not resolve prefixes |
+| Crash recovery | Sessions and edited files use direct writes; there is no journal, atomic save, or completed-tool ledger |
+| Context growth | No token-budget enforcement, summarization, or automatic overflow recovery |
+| Tool scheduling | Non-prompted tools run together before prompted tools; approval classification does not establish dependencies |
+| Completion limit | Ten model iterations per request; no overall cost budget or repeated-call detection |
+| Demo reporting | Mock continuation considers historical tool results and may report an earlier failure or result |
 
-## References & Inspiration
+To inspect saved records, list `~/.ai-assistant/sessions/`. Supplying a full UUID
+with `--resume` selects that record, but should not be treated as reliable
+conversation continuation until the context wiring is repaired.
 
-### AI Code Assistant Products
+## Development and verification
 
-- [GitHub Copilot](https://github.com/features/copilot) - GitHub's AI pair programmer powered by OpenAI Codex
-- [Cursor](https://cursor.sh) - AI-first code editor built on VS Code
-- [Codeium](https://codeium.com) - Free AI code completion and chat
-- [Tabnine](https://www.tabnine.com) - AI code assistant with local and cloud models
-- [Amazon CodeWhisperer](https://aws.amazon.com/codewhisperer/) - AWS AI coding companion
-- [Sourcegraph Cody](https://sourcegraph.com/cody) - AI coding assistant with codebase context
+| Script | Purpose |
+|--------|---------|
+| `npm run dev` | Start TypeScript source once |
+| `npm run type-check` | Check TypeScript without emitting files |
+| `npm run build` | Compile into dist |
+| `npm start` | Run compiled CLI |
+| `npm run lint` | Invoke ESLint; configuration must be available |
+| `npm test` / `npm run test:watch` | Invoke Vitest; no test files are currently checked into this project |
 
-### Research Papers
+Tools are registered explicitly in [src/tools/index.ts](./src/tools/index.ts).
+Adding a tool requires implementing the shared interface and registering it there;
+there is no dynamic plugin loader or MCP client.
 
-- [Evaluating Large Language Models Trained on Code](https://arxiv.org/abs/2107.03374) - OpenAI Codex paper introducing code-trained LLMs
-- [A Systematic Evaluation of Large Language Models of Code](https://arxiv.org/abs/2202.13169) - Comprehensive benchmark of code LLMs
-- [CodeBERT: A Pre-Trained Model for Programming and Natural Languages](https://arxiv.org/abs/2002.08155) - Microsoft's bimodal pre-trained model for code
-- [InCoder: A Generative Model for Code Infilling and Synthesis](https://arxiv.org/abs/2204.05999) - Meta AI's unified generative model for code
-- [StarCoder: May the Source Be with You](https://arxiv.org/abs/2305.06161) - BigCode's open LLM trained on permissively licensed code
+This review checked documentation against source. It did not claim successful
+live-provider execution, cross-platform terminal testing, or a passing test suite.
 
-### Documentation & Guides
+## Read next
 
-- [Anthropic Tool Use Documentation](https://docs.anthropic.com/claude/docs/tool-use) - Building agentic systems with Claude
-- [Model Context Protocol](https://modelcontextprotocol.io) - Anthropic's open protocol for connecting AI to tools and data
-- [OpenAI Function Calling Guide](https://platform.openai.com/docs/guides/function-calling) - Connecting GPT models to external tools
-- [LangChain Agents](https://python.langchain.com/docs/modules/agents/) - Framework for building agentic LLM applications
-
-### Engineering Blogs
-
-- [GitHub Blog: How GitHub Copilot is getting better at understanding your code](https://github.blog/2023-05-17-how-github-copilot-is-getting-better-at-understanding-your-code/) - Copilot architecture deep dive
-- [Inside GitHub: Working with the LLMs behind GitHub Copilot](https://github.blog/2023-05-17-inside-github-working-with-the-llms-behind-github-copilot/) - Engineering decisions behind Copilot
-- [Cursor Blog](https://cursor.sh/blog) - Technical posts on building an AI-native IDE
-- [Codeium Blog: How Codeium Works](https://codeium.com/blog) - Engineering insights on AI code completion
-
-### Open Source Projects
-
-- [aider](https://github.com/paul-gauthier/aider) - AI pair programming in your terminal
-- [Continue](https://github.com/continuedev/continue) - Open-source autopilot for VS Code and JetBrains
-- [Tabby](https://github.com/TabbyML/tabby) - Self-hosted AI coding assistant
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) - Efficient inference of LLMs in C/C++
-- [Ollama](https://github.com/ollama/ollama) - Run LLMs locally with simple API
-
-### Prompt Engineering for Code
-
-- [OpenAI Best Practices for Prompt Engineering](https://platform.openai.com/docs/guides/prompt-engineering) - Official guide to effective prompting
-- [Anthropic Prompt Engineering Guide](https://docs.anthropic.com/claude/docs/prompt-engineering) - Techniques for getting better outputs from Claude
-- [Microsoft Semantic Kernel](https://learn.microsoft.com/en-us/semantic-kernel/overview/) - SDK for integrating LLMs into applications
+- [Architecture](./architecture.md): proposed production design and verified implementation map.
+- [Frontend interview](./system-design-answer-frontend.md): terminal interaction and rendering.
+- [Backend interview](./system-design-answer-backend.md): orchestration, execution, and recovery.
+- [Fullstack interview](./system-design-answer-fullstack.md): end-to-end task and permission flow.
+- [Development history](./CLAUDE.md): prior iterations and open questions; current source takes precedence where it differs.

@@ -1,387 +1,362 @@
-# Dashboarding System (Metrics Monitoring) - System Design Answer (Frontend Focus)
+# Dashboarding: frontend system design interview
 
-## 45-minute system design interview format - Frontend Engineer Position
+## 🎯 Establish the user contract — 4 minutes
 
-## Introduction
+> “I would design this for an engineer investigating a service problem. The interface must make several measurements comparable and make uncertainty visible. A fast chart that quietly shifts a sample to another timestamp can lead to the wrong operational decision.”
 
-“I’ll design the frontend for a metrics monitoring product similar to Datadog or Grafana. The important frontend problem is not drawing a line chart. It is allowing many teams to own different panels while keeping the dashboard responsive, secure, observable, and resilient when one panel is slow or broken.”
+I would start with a dashboard containing time-series charts, gauges, and summary
+values. Users can choose a time range, filter series, refresh, and save panel
+configuration. They can inspect active alerts and understand which rule and measurements
+caused an incident. A metrics explorer supports investigation outside a saved dashboard.
 
-I will use a dashboard shell with a versioned panel plugin contract. A centralized data coordinator will schedule panel queries. The default deployment model is same-origin plugins or Module Federation for independently shipped panel families. I will reserve iframes for untrusted or hard-isolation extensions rather than placing every chart in its own iframe.
+I would clarify freshness before choosing a transport. For trend monitoring, a
+ten-second refresh target is sufficient for this first version. An incident-response
+product needing updates within a second would change the subscription and server fan-out
+design. Neither requirement means that receiving a response guarantees its observations
+are current.
 
-### RADIO Map
+The first release supports scalar gauges and cumulative counters with explicit units and
+supported operations. Logs, traces, arbitrary executable panel plugins, and a general
+query language are outside this interview's scope. I would require distribution support
+before offering latency percentiles; a chart cannot recover a percentile from averages
+alone.
 
-| Stage | Dashboard focus |
-|---|---|
-| **R — Requirements** | Operator workflows, ownership, responsiveness, accessibility, and permissions |
-| **A — Architecture** | Shell, registry, panel runtime, coordinator, and server boundary |
-| **D — Data model** | Dashboard configuration, panel state, query plans, and client-only UI state |
-| **I — Interfaces** | Shell-to-plugin capability contract and browser-to-server dashboard APIs |
-| **O — Optimizations** | Render isolation, query coordination, caching, large-dashboard rendering, and rollout |
+The critical interaction is comparing panels during investigation. Their absolute time
+window should match, even if one query finishes later. A failed panel must show its own
+failure while successful panels remain usable. Switching dashboard or time range must
+prevent an older response from appearing under the new selection.
 
-## R — Requirements
+I would also distinguish viewing data from editing configuration. A saved dashboard is a
+reusable definition; its current query results are transient. Access to a private
+dashboard and access to the underlying metrics are separate permissions, both enforced
+by the server.
 
-### Functional Requirements
+| Requirement | Visible success criterion |
+|-------------|---------------------------|
+| Compare measurements | Shared window, explicit units and resolution |
+| Investigate a point | Actual timestamp, complete series identity, value and quality |
+| Handle gaps | Missing values remain gaps; query failure is explicit |
+| Change context | Previous requests cannot replace the current selection |
+| Edit configuration | Pending, saved, conflict, and failed states are distinguishable |
+| Inspect an alert | Rule version, incident state, observation age, and evaluation quality |
 
-I want to confirm these requirements before choosing boundaries:
+## 📏 Estimate browser and service work — 3 minutes
 
-1. Users can view dashboards containing many panels.
-2. Users can create, edit, resize, reorder, duplicate, and delete panels.
-3. Panels can render time series, gauges, stat values, tables, and future visualization types.
-4. Users can select a shared time range and refresh policy.
-5. The dashboard can show loading, stale, empty, permission-denied, and error states per panel.
-6. Users can explore metrics and configure alert rules.
-7. Different product teams can ship panel types without rebuilding the entire shell.
-8. Panel data access is controlled by the backend, not by frontend visibility alone.
+Assume 10,000 concurrent viewers with ten panels each, refreshing every ten seconds.
+That produces roughly 10,000 panel queries per second before reuse. Combining panels
+into one HTTP request reduces transport overhead, but ten distinct plans still require
+work at the query service.
 
-### Non-Functional Requirements
+Within one browser, ten panels showing twenty series each and a thousand buckets per
+series already represent 200,000 plotted values. I would set a total response and
+rendering budget, not merely a per-series limit. Returning all matching hosts because
+the chart library can technically accept an array is an unbounded product decision.
 
-At production scale I would target:
+A chart about 1,200 pixels wide does not need every raw observation from a month. The
+client supplies a desired point budget, and the server chooses a supported resolution
+while returning what it actually used. Exact data export is a separate, explicitly
+larger workload.
 
-- 20–50 panels per dashboard without blocking input or causing full-page re-renders.
-- Sub-100ms interaction feedback for layout changes and filter changes.
-- A refresh cycle that does not create one timer and one request pipeline per panel.
-- Independent failure containment: one panel cannot crash the shell or hide healthy panels.
-- Keyboard and screen-reader support for dashboard navigation, editing, and panel status.
-- Strong tenant and metric authorization, including safe behavior for shared dashboards.
-- Versioned plugin APIs, rollback support, and telemetry for load, query, and render failures.
+I would measure time to usable panels, input responsiveness, response size, rendering
+time, and request overlap on representative devices. A loading spinner disappearing
+quickly is insufficient if labels, axes, or points are wrong. The production targets are
+design assumptions, not performance measurements of the repository demo.
 
-### Scope Boundaries
+## 🏗️ Draw the browser architecture — 5 minutes
 
-The backend owns metric authorization, query execution, aggregation, retention, and alert evaluation. The frontend owns composition, layout, rendering, scheduling, caching of view state, and user feedback. A plugin can request data through a capability API, but it cannot make the browser’s authorization decision.
-
-### Clarifying Questions and Assumptions
-
-I would confirm whether we are designing an operator-facing desktop product, whether dashboards are mostly read-only during incidents, and whether third-party panel code is in scope. I would also ask whether the priority is sub-second streaming or a 10-second freshness target, how many panels are typical, and whether users can edit the same dashboard concurrently.
-
-For this answer, I assume 20–50 panels, desktop-first use with tablet fallback, 10-second freshness for most metrics, first-party panels owned by several teams, and optional third-party extensions. Dashboard viewing, time-range changes, and panel configuration are in scope; offline editing and arbitrary customer code are follow-up scope.
-
-## A — Architecture
-
-### Capacity and Rendering Constraints
-
-Assume 100,000 daily active users, 10,000 concurrent dashboard viewers, and 20 panels on an average dashboard. If every panel polls independently every 10 seconds, one dashboard produces 120 panel requests per minute. At 10,000 viewers, that is 20,000 requests per second before accounting for retries, duplicated queries, or multiple tabs.
-
-The browser should therefore treat a dashboard refresh as one coordinated operation. The coordinator sends one dashboard-scoped batch request, deduplicates identical query plans, limits concurrency, and distributes partial results to panels. The server can then share Redis and time-series query caches across users.
-
-The frontend also has a rendering budget. A chart should not render every raw point if the viewport cannot display it. The query contract should return an appropriate bucket size, and the renderer should preserve extrema when it downsamples locally. Historical ranges can use coarser server-side rollups; recent ranges can use finer buckets.
-
-### High-Level Component Diagram
+I would keep this whiteboard diagram small. The important boundary is the coordinator
+between dashboard configuration and independent panel renderers. The server owns
+authorization and query semantics; the browser owns interaction and presentation.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ Dashboard Shell                                                             │
-│ Routing · auth context · layout · time range · accessibility · telemetry   │
-├───────────────────────────────┬─────────────────────────────────────────────┤
-│ Panel Registry                 │ Dashboard Data Coordinator                  │
-│ versioned plugin metadata      │ batch · dedupe · cache · refresh · cancel    │
-├───────────────────────────────┴─────────────────────────────────────────────┤
-│ Panel Runtime                                                               │
-│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌─────────────────────┐ │
-│ │ Metrics      │ │ Billing      │ │ Tracing      │ │ Third-party iframe  │ │
-│ │ plugin       │ │ plugin       │ │ plugin       │ │ (optional boundary) │ │
-│ └──────────────┘ └──────────────┘ └──────────────┘ └─────────────────────┘ │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ Server API boundary · authorization · dashboard data · plugin manifests     │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────┐      ┌──────────────────────┐
+│ Route + controls     │─────▶│ Query coordinator    │
+└──────────────────────┘      └───────────┬──────────┘
+                                          │
+                                          ▼
+                              ┌──────────────────────┐
+                              │ Query API            │
+                              └───────────┬──────────┘
+                                          │
+                                          ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ Panel renderers      │◀─────│ Results + quality    │
+└──────────────────────┘      └──────────────────────┘
 ```
 
-### Shell Responsibilities
-
-The shell is deliberately boring and stable. It owns:
-
-- Routing, dashboard loading, authentication context, and tenant context.
-- Grid layout, responsive breakpoints, edit mode, and persistence of layout changes.
-- Global time range, refresh policy, page visibility, and manual refresh.
-- The panel registry, plugin lifecycle, capability API, and compatibility checks.
-- Error boundaries, loading placeholders, stale-data indicators, and retry actions.
-- Telemetry such as plugin load time, query latency, render duration, and failures.
-
-The shell does not know how a CPU chart calculates a y-axis or how a billing panel formats currency. That knowledge belongs to the plugin.
-
-### Panel Registry
-
-The registry maps a stable panel type to a plugin descriptor. A descriptor contains:
-
-| Field | Responsibility |
-|---|---|
-| `id` and `version` | Stable identity and compatibility negotiation |
-| `renderer` | Visualization mounted inside the panel boundary |
-| `editor` | Configuration UI used in dashboard edit mode |
-| `queryBuilder` | Converts configuration into a normalized query plan |
-| `requiredCapabilities` | Declares data and actions the plugin needs |
-| `metadata` | Display name, icon, minimum size, and accessibility label |
-| `health` | Optional readiness and diagnostics hooks |
-
-The registry is an indirection point, not a security boundary. The shell filters what it can display, but the backend validates every query and capability request.
-
-### Ownership and Deployment
-
-I would assign ownership by domain rather than by chart shape:
-
-- The observability team owns CPU, memory, latency, and log-volume panels.
-- The billing team owns cost and quota panels.
-- The security team owns audit and threat panels.
-- The platform team owns the shell, registry contract, data coordinator, and design system.
-
-For a same-origin first-party plugin, Module Federation or an equivalent remote-module system lets a team deploy a compatible panel bundle independently. The shell pins an approved version, performs a manifest and contract check, and supports rollback to the previous known-good version.
-
-I would usually ship a family of related panels as one remote, not one remote for every chart. That preserves team autonomy without creating dozens of independent runtimes.
-
-### Plugin Runtime Contract
-
-### Renderer Lifecycle
-
-The shell mounts a panel in these stages:
-
-1. Read the persisted panel configuration and plugin identifier.
-2. Resolve the plugin from the local registry or approved remote manifest.
-3. Check compatibility with the shell runtime and required capabilities.
-4. Ask the data coordinator for the panel’s normalized data snapshot.
-5. Mount the renderer inside a panel-level error boundary.
-6. Send updated snapshots without remounting the plugin when possible.
-7. Unmount and release subscriptions when the panel leaves the viewport.
-
-The plugin receives panel configuration, dimensions, locale, theme, user capability context, and a data snapshot. It should not receive database credentials or construct arbitrary cross-tenant URLs.
-
-### Configuration and Query Ownership
-
-The editor owns user-facing configuration. The query builder converts that configuration into a normalized query plan containing metric identity, filters, aggregation, grouping, time range, and desired resolution. The coordinator canonicalizes the plan before deduplication.
-
-This avoids a common failure mode where two panels request the same metric with different JSON property ordering and miss the cache. It also gives the backend one stable shape to validate and authorize.
-
-### Dashboard Data Coordinator
-
-### Why Coordination Matters
-
-Independent panel hooks are simple, but they multiply timers, duplicate requests, and create unpredictable completion order. A global coordinator gives the dashboard one refresh clock and lets us make deliberate decisions about priority.
-
-The coordinator performs the following work:
-
-1. Collect visible and prefetchable panel query plans.
-2. Normalize and deduplicate equivalent plans.
-3. Read fresh data from a client cache when allowed.
-4. Send a dashboard-scoped batch request to the backend.
-5. Apply concurrency limits and cancellation when the time range changes.
-6. Preserve the last successful snapshot while a refresh is in flight.
-7. Return independent success, empty, stale, forbidden, and error states.
-8. Notify only the panels whose data changed.
-
-The batch response is keyed by panel ID or query ID. A panel failure should not turn the whole response into a failure. The coordinator also records partial failure rate so a dashboard that is technically rendering but mostly stale is visible to operators.
-
-### Refresh Scheduling
-
-Refresh is adaptive rather than a blind interval:
-
-- Pause or slow refresh for a hidden browser tab.
-- Refresh visible panels first and prefetch below-the-fold panels afterward.
-- Apply jitter so thousands of tabs do not refresh on the same second.
-- Back off after repeated failures and expose a stale timestamp.
-- Abort an in-flight request when the user changes the time range.
-- Use push updates for high-priority use cases later without changing the panel contract.
-
-Polling is a reasonable local default because it is cacheable and operationally simple. The coordinator keeps the transport replaceable so WebSockets or server-sent events can be introduced for selected panel families.
-
-### Cache Semantics
-
-The client cache key includes tenant, dashboard permissions, normalized query, time range, resolution, and plugin-independent data version. Recent data has a short freshness window. Historical data can be reused longer because it is effectively immutable.
-
-The cache must never be used to bypass authorization. A shared browser cache should be partitioned by tenant and user capability context, and sensitive panels should opt out of persistence.
-
-## D — Frontend Data Model
-
-The model separates data received from the server from persisted dashboard configuration and short-lived browser state. That keeps the plugin runtime declarative: renderers consume a panel snapshot rather than owning a hidden network cache.
-
-| Source | Entity | Owner | Important fields |
-|---|---|---|---|
-| Server | Dashboard | Shell/store | `id`, `name`, `permissions`, `layoutVersion`, `panels` |
-| Server | Panel configuration | Registry + editor | `id`, `pluginId`, `pluginVersion`, `queryConfig`, `displayConfig`, `position` |
-| Derived | Query plan | Data coordinator | normalized metric selector, filters, aggregation, range, resolution, capability scope |
-| Server | Panel snapshot | Data coordinator | `results`, `fetchedAt`, `staleAt`, `status`, `error` |
-| Client persisted | View preferences | Shell/store | selected range, refresh preference, collapsed navigation, theme |
-| Client ephemeral | Interaction state | Local component | drag preview, editor draft, focus target, tooltip, retrying state |
-
-The panel configuration is persisted with a `layoutVersion`, so a debounced layout save can use optimistic concurrency. The snapshot is not persisted in the dashboard store: it is cacheable server state whose lifecycle belongs to the coordinator.
-
-### State and Render Lifecycle
-
-I would separate state into three layers:
-
-| Layer | Examples | Owner |
-|---|---|---|
-| URL state | dashboard ID, time range, selected variable | Router |
-| Dashboard state | panel configuration, layout, edit mode | Shell/store |
-| Server state | panel snapshots, freshness, errors, request status | Data coordinator |
-
-Zustand is sufficient for local shell state. For a larger product, a server-state library can provide request deduplication, invalidation, retries, and focus-aware refetching. I would not put every data point into a global store; panel snapshots should be scoped and structurally shared.
-
-The grid should virtualize or otherwise defer panels that are outside the viewport when dashboards become large. Layout changes update local state immediately and persist through a debounced mutation with a version number. A conflict response triggers a merge or asks the user to reload rather than silently overwriting another editor.
-
-### Cross-Cutting Runtime Concerns
-
-### Failure Isolation and Observability
-
-Each panel has at least three independent boundaries:
-
-1. **Network boundary:** request timeout, retry policy, cancellation, and stale fallback.
-2. **Data boundary:** schema validation, empty-state handling, and forbidden-state handling.
-3. **Render boundary:** an error boundary around the plugin renderer.
-
-If a chart throws during rendering, the shell replaces only that panel with a retryable fallback. The error event includes dashboard ID, panel ID, plugin version, query fingerprint, and browser context, but not raw sensitive metric values.
-
-The frontend should emit:
-
-- Plugin manifest load success, failure, and duration.
-- Time to first panel and time to usable dashboard.
-- Query batch size, deduplication ratio, cache hit rate, and partial failures.
-- Render duration and long-task count by plugin type.
-- Stale age, forbidden panel count, and retry rate.
-
-This makes the dashboard observable as a product, not just a collection of charts.
-
-### Authorization and Security
-
-A frontend plugin cannot safely enforce data access by itself. The backend must authorize the dashboard, panel, tenant, metric, tags, and requested time range. The browser can use capability metadata to hide unavailable editors and avoid unnecessary requests, but a malicious user can still modify JavaScript and network calls.
-
-For first-party plugins:
-
-- Use same-origin or an allowlisted remote origin.
-- Verify signed manifests or deploy through a trusted artifact pipeline.
-- Restrict plugin capabilities to the minimum required scope.
-- Validate configuration and query plans at the API boundary.
-- Include tenant and permission context in cache isolation.
-- Apply CSP, Trusted Types where feasible, and dependency scanning.
-
-For third-party or untrusted plugins, use an iframe with a narrow `postMessage` protocol, sandbox attributes, a separate origin, and a per-plugin CSP. The host should validate message schemas, enforce request quotas, and never pass raw session tokens into the frame.
-
-### Responsive Design and Accessibility
-
-The shell defines responsive layout behavior; plugins receive the available size and must support a minimum render size. A narrow viewport may collapse a multi-column dashboard into a single column while retaining panel order and heading hierarchy.
-
-Charts need accessible alternatives. Each renderer should expose a text summary or data table, announce meaningful status changes, and avoid relying on color alone for thresholds. Keyboard users must be able to move through panels, enter edit mode, resize or reorder with an alternate control, and reach retry and configuration actions.
-
-Loading and stale states should be announced politely rather than on every polling tick. Focus must remain stable when a panel refreshes.
-
-## I — Interface Definitions
-
-The browser-facing server contract should be dashboard-scoped for coordinated reads:
-
-```
-GET  /api/v1/dashboards                         → list accessible dashboards
-GET  /api/v1/dashboards/:id                     → dashboard metadata and panel configs
-POST /api/v1/dashboards/:id/data                → batch data for authorized panel IDs
-POST /api/v1/dashboards/:id/panels               → create a panel configuration
-PUT  /api/v1/dashboards/:id/panels/:panelId     → update configuration or layout
-DELETE /api/v1/dashboards/:id/panels/:panelId   → remove a panel
-GET  /api/v1/panel-plugins/manifest             → approved plugin metadata and versions
-```
-
-The batch endpoint returns a result per requested panel. Each result can be successful, empty, stale, forbidden, or failed. A response-level error is reserved for a dashboard-level authorization or availability failure.
-
-The frontend API client owns serialization and cancellation. Plugins use a capability API rather than importing the raw fetch client, which prevents every remote from inventing a different retry, authentication, or telemetry policy.
-
-### Shell-to-Plugin Interfaces
-
-| Interface | Inputs | Output or event | Why it exists |
-|---|---|---|---|
-| Plugin renderer | panel configuration, dimensions, theme, data snapshot | rendered panel | Separates rendering from fetching |
-| Panel editor | current configuration, available metrics, user capabilities | validated configuration change | Keeps configuration ownership with the plugin |
-| Query builder | configuration, shared time range, variables | normalized query plan | Allows deduplication and server validation |
-| Capability API | declared scope, query plan, cancellation signal | authorized snapshot or typed error | Prevents direct ad hoc fetch behavior |
-| Shell event channel | panel ID, event name, payload | telemetry, resize, retry, edit request | Keeps plugins decoupled from shell internals |
-
-The shell validates plugin events and configuration at its boundary. The server independently validates the resulting query, so a remote plugin cannot obtain data just by claiming a broader capability.
-
-## O — Optimizations and Deep Dives
-
-### Deep Dive 1: Plugin Architecture Versus One SPA
-
-I choose a plugin boundary because panel teams need independent ownership and deployment. A single SPA gives excellent shared-memory performance and the simplest debugging model, but every chart imports the same dependency graph and ships on the shell’s release train. Over time, team boundaries become implicit and a new panel can destabilize the entire dashboard.
-
-Module Federation or a versioned plugin runtime addresses that organizational bottleneck. A team can ship a panel family independently, use a specialized visualization library, and roll back its remote without rebuilding the shell. The shell still provides shared layout, data access, telemetry, and error handling.
-
-The cost is runtime compatibility. Remote modules can break because of React, design-system, or contract version mismatches. I mitigate that with a small stable contract, shared dependency policy, manifest validation, canary loading, and a fallback renderer. I would not split every chart into a separately deployed remote because the operational overhead would exceed the benefit.
-
-### Deep Dive 2: Module Federation Versus Iframes
-
-Iframes provide the strongest browser isolation. A bad or untrusted plugin cannot directly corrupt the shell’s DOM, CSS, JavaScript heap, or dependency graph. They also support separate CSPs, origins, and deployment pipelines. This is the right choice for customer-supplied extensions, plugins owned by unrelated security domains, or content that must be treated as untrusted.
-
-I would not make every chart an iframe. Twenty charts would mean twenty document runtimes, duplicated React and chart libraries, separate network lifecycles, expensive memory use, and a large `postMessage` surface. Resizing, focus management, deep links, tooltips, keyboard navigation, and coordinated theming also become harder. A slow frame may be isolated, but the dashboard still pays the resource cost.
-
-Therefore my default is same-origin plugins or Module Federation for trusted first-party panel families. I use iframes selectively when hard isolation is more valuable than shared performance and interaction quality.
-
-### Deep Dive 3: Independent Panel Fetching Versus Coordinated Data
-
-Independent fetching is attractive because each panel is self-contained. It fails at dashboard scale: twenty timers drift, identical queries are duplicated, retries create bursts, and changing a global time range creates a thundering herd. It is also difficult to show whether the dashboard is partially stale.
-
-A coordinator creates one place for scheduling, deduplication, cancellation, cache policy, and partial failure semantics. It can batch requests at the HTTP boundary and later fan out to query workers or use a query plan service. Panels remain independent at the rendering boundary, while the system is coordinated at the data boundary.
-
-The trade-off is a more sophisticated shell and a less autonomous plugin API. A plugin must declare its query needs and accept the coordinator’s lifecycle. That is worthwhile because the coordinator protects the backend and makes the user’s view consistent. For a small dashboard with five panels, independent hooks may be acceptable; I would evolve toward coordination before the product reaches dozens of panels or multiple teams.
-
-### Deep Dive 4: Data Authorization Versus Frontend Isolation
-
-Putting each chart in an iframe does not automatically grant it a safe data boundary. The iframe may still call a backend endpoint that returns data for the wrong tenant, and a same-origin plugin can still be tampered with in the browser. Authorization must happen on the server for every query.
-
-The frontend should still expose capability-scoped APIs because they reduce accidental overreach and make plugin ownership explicit. The backend validates the capability, dashboard membership, metric scope, tag filters, and tenant context. The trade-off is duplicated policy metadata and more contract work, but it gives users fast feedback while preserving real security at the only boundary that can be trusted.
-
-### Trade-offs Summary
-
-| Decision | ✅ Chosen | ❌ Alternative | Reasoning |
-|---|---|---|---|
-| Panel boundary | Versioned plugin contract | One giant SPA | Independent ownership without giving up shell coordination |
-| Trusted deployment | Module Federation or same-origin remote | One iframe per chart | Independent releases with lower runtime and interaction cost |
-| Untrusted deployment | Sandboxed iframe | Same-origin plugin | Hard DOM, CSP, origin, and dependency isolation |
-| Data access | Dashboard data coordinator | One polling hook per panel | Batching, deduplication, cancellation, and consistent freshness |
-| Authorization | Backend capability enforcement | Frontend permission checks | Browser code is mutable and cannot be a security boundary |
-| Updates | Adaptive polling first | WebSocket everywhere | Simpler operations and cacheability; push can be added selectively |
-| State | URL + shell state + server state | All data in global store | Clear ownership and fewer unnecessary re-renders |
-| Visualization | Plugin-owned renderer | Shell-owned chart switch | Domain teams can evolve visualizations without shell changes |
-| Layout | CSS/grid runtime with virtualization | Render every panel eagerly | Keeps input responsive on large dashboards |
-
-### Rollout and Testing
-
-I would migrate from a monolithic chart switch in stages rather than introducing remote bundles on day one:
-
-1. Define the panel descriptor and capability contract while keeping all renderers in the existing bundle.
-2. Move data fetching into the dashboard coordinator and add panel-level error boundaries.
-3. Add manifest validation, plugin telemetry, and a compatibility test matrix.
-4. Extract one low-risk panel family as a remote and run it behind a feature flag.
-5. Add canary rollout, version pinning, automatic fallback, and a kill switch before expanding adoption.
-
-The test strategy follows the boundaries:
-
-- Contract tests validate plugin descriptors, capability declarations, and batch response schemas.
-- Coordinator tests cover deduplication, cancellation, stale fallback, retry backoff, and partial failures.
-- Renderer tests use fixed snapshots for empty, loading, stale, forbidden, and large-data states.
-- Browser tests verify keyboard navigation, layout persistence, focus stability, and a failed panel next to healthy panels.
-- Performance tests measure time to first usable panel, long tasks, memory, and batch request reduction.
-- Security tests verify that cache keys include tenant context and that plugin messages cannot request undeclared capabilities.
-
-The success metric for the migration is not “we use Module Federation.” It is that teams can release a panel independently while dashboard load time, failure rate, and data authorization remain within the same budgets.
-
-If the interviewer asks what breaks first, I would prioritize three risks. At the browser edge, too many simultaneously rendered panels cause long tasks and memory pressure, so I virtualize and prioritize visible work. At the service edge, synchronized refreshes create query bursts, so I batch, jitter, cache, and back off. At the organization edge, plugin contracts drift between teams, so I version the manifest, keep compatibility tests, and provide a shell-owned fallback.
-
-## Local Implementation Mapping
-
-The current local React + Vite project is the migration starting point rather than the full production architecture:
-
-- `DashboardGrid` and `DashboardPanel` remain shell components.
-- The existing type switch and per-panel polling are sufficient for the demo, but do not yet provide plugin or refresh isolation.
-- The first local increment is a registry that maps the current line, area, bar, gauge, and stat types to renderers.
-- The next increment is a dashboard data hook and batch API that supply independently renderable panel snapshots.
-- A panel error boundary is added before loading remote plugins.
-- Recharts remains a reasonable local renderer choice, but it is an implementation detail rather than the central architectural decision.
-- The local project uses HTTP polling and a single Vite bundle; production can replace the registry loader with approved remote manifests and Module Federation.
-
-I would not add iframes to the local demo merely to demonstrate isolation. The demo should make the boundary explicit in the contract and document when a sandboxed iframe becomes justified.
-
-## Summary
-
-“My final design is a stable dashboard shell around independently owned panel plugins. The shell controls layout, lifecycle, authorization context, refresh scheduling, accessibility, and failure isolation. A dashboard data coordinator batches and deduplicates requests, preserves stale data, and reports partial failures. Trusted first-party panels use a versioned plugin or Module Federation boundary; untrusted extensions use sandboxed iframes. The backend remains the source of truth for data authorization.”
-
-The most important senior-level decisions are:
-
-1. Make ownership and deployment boundaries explicit with a plugin registry.
-2. Coordinate data access at dashboard scope instead of polling independently from every chart.
-3. Isolate rendering failures at the panel boundary.
-4. Treat iframes as a targeted hard-isolation tool, not the default composition model.
-5. Keep authorization on the backend and use frontend capabilities for ergonomics, not security.
+The route identifies the dashboard and shareable investigation context. Time range,
+selected filters, and a pinned absolute window belong in the URL when sharing them is
+useful. Hover state and an open menu remain local. An unsaved panel draft is separate
+from the last saved dashboard configuration.
+
+The query coordinator turns visible panel definitions into normalized query plans. It
+chooses one time anchor, shares identical work, limits in-flight requests, and
+associates each result with its plan and refresh generation. Panel components receive a
+result and status rather than starting their own network timers.
+
+I would use React for composition and a small shared store for dashboard editing and
+query coordination. A store library does not itself solve stale requests or define cache
+correctness. Those need explicit transitions and identity. Server configuration can have
+its own fetch/cache layer rather than being copied into several overlapping stores.
+
+Renderers have a common contract: data, units, effective range, resolution, quality, and
+interaction callbacks. A local registry selects line, area, bar, gauge, or stat
+behavior. Adding a panel type should not require duplicating authentication, polling,
+cancellation, and error handling in that renderer.
+
+The initial editor uses accessible form controls for metric, aggregation, grouping, and
+title. Dragging and resizing can be an enhancement, with keyboard alternatives and a
+narrow-screen layout. I would avoid promising a plugin sandbox merely because renderer
+components use a registry.
+
+## 🧭 Define state and API boundaries — 4 minutes
+
+I separate configuration state from query state because they change at different rates
+and have different recovery rules. A failed refresh must not erase an unsaved title
+edit, and saving a title must not falsely mark chart observations as fresh.
+
+| State | Identity | Recovery behavior |
+|-------|----------|-------------------|
+| Saved dashboard | Dashboard ID and server revision | Refetch or conditionally update |
+| Editor draft | Base revision and local changes | Preserve on failure; resolve conflicts |
+| Query plan | Authorized scope, metric, filters, operation, range, interval | Share only equivalent work |
+| Refresh | Dashboard context and generation | Ignore obsolete responses |
+| Panel result | Plan identity plus effective bounds and data version | Retain as explicitly stale when appropriate |
+| Incident | Incident ID and evaluated rule version | Refresh status without rewriting historical meaning |
+
+The query response needs more than an array of values. It should identify each complete
+series, return UTC bucket timestamps, effective resolution, source coverage, latest
+observation time, and any partial or approximate result status. An HTTP success with no
+rows is not sufficient evidence that a service is healthy.
+
+For configuration, I would propose conditional updates against the revision the user
+edited. The API returns the resulting revision, and duplicate creation retries use a
+stable mutation identity. These are proposed contracts; the existing API does not supply
+revision checks or durable mutation receipts.
+
+| Proposed API operation | Purpose |
+|------------------------|---------|
+| Get dashboard | Fetch authorized configuration and revision |
+| Query bounded panel plans | Return independently identified results and quality |
+| Update dashboard/panel with expected revision | Detect concurrent edits |
+| List incidents | Return bounded history with evaluation context |
+| Test a rule draft | Preview its predicate without creating an incident |
+
+I would distinguish expired authentication, forbidden access, invalid queries,
+unavailable dependencies, and empty measurements. They lead to different user actions.
+The client can hide unavailable editing controls for convenience, but the server must
+still authorize every request and the exact target resource.
+
+## 🔧 Deep dive 1: coordinate refresh without losing context — 8 minutes
+
+> “I would choose coordinated polling for the stated ten-second freshness requirement. The challenge is keeping requests and results attached to the user's current investigation.”
+
+At the start of a refresh, the coordinator captures an absolute end time and derives the
+start time. Every plan in that refresh uses those bounds. Live mode advances this anchor
+on a controlled cadence; a pinned historical window stays fixed until the user changes
+it.
+
+Plans include all inputs affecting meaning, including authorization scope, labels,
+grouping, aggregation, and resolution. Identical plans can share a pending request and a
+result. If two panels use different units or transformations, I would distinguish shared
+source data from panel-specific presentation so an inappropriate transform is not
+reused.
+
+I would cap concurrent requests and prioritize visible panels. A slow refresh does not
+launch unlimited overlapping copies every ten seconds. Hidden-tab polling pauses;
+returning to the tab schedules a fresh generation. Failed requests use bounded backoff
+and jitter so many viewers do not retry in lockstep.
+
+When the user changes a range, filter, or dashboard, the coordinator advances the
+context generation and cancels obsolete work where possible. Cancellation saves
+resources, but it is not the correctness boundary. Each completion must still match the
+active plan and generation before it can publish a result.
+
+Consider a one-hour CPU request that takes four seconds. After one second the user
+chooses seven days, and that query finishes first. Without the generation check, the
+older one-hour response can replace the seven-day result while the controls still say
+seven days. A network library's cache does not automatically prevent this mismatch in
+component state.
+
+During an ordinary refresh, I would keep the previous usable result visible with a
+refreshing indicator. If the new request fails, it becomes a labeled stale snapshot with
+its actual observation time and error. A context change requires more care: old data can
+be shown only as an explicitly identified previous view, never as current results under
+new filters.
+
+Panel failures stay local. A database timeout in a CPU chart must not remove a
+successful memory chart or block time-range controls. An error boundary also isolates
+renderer exceptions, which are different from API failures. Retrying one failed panel
+should not repeatedly fetch the whole dashboard configuration.
+
+A page-level status can report that eight of ten panels completed for a particular
+window. It should not imply that all observations are current merely because metadata
+loaded. I would reserve “last observed” for sample age and “last queried” for transport
+activity.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Coordinated polling | Shared bounds, bounded work, straightforward recovery | Must manage generations and partial results |
+| ❌ Independent panel timers | Small standalone components | Drift, duplicate queries, overlap, inconsistent freshness |
+| ❌ Push for this first version | Lower delivery latency | Subscription recovery and fan-out exceed the stated need |
+
+The cost of coordination is centralized lifecycle logic. I would keep that logic
+independent of chart rendering and test it with deliberately reordered completions. If
+sub-second freshness becomes a requirement, I would preserve plan identity and
+generation checks while changing the transport; a persistent connection does not
+eliminate them.
+
+## 🔧 Deep dive 2: preserve meaning when drawing fewer points — 8 minutes
+
+> “I would negotiate a bounded resolution with the server and align points by timestamp. I would never use array position or a convenient zero to fill a measurement gap.”
+
+Suppose host A has points at 00:00 and 00:02, while host B has a point at 00:01. Zipping
+their arrays places B's value at A's first timestamp. Padding B's second entry with zero
+then invents a measurement at 00:02. Both errors make the chart easy to render while
+changing the evidence presented to the user.
+
+Instead, each series retains its canonical identity and bucket timestamps. The renderer
+joins on timestamps, or uses independent time/value arrays if the chart library supports
+them. An absent bucket remains null or absent. Connecting across gaps should be an
+explicit visual policy, with gaps still discoverable, rather than an invisible data
+transformation.
+
+Series identity includes label names as well as values. Concatenating values with a
+delimiter can collide and can change when object order changes. Stable identities also
+keep colors and legend selection consistent between refreshes. Display labels can be
+shorter, but the tooltip exposes the complete identity.
+
+For long ranges, the server chooses buckets from supported data sources using the
+requested point budget. It returns the effective interval and coverage. The browser must
+not label a one-hour materialized bucket as a precise one-minute measurement or create
+intermediate points that imply unavailable resolution.
+
+Aggregation must match the question. A mean across unevenly populated buckets uses their
+sums and counts. An average of host averages gives each host equal weight, which may be
+a valid operation, but it is different from an average across all samples. The UI should
+name the selected interpretation instead of hiding it behind a generic “average.”
+
+For gauges, I would show the chosen sample or summary window and its observation age.
+For cumulative counters, I would ask the server for a defined reset-aware rate. A value
+already measured in requests per second cannot simply be summed across time and keep the
+same unit. Panel formatting cannot repair an incorrect server operation.
+
+A stat panel matching three hosts must either display each host, apply an explicit
+reduction, or require a single series. Taking the first result is unstable and
+misleading. Likewise, a gauge should use a configured range appropriate to its unit, not
+automatically clamp every measurement to a percentage.
+
+I would format timestamps at the final presentation step. Multi-day charts need dates as
+well as times, and tooltips should show an unambiguous instant and time zone. Formatting
+several days as repeated hour/minute labels must not turn timestamps into
+indistinguishable categorical keys.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Server aggregation with declared resolution | Bounds transfer and query work; preserves stated semantics | Requires coverage and precision metadata |
+| ❌ Fetch all raw samples and reduce in the browser | Flexible client exploration | Large transfers, memory pressure, wasted database work |
+| ❌ Align by array index and fill zero | Easy chart input | Moves measurements and invents healthy-looking values |
+
+The trade-off is information loss. A coarse average can conceal a short spike; min/max
+bands or a drill-down can expose it while raw data exists. Once raw observations expire,
+exact detail may be unavailable. The interface should disclose that limit rather than
+suggest zooming can recreate it.
+
+## 🔧 Deep dive 3: make editing and alerts explainable — 7 minutes
+
+> “I would keep a rule's draft, its saved version, and the incident it produced distinct. Otherwise editing a threshold can silently change the apparent explanation of an earlier alert.”
+
+A panel editor starts from a known configuration revision. Local edits update a draft
+and preview; saving sends the expected revision. If another user changed the panel, the
+draft remains available while the interface presents the conflict. For a small form,
+asking the user to reconcile changed fields is simpler than implementing collaborative
+text editing.
+
+Creation and save controls show pending status and prevent accidental repeated
+submissions. A retry after an uncertain response reuses the same mutation identity.
+Closing a dialog or navigating away prevents its late completion from mutating a
+different editor. Successful writes invalidate the relevant configuration and dependent
+plans, not every unrelated query.
+
+I would use immediate local preview for reversible presentation changes, while
+representing server persistence honestly. An optimistic toggle can work if rollback is
+tied to the same entity and operation; otherwise a refetch after confirmation is easier
+to reason about. A generic shared error string is inadequate when multiple panels have
+independent edits.
+
+Alert configuration separates the evaluation window from how long a condition must
+remain true. “Average CPU over five minutes exceeds 90” and “that predicate has stayed
+true for five minutes” are different controls. A preview explains the predicate and
+available data, but does not promise that a future scheduled evaluation will fire at an
+exact wall-clock second.
+
+An incident row should show the evaluated rule version, affected series/group,
+transition time, and supporting value. Current rule text can be linked separately. If a
+user edits a threshold later, historical evidence must still describe the condition that
+opened the incident.
+
+The interface distinguishes firing, pending, and resolved condition states from no-data
+and evaluation-error quality. A firing incident with missing telemetry stays visibly
+uncertain according to policy; disappearance from a successful query is not sufficient
+reason to paint it green. The banner's count should represent a known total or
+explicitly say that it shows a limited subset.
+
+Delivery status is another separate fact. Creating an incident does not prove an email
+or webhook reached anyone. The UI can display queued, attempted, confirmed, or failed
+delivery status based on actual backend evidence, without turning a log message into
+“notification sent.”
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Versioned configuration and explicit incident context | Explains conflicts and historical behavior | More state and deliberate recovery UI |
+| ❌ Unconditional save and current-rule labels everywhere | Minimal form code | Lost edits and misleading historical explanations |
+| ❌ Treat empty/error as healthy | Simple red/green display | Conceals loss of monitoring coverage |
+
+I would keep the first implementation modest: clear forms, conditional saves, bounded
+history, and readable quality states. This gives operators evidence they can act on
+before adding complex layouts or extensibility. The same state distinctions also support
+useful keyboard and screen-reader announcements without announcing every background
+poll.
+
+## 📈 Scale and verify the experience — 4 minutes
+
+The first bottlenecks are often excess points, matching too many series, and duplicate
+work. I would inspect those before replacing SVG rendering with canvas. If profiling
+shows chart rendering dominates, a denser renderer can help, but query limits and
+semantic correctness remain necessary.
+
+Use virtualization for large dashboard lists or histories. For panel grids, preserve
+query and editor state independently of whether a renderer is mounted. A panel scrolling
+out of view should not lose an unsaved edit, and remounting should not create another
+independent polling loop.
+
+A narrow screen needs deliberate panel stacking and readable axes. Legends and tooltips
+cannot be the only way to understand a series: provide a keyboard-accessible summary or
+data view. Status should use text and symbols as well as color, especially for stale or
+missing telemetry.
+
+I would verify reversed request completion, navigation during a save, uneven timestamps,
+duplicate display labels, empty series, delayed ingestion, multi-day ranges, and partial
+query failure. These checks exercise the user's interpretation of data rather than
+merely checking that a heading appears. Performance checks use realistic series counts
+and include repeated navigation to detect retained timers and large result objects.
+
+## 🛠️ Relate the design to this repository — 2 minutes
+
+The current React/TanStack Router/Recharts application provides a public seeded
+dashboard, a metrics explorer, and alert controls. It is a useful starting point, but
+the proposed coordinator and revision contracts are not implemented. The two Zustand
+stores exist without being used by the current route/component tree.
+
+Panel renderers poll independently. Charts align series by index and fill missing
+entries with zero; gauges and stats use the last bucket of the first series. Longer
+queries select absent rollup tables. The Refresh button reloads dashboard metadata, and
+several async paths lack response-generation guards. These are source findings, with
+selected isolated checks, rather than a claimed browser reproduction.
+
+There is no login screen, interactive panel editor, or drag/resize implementation.
+Alerts are publicly mutable, empty descriptions fail form validation, and missing data
+can resolve an incident. Webhooks are only logged. I would prioritize correct
+query/error contracts and sample alignment, then coordinated refresh and
+access/configuration workflows. The detailed current behavior is recorded in
+[architecture.md](./architecture.md#implementation-notes).

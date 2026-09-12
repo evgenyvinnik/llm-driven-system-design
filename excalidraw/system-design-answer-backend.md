@@ -1,367 +1,400 @@
-# Excalidraw - Collaborative Whiteboard (Backend Focus)
+# Excalidraw: Backend System Design Interview
 
-## 🎯 Problem Statement
+## 🎯 Scope and Requirements — 5 minutes
 
-Design a collaborative whiteboard where multiple users can simultaneously draw shapes, see each other's cursors, and have their work persist reliably. Think Excalidraw, Miro, or FigJam -- but focused on the backend challenges of real-time sync, conflict resolution, and persistence.
+> “I’ll design the backend for a shared drawing board. The central promise is that
+> collaborators converge on the same accepted scene, and a drawing acknowledged as saved
+> survives a room server restart.”
 
-## 📋 Requirements Clarification
+I would first clarify whether collaboration means several people editing while connected, or
+independent copies merging after days offline. Those are different products. I’ll support
+connected collaboration, short disconnections, and recoverable local drafts. Unrestricted
+offline merging and character-by-character text collaboration are extensions that could
+justify a mature CRDT library.
 
-"Before diving in, let me clarify scope and constraints."
+Users create drawings, open private or public boards, invite viewers or editors, and
+manipulate rectangles, ellipses, diamonds, lines, arrows, freehand strokes, and text. Owners
+manage access. Public visibility permits reading; it does not grant editing. We need
+presence and cursors, but losing a cursor update is acceptable. Losing an acknowledged shape
+edit is not.
 
-**Functional:**
-- Multi-user real-time drawing on shared canvas
-- Shape types: rectangles, ellipses, lines, arrows, freehand paths, text
-- Drawing CRUD with sharing permissions (view/edit)
-- Live cursor presence showing collaborator positions and usernames
-- Persistent storage with version history for recovery
-- Collaborator management with granular access control (view vs edit)
+I would defer image uploads, comments, rich text, and export rendering. They can be added
+around a stable scene model. Export would consume a specific committed scene revision so it
+cannot mix several collaborators’ intermediate states.
 
-**Non-Functional:**
-- Collaboration latency < 50ms for shape operations between peers
-- Support 50+ concurrent users per drawing room
-- 100K+ concurrent active drawings across the platform
-- Handle 10K+ canvas elements per drawing without degradation
-- 99.9% availability with graceful degradation under load
-- 99.99% data durability for saved drawings
-- Graceful conflict resolution for concurrent edits to the same element
+| Requirement | Initial target or decision |
+|-------------|----------------------------|
+| Editing feedback | Immediate local draft; no network round trip before drawing |
+| Peer previews | Regional p95 below 150 ms under the supported workload |
+| Durable acceptance | Regional p95 below 250 ms for ordinary commands |
+| Availability | Proposed 99.9% regional service availability |
+| Crash recovery | No acknowledged edit lost on a room process crash |
+| Initial board profile | Approximately 1,000 elements and up to 20 collaborators |
+| Offline behavior | Preserve drafts; reconcile before claiming acceptance |
 
-**Out of scope:** Image import, templates, mobile clients, offline mode, export to PNG/SVG
+These are design targets, not benchmark results from the repository. Durability also depends
+on database configuration and the stated fault model; surviving a process crash does not
+automatically imply surviving an entire region’s loss.
 
-> "I want to focus the backend discussion on three hard problems: the real-time collaboration protocol, conflict resolution semantics, and the persistence strategy. These are where the interesting trade-offs live."
+For a capacity estimate, assume 5,000 active boards and four connected people per board.
+That gives 20,000 sockets. If 10% of those users finish two editing gestures each second, we
+receive 4,000 durable commands per second. At an assumed 500 bytes per command, that is 2
+MB/s, or 172.8 GB/day if that peak persisted all day, before indexes and replication.
 
-## 🏗️ Architecture
+Presence can exceed durable traffic. If one quarter of connected users send cursor updates
+at 10 Hz, that is 50,000 incoming updates each second. Sending each to three peers at 200
+bytes means about 30 MB/s of outgoing payload. I would size and limit these paths
+separately.
 
-```
-┌─────────────┐          ┌─────────────┐          ┌─────────────┐
-│   Browser   │──HTTP───▶│   API GW    │──────────▶│  API Server │
-│  (Canvas +  │          │  (nginx /   │          │  (Express)  │
-│   WS Client)│──WS────▶│   sticky)   │──────────▶│  + WS Room  │
-└─────────────┘          └─────────────┘          └──────┬──────┘
-                                                         │
-                              ┌───────────────────┬──────┴──────┐
-                              │                   │             │
-                         ┌────▼────┐        ┌─────▼─────┐  ┌───▼───┐
-                         │PostgreSQL│        │   Redis   │  │Redis  │
-                         │ Drawings │        │ Sessions  │  │Pub/Sub│
-                         │ Users    │        │ Cursors   │  │(scale)│
-                         └──────────┘        └───────────┘  └───────┘
-```
+## 🏗️ Architecture and Data Model — 7 minutes
 
-> "I split the architecture into REST for CRUD operations and WebSocket for real-time collaboration. The API server handles both on the same port, which simplifies deployment. For horizontal scaling, I'd add Redis Pub/Sub to fan out WebSocket messages across server instances."
-
-**Component responsibilities:**
-
-- **API Gateway (nginx):** Terminates TLS, routes HTTP and WebSocket traffic, enforces sticky sessions via IP hash so that a user's WebSocket connection consistently lands on the same backend server. This is critical because room state lives in memory on the server that owns the room.
-
-- **API Server (Express + WS):** Handles REST endpoints for drawing CRUD, user authentication, and collaborator management. Also upgrades HTTP connections to WebSocket for real-time collaboration. Each server instance maintains an in-memory map of active rooms, where a room is a drawing ID mapped to the set of connected WebSocket clients.
-
-- **PostgreSQL:** Stores the authoritative state of all drawings, users, collaborators, and version history. The elements column uses JSONB for flexible schema storage of heterogeneous shape types.
-
-- **Redis (Sessions + Cursors):** Backs express-session for server-side session storage with immediate revocation. Also stores ephemeral cursor positions as Redis hashes with TTLs so that late-joining users see existing collaborator positions.
-
-- **Redis Pub/Sub (scaling path):** Not active in the single-server deployment, but the architecture anticipates adding pub/sub channels per drawing so that shape operations fan out across multiple API server instances.
-
-## 💾 Data Model
-
-> "I chose JSONB for elements because they're always loaded as a complete set for rendering. We never query 'find all rectangles across drawings' -- we always operate on one drawing's full element array. This avoids JOIN overhead and supports flexible element schemas where freehand shapes have a `points` array but rectangles don't."
-
-**Users table** -- standard authentication with UUID primary keys:
-
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | Auto-generated |
-| username | VARCHAR(30) | Unique, used for display |
-| email | VARCHAR(255) | Unique, used for login |
-| password_hash | VARCHAR(255) | bcrypt hashed |
-| display_name | VARCHAR(100) | Optional display name |
-| avatar_url | VARCHAR(500) | Optional profile image |
-| created_at | TIMESTAMP | Auto-set |
-| updated_at | TIMESTAMP | Auto-updated |
-
-**Drawings table** -- the core entity containing all canvas state:
-
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | Auto-generated |
-| title | VARCHAR(255) | Defaults to 'Untitled' |
-| owner_id | UUID FK | References users, cascade delete |
-| elements | JSONB | Array of all shapes on the canvas |
-| app_state | JSONB | Viewport, grid settings, preferences |
-| is_public | BOOLEAN | Defaults to false |
-| created_at | TIMESTAMP | Auto-set |
-| updated_at | TIMESTAMP | Auto-updated on every save |
-
-**Collaborators table** -- access control for shared drawings:
-
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | Auto-generated |
-| drawing_id | UUID FK | References drawings, cascade delete |
-| user_id | UUID FK | References users, cascade delete |
-| permission | VARCHAR(10) | 'view' or 'edit', checked constraint |
-| created_at | TIMESTAMP | Auto-set |
-
-Unique constraint on (drawing_id, user_id) prevents duplicate entries and provides idempotent collaborator-add operations.
-
-**Versions table** -- periodic snapshots for recovery:
-
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | Auto-generated |
-| drawing_id | UUID FK | References drawings |
-| version_number | INTEGER | Incrementing per drawing |
-| elements | JSONB | Full snapshot of elements at this version |
-| created_by | UUID FK | User who triggered the save |
-| created_at | TIMESTAMP | Auto-set |
-
-Capped at 50 versions per drawing. Enables recovery from accidental bulk deletes and provides an audit trail of drawing evolution.
-
-**Operations table** -- operation log for debugging and analytics:
-
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | Auto-generated |
-| drawing_id | UUID FK | References drawings |
-| user_id | UUID FK | User who performed the operation |
-| operation_type | VARCHAR(10) | 'add', 'update', 'delete', 'move' |
-| element_id | VARCHAR(255) | Target element identifier |
-| element_data | JSONB | Element state after operation |
-| version | INTEGER | Element version at operation time |
-| created_at | TIMESTAMP | Auto-set |
-
-**Element schema** (stored inside the JSONB elements array): Each element carries an id, type (rectangle, ellipse, diamond, arrow, line, freehand, text), position (x, y), dimensions (width, height), optional points array for freehand and line shapes, styling properties (strokeColor, fillColor, strokeWidth, opacity), a version counter, an updatedAt timestamp for LWW resolution, an isDeleted flag for soft deletes, and a createdBy user reference.
-
-## 🔌 API Design
-
-### Authentication Endpoints
+> “I’ll assign one active authority to each drawing. It validates commands, commits their
+> order, and distributes canonical results. Persistent connections carry both reliable edits
+> and disposable presence, with different handling for each.”
 
 ```
-POST /api/v1/auth/register    Create new user account
-POST /api/v1/auth/login       Authenticate and create session
-POST /api/v1/auth/logout      Destroy session
-GET  /api/v1/auth/me          Return current authenticated user
+┌──────────────────────┐     ┌──────────────────────┐
+│ Browser collaborators│────▶│ Session / access API │
+└──────────┬───────────┘     └──────────┬───────────┘
+           │                           │
+           ▼                           ▼
+┌──────────────────────┐     ┌──────────────────────┐
+│ WebSocket gateway    │────▶│ Drawing authority    │
+└──────────────────────┘     └──────────┬───────────┘
+                                        │
+                                        ▼
+                             ┌──────────────────────┐
+                             │ PostgreSQL log/state │
+                             └──────────┬───────────┘
+                                        │
+                                        ▼
+                             ┌──────────────────────┐
+                             │ Snapshot workers     │
+                             └──────────────────────┘
 ```
 
-### Drawing Endpoints
+The authority is a logical role, not necessarily a separate deployment on day one. One
+process can own many rooms. A routing layer maps a drawing to its owner. Adding processes
+later requires exclusive ownership with fencing, not just sharing cursor messages through
+Redis.
+
+PostgreSQL holds identities, permissions, accepted commands, receipts, and snapshot
+metadata. Initial scene snapshots can also live there. Object storage becomes useful when
+snapshot sizes and retention justify a separate lifecycle. Redis may cache routing or
+distribute presence, but a Redis notification is not the durable record of an edit.
+
+| Record | Important fields | Purpose |
+|--------|------------------|---------|
+| User | ID, username, email, password hash | Identity and session lookup |
+| Drawing | ID, owner, title, visibility, generation, current sequence | Board identity and accepted revision |
+| Membership | Drawing, user, view/edit permission | Authorization independent of client UI |
+| Element | ID, lifecycle generation, geometry/style/text revisions | Conflict boundaries within a drawing |
+| Command receipt | Drawing, actor, operation ID, body digest, outcome | Safe retries and lost-acknowledgment recovery |
+| Accepted event | Drawing, sequence, canonical change, actor | Replay and ordered distribution |
+| Snapshot | Drawing, covered sequence, content reference, checksum | Bound recovery cost |
+| Owner epoch | Drawing, fencing epoch, owner | Reject writes from a superseded room owner |
+
+The receipt, state transition, sequence allocation, and accepted event must commit together.
+Otherwise a retry could either duplicate an effect or receive a receipt for an effect that
+never became durable.
+
+Elements have stable IDs and explicit stacking order. I would start by assigning creation
+order from the accepted server sequence. If bringing objects forward becomes a feature, it
+needs an explicit ordering command. Array insertion order on each browser is not a shared
+ordering rule.
+
+Geometry forms one consistency group: position, dimensions, and relative stroke points must
+describe one coherent shape. Style is another group, and text content is another. That lets
+a move and a recolor succeed independently without promising to merge every possible
+concurrent edit.
+
+| Interface | Purpose |
+|-----------|---------|
+| POST /api/drawings | Create a drawing with a retry-safe creation receipt |
+| GET /api/drawings | List accessible drawing summaries with pagination |
+| GET /api/drawings/:id | Read authorized metadata and a snapshot cursor |
+| POST /api/drawings/:id/collaborators | Owner grants a role |
+| DELETE /api/drawings/:id/collaborators/:userId | Owner revokes a role |
+| WebSocket join | Authorize subscription and establish a sequence boundary |
+| WebSocket command | Request a durable scene change |
+| WebSocket acknowledgment/event | Return canonical outcome and accepted sequence |
+| WebSocket presence | Relay bounded cursor and connection state |
+
+These describe the proposed contract. I would not let an unrestricted HTTP whole-scene
+update bypass the same authority used by WebSocket commands.
+
+## 🔧 Deep Dive: Ordering and Concurrent Edits — 9 minutes
+
+> “I’ll choose server-ordered commands with conditional property-group revisions. That gives
+> us a small, explainable conflict model for connected drawing. It is not a claim that a
+> version number turns arbitrary object replacement into a CRDT.”
+
+Consider Alice moving a rectangle while Bob changes its color. Alice’s command names the
+geometry revision she observed; Bob’s names the style revision he observed. The authority
+accepts both if their respective expectations still hold. The resulting element contains the
+accepted geometry and the accepted color.
+
+Now suppose Alice and Bob both move the same rectangle from geometry revision 12. The first
+accepted command advances that group. The other receives a conflict with the current
+geometry. We preserve the losing user’s draft and let them reapply deliberately as a new
+command. Silently accepting both against the same base would conceal that one person’s
+intention displaced the other’s.
+
+The exact boundary matters. Treating every numeric field independently could combine one
+user’s x coordinate with another user’s width, creating a shape neither intended. Treating
+the entire element as one field would make a harmless recolor conflict with a move. Property
+groups express the invariants users recognize.
+
+A command carries a stable operation ID, a drawing generation, its target element, the
+expected group revision, and the intended change. The authenticated connection supplies the
+actor identity. The server never trusts a claimed username or user ID in the payload as
+authorization.
+
+For each command, the authority follows a short sequence:
+
+1. Validate size, shape type, finite coordinates, point count, and allowed fields.
+2. Verify current edit permission and the drawing’s lifecycle generation.
+3. Look up the actor-scoped operation receipt and compare its body digest.
+4. Check the ownership epoch and the expected property-group revision.
+5. Commit the canonical change, next sequence, event, and receipt atomically.
+6. Acknowledge the sender and distribute the same canonical event to peers.
+
+A repeated operation ID with a different body is a conflict, not a new edit. A repeated ID
+with the same body returns the recorded outcome. Retries therefore do not depend on a client
+clock or on whether the first response reached the browser.
+
+The sender receives the same accepted revision as everybody else. It must replace its
+pending overlay with that canonical result. Recipients do not increment versions again when
+applying remote events; doing so would create different metadata on each browser even if the
+pictures initially looked identical.
+
+Deletion is an explicit lifecycle transition. It records a tombstone or equivalent
+generation boundary so a delayed update cannot recreate the element. Restoring an object is
+a separate authorized operation. Reusing an old ID and blindly accepting an “add” command
+would undermine deletion semantics.
+
+| Approach | Strength | Cost or failure for this scope |
+|----------|----------|-------------------------------|
+| ✅ Server order plus group revisions | Clear acceptance and conflict boundaries | Needs an available authority for commitment |
+| ❌ Whole-element timestamp winner | Small implementation | Clock skew and replacements discard independent edits |
+| ❌ Unrestricted offline CRDT from the outset | Stronger offline merge model when correctly designed | More lifecycle, ordering, undo, and compaction semantics to validate |
+
+A mature CRDT library is a reasonable alternative if independently edited replicas must
+merge without a continuously available authority. I would evaluate its actual data types,
+deletion behavior, and undo model. I would not implement an ad hoc timestamp tie-breaker and
+assume convergence follows.
+
+Even a deterministic last-writer rule has a product cost: it can consistently discard an
+intended edit. Our conditional approach makes that conflict visible. We give up seamless
+simultaneous manipulation of the same property group in exchange for predictable behavior
+that a user can recover from.
+
+Undo follows the same model. It requests a conditional inverse of the user’s own accepted
+operation. If somebody else has since changed that group, we show a conflict instead of
+restoring an old scene snapshot and erasing unrelated work.
+
+## 💾 Deep Dive: Durability, Joining, and Reconnection — 10 minutes
+
+> “The saved indicator should correspond to a durable receipt. A broadcast or an in-memory
+> scene change is not enough, because a room can crash between distributing an edit and
+> writing its snapshot.”
+
+A tempting implementation keeps the full scene in memory and writes it after two seconds
+without edits. That reduces database work, but it has no two-second loss bound: continuous
+editing can keep resetting the timer indefinitely. A last-client-disconnect flush also fails
+if the process crashes or that final write fails.
+
+I would instead persist completed editing commands before calling them accepted. A long drag
+can send disposable previews, but its durable result is one completed gesture. We do not
+need a database write for every mouse movement to obtain durable editing semantics.
+
+The initial implementation can use short PostgreSQL transactions that serialize a drawing’s
+sequence and validate the current owner epoch. Different drawings proceed independently.
+Very hot drawings still serialize their meaningful changes; additional servers cannot remove
+that consistency requirement without changing the model.
+
+| Approach | What the user can rely on | Trade-off |
+|----------|--------------------------|-----------|
+| ✅ Durable command receipt before acceptance | Accepted edit survives room process loss | Each accepted gesture pays a persistence round trip |
+| ❌ Debounced scene write as the only persistence | Latest scene survives only after a successful flush | Quiet-period scheduling can leave an unbounded unsaved interval |
+| ❌ Database write on every pointer movement | Every sampled movement may be stored | High volume without corresponding user value |
+
+Snapshots reduce replay time; they do not define when a command becomes durable. A worker
+materializes state through sequence N, verifies the serialized snapshot, and only then
+publishes its reference and covered sequence. Recovery loads that snapshot and replays
+accepted events after N.
+
+Publishing the pointer first would advertise a snapshot that may not exist. Trimming the log
+before a valid snapshot covers it would remove the only recovery path. Retention therefore
+follows verified coverage, consumer requirements, and lifecycle rules, rather than a timer
+that simply deletes old events.
+
+Joining a room also needs a precise boundary. Reading a snapshot and later subscribing
+creates a gap where edits can disappear between those actions. I would have the authority
+establish a cursor and either buffer new events during snapshot delivery or replay the
+durable tail through a known high-water mark.
 
 ```
-GET    /api/v1/drawings              List authenticated user's drawings
-GET    /api/v1/drawings/public       List public drawings (paginated)
-POST   /api/v1/drawings              Create a new drawing
-GET    /api/v1/drawings/:id          Get drawing with full elements array
-PUT    /api/v1/drawings/:id          Update drawing metadata or elements
-DELETE /api/v1/drawings/:id          Delete drawing (owner only)
+┌──────────────────────┐     ┌──────────────────────┐
+│ Snapshot through N   │────▶│ Apply tail N+1 ... R │
+└──────────────────────┘     └──────────┬───────────┘
+                                        │
+                                        ▼
+                             ┌──────────────────────┐
+                             │ Follow events > R    │
+                             └──────────────────────┘
 ```
 
-### Collaborator Endpoints
-
-```
-POST   /api/v1/drawings/:id/collaborators           Add collaborator with permission
-DELETE /api/v1/drawings/:id/collaborators/:userId    Remove collaborator
-GET    /api/v1/drawings/:id/collaborators            List collaborators for drawing
-```
-
-### Health and Metrics
-
-```
-GET /api/health            Simple liveness check
-GET /api/health/detailed   Component-level health (DB, Redis, WS)
-GET /metrics               Prometheus metrics endpoint
-```
-
-### WebSocket Protocol
-
-All real-time communication uses JSON messages over a single `/ws` endpoint. Client-to-server messages include: join-room (with drawingId, userId, username), leave-room, shape-add (with element data), shape-update, shape-delete (with elementId), shape-move, elements-sync (full state push), and cursor-move (with x, y coordinates). Server-to-client messages include: connected (with assigned cursor color), room-state (full elements array on join), user-joined, user-left, shape operation broadcasts to other room members, cursor-move broadcasts with username and color, and error messages.
-
-## 🔧 Deep Dive 1: Real-Time Collaboration Protocol
-
-### WebSocket Room Management
-
-```
-Server maintains: rooms = Map<drawingId, Set<WebSocket>>
-
-join-room:
-  1. Client sends { type: 'join-room', drawingId, userId, username }
-  2. Server validates user has view or edit permission
-  3. Server adds client to room set
-  4. Server loads elements from memory (or DB if first joiner)
-  5. Server sends { type: 'room-state', elements } to joiner
-  6. Server broadcasts { type: 'user-joined' } to other room members
-
-shape-add/update/delete:
-  1. Client sends operation with element data
-  2. Server validates user has edit permission
-  3. Server applies CRDT merge to in-memory state
-  4. Server broadcasts to all room members except sender
-  5. Server resets debounced DB save timer (2s idle)
-```
-
-When the last user leaves a room, the server flushes the in-memory state to PostgreSQL immediately before cleaning up the room entry. This ensures no data loss during graceful departures.
-
-### Trade-off: WebSocket Rooms vs Redis Pub/Sub
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ In-memory rooms | Zero-latency broadcast, simple | Single-server only |
-| ❌ Redis Pub/Sub | Multi-server fan-out | Added latency (~1ms), complexity |
-
-> "For a single-server deployment, in-memory rooms give the lowest possible broadcast latency. When scaling horizontally, I'd add Redis Pub/Sub: each server subscribes to channels for its active drawing rooms, and operations publish to the channel. The trade-off is ~1ms added latency per message, but this is well within our 50ms target. Sticky sessions ensure a user's WebSocket typically stays on one server, reducing cross-server traffic."
-
-### Message Ordering and Delivery
-
-WebSocket over TCP guarantees in-order delivery per connection, but messages from different users arrive in nondeterministic order at the server. The CRDT merge function handles this: because it is commutative and associative, the final state is the same regardless of arrival order. The server does not buffer or reorder messages -- it applies each operation immediately and broadcasts the result. This keeps latency minimal at the cost of transient inconsistency windows where two clients may briefly see different states until the next message arrives.
-
-## 🔧 Deep Dive 2: Conflict Resolution with Shape-Level LWW
-
-### The Core Problem
-
-Two users simultaneously edit the same rectangle -- User A changes its color while User B moves it. Without conflict resolution, one update overwrites the other entirely, losing either the color change or the position change.
-
-### Shape-Level Last-Writer-Wins
-
-Each element carries: `id`, `version` (integer), `updatedAt` (timestamp)
-
-```
-mergeElements(existing[], incoming[]):
-  for each incoming element:
-    current = existing[element.id]
-    if !current                                       ──▶ add element
-    if element.version > current.version              ──▶ replace
-    if same version, element.updatedAt > current.updatedAt ──▶ replace
-    else                                              ──▶ keep existing
-```
-
-### Trade-off: LWW vs Full CRDT (Yjs/Automerge) vs OT
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Shape-level LWW | Simple, low overhead, 50 LOC | Loses one edit on same-element conflict |
-| ❌ Full CRDT (Yjs) | True conflict-free merging | 100KB+ library, complex data structures |
-| ❌ OT (Operational Transform) | Precise character-level merges | Requires centralized transform server, hard to implement correctly |
-
-> "I chose LWW because whiteboard users typically work on different shapes. The probability of two users editing the exact same rectangle at the exact same moment is low. When it happens, the user whose edit 'loses' sees their change replaced -- which feels natural ('someone else moved the box I was editing'). For text elements where character-level merging matters, I'd integrate Yjs, but for geometric shapes, LWW provides 90% of the value at 10% of the complexity."
-
-> "OT is what Google Docs uses and it provides mathematically precise merging of concurrent operations. But OT requires a centralized transform server that sequences all operations and computes the transformed indices. This adds a single point of failure and increases latency because every operation must round-trip through the sequencer. For a whiteboard where operations are at the shape level rather than the character level, OT's precision is unnecessary overhead."
-
-### Why Version + Timestamp (Not Just Timestamp)
-
-Using timestamps alone for conflict resolution has a subtle failure mode: clock skew between clients can cause a slower machine's edits to always lose, regardless of actual recency. The version counter provides a reliable ordering that does not depend on clock synchronization. Timestamps serve only as a tiebreaker when versions match, which should only happen when two clients increment from the same base version simultaneously.
-
-### Soft Deletes for CRDT Correctness
-
-Deleted elements are marked `isDeleted: true` rather than removed. This prevents a subtle bug: if User A deletes element X while User B concurrently updates element X, User B's update would "resurrect" the element if the delete had physically removed it from the array. With soft deletes, the CRDT merge sees the higher-version delete and keeps it deleted. The renderer filters out soft-deleted elements during display.
-
-### Vector Clocks as an Alternative
-
-A more sophisticated approach would assign each client a logical clock and use vector clocks to detect true concurrency (where neither operation causally precedes the other). This would allow the system to present concurrent edits to the user for manual resolution rather than silently discarding one. The cost is significant: vector clocks grow linearly with the number of participants, and the merge logic becomes substantially more complex. For a whiteboard where "last write wins" is an acceptable UX, the simpler version-plus-timestamp approach is justified.
-
-## 🔧 Deep Dive 3: Persistence Strategy
-
-### Debounced Auto-Save
-
-Rather than writing every operation to the database (which would generate thousands of writes during freehand drawing at 60 points/second), the server uses a debounced save:
-
-1. After each shape operation, reset a 2-second timer
-2. When the timer fires, write the full element array to PostgreSQL in a single atomic transaction
-3. On room empty (last user leaves), flush immediately
-4. On server shutdown (SIGTERM), flush all active rooms before exit
-
-The full-state write is inherently idempotent: if the database write fails and retries, writing the same snapshot twice produces the same result. There is no risk of partial application or double-counting.
-
-### Write-Ahead Strategy
-
-For scenarios where the 2-second data loss window is unacceptable, a write-ahead log (WAL) approach would persist each operation to a lightweight append-only store (Redis Streams or a dedicated operations table) before broadcasting. On server crash, the WAL is replayed to reconstruct the state since the last snapshot. This reduces the data loss window to effectively zero at the cost of one additional write per operation. For a whiteboard application where losing 2 seconds of strokes is tolerable, the debounced approach is the pragmatic choice.
-
-### Trade-off: Debounced Save vs Event Sourcing
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Debounced full-state save | Simple, predictable writes | Lose up to 2s of work on crash |
-| ❌ Event sourcing | Perfect audit trail, undo support | Massive write volume, complex replay |
-
-> "Event sourcing is the theoretically correct approach -- persist every operation, reconstruct state by replaying. But freehand drawing generates ~60 operations per second per user. With 50 concurrent users, that's 3,000 writes/second to the operations table. The debounced approach collapses all those into a single JSONB write every 2 seconds. We lose up to 2 seconds of work on a server crash, which is acceptable given that the WebSocket reconnection flow will re-sync state from the surviving in-memory copy."
-
-### Version Snapshots
-
-Every save creates a version snapshot (capped at 50 per drawing). This enables:
-- Recovery from accidental bulk deletes
-- Audit trail of drawing evolution
-- Future undo/redo implementation
-
-Old snapshots beyond the cap are pruned on a FIFO basis. The version number increments monotonically per drawing, providing a clear timeline.
-
-## 🔌 Cursor Presence
-
-### Architecture
-
-```
-Client cursor-move ──▶ WebSocket broadcast (real-time, ~60fps throttled to 10fps)
-                   └──▶ Redis HSET (persistence for late joiners, 30s TTL)
-
-presence:cursors:{drawingId} = {
-  userId1: '{"x":100,"y":200,"color":"#e03131","username":"alice"}',
-  userId2: '{"x":300,"y":150,"color":"#3b5bdb","username":"bob"}'
-}
-```
-
-> "Cursor updates flow primarily through WebSocket broadcast for minimum latency. Redis serves as the persistence layer so that when a new user joins, they can see existing cursor positions from the Redis hash. The 30-second TTL auto-cleans stale cursors from disconnected users."
-
-The server throttles cursor broadcasts from 60fps (the rate at which the browser fires mousemove events) down to 10fps. This reduces WebSocket message volume by 6x while maintaining a smooth visual experience for other users. The throttle is applied per-user on the server side so that a misbehaving client cannot flood the room.
-
-## 🗄️ Caching Strategy
-
-Drawing metadata (title, owner, collaborator list, permissions) is cached in Redis with a 5-minute TTL. When a user opens the drawing list page, the API reads from cache rather than querying PostgreSQL. Cache invalidation occurs on write: creating, updating, or deleting a drawing evicts the relevant cache keys.
-
-The full elements array is not cached in Redis because it lives in the server's in-memory room state during active collaboration. When no users are in a room, the elements are only in PostgreSQL. Loading a drawing from the database into memory when the first user joins takes 10-50ms depending on element count, which is acceptable since it happens once per room activation.
-
-Session data uses Redis with a 24-hour TTL. This provides immediate revocation (deleting the session key logs the user out instantly) and avoids storing session state on the API server, which would break horizontal scaling.
-
-## 🛡️ Failure Handling
-
-**WebSocket disconnection:** When a client disconnects unexpectedly, the server removes them from the room set, broadcasts a user-left message to remaining participants, and updates the Redis cursor hash by removing their entry. If the room becomes empty, it triggers an immediate flush to PostgreSQL.
-
-**WebSocket reconnection:** The client implements exponential backoff with jitter, starting at 500ms and capping at 30 seconds. On reconnection, the client re-sends a join-room message. The server responds with the current room-state, and the client reconciles its local elements with the server's authoritative copy using the same CRDT merge function. Any local changes made during the disconnection window are re-sent to the server.
-
-**Database failure:** Database operations are wrapped in a circuit breaker. When PostgreSQL becomes unavailable, the circuit opens after 5 consecutive failures. In-memory room state continues to serve active collaborators without interruption. The debounced save retries accumulate, and once the circuit closes (half-open probe succeeds), all pending saves flush. During the outage, new drawing creation and listing fail gracefully with 503 responses.
-
-**Redis failure:** If Redis becomes unavailable, sessions degrade (users may need to re-authenticate), cursor persistence is lost (but WebSocket broadcast cursors continue working), and rate limiting falls back to in-memory counters per server. The circuit breaker pattern prevents Redis connection attempts from blocking request processing.
-
-**Server crash recovery:** On startup, the server has no in-memory room state. The first user to join a drawing triggers a load from PostgreSQL, which represents the last debounced save. Up to 2 seconds of operations may be lost. This is mitigated by the client holding its own local state and re-sending it during the reconnection reconciliation.
-
-## 📡 Observability
-
-**Prometheus metrics** track HTTP request duration (histogram), total HTTP requests (counter by method, path, status), active WebSocket connections (gauge), WebSocket messages by type (counter), drawings created (counter), active sessions (gauge), authentication attempts by result (counter), and circuit breaker state transitions (gauge).
-
-**Structured logging** uses Pino with JSON output. Each log entry includes a request trace ID (from the x-trace-id header), user context (userId if authenticated), query timing for database operations, and WebSocket room events (join, leave, flush). Log levels follow standard severity: error for failures requiring attention, warn for degraded states (circuit breaker open), info for business events (drawing created, collaborator added), debug for protocol-level detail (individual shape operations).
-
-**Health checks** expose three levels: a simple liveness check at `/api/health` that returns 200 if the process is running, a readiness check that verifies PostgreSQL and Redis connectivity, and a detailed check at `/api/health/detailed` that reports component-level status with latency measurements for each dependency.
-
-## 📊 Scaling Path
-
-1. **Phase 1 (Current):** Single server, in-memory rooms, debounced PostgreSQL saves
-2. **Phase 2 (10K users):** Add Redis Pub/Sub for cross-server WebSocket fan-out, sticky sessions via nginx IP hash, read replicas for drawing list queries
-3. **Phase 3 (100K users):** Shard drawings by ID hash across database nodes, dedicated WebSocket gateway layer separated from REST API servers, CDN for frontend static assets
-4. **Phase 4 (1M users):** Element-level JSONB updates via `jsonb_set()` to reduce write amplification on large drawings, distributed CRDT via Yjs for text elements, connection pooling with PgBouncer, regional deployment with cross-region CRDT sync
-
-### What Breaks First
-
-**WebSocket connections** are the first bottleneck. Each connection consumes approximately 50KB of memory for the socket buffer plus the room state reference. A single server with 8GB of RAM can handle roughly 50K-100K concurrent connections before memory pressure causes degradation. Horizontal scaling with Redis Pub/Sub is the primary mitigation.
-
-**PostgreSQL write throughput** becomes a concern with thousands of active drawings. Each debounced save writes a full JSONB column, which for large drawings (10K elements) can be several megabytes. At 1,000 concurrent active rooms with 2-second debounce, the database sees 500 writes/second, each potentially writing 1-5MB of JSONB. Connection pooling, batched writes, and eventual sharding address this.
-
-**Redis cursor write rate** scales with the number of active users times the cursor update frequency. At 100K users updating at 10fps, Redis sees 1M writes/second for cursor data alone. Redis can handle this throughput, but the network bandwidth becomes significant. Throttling cursor updates further (to 5fps) or moving cursor persistence to an in-memory data structure with periodic Redis syncs would reduce the load.
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Conflict resolution | Shape-level LWW | Full CRDT (Yjs) | Simple, sufficient for shapes |
-| Element storage | JSONB column | Normalized table | Single read/write, flexible schema |
-| Real-time transport | WebSocket | SSE / Long polling | Bidirectional, low latency |
-| Persistence | Debounced save | Event sourcing | Lower write amplification |
-| Room management | In-memory Map | Redis Pub/Sub | Zero-latency for single server |
-| Cursor storage | Redis hash + WS | WS only | Late-joiner cursor persistence |
-| Session storage | Redis + cookie | JWT | Immediate revocation, simpler |
-| Conflict ordering | Version + timestamp | Vector clocks | Simpler, acceptable UX for whiteboards |
-| Database writes | Full JSONB rewrite | Element-level jsonb_set | Simpler, sufficient at current scale |
-| Cache strategy | Redis metadata cache | Full element caching | Elements live in-memory during collaboration |
+The client applies events in sequence and requests catch-up when a gap appears. Duplicate
+events can be ignored using their sequence and receipt identity. A drawing generation
+distinguishes a deleted or replaced board from a continuation of an old one.
+
+After disconnection, the browser keeps its last committed cursor and actor-scoped pending
+commands. It reconnects, reauthorizes access, catches up, and resubmits unacknowledged
+operation IDs. If the server committed a command before the connection died, its receipt
+resolves the uncertainty without applying it twice.
+
+Pending commands may now conflict with newer accepted revisions. The client must not
+“repair” that by uploading its entire old scene. It presents the conflict and preserves the
+draft for reapplication or recovery. This is how we support useful offline work without
+promising unrestricted offline convergence.
+
+A browser switching accounts or drawings must isolate those queues. Late responses from a
+previous room need a subscription generation check. Otherwise the networking layer can be
+correct while the UI overwrites the current board with a valid response for a different
+board.
+
+Tombstone and receipt retention are linked to retry support. If all evidence of a deletion
+or processed command disappears while an old client can still replay it, the system can
+resurrect or duplicate work. I would define a minimum supported history boundary and reject
+commands older than that boundary until the client resynchronizes. Their local drafts remain
+recoverable, but are not blindly replayed.
+
+During a database outage, the server can continue forwarding bounded cursor previews if
+appropriate, but it cannot label new durable edits accepted. The browser displays pending
+work. Once storage recovers, receipts and revision checks determine which commands can be
+applied.
+
+The main cost of this design is operational: durable log growth, snapshot scheduling,
+retention rules, and recovery testing. That cost buys a precise answer to “Is my drawing
+saved?” rather than inferring safety from a connected socket.
+
+## 🌐 Deep Dive: Room Ownership, Presence, and Access — 8 minutes
+
+> “I’ll scale by drawing, because unrelated drawings do not need a shared edit order. Within
+> one drawing, I’ll preserve one authority and spend effort bounding fanout and memory.”
+
+With roughly 1,000 elements at an assumed 500 bytes each, a scene is about 0.5 MB
+serialized. Five thousand resident scenes would be about 2.5 GB before JavaScript object
+overhead, indexes, queues, and sockets. We should evict idle rooms only after their accepted
+state is recoverable, and cap room and connection admission per process.
+
+A registry assigns a drawing to a room owner with an epoch. On failover, the new owner
+obtains a later epoch. Every durable write checks that epoch in storage. An expired lease
+alone is insufficient: a paused old process could resume and write unless the database
+rejects its stale ownership token.
+
+The gateway routes a drawing to that owner. Affinity by user or IP is not enough because
+collaborators on different networks still need the same authority. Redis pub/sub can
+distribute notifications, but it cannot prevent two independent room copies from overwriting
+each other’s full-scene snapshots.
+
+| Approach | Benefit | Cost or limit |
+|----------|---------|---------------|
+| ✅ Drawing ownership with storage fencing | One accepted order across failover | Routing, ownership transitions, and catch-up logic |
+| ❌ Several independent room maps plus pub/sub | Easy initial fanout | Broadcasts alone do not coordinate conflicting durable writers |
+| ❌ One global room server | Simple local deployment | Shared capacity and failure boundary for every drawing |
+
+A very popular board is a separate problem from many small boards. We can distribute
+delivery to many viewers while retaining one editing authority. If 20 editors remain the
+supported profile, a board with thousands of spectators should not force every editor
+process to maintain all viewer sockets or cursor streams.
+
+Presence is keyed by connection ID, with user identity attached for display. Two tabs from
+one account are two live connections. Removing one must not erase the other. The server
+records last-seen times and the client expires stale entries, even if a clean close event
+never arrives.
+
+I would coalesce cursor movement to the latest value and apply per-connection and per-room
+rate limits. A ten-Hz starting limit is a tuning assumption. Cursor packets need not wait
+for durable storage, and an old cursor update has no reason to queue behind newer ones.
+
+A single expiring room hash is not sufficient for per-person liveness. If active
+collaborators keep refreshing the key’s TTL, stale members can remain indefinitely.
+Per-connection timestamps or independently expiring records make the intended lease
+explicit.
+
+Backpressure must also distinguish message types. When a socket is slow, replace older
+presence with newer presence. Bound reliable event buffering; if the client falls too far
+behind, disconnect it with a resumable cursor and require catch-up. An unbounded queue turns
+one slow reader into a memory failure for healthy rooms.
+
+Authorization applies at connection establishment, room join, and durable mutation. The
+upgrade verifies the session and allowed origin. The join verifies read access. Each command
+checks edit access against a current permission revision or equivalent authoritative check.
+An authenticated public viewer is still a viewer.
+
+Revocation should invalidate active subscriptions and editing rights promptly. A grant
+change must be coordinated with command admission so the product has a defined boundary for
+edits racing revocation. The same rule must cover HTTP updates; protecting one transport
+while leaving another writable defeats the policy.
+
+The cost is extra state and checks on a latency-sensitive path. I would cache only with
+explicit invalidation and bounded staleness appropriate to the access requirement. For
+private drawings, an old cached “public” flag cannot independently authorize access after
+the owner makes the drawing private.
+
+## 📊 Failure Handling and Verification — 4 minutes
+
+I would prioritize end-to-end signals: time from command submission to durable receipt,
+conflict rate, room recovery duration, sequence-gap frequency, oldest unacknowledged
+command, snapshot lag, and socket backlog. Request latency alone will not reveal that
+collaborators have stopped converging.
+
+Presence drops and rejected edit commands should be separate metrics. A system can
+intentionally drop cursor updates while preserving accepted editing correctness. Metric
+labels should use bounded categories, never arbitrary client-supplied message types or
+drawing IDs.
+
+| Failure to exercise | Required observation |
+|---------------------|----------------------|
+| Crash after commit but before acknowledgment | Retry returns the original receipt |
+| Edit while a new client joins | Snapshot plus tail includes it exactly once in state |
+| Two moves from the same group revision | One accepts; the other reports a recoverable conflict |
+| Duplicate delete or delayed pre-delete update | No repeated effect or resurrection |
+| Ownership changes while old server resumes | Old epoch cannot commit |
+| Access revoked with a socket open | Later unauthorized commands cannot commit |
+| One slow socket or malformed large message | Bounded impact on healthy collaborators |
+
+I would run deterministic reducer and protocol tests before load tests. Then I would test
+actual sockets and database transactions with controlled failures. Mocked HTTP handlers are
+useful for route behavior but cannot establish convergence, SQL validity, or durable
+recovery.
+
+Load testing should separate many small rooms from one hot room. It should include large
+freehand strokes, slow consumers, connection churn, and snapshot recovery. A single average
+requests-per-second result would hide the boundaries that matter here.
+
+## 🏁 Repository Mapping and Closing — 2 minutes
+
+The local project runs one Express and WebSocket process with PostgreSQL, Redis sessions, a
+full-scene cache, and process-local room maps. It has seven element types and debounced
+full-scene writes. It does not implement the durable command protocol, fenced ownership, or
+snapshot-and-tail recovery described above.
+
+Several current behaviors are important limitations. WebSocket joins and edits do not
+authenticate or enforce drawing permissions. The merge helper and operation reducer disagree
+on versions and ties, and clients rewrite remote metadata. The operations table is unused;
+history is written only by HTTP scene updates.
+
+An initial room load can overwrite edits made while it was pending. Continuous edits
+postpone the save timer, and failed saves have no durable retry. HTTP scene saves and room
+saves can overwrite each other. The collaborator insertion query is invalid and its caught
+error can produce a success response containing a null collaborator.
+
+> “My first backend milestone would be a secure, single-process authority with canonical
+> events and durable receipts. I would demonstrate crash recovery and conflict behavior
+> before introducing multiple room owners or claiming offline convergence.”
+
+The [architecture document](architecture.md) separates this proposed production design from
+the current schema, request paths, and local implementation limits.

@@ -1,219 +1,164 @@
 # Google Calendar
 
-A full-stack calendar application with Month, Week, and Day views, event scheduling with conflict detection, and a clean UI inspired by Google Calendar.
+A calendar learning project built with React, Express, and PostgreSQL. Explore month, week, and day layouts, manage events in personal calendars, and trace owner-scoped date queries and advisory overlap checks. This is a local demonstration inspired by Google Calendar, not a connection to Google's service or a complete scheduling product.
 
-## Codebase Stats
+## What you can try
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 4,416 |
-| Source Files | 54 |
-| .md | 1,509 |
-| .tsx | 1,416 |
-| .ts | 1,191 |
-| .json | 154 |
-| .sql | 68 |
+- Sign in, navigate dates, switch views, and toggle existing calendars in the sidebar.
+- Create, edit, and delete events with a title, time range, calendar, location, description, and color.
+- View timed events in day/week grids and all-day events in the month grid. All-day events currently have no lane in day/week views.
+- Use the API to register accounts and create, rename, recolor, or delete non-primary calendars. These management screens are not implemented.
+
+The API permits overlaps and returns matching timed events as advisory information. The editor closes immediately after a successful save, so its conflict banner does not remain visible. Recurring events, invitations, sharing, reminders, drag-and-drop, offline support, and an admin interface are not implemented.
+
+Read [architecture.md](./architecture.md) for the source audit and a separate proposed production design. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) interview answers explain proposed designs with whiteboard diagrams and trade-offs.
+
+## Stack and local flow
+
+| Layer | Actual implementation |
+|-------|-----------------------|
+| Browser | React 19, TypeScript, Vite 6, TanStack Router, Zustand, date-fns 4, Tailwind CSS 3 |
+| API | One Express process with auth, calendar, and event routers |
+| Persistence | PostgreSQL 16; users, calendars, events, and `session` tables |
+| Authentication | bcrypt password hashes and PostgreSQL-backed express-session cookies |
+| Optional Compose service | Valkey 8 is declared but has no application client or usage |
+
+```text
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ React browser          │       │ Express API            │       │ PostgreSQL 16          │
+│ Views + modal + store  │◀─────▶│ Calendar + event API   │◀─────▶│ Data + session table   │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+                          Vite proxies /api to Express; Valkey is not used
 
 
-## Features
+Read: get range → owner-filtered SQL → replace events array → render
 
-- **Multiple Views**: Month, Week, and Day views with smooth navigation
-- **Event Management**: Create, edit, and delete calendar events
-- **Conflict Detection**: Warns when events overlap (non-blocking)
-- **Multiple Calendars**: Support for multiple calendars with visibility toggles
-- **All-Day Events**: Support for all-day events
-- **Color Coding**: Customizable event colors
-- **Session-based Auth**: Simple login/logout with demo accounts
-
-## Screenshots
-
-(Screenshots will be added after initial run)
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js >= 20.0.0
-- Docker and Docker Compose (recommended)
-
-### Setup
-
-1. Start infrastructure (PostgreSQL + Valkey):
-```bash
-cd google-calendar
-docker-compose up -d
+Write: submit modal → SQL write + conflict result → update array → close modal
 ```
 
-2. Install backend dependencies and initialize database:
+## Setup
+
+Use Node.js 20 or newer and npm. Run commands below from `google-calendar/` unless a block changes directory. PostgreSQL uses port 5432, the API uses 3000, and Vite normally uses 5173; stop conflicting project services first.
+
+### Option A: Docker Compose (recommended)
+
+```bash
+docker compose up -d postgres
+docker compose exec postgres pg_isready -U calendar_user -d google_calendar
+```
+
+The PostgreSQL-only command starts everything this application uses. `docker compose up -d` also starts the unused Valkey service. Compose creates the database and role, but does **not** mount the application schema; run the migration below.
+
+To stop services, run `docker compose down`. `docker compose down -v` also **deletes this project's database and Valkey volumes** and is only appropriate for an intentional reset.
+
+### Option B: Native installation (no Docker)
+
+On macOS with Homebrew, install and start PostgreSQL. The role/database creation commands are for a fresh installation; skip creation if they already exist.
+
+```bash
+brew install postgresql@16
+brew services start postgresql@16
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+psql postgres -c "CREATE ROLE calendar_user WITH LOGIN PASSWORD 'calendar_pass';"
+createdb -O calendar_user google_calendar
+PGPASSWORD=calendar_pass psql -h localhost -U calendar_user -d google_calendar -c 'SELECT current_database(), current_user;'
+```
+
+Valkey is optional because the application does not use it. To mirror the extra Compose service, run `brew install valkey`, `brew services start valkey`, then `valkey-cli ping` and expect `PONG`.
+
+### Install, migrate, seed, and start the API
+
+In the first terminal:
+
 ```bash
 cd backend
 npm install
+export DATABASE_URL='postgresql://calendar_user:calendar_pass@localhost:5432/google_calendar'
+export SESSION_SECRET='local-calendar-demo-secret'
 npm run db:migrate
-npm run db:seed    # Creates demo users (alice, bob)
-```
-
-3. Start the backend:
-```bash
+npm run db:seed
 npm run dev
 ```
 
-4. In a new terminal, install and start the frontend:
+On a fresh database, the seed creates `alice` and `bob`, both with password `password123`. Alice has Personal and Work calendars and seven example events; Bob has a Personal calendar with no events. Examples cover today, tomorrow, an offsite three days ahead, and planning a week ahead.
+
+The seed chooses a date from the Node process's local clock and constructs event times in `America/Los_Angeles`. The browser renders in its own local zone; the saved user timezone preference is not applied. The seed is **not a repair tool**: it skips when both usernames exist and can fail when only one exists. It does not repair missing calendars/events or update existing passwords. Use an empty demo database for the initial seed.
+
+### Start the browser
+
+In a second terminal, again starting from `google-calendar/`:
+
 ```bash
-cd google-calendar/frontend
+cd frontend
 npm install
 npm run dev
 ```
 
-5. Open http://localhost:5173 and login with:
-   - Username: `alice` or `bob`
-   - Password: `password123`
+Open [http://localhost:5173](http://localhost:5173) and log in with Alice. Vite proxies `/api` requests to port 3000. Clicking a month date opens that day; clicking an hourly slot opens the editor, but its initial time currently resets to 09:00–10:00 rather than the clicked hour.
 
-## Tech Stack
+### Environment variables
 
-### Frontend
-- **Framework**: React 19 with TypeScript
-- **Router**: TanStack Router (file-based routing)
-- **State**: Zustand with persist middleware
-- **Styling**: Tailwind CSS
-- **Date Handling**: date-fns
+| Variable | Default | Used by |
+|----------|---------|---------|
+| `DATABASE_URL` | `postgresql://calendar_user:calendar_pass@localhost:5432/google_calendar` | API, migration, seed, and session store |
+| `PORT` | `3000` | API listener |
+| `FRONTEND_URL` | `http://localhost:5173` | Credentialed CORS origin |
+| `SESSION_SECRET` | `dev-secret-change-in-production` | Session signing; override outside disposable development |
+| `NODE_ENV` | Unset | Enables Secure cookies when exactly `production` |
 
-### Backend
-- **Runtime**: Node.js with Express
-- **Database**: PostgreSQL 16 (also stores sessions)
-- **Session Store**: PostgreSQL via `connect-pg-simple` (Valkey runs in docker-compose but is currently unused — reserved for future caching)
-- **Auth**: express-session with connect-pg-simple
+There is no dotenv loader. Export overrides into each relevant process; writing a `.env` file alone does not load them. The frontend proxy target is fixed in [vite.config.ts](./frontend/vite.config.ts); changing `PORT` requires matching that target. Production TLS termination also needs suitable proxy trust and cookie configuration, which this demo does not supply.
 
-## API Endpoints
+## API reference
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | /api/auth/login | Login user |
-| POST | /api/auth/logout | Logout user |
-| GET | /api/auth/me | Get current user |
-| GET | /api/calendars | List user calendars |
-| POST | /api/calendars | Create calendar |
-| GET | /api/events?start=&end= | Get events in date range |
-| GET | /api/events/:id | Get single event |
-| POST | /api/events | Create event (returns conflicts) |
-| PUT | /api/events/:id | Update event (returns conflicts) |
-| DELETE | /api/events/:id | Delete event |
+All calendar and event routes require a session. Registration and login create one; `/api/auth/me` checks it. Request field names use camelCase, while database-backed response rows use snake_case.
 
-## Project Structure
+| Method | Path | Behavior |
+|--------|------|----------|
+| POST | `/api/auth/register` | Create user and default Personal calendar; no registration UI |
+| POST | `/api/auth/login` | Authenticate with username and password |
+| POST | `/api/auth/logout` | Destroy session and clear cookie |
+| GET | `/api/auth/me` | Return current user |
+| GET / POST | `/api/calendars` | List own calendars / create a calendar |
+| PUT / DELETE | `/api/calendars/:id` | Rename or recolor / delete an owned non-primary calendar and its events |
+| GET | `/api/events?start=...&end=...` | Events overlapping the interval; optional singular `calendarId` |
+| GET | `/api/events/:id` | Owned event with calendar name and effective color |
+| POST / PUT | `/api/events` / `/api/events/:id` | Create / update; return event and optional advisory conflicts |
+| DELETE | `/api/events/:id` | Delete owned event |
+| GET | `/api/events/:id/conflicts` | Conflicts for an existing owned event; no unsaved-event preview endpoint |
+| GET | `/api/health` | Static process response; no explicit database readiness probe |
 
-```
-google-calendar/
-├── docker-compose.yml       # PostgreSQL + Valkey
-├── backend/
-│   ├── package.json
-│   ├── src/
-│   │   ├── api/
-│   │   │   ├── app.ts       # Express app
-│   │   │   └── index.ts     # Server entry
-│   │   ├── routes/
-│   │   │   ├── auth.ts      # Authentication
-│   │   │   ├── calendars.ts # Calendar CRUD
-│   │   │   └── events.ts    # Event CRUD
-│   │   ├── services/
-│   │   │   └── conflictService.ts
-│   │   ├── shared/
-│   │   │   ├── db.ts        # PostgreSQL pool
-│   │   │   └── auth.ts      # Auth middleware
-│   │   └── db/
-│   │       ├── init.sql     # Database schema
-│   │       ├── migrate.ts   # Migration runner
-│   │       └── seed.ts      # Demo data seeder
-│   └── tsconfig.json
-└── frontend/
-    ├── package.json
-    ├── index.html
-    ├── src/
-    │   ├── main.tsx
-    │   ├── routes/
-    │   │   ├── __root.tsx   # Root layout
-    │   │   ├── index.tsx    # Calendar page
-    │   │   └── login.tsx    # Login page
-    │   ├── components/
-    │   │   ├── calendar/
-    │   │   │   ├── MonthView.tsx
-    │   │   │   ├── WeekView.tsx
-    │   │   │   ├── DayView.tsx
-    │   │   │   ├── EventModal.tsx
-    │   │   │   ├── EventCard.tsx
-    │   │   │   ├── CalendarSidebar.tsx
-    │   │   │   ├── MiniCalendar.tsx
-    │   │   │   ├── ViewSwitcher.tsx
-    │   │   │   └── DateNavigator.tsx
-    │   │   └── icons/
-    │   ├── stores/
-    │   │   ├── calendarStore.ts
-    │   │   └── authStore.ts
-    │   ├── services/
-    │   │   └── api.ts
-    │   ├── utils/
-    │   │   └── dateUtils.ts
-    │   └── types.ts
-    └── tailwind.config.js
-```
+For direct timed-event API calls, send explicit offsets or UTC timestamps. Event creation requires `calendarId`, `title`, `startTime`, and `endTime`. The database enforces end after start, but broader input/range limits are incomplete. `recurrence_rule` is an unused schema field; the API does not create or expand recurrence rules.
 
-## Development
+## Verification commands
 
-### Available Scripts
+From `google-calendar/`, after installing dependencies:
 
-**Backend:**
 ```bash
-npm run dev          # Start server with hot reload
-npm run db:migrate   # Run database migrations
-npm run db:seed      # Seed demo data
+(cd backend && npm run build)
+(cd frontend && npm run build)
+(cd frontend && npx tsc --noEmit -p tsconfig.app.json)
+(cd frontend && npx tsc --noEmit -p tsconfig.node.json)
+curl http://localhost:3000/api/health
 ```
 
-**Frontend:**
+The backend also declares `test` and `test:watch`, but has no checked-in backend test files. The frontend's `type-check` script targets the empty root references file rather than checking the referenced applications; use the explicit commands above or its build. Its `lint` script exists, but no project ESLint configuration is checked in. Neither package has a format script.
+
+The repository's [smoke tests](./tests/smoke.spec.ts) check login and a basic calendar page. They do not establish time-zone, editing, conflict, or layout correctness. With the database, seeded API, and browser server already running, execute from the **repository root**:
+
 ```bash
-npm run dev          # Start Vite dev server
-npm run build        # Build for production
-npm run type-check   # TypeScript type checking
-npm run lint         # ESLint
-npm run format       # Prettier
+npm run test:smoke google-calendar
+npm run screenshots google-calendar
 ```
 
-## Key Design Decisions
+The [screenshot configuration](../scripts/screenshot-configs/google-calendar.json) targets login, month, week, and day views. This documentation review used source inspection and isolated checks with mocked dependencies; it did not start the stack, run builds, or capture browser screenshots.
 
-1. **Conflict Detection**: Events are checked for time overlaps when creating/updating. The API returns conflicting events but doesn't block creation - it's informational.
+## Known limitations
 
-2. **Calendar Visibility**: Users can toggle calendar visibility to filter events in the view without deleting them.
+- **Time handling:** form submissions omit the offset, so the browser, Node process, and PostgreSQL can interpret the same input differently. All-day data is stored as timestamps. Midnight inclusion, overnight clipping, and daylight-saving positioning need correction.
+- **Rendering:** timed overlaps occupy the same horizontal space; all-day items are omitted from day/week views. The month date list has 28, 35, or 42 cells while the CSS always declares six rows.
+- **Saving:** updates have no version check and creates have no idempotency key. An update can commit before its conflict lookup fails, returning an error despite a saved change. Clearing description/location in the form does not clear them in storage.
+- **Client lifecycle:** range requests can arrive out of order, fetch errors are console-only, and calendar/editor state is not reset at logout. In-flight saves can close a newly opened editor; logout does not check HTTP error status.
+- **Interaction:** modal focus management, a keyboard-operable date/time grid, a mobile layout, calendar management screens, and persistent conflict feedback remain unfinished.
 
-3. **Date Range Queries**: Events are fetched based on the visible date range to minimize data transfer.
-
-4. **Session Auth**: Uses PostgreSQL-backed sessions for simplicity, avoiding JWT complexity.
-
-## Database Schema
-
-```sql
--- Users
-CREATE TABLE users (
-  id SERIAL PRIMARY KEY,
-  username VARCHAR(50) UNIQUE NOT NULL,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  timezone VARCHAR(50) DEFAULT 'UTC'
-);
-
--- Calendars
-CREATE TABLE calendars (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
-  name VARCHAR(100) NOT NULL,
-  color VARCHAR(7) DEFAULT '#3B82F6',
-  is_primary BOOLEAN DEFAULT FALSE
-);
-
--- Events
-CREATE TABLE events (
-  id SERIAL PRIMARY KEY,
-  calendar_id INTEGER REFERENCES calendars(id),
-  title VARCHAR(255) NOT NULL,
-  start_time TIMESTAMPTZ NOT NULL,
-  end_time TIMESTAMPTZ NOT NULL,
-  all_day BOOLEAN DEFAULT FALSE,
-  CONSTRAINT valid_time_range CHECK (end_time > start_time)
-);
-```
+See [Implementation Notes](./architecture.md#implementation-notes) for evidence, exact behavior, and the boundary between this demo and the proposed design.

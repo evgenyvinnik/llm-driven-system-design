@@ -1,776 +1,455 @@
-# Apple Pay - System Design Answer (Full-Stack Focus)
+# Apple Pay: full-stack system design interview
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+> “I would follow one purchase from the amount the user reviews to the
+> result the merchant records. The difficult part is keeping that intent
+> intact when the device, browser, server, and payment provider finish at
+> different times.”
 
----
+This is a proposed production design. It uses a wallet experience and a
+merchant checkout to explain the integration boundaries; it does not claim
+to reproduce Apple's internal architecture. The local project is an HTTP
+simulator, compared with the proposal near the end.
 
-## 📋 Problem Statement
+## 🧭 Discussion plan
 
-Design a mobile payment system that allows users to:
-- Add credit/debit cards to a digital wallet
-- Make contactless NFC payments at terminals
-- Complete in-app and web payments
-- Manage cards across multiple devices
+| Topic | Minutes |
+|-------|---------|
+| Scope and requirements | 5 |
+| Architecture and contracts | 7 |
+| Deep dive: one checkout across client and server | 10 |
+| Deep dive: an uncertain payment result | 10 |
+| Deep dive: device lifecycle and privacy | 8 |
+| Scaling, verification, and implementation boundary | 5 |
+| Total | 45 |
 
-This answer covers the end-to-end architecture, emphasizing the integration between frontend and backend components.
+## 🎯 Clarify the system we own
 
----
+A wallet manages a customer's payment credentials. A merchant owns an order
+and its total. A processor routes authorization, and the issuer decides
+whether it is approved. I would put these roles on the board before choosing
+a database or a frontend state library.
 
-## 🎯 Requirements Clarification
+We will design card enrollment and management, an ordinary user-confirmed
+app/web checkout, payment recovery, and transaction history. Contactless
+payment is a separate edge integration through a device and terminal; it
+is not an HTTP request from a React wallet for every physical tap.
 
-### Functional Requirements
-1. **Card Provisioning**: Add cards with tokenization through card networks
-2. **NFC Payment**: Tap-to-pay at contactless terminals
-3. **In-App Payment**: Payment sheet for app/web checkout
-4. **Card Management**: Suspend, remove, set default card
-5. **Transaction History**: View past payments with merchant details
+The merchant should not need access to all the customer's cards. It asks
+for a supported payment capability and receives the information required
+for the authorized purchase.
 
-### Non-Functional Requirements
-1. **Latency**: < 500ms for NFC transaction
-2. **Security**: PCI-DSS compliance, no raw card numbers stored
-3. **Availability**: 99.99% for payment processing
-4. **Offline Resilience**: Show cached cards when offline
+I would exclude transit express modes, person-to-person balances, subscriptions,
+and a new settlement network. Authorization and capture are distinct; a
+receipt saying “authorized” does not establish that settlement occurred.
 
-### Scale Estimates
-- 500M+ Apple Pay users
-- 500M transactions/day
-- 1B+ provisioned cards
+### Functional requirements
 
----
+- Enroll a card on an eligible device, with issuer verification if needed.
+- Display safe card metadata and device-specific availability.
+- Review a fixed merchant, amount, currency, and order version.
+- Authorize through the supported platform integration.
+- Submit one identified attempt and recover its result after interruption.
+- Suspend device credentials and expose confirmation status.
+- Show history and linked refund outcomes to authorized users.
 
-## 🏗️ High-Level Architecture
+### Non-functional requirements
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Browser/Mobile (React Application)                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Views: Wallet │ CardDetail │ Transactions │ AddCard                     │
-│  Components: CardStack, PaymentSheet, TransactionList                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Zustand Store: cards[], transactions[], paymentSheet, auth             │
-├─────────────────────────────────────────────────────────────────────────┤
-│  API Service: fetch wrapper with auth, idempotency keys                 │
-└───────────────────────────────────┬─────────────────────────────────────┘
-                                    │ REST API (JSON)
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Express API Server                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Middleware: cors, session, auth, idempotency, metrics                  │
-├──────────────────┬───────────────────┬──────────────────────────────────┤
-│  cards.ts        │  payments.ts      │  transactions.ts                 │
-│  • provision     │  • nfc            │  • list                          │
-│  • suspend       │  • in-app         │  • detail                        │
-│  • remove        │  • cryptogram     │                                  │
-├──────────────────┴───────────────────┴──────────────────────────────────┤
-│  Services: NetworkClient, TokenLifecycle, CircuitBreaker                │
-└──────────────────────────┬──────────────────────────────────────────────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         ▼                 ▼                 ▼
-┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-│    Valkey     │  │  PostgreSQL   │  │ Card Networks │
-│  (Cache +     │  │   (Source     │  │    (TSPs)     │
-│  Idempotency) │  │   of Truth)   │  │               │
-└───────────────┘  └───────────────┘  └───────────────┘
-```
+| Concern | Proposed target or invariant |
+|---------|------------------------------|
+| Local UI | Selection feedback within 100 ms |
+| Owned APIs | p99 under 200 ms, excluding external/human waits |
+| Checkout deadline | Illustrative two seconds before a pending-recovery state |
+| Availability | 99.99% for owned orchestration, separate from issuer acceptance |
+| Correctness | One durable attempt per intended purchase operation |
+| Privacy | Credentials do not enter ordinary display caches or analytics |
+| Recovery | Reload and retry refer to the same unresolved operation |
+| Accessibility | Complete review, authorization, pending, and result paths |
 
----
+A physical terminal's radio exchange and its final issuer decision have
+different latency boundaries. I would avoid promising that every purchase
+completes in 500 ms merely because a UI animation does.
 
-## 🗄️ Data Model
+For capacity planning, assume 100 million daily authorizations at the
+processor boundary: about 1,160 per second average, 11,600 at a tenfold peak.
+At about 1 KB each, that is 100 GB/day raw before indexes and replication.
+These are interview assumptions, not measured traffic from Apple or this app.
 
-### Database Schema
+## 🏗️ Architecture I would draw
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              users                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  id           UUID PRIMARY KEY                                           │
-│  email        VARCHAR(255) UNIQUE NOT NULL                               │
-│  password_hash VARCHAR(255) NOT NULL                                     │
-│  created_at   TIMESTAMPTZ DEFAULT NOW()                                  │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    │ 1:N
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         provisioned_cards                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  id            UUID PRIMARY KEY                                          │
-│  user_id       UUID NOT NULL REFERENCES users(id)                        │
-│  device_id     UUID NOT NULL                                             │
-│  token_ref     VARCHAR(100) NOT NULL  ──▶ Network token reference        │
-│  network       VARCHAR(20) NOT NULL   ──▶ visa, mastercard, amex         │
-│  last4         VARCHAR(4) NOT NULL    ──▶ Display only                   │
-│  card_type     VARCHAR(20)            ──▶ credit, debit                  │
-│  card_art_url  VARCHAR(500)           ──▶ Card image URL                 │
-│  status        VARCHAR(20) DEFAULT 'active'                              │
-│  is_default    BOOLEAN DEFAULT FALSE                                     │
-│  suspended_at  TIMESTAMPTZ                                               │
-│  suspend_reason VARCHAR(100)                                             │
-│  provisioned_at TIMESTAMPTZ DEFAULT NOW()                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  INDEX idx_cards_user ON (user_id)                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    │ 1:N (via token_ref)
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            transactions                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│  id               UUID PRIMARY KEY                                       │
-│  token_ref        VARCHAR(100) NOT NULL  ──▶ Links to card token         │
-│  merchant_name    VARCHAR(200)                                           │
-│  merchant_category VARCHAR(10)           ──▶ MCC code                    │
-│  amount           DECIMAL(12,2) NOT NULL                                 │
-│  currency         VARCHAR(3) NOT NULL                                    │
-│  status           VARCHAR(20) NOT NULL   ──▶ approved, declined, pending │
-│  auth_code        VARCHAR(20)                                            │
-│  transaction_type VARCHAR(20)            ──▶ nfc, in_app, web            │
-│  created_at       TIMESTAMPTZ DEFAULT NOW()                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│  INDEX idx_transactions_token ON (token_ref, created_at DESC)            │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Wallet / checkout UI     │───────▶│ Wallet API               │
+│ Reviewed intent          │        │ Enrollment / lifecycle   │
+└────────────┬─────────────┘        └────────────┬─────────────┘
+             ▼                                   ▼
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Platform / device        │        │ Token authority          │
+│ Credential handoff       │        │ Enroll / revoke          │
+└────────────┬─────────────┘        └──────────────────────────┘
+             ▼
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Merchant / processor     │───────▶│ Network / issuer         │
+│ Durable payment attempt  │        │ Authorization outcome    │
+└──────────────────────────┘        └──────────────────────────┘
 ```
 
-### Shared Type Interfaces
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Card Interface (Frontend + Backend)                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  id: string                                                              │
-│  userId: string                                                          │
-│  deviceId: string                                                        │
-│  tokenRef: string                                                        │
-│  network: 'visa' | 'mastercard' | 'amex'                                 │
-│  last4: string                                                           │
-│  cardType: 'credit' | 'debit'                                            │
-│  cardArtUrl?: string                                                     │
-│  status: 'active' | 'suspended'                                          │
-│  isDefault: boolean                                                      │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                  Transaction Interface (Frontend + Backend)              │
-├─────────────────────────────────────────────────────────────────────────┤
-│  id: string                                                              │
-│  merchantName: string                                                    │
-│  merchantCategory: string                                                │
-│  amount: number                                                          │
-│  currency: string                                                        │
-│  status: 'approved' | 'declined' | 'pending'                             │
-│  transactionType: 'nfc' | 'in_app' | 'web'                               │
-│  createdAt: string                                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│              PaymentRequest / PaymentResult (API Contract)               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  PaymentRequest:                                                         │
-│  ├── amount: number                                                      │
-│  ├── currency: string                                                    │
-│  ├── merchantId: string                                                  │
-│  └── merchantName: string                                                │
-│                                                                          │
-│  PaymentResult:                                                          │
-│  ├── approved: boolean                                                   │
-│  ├── authCode?: string                                                   │
-│  ├── network: string                                                     │
-│  └── transactionId: string                                               │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔐 Card Provisioning Flow (Full Stack)
-
-### Frontend: Add Card Form
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      AddCardFlow Component                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  State:                                                                  │
-│  ├── step: 'input' | 'verify' | 'complete'                               │
-│  ├── cardData: CardInput | null                                          │
-│  └── verificationMethods: string[]                                       │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │                        Step Flow                                     ││
-│  │                                                                      ││
-│  │  ┌─────────┐      ┌─────────┐      ┌──────────┐                      ││
-│  │  │  input  │─────▶│  verify │─────▶│ complete │                      ││
-│  │  └─────────┘      └─────────┘      └──────────┘                      ││
-│  │       │                │                │                            ││
-│  │       ▼                ▼                ▼                            ││
-│  │  CardInputForm   VerificationStep  SuccessScreen                     ││
-│  │                                                                      ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│                                                                          │
-│  handleSubmit(data):                                                     │
-│  ├── setCardData(data)                                                   │
-│  ├── result = await api.provisionCard({ pan, expiry, cvv })              │
-│  ├── if result.status === 'verification_required':                       │
-│  │       setVerificationMethods(result.methods)                          │
-│  │       setStep('verify')                                               │
-│  └── else if result.status === 'success':                                │
-│          addCard(result.card)                                            │
-│          setStep('complete')                                             │
-│                                                                          │
-│  handleVerification(method, code):                                       │
-│  ├── result = await api.completeVerification(...)                        │
-│  └── if result.success:                                                  │
-│          addCard(result.card)                                            │
-│          setStep('complete')                                             │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Backend: Provisioning Endpoint
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    POST /api/cards  (Provisioning)                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Middleware: idempotencyMiddleware                                       │
-│                                                                          │
-│  Step 1: Identify card network from BIN                                  │
-│  ────────────────────────────────────────                                │
-│  network = identifyNetwork(pan)  ──▶ visa, mastercard, amex              │
-│                                                                          │
-│  Step 2: Encrypt PAN for network                                         │
-│  ────────────────────────────────────────                                │
-│  encryptedPAN = await encryptForNetwork(pan, network)                    │
-│                                                                          │
-│  Step 3: Request token from network's TSP                                │
-│  ────────────────────────────────────────                                │
-│  tokenResponse = await circuitBreaker.execute(                           │
-│      network,                                                            │
-│      () => networkClient[network].requestToken({                         │
-│          encryptedPAN, expiry, cvv, deviceId, walletId                   │
-│      })                                                                  │
-│  )                                                                       │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │  if tokenResponse.requiresVerification:                              ││
-│  │      return { status: 'verification_required', methods: [...] }      ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│                                                                          │
-│  Step 4: Store token reference (NOT the PAN)                             │
-│  ────────────────────────────────────────                                │
-│  INSERT INTO provisioned_cards                                           │
-│      (user_id, device_id, token_ref, network, last4, card_type, ...)     │
-│                                                                          │
-│  Step 5: Invalidate user's card cache                                    │
-│  ────────────────────────────────────────                                │
-│  redis.del(`cards:${userId}`)                                            │
-│                                                                          │
-│  Return: { status: 'success', card: {...} }                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 💳 Payment Processing (Full Stack)
-
-### Frontend: Payment Sheet
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      PaymentSheet Component                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Props from Store:                                                       │
-│  ├── isPaymentSheetOpen                                                  │
-│  ├── paymentRequest: { amount, currency, merchantId, merchantName }      │
-│  ├── selectedCardId                                                      │
-│  └── cards[]                                                             │
-│                                                                          │
-│  Local State:                                                            │
-│  └── authState: 'idle' | 'authenticating' | 'success' | 'error'          │
-│                                                                          │
-│  handlePayment():                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │  1. setAuthState('authenticating')                                   ││
-│  │                                                                      ││
-│  │  2. authenticated = await requestBiometricAuth()                     ││
-│  │     if !authenticated: setAuthState('error'), return                 ││
-│  │                                                                      ││
-│  │  3. Generate idempotency key:                                        ││
-│  │     idempotencyKey = `pay-${merchantId}-${Date.now()}`               ││
-│  │                                                                      ││
-│  │  4. result = await api.processPayment(                               ││
-│  │         { cardId, amount, currency, merchantId },                    ││
-│  │         { idempotencyKey }                                           ││
-│  │     )                                                                ││
-│  │                                                                      ││
-│  │  5. if result.approved:                                              ││
-│  │         setAuthState('success')                                      ││
-│  │         addTransaction(result.transaction)  ──▶ Optimistic update    ││
-│  │         setTimeout(closePaymentSheet, 1500)                          ││
-│  │     else:                                                            ││
-│  │         setAuthState('error')                                        ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│                                                                          │
-│  Render:                                                                 │
-│  ├── PaymentHeader (merchant name)                                       │
-│  ├── AmountDisplay (amount, currency)                                    │
-│  ├── CardSelector (active cards dropdown)                                │
-│  └── PaymentButton (state-aware, FaceID icon)                            │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Backend: Payment Endpoint
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   POST /api/payments/in-app                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Middleware: idempotencyMiddleware                                       │
-│                                                                          │
-│  Step 1: Get card and verify ownership                                   │
-│  ────────────────────────────────────────                                │
-│  SELECT * FROM provisioned_cards                                         │
-│  WHERE id = $cardId AND user_id = $userId AND status = 'active'          │
-│                                                                          │
-│  if no rows: return 404 'Card not found or inactive'                     │
-│                                                                          │
-│  Step 2: Generate cryptogram                                             │
-│  ────────────────────────────────────────                                │
-│  cryptogram = generateCryptogram({                                       │
-│      tokenRef: card.token_ref,                                           │
-│      amount,                                                             │
-│      merchantId                                                          │
-│  })                                                                      │
-│  ──▶ Simulated; real implementation uses Secure Element                  │
-│                                                                          │
-│  Step 3: Process with card network (circuit breaker)                     │
-│  ────────────────────────────────────────                                │
-│  authResult = await circuitBreaker.execute(                              │
-│      card.network,                                                       │
-│      () => networkClient[card.network].authorize({                       │
-│          token: card.token_ref,                                          │
-│          cryptogram: cryptogram.value,                                   │
-│          atc: cryptogram.atc,                                            │
-│          amount, currency, merchantId                                    │
-│      }),                                                                 │
-│      fallback: () => ({ approved: false, reason: 'Network unavailable' })│
-│  )                                                                       │
-│                                                                          │
-│  Step 4: Record transaction                                              │
-│  ────────────────────────────────────────                                │
-│  INSERT INTO transactions                                                │
-│      (token_ref, merchant_name, amount, currency, status, auth_code,     │
-│       transaction_type='in_app')                                         │
-│                                                                          │
-│  Step 5: Audit log                                                       │
-│  ────────────────────────────────────────                                │
-│  await auditLog({                                                        │
-│      userId, action: 'payment.approved' | 'payment.declined',            │
-│      resourceType: 'transaction', resourceId, metadata                   │
-│  })                                                                      │
-│                                                                          │
-│  Return: { approved, authCode, transaction }                             │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔄 Token Lifecycle Management
-
-### Frontend: Card Management
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      CardActions Component                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Props: card                                                             │
-│  Store: suspendCard(), removeCard()                                      │
-│                                                                          │
-│  handleSuspend():                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │  confirmed = await showConfirm('Suspend this card?')                 ││
-│  │  if !confirmed: return                                               ││
-│  │                                                                      ││
-│  │  await api.suspendCard(card.id)                                      ││
-│  │  suspendCard(card.id)  ──▶ Update local store                        ││
-│  │  showToast('Card suspended')                                         ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│                                                                          │
-│  handleRemove():                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐│
-│  │  confirmed = await showConfirm('Remove this card permanently?')      ││
-│  │  if !confirmed: return                                               ││
-│  │                                                                      ││
-│  │  await api.removeCard(card.id)                                       ││
-│  │  removeCard(card.id)  ──▶ Update local store                         ││
-│  │  showToast('Card removed')                                           ││
-│  └─────────────────────────────────────────────────────────────────────┘│
-│                                                                          │
-│  Render (conditional):                                                   │
-│  ├── if status === 'active':  [Suspend Card] button (yellow)            │
-│  ├── if status === 'suspended': [Reactivate Card] button (green)        │
-│  └── [Remove Card] button (red)                                          │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Backend: Token Lifecycle Service
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     TokenLifecycleService                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  suspendCard(userId, cardId, reason):                                    │
-│  ────────────────────────────────────────                                │
-│  1. card = await getCard(userId, cardId)                                 │
-│                                                                          │
-│  2. await networkClient[card.network].suspendToken(card.tokenRef, reason)│
-│     ──▶ Notify card network to block transactions                        │
-│                                                                          │
-│  3. UPDATE provisioned_cards                                             │
-│     SET status = 'suspended',                                            │
-│         suspended_at = NOW(),                                            │
-│         suspend_reason = reason                                          │
-│     WHERE id = cardId AND user_id = userId                               │
-│                                                                          │
-│  4. redis.del(`token:${card.tokenRef}`)                                  │
-│     redis.del(`cards:${userId}`)                                         │
-│     ──▶ Invalidate caches                                                │
-│                                                                          │
-│  5. await auditLog({                                                     │
-│         userId, action: 'card.suspended', resourceType: 'card',          │
-│         resourceId: cardId, metadata: { reason }                         │
-│     })                                                                   │
-│                                                                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  handleDeviceLost(userId, deviceId):                                     │
-│  ────────────────────────────────────────                                │
-│  1. SELECT * FROM provisioned_cards                                      │
-│     WHERE user_id = userId AND device_id = deviceId AND status = 'active'│
-│                                                                          │
-│  2. for each card:                                                       │
-│         await suspendCard(userId, card.id, 'device_lost')                │
-│                                                                          │
-│  3. return { suspendedCount: cards.length }                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📡 API Design
-
-### RESTful Endpoints
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          API Endpoints                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Authentication:                                                         │
-│  POST   /api/auth/login            ──▶ Create session                    │
-│  POST   /api/auth/logout           ──▶ Destroy session                   │
-│  GET    /api/auth/me               ──▶ Get current user                  │
-│                                                                          │
-│  Cards:                                                                  │
-│  GET    /api/cards                 ──▶ List user's cards                 │
-│  POST   /api/cards                 ──▶ Provision new card (idempotent)   │
-│  DELETE /api/cards/:id             ──▶ Remove card                       │
-│  POST   /api/cards/:id/suspend     ──▶ Suspend card                      │
-│  POST   /api/cards/:id/reactivate  ──▶ Reactivate card                   │
-│  PUT    /api/cards/:id/default     ──▶ Set as default                    │
-│                                                                          │
-│  Payments:                                                               │
-│  POST   /api/payments/in-app       ──▶ Process in-app payment (idempotent)│
-│                                                                          │
-│  Transactions:                                                           │
-│  GET    /api/transactions          ──▶ List transactions (paginated)     │
-│  GET    /api/transactions/:id      ──▶ Get transaction detail            │
-│                                                                          │
-│  Devices:                                                                │
-│  POST   /api/devices/:id/lost      ──▶ Mark device as lost               │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### API Client with Idempotency
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Frontend API Service                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  provisionCard(data):                                                    │
-│  ────────────────────────────────────────                                │
-│  idempotencyKey = `provision-${data.pan.slice(-4)}-${Date.now()}`        │
-│                                                                          │
-│  fetch('/api/cards', {                                                   │
-│      method: 'POST',                                                     │
-│      headers: {                                                          │
-│          'Content-Type': 'application/json',                             │
-│          'Idempotency-Key': idempotencyKey                               │
-│      },                                                                  │
-│      credentials: 'include',                                             │
-│      body: JSON.stringify(data)                                          │
-│  })                                                                      │
-│                                                                          │
-│  processPayment(data, { idempotencyKey }):                               │
-│  ────────────────────────────────────────                                │
-│  fetch('/api/payments/in-app', {                                         │
-│      method: 'POST',                                                     │
-│      headers: {                                                          │
-│          'Content-Type': 'application/json',                             │
-│          'Idempotency-Key': idempotencyKey                               │
-│      },                                                                  │
-│      credentials: 'include',                                             │
-│      body: JSON.stringify(data)                                          │
-│  })                                                                      │
-│                                                                          │
-│  Purpose: Prevent duplicate card provisioning or payment processing      │
-│  if user retries due to network timeout or UI double-click              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔒 Session & Authentication
-
-### Backend Configuration
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Express Session Setup                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Session Store: RedisStore (Valkey)                                      │
-│                                                                          │
-│  Configuration:                                                          │
-│  ├── secret: process.env.SESSION_SECRET                                  │
-│  ├── resave: false                                                       │
-│  ├── saveUninitialized: false                                            │
-│  └── cookie:                                                             │
-│      ├── maxAge: 7 days (7 * 24 * 60 * 60 * 1000)                        │
-│      ├── httpOnly: true   ──▶ Prevents XSS access                        │
-│      ├── secure: true (production)  ──▶ HTTPS only                       │
-│      └── sameSite: 'lax'  ──▶ CSRF protection                            │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Frontend Auth State
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      AuthStore (Zustand)                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  State:                                                                  │
-│  ├── user: User | null                                                   │
-│  ├── isAuthenticated: boolean                                            │
-│  └── isLoading: boolean                                                  │
-│                                                                          │
-│  Actions:                                                                │
-│  ├── login({ email, password }):                                         │
-│  │       user = await api.login(email, password)                         │
-│  │       set({ user, isAuthenticated: true })                            │
-│  │                                                                       │
-│  └── logout():                                                           │
-│          await api.logout()                                              │
-│          set({ user: null, isAuthenticated: false })                     │
-│          useWalletStore.getState().clear()  ──▶ Clear card data          │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 💾 Caching Strategy
-
-### Cache Layers
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          Caching Architecture                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Layer 1: Frontend (Zustand + localStorage)                              │
-│  ────────────────────────────────────────                                │
-│  ├── cards[]         ──▶ Full offline access                             │
-│  ├── transactions[]  ──▶ Last 50 cached                                  │
-│  └── Purpose: Offline resilience, instant app load                       │
-│                                                                          │
-│                              │                                           │
-│                              ▼                                           │
-│                                                                          │
-│  Layer 2: Backend Cache (Valkey/Redis)                                   │
-│  ────────────────────────────────────────                                │
-│  ├── token:${tokenRef}   ──▶ 5 min TTL (token lookups)                   │
-│  ├── cards:${userId}     ──▶ 2 min TTL (user's card list)                │
-│  ├── idempotency:${key}  ──▶ 24h TTL (duplicate prevention)              │
-│  └── sessions:${sid}     ──▶ 7 day TTL (user sessions)                   │
-│                                                                          │
-│                              │                                           │
-│                              ▼                                           │
-│                                                                          │
-│  Layer 3: PostgreSQL (Source of Truth)                                   │
-│  ────────────────────────────────────────                                │
-│  ├── provisioned_cards                                                   │
-│  ├── transactions                                                        │
-│  └── users                                                               │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Cache Invalidation
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Cache Invalidation Triggers                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Event                         │  Invalidation Action                    │
-│  ──────────────────────────────┼────────────────────────────────────────│
-│  Card provisioned              │  DEL cards:${userId}                    │
-│  Card suspended/reactivated    │  DEL cards:${userId}                    │
-│                                │  DEL token:${tokenRef}                  │
-│  Card removed                  │  DEL cards:${userId}                    │
-│                                │  DEL token:${tokenRef}                  │
-│  Device marked lost            │  DEL cards:${userId}                    │
-│                                │  DEL token:${tokenRef} for each card    │
-│  User logout                   │  DEL session:${sessionId}               │
-│                                │  (wallet store cleared on frontend)     │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## ⚖️ Deep Trade-off Analysis
-
-### Trade-off 1: Idempotency Keys vs Optimistic Locking
-
-**Why Idempotency Keys Work for Payment APIs:**
-
-Payment operations are inherently non-idempotent - charging a card twice is a critical bug, not a minor inconvenience. The idempotency key pattern solves network unreliability: if a client sends a payment request and the connection drops before receiving the response, they can't know if the payment succeeded. Retrying without protection could result in double charges.
-
-With idempotency keys, the backend stores the request hash and result in Redis with 24-hour TTL. When the same key arrives again, we return the cached result instead of processing again. The key generation happens client-side (`pay-${merchantId}-${Date.now()}`) ensuring the client controls when retries are safe.
-
-The frontend generates keys at request time rather than having the backend generate them - this is intentional. The client knows when the user genuinely wants a new transaction (new click) versus when they're retrying a failed request (same intent, network issue). Server-generated keys would require the server to distinguish between "user clicked twice" and "network retry" - information only the client has.
-
-**Why Optimistic Locking Falls Short:**
-
-Optimistic locking (version columns, ETags) protects against concurrent modifications to the same resource but doesn't prevent duplicate operations creating new resources. When provisioning a card, there's no existing row to version-check - we're creating new data. A retry would create another card token, even with perfect optimistic locking on the user's card list.
-
-Database-level constraints (unique on tokenRef) catch some duplicates, but the token comes from the external network TSP - by the time we'd detect the duplicate, we've already requested two tokens from Visa. The idempotency check must happen before network calls, not after database insertion.
-
----
-
-### Trade-off 2: Circuit Breaker per Network vs Global Fallback
-
-**Why Per-Network Circuit Breakers Work:**
-
-Each card network (Visa, Mastercard, Amex) operates independently. If Visa's TSP is experiencing issues, we should fail Visa card operations quickly while continuing to serve Mastercard payments normally. A global circuit breaker would take down all payment processing when one network has problems.
-
-The per-network approach uses the network identifier as the circuit key. When Visa's failure rate exceeds threshold, only the Visa circuit opens - returning immediate failures for Visa cards while Mastercard continues working. Users with multiple cards can simply select a working one.
-
-The fallback function returns `{ approved: false, reason: 'Network temporarily unavailable' }` rather than throwing. This lets the frontend show a meaningful message and offer the card selector, enabling the user to try a different card. Hard failures would crash the payment sheet entirely.
-
-**Why Global Fallback Would Fail:**
-
-A global "payment service" circuit breaker would have simpler code but worse user experience. If any network fails too often, all payments stop. This violates isolation - an infrastructure principle stating that unrelated failures shouldn't cascade. Visa's problems have nothing to do with Mastercard's infrastructure.
-
-The complexity cost of per-network breakers is additional Redis keys and configuration (`circuit:visa`, `circuit:mastercard`, `circuit:amex`), but this is minimal compared to the availability benefit. In production, network issues are common - rate limiting, maintenance windows, regional outages. Per-network isolation means these only affect the specific network's cards.
-
----
-
-### Trade-off 3: Session Storage vs JWT for Payment Authentication
-
-**Why Session Storage Works for Wallet Apps:**
-
-Payment applications need the ability to immediately revoke access - if a user's device is stolen, they call customer service and expect instant protection. Session-based auth with Redis enables this: deleting the session key immediately invalidates access, effective on the very next request.
-
-The session ID is stored in an httpOnly cookie, preventing JavaScript access and eliminating XSS token theft. The actual session data (userId, deviceId, permissions) lives in Redis server-side, not exposed to the client. When the user marks their device as lost, we can invalidate all sessions for that device by scanning Redis keys.
-
-For payment apps specifically, we also need to track which sessions have completed device verification. This mutable session state (isDeviceVerified, biometricEnrolled) is easy with server-side sessions - just update the Redis hash. With JWT, you'd need to issue new tokens whenever session state changes.
-
-**Why JWT Would Cause Security Challenges:**
-
-JWT tokens are stateless - once issued, they're valid until expiration. Revoking a JWT before expiry requires maintaining a blocklist, which negates the statelessness benefit. For a wallet app where instant revocation is critical (lost device scenario), you'd need Redis for the blocklist anyway, so you've gained nothing over sessions.
-
-JWT's typical 15-minute access token + refresh token pattern means stolen tokens grant 15 minutes of unauthorized access. For social media, this might be acceptable; for payment authorization, it's not. The refresh token dance also adds complexity: refresh endpoint implementation, secure refresh token storage, token rotation.
-
-The "stateless scaling" benefit of JWT matters less when you already need Redis for caching, rate limiting, and idempotency. Adding session storage to existing Redis infrastructure is trivial compared to implementing secure JWT revocation.
-
----
-
-## ✅ Trade-offs Summary
-
-| Decision | Pros | Cons |
-|----------|------|------|
-| Zustand + persist | Offline card viewing | Manual sync on reconnect |
-| Idempotency middleware | Safe retries | Redis dependency |
-| Circuit breaker per network | Isolated failures | Configuration complexity |
-| Serializable transactions | Financial accuracy | Lower throughput |
-| Card network tokens | Security | Integration complexity |
-| Optimistic UI updates | Instant feedback | Rollback needed on error |
-
----
-
-## 📈 Scalability Path
-
-### Current: Single Server
-
-```
-┌──────────┐     ┌───────────────────┐     ┌─────────────────┐
-│ Browser  │────▶│ Express (Node.js) │────▶│ PostgreSQL      │
-└──────────┘     └───────────────────┘     │ + Valkey        │
-                          │                └─────────────────┘
-                          │
-                          ▼
-                 ┌───────────────────┐
-                 │   Card Networks   │
-                 │   (Visa/MC/Amex)  │
-                 └───────────────────┘
-```
-
-### Future: Scaled
-
-```
-┌──────────┐     ┌─────────┐     ┌────────────────┐     ┌─────────────────┐
-│ Browser  │────▶│   CDN   │────▶│ Load Balancer  │────▶│ Express (N×)    │
-└──────────┘     │ (static)│     └────────────────┘     └─────────────────┘
-                 └─────────┘                                     │
-                                                   ┌─────────────┼─────────────┐
-                                                   ▼             ▼             ▼
-                                           ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-                                           │ Read Replicas│ │Valkey Cluster│ │ Card Networks│
-                                           └─────────────┘ └─────────────┘ └─────────────┘
-                                                   │
-                                                   ▼
-                                           ┌─────────────────────┐
-                                           │ PostgreSQL (Primary)│
-                                           │ + Sharding by userId │
-                                           └─────────────────────┘
-```
-
----
-
-## 🚀 Future Enhancements
-
-1. **Real-time Updates**: WebSocket for transaction notifications
-2. **Multi-Region**: Active-active for global availability
-3. **Fraud Detection**: ML-based transaction scoring
-4. **Apple Watch**: Companion app for wrist payments
-5. **Recurring Payments**: Subscription management
+The diagram separates who owns credentials from who owns the order. It
+compresses platform-specific handoffs rather than claiming every arrow is
+a direct browser call. App/web payment credentials have a different handoff
+from contactless transactions. [Apple's description of payment flows](https://support.apple.com/en-euro/guide/security/secfbd5c0e54/web).
+
+The wallet API stores user/device associations, token metadata, and lifecycle
+operations. The merchant/processor stores checkout attempts and external
+references. PostgreSQL suits their local relationships and short atomic
+transitions. Redis is useful for display caches and response acceleration.
+
+Committed events pass through durable outboxes to history and notifications.
+Those projections can lag briefly without putting a message broker between
+every card-selection click and its visual feedback.
+
+### State ownership across the stack
+
+| Fact | Authority | Client treatment |
+|------|-----------|------------------|
+| Selected card | Current interaction | Update locally by stable ID |
+| Order amount and currency | Merchant server | Display a versioned snapshot |
+| Token activation | Token authority, reflected by wallet | Refresh metadata; do not infer from a card image |
+| User's payment intent | Supported platform confirmation | Track the matching interaction |
+| Payment outcome | Durable processor/provider operation | Render pending or conclusive result |
+| History list | Authorized projection | Cache/page with freshness context |
+
+React components render facts and collect intent. A shared interaction
+controller owns the active checkout, operation reference, and asynchronous
+transitions. Query state holds server data; sensitive entry fields remain
+isolated from persisted application stores.
+
+### API contracts, not handler implementations
+
+These are proposed resources, not a listing of the repository's endpoints.
+
+| Method | Resource | Purpose |
+|--------|----------|---------|
+| POST | `/wallet/enrollments` | Begin an identified card/device enrollment |
+| GET | `/wallet/enrollments/:id` | Resume verification/activation state |
+| GET | `/wallet/cards` | Authorized display-safe metadata |
+| POST | `/wallet/devices/:id/suspensions` | Request and track device-scoped revocation |
+| POST | `/merchant/checkouts` | Create a checkout with authoritative total |
+| POST | `/merchant/checkouts/:id/attempts` | Submit one identified payment attempt |
+| GET | `/merchant/payment-operations/:id` | Recover its current outcome |
+| GET | `/wallet/transactions` | Page authorized history |
+| POST | `/merchant/payments/:id/refunds` | Create a linked refund operation |
+
+Every operation result requires the appropriate actor's authorization. An
+opaque ID or a route containing a merchant ID is not an access-control rule.
+
+## 🔧 Deep dive 1: one checkout from review to submission
+
+### Decision
+
+I would freeze the reviewed checkout version and bind one operation identity
+to it. A user may edit an order before confirming, but asynchronous callbacks
+cannot quietly substitute a different amount after confirmation begins.
+
+> “The frontend and backend need to agree on what the person said yes to.
+> A biometric success alone is not an approval to charge any current value
+> in an editable amount field.”
+
+### Walk through a $24.99 purchase
+
+1. The merchant persists a checkout for $24.99 with currency and order version.
+2. The client displays those values and eligible payment choices.
+3. The user starts confirmation; the controller captures that exact intent.
+4. The supported platform flow produces the permitted credential handoff.
+5. The merchant validates the order version and claims the payment attempt.
+6. The processor submits the attempt using a stable external reference.
+7. The client displays the operation's authoritative status.
+
+If shipping or tax changes, the merchant increments the order version and
+requires a renewed review of the new total. A stale client cannot insist on
+an old price by posting its own amount.
+
+Currency formatting is presentation; the server validates the underlying
+amount and supported currency precision. A three-character string and a
+positive floating-point number are not a sufficient financial contract.
+
+### One controller owns the interaction
+
+I would use explicit states: reviewing, authorizing, submitting, pending,
+approved, declined, and cancelled-before-submission. A few clear transitions
+are easier to reason about than multiple independent loading flags.
+
+Each asynchronous callback includes the interaction identity. If the user
+closes an enrollment modal or changes checkout, an old callback is ignored.
+Cancelling a local animation does not cancel an authorization already sent
+to a provider.
+
+The Pay button is disabled during active confirmation and submission. That
+improves the experience, while server operation identity protects other tabs,
+transport retries, and calls from clients that do not obey that button.
+
+### Bind the client and server with operation identity
+
+The operation key must exist before the first potentially ambiguous request.
+The client or server may generate it, provided retries retain it and the
+server associates it with the authenticated actor and canonical intent.
+
+A key generated on every fetch describes transport attempts, not user intent.
+A key derived only from amount and merchant confuses separate legitimate
+purchases. I would use an opaque unique identity and a separate fingerprint
+of the validated request.
+
+Reusing that key with changed input produces a conflict. Retrying the same
+operation returns its existing state. The client retains the reference across
+reloads without persisting the payment credential itself.
+
+### Trade-off and alternative
+
+| Approach | Benefit | Failure or cost |
+|----------|---------|-----------------|
+| ✅ Versioned checkout and stable operation | Preserves reviewed intent across retries | More explicit state and contracts |
+| ❌ Read mutable form state when a callback ends | Less coordination code | May submit a different amount/card than reviewed |
+| ❌ Disable Pay as the only protection | Easy local double-click prevention | Does not cover retries or multiple clients |
+
+The chosen design requires tests for late callbacks and order changes. I
+would accept that work because it protects the interface's most important
+statement: which purchase the customer actually confirmed.
+
+## 🔧 Deep dive 2: recover an outcome without inventing certainty
+
+### Decision
+
+The server persists a durable attempt before external submission, and the
+client treats an ambiguous timeout as pending. Both sides recover the same
+operation rather than create a new one after any exception.
+
+Imagine the issuer approves $24.99, then the response disappears. The client
+cannot tell whether the request failed before submission or after approval.
+A red banner saying “Declined” would communicate information we do not have.
+
+### Server preparation and recovery
+
+The processor creates an attempt with actor, checkout, key, request
+fingerprint, provider reference, and current state. A unique constraint
+serializes competing claims for that identity.
+
+It commits that preparation before making the external request. Short
+transactions update local state; none remain open while a provider is slow.
+A worker lease coordinates execution but does not erase the operation when
+its timeout expires.
+
+The external integration needs a safe retry or status-lookup contract using
+the stable reference. If the provider accepted a request, a process restart
+must find that result instead of creating another authorization.
+
+When the result is conclusive, update the attempt and append an outbox event
+in one commit. History and notifications consume events with deduplication.
+The checkout's final business state follows the appropriate authorization or
+capture rule; the browser is not the source of truth.
+
+### Client recovery
+
+| Situation | What the interface does |
+|-----------|-------------------------|
+| Rejected before provider submission | Shows a correction or a clear non-submission error |
+| Provider conclusively declined | Shows a decline and permitted next action |
+| Submission may have happened | Shows pending and checks the operation |
+| User reloads while pending | Restores the reference and queries authorized status |
+| Approval arrives after a delay | Shows the same receipt and refreshes history |
+
+I would poll pending operations with backoff or use a notification to prompt
+a status refresh. A push event can be duplicated or delayed; the durable
+status endpoint remains authoritative.
+
+The user should not be encouraged to switch cards automatically while the
+first attempt is unresolved. The merchant may need to cancel or reconcile
+that attempt before accepting a replacement.
+
+### Why a cache cannot settle the question
+
+A Redis record with a 24-hour TTL can accelerate successful retries. It
+cannot prove that a payment failed when the key is absent. The key might
+have been evicted, expired, or never written after a successful SQL insert.
+
+A short lock has the same limitation. Its expiry tells us that the local
+worker may need recovery, not that a remote issuer did nothing. Late workers
+also need fencing or conditional state transitions so they cannot overwrite
+newer results.
+
+We can aim for one externally effective operation when the provider contract
+supports it. We should not claim universal exactly-once behavior across an
+arbitrary remote service merely because local SQL transactions are serializable.
+
+### A separate replay boundary
+
+Credential replay protection belongs to the payment scheme. Apple describes
+cryptograms computed using a key and transaction counter, plus additional
+scheme-dependent data. Our HTTP key identifies a merchant operation; it does
+not replace credential validation. [Apple authorization reference](https://support.apple.com/guide/security/payment-authorization-with-apple-pay-secc1f57e189/web).
+
+A legitimate retry reads a previously authorized operation result. It should
+not generate another cryptogram or another provider authorization just to
+reconstruct the answer.
+
+### What we give up
+
+The pending state is less immediately satisfying than a green or red banner.
+We also need recovery workers, provider references, and support visibility.
+Those costs preserve truthful behavior when a system cannot know the answer
+within the user's initial wait budget.
+
+## 🔧 Deep dive 3: device lifecycle and privacy meet in the UI
+
+### Decision
+
+I would model each device's credential association explicitly and distinguish
+requested lifecycle changes from confirmed enforcement. Display data is
+cached carefully; payment eligibility remains authoritative elsewhere.
+
+For enrollment, create an operation that can pause for issuer verification.
+The UI displays “verification required” or “activation pending” instead of
+claiming a usable card as soon as metadata is inserted locally.
+
+Card input goes through the approved integration. If a custom form temporarily
+handles sensitive fields, they do not enter localStorage, analytics, query
+strings, or shared wallet state. The form clears them when their required
+lifetime ends.
+
+### One card across several devices
+
+The customer's phone and watch can have distinct credential associations.
+Losing the phone should affect the phone's tokens without disabling the watch.
+That requires separate token identity and lifecycle state, not one shared
+“card active” flag for every device.
+
+Tokenization provides a constrained substitute for the PAN; domain restrictions
+and lifecycle are part of its purpose. A random local identifier has none of
+those guarantees by itself. [EMVCo tokenisation overview](https://www.emvco.com/emv-technologies/payment-tokenisation/).
+
+The wallet can show issuer description, last four digits, network, and device.
+Last four digits alone do not identify a card uniquely and should not be used
+as a backend uniqueness constraint.
+
+### Lost-device workflow
+
+1. The user identifies the device and confirms the affected scope.
+2. The server records a versioned revocation request and blocks local use.
+3. Durable work dispatches lifecycle requests to the token authority.
+4. The UI shows pending status until enforcement is confirmed.
+5. Notifications invalidate cached metadata; refresh recovers missed updates.
+
+An unreachable device or provider does not turn a local update into remote
+enforcement. This is why “requested” is a useful product state, not merely
+an implementation detail.
+
+Out-of-order events must not reactivate a newer suspension. Lifecycle versions
+or an authoritative state refresh resolve ordering. A reader that fetched an
+old active record must not repopulate a stale cache after revocation.
+
+### Privacy across account changes
+
+A client cache has an account owner and an explicit persistence projection.
+Logout clears it and invalidates in-flight requests for that account. A late
+history response must not appear in the next person's session.
+
+I would keep only a small recent display snapshot if the product needs offline
+viewing. Offline card display does not imply offline browser payment. Device
+and scheme-specific payment capabilities remain a separate contract.
+
+A query library or Zustand can help organize state, but neither automatically
+solves account isolation. That is a contract around cache keys, lifecycle,
+response identity, and clearing behavior.
+
+### Refunds continue the same story
+
+A refund has a parent payment, its own operation ID, amount, and pending/final
+status. The UI distinguishes partial from full refund and waits for the
+processor's result.
+
+The backend atomically reserves refundable value against the original captured
+payment. Two concurrent $70 refunds on a $100 payment cannot both reserve
+funds. Uncertain provider outcomes retain the reservation until reconciled.
+
+A negative transaction row is useful for display but does not by itself prove
+that the value invariant or external refund occurred.
+
+### Trade-off
+
+Immediate local selection is appropriate; confirmed activation and revocation
+need evidence. This produces more UI states and lifecycle work than optimistic
+updates everywhere. It also avoids telling the user that a lost payment
+credential is blocked when only the local page has changed.
+
+## 📜 History and rendering
+
+The server exposes a display-safe history projection with cursor pagination
+using time and stable ID. The client fetches a recent page, merges by ID, and
+preserves order when new entries arrive.
+
+After a confirmed payment, show its receipt immediately even if the history
+projection lags. Merge that operation when it appears in the list so users
+do not see two rows for the same purchase.
+
+Virtualize a long retained history when needed, while keeping keyboard focus
+and screen-reader semantics intact. A few wallet cards can remain a simple
+list; a gesture carousel is a product choice rather than a scaling requirement.
+
+## 📈 What breaks first and how I would respond
+
+Provider concurrency and unresolved attempts can grow before CPU saturates.
+Separate provider/workload budgets, deadlines, and circuit breakers prevent
+slow enrollment from consuming authorization resources.
+
+Large history writes need retention tiers, time partitioning, and eventually
+sharding based on measured limits. Preserve operation uniqueness within the
+chosen ownership boundary; a global index that cannot be enforced undermines
+the correctness model.
+
+A regional failover must fence the previous writer and recover provider
+references before new submission. Asynchronous replicas may serve history,
+but stale status cannot prove that an old region never authorized a payment.
+
+For the frontend, measure interaction feedback, page usability, large-list
+rendering, and pending recovery completion. Optimize actual bottlenecks before
+adding broad persistence or an animation framework.
+
+## 🧪 Validation across the boundary
+
+- Drop the response after provider approval and recover the same operation.
+- Retry one intent from two tabs and check the stable external reference.
+- Change checkout version while authorization is pending.
+- Deliver a late callback after cancellation or account change.
+- Process duplicate and out-of-order lifecycle notifications.
+- Race partial refunds against the same remaining balance.
+- Complete review, pending recovery, and receipt navigation with a screen reader.
+
+Track provider latency separately from owned latency, plus unresolved-attempt
+age, outbox lag, revocation acknowledgement delay, and refund conflicts.
+Logs should carry safe operation IDs, not raw payment credentials.
+
+## ⚖️ Trade-offs to summarize aloud
+
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| ✅ Fixed checkout version; ❌ mutable callback inputs | Matches what the user reviewed | Reconfirmation after changes |
+| ✅ Durable operation; ❌ cache-only retry protection | Recovers across crashes | Explicit recovery machinery |
+| ✅ Pending uncertainty; ❌ automatic decline on timeout | Preserves truthful outcome | Longer pending UX |
+| ✅ Device-specific lifecycle; ❌ one global card flag | Narrow lost-device scope | More token associations |
+| ✅ Bounded account cache; ❌ persist all shared state | Limits privacy and stale-data exposure | Careful clearing and merging |
+
+## 🧩 Repository boundary
+
+The local React app and Express server simulate devices, tokens, biometrics,
+and authorization. The server receives PAN/CVV JSON during provisioning,
+generates an unkeyed digest, and records amount-based simulated decisions.
+It has no real platform payment API, cryptogram validation, or provider call.
+
+The browser omits the required idempotency header, so protected card/payment
+flows are currently blocked. The Redis middleware has no durable operation
+record; biometric sessions are reusable; public merchant routes lack ownership
+checks; refund writes are not atomic. Instantiated network breakers are unused
+by the payment handler.
+
+The app's card/history stores are memory-only and not cleared on logout.
+There is no operation recovery, issuer activation workflow, or full accessible
+modal. These are concrete gaps between the teaching simulator and this
+proposal, documented with source references in the [architecture](./architecture.md).

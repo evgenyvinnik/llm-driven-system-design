@@ -1,112 +1,129 @@
-# 20 Forms, 40 Designs
+# 20 Forms, 40+ Designs
 
-A form library comparison playground demonstrating 20 common forms implemented across 41 React design systems with complete CSS isolation using an iframe-based architecture.
+A browser playground for comparing the same form across React component libraries.
+Choose forms and libraries, compare their native controls, and switch between light
+and dark themes. Each preview runs in an iframe so one library's CSS reset does not
+change another library's appearance.
 
-**Live Demo:** [evgenyvinnik.github.io/20forms-20designs](https://evgenyvinnik.github.io/20forms-20designs/)
+This folder contains **documentation only**. Run the application from the
+[implementation repository](https://github.com/evgenyvinnik/20forms-20designs), or
+open the [live demo](https://evgenyvinnik.github.io/20forms-20designs/).
 
-**Source Code:** [github.com/evgenyvinnik/20forms-20designs](https://github.com/evgenyvinnik/20forms-20designs)
+## What the project demonstrates
 
-## Features
+- Multiple form and library selections, with previews grouped by library or form.
+- Twenty form types, including login, registration, checkout, onboarding, and search.
+- Independent library applications, each with its own styles and React root.
+- A theme toggle and a “Light only” indicator for entries marked without dark mode.
+- Comparison preferences saved in local storage and encoded in URL parameters.
+- Links from preview cards to the corresponding form's source code.
+- Static build assembly and deployment to GitHub Pages.
 
-- **820 Form Implementations** - 41 libraries × 20 forms, each in an isolated context
-- **CSS Isolation** - No style conflicts between design systems (iframe-based architecture)
-- **Theme Support** - Light/dark mode toggle for libraries that support theming
-- **Comparison Matrix** - Side-by-side comparison of forms across libraries
-- **Static Deployment** - Fully static, hosted on GitHub Pages
+These are UI demonstrations. Login and checkout forms do not provide authentication
+or payment services; for example, the MUI login handler prevents submission and
+calls a demo alert. There is no application backend or database to configure.
 
-## Architecture Overview
+## Source snapshot and scope
+
+Reviewed on 2026-09-09 against upstream commit
+[`bc34aba`](https://github.com/evgenyvinnik/20forms-20designs/tree/bc34aba76a4cabe9bfe545bc8dccf3689808e482).
+The shell registry has **46 enabled comparison entries**, including the unstyled
+“React + No CSS” baseline, and 20 forms. That permits 920 form/library selections;
+it is a catalog count, not a claim that every combination has passed visual or
+behavioral tests. The source contains 47 app packages: one shell and 46 previews.
+
+The active catalog is defined in
+[apps/shell/src/config.ts](https://github.com/evgenyvinnik/20forms-20designs/blob/bc34aba76a4cabe9bfe545bc8dccf3689808e482/apps/shell/src/config.ts).
+Consult it for current names and theme flags rather than relying on the historical
+“20 Forms, 40 Designs” title or a duplicated library list.
+
+## Architecture overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Shell Application                        │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │           Comparison Matrix UI (React + Vite)            │    │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │    │
-│  │  │ Form Select │  │ Lib Select  │  │ Theme Toggle│       │    │
-│  │  └─────────────┘  └─────────────┘  └─────────────┘       │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                              │                                   │
-│  ┌───────────────────────────▼───────────────────────────────┐  │
-│  │                    Preview Grid                            │  │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │  │
-│  │  │ <iframe> │  │ <iframe> │  │ <iframe> │  │ <iframe> │   │  │
-│  │  │  MUI     │  │  Chakra  │  │  Ant     │  │  ...     │   │  │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                    ▼                ▼                ▼
-        ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-        │   MUI App     │  │  Chakra App   │  │   Ant App     │
-        │ (20 forms)    │  │ (20 forms)    │  │ (20 forms)    │
-        │ Isolated CSS  │  │ Isolated CSS  │  │ Isolated CSS  │
-        └───────────────┘  └───────────────┘  └───────────────┘
+┌──────────────────────────────┐
+│ Shell: selection and grouping│
+│ React + Zustand              │
+└──────────────┬───────────────┘
+               │ iframe URLs + theme messages
+       ┌───────┴────────┐
+       ▼                ▼
+┌─────────────┐  ┌─────────────┐
+│ Library A   │  │ Library B   │
+│ Own document│  │ Own document│
+└─────────────┘  └─────────────┘
 ```
 
-See [architecture.md](./architecture.md) for detailed design documentation.
+Bun workspaces organize the applications; Vite builds them separately. The shell
+uses TypeScript and Zustand, while many preview apps use JavaScript/JSX. The build
+script builds the shell first, then the existing consolidated preview apps using
+up to 14 workers. It assembles their output into one static deployment.
 
-## Forms Implemented
+See [architecture.md](./architecture.md) for source evidence, implementation
+limitations, and a separate production design. The
+[frontend](./system-design-answer-frontend.md),
+[backend/infrastructure](./system-design-answer-backend.md), and
+[fullstack](./system-design-answer-fullstack.md) answers present proposed designs
+for an interview.
 
-1. User registration / sign up
-2. User login / sign in
-3. Password reset / forgot password request
-4. Two-factor authentication code entry
-5. Contact or support inquiry
-6. Newsletter or marketing subscription
-7. Profile information update
-8. Account security and password change
-9. Billing information capture
-10. Shipping address capture
-11. Checkout with payment details
-12. Order tracking lookup
-13. Appointment or booking request
-14. Event registration / RSVP
-15. Job application submission
-16. Customer feedback or satisfaction survey
-17. Support ticket submission
-18. Multi-step onboarding wizard
-19. Advanced search with filters
-20. Privacy, consent, and communication preferences
+## Run the complete comparison locally
 
-## Design System Libraries (41)
-
-MUI, Chakra UI, Ant Design, Arco Design, Ariakit, Atlassian Atlaskit, Base Web, Blueprint, Braid, Carbon, Cloudscape, CoreUI, DaisyUI, Elastic UI, Evergreen, Flowbite React, Fluent UI, Gravity UI, Grommet, Headless UI, Mantine, Material Tailwind, PatternFly, Pinterest Gestalt, PrimeReact, Primer React, Radix UI, React Bootstrap, React Spectrum, RSuite, Salesforce Lightning, Semantic UI React, Semi Design, Shadcn/ui, Shopify Polaris, Tamagui, Theme UI, U.S. Web Design System, Web Awesome, Zendesk Garden
-
-## Tech Stack
-
-- **Monorepo:** 42 separate Vite + React applications
-- **Shell:** Main comparison UI
-- **Library Apps:** Each design system in isolated app
-- **Build:** Parallel build orchestration
-- **Testing:** Playwright for E2E tests
-- **Deployment:** GitHub Pages (static)
-
-## System Design Concepts Demonstrated
-
-1. **CSS Isolation** - iframe-based complete style isolation
-2. **Monorepo Architecture** - Managing 42 interdependent apps
-3. **Parallel Build Orchestration** - Efficient multi-app builds
-4. **Static Site Generation** - GitHub Pages deployment
-5. **Component Library Comparison** - Systematic UI library evaluation
-
-## Development
+Install Bun and a compatible Node.js runtime. The reviewed upstream deployment
+workflow uses Node.js 22; its package manifest declares Bun >= 1.0.0. Commands below
+run in the **external repository**, not this documentation folder.
 
 ```bash
-# Install dependencies
+git clone https://github.com/evgenyvinnik/20forms-20designs.git
+cd 20forms-20designs
 bun install
-
-# Run shell app in development mode
-bun run dev:shell
-
-# Build all 42 apps for production
 bun run build
-
-# Preview production build
 bun run preview
-
-# Run linting
-bun run lint
 ```
 
-## Notes
+Open the URL printed by the preview server, normally
+[localhost:3000/20forms-20designs/](http://localhost:3000/20forms-20designs/).
+It tries another port if 3000 is occupied. To choose one explicitly:
 
-This is an external project. The full source code and implementation details are available in the [20forms-20designs repository](https://github.com/evgenyvinnik/20forms-20designs).
+```bash
+PORT=4000 bun run preview
+```
+
+The complete preview serves the assembled shell and library assets with their
+production base paths. No Docker or native database installation is needed because
+this application has no infrastructure services.
+
+## Develop and check the shell
+
+```bash
+# Shell development server; does not start every library app
+bun run dev:shell
+
+# Lint source across the external monorepo
+bun run lint
+
+# Run the shell's browser tests
+cd apps/shell
+bunx playwright install chromium
+bunx playwright test --project=chromium
+```
+
+The Playwright configuration starts the shell Vite server. Its tests cover controls,
+preview containers, URL state, and persistence; they do not establish that all
+built library documents load successfully or render equivalent forms. Use the
+assembled production preview to inspect iframe contents and asset paths.
+
+## Known limitations in the reviewed source
+
+- Every selected form/library pair mounts a frame immediately. Selecting the full
+  catalog can create 920 frames; lazy loading and a bounded frame cache are future work.
+- Theme changes update both frame URLs and send `SET_THEME` messages, so changing
+  theme can reload a document and reset form input. Frames are removed on deselection.
+- URLs encode partial selections, but omit empty and all-selected lists. Those
+  states can restore differently in another browser because omitted values fall
+  back to saved preferences or defaults. URL history is replaced, not appended.
+- Preview build failures are logged without necessarily failing the overall build.
+  Check the build summary and assembled previews before relying on the output.
+- The iframe setup separates styles but is not a sandbox for arbitrary untrusted
+  code. The current project embeds its own curated library apps.
+
+This documentation review inspected source and configuration; it did not run a
+full upstream build or claim measured load times, bundle budgets, or visual parity.

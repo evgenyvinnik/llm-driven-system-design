@@ -1,596 +1,407 @@
-# Design DocuSign - System Design Answer (Backend Focus)
+# Design an electronic signature platform — backend interview
 
-## 45-minute system design interview format - Backend Engineer Position
+A 45-minute proposed design, with three deep dives. The production guarantees described here
+are design choices; the local implementation differs in important ways summarized at the
+end.
 
----
+## 🎯 Requirements and boundaries — 4 minutes
 
-## 1. Requirements Clarification (3-4 minutes)
+> “I would start by defining what the system records: a specific recipient performed a specific action on a specific immutable document revision. Sending an email and generating a downloadable artifact are related jobs, but neither should determine whether that action committed.”
 
-### Functional Requirements
+The core flow is prepare an envelope, assign fields and routing stages, send it, collect
+recipient decisions, and produce a final artifact with an evidence manifest. The sender may
+withdraw an active envelope; recipients may decline. Those competing decisions must have a
+defined order.
 
-- **Upload**: Upload documents (primarily PDFs) for signing
-- **Prepare**: Add signature fields and assign to recipients
-- **Route**: Send to recipients in specified order (serial or parallel)
-- **Sign**: Capture legally binding electronic signatures
-- **Complete**: Generate final signed document with certificate of completion
+I would ask about signature assurance, supported document formats, expected retention, and
+whether recipients sign in serial or parallel. Those answers affect the evidence and
+authorization model. For this discussion, I assume ordinary PDFs, accountless invited
+signers, and explicit routing stages.
 
-### Non-Functional Requirements
+I would exclude collaborative preparation, template management, offline submission, and
+external identity-provider integration from the first version. We still leave room for an
+assurance policy, but a flag in a database is not an implemented identity check.
 
-- **Availability**: 99.99% for signing ceremonies
-- **Durability**: Documents stored for 10+ years with guaranteed integrity
-- **Compliance**: ESIGN Act, UETA, eIDAS compliant
-- **Security**: End-to-end encryption, SOC 2 Type II compliant
-- **Auditability**: Every action logged with tamper-proof trail
+| Requirement | Proposed objective |
+|-------------|--------------------|
+| Correctness | One accepted effect per scoped operation; immutable document revision binding |
+| Availability | 99.9% regional metadata/action API availability |
+| Latency | p95 under 300 ms for small metadata operations, excluding file transfer |
+| Artifacts | Asynchronous generation, p95 under 60 seconds for bounded ordinary PDFs |
+| Audit | Ordered, canonical events bound to content and a protected expected head |
+| Recovery | Explicit database replication acknowledgment and regional failover policy |
 
-### Scale Estimation
+I would not promise legal enforceability, a particular retention period, or a certification
+merely from this architecture. The engineering model must implement the product's specified
+consent, identity, access, and retention requirements and preserve evidence of what actually
+happened.
 
-- 100K envelopes per day, average 3 recipients each
-- Document sizes: 100KB - 50MB (PDFs)
-- Long-term storage: 10+ years with integrity verification
+One distinction matters throughout: a recipient finishing their fields, all recipients
+finishing, and the final artifact becoming available are three separate facts. Combining
+them into one status hides failure and makes recovery harder.
 
----
+## 📏 Capacity and architecture — 4 minutes
 
-## 2. High-Level Architecture (5 minutes)
+Assume 100,000 envelopes per day, three recipients per envelope, two 2 MiB PDFs per
+envelope, and three field actions per recipient. A tenfold daily-average peak is an initial
+assumption to validate against batch sends and business-hour concentration.
+
+That gives about 1.16 envelope creations per second on average and 11.6 at the assumed peak.
+Field actions are approximately 900,000 per day, or 104 per second at peak. This is a
+reasonable starting workload for a relational database with short transactions.
+
+Bytes are more demanding: originals alone are about 391 GiB per day, or 139 TiB per year
+before replicas, signatures, output artifacts, and retained versions. I would separate file
+transfer and parsing capacity from the small-request API budget.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Client Layer                                 │
-│               Web App │ Mobile App │ API Integration                 │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                          API Gateway                                 │
-│                     (Auth, Rate Limiting)                            │
-└───────────┬───────────────────┼───────────────────┬─────────────────┘
-            │                   │                   │
-            ▼                   ▼                   ▼
-┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐
-│ Document Service  │  │ Workflow Engine   │  │ Signing Service   │
-├───────────────────┤  ├───────────────────┤  ├───────────────────┤
-│ - PDF processing  │  │ - State mgmt      │  │ - Capture sig     │
-│ - Field placement │  │ - Routing logic   │  │ - Verify ID       │
-│ - Templates       │  │ - Reminders       │  │ - Audit logging   │
-└─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘
-          │                      │                      │
-          └──────────────────────┼──────────────────────┘
+┌─────────────────┐     ┌──────────────────┐
+│ Sender / signer │────▶│ Gateway and auth │
+└─────────────────┘     └──────────────────┘
                                  │
                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Data Layer                                  │
-├─────────────────────┬─────────────────────┬─────────────────────────┤
-│     PostgreSQL      │      S3/MinIO       │     Elasticsearch       │
-│  - Envelopes        │  - Documents        │  - Audit logs           │
-│  - Recipients       │  - Signatures       │  - Search               │
-│  - Workflow state   │  - Certificates     │  - Analytics            │
-└─────────────────────┴─────────────────────┴─────────────────────────┘
+                        ┌──────────────────┐
+                        │ Envelope service │
+                        │ State authority  │
+                        └──────────────────┘
+                            │         │
+                            ▼         ▼
+                  ┌──────────────┐ ┌───────────────┐
+                  │ PostgreSQL   │ │ Private       │
+                  │ State, audit │ │ object store  │
+                  │ receipts,    │ │ Originals and │
+                  │ outbox       │ │ artifacts     │
+                  └──────────────┘ └───────────────┘
+                         │                 ▲
+                         ▼                 │
+                  ┌───────────────┐ ┌───────────────┐
+                  │ Relay / queue │▶│ Workers       │
+                  │ Durable jobs  │ │ PDF and email │
+                  └───────────────┘ └───────────────┘
 ```
 
-### Component Responsibilities
+I would begin with one regional envelope authority and modular services, not a transaction
+scattered across several databases. Stateless API replicas share that authority. Object
+storage holds immutable bytes; PostgreSQL holds the references and business decisions.
 
-- **Document Service**: PDF processing, field placement, template management
-- **Workflow Engine**: State machine for signing orchestration
-- **Signing Service**: Signature capture, recipient verification, audit logging
+A CDN can serve application assets. Document delivery must remain authorized and
+version-bound, through a private gateway or a narrowly scoped signed URL. A public bucket is
+not made private by adding authentication to the metadata API.
 
----
+## 💾 Data model and API — 5 minutes
 
-## 3. Database Schema Design (6 minutes)
+The envelope is the concurrency boundary. Documents, field definitions, recipients, and
+their accepted actions all identify the frozen revision. A mutable draft and an active
+signing revision must not share an ambiguous “latest document” reference.
 
-### Schema Overview
+| Entity | Key information | Constraint or access pattern |
+|--------|-----------------|------------------------------|
+| Envelope | Sender, home region, version, state, active stage | Guard lifecycle changes by envelope ID/version |
+| Document revision | Immutable object key/version, digest, page metadata | Never replace bytes referenced by accepted actions |
+| Recipient | Envelope revision, role, stage, invitation/session policy | Signer authority checked against current stage and state |
+| Field definition | Document/page, geometry, recipient, type, required rule | Same-envelope assignment and bounded geometry |
+| Field action | Field revision, input/image digest, actor, operation, time | Unique accepted action under the chosen field policy |
+| Operation receipt | Scope, operation ID, request digest, response | Unique scoped key; commit alongside the effect |
+| Audit event | Envelope sequence, canonical payload, previous hash, hash | Unique sequence and serialized head advancement |
+| Outbox / consumer receipt | Stable event ID, destination, payload version, result | Retain dispatch work and detect duplicate consumption |
+| Artifact | Frozen inputs, generation ID, object digest, readiness | Publish one output for the intended generation |
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  envelopes                                                           │
-├─────────────────────────────────────────────────────────────────────┤
-│  id UUID PK, sender_id UUID FK, name VARCHAR(200)                   │
-│  status VARCHAR(30) DEFAULT 'draft'                                 │
-│  authentication_level VARCHAR(30) DEFAULT 'email'                   │
-│  expiration_date TIMESTAMP, created_at, updated_at, completed_at    │
-│  INDEX: idx_envelopes_sender_status ON (sender_id, status)          │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┐
-        │                       │                       │
-        ▼                       ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   recipients    │    │    documents    │    │  audit_events   │
-├─────────────────┤    ├─────────────────┤    ├─────────────────┤
-│ id UUID PK      │    │ id UUID PK      │    │ id UUID PK      │
-│ envelope_id FK  │    │ envelope_id FK  │    │ envelope_id FK  │
-│ name, email     │    │ name, page_count│    │ event_type      │
-│ role            │    │ s3_key, status  │    │ data JSONB      │
-│ routing_order   │    │ created_at      │    │ timestamp       │
-│ status          │    └────────┬────────┘    │ actor           │
-│ access_token    │             │             │ previous_hash   │
-│ ip_address      │             ▼             │ hash (SHA-256)  │
-│ completed_at    │    ┌─────────────────┐    └─────────────────┘
-└────────┬────────┘    │ document_fields │
-         │             ├─────────────────┤
-         │             │ id UUID PK      │
-         │             │ document_id FK  │
-         │             │ recipient_id FK │
-         │             │ type, page_num  │
-         ▼             │ x, y, w, h      │
-┌─────────────────┐    │ required, done  │
-│   signatures    │    │ value, sig_id   │
-├─────────────────┤    └─────────────────┘
-│ id UUID PK      │
-│ recipient_id FK │
-│ field_id FK     │
-│ s3_key, type    │
-│ created_at      │
-└─────────────────┘
+I would store opaque object references and digests in SQL rather than the PDF bytes. This
+keeps database transactions small. It also creates a cleanup problem: an uploaded object may
+never become attached, so staging and garbage collection are part of the design.
 
-┌─────────────────────────────────────────────────────────────────────┐
-│  idempotency_keys (prevent duplicate operations)                     │
-├─────────────────────────────────────────────────────────────────────┤
-│  key VARCHAR(255) PK, response JSONB, created_at TIMESTAMP          │
-│  INDEX: idx_idempotency_created ON (created_at)                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The API describes business operations explicitly. The paths below are proposed, and I would
+settle exact naming with the client team rather than letting storage table names define the
+interface.
 
----
+| Method | Example path | Purpose |
+|--------|--------------|---------|
+| POST | `/envelopes` | Create a draft |
+| PUT | `/envelopes/:id/draft` | Update a matching draft revision |
+| POST | `/envelopes/:id/send` | Freeze and activate the signing revision |
+| POST | `/invitations/exchange` | Establish scoped signer authority |
+| GET | `/signing/session` | Current revision, fields, and permitted actions |
+| POST | `/fields/:id/actions` | Record one field action with an operation ID |
+| POST | `/envelopes/:id/finish` | Confirm this recipient's completion |
+| POST | `/envelopes/:id/decline` | Record a recipient's decision |
+| POST | `/envelopes/:id/void` | Sender withdrawal under the state rule |
+| GET | `/operations/:id` | Reconcile an ambiguous action outcome |
+| GET | `/envelopes/:id/artifacts` | Authorized ready outputs and their identities |
 
-## 4. Workflow Engine State Machine (8 minutes)
+Errors need stable meanings: invalid input, unauthorized field, stale revision, inactive
+stage, terminal envelope, and unresolved operation. A transport failure is not itself proof
+that the operation failed.
 
-### State Transitions
+## 🔧 Deep dive: order workflow decisions at one authority — 9 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Envelope State Machine                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│      ┌───────┐                                                       │
-│      │ draft │                                                       │
-│      └───┬───┘                                                       │
-│          │ send                                                      │
-│          ▼                                                           │
-│      ┌───────┐                                                       │
-│      │ sent  │─────────────┐                                         │
-│      └───┬───┘             │ void                                    │
-│          │ deliver         │                                         │
-│          ▼                 ▼                                         │
-│   ┌───────────┐      ┌────────┐                                      │
-│   │ delivered │      │ voided │ (terminal)                           │
-│   └─────┬─────┘      └────────┘                                      │
-│         │                                                            │
-│    ┌────┴────┐                                                       │
-│    │         │                                                       │
-│    ▼         ▼                                                       │
-│ ┌────────┐ ┌──────────┐                                              │
-│ │ signed │ │ declined │ (terminal)                                   │
-│ └────┬───┘ └──────────┘                                              │
-│      │ all recipients done                                           │
-│      ▼                                                               │
-│ ┌───────────┐                                                        │
-│ │ completed │ (terminal)                                             │
-│ └───────────┘                                                        │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+> “My first correctness choice is to serialize the decisions that change who is allowed to sign. Otherwise two perfectly valid requests can combine into an invalid workflow.”
 
-### Routing Logic
+An envelope starts as a draft. Send validates and freezes its documents, field definitions,
+recipients, and stage plan. The first stage becomes active. After every required signer in
+that stage confirms Finish, the next stage activates. When all required signers finish, the
+envelope's signing work is complete and artifact generation begins.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                   Get Next Recipients                                │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. Query recipients ordered by routing_order ASC                    │
-│  2. Filter to pending status only                                    │
-│  3. Find lowest incomplete routing order                             │
-│  4. Return ALL recipients at that order (parallel signing)           │
-└─────────────────────────────────────────────────────────────────────┘
-```
+I would use a short PostgreSQL transaction guarded by the envelope row or version for Send,
+Finish, Decline, and Void. It checks current authority and state, performs the transition,
+appends the corresponding audit event, stores the operation receipt, and creates outbox jobs
+before commit.
 
-"Recipients with the same routing_order sign in parallel. Recipients with different orders sign serially."
+All draft mutations must participate in that same guard. Consider a sender changing a field
+just as Send validates the envelope. If only Send takes a lock, the other route can read
+“draft,” wait elsewhere, then update the field after Send commits. The supposedly frozen
+document no longer matches its field plan.
 
-### Complete Recipient Flow
+That is why the invariant is a shared protocol across routes, not the presence of one `FOR
+UPDATE` statement. Either the mutation sees the expected draft version and commits under the
+guard, or it reports a conflict. Uploaded bytes can be staged beforehand so we never hold
+the lock during file transfer.
 
-```
-┌──────────────────┐
-│ Recipient signs  │
-│ all their fields │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Mark recipient   │
-│ as completed     │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────────────────────┐
-│ Check: All siblings at this      │
-│ routing order complete?          │
-└────────────────┬─────────────────┘
-                 │
-     ┌───────────┴───────────┐
-     │ No                    │ Yes
-     ▼                       ▼
-┌─────────────┐     ┌─────────────────────────┐
-│ Wait for    │     │ Get next recipients     │
-│ siblings    │     └────────────┬────────────┘
-└─────────────┘                  │
-                     ┌───────────┴───────────┐
-                     │ None                  │ Some
-                     ▼                       ▼
-            ┌─────────────────┐    ┌─────────────────┐
-            │ Complete        │    │ Queue signing   │
-            │ envelope        │    │ notifications   │
-            └────────┬────────┘    └─────────────────┘
-                     │
-                     ▼
-            ┌─────────────────┐
-            │ Generate signed │
-            │ PDF + cert      │
-            └─────────────────┘
-```
+For parallel signing, recipients at one stage can fill different fields independently. Stage
+advancement remains one ordered decision. If the last two signers finish concurrently, the
+second transaction sees the first one's committed completion, activates the next stage once,
+and inserts one stable transition event.
 
-### Idempotent State Transitions
+Recipients copied for information do not participate in the required-signer count. In-person
+signing is not just another string with the same authority; I would keep it out of scope
+until its delegation and identity rules are explicit.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│             Idempotent Transition (Database Transaction)             │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. BEGIN transaction                                                │
-│  2. Check idempotency_keys table for duplicate request               │
-│     - If found: ROLLBACK, return cached response                     │
-│  3. Lock envelope row with FOR UPDATE                                │
-│  4. Validate state transition is allowed                             │
-│  5. Execute operation                                                │
-│  6. Store idempotency key with response                              │
-│  7. COMMIT transaction                                               │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Now consider a sender withdrawing the envelope while a recipient finishes. If Void wins the
+guard, Finish sees a terminal state and cannot create an accepted action. If Finish wins,
+the withdrawal follows the defined completed-state rule. We do not resolve this by comparing
+browser timestamps after accepting both.
 
-"This prevents race conditions and duplicate processing when clients retry failed requests."
+| Approach | Why it fits | Cost or failure |
+|----------|-------------|-----------------|
+| ✅ Short transaction per envelope decision | Orders authorization, stage changes, and competing terminal actions | Contention for unusually large or active envelopes |
+| ❌ Independent updates plus notifications | Simple happy path | Lost invitations and contradictory terminal states after races |
+| Alternative: single-writer event stream | Can preserve ordered authority | More replay, projection, and operational machinery |
 
----
+The event-stream alternative can be correct if one ordered stream owns the aggregate. My
+objection is to independent services each believing they own part of the transition, not to
+event-driven architecture itself. At this scale, SQL transactions make the invariants easier
+to inspect and operate.
 
-## 5. Tamper-Proof Audit Trail (8 minutes)
+I would keep notification and PDF work outside the transaction. Instead, write an outbox row
+alongside the state change. A relay publishes the job, waits for broker confirmation, then
+marks it dispatched. If it crashes after publishing but before marking, it publishes again;
+consumers must expect duplicates.
 
-### Hash Chain Implementation
+A worker keeps a durable receipt for a stable event ID. For external email, a local receipt
+alone cannot prevent the provider accepting a message just before the worker crashes. Use
+provider idempotency or queryable provider receipts when available, otherwise describe the
+remaining duplicate-delivery risk honestly.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Audit Event Hash Chain                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Event 1          Event 2          Event 3          Event 4         │
-│  ┌─────────┐      ┌─────────┐      ┌─────────┐      ┌─────────┐     │
-│  │ data    │      │ data    │      │ data    │      │ data    │     │
-│  │ prev: 0 │──────│ prev: H1│──────│ prev: H2│──────│ prev: H3│     │
-│  │ hash: H1│      │ hash: H2│      │ hash: H3│      │ hash: H4│     │
-│  └─────────┘      └─────────┘      └─────────┘      └─────────┘     │
-│       │                │                │                │          │
-│       └────────────────┴────────────────┴────────────────┘          │
-│                        Linked by hashes                              │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+This design trades immediate side-effect completion for durable intent and measurable lag.
+The sender sees “invitation queued” before “provider accepted.” An unavailable email
+provider can delay the next person's invitation without undoing the already committed
+workflow.
 
-### Hash Calculation
+I would add admission limits for extreme envelopes and measure lock wait time. At the
+initial aggregate rate, sharding individual workflow decisions would buy complexity before
+it solves a demonstrated bottleneck.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                   Hash Calculation Process                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Input payload:                                                      │
-│  ├── event.id                                                        │
-│  ├── event.envelopeId                                                │
-│  ├── event.eventType                                                 │
-│  ├── event.data (JSON)                                               │
-│  ├── event.timestamp                                                 │
-│  └── event.previousHash                                              │
-│                                                                      │
-│  Output: SHA-256(JSON.stringify(payload)) ──▶ 64-char hex string    │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep dive: idempotency across SQL and object storage — 8 minutes
 
-### Chain Verification
+A signer may double-tap, retry after a timeout, or use two tabs. We need to distinguish
+repeated transport attempts from distinct conflicting intentions. A response cache alone
+does not make that distinction safely.
 
-```
-┌────────────────────┐
-│ Verify Chain       │
-│ for envelope       │
-└─────────┬──────────┘
-          │
-          ▼
-┌────────────────────┐
-│ Fetch all events   │
-│ ORDER BY timestamp │
-└─────────┬──────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────────────┐
-│  For each event:                                                │
-│  1. Verify previous_hash matches prior event's hash            │
-│  2. Recalculate hash from event data                           │
-│  3. Compare calculated hash with stored hash                    │
-│  4. If mismatch: chain is broken, return invalid               │
-└────────────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────┐
-│ Return: valid/     │
-│ invalid + error    │
-└────────────────────┘
-```
+The client supplies an operation ID for one action, stable across retries. The server scopes
+it to the actor or signer session, envelope revision, and operation type. It records a
+digest of the request, including the field revision and signature image or value digest.
 
-### Audit Event Types
+Inside the transaction, a unique operation claim determines whether this is new. If the same
+operation already completed with the same digest, return its immutable receipt. If the key
+has a different digest, reject it. If another operation already completed this field, return
+that distinct conflict rather than pretending the new action succeeded.
 
-| Category | Event Types |
-|----------|-------------|
-| Envelope lifecycle | envelope_created, envelope_sent, envelope_voided, envelope_completed |
-| Document events | document_uploaded, field_added, field_removed |
-| Recipient events | recipient_added, recipient_viewed, recipient_declined, recipient_completed |
-| Signature events | signature_captured, field_completed |
-| Authentication | access_token_generated, sms_verification_sent, sms_verification_completed |
+The business mutation and receipt must commit together. A crash after the field update but
+before an independent receipt insert otherwise leaves the retry unable to tell whether the
+action happened. Redis may accelerate reading committed receipts, but SQL remains the
+authority for deciding whether to execute.
 
-"Each signature capture includes: recipientId, fieldId, signatureId, signatureType, ipAddress, userAgent, timestamp, geolocation."
+A Redis failure should not silently turn a known operation into a new one. For session
+authentication, an unavailable session store may require failing the request. For operation
+receipts, the backend can use its durable SQL path. Those are separate dependency policies.
 
----
+| Choice | Benefit | Trade-off |
+|--------|---------|-----------|
+| ✅ Scoped SQL receipt in the mutation transaction | One committed decision with a replayable result | Receipt storage, retention, and transaction contention |
+| ❌ Redis check then perform then cache | Fast and easy | Concurrent misses execute twice; crashes leave uncertain effects |
+| ❌ Hour-based generated key | Catches some nearby duplicates | Time boundaries separate the same intent; no payload binding |
 
-## 6. Signature Capture Service (6 minutes)
+The hard boundary is object storage. We cannot roll an object upload back with a PostgreSQL
+transaction. I would first validate the image and place it under a new immutable staging
+key, then record its version and digest in the transaction that accepts the field action.
 
-### Capture Flow
+If staging fails, there is no recorded action. If staging succeeds but SQL rejects the
+action, the object remains unattached and is collected later. If SQL commits but the
+response is lost, the same operation returns its receipt and references the same accepted
+bytes.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Signature Capture Flow                            │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. Check idempotency key in Redis                                   │
-│     - If found: return cached result                                 │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  2. BEGIN database transaction                                       │
-│  3. Lock field row with FOR UPDATE                                   │
-│  4. Verify field not already completed                               │
-│  5. Verify recipient owns this field                                 │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  6. Process signature based on type:                                 │
-│     ├── draw: decode base64 image data                               │
-│     ├── typed: render text with selected font                        │
-│     └── upload: validate uploaded image                              │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  7. Store signature in S3 with KMS encryption                        │
-│  8. Create signature record in database                              │
-│  9. Mark field as completed                                          │
-│  10. COMMIT transaction                                              │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  11. Log to audit trail with full context                            │
-│  12. Cache result for idempotency (24h TTL)                          │
-│  13. Check if recipient completed all required fields                │
-│      - If yes: trigger workflow.completeRecipient()                  │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Garbage collection must avoid racing with an in-flight attachment. Use explicit staging
+lifecycle/ownership or a conservative age plus an attachment check under the appropriate
+coordination. A storage timeout can also leave an object present, so reconcile using its
+known identity before creating unbounded replacements.
 
----
+The receipt can say “field action recorded” without saying the recipient finished. Finish
+has its own operation ID and rechecks required field values. Merely setting a completed
+boolean is not sufficient if an empty required text field or an unchecked required consent
+field violates the product's rule.
 
-## 7. Message Queue Architecture (5 minutes)
+A field-action uniqueness constraint complements operation idempotency. Two different
+operation IDs for the same field must not both become accepted final actions unless
+replacement is explicitly modeled as a new revision. This is how we handle two tabs whose
+intentions were genuinely distinct.
 
-### RabbitMQ Queue Topology
+Receipt retention is also a policy. If receipts expire but the original effect remains,
+replay cannot simply treat the old key as new. Keep enough durable identity or field-state
+constraints to resolve late retries, and expose an expired-recovery result if the original
+response is no longer retained.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      RabbitMQ Exchanges                              │
-├─────────────────┬─────────────────────┬─────────────────────────────┤
-│ docusign.direct │   docusign.fanout   │      docusign.dlx           │
-│ (direct type)   │   (fanout type)     │   (dead letter)             │
-└────────┬────────┴──────────┬──────────┴────────────┬────────────────┘
-         │                   │                       │
-         ▼                   ▼                       ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ workflow queue  │  │  email queue    │  │    dlq queue    │
-└────────┬────────┘  └────────┬────────┘  └─────────────────┘
-         │                    │
-         ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐
-│ Workflow Worker │  │  Email Worker   │
-└─────────────────┘  └─────────────────┘
-```
+> “I would promise one accepted effect for the defined operation scope. I would not call the network exactly-once, because responses and worker messages can still be duplicated or lost.”
 
-### Message Publishing with Delivery Guarantees
+The cost is a more careful protocol and some abandoned-object cleanup. The benefit is that
+an unknown outcome becomes a recoverable state rather than a reason to guess whether a
+signature was recorded.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Message Structure                                 │
-├─────────────────────────────────────────────────────────────────────┤
-│  {                                                                   │
-│    id: UUID,                                                        │
-│    type: event_type,                                                │
-│    envelopeId: UUID,                                                │
-│    data: {...},                                                     │
-│    timestamp: ISO8601,                                              │
-│    idempotencyKey: "{type}:{envelopeId}:{timestamp}"                │
-│  }                                                                   │
-│                                                                      │
-│  Options: persistent=true, messageId=id,                            │
-│           headers: { x-idempotency-key, x-retry-count }             │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep dive: evidence that binds to actual bytes — 7 minutes
 
-### Consumer with Backpressure
+An audit list can tell a compelling story while failing to identify the document that story
+is about. I would start with content identity: immutable original revision, page geometry,
+accepted field values or signature digests, and the exact consent/confirmation version used
+for the action.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Consumer Processing                               │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Prefetch: 5 (limits concurrent processing)                         │
-│                                                                      │
-│  For each message:                                                   │
-│  1. Check Redis for processed:{idempotencyKey}                      │
-│     - If found: ACK and skip (already processed)                    │
-│  2. Process the event                                               │
-│  3. Store processed key in Redis (24h TTL)                          │
-│  4. ACK the message                                                 │
-│                                                                      │
-│  On error:                                                          │
-│  - If retryCount < 3: republish with incremented count, NACK        │
-│  - If retryCount >= 3: NACK (goes to DLQ)                           │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Each committed event gets a per-envelope sequence number and a canonical payload version.
+Include the actor, action, revision identifiers, content digests, recording time, and
+previous event hash. Update the audit head under the same guard as the associated business
+decision.
 
----
+I would not hash arbitrary serialized database JSON and assume it will reproduce the same
+bytes later. Object-key ordering and timestamp representation need an explicit canonical
+format. Verification must be defined across storage round trips and future implementation
+versions.
 
-## 8. Recipient Authentication (4 minutes)
+The sequence matters too. Two writers reading the same previous hash can create competing
+successors. Ordering events only by wall-clock timestamp does not repair that fork, and
+timestamps can tie. The database should enforce unique sequence positions while the envelope
+authority advances the head once.
 
-### Authentication Levels
+A chain alone does not prevent a privileged actor from replacing the events and recomputing
+all hashes. Nor does checking the available prefix prove that the expected tail was not
+deleted. The verifier needs an independently protected expected head and event count.
 
-The envelope's `authentication_level` supports a ladder of assurance, from lightest to strongest:
+I would export signed checkpoints and canonical event batches to separately controlled
+storage. A checkpoint identifies envelope revision, sequence count, head digest, signing key
+version, and checkpoint time. Verification checks against that retained reference rather
+than simply trusting whatever head the mutable database currently returns.
 
-- **email** (default, and the level actually enforced): recipient authenticates by clicking an email link carrying a unique per-recipient access token. Account-less — the signer never registers.
-- **sms**: a 6-digit code is generated, stored in Redis with a 5-minute expiry, and sent via an SMS provider; the recipient must enter it before the signing session is minted. Each send/verify is an audit event.
-- **knowledge / id_verification**: knowledge-based questions or a government-ID check, delegated to a third-party identity provider for high-value agreements.
+| Approach | What it establishes | Cost or limitation |
+|----------|----------------------|--------------------|
+| ✅ Canonical chain plus protected checkpoint | Detectable divergence from the anchored record | Key management, archive permissions, export lag |
+| ❌ Mutable chain beside workflow rows | Internal consistency of available rows | An actor controlling both can rewrite or truncate them |
+| ❌ Signature image alone | A visual mark | No complete binding to document revision or authority |
 
-> "I'd gate the second factor *before* minting the signing session, not per-field — once a signer is authenticated for an envelope, re-challenging on every field would be hostile. The access token proves possession of the link; the SMS/KBA step proves the person. For most business e-signature flows, email-link possession is the accepted bar, which is why it's the default."
+This does not establish a person's identity by itself. An IP address is context, and an
+email-link session is evidence of link possession. Stronger assurance requires the
+corresponding authentication process and records, not stronger language in a certificate
+template.
 
----
+Artifact generation consumes a frozen input manifest. The worker places accepted fields into
+each PDF and writes the output to an immutable key with its digest. Any digital sealing step
+has a defined key and verification policy; merely flattening an image into a PDF is a
+rendering operation.
 
-## 9. Circuit Breaker for External Services (3 minutes)
+The worker publishes readiness conditionally for its generation ID. If two deliveries run
+the same job, they cannot replace a newer artifact. If generation fails, preserve the
+recorded signer actions and expose an artifact-pending or failed state with a retryable job.
 
-### Circuit Breaker Configuration
+The evidence manifest should enumerate all documents, not pick an arbitrary document name
+from a join. It references the canonical sequence actually verified. Fetching events for
+display and running verification in separate unbound queries can produce a report about two
+different sets of events.
 
-| Service | Timeout | Error Threshold | Reset Timeout |
-|---------|---------|-----------------|---------------|
-| Email | 5s | 50% | 60s |
-| S3 | 30s | 50% | 30s |
-| SMS | 10s | 50% | 120s |
+The trade-off is that artifact readiness and archive/checkpoint readiness may lag behind
+signing. I would expose those stages and monitor their age. A single “completed and
+verified” flag would hide the very failure conditions the evidence design is meant to
+explain.
 
-### Circuit Breaker States
+## 🧯 Security and failure handling — 3 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Circuit Breaker States                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│    CLOSED ────────▶ OPEN ────────▶ HALF-OPEN                        │
-│       │               │               │                              │
-│   (normal)      (50% failures)   (after reset                        │
-│       ▲               │            timeout)                          │
-│       │               │               │                              │
-│       └───────────────┴───────────────┘                              │
-│            (on success in half-open)                                 │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Sender accounts use secure sessions and server-side authorization. Signer invitations are
+scoped, expiring, and revocable, with action permission checked from current envelope state.
+The document route must apply the intended access policy too; withdrawing signing authority
+does not automatically revoke a previously issued storage URL.
 
-### Fallback Strategy
+Keep uploaded content private, validate resource bounds, and parse under controlled
+concurrency. A PDF parser or worker thread is not a complete security boundary. Logs should
+identify request/operation IDs without retaining invitation secrets in URL paths or
+unnecessary signature content.
 
-"When S3 circuit breaker is open, queue uploads for retry when storage recovers. Return {queued: true} to client."
+| Failure | Response |
+|---------|----------|
+| SQL authority unavailable | Reject new workflow decisions rather than accept unrecorded signatures |
+| Storage timeout | Reconcile staged object identity; keep action outcome explicit |
+| Broker outage | Retain outbox work; show dispatch delay |
+| Poison message | Durable retry/quarantine with verified routing and operator visibility |
+| Audit append failure | Abort the business transaction |
+| Artifact generation failure | Retry generation without repeating signer actions |
+| Old region still reachable after failover | Fence the old writer before accepting new mutations |
 
----
+A circuit breaker bounds repeated failures and protects capacity; it does not cancel a
+remote effect already underway. I would use bounded timeouts, admission controls, and
+retries that understand operation identity. A queue's durable flag also does not repair an
+incompatible message contract or a missing dead-letter binding.
 
-## 10. Certificate of Completion (3 minutes)
+## 🚀 Scaling and verification — 3 minutes
 
-### Certificate Generation Flow
+I would scale byte delivery and PDF processing before sharding the envelope database. At our
+assumptions, object bandwidth and bounded parser concurrency are more pressing than a few
+hundred transactional writes per second.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                Certificate of Completion                             │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. Fetch all audit events for envelope                              │
-│  2. Verify hash chain integrity                                      │
-│  3. Build certificate object:                                        │
-│     ├── envelopeId, documentName, completedAt                        │
-│     ├── signers: [{ name, email, signedAt, ipAddress }]              │
-│     ├── events: [{ time, action, actor, details }]                   │
-│     ├── chainVerified: true/false                                    │
-│     └── integrityHash: final event hash                              │
-│  4. Render certificate as PDF                                        │
-│  5. Store in S3: envelopes/{id}/certificate.pdf                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Add appropriate sender/status indexes and stable pagination, partition growing audit/outbox
+maintenance by time, and measure per-envelope lock contention. Keep one envelope's state and
+sequence colocated. Regional distribution assigns each envelope one writer and requires a
+deliberate failover/replication policy.
 
-### Certificate Contents
+Observe business progress: age of the oldest outbox job, time to notify an active stage,
+unknown action outcomes awaiting reconciliation, artifact-generation lag, and failed
+evidence checks. Health probes show dependencies are reachable; they cannot prove that a
+worker understands the payload or that a recipient received an email.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Certificate Structure                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Document: [Document Name]                                           │
-│  Completed: [Timestamp]                                              │
-│  Integrity Hash: [SHA-256]                                           │
-│  Chain Verified: Yes/No                                              │
-│                                                                      │
-│  Signers:                                                            │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │ Name        │ Email           │ Signed At    │ IP Address  │    │
-│  ├─────────────┼─────────────────┼──────────────┼─────────────┤    │
-│  │ John Doe    │ john@example.com│ 2024-01-15   │ 192.168.1.1 │    │
-│  │ Jane Smith  │ jane@example.com│ 2024-01-16   │ 10.0.0.1    │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│                                                                      │
-│  Audit Trail:                                                        │
-│  [Timestamp] envelope_created by sender@example.com                  │
-│  [Timestamp] envelope_sent                                           │
-│  [Timestamp] recipient_viewed by john@example.com from IP           │
-│  [Timestamp] signature_captured                                      │
-│  [Timestamp] recipient_completed                                     │
-│  [Timestamp] envelope_completed                                      │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| Verification scenario | Invariant |
+|-----------------------|-----------|
+| Concurrent last signers | One stage activation and stable event identity |
+| Draft edit racing Send | Either included in the frozen revision or rejected |
+| Same operation concurrently | One accepted effect and the same receipt |
+| Void racing Finish | One defined ordering, no terminal-state resurrection |
+| Crash after publish | Duplicate consumer delivery is safe |
+| SQL rejects after upload | Unattached bytes are eventually collected safely |
+| JSON/timestamp round trip | Canonical digest remains reproducible |
+| Tail deletion or full local rewrite | Protected checkpoint detects divergence |
 
----
+I would test these with controlled failures, not infer correctness from a login smoke test.
+Load tests then establish the latency and memory envelope for the supported document sizes.
 
-## 11. Key Backend Trade-offs
+## ⚖️ Trade-offs and implementation boundary — 2 minutes
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Audit integrity | Hash chain | Simple logging | Legal defensibility, tamper evidence |
-| Document storage | S3 with KMS | Database BLOBs | Scale, durability, compliance |
-| Workflow | State machine | Event-driven | Clarity, validation, debugging |
-| Authentication | Multi-factor | Email only | Enterprise security requirements |
-| Idempotency | Redis + PostgreSQL | PostgreSQL only | Fast duplicate detection |
+| Workflow authority | ✅ Guarded SQL aggregate | ❌ Independent lifecycle writes | Orders stage and terminal decisions |
+| Side effects | ✅ Outbox plus duplicate-safe workers | ❌ Publish after commit | Retains dispatch intent through crashes |
+| Idempotency | ✅ Scoped durable receipts | ❌ Response cache alone | Couples the effect to replay evidence |
+| Audit | ✅ Canonical events and protected checkpoints | ❌ Unanchored mutable chain | Binds verification to an expected complete record |
+| Artifacts | ✅ Separate asynchronous readiness | ❌ Generate during signing lock | Keeps slow rendering outside core decisions |
 
-### Why Hash Chain over Simple Logging?
+The local code has one Express API with PostgreSQL, Redis, MinIO, and RabbitMQ helpers. Only
+Send takes an envelope lock; other transitions and field actions are not atomic. The receipt
+cache can execute concurrent duplicates, and the normal session cache shape blocks signer
+writes.
 
-1. **Legal Defensibility**: Courts accept cryptographic proof of integrity
-2. **Tamper Evidence**: Any modification breaks the chain
-3. **Independent Verification**: Chain can be verified without access to source system
-4. **Compliance**: Meets ESIGN, UETA, eIDAS requirements
+The two audit writers use incompatible formats, the worker expects different payloads and
+nonexistent tables, and sender completion notification misuses a user ID as a recipient
+foreign key. Final signed artifact generation and protected checkpoints are absent.
+[architecture.md](./architecture.md) documents those source findings; this interview answer
+describes the design needed to resolve them.
 
----
-
-## Summary
-
-"This DocuSign backend design demonstrates:
-
-1. **Workflow State Machine**: Explicit transitions prevent invalid states
-2. **Tamper-Proof Audit**: Hash chain provides legal defensibility
-3. **Idempotency**: All critical operations are safely retryable
-4. **Message Queues**: Decouple signing from notifications
-5. **Multi-Factor Auth**: Configurable security levels
-6. **Circuit Breakers**: Protect against external service failures
-7. **Certificate Generation**: Complete signing record with integrity proof
-
-The design prioritizes legal compliance - every action is logged, hashed, and verifiable years after signing."
+> “I would leave the whiteboard with three invariants: one authority orders the envelope, one durable receipt identifies an accepted action, and one protected content reference identifies what the evidence covers. Those are more useful than a diagram full of services without clear ownership.”

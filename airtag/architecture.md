@@ -1,788 +1,532 @@
-# Design AirTag - Architecture
+# AirTag — Architecture
 
 ## System Overview
 
-AirTag uses the Find My network to locate items using crowd-sourced Bluetooth detection. Core challenges involve privacy-preserving location, key rotation, and anti-stalking measures.
+Design an item-finding network in which nearby participating devices report an
+approximate observation of a lost item, and its owner retrieves those observations.
+The central challenges are protecting location contents, handling delayed reports,
+communicating uncertainty, and providing unwanted-tracker protection.
 
-**Learning Goals:**
-- Build privacy-preserving location systems
-- Design end-to-end encrypted reporting
-- Implement key rotation schemes
-- Handle crowd-sourced data at scale
+The production design below is a proposal inspired by offline finding. It is not
+Apple's internal implementation. Apple's published design describes public-key
+report encryption and owner-side decryption, with private key material excluded
+from Apple's servers. [Apple Platform Security](https://support.apple.com/en-ie/guide/security/sece994d0126/web)
 
----
+**This repository implements a server-trusted simulation.** Its backend generates
+and stores master secrets, encrypts map-click coordinates, decrypts history and
+returns plaintext locations. The final Implementation Notes document that boundary
+and other differences from the proposed production system.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Track**: Locate items via the Find My network of billions of Apple devices
-2. **Precision**: UWB-based directional finding for nearby items
-3. **Lost Mode**: Notify owner when a lost item is found by the network
-4. **Anti-Stalking**: Detect and alert users to unknown trackers traveling with them
-5. **Sound**: Play sound to locate nearby items
+- Pair an item with an owner and maintain authorized ownership metadata.
+- Accept encrypted observations from participating finder devices.
+- Retrieve bounded report history and decrypt it on an authorized owner device.
+- Show the latest credible observation, its age and uncertainty.
+- Support lost-item contact information and a deliberate notification policy.
+- Detect potentially unwanted trackers through the nearby device/OS safety path.
+- Distinguish nearby hardware actions from remote observations.
 
-### Non-Functional Requirements
+BLE scanning, secure pairing, UWB ranging and NFC require a hardware/platform
+integration. A web dashboard can visualize results but does not provide those
+capabilities merely by drawing their controls.
 
-- **Privacy**: Apple cannot decrypt or see item locations -- end-to-end encrypted
-- **Scale**: 1B+ Find My network devices submitting reports, 500M+ AirTags
-- **Latency**: < 15 minutes for location update (limited by key rotation period)
-- **Battery**: 1+ year battery life on CR2032 (requires ultra-low-power BLE)
-- **Availability**: 99.99% for report ingestion, 99.9% for location retrieval
-- **Throughput**: 10M+ encrypted location reports per minute globally
+### Non-functional requirements
 
----
+These are proposed targets and trust boundaries, not measured results:
+
+| Requirement | Target or rule |
+|-------------|----------------|
+| Location confidentiality | The report service does not receive owner decryption secrets or plaintext coordinates |
+| Ingestion | p99 below 300 ms for durable regional acceptance |
+| Retrieval | p95 below 500 ms for a bounded recent query, excluding client decryption |
+| Availability | 99.99% ingestion and 99.9% query availability targets |
+| Retention | Seven days of report storage initially, enforced by a defined cleanup policy |
+| Recovery | Retry the same report identity without multiplying its durable effect |
+| Safety | Unwanted-tracker detection and actionable alerts remain a first-class path |
+| User feedback | Observation age, report delivery state and network failure are distinguishable |
+
+There is no universal time-to-find guarantee. A tag needs a nearby participating
+finder, and that finder needs an upload opportunity. Key rotation is not an upper
+bound on observation latency or a reason to delay reporting until the next period.
+
+## Capacity Estimation
+
+Assume one billion reports/day and an encoded envelope of roughly 1 KB. That is
+about 11,600 reports/second on average and 1 TB/day of payloads. A 100,000/second
+peak allows for geographic and temporal concentration. These are planning assumptions,
+not claims about deployed AirTag counts or demonstrated database throughput.
+
+Seven days is about 7 TB of raw payloads, or 21 TB with three copies before indexes,
+logs and metadata. Time-bucketed retention and bounded query fan-out matter more
+than choosing a database from an unsupported universal writes-per-second limit.
+
+With a hypothetical 15-minute lookup period, one day spans 96 intervals; a query
+including both boundary periods may need 97 keys. A week spans 672 intervals plus
+possible boundary coverage. More frequent rotation increases lookup work, but should
+not require downloading all historical reports every refresh.
+
+### Local Development Scale
+
+The seed creates seven fixed devices and thirteen reports. One Express API connects
+to one PostgreSQL, one Valkey and optionally RabbitMQ plus workers. The frontend
+uses one latest-location request per listed device and polls selected history every
+30 seconds. No local capacity benchmark was performed during this review.
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     AirTag Device                                │
-│         (BLE beacon, UWB, NFC, Speaker, Motion sensor)          │
-│         Broadcasts rotating BLE identifier every 2 seconds      │
-└─────────────────────────────────────────────────────────────────┘
-                              │ BLE advertisement
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Find My Network                                │
-│              (1B+ iPhones, iPads, Macs)                         │
-│         Detect BLE beacons, encrypt location, report            │
-└─────────────────────────────────────────────────────────────────┘
-                              │ Encrypted reports (HTTPS)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                   │
-│              (Auth, Rate Limiting, Geo-routing)                 │
-└─────────────────────────────────────────────────────────────────┘
-        │              │              │              │
-        ▼              ▼              ▼              ▼
-┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
-│  Report    │ │  Query     │ │ Anti-Stalk │ │Notification│
-│  Ingestion │ │  Service   │ │  Service   │ │  Service   │
-│            │ │            │ │            │ │            │
-│ Store blobs│ │ Lookup by  │ │ Pattern    │ │ Push alerts│
-│ No decrypt │ │ id hash   │ │ detection  │ │ Lost mode  │
-└─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
-      │              │              │              │
-      ▼              ▼              ▼              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                  │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│  PostgreSQL     │  Redis/Valkey     │  RabbitMQ                 │
-│  - Reports      │  - Cache          │  - Report ingestion       │
-│  - Devices      │  - Sessions       │  - Anti-stalk analysis    │
-│  - Sightings    │  - Rate limits    │  - Notification delivery  │
-│  - Notifications│  - Idempotency    │  - Report cleanup         │
-└─────────────────┴───────────────────┴───────────────────────────┘
+┌──────────────┐       ┌─────────────────────┐       ┌─────────────────┐
+│ Item beacon  │──────▶│ Nearby finder / OS  │──────▶│ Ingestion API   │
+│ Rotating key │ BLE   │ Encrypt observation │ HTTPS │ Validate, admit │
+└──────────────┘       └──────────┬──────────┘       └────────┬────────┘
+                                 │ safety signals            ▼
+                       ┌─────────▼──────────┐       ┌─────────────────┐
+                       │ Local unwanted-   │       │ Durable log /   │
+                       │ tracker detection  │       │ report workers  │
+                       └────────────────────┘       └────────┬────────┘
+                                                            ▼
+┌──────────────────────┐      ┌─────────────────┐   ┌─────────────────┐
+│ Owner app            │◀────▶│ Bounded query API│◀─▶│ Opaque report   │
+│ Keys, decrypt, map   │      │ and read cache  │   │ store + index   │
+└──────────────────────┘      └─────────────────┘   └─────────────────┘
 ```
 
-### Privacy Flow (Zero-Knowledge Design)
+Account/pairing metadata is a separate concern from report contents. The owner app
+obtains its keys through a protected local pairing and encrypted synchronization
+flow. The report service has ciphertext and lookup tokens, not a decrypting key store.
 
-```
-AirTag                          iPhone (finder)              Apple Server              Owner's iPhone
-  │                                  │                           │                          │
-  │─── BLE: {rotatingId, pubKey} ──▶│                           │                          │
-  │                                  │                           │                          │
-  │                        Encrypt(myLocation, pubKey)           │                          │
-  │                                  │                           │                          │
-  │                                  │──── {hash(id), blob} ───▶│                          │
-  │                                  │                           │── Store encrypted blob   │
-  │                                  │                           │                          │
-  │                                  │                           │◀── Query by hash(id) ────│
-  │                                  │                           │                          │
-  │                                  │                           │──── Return blob ────────▶│
-  │                                  │                           │                          │
-  │                                  │                      Decrypt(blob, privateKey)       │
-  │                                  │                           │           = location      │
-```
+The nearby device handles safety observations through a dedicated platform path.
+Uploading every person's plaintext movement history to a centralized anti-stalking
+service would contradict the location privacy goal unless that additional trust
+relationship were explicitly chosen and disclosed.
 
-Apple servers store only encrypted blobs and identifier hashes. They cannot correlate reports to devices or decrypt locations. Only the owner, who holds the master secret, can derive the identifier hashes for their device and decrypt the payloads.
+## Core Components / Request Flows
 
----
+### Pairing, ownership and key custody
 
-## Core Components
+Establish possession and ownership during pairing. Generate key material at the
+trusted endpoint, protect it with the platform's available key storage, and define
+how another owner device can receive it through encrypted synchronization.
 
-### 1. Key Rotation and Beacon Protocol
+Use a reviewed cryptographic protocol and supported libraries. This document does
+not specify a new elliptic-curve construction or claim that a random field named
+“ephemeral public key” constitutes a key agreement.
 
-The AirTag derives a new key pair every 15 minutes from a deterministic master secret shared with the owner's iCloud account.
+Account authentication and possession of decryption capability are different.
+Resetting an account password cannot recover missing keys unless a recovery mechanism
+was designed. A server-accessible KMS can protect stored secrets from some attacks,
+but does not make that server unable to decrypt.
 
-**Key Derivation Chain:**
-1. Master secret (32 bytes) is generated at pairing time and synced to owner's iCloud Keychain
-2. Current period = `floor(timestamp / (15 * 60 * 1000))`
-3. Period key = `HMAC-SHA256(masterSecret, "airtag_key_" + period)`
-4. EC key pair: private key = period key (truncated to P-224 size), public key derived via ECDH
-5. BLE identifier = `SHA-256(publicKey)` truncated to 6 bytes
-6. BLE advertisement broadcasts: {identifier (6 bytes), publicKey (full)}
+Rotation reduces stable broadcast identifiers. It does not eliminate correlation
+through physical co-movement, timing, network addresses or batched lookup requests.
+Apple describes changing derived public keys approximately every 15 minutes in its
+published offline-finding design; that is a reference behavior, not a security proof
+for this repository's unrelated symmetric demo. [Find My security](https://support.apple.com/guide/security/find-my-security-sec6cbc80fd0/web)
 
-**Why 15-minute rotation**: Balances privacy (shorter = harder to track) against battery life (longer = fewer key derivations) and location freshness (reports are only useful within the rotation window). A 15-minute window also aligns with typical urban transit times, preventing long-distance tracking by passive observers.
+### Observation and durable ingestion
 
-### 2. Location Reporting (Crowd-Sourced)
+1. The finder observes a beacon and obtains its current public encryption material.
+2. It records its approximate location, observation time and accuracy.
+3. It encrypts the observation for the owner and creates a stable report identity.
+4. It submits the same envelope on retries, subject to bounded local buffering.
+5. The service validates envelope shape/size, applies admission controls, and durably accepts it.
+6. A worker stores or upserts the report and advances ingestion progress.
+7. Queries expose stored reports and distinguish processing lag from absence.
 
-When an iPhone detects an AirTag BLE advertisement, it encrypts its own GPS location using the AirTag's public key (ECIES: Elliptic Curve Integrated Encryption Scheme) and submits the encrypted blob to Apple's servers.
+The finder knows the location it observes; encryption protects the contents from
+intermediaries and unauthorized readers. Public-key encryption does not prove that
+the finder reported a truthful location. The owner must treat observations as evidence
+with accuracy and plausibility limits, not infallible coordinates.
 
-**ECIES Encryption:**
-1. Generate ephemeral EC key pair (P-224)
-2. Compute shared secret via ECDH with AirTag's public key
-3. Derive AES-256-GCM key from shared secret using SHA-256
-4. Encrypt `{lat, lon, accuracy, timestamp}` with random IV
-5. Transmit: `{ephemeralPublicKey, iv, ciphertext, authTag}`
+Envelope authentication should bind relevant protocol context, including version
+and lookup identity. Keep server receipt time distinct from an encrypted observation
+time. A server cannot validate a hidden timestamp merely by validating its own clock.
 
-Only the owner (who can derive the matching private key from the master secret) can decrypt. The finder iPhone never knows which AirTag it reported -- it just forwards the blob.
+### Owner query and map display
 
-### 3. Location Retrieval (Owner)
+The owner derives lookup tokens for a bounded time window and requests corresponding
+ciphertexts. The query service caps tokens, result bytes, time span and pagination
+work. For global delivery, define how a token resolves to report storage regardless
+of where a finder uploaded it; region-only ingestion without discovery routing can
+strand observations away from the owner's query.
 
-When the owner opens Find My, the client derives all possible identifier hashes for a time range (one per 15-minute period), queries Apple's servers for matching encrypted reports, and decrypts each payload locally.
+The client decrypts each report, validates the payload and merges by report identity.
+Sort observations by observation time, with a stable tie-breaker. A late upload of
+an old sighting must not move the “latest” marker backward in time.
 
-**Query Flow:**
-1. Derive period keys for the time range (typically last 24 hours = 96 periods)
-2. Compute identifier hash for each period: `SHA-256(SHA-256(publicKey)[:6])`
-3. Batch query: `SELECT * FROM location_reports WHERE identifier_hash = ANY($hashes) AND created_at BETWEEN $start AND $end`
-4. Decrypt each payload using the period's private key
-5. Cache decrypted locations in `decrypted_locations` table for map display
+Show timestamp and accuracy together. A line between sparse observations represents
+a sequence, not a measured continuous journey. Empty history, unavailable network,
+missing keys and invalid ciphertext need different states.
 
-### 4. Anti-Stalking Detection
+Map tiles, external directions and analytics can expose the viewed area after
+successful local decryption. Include those services in the privacy assessment;
+keeping the report database opaque does not automatically protect the whole UI.
 
-Detects unknown trackers traveling with a user across multiple locations.
+### Lost mode and notification choices
 
-**Detection Algorithm:**
-1. iPhone periodically scans for BLE advertisements
-2. Unknown identifiers (not belonging to the user's registered devices) are recorded as sightings
-3. Sightings are analyzed for stalking patterns within a 3-hour sliding window:
-   - **Threshold**: 3+ sightings of the same identifier
-   - **Distance**: User has traveled > 500 meters with the tracker
-   - **Duration**: Tracker has been present for > 1 hour
-4. If pattern detected, alert the user with notification: "Unknown AirTag Detected"
-5. Offer options: play sound, show map of sighting locations, instructions to disable
+A public found-item page should use a deliberate physical-item lookup mechanism
+and show only contact information the owner chose to publish. It must not expose
+private report history or an account-wide device list.
 
-**False Positive Mitigation**: Family members' AirTags, shared spaces (offices, transit), and AirTags on shared items are common false positives. The distance threshold (500m) and time window (1 hour) filter out most static encounters.
+For “notify when found,” one option is for the owner app to detect newly retrieved
+reports. A server subscription to short-lived lookup tokens can reduce polling, but
+reveals an association between that subscription and those tokens. Choose and disclose
+that metadata trade-off rather than claiming complete unlinkability.
 
-### 5. Lost Mode
+Notification identity, retries and expiry are separate from report identity. The
+system should not send an unbounded stream of identical “found” alerts for every
+finder observation, or treat push delivery as the only durable record of a report.
 
-When enabled, Lost Mode tags the device with contact information. When a network device detects a lost AirTag:
-1. The location report is submitted (standard flow)
-2. The server checks if the identifier hash matches any device in Lost Mode
-3. If matched, a push notification is queued for the owner
-4. NFC tap on the AirTag reveals the owner's contact message
+### Unwanted-tracker safety
 
----
+Detection belongs close to the nearby device, with protected short-lived sighting
+history and platform-supported signals. The protocol must reconcile rotating
+identifiers with recognizing repeated unwanted proximity; grouping unrelated hashes
+by guesswork is not a complete solution.
+
+The UI should clearly describe the observation and offer supported next actions.
+It must not label a person a stalker from a heuristic, hide essential help behind
+multiple steps, or imply that no alert proves safety. Device identification and
+disabling instructions should follow maintained platform guidance.
+[Apple's unwanted-tracking guidance](https://support.apple.com/en-us/119874)
+
+The repository's thresholds are demo constants, not calibrated safety guarantees.
+Detailed local behavior is documented below.
 
 ## Database Schema
 
-### Entity-Relationship Diagram
+The complete local schema is in
+[backend/src/db/init.sql](./backend/src/db/init.sql). It uses plain PostgreSQL,
+not PostGIS, partitioned tables or a distributed report store.
 
-```
-                                ┌─────────────────┐
-                                │     session      │
-                                │─────────────────│
-                                │ sid (PK)         │
-                                │ sess (JSON)      │
-                                │ expire           │
-                                └─────────────────┘
+| Table | Important local fields | Relationships and constraints |
+|-------|------------------------|-------------------------------|
+| `users` | UUID, unique email, bcrypt hash, name, user/admin role | Role check and email uniqueness |
+| `registered_devices` | UUID, owner, type, name, emoji, plaintext master secret, active flag | Owner FK with cascade; type check; owner/active indexes |
+| `location_reports` | Bigserial ID, identifier hash, encrypted JSON envelope, region, receipt time | No device FK; identifier/time B-tree indexes; no report uniqueness |
+| `lost_mode` | Device ID, enabled flag, contact fields, notification preference, enabled time | Device ID is PK/FK with cascade |
+| `notifications` | UUID, user/device IDs, type, title/message, read flag and JSON data | User cascade, device set-null; partial unread index |
+| `tracker_sightings` | User ID, identifier hash, plaintext coordinates and seen time | User cascade; user/hash and time indexes |
+| `decrypted_locations` | Device ID, plaintext coordinates and observation time | Declared but unused by the current application read/write path |
+| `session` | Session ID, JSON and expiry | Declared optional PostgreSQL session table; active sessions use Redis |
 
-┌─────────────────┐       1:N        ┌─────────────────────┐
-│      users      │◄─────────────────│  registered_devices  │
-│─────────────────│                  │─────────────────────│
-│ id (PK, UUID)   │                  │ id (PK, UUID)        │
-│ email (UNIQUE)  │                  │ user_id (FK) ────────┤ CASCADE
-│ password_hash   │                  │ device_type          │
-│ name            │                  │ name, emoji          │
-│ role            │                  │ master_secret        │
-└────────┬────────┘                  │ current_period       │
-         │                           │ is_active            │
-         │ 1:N CASCADE               └──────────┬──────────┘
-         │                                       │
-         ▼                                       │ 1:1 CASCADE
-┌─────────────────┐                              ▼
-│  notifications  │                    ┌─────────────────────┐
-│─────────────────│                    │     lost_mode        │
-│ id (PK, UUID)   │                    │─────────────────────│
-│ user_id (FK)    │                    │ device_id (PK, FK)  │
-│ device_id (FK)  │ SET NULL           │ enabled             │
-│ type            │                    │ contact_phone/email │
-│ title, message  │                    │ message             │
-│ is_read, data   │                    │ notify_when_found   │
-└─────────────────┘                    └─────────────────────┘
-         │
-         │ 1:N CASCADE                 1:N CASCADE
-         ▼                                       ▼
-┌─────────────────┐                    ┌─────────────────────┐
-│tracker_sightings│                    │ decrypted_locations  │
-│─────────────────│                    │─────────────────────│
-│ id (PK, BIGSER) │                    │ id (PK, BIGSERIAL)  │
-│ user_id (FK)    │                    │ device_id (FK)       │
-│ identifier_hash │                    │ latitude, longitude  │
-│ latitude, lng   │                    │ accuracy, address    │
-│ seen_at         │                    │ timestamp            │
-└─────────────────┘                    └─────────────────────┘
+No foreign key from reports to devices does not establish privacy. The same backend
+has every device secret and actively derives report identifiers. Raw encrypted
+reports also survive device deletion because there is no cascade relationship or
+scheduled retention cleanup for them.
 
-┌─────────────────────┐
-│  location_reports   │  ◄── Standalone (no FK to devices -- privacy by design)
-│─────────────────────│
-│ id (PK, BIGSERIAL)  │      Server cannot correlate reports to devices
-│ identifier_hash     │      Only owner can derive matching hashes
-│ encrypted_payload   │
-│ reporter_region     │
-│ created_at          │
-└─────────────────────┘
-```
-
-### Table Definitions
-
-```sql
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    name VARCHAR(100) NOT NULL,
-    role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Registered devices (AirTags, iPhones, etc.)
-CREATE TABLE IF NOT EXISTS registered_devices (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    device_type VARCHAR(50) NOT NULL CHECK (device_type IN ('airtag', 'iphone', 'macbook', 'ipad', 'airpods')),
-    name VARCHAR(100) NOT NULL,
-    emoji VARCHAR(10) DEFAULT '📍',
-    master_secret VARCHAR(64) NOT NULL,
-    current_period INTEGER DEFAULT 0,
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_devices_user ON registered_devices(user_id);
-CREATE INDEX idx_devices_active ON registered_devices(is_active);
-
--- Location reports (encrypted blobs from crowd-sourced network)
-CREATE TABLE IF NOT EXISTS location_reports (
-    id BIGSERIAL PRIMARY KEY,
-    identifier_hash VARCHAR(64) NOT NULL,
-    encrypted_payload JSONB NOT NULL,
-    reporter_region VARCHAR(10),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_reports_identifier ON location_reports(identifier_hash);
-CREATE INDEX idx_reports_time ON location_reports(created_at);
-CREATE INDEX idx_reports_identifier_time ON location_reports(identifier_hash, created_at DESC);
-
--- Lost mode settings
-CREATE TABLE IF NOT EXISTS lost_mode (
-    device_id UUID PRIMARY KEY REFERENCES registered_devices(id) ON DELETE CASCADE,
-    enabled BOOLEAN DEFAULT FALSE,
-    contact_phone VARCHAR(50),
-    contact_email VARCHAR(200),
-    message TEXT,
-    notify_when_found BOOLEAN DEFAULT TRUE,
-    enabled_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Notifications
-CREATE TABLE IF NOT EXISTS notifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    device_id UUID REFERENCES registered_devices(id) ON DELETE SET NULL,
-    type VARCHAR(50) NOT NULL CHECK (type IN ('device_found', 'unknown_tracker', 'low_battery', 'system')),
-    title VARCHAR(200) NOT NULL,
-    message TEXT,
-    is_read BOOLEAN DEFAULT FALSE,
-    data JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_notifications_user ON notifications(user_id);
-CREATE INDEX idx_notifications_unread ON notifications(user_id, is_read) WHERE is_read = FALSE;
-
--- Anti-stalking tracker sightings
-CREATE TABLE IF NOT EXISTS tracker_sightings (
-    id BIGSERIAL PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    identifier_hash VARCHAR(64) NOT NULL,
-    latitude DECIMAL(10, 8) NOT NULL,
-    longitude DECIMAL(11, 8) NOT NULL,
-    seen_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_sightings_user_identifier ON tracker_sightings(user_id, identifier_hash);
-CREATE INDEX idx_sightings_time ON tracker_sightings(seen_at);
-
--- Decrypted location cache
-CREATE TABLE IF NOT EXISTS decrypted_locations (
-    id BIGSERIAL PRIMARY KEY,
-    device_id UUID NOT NULL REFERENCES registered_devices(id) ON DELETE CASCADE,
-    latitude DECIMAL(10, 8) NOT NULL,
-    longitude DECIMAL(11, 8) NOT NULL,
-    accuracy DECIMAL(10, 2),
-    address TEXT,
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_decrypted_device ON decrypted_locations(device_id);
-CREATE INDEX idx_decrypted_time ON decrypted_locations(device_id, timestamp DESC);
-
--- Session table for express-session
-CREATE TABLE IF NOT EXISTS session (
-    sid VARCHAR NOT NULL COLLATE "default",
-    sess JSON NOT NULL,
-    expire TIMESTAMP(6) NOT NULL,
-    PRIMARY KEY (sid)
-);
-
-CREATE INDEX idx_session_expire ON session(expire);
-```
-
-### Schema Design Rationale
-
-**location_reports has NO foreign key to registered_devices**: This is the most critical design decision. The server cannot correlate an identifier_hash to a specific device because: (1) identifiers rotate every 15 minutes, (2) only the owner can derive which hashes belong to their device, (3) reports come from anonymous network devices. This enforces the zero-knowledge privacy guarantee.
-
-**Separated encrypted and decrypted data**: `location_reports` stores what the server receives (encrypted blobs, anonymous). `decrypted_locations` stores what the owner sees (plaintext coordinates, linked to device). This separation enforces that the server cannot JOIN reports to devices without the master_secret.
-
-**Lost mode as 1:1 table**: `device_id` is both PK and FK, enforcing exactly one record per device. Separating from `registered_devices` avoids nullable contact columns and cleanly separates device identity from lost state.
-
-**BIGSERIAL for high-volume tables**: `location_reports` (billions of rows), `tracker_sightings`, and `decrypted_locations` use BIGSERIAL for compact storage (8 bytes vs 16 for UUID) and faster sequential inserts. User-facing entities use UUID for security (no enumeration) and distributed generation.
-
-**Partial index for unread notifications**: `WHERE is_read = FALSE` keeps the index small since most notifications are eventually read. The badge count query (`SELECT COUNT(*) WHERE user_id = $1 AND is_read = FALSE`) hits only the small partial index.
-
-### Foreign Key Strategy
-
-| Parent | Child | FK Column | On Delete | Rationale |
-|--------|-------|-----------|-----------|-----------|
-| `users` | `registered_devices` | `user_id` | CASCADE | Device meaningless without owner |
-| `users` | `notifications` | `user_id` | CASCADE | Notifications are user-specific |
-| `users` | `tracker_sightings` | `user_id` | CASCADE | Anti-stalking data is user-specific |
-| `registered_devices` | `lost_mode` | `device_id` | CASCADE | Lost mode settings meaningless without device |
-| `registered_devices` | `notifications` | `device_id` | SET NULL | Preserve notification history ("Your AirTag was found") even after device removal |
-| `registered_devices` | `decrypted_locations` | `device_id` | CASCADE | Cached locations useless without device |
-
----
+The production model would replace server-held decryption secrets with protected
+endpoint key custody. Report storage would add stable report identity, envelope
+version, receipt-time retention buckets and a bounded lookup index. Safety history
+would move to the nearby trusted endpoint rather than this plaintext server table.
 
 ## API Design
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/auth/register` | Create user account |
-| POST | `/api/auth/login` | Authenticate and create session |
-| POST | `/api/auth/logout` | Destroy session |
-| GET | `/api/devices` | List user's registered devices |
-| POST | `/api/devices` | Register a new device |
-| DELETE | `/api/devices/:id` | Remove a device |
-| POST | `/api/locations/report` | Submit encrypted location report (idempotent) |
-| GET | `/api/locations/:deviceId` | Get decrypted locations for a device |
-| POST | `/api/lost-mode/:deviceId` | Enable/disable lost mode |
-| GET | `/api/lost-mode/:deviceId` | Get lost mode status |
-| GET | `/api/notifications` | List user notifications |
-| PATCH | `/api/notifications/:id/read` | Mark notification as read |
-| GET | `/api/anti-stalking/check` | Check for unknown trackers |
-| POST | `/api/anti-stalking/sighting` | Report tracker sighting |
-| GET | `/api/admin/stats` | Admin dashboard statistics |
-| GET | `/health` | Shallow health check (liveness) |
-| GET | `/health/ready` | Deep health check (readiness) |
-| GET | `/metrics` | Prometheus metrics |
+The local prefix is `/api`; the application does not implement `/api/v1` contracts.
+All location, device, lost-mode, notification and sighting routes require a session,
+including the report-submission endpoint.
 
----
+| Method | Path | Implemented behavior |
+|--------|------|----------------------|
+| POST | `/api/auth/register`, `/api/auth/login`, `/api/auth/logout` | Account/session actions |
+| GET | `/api/auth/me` | Current database user associated with the session |
+| GET / POST | `/api/devices` | List / create devices; responses include stored secret fields |
+| GET / PATCH / DELETE | `/api/devices/:id` | Owned device detail / update / removal |
+| POST | `/api/devices/:id/play-sound` | Simulated acknowledgement only |
+| GET | `/api/locations/:deviceId` | Server-decrypted history; optional startTime/endTime/limit |
+| GET | `/api/locations/:deviceId/latest` | Latest plaintext location, including a cache shortcut |
+| POST | `/api/locations/:deviceId/simulate` | Owner-supplied coordinates encrypted and stored by the server |
+| POST | `/api/locations/report` | Queue supplied envelope, or synchronously store on publication error |
+| GET / PUT | `/api/lost-mode/:deviceId` | Read / upsert owned device settings |
+| POST | `/api/lost-mode/:deviceId/enable`, `/api/lost-mode/:deviceId/disable` | Quick lost-mode changes |
+| GET | `/api/notifications`, `/api/notifications/unread-count` | Inbox / unread count |
+| POST | `/api/notifications/:id/read`, `/api/notifications/read-all` | Mark read |
+| DELETE | `/api/notifications/:id` | Delete owned notification |
+| POST | `/api/anti-stalking/sighting` | Record plaintext sighting and analyze synchronously |
+| GET | `/api/anti-stalking/unknown-trackers`, `/api/anti-stalking/sightings/:identifierHash` | Summaries / recent sighting details |
+| GET | `/api/admin/stats`, `/api/admin/users`, `/api/admin/devices`, `/api/admin/lost-devices` | Session-role-protected administration reads |
+
+The queued report response is HTTP 202 with status `queued`; synchronous storage
+returns HTTP 201 and a report ID. Neither path currently offers a durable operation
+lookup or the same deduplication behavior.
+
+A production owner query would submit a bounded set of derived tokens and receive
+ciphertexts with continuation metadata. The local device-ID endpoint performs both
+lookup derivation and decryption on the server instead.
 
 ## Key Design Decisions
 
-### 1. End-to-End Encryption (Zero-Knowledge)
+### Endpoint decryption versus server-trusted convenience
 
-Apple cannot decrypt location reports. The finder encrypts with the AirTag's rotating public key; only the owner (with the master secret) can derive the matching private key to decrypt. This means Apple is not a liability for location data, and a server breach exposes only encrypted blobs. The trade-off is that Apple cannot provide server-side features like geofencing or location-based alerts -- all location processing must happen on the owner's device after decryption.
+Owner-side keys protect report contents when storage or an intermediary is compromised.
+They also let the backend store opaque observations without interpreting coordinates.
+The cost is pairing, recovery, sharing, client processing and secure application delivery.
 
-### 2. 15-Minute Key Rotation
+Server-side decryption simplifies the demo and enables its lost-mode scan and map
+API. It also means a backend or database compromise exposes location capability.
+Encrypting secrets under a server-accessible key changes storage protection, not
+which party can read locations. The local project makes this convenience trade-off.
 
-Rotating BLE identifiers every 15 minutes prevents passive tracking by third parties who observe BLE advertisements. A shorter rotation (e.g., 1 minute) would improve privacy but dramatically increase battery consumption (more key derivations, more BLE advertisement changes) and reduce the window for network devices to submit reports. The 15-minute window provides a practical balance: long enough for nearby iPhones to detect and report, short enough to prevent sustained tracking across a city.
+### Stable report identity versus an expiring processing marker
 
-### 3. Anti-Stalking as a First-Class Feature
+A finder should reuse one report identity and envelope when retrying a lost response.
+Durable storage enforces uniqueness for that identity, with a payload fingerprint
+rejecting conflicting reuse. A worker may receive the same message twice and still
+produce one report record.
 
-Rather than relying on users to manually check for trackers, the system proactively scans and alerts. The detection thresholds (3+ sightings, 500m distance, 1 hour duration) are calibrated to minimize false positives from family AirTags, shared spaces, and transit while catching genuine stalking attempts. The trade-off is alert fatigue -- in dense urban environments with many AirTags, the false positive rate can be noticeable. We mitigate this by requiring significant user movement (500m) alongside persistent tracker presence.
+A Redis marker written before storage can survive a failed insert and suppress work
+that never completed. A marker written only afterward leaves a duplicate window.
+Use the durable sink to establish the effect; an optional cache accelerates duplicate
+responses but does not replace the sink's consistency rule.
 
----
+The cost is a uniqueness/indexing strategy at the actual write volume. It must be
+measured. Assuming a database constraint is unaffordable and then claiming exactly-once
+behavior from an independent cache hides the failure boundary.
 
-## Caching and Edge Strategy
+### Freshness-based caching versus rotation-based expiry
 
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Mobile    │───▶│    CDN      │───▶│   Valkey    │───▶│ PostgreSQL  │
-│   Client    │    │  (Static)   │    │   (Cache)   │    │  (Source)   │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-```
+Rotated identifiers remain relevant for historical or delayed reports. A report
+arriving after its period ends is not automatically useless. Cache policy must be
+based on acceptable view staleness and report arrival behavior, not just key rotation.
 
-| Layer | What's Cached | TTL | Strategy |
-|-------|---------------|-----|----------|
-| CDN | Static assets, NFC landing pages | 24 hours | Cache-Control headers |
-| Valkey L1 | User's device list | 5 minutes | Cache-aside, invalidate on device change |
-| Valkey L2 | Location report lookups | 15 minutes | Cache-aside (aligns with key rotation) |
-| Valkey L3 | Idempotency keys | 24 hours | Write-on-submit, prevents replay |
-| Client | Recent decrypted locations | 1 minute | Stale-while-revalidate |
+Use stable bounded time windows, incremental retrieval and short negative-cache
+lifetimes for recent periods. Historical buckets may be cached longer only under a
+defined late-arrival policy. Include every query dimension and authorization scope.
 
-**Cache-Aside** is the primary pattern: check cache first, fetch from DB on miss, populate cache with TTL. On writes (device registered, lost mode toggled), the relevant cache keys are explicitly invalidated. The 15-minute TTL for reports aligns with key rotation -- cached data expires as new identifiers become active.
-
----
-
-## Async Queue Architecture (RabbitMQ)
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                         RabbitMQ                               │
-│                                                                │
-│  Exchange: airtag.events (topic)                               │
-│                                                                │
-│  ┌────────────────────────────────────────────────────────┐    │
-│  │ location.reports ── Store encrypted blobs (at-least-1) │    │
-│  ├────────────────────────────────────────────────────────┤    │
-│  │ antistalk.analyze ── Pattern detection (at-least-1)    │    │
-│  ├────────────────────────────────────────────────────────┤    │
-│  │ notifications.push ── Alert delivery (at-least-1)      │    │
-│  ├────────────────────────────────────────────────────────┤    │
-│  │ reports.cleanup ── TTL expiration (at-most-1)          │    │
-│  └────────────────────────────────────────────────────────┘    │
-└───────────────────────────────────────────────────────────────┘
-```
-
-| Queue | Semantics | Prefetch | Backpressure |
-|-------|-----------|----------|--------------|
-| `location.reports` | At-least-once, idempotent writes | 100 | Max 1M messages, 7-day TTL |
-| `antistalk.analyze` | At-least-once, stateless check | 10 | Dead-letter after 2 retries |
-| `notifications.push` | At-least-once, dedup in push | 50 | Retry with backoff |
-| `reports.cleanup` | At-most-once, cron backup | 1000 | Acceptable to miss some |
-
----
+This adds bookkeeping compared with one fixed TTL, but avoids both stale “not found”
+responses and nearly unique cache keys for every millisecond-level refresh.
 
 ## Consistency and Idempotency
 
-### Write Semantics
+For the production path, acknowledge ingestion only after a defined durable boundary:
+a confirmed append to the chosen ingestion log, or a committed report insert. Worker
+acknowledgement follows the idempotent durable effect. Retries and retention must
+preserve identity over the supported replay horizon.
 
-| Operation | Consistency | Idempotency | Rationale |
-|-----------|-------------|-------------|-----------|
-| Location Report | Eventual | Idempotent (content-hash dedup) | High volume; duplicates are harmless |
-| Device Registration | Strong | Idempotent (upsert by device_id) | Critical user data |
-| Lost Mode Toggle | Strong | Idempotent (last-write-wins) | User expects immediate effect |
-| Anti-Stalking Alert | Eventual | At-least-once | Missing an alert is worse than a duplicate |
+If a database transaction also creates a notification intent, use an outbox for
+that intent. A relay can publish more than once; the notification consumer therefore
+needs its own durable identity and provider-specific retry/reconciliation behavior.
+There is no universal exactly-once guarantee for every external delivery.
 
-**Location Report Idempotency**: The idempotency key is `SHA-256(identifierHash + timestamp_rounded_to_minute + payloadHash)`. Redis stores this key with 24-hour TTL. Duplicate submissions return 200 without re-inserting. This handles client retries on cellular networks.
+Lost-mode settings need an expected version or another explicit conflict policy
+when edited from multiple owner devices. Pairing/removal and key sharing likewise
+need defined lifecycle semantics. None of these follow automatically from using UUIDs.
 
-**Lost Mode Optimistic Locking**: Toggle operations include a version number. The UPDATE checks `WHERE version = $expected`, returning a conflict error if another session modified the record. This prevents race conditions between multiple devices.
+## Security / Auth
 
----
+The local app uses bcrypt and Redis-backed express-session cookies. Backend ownership
+checks exist on device and history operations, and admin routes check the role stored
+in the session. Login does not regenerate the session ID, and role changes in the
+database do not immediately replace an existing session's role.
+
+A critical exception is `getLatestLocation`: it returns a device-keyed cache hit
+before checking the caller's ownership. Authorization must precede returning any
+cached private value. Device deletion also leaves that latest cache intact until TTL.
+
+Device APIs and the admin device list serialize `master_secret`. Frontend TypeScript
+interfaces omitting that property do not remove it from the network response or
+runtime object. Map simulation logs device IDs and plaintext coordinates; broad
+claims of secret/location redaction are therefore inaccurate.
+
+The rate limiter reads the first `X-Forwarded-For` value directly. A production
+proxy trust policy must establish which forwarding information is authoritative.
+Report shape, coordinates, query ranges and response size also require stronger
+validation than the local truthiness checks and TypeScript casts.
 
 ## Observability
 
-### Metrics (Prometheus)
+Measure accepted, stored, rejected and duplicate reports separately. Query latency
+needs a matching freshness measure: report processing lag, age of the latest valid
+observation, and client time since the last successful refresh are distinct signals.
+Safety metrics should not centralize raw personal movement histories.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_request_duration_seconds` | Histogram | API latency by endpoint |
-| `location_reports_total` | Counter | Ingestion throughput, regional breakdown |
-| `cache_operations_total{result}` | Counter | Cache hit/miss ratio |
-| `db_query_duration_seconds` | Histogram | Slow query detection |
-| `rate_limit_hits_total` | Counter | Abuse detection, limit tuning |
+[shared/metrics.ts](./backend/src/shared/metrics.ts) collects HTTP timing, cache,
+selected database operations, duplicate checks and rate-limit events. Queue metrics
+are collected in each process; workers have no HTTP metrics server, so their values
+are not included in the API endpoint. Session/device gauges are declared but not
+updated by their business services.
 
-### Alert Thresholds
-
-| Metric | Warning | Critical |
-|--------|---------|----------|
-| Report ingestion p99 | > 200ms | > 500ms |
-| Report error rate | > 1% | > 5% |
-| Anti-stalking queue depth | > 10K | > 100K |
-| Redis memory | > 80% | > 95% |
-
-### Structured Logging
-
-Pino JSON logs with request correlation IDs, component-level child loggers (e.g., `locationService`, `antiStalkingService`), and automatic redaction of sensitive fields. Development mode uses `pino-pretty` for readability.
-
----
+HTTP route labels can lose the router prefix and combine unrelated paths. Region
+labels accept report-supplied values and need bounded cardinality at scale.
+Pino request IDs are not propagated through all service calls or queue envelopes,
+so the code does not supply end-to-end distributed tracing.
 
 ## Failure Handling
 
-### Graceful Degradation
+| Failure | Proposed production behavior | Local behavior |
+|---------|------------------------------|----------------|
+| Finder offline | Bounded retry buffer preserving report identity | No real finder client |
+| Broker publication uncertain | Resolve/retry same durable identity | Ordinary channel, no publisher confirms |
+| Worker SQL failure | Bounded retry and recoverable dead-letter storage | Reject without requeue; no dead-letter binding |
+| Cache error | Bounded fallback where authorized | Helpers catch errors; sessions/limits still depend on Redis |
+| Query/decryption failure | Distinct unavailable/key/invalid-report state | Many errors become console output or empty-looking UI |
+| Broker reconnect | Re-establish consumers and readiness | Connection fields reset; consumers do not resubscribe automatically |
 
-- **Redis down**: Cache misses fall through to PostgreSQL; rate limiting degrades to in-memory counters; idempotency checks are bypassed (at-least-once is acceptable)
-- **RabbitMQ down**: Location reports are written directly to PostgreSQL (synchronous fallback); anti-stalking analysis is deferred until queue recovers
-- **PostgreSQL read replica down**: Queries fall back to primary; write performance may degrade
+`/health` and `/health/live` are liveness endpoints. `/health/ready` checks PostgreSQL
+and Redis, but returns 200 degraded when either alone fails and 503 only when both
+fail. It does not inspect RabbitMQ or consumers. The API starts listening without
+calling the available dependency-wait helper.
 
-### Retry Strategy
-
-Queue consumers use exponential backoff with dead-letter queues after 3 attempts. HTTP clients retry with jitter on 5xx responses. All retryable operations use idempotency keys.
-
----
+Workers close their AMQP/database/Redis clients on termination, but do not explicitly
+cancel consumption and drain active handlers before closing the channel. The API
+has no graceful shutdown handler. No circuit breaker is implemented; this is an
+omission, not evidence that databases or brokers cannot fail independently.
 
 ## Scalability Considerations
 
-### What Breaks First
+Partition high-volume report storage by lookup-token ownership with receipt-time
+buckets for retention. Regional ingress can forward to a deterministic token owner
+or an explicitly discoverable global index. Geography and encrypted contents cannot
+supply routing information the service deliberately does not possess.
 
-1. **Location report ingestion** -- 10M+ reports/minute requires Kafka-level throughput. RabbitMQ works for moderate scale; at global scale, partition by region with Kafka.
-2. **Identifier hash lookups** -- Each owner query generates 96+ hashes (24h / 15min). PostgreSQL compound index handles this, but at 500M AirTags, consider Cassandra partitioned by identifier_hash prefix.
-3. **Anti-stalking analysis** -- Per-user pattern detection is CPU-bound. Horizontally scale workers, partition by user_id.
+Bound report size, token batches, per-token history, query concurrency and client
+decryption work. Latest reads need incremental retrieval, not full-week scans for
+every card. Duplicate suppression must preserve the durable storage contract across
+partition moves and replay.
 
-### Horizontal Scaling Path
-
-- **Report ingestion**: Partition by `reporter_region` across Kafka topics and consumer groups
-- **Query service**: Stateless, horizontal scaling behind load balancer
-- **Anti-stalking**: Worker pool consuming from RabbitMQ with configurable prefetch
-- **Database**: Read replicas for query service, time-based partitioning for `location_reports` (7-day retention), geographic sharding for global scale
-
----
+Drop expired storage buckets through a controlled retention process and include
+backups/logs in the policy. Do not infer retention from a query's default seven-day
+window. Add a new database or broker only after representative measurements justify
+its operational costs; product names have no fixed universal throughput ceiling.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Encryption | End-to-end (ECIES) | Server-side | Zero-knowledge privacy; Apple cannot see locations |
-| Key rotation | 15 minutes | Hourly / 1 minute | Balance privacy, battery life, and report window |
-| Anti-stalking | Proactive alerts | Manual check | Safety-first; false positives preferable to missed stalking |
-| Precision finding | UWB | BLE RSSI only | Centimeter-level accuracy vs meter-level |
-| Report storage | PostgreSQL + BIGSERIAL | Cassandra | Simpler operations; partition by time at scale |
-| Queue | RabbitMQ | Kafka | Easier setup, sufficient for learning scale |
-| Session storage | Redis + cookie | JWT | Immediate revocation, simpler session management |
-| Identifier hash index | Compound B-tree | Hash index | Supports range scans (time-ordered retrieval) |
-
----
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-App (conditional rendering based on auth + tab state)
-├── [Unauthenticated]
-│   └── LoginForm (email/password + register toggle)
-├── [Authenticated]
-│   ├── Header (logo, user info, notification bell with badge)
-│   ├── NotificationsPanel (slide-out panel, mark read, mark all read)
-│   ├── Tab Switcher (My Devices / Admin Dashboard -- admin only)
-│   ├── [Devices Tab]
-│   │   ├── Device List
-│   │   │   └── DeviceCard (emoji, name, type, last location, battery)
-│   │   ├── MapView (Leaflet map with device markers + location history)
-│   │   └── DeviceDetails (device info, lost mode controls, sound, delete)
-│   ├── [Admin Tab]
-│   │   └── AdminDashboard (system stats, user list, report counts)
-│   └── AddDeviceModal (device type selector, name, emoji picker)
-```
-
-### Zustand Store
-
-A single unified store (`useStore`) manages all application state, organized into five domains:
-
-**Auth state**: `user` (current user or null), `isLoading`, `error`. Actions: `login`, `register`, `logout`, `checkAuth`. The `checkAuth` action runs on mount to restore sessions from existing cookies. After login, it cascades to fetch devices and unread notification count.
-
-**Devices state**: `devices` (array of registered devices), `selectedDevice` (currently selected for map/details view). Actions: `fetchDevices`, `createDevice`, `updateDevice`, `deleteDevice`, `selectDevice`, `playSound`. Selecting a device triggers automatic loading of its location history and lost mode settings.
-
-**Locations state**: `locations` (location history for the selected device). Actions: `fetchLocations`, `simulateLocation`. The simulate action is the demo equivalent of a crowd-sourced network report -- clicking on the map submits an encrypted location report for the selected device, then refreshes the location history.
-
-**Lost Mode state**: `lostModeSettings` (Record keyed by device ID). Actions: `fetchLostMode`, `updateLostMode`, `enableLostMode`, `disableLostMode`. Lost mode settings are fetched lazily when a device is selected, not eagerly on login.
-
-**Notifications state**: `notifications` (array), `unreadCount` (for badge display). Actions: `fetchNotifications`, `fetchUnreadCount`, `markAsRead`, `markAllAsRead`. The unread count is fetched on login and decremented optimistically when marking individual notifications as read.
-
-### Routing
-
-The AirTag frontend does not use a router library. Instead, it uses conditional rendering in the root `App` component based on authentication state and a local `activeTab` state variable (`'devices' | 'admin'`). The authentication check happens on mount via `useStore().checkAuth()`. If the user is not authenticated, `LoginForm` is rendered. If authenticated, the main layout (Header + DeviceList + MapView) is rendered. Admin users see a tab switcher to toggle between the devices view and the admin dashboard.
-
-This routing approach is appropriate because the application has only two views (devices and admin), and there is no need for deep linking, browser history, or shareable URLs for internal pages.
-
-### Data Fetching
-
-API communication is centralized in `services/api.ts`, which exports domain-specific API objects (`authApi`, `devicesApi`, `locationsApi`, `lostModeApi`, `notificationsApi`). Each API object wraps `fetch` calls with `credentials: 'include'` for cookie-based session auth and standardized error handling (parsing the response body for error messages).
-
-Data fetching is triggered by store actions, which update state on success. There is no background polling or WebSocket connection -- location data is refreshed by a 30-second `setInterval` timer that runs while a device is selected, and by user-initiated actions (clicking the map to simulate a report).
-
-### Key UI Patterns
-
-**Interactive map with Leaflet**: The `MapView` component renders a Leaflet map showing the selected device's location history as markers. Clicking on the map triggers `simulateLocation`, which submits an encrypted location report for the selected device at the clicked coordinates. This simulates the crowd-sourced Find My network without requiring hardware.
-
-**Device card selection**: `DeviceCard` components support selection via click. Selecting a device loads its location history, renders markers on the map, and shows the `DeviceDetails` panel below the map. The selected device is visually highlighted.
-
-**Notification badge**: The `Header` component shows a bell icon with a badge count of unread notifications. Clicking opens the `NotificationsPanel`, a slide-out panel listing all notifications with mark-as-read and mark-all-as-read actions. The badge count updates optimistically (decrements immediately on mark-as-read without waiting for the API response).
-
-**Periodic location refresh**: When a device is selected, a `useEffect` sets up a 30-second interval to re-fetch locations. This ensures the map stays reasonably current without WebSocket infrastructure. The interval is cleared when the device is deselected or the component unmounts.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade backend pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and why it matters for a system operating at scale.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is a method for restricting system access based on the roles assigned to individual users, rather than assigning permissions directly to each user. In this project, users have a `role` column in the `users` table with a CHECK constraint limiting values to `'user'` or `'admin'`.
-
-The purpose of RBAC is to separate "who can do what" from "who is who." Instead of maintaining a per-user permission list (which becomes unmanageable at thousands of users), you define a small set of roles and assign permissions to roles. A user inherits all permissions of their role. In this project, regular users can manage their own devices, view their own locations, and configure lost mode. Admins can additionally view system-wide statistics, see all users, and access report counts.
-
-On the frontend, the admin tab is conditionally rendered only when `user.role === 'admin'`. On the backend, the admin routes middleware verifies the role server-side via the session, so even direct API calls from non-admin users are rejected with 403 Forbidden.
-
-At production scale, RBAC prevents unauthorized access to sensitive operations (viewing all users' device locations, accessing aggregate tracking data) without requiring complex per-resource permission checks on every request.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database, and populates the cache on a miss. The cache does not communicate with the database directly -- the application code sits between them and manages both.
-
-The flow works as follows: (1) The application receives a request for data. (2) It checks Valkey/Redis for a cached value using a deterministic key. (3) If the key exists (cache hit), the cached value is returned immediately, avoiding a database query. (4) If the key does not exist (cache miss), the application queries PostgreSQL, stores the result in Redis with a TTL (time-to-live), and returns the result.
-
-On writes, the application explicitly invalidates (deletes) the relevant cache keys so that subsequent reads fetch fresh data from the database. This project uses cache-aside for device lists (5-minute TTL) and location report lookups (15-minute TTL, aligned with the key rotation period -- cached reports expire as new identifiers become active).
-
-The pattern matters at scale because database queries are orders of magnitude slower than Redis lookups. When an owner queries for their AirTag's location, the server must look up reports by identifier hash across potentially billions of rows. Caching recent lookup results in Redis avoids repeating expensive PostgreSQL index scans for the same query within the TTL window.
-
-The trade-off is eventual consistency: after a new location report arrives, there is a brief window (up to TTL) where the cached result does not include the new report. For location tracking with 15-minute key rotation periods, a few minutes of staleness is acceptable -- the user will see the new location on the next refresh after TTL expiry.
-
-### Circuit Breaker
-
-This project does not implement a circuit breaker in the backend because it does not have an external storage service (like MinIO/S3) that could fail independently. Location reports are stored directly in PostgreSQL, which is the same dependency that handles all other queries. A circuit breaker is most valuable when wrapping calls to an external service that can fail independently of the core database -- see the iCloud project for a full circuit breaker implementation around MinIO operations.
-
-However, the architectural principle still applies: if this system were deployed at production scale with a separate object storage layer for large encrypted payloads, circuit breakers would wrap those storage calls to prevent cascade failures when the storage tier becomes unavailable while allowing metadata queries to continue functioning.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Each log entry contains a set of named fields (timestamp, level, message, request ID, component name, etc.) that can be indexed, searched, and aggregated by log management systems.
-
-This project uses Pino, a high-performance Node.js JSON logger. In development, `pino-pretty` formats the output for human readability. In production, raw JSON is emitted for consumption by log aggregation systems (ELK stack, Grafana Loki).
-
-Key features of the logging setup:
-- **Component child loggers**: Separate child loggers are created for `locationService`, `antiStalkingService`, and other components. Each child logger automatically includes the component name in every log entry, making it trivial to filter logs by subsystem.
-- **Request correlation**: Each HTTP request receives a unique ID that propagates through all log entries generated during that request. This allows tracing a single location report from ingestion through queue processing to storage.
-- **Sensitive field redaction**: The logger is configured to automatically redact sensitive fields, preventing accidental logging of master secrets, encrypted payloads, or session tokens.
-
-At scale, structured logging is essential because text-based logging is unsearchable across thousands of server instances processing millions of location reports per minute. When investigating why a particular device's location is not updating, you need to search across all servers for that device's identifier hash. With structured logs, this is a simple JSON field query. With text logs, you would need regex matching across terabytes of log files.
-
-### Prometheus Metrics
-
-Prometheus is a time-series monitoring system that collects numerical measurements from applications at regular intervals (scraping). Applications expose an HTTP endpoint (`/metrics`) in a specific text format, and the Prometheus server periodically fetches this endpoint.
-
-This project exposes metrics via the `prom-client` library with the following metric types:
-
-- **Histogram** (`http_request_duration_seconds`): Records the distribution of API latency by endpoint. Prometheus computes percentiles (p50, p95, p99). This answers "what is the latency that 99% of requests are below?"
-- **Counter** (`location_reports_total`): Tracks total ingested reports, segmented by region. Since counters only increase, Prometheus computes the rate (reports/second) by differentiating over time.
-- **Counter** (`cache_operations_total` with `result` label): Tracks cache hits and misses. The hit rate (hits / (hits + misses)) indicates whether the cache is effective.
-- **Counter** (`rate_limit_hits_total`): Counts how often rate limits are triggered, useful for detecting abuse patterns and tuning limits.
-- **Histogram** (`db_query_duration_seconds`): Detects slow database queries before they become user-facing latency issues.
-
-At scale, metrics enable alerting and capacity planning. Without metrics, you discover that report ingestion is backed up only when users report stale locations. With metrics, you set an alert: "if ingestion p99 exceeds 500ms for 5 minutes, page the on-call engineer." Metrics also reveal trends: "report volume has increased 20% this month" -- which signals the need to add more ingestion workers or move from RabbitMQ to Kafka.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make to the API within a time window. Its purpose is to prevent abuse (intentional or accidental) from overwhelming the server and degrading service for all users.
-
-This project implements per-endpoint rate limiting with Redis-backed counters:
-
-| Endpoint Group | Limit | Window | Purpose |
-|---------------|-------|--------|---------|
-| Auth (login/register) | 10 | 1 minute | Prevent brute-force login attacks |
-| Location reports | 100 | 1 minute | Throttle high-volume report submission |
-| Location queries | 60 | 1 minute | Prevent excessive polling |
-| Admin endpoints | 20 | 1 minute | Protect admin operations |
-
-Each incoming request increments a counter keyed by the client's IP address and endpoint group. If the counter exceeds the limit, the server returns 429 Too Many Requests with a `Retry-After` header.
-
-Rate limiting is especially important for the location report endpoint because it is publicly accessible (any Find My network device can submit reports). Without rate limiting, a malicious actor could flood the ingestion pipeline with fake reports, consuming database write capacity and queue space. Per-endpoint limits ensure that a burst of report submissions does not affect the owner's ability to query their device's location.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a distributed system with unreliable networks, clients frequently retry requests when they do not receive a response. Without idempotency, a retry could create duplicate location reports or duplicate device registrations.
-
-This project implements idempotency for location reports using content-hash deduplication. The idempotency key is `SHA-256(identifierHash + timestamp_rounded_to_minute + payloadHash)`. This key is stored in Redis with a 24-hour TTL. When a duplicate report arrives (same identifier, same time window, same payload), the server returns 200 without re-inserting the report.
-
-This approach is particularly important for the Find My network because reports are submitted by iPhones on cellular networks, which are prone to timeouts and retries. A single AirTag detection might generate multiple submission attempts from the same finder device. Without deduplication, each retry would create a separate database row, inflating report counts and wasting storage. The content-hash approach ensures that duplicate reports are detected regardless of which server instance processes the retry.
-
-Device registration uses upsert semantics (INSERT ON CONFLICT UPDATE), which is another form of idempotency -- registering the same device twice updates the existing record rather than creating a duplicate.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether the application is functioning correctly. They are designed for automated systems (load balancers, container orchestrators) to determine whether to route traffic to an instance.
-
-This project implements a two-tier health check system:
-
-1. **`/health`** (liveness probe): Returns 200 if the process is running. This is the simplest check -- if the HTTP server can respond at all, the process is alive. Kubernetes uses this to decide whether to restart a container.
-
-2. **`/health/ready`** (readiness probe): Tests connectivity to PostgreSQL and Redis. It executes a lightweight query against each dependency (e.g., `SELECT 1` for PostgreSQL, `PING` for Redis). If either dependency is unreachable, the endpoint returns 503 Service Unavailable. Load balancers use this to stop routing traffic to instances that cannot serve requests.
-
-The distinction between liveness and readiness is critical at scale. A server stuck in an infinite loop is not live (needs restart). A server that just started and has not yet established database connections is live but not ready (should not receive traffic yet). A server whose Redis connection was temporarily dropped during a Redis failover is live but not ready until the connection is re-established.
-
-Without health checks, a load balancer has no way to know that an instance is unhealthy. It continues routing traffic to a broken instance, causing user-facing errors, while healthy instances sit underutilized. Health checks enable automatic traffic shifting away from unhealthy instances within seconds of a failure.
-
----
+| Location contents | Owner-side decryption | Server-held master secrets | Exclude service from plaintext capability |
+| Report identity | Durable sink uniqueness | Independent expiring marker | Recover retries and interrupted writes |
+| Query caching | Stable windows and freshness policy | Match TTL to rotation blindly | Preserve delayed reports and useful cache reuse |
+| Safety history | Protected nearby-device processing | Central plaintext movement database | Avoid expanding location exposure |
+| Notification hints | Explicit scoped subscription or owner polling | Assume anonymous global owner lookup | Account for metadata and delivery trade-offs |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.
+### Actual local flow
 
-### Local Architecture
+The API, PostgreSQL and Valkey support the main map demo. RabbitMQ and the two
+workers support a separate report-ingestion path. All radio observations are
+simulated; no BLE beacon, UWB ranging, NFC reader or Apple network connection exists.
 
+On a map click, [locationService.ts](./backend/src/services/locationService.ts)
+checks device ownership, derives the current lookup hash, encrypts the supplied
+coordinates using the stored master secret, and calls its synchronous insert path.
+History reads derive hashes and decrypt on that same backend, then cache plaintext
+in Redis. The browser receives coordinates through ordinary authenticated fetches.
+
+The symmetric key is constant for a device, derived from its master secret and a
+fixed label. Fifteen-minute HMAC-derived values change the lookup identifier only.
+The `ephemeralPublicKey` field contains random bytes and is unused by decryption.
+There is no EC key pair, ECDH or client-side WebCrypto in the running flow.
+See [utils/crypto.ts](./backend/src/utils/crypto.ts).
+
+### Patterns actually wired
+
+[shared/cache.ts](./backend/src/shared/cache.ts) implements cache-aside helpers for
+history and latest locations. History values use a 900-second TTL, latest values
+60 seconds. Device-list and device-by-ID cache helpers exist but are not called by
+the device service. Identifier invalidation currently just logs and deletes no keys.
+
+[shared/idempotency.ts](./backend/src/shared/idempotency.ts) uses an atomic Redis
+claim in the synchronous submission path. Its key primitive is:
+
+```typescript
+await redis.set(key, JSON.stringify({ timestamp: Date.now(), response }), 'EX', IDEMPOTENCY_TTL, 'NX');
 ```
-┌─────────────────────────────────────────────────────────────┐
-│               React Frontend (:5173)                         │
-│  MapView (Leaflet) + DeviceCards + NotificationsPanel        │
-│  LoginForm + AddDeviceModal + AdminDashboard                 │
-│  State: Zustand (useStore)                                   │
-└────────────────────────┬────────────────────────────────────┘
-                         │ HTTP (fetch, credentials: include)
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│           Express Backend (:3000)                             │
-│  Routes: auth, devices, locations, lostMode,                │
-│          notifications, antiStalking, admin                  │
-│  Middleware: session (Redis), auth, rate limiting            │
-│  Shared: logger, metrics, cache, idempotency, health        │
-└──────┬──────────────┬──────────────┬────────────────────────┘
-       │              │              │
-       ▼              ▼              ▼
-┌────────────┐ ┌────────────┐ ┌────────────┐
-│ PostgreSQL │ │   Valkey   │ │  RabbitMQ  │
-│  (:5432)   │ │  (:6379)   │ │(:5672/mgmt │
-│ DB: findmy │ │  Sessions, │ │  :15672)   │
-│ User:findmy│ │  cache,    │ │ Location   │
-│            │ │  rate limit│ │ workers    │
-└────────────┘ └────────────┘ └────────────┘
-```
 
-**Workers** (separate processes):
-- `location-worker` (`src/workers/location-worker.ts`) -- consumes from RabbitMQ, stores encrypted reports, checks lost mode, triggers notifications
-- `notification-worker` (`src/workers/notification-worker.ts`) -- processes notification queue
+Atomic claiming prevents two callers from both obtaining that particular claim;
+it does not make the subsequent PostgreSQL insert atomic with Redis. The claim
+initially has no result, is retained after insert failure, and concurrent duplicates
+can receive an undefined response. Identity also uses the server's current minute,
+so the same report retried across a minute boundary gets a different key. Timestamp
+validation is passed `Date.now()`, not the observation's timestamp.
 
-### Production Patterns Actually Implemented
+[shared/queue.ts](./backend/src/shared/queue.ts) declares two durable queues:
+`location-reports` with 24-hour message TTL and `notifications` with one-hour TTL.
+It sets prefetch to ten and publishes persistent messages to ordinary channels.
+The send boolean indicates local backpressure, not a durable broker confirmation.
+The API still returns 202 when the boolean is false.
 
-| Pattern | File | Why It Matters at Scale |
-|---------|------|------------------------|
-| Structured logging (Pino) | `backend/src/shared/logger.ts` | JSON logs with component-level child loggers, request IDs for correlation |
-| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP duration histograms, report counters, cache hit/miss, rate limit hits |
-| Redis caching (cache-aside) | `backend/src/shared/cache.ts` | 15-min TTL for location lookups, 5-min TTL for device lists; invalidate on write |
-| Idempotency | `backend/src/shared/idempotency.ts` | Content-hash dedup for location reports, 24h Redis TTL, safe retries |
-| Rate limiting (Redis-backed) | `backend/src/shared/rateLimit.ts` | Per-endpoint: auth 10/min, reports 100/min, queries 60/min, admin 20/min |
-| Health checks | `backend/src/shared/health.ts` | `/health` (liveness), `/health/ready` (PostgreSQL + Redis check) |
-| Session auth (Redis store) | `backend/src/index.ts` | connect-redis with 24h session TTL, httpOnly cookies |
-| AES-256-GCM encryption | `backend/src/utils/crypto.ts` | Simplified ECIES: HMAC-SHA256 key derivation, AES-256-GCM for payloads |
-| Key rotation | `backend/src/utils/crypto.ts` | 15-minute period derivation from master secret |
-| Anti-stalking detection | `backend/src/services/antiStalkingService.ts` | Sighting count, distance, time-span heuristics with 1h alert cooldown |
-| RabbitMQ workers | `backend/src/workers/location-worker.ts` | Background report processing with prefetch, ack/nack, lost mode notification trigger |
-| Notification service | `backend/src/services/notificationService.ts` | Database-backed notifications with unread count, type filtering |
+[shared/rateLimit.ts](./backend/src/shared/rateLimit.ts) wires separate one-minute
+budgets: auth login/register 10, device POST operations 20, report submission 100,
+other location operations 240, admin 20 and general API 100. These are IP-based
+unless the forwarding header overrides the key; the per-user helper is unused.
+There is no configured in-memory fallback for Redis rate-limit errors.
 
-### Simplifications from Production Design
+Pino, Prometheus and liveness/readiness helpers are present under `src/shared`.
+Their actual scope is described above; they do not establish a tested service-level
+objective or a reliable alert-delivery pipeline.
 
-| Production | Local Substitute | Why |
-|------------|-----------------|-----|
-| ECIES with P-224 elliptic curves | AES-256-GCM with HMAC-SHA256 key derivation | Full ECIES requires hardware key management; simplified crypto demonstrates the pattern |
-| Hardware BLE beacon | Simulated via map clicks in frontend | No physical AirTag hardware |
-| Billions of Find My network devices | Single user submitting reports manually | Demonstrates the protocol without crowd-sourcing |
-| Kafka for report ingestion | RabbitMQ with 2 worker instances | Sufficient for dev scale, same at-least-once semantics |
-| Hardware Security Module (HSM) | Master secret stored as plaintext in DB | HSM integration requires specialized hardware |
-| Push notifications (APNs) | Database notifications polled by frontend | No Apple Push Notification Service access |
-| UWB precision finding | Not implemented | Requires U1 chip hardware |
-| NFC identification | Not implemented | Requires NFC reader hardware |
-| OAuth / Apple ID | Session-based email/password auth | Simpler; focused on tracking, not identity |
+### Incomplete workflows and correctness gaps
 
-### What Was Omitted
+**Queued reports.** The [location worker](./backend/src/workers/location-worker.ts)
+inserts every delivery without an idempotency check or unique report constraint.
+Both workers reject failures without requeue and without a dead-letter destination.
+A crash after insert but before acknowledgement can duplicate effects on redelivery.
+A broker error can send the API into synchronous fallback without one shared durable
+identity covering both paths.
 
-- **CDN and edge caching** -- no multi-POP deployment
-- **Multi-region deployment** -- single local instance
-- **Kubernetes orchestration** -- Docker Compose only
-- **Geographic sharding** -- single PostgreSQL instance
-- **Time-based table partitioning** -- single `location_reports` table
-- **UWB precision finding** -- hardware required
-- **NFC tap identification** -- hardware required
-- **Power management / BLE advertising** -- hardware required
-- **iCloud Keychain integration** -- Apple ecosystem only
-- **GDPR data export pipeline** -- CASCADE delete implemented, export not
+**Lost mode.** Both submission paths scan all notify-enabled lost devices and derive
+only their current hash. Reports delayed across a rotation can miss notification
+matching. Matching uses server-held secrets, proving the service can correlate
+reports with owners. There is no notification cooldown for repeated found reports,
+no optimistic version field, no public found-item page and no NFC flow. Lost-mode
+updates are upserts, but ordinary device creation is two separate inserts, not an
+idempotent registration transaction.
+
+**History and cache.** Default history calls put fresh millisecond start/end values
+in the cache key, limiting reuse. Queries select all reports for derived hashes,
+then decrypt, sort and slice in memory; they do not enforce an exact observation-time
+filter or SQL result cap. The key-period loop and user-supplied limits are unbounded.
+Neither active-flag changes nor device deletion invalidate private location caches.
+
+**Unwanted trackers.** [antiStalkingService.ts](./backend/src/services/antiStalkingService.ts)
+runs synchronously after a sighting insert. It requires at least three sightings of
+one hash in three hours and either accumulated point-to-point distance over 500 m
+or a span over one hour. It is not the distance-and-time rule described in older docs.
+GPS noise affects accumulated distance, and hashes are not linked across rotations.
+Own-device exclusion compares only current hashes; historical owned observations can
+later appear unknown. The summary endpoint checks count, not the full alert rule.
+Its one-hour alert cooldown is a read-then-insert check and can race.
+
+**Frontend.** [App.tsx](./frontend/src/App.tsx) uses local tab state, not routing.
+[useStore.ts](./frontend/src/stores/useStore.ts) keeps one history array and does not
+guard responses by selected device or account generation. A late response can place
+one device's points under another device's name, or repopulate state after logout.
+Latest-card requests are unbounded concurrent fan-out and map failed reads to missing
+locations. Polling runs every 30 seconds while selected without a visibility gate.
+
+[MapView.tsx](./frontend/src/components/MapView.tsx) centers only once per mounted
+map and does not reset that flag on device change. Its empty-state overlay can
+intercept map clicks. [DeviceDetails.tsx](./frontend/src/components/DeviceDetails.tsx)
+initializes a lost-mode form before asynchronous settings arrive and does not reset
+it on device changes. Directions uses fixed coordinates; Play Sound is an API
+acknowledgement plus a timer. Device cards render the supplied emoji through raw HTML.
+
+Notifications load on panel opening. Mark-read updates happen after the server
+response, not optimistically, and concurrent clicks can decrement the badge twice.
+The badge is otherwise fetched on authentication, not continuously. Redis publishes
+have no subscriber bridge to the UI. Safety API methods exist in the frontend client
+but are not connected to a detection or action screen. There is no offline persistence,
+service worker, precision finding, hardware disabling or push integration.
+
+### Local substitutions and verification
+
+PostgreSQL replaces a partitioned report store; Valkey holds sessions and plaintext
+read caches; map clicks replace finder devices. The SQL `decrypted_locations` and
+`session` tables are unused in current business flows. Retention jobs, encrypted
+key synchronization/recovery, native hardware adapters, durable replay tooling,
+CDN deployment and multi-region infrastructure are omitted.
+
+The seed uses fixed demo secrets and recent encrypted history, preserving existing
+users/devices but appending reports and notifications on every run. Its current
+password is `password123` for new users; the Playwright login helper still uses
+`admin123`. There are no backend tests. Setup alternatives and script details are
+in [README.md](./README.md).
+
+This review traced source and configuration, including both report paths, all
+services, workers, state, maps, seed and smoke-test setup. It did not run a hardware
+integration, security audit, application build or real broker/database recovery test.
+The findings above document the implementation; they do not imply fixes to its code.

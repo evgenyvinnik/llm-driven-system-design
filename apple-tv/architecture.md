@@ -1,190 +1,134 @@
-# Design Apple TV+ - Architecture
+# Apple TV+ architecture
 
 ## System Overview
 
-Apple TV+ is a premium video streaming service delivering original content with high-quality video, adaptive streaming, and cross-device experience. Core challenges involve video transcoding, global content delivery, DRM protection, and personalization.
+Design a subscription video-on-demand service for discovering movies and series, starting protected playback, and resuming across household devices. The main learning problems are separating media delivery from account APIs, publishing complete media revisions, making quality decisions under uncertain bandwidth, and preserving user intent when progress updates race.
 
-**Learning Goals:**
-- Build video ingestion and transcoding pipelines
-- Design adaptive bitrate streaming
-- Implement global CDN strategies
-- Handle DRM and content protection
-
----
+**Scope of this document:** the production sections describe a proposed system, not Apple's private architecture or a deployed implementation. The repository implements a catalog/account application and a timer-based player simulation. Its actual schema is reproduced below; the final [Implementation Notes](#implementation-notes) map the proposal to source and explain limitations.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed production service
 
-1. **Stream**: Watch video content with adaptive quality
-2. **Browse**: Discover content through recommendations and search
-3. **Download**: Save content for offline viewing
-4. **Continue**: Resume playback across devices
-5. **Share**: Family sharing and user profiles
+- Discover available movies/series, search, inspect episodes and maintain profile-specific watchlists.
+- Publish validated, encoded media with audio and caption tracks; remove unavailable titles safely.
+- Authorize playback against current account, profile, territory, device and rights policy.
+- Deliver adaptive video with accessible controls and an explicit unsupported-device path.
+- Save progress, resume on another device, and keep completion events separate from position.
+- Support audited administration and a real subscription provider integration.
 
-### Non-Functional Requirements
+Offline licensed playback is a later platform-specific extension. It needs both downloadable encrypted bytes and a supported persistent license lifecycle. Ordinary browser caching alone does not satisfy that contract.
 
-- **Quality**: Support 4K HDR with Dolby Vision/Atmos
-- **Latency**: < 2s to start playback
-- **Availability**: 99.99% for streaming
-- **Scale**: Millions of concurrent streams
+### Non-functional requirements — design targets, not measurements
 
----
+| Concern | Proposed target and scope |
+|---------|---------------------------|
+| Playback start | p95 below 2 seconds on a defined supported-device/network cohort |
+| Authorization | p99 below 200 ms within the owning region, excluding media download |
+| Availability | 99.99% playback authorization; existing buffered playback degrades independently |
+| Resume | Acknowledged progress survives an API restart; handoff normally within 15 seconds |
+| Experience | Measure rebuffer time, failed starts, quality changes and accessibility by device class |
+| Publication | No active revision points to missing or unvalidated mandatory media |
+
+First-frame time includes manifest, license, first segment, decode and buffering. A fast playback-info response alone cannot establish the first target. Rights denials are distinguished from service failures.
+
+## Capacity Estimation
+
+Assume 10 million daily viewers watching two hours each, with 2 million concurrent viewers at peak. These are planning inputs, not reported Apple figures.
+
+| Estimate | Calculation | Implication |
+|----------|-------------|-------------|
+| Average concurrency | 20 million viewing hours / 24 ≈ 833,000 | Delivery is sustained, not only a launch spike |
+| Peak media throughput | 2 million × 6 Mb/s = 12 Tb/s | Send media from CDN edges, not Express |
+| Video segment requests | 2 million / 6 seconds ≈ 333,000/s | Separate audio adds requests; manifests/licenses add startup work |
+| Progress traffic | 2 million / 15 seconds ≈ 133,000 updates/s | Coalesce writes and partition by profile after measuring |
+| Daily media bytes | 20 million hours × 3,600 × 6 Mb/s / 8 ≈ 54 PB | Delivery cost dominates small JSON payloads |
+| Encoded library | 50,000 hours × 3,600 × 40 Mb/s / 8 ≈ 900 TB | Aggregate ladder estimate, before masters and replicas |
+
+A six-second segment at 6 Mb/s is roughly 4.5 MB. Shortening segments improves opportunities to switch quality but increases request overhead. Measure the trade-off against startup and rebuffering objectives; VOD does not need live-edge latency machinery.
+
+### Local Development Scale
+
+One React development server, one Express process, PostgreSQL, Valkey and MinIO are sufficient for the seeded demo. Additional API instances demonstrate shared sessions and independent process state, not validated streaming throughput. No benchmark or resource ceiling has been measured.
 
 ## High-Level Architecture
 
+Proposed production topology; media and control requests take different paths.
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Content Ingestion                            │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐       │
-│  │ Master Files  │  │  Transcoder   │  │   Packager    │       │
-│  │               │  │               │  │               │       │
-│  │ - 4K masters  │──▶│ - Multi-res   │──▶│ - HLS chunks  │       │
-│  │ - Audio stems │  │ - Multi-codec │  │ - Manifests   │       │
-│  └───────────────┘  └───────────────┘  └───────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Origin Storage                               │
-│     (Encrypted HLS segments, manifests, DRM keys)               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  CDN Edge A   │    │  CDN Edge B   │    │  CDN Edge C   │
-│  (us-west)    │    │  (eu-west)    │    │  (ap-east)    │
-└───────────────┘    └───────────────┘    └───────────────┘
-              │               │               │
-              └───────────────┼───────────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Client Layer                               │
-│      Apple TV │ iPhone │ iPad │ Mac │ Web │ Smart TV            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      API Gateway                                │
-│        (Auth, rate limiting, routing, geo-enforcement)          │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Content       │    │ Playback      │    │ Recommendation│
-│ Service       │    │ Service       │    │ Service       │
-│               │    │               │    │               │
-│ - Catalog     │    │ - Manifests   │    │ - Personalized│
-│ - Metadata    │    │ - Progress    │    │ - Trending    │
-│ - Search      │    │ - DRM         │    │ - Continue    │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                 │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │   Redis/Valkey    │   Object Storage (S3)     │
-│   - Catalog     │   - Sessions      │   - Video segments        │
-│   - Users       │   - Cache         │   - Thumbnails            │
-│   - Progress    │   - Rate limits   │   - Master files          │
-│   - Downloads   │   - Watch state   │                           │
-└─────────────────┴───────────────────┴───────────────────────────┘
+┌────────────────┐                  ┌────────────────┐
+│ Viewer apps    │─ media ─────────▶│ CDN + shield   │
+│                │                  │                │
+└────────────────┘                  └────────────────┘
+        │ control                           │ cache miss
+        ▼                                   ▼
+┌────────────────┐                  ┌────────────────┐
+│ Domain APIs    │                  │ Private origin │
+│ SQL / cache    │                  │                │
+└────────────────┘                  └────────────────┘
+                                            ▲ publish
+                                            │
+                                    ┌────────────────┐
+                                    │ Encode workers │
+                                    │ Queue / jobs   │
+                                    └────────────────┘
 ```
 
----
+Domain APIs include catalog/profile services, playback authorization, progress and subscription state. A separate license service uses a protected key service. Neither clear content keys nor user-specific license responses belong in a shared public CDN cache. Workers receive source revisions through an ingestion service and publish versioned objects to origin.
 
-## Core Components
+## Core Components / Request Flows
 
-### 1. Video Transcoding Pipeline
+### Ingestion and publication — proposed
 
-The ingestion pipeline takes 4K master files and produces multiple encoded variants for adaptive streaming. Each master is encoded into a ladder of resolutions and bitrates:
+1. Create a draft source revision and upload session, with bounded size and an expected checksum.
+2. Upload the master to private storage; validate format, duration, rights metadata and required tracks.
+3. Commit the job record and dispatch intent together, using an outbox so a queue outage does not lose work.
+4. Workers claim jobs identified by source revision and encoding profile. Write outputs to a new immutable namespace.
+5. Validate every mandatory rendition and manifest reference, including object existence, track timing and decode compatibility.
+6. Atomically change the catalog's active revision pointer only after the required set passes validation.
+7. Deliver a publication event to caches/search. Retry propagation, and track its revision and lag.
 
-| Resolution | Codec | Bitrate | HDR | Target Device |
-|------------|-------|---------|-----|---------------|
-| 2160p (4K) | HEVC | 25 Mbps | Dolby Vision | Apple TV 4K |
-| 2160p | HEVC | 15 Mbps | HDR10 | Smart TVs |
-| 1080p | HEVC | 8 Mbps | SDR | iPad, Mac |
-| 1080p | H.264 | 6 Mbps | SDR | Older devices |
-| 720p | H.264 | 3 Mbps | SDR | iPhone cellular |
-| 480p | H.264 | 1.5 Mbps | SDR | Low bandwidth |
+Duplicate worker delivery is expected. An existing validated output can satisfy a repeated job; a partial upload cannot. Publication should use a revision check so a late worker cannot replace a newer edit. Failed optional high-quality outputs may leave a valid baseline release if product policy explicitly allows that.
 
-Encoding is distributed across worker clusters. Each resolution/codec combination runs as an independent job, enabling parallelism. Per-scene quality optimization (VMAF-based) adjusts bitrate allocation -- action sequences get more bits, static dialog scenes get fewer.
+Removal blocks new authorization immediately at the authority. Edge credentials and existing licenses need a defined expiry/revocation policy; cache invalidation alone does not revoke already delivered media.
 
-After encoding, the packager segments each variant into 6-second HLS chunks (`.ts` files) and generates variant playlists. Audio tracks (multiple languages, Dolby Atmos) and subtitles are packaged separately.
+### Playback start and delivery — proposed
 
-### 2. Adaptive Streaming (HLS)
+The client creates a playback session for a specific title, profile and device capability set. The server validates account/profile ownership, active rights and subscription, then returns a media revision, bounded authorization credentials and the license endpoint. Credential renewal uses the same playback session, not a new billable viewing event.
 
-The master manifest lists all available quality variants. The client's ABR algorithm selects the appropriate variant based on:
+The client fetches manifests and encrypted media through the CDN, obtains a license through the protected license path, and starts conservatively. A media engine owns buffer, decoder and quality adaptation. Application state reflects actual events such as playing, waiting and ended; a button click is only a request to play.
 
-- **Available bandwidth** (measured from segment download times)
-- **Buffer health** (maintain 30s buffer target)
-- **Device capabilities** (4K HDR only on capable hardware)
-- **Battery state** (reduce quality on low battery)
+Cache immutable media by asset revision and rendition. Validate edge authorization before serving cached protected bytes, while keeping authorized viewers of the same revision able to share cached objects. Apply the CDN's supported cache-key/authentication model explicitly; stripping a token without checking it would expose media.
 
-The manifest includes audio groups (language tracks) and subtitle groups, allowing independent selection. Codec strings in the manifest (`hvc1.2.4.L150.B0` for Dolby Vision HEVC) enable clients to filter unsupported variants before attempting playback.
+HLS supports multiple renditions and both MPEG-2 transport-stream and fragmented MP4 segments. A DASH comparison must consider platform support and packaging, rather than assuming HLS inherently uses an inefficient container. [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216)
 
-### 3. Content Delivery Network
+For Apple-platform protection, integrate the documented FairPlay client and key-server workflow. Use its SDK and approved deployment credentials rather than inventing cryptographic message formats. Other target platforms need their supported protection systems. [Apple FairPlay Streaming](https://developer.apple.com/streaming/fps/)
 
-A multi-tier CDN architecture minimizes latency:
+### Progress, completion and discovery — proposed
 
-1. **Edge nodes** (city-level): Cache popular content, serve 95%+ of requests
-2. **Regional shields**: Aggregate cache misses before hitting origin
-3. **Origin storage**: S3/MinIO with all content, accessed only on cache misses
+Use an explicit profile/title/playback-session identity and increasing sequence number within each session. A retry repeats the same sequence and payload. The server assigns a durable revision to each accepted update and returns the accepted position/revision, including on replay.
 
-Predictive pre-positioning pushes new release content to edge nodes before launch. Cache keys include content ID and variant ID; manifests have short TTLs (60s) while segments have long TTLs (24h).
+Cross-device ordering is a product policy. This design uses an explicit handoff to establish a new active session generation. Older sessions can retain analytics events but cannot silently overwrite its resume position. An offline return offers a choice when its base revision is stale. Taking the maximum position would lose intentional rewinds, while arbitrary client wall-clock order is vulnerable to skew.
 
-Geographic licensing enforcement happens at the API layer -- the CDN serves segments to any authenticated request, but the API refuses to issue manifest URLs for content not licensed in the user's region.
+Completion is a separate event with a deduplication key; a resume pointer may later move backward on a rewatch. Commit authoritative progress and the completion/outbox record consistently. A queue projection builds recommendations and aggregate history, with observable lag. The client should not need a live push channel simply to resume; it can fetch the current revision when playback starts.
 
-### 4. DRM Protection (FairPlay)
+### Frontend responsibilities — proposed
 
-Content is encrypted with AES-128 per-segment keys. The playback flow:
+Use route state for content selection and browse filters, a request cache for remote data, a small store for authenticated context and player controls, and component state for transient menus. Scope personal data by account and profile generation. On a switch, cancel pending requests, clear personal views and ignore late responses from the previous context.
 
-1. Client requests manifest URL from API (includes playback token)
-2. Client downloads manifest from CDN
-3. Before decrypting segments, client sends SPC (Server Playback Context) to license server
-4. License server validates playback token, device authorization, and subscription
-5. Server returns CKC (Content Key Context) containing the decryption key encrypted for the specific device's Secure Element
-6. Client decrypts and plays segments
+Load critical title/artwork data first, fetch independent home rows concurrently, and progressively load bounded shelves. Virtualize large catalogs with focus-aware overscan. Avoid unmounting the focused card, a player or an open menu just because a viewport calculation changes.
 
-Device-specific licenses enable per-device revocation and download limits (max 25 offline downloads per account).
-
-### 5. Watch Progress Sync
-
-Watch progress uses a last-write-wins (LWW) strategy with client-side timestamps for conflict resolution. When a user watches on their iPhone and later switches to Apple TV, the most recent position wins:
-
-```sql
-INSERT INTO watch_progress (..., client_timestamp, ...)
-ON CONFLICT (profile_id, content_id)
-DO UPDATE SET
-  position = CASE
-    WHEN watch_progress.client_timestamp < $new_timestamp THEN $new_position
-    ELSE watch_progress.position
-  END,
-  client_timestamp = GREATEST(watch_progress.client_timestamp, $new_timestamp);
-```
-
-"Continue Watching" shows content where `position > 60s` AND `progress < 90%`, ordered by `updated_at DESC`.
-
-### 6. Recommendations
-
-The recommendation engine generates multiple content rows for the home screen:
-
-- **Continue Watching**: In-progress content (profile-specific)
-- **Because You Watched X**: Content similar to recently completed shows
-- **Trending**: Popular content weighted by recent view velocity
-- **New Releases**: Recently added content matching profile genre preferences
-- **For Kids** (kids profiles): Age-appropriate content only
-
-### 7. Offline Downloads
-
-Download management enforces account-wide limits (25 downloads) and time-based license expiry (30 days). The download manifest includes all segments for a selected quality tier plus audio and subtitle tracks. Expired downloads require re-licensing, which checks subscription status.
-
----
+The player owns its media engine lifecycle outside high-frequency React rendering. Keep the latest position in a stable reference for a fixed save scheduler. Save after meaningful seeks/pauses and on handoff; navigation/unload delivery remains best effort, so periodic acknowledged saves limit loss.
 
 ## Database Schema
 
+### Current local schema
+
+The following is the actual [backend/src/db/init.sql](./backend/src/db/init.sql). It is a fresh-schema initializer, not a production migration plan. Several tables are scaffolding; their presence does not imply connected endpoints. SQL constraints enforce only what is written here, not all the production invariants above.
+
 ```sql
+-- Apple TV+ Database Schema
+
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -320,7 +264,7 @@ CREATE TABLE watch_progress (
   position INTEGER NOT NULL DEFAULT 0, -- seconds
   duration INTEGER NOT NULL,
   completed BOOLEAN DEFAULT false,
-  client_timestamp BIGINT, -- For last-write-wins conflict resolution
+  client_timestamp BIGINT, -- Client-side timestamp for last-write-wins conflict resolution
   updated_at TIMESTAMP DEFAULT NOW(),
   PRIMARY KEY (profile_id, content_id)
 );
@@ -392,494 +336,224 @@ CREATE INDEX idx_audit_event ON audit_log(event, created_at DESC);
 CREATE INDEX idx_audit_created ON audit_log(created_at DESC);
 ```
 
-### Schema Design Rationale
+### Production changes required
 
-**Self-referential content table**: The `content` table stores movies, series, and episodes in a single table. Episodes reference their parent series via `series_id`. This enables a single query to fetch a series with all its episodes, ordered by `(season_number, episode_number)`.
+| Area | Proposed addition or invariant | Missing locally |
+|------|--------------------------------|-----------------|
+| Publication | Source/asset revisions, job uniqueness, validation state and active revision pointer | Ready is a freely editable metadata status |
+| Profile ownership | Account/profile association checked for every personal request | Separate foreign keys do not prove the profile belongs to user_id |
+| Media | Unique revision/rendition/segment identity and immutable object checksum | Segment metadata is neither populated nor read by playback |
+| Playback sessions | Unique session, entitlement snapshot/version, bounded device lease | Unsigned token and process-local count map |
+| Progress | Session generation/sequence, accepted revision and valid content-duration bounds | Client timestamps and caller-supplied duration |
+| Completion | Unique event ID with durable publication intent | Random history IDs permit duplicate completions |
+| Subscription | Provider subscription/event IDs and ordered state transitions | Tier/expiry assignments, no billing record |
+| Audit/retention | Restricted append path, retention policy and monitored export | audit_log table has no writer |
 
-**Profile-level watch state**: Watch progress and watchlists are keyed by `profile_id`, not `user_id`. Each family member has independent watch history. The primary key `(profile_id, content_id)` ensures one progress record per content per profile.
-
-**Encoded variants + segments**: The two-table split (`encoded_variants` -> `video_segments`) models the HLS hierarchy. Variants describe quality levels; segments are the individual chunks. This supports manifest generation without file system inspection.
-
-**Audit log**: Compliance-grade event logging for DRM license issuance, content access, and account changes. `ON DELETE SET NULL` preserves audit records when users or content are removed.
-
----
+Catalog indexes support type, status, featured and series lookup. There is no full-text index or genre GIN index. Progress/history have profile-plus-time indexes. Production pagination needs deterministic tie-breakers and bounded limits; the current API commonly uses raw offset/limit values.
 
 ## API Design
 
-### Content
+### Existing routes
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/content` | Browse catalog with filters |
-| GET | `/api/content/:id` | Content details (episodes for series) |
-| GET | `/api/content/featured` | Featured/hero content |
-| GET | `/api/content/search?q=` | Search catalog |
+All paths below are implemented handlers, with the qualifications shown. See [routes](./backend/src/routes/) and [API client](./frontend/src/services/api.ts).
 
-### Streaming
+| Method | Path | Current behavior |
+|--------|------|------------------|
+| POST | /api/auth/register, /login, /logout | Account/session operations |
+| GET | /api/auth/me | Session user fields plus owned profiles |
+| POST | /api/auth/profile/:id/select | Select an owned profile in the session |
+| POST / DELETE | /api/auth/profiles, /api/auth/profiles/:id | Create/delete profile; count limits race |
+| GET | /api/content | Public ready non-episode catalog; type/genre/search/limit/offset |
+| GET | /api/content/featured, /:id, /:id/seasons, /meta/genres | Featured/details/episodes/genres; detail restrictions differ |
+| POST | /api/content/:id/view | Public counter increment, not verified playback |
+| GET | /api/stream/:contentId/playback | Paid-session check and simulated playback metadata |
+| GET | /api/stream/:contentId/master.m3u8 | Generated playlist text |
+| GET | /api/stream/:contentId/variant/:variantId.m3u8 | Playlist derived from duration, not actual variant assets |
+| POST | /api/stream/:contentId/playback/end | Adjust process-local tracking, no session ownership |
+| GET / POST | /api/watch/progress/:contentId | Profile progress read/upsert |
+| GET | /api/watch/progress, /continue, /history | Personal SQL reads, no response cache |
+| POST | /api/watch/progress/batch | Shadowed by earlier /progress/:contentId handler |
+| DELETE | /api/watch/history | Separately delete history and progress |
+| GET / POST / DELETE | /api/watchlist, /:contentId, /:contentId | Read/add/remove membership |
+| GET | /api/watchlist/check/:contentId | Individual membership check |
+| GET | /api/recommendations | Session-aware SQL sections; no personalized cache |
+| GET | /api/recommendations/trending, /new-releases, /genre/:genre | Public recommendation lists |
+| POST / GET | /api/recommendations/rate/:contentId, /rating/:contentId | Store/read profile rating |
+| GET | /api/subscription/plans, /status | Demo plans and current SQL subscription state |
+| POST | /api/subscription/subscribe, /cancel | Simulated assignment; cancellation is message-only |
+| GET | /api/admin/stats, /users, /content, /analytics/views | Admin reads |
+| POST / PUT / DELETE | /api/admin/content, /:id, /:id | Admin metadata CRUD, no file ingestion |
+| POST | /api/admin/content/:id/feature | Toggle featured flag |
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/stream/:contentId/master.m3u8` | HLS master manifest |
-| GET | `/api/stream/:contentId/variant/:variantId` | Variant playlist |
-| GET | `/api/stream/:contentId/segment/:segmentId` | Video segment |
+Streaming also exposes audio/subtitle playlists and segment paths. These are scaffolding, not an upload, DRM or download API. There is no standalone `/api/search`, `/api/profiles`, DRM license or content-publish endpoint.
 
-### Watch Progress
+For example, the existing progress client sends:
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/watch/continue` | Continue Watching list |
-| POST | `/api/watch/progress` | Update watch position |
-| POST | `/api/watch/progress/batch` | Batch sync (offline to online) |
+```json
+{"position":120,"duration":7200}
+```
 
-### Watchlist
+The browser omits the optional client timestamp. The single-update response can report success/wasUpdated/completed; the Redis stale shortcut returns a different skipped/reason shape. A production contract should always return the authoritative accepted revision and position, rather than making clients infer acceptance from a generic success flag.
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/watchlist` | My List |
-| POST | `/api/watchlist` | Add to watchlist |
-| DELETE | `/api/watchlist/:contentId` | Remove from watchlist |
+### Proposed additional contracts
 
-### Recommendations
+| Operation | Contract |
+|-----------|----------|
+| Create playback session | Bind account/profile/title revision/device capability; return bounded media and license access |
+| Progress update | Include session generation, sequence and base revision; return accepted state or conflict |
+| Publish revision | Require expected draft revision and validated asset set; replay the same durable operation |
+| Provider webhook | Verify provider identity and deduplicate event ID before subscription transition |
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/recommendations` | Personalized content rows |
-
-### Subscription
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/subscription` | Current subscription status |
-| POST | `/api/subscription` | Create/upgrade subscription |
-
-### Admin
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/admin/stats` | Platform statistics |
-| GET | `/api/admin/content` | Content management list |
-| POST | `/api/admin/content` | Add new content |
-| PUT | `/api/admin/content/:id` | Update content metadata |
-
----
+These are design extensions, not callable local endpoints.
 
 ## Key Design Decisions
 
-### 1. HLS over DASH
+### Encode before publication
 
-**Decision**: Use HLS (HTTP Live Streaming) as the primary streaming format.
+Precompute a bounded rendition ladder and validate an entire release before switching its active pointer. This lets every viewer fetch the same immutable objects, enables CDN reuse and keeps expensive encoding out of startup. Encoding on the first request might reduce work for unpopular titles but creates unpredictable first-view latency and a resource spike on releases. Eager encoding costs storage and processing for unwatched media; per-title analysis and baseline-first releases can reduce that cost without publishing missing mandatory assets.
 
-**Why HLS works**: Native support across all Apple devices without additional player libraries. FairPlay DRM integrates natively with HLS. Every CDN supports HLS caching. The format is well-documented with Apple's HLS Authoring Specification providing clear guidelines for encoding ladders.
+### Keep media delivery separate from entitlement
 
-**Why DASH fails for this use case**: DASH requires a third-party player on Apple devices. FairPlay DRM is HLS-only; using DASH would require Widevine, adding a second DRM system. While DASH is technically more flexible (supports more codecs), the operational overhead of maintaining two DRM systems outweighs the codec flexibility benefit for an Apple-first service.
+Authorize a playback session centrally and validate bounded credentials at delivery boundaries. Sending every segment through the account API would put hundreds of thousands of requests and terabits of media on a database-dependent service. Making an entire media bucket public would avoid that bottleneck but bypass content access policy. The chosen split requires credential renewal, rights-expiry handling, private origin configuration and a stated revocation window. Existing licenses/buffered bytes cannot be recalled instantly.
 
-**Trade-off**: HLS has slightly higher segment overhead than DASH (TS containers vs. fMP4), and the Apple ecosystem lock-in limits flexibility. For non-Apple devices (web, smart TVs), we serve HLS in fMP4 containers which most modern players support.
+### Preserve playback intent rather than trusting the largest timestamp
 
-### 2. Per-Segment Encryption
-
-**Decision**: Encrypt each HLS segment with a unique key rather than using a single content-wide key.
-
-**Why it works**: Per-segment keys enable secure seeking -- the player only needs the key for the segment being played, not the entire file. This is required for offline playback where the device stores encrypted segments and licenses separately.
-
-**Why single-key fails**: A single key for the entire content means compromising one key exposes the whole film. Per-segment rotation limits the damage of any single key exposure to 6 seconds of content.
-
-**Trade-off**: More key rotation requests to the license server. We mitigate this by including multiple segment keys in each license response (key rotation window of 10 segments).
-
-### 3. Last-Write-Wins for Watch Progress
-
-**Decision**: Use client-side timestamps with last-write-wins (LWW) for watch progress conflict resolution rather than strong consistency.
-
-**Why LWW works**: A user only watches on one device at a time. Conflicts are rare and low-stakes -- the worst case is resuming from a position 30 seconds off. LWW enables fast writes without distributed locks, keeping progress updates under 10ms.
-
-**Why strong consistency fails**: Serializable transactions for every progress update (every 10 seconds during playback) would create lock contention. At millions of concurrent streams, this bottleneck would degrade playback experience for a problem (conflicting progress) that almost never occurs.
-
-**Trade-off**: In the rare case of simultaneous playback on two devices, one device's position will be silently overwritten. The client includes `client_timestamp` so the more recent write always wins, even if it arrives at the server later.
-
----
+Within-session sequences and explicit handoff generations make retries and rewinds understandable. Simple last-write-wins by client clock lets a fast device suppress later valid updates; maximum-position merging loses rewinds. Explicit conflict policy adds state and occasionally a user choice. That is preferable to claiming there is one objectively correct resume position when two people watch the same profile on different devices.
 
 ## Consistency and Idempotency
 
-### Consistency Model
+Production metadata publication, subscription transitions and progress acceptance need durable receipts scoped by actor, operation and payload. A Redis response cache can accelerate replay but must not be the only evidence of a committed SQL write. Authentication/authorization precedes replay; an expired credential must not reuse a cached success to bypass access checks.
 
-| Operation | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Watch progress | Eventual (LWW) | One active session per profile; conflicts rare |
-| Download initiation | Strong (serializable) | Must enforce download limits accurately |
-| Content ingestion | Strong (per-content) | Encoding jobs depend on consistent state |
-| License grants | Strong | Security-critical; must not double-issue |
-| Watchlist add/remove | Eventual | Low conflict risk; UI handles stale reads |
-| Profile creation | Strong | Must enforce max profiles per account |
+Use unique constraints for operation/event identity, conditional state transitions, and outbox records committed with their source change. Queue delivery can repeat. Workers apply a given event once to each projection and checkpoint only after its effects commit. These give repeatable effects within defined boundaries, not universal exactly-once execution across a billing provider, queue, SQL and browser.
 
-### Idempotency
+The local middleware does not provide those guarantees; its scope and failure windows are detailed below.
 
-All mutating endpoints accept an `Idempotency-Key` header. The middleware checks Redis for an existing response, returning cached results for replayed requests. Concurrent duplicates receive 409 Conflict. Cached responses expire after 24 hours.
+## Security / Auth
 
-Key idempotency patterns:
-- **Download initiation**: Composite key (user + content + device + quality); existing pending/active downloads returned instead of creating duplicates
-- **Watch progress**: Inherently idempotent via `ON CONFLICT` upsert with `client_timestamp` comparison
-- **Transcoding jobs**: Job ID derived from content ID + profile hash; workers check completion before starting
+Production enforcement belongs on the server for account/profile ownership, kids restrictions, subscription rights and administrative actions. Revalidate selected profile ownership rather than trusting a stale session field. Regenerate sessions at login, revoke changed roles/entitlements deliberately, bound login attempts and validate request bodies.
 
----
+Protect media and license credentials from logs, referrers and shared caches. Use purpose-bound, expiring credentials and a supported DRM implementation. A base64 JSON object provides neither signature validation nor content protection. Offline access needs device-supported license storage and explicit expiry; a database download row is insufficient.
 
-## Security and Auth
-
-### Session-Based Authentication
-
-Sessions stored in Redis via `connect-redis` with express-session. Cookies are `httpOnly`, `sameSite: lax`, with `secure: true` in production. Session secret configured via environment variable.
-
-### Subscription Enforcement
-
-Streaming endpoints check subscription status before generating manifest URLs. Expired subscriptions receive a 403 with redirect to subscription management. Free-tier users can browse the catalog but cannot stream.
-
-### Profile Management
-
-Each account supports up to 6 profiles. Kids profiles enforce content rating filters (G, PG only) at the API layer. Profile selection is stored in the session.
-
----
+Catalog policy must cover direct details, playback, history and recommendation results consistently. Hiding adult titles on one home row cannot establish parental controls. Proposed administrative publication also validates rights and assets; ordinary metadata editing must not bypass these gates.
 
 ## Observability
 
-### Prometheus Metrics
+Production quality telemetry starts at the client: failed starts, time to first rendered frame, rebuffer ratio, decode failures, selected rendition and abandonment. Report bounded, sampled dimensions such as device class and region, with a playback session ID for correlation outside metric labels.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_request_duration_seconds` | Histogram | API latency by method, route, status |
-| `playback_start_latency_seconds` | Histogram | Time to first frame by device/quality |
-| `active_streams_total` | Gauge | Concurrent streams by quality/device |
-| `manifest_generation_duration_seconds` | Histogram | HLS manifest build time |
-| `streaming_errors_total` | Counter | Errors by type (DRM, network, codec) |
-| `circuit_breaker_state` | Gauge | Health of external dependencies |
-| `watch_progress_updates_total` | Counter | Sync success/conflict/error rates |
-| `idempotent_requests_total` | Counter | Idempotency cache hit/miss |
+Backend metrics track authorization availability, queue age, failed publication, progress acceptance/conflicts, outbox lag and subscription webhook delay. CDN hit rate, origin throughput and media errors come from actual delivery telemetry. Compare player success with authorization success to catch empty or corrupt media even when APIs return 200.
 
-### SLI/SLO Targets
-
-| SLI | Target | Warning | Critical |
-|-----|--------|---------|----------|
-| Playback start latency (p95) | < 2s | > 2.5s | > 4s |
-| API availability | 99.9% | < 99.5% | < 99% |
-| Streaming availability | 99.99% | < 99.95% | < 99.9% |
-| Manifest generation (p95) | < 100ms | > 150ms | > 300ms |
-| CDN cache hit rate | > 95% | < 90% | < 80% |
-
-### Structured Logging
-
-JSON-formatted logs via Pino with request correlation (`requestId`), user/profile context, and separate audit logging for security events (license issuance, content access, login, device registration).
-
----
+Local `/metrics` exposes HTTP and demo counters; it does not collect first-frame or real CDN data. `/health`, `/health/live` and `/health/ready` are API diagnostics, not proof that any title can play.
 
 ## Failure Handling
 
-### Circuit Breaker Pattern
+| Failure | Proposed response |
+|---------|-------------------|
+| Encoding worker dies | Reclaim its lease; reuse validated immutable outputs and retry unfinished work |
+| Queue publish fails after draft commit | Outbox dispatcher retries; draft remains visibly unready |
+| CDN edge fails | Bounded retry and alternate healthy delivery path; preserve playback session |
+| License service unavailable | Explain inability to start; never return a fake successful license |
+| Progress service unavailable | Continue local playback, retain bounded retryable state and show save uncertainty |
+| Device sends stale progress | Return current accepted state/conflict; do not silently regress resume |
+| Subscription event repeats | Deduplicate provider event and enforce event/state ordering |
+| Rights withdrawn | Deny new authorization; expire/revoke existing access according to documented policy |
 
-Independent circuit breakers for each external dependency:
-
-| Service | Timeout | Error Threshold | Reset Timeout |
-|---------|---------|-----------------|---------------|
-| CDN | 5s | 30% | 15s |
-| Transcoding | 5 min | 50% | 2 min |
-| DRM | 5s | 25% | 60s |
-| Storage | 10s | 40% | 30s |
-
-**Fallback strategies:**
-- **CDN failure**: Return cached content from origin or error gracefully
-- **Transcoding failure**: Queue job for later; content marked as "processing"
-- **DRM failure**: No fallback (license required for playback); user sees retry prompt
-- **Storage failure**: Return cached metadata if available
-
-### Graceful Degradation
-
-- **Recommendations down**: Return static "Popular Now" content
-- **Under high load**: Cap max quality at 1080p/4.5Mbps to shed load
-- **CDN unhealthy**: Reduce max quality to 720p/3Mbps
-
-### Retry Strategy
-
-Exponential backoff with jitter for retryable errors (5xx, 429, ETIMEDOUT, ECONNRESET). Max 3 retries with base delay 100ms, max delay 10s. Non-retryable errors (4xx) fail immediately.
-
----
+Circuit breakers limit repeated calls to unhealthy dependencies. They do not cancel timed-out work, persist retry jobs, or manufacture usable video as a fallback. Isolate encoding resources from latency-sensitive authorization and progress APIs.
 
 ## Scalability Considerations
 
-### What Breaks First
+CDN egress and cache misses dominate delivery. Use immutable revision URLs, origin shields and release prewarming where measurements justify the cost. Maintain compatible renditions so lower bandwidth or older devices can play without requesting unsupported codecs.
 
-1. **CDN cache hit rate under new releases**: A major premiere drives millions of simultaneous requests for the same content. Solution: predictive pre-positioning to edge nodes 24h before release.
+Progress is the first likely high-volume write bottleneck. Coalesce each active session's position updates, separate history events, and partition by profile while preserving its ordering/ownership. Add admission control and backpressure before accumulating an unbounded event backlog.
 
-2. **Watch progress write volume**: Millions of concurrent viewers updating progress every 10 seconds. Solution: batch client-side updates, write to Redis first, flush to PostgreSQL asynchronously.
-
-3. **Transcoding backlog**: A content library expansion could overwhelm encoding workers. Solution: autoscale workers based on queue depth, prioritize by release date.
-
-### Horizontal Scaling Path
-
-- **API servers**: Stateless; scale horizontally behind load balancer
-- **PostgreSQL**: Read replicas for catalog queries; shard user data by `user_id`
-- **Redis**: Redis Cluster with slot-based sharding
-- **CDN**: Multi-CDN strategy (CloudFront + Akamai) for redundancy and geographic coverage
-- **Transcoding**: Spot instances for cost-effective parallel encoding
-
-### Multi-Region Strategy
-
-- Active-active regions with region-local databases
-- Watch progress syncs across regions with LWW conflict resolution
-- Content catalog replicated asynchronously (eventual consistency acceptable)
-- CDN automatically routes to healthy origins on regional failure
-
----
+Catalog reads can use caches/replicas with versioned invalidation. Entitlement and publication decisions need current authoritative state. Search and recommendations can be asynchronous projections with a defined stale-result policy and a final playback authorization check. A multi-region plan must choose ownership and failover semantics rather than assuming an extra replica preserves all write invariants.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Streaming format | HLS | DASH | Native Apple device support, FairPlay integration |
-| DRM | FairPlay | Widevine | Native on all Apple devices |
-| Encoding | HEVC + H.264 | AV1 | Broader device support today |
-| CDN | Multi-CDN | Single CDN | Reliability and geographic coverage |
-| Watch progress | LWW (eventual) | Strong consistency | Low conflict risk, better write latency |
-| Offline | License-based (30 day) | Time-based stream | More flexible, supports subscription changes |
-| Retries | Exponential backoff | Fixed interval | Prevents thundering herd on recovery |
-| Circuit breaker | Per-service | Global | Isolates failures to specific dependencies |
-
----
-
-## Frontend Architecture
-
-This section documents the React frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
-
-### Component Hierarchy
-
-```
-__root.tsx (RootComponent)
-└── Outlet ─── child route content
-    ├── index.tsx (Home) ─── hero banner, content rows, recommendations
-    │   ├── HeroBanner ─── featured content with auto-rotation
-    │   ├── ContentRow ─── horizontal scrollable row of content cards
-    │   │   └── ContentCard ─── poster with title, genre, rating
-    │   └── Continue Watching row (profile-specific)
-    ├── content.$contentId.tsx ─── content detail page
-    │   └── Episode listing for series (grouped by season)
-    ├── watch.$contentId.tsx ─── full-screen video player
-    │   └── VideoPlayer
-    │       ├── VideoOverlay ─── content title, background
-    │       ├── PlayerTopBar ─── back button, content title
-    │       └── PlayerControls ─── play/pause, seek, volume, quality
-    │           ├── ProgressBar ─── draggable scrubber
-    │           └── QualitySettings ─── resolution/codec picker
-    ├── movies.tsx ─── filtered catalog (movies only)
-    ├── shows.tsx ─── filtered catalog (series only)
-    ├── watchlist.tsx ─── My List
-    ├── profiles.tsx ─── profile selection and management
-    ├── account.tsx ─── subscription management
-    ├── admin.tsx ─── admin dashboard
-    │   └── AdminTabs
-    │       ├── OverviewTab ─── platform stats (StatCard components)
-    │       ├── ContentTab ─── content CRUD
-    │       └── UsersTab ─── user management
-    ├── login.tsx ─── email/password login
-    └── register.tsx ─── account registration
-```
-
-Unlike Apple Music's fixed sidebar layout, Apple TV uses a full-width layout with a top `Header` component containing navigation links and profile selector. The root component is minimal -- it validates the session on mount and renders a dark-themed container.
-
-### Zustand Stores
-
-**`authStore`** -- Manages user session and multi-profile state. Uses `zustand/middleware/persist` to save the `currentProfile` to localStorage, so the selected profile survives page reloads. Holds `user`, `profiles` array, and `currentProfile`. Actions include `login`, `register`, `logout`, `checkAuth`, `selectProfile` (calls the backend to bind the profile to the session), `createProfile`, and `deleteProfile`. Multi-profile support enables different family members to have separate watch histories, watchlists, and recommendations.
-
-**`playerStore`** -- Manages video playback state. Key state includes `content`, `manifestUrl` (HLS manifest URL from the backend), `currentTime`, `duration`, `volume`, `isFullscreen`, `selectedVariant` (the current quality level), `selectedAudioTrack`, and `selectedSubtitle`. The `loadContent` action fetches playback info from `/api/stream/:contentId/playback` and saved progress from `/api/watch/progress/:contentId`, restoring the user's last position for seamless resume. The `saveProgress` action persists the current position to the server for cross-device sync.
-
-**`contentStore`** -- Manages catalog data and user content interactions. Holds `featured` (hero content), `continueWatching` (profile-specific in-progress content), `watchlist` (My List items), `recommendations` (personalized sections), and `genres`. Each has a corresponding `fetch*` action that calls the backend API. The `addToWatchlist` and `removeFromWatchlist` actions perform optimistic updates, immediately modifying local state while the server request is in flight.
-
-### Routing
-
-Uses TanStack Router with file-based routing. Dynamic route segments use the `$param` convention (e.g., `content.$contentId.tsx` maps to `/content/:contentId`). The `watch.$contentId.tsx` route renders the full-screen video player, separate from the main layout. A dedicated `router.ts` file creates the router instance with the generated route tree.
-
-### Data Fetching
-
-All API calls go through `services/api.ts`, organized into namespace objects: `authApi`, `contentApi`, `streamingApi`, `watchProgressApi`, `watchlistApi`, `subscriptionApi`, `recommendationsApi`, and `adminApi`. The shared `fetchApi` helper includes `credentials: 'include'` for cookie-based session auth and standardized error handling.
-
-The home page fetches data through the `contentStore` on mount: `fetchFeatured()`, `fetchContinueWatching()`, and `fetchRecommendations()` are called in parallel. Content detail pages fetch data directly in their route components using `useEffect`.
-
-### Key UI Pattern: Video Player
-
-The video player is the centerpiece of the Apple TV frontend, designed as a full-screen cinematic experience.
-
-**Player architecture:**
-The `VideoPlayer` component fills the entire viewport (`h-screen`) and manages several custom hooks:
-- `useAutoHideControls` -- hides the control overlay after 3 seconds of inactivity during playback, reappearing on mouse movement. The cursor also hides (`cursor: none`) for an immersive experience.
-- `useKeyboardControls` -- binds keyboard shortcuts: Space/K for play/pause, Left/Right arrows for 10-second seek, Up/Down for volume, M for mute, F for fullscreen, Escape to exit fullscreen.
-- `usePlaybackSimulation` -- since no real video files are served, this hook increments `currentTime` by 1 second each second during playback, simulating playback progress.
-- `useProgressAutoSave` -- saves watch progress to the server every 10 seconds via `playerStore.saveProgress()`, enabling cross-device resume.
-
-**Controls hierarchy:**
-The `ControlsOverlay` wrapper provides gradient overlays (top and bottom) that fade in/out with CSS transitions. `PlayerTopBar` shows the content title and a back button. `PlayerControls` renders the bottom control bar with play/pause, seek (via a draggable `ProgressBar` with scrubber), volume slider, quality selector (`QualitySettings` dropdown listing available `EncodedVariant` objects), and fullscreen toggle.
-
-**Quality selection:**
-The `QualitySettings` component displays available quality variants (from the `encoded_variants` table) as a dropdown. Each option shows resolution, codec, and bitrate. Selecting a variant updates `playerStore.selectedVariant`. In production, this would switch the HLS variant playlist; in the demo, it is purely visual.
-
-**Progress persistence:**
-When a user navigates to the watch page, `playerStore.loadContent` fetches both the content metadata and the saved progress position. `currentTime` is initialized to the saved position, allowing seamless resume. Progress is saved on unmount (via a cleanup function in `useEffect`) and periodically during playback.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers who may not have encountered these patterns before.
-
-### Role-Based Access Control (RBAC)
-
-**What it is:** RBAC is a method of restricting system access based on the roles assigned to individual users. Instead of granting permissions directly to each user (which becomes unmanageable at scale), you assign users to roles, and roles carry predefined sets of permissions. When the system needs to decide whether a user can perform an action, it checks the user's role against the required permission for that action.
-
-**How it works in this project:** Users have a `role` column in the `users` table with values `'user'` or `'admin'`. The backend middleware checks `req.session.user.role` before allowing access to admin endpoints (`/api/admin/*`). Regular users can browse content, manage their watchlist, and stream; admins can additionally manage content, view platform statistics, and manage users. Subscription tier (`free`, `monthly`, `yearly`) acts as a secondary access control -- streaming endpoints check subscription status before generating manifest URLs.
-
-**Why it matters at scale:** Without RBAC, access control devolves into scattered conditional checks throughout the codebase. As the team grows, no one can answer the question "what can a free-tier user actually do?" without reading every route handler. RBAC centralizes this into an auditable, testable system. Adding a new role (e.g., `content_curator` who can feature content but not manage users) requires only a middleware update, not changes to dozens of route handlers.
-
-### Redis Cache-Aside
-
-**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache (typically Redis) before querying the primary database. If the data is in the cache (a "hit"), the cached value is returned immediately. If the data is not in the cache (a "miss"), the application queries the database, stores the result in the cache with a time-to-live (TTL), and then returns it. The cache is never written to directly by the database -- the application is responsible for populating it.
-
-**How it works in this project:** Content metadata (titles, descriptions, thumbnails), recommendation sections, and session data are cached in Redis. The recommendation engine results are particularly expensive to compute (they involve JOINs across watch history, content ratings, and genre preferences), so caching them for a few minutes avoids recalculating on every page load. Cache entries are keyed by profile ID since recommendations are profile-specific.
-
-**Why it matters at scale:** Video streaming home pages are among the most read-heavy pages on the internet. Millions of users loading the home page simultaneously, each expecting personalized content rows, would overwhelm the database if every request triggered fresh recommendation queries. Redis serves these cached results in sub-millisecond time, and the TTL ensures fresh recommendations appear within minutes of new viewing activity.
-
-### Circuit Breaker (Opossum)
-
-**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly trying to execute an operation that is likely to fail. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and subsequent calls fail immediately without attempting the operation. After a timeout period, the circuit enters a "half-open" state where a limited number of test requests are allowed through. If they succeed, the circuit closes and normal operation resumes; if they fail, the circuit opens again.
-
-The three states are:
-- **Closed** (normal operation): requests pass through. If the failure rate exceeds the error threshold, the circuit opens.
-- **Open** (failing fast): all requests immediately fail with a fallback response, without contacting the downstream service. After the reset timeout elapses, the circuit transitions to half-open.
-- **Half-open** (testing recovery): a small number of requests are allowed through. If they succeed, the circuit closes. If any fail, the circuit reopens.
-
-**How it works in this project (`backend/src/shared/circuitBreaker.ts`):** Independent circuit breakers wrap calls to each external dependency: CDN (5s timeout, 30% error threshold, 15s reset), transcoding service (5min timeout, 50% threshold, 2min reset), DRM license server (5s timeout, 25% threshold, 60s reset), and storage (10s timeout, 40% threshold, 30s reset). The `opossum` library manages state transitions. When a circuit opens, the fallback returns a graceful response (e.g., "Popular Now" content instead of personalized recommendations). Circuit state is exposed as a Prometheus gauge metric and included in the `/health` endpoint.
-
-**Why it matters at scale:** Without circuit breakers, a failing DRM license server causes every playback request to hang for 30 seconds (the default TCP timeout) before returning an error. During this time, the request consumes a connection from the pool and a thread from the event loop. Under load, all connections are consumed waiting for the dead service, and the entire application becomes unresponsive -- even for requests that do not depend on DRM. This is called "cascading failure." Circuit breakers prevent this by failing fast: instead of waiting 30 seconds, the request fails in under 1ms with a clear error message, preserving resources for requests that can still succeed.
-
-### Structured Logging (Pino)
-
-**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text strings. Each log entry contains a consistent set of fields (`timestamp`, `level`, `service`, `requestId`, `message`, plus arbitrary context) that log aggregation systems (ELK, Loki, Datadog) can index and search. This is in contrast to traditional `console.log("User 123 failed to login")` which is human-readable but impossible to query programmatically.
-
-**How it works in this project (`backend/src/shared/logger.ts`):** The Pino logger outputs JSON lines. Express middleware creates a child logger for each request, binding the `requestId` (from `X-Request-Id` header or generated), HTTP method, path, and user/profile context. Audit events (login, license issuance, content access, profile changes) are logged to a separate audit channel for compliance. Pino was chosen over Winston for its low overhead -- it serializes JSON in a worker thread, keeping the event loop free.
-
-**Why it matters at scale:** When investigating why a specific user cannot play a specific episode, an engineer needs to trace the exact sequence: authentication check, subscription validation, manifest generation, DRM license request. With structured logging, they filter by `userId` and `contentId` to find all relevant log lines across all services, then by `requestId` to see the full request lifecycle. Without structured logs, this investigation requires manually searching text files with `grep`, often across dozens of servers, hoping the log format is consistent.
-
-### Prometheus Metrics
-
-**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals. Applications expose a `/metrics` endpoint that returns metric values in a specific text format. Prometheus stores these time series and enables queries like "what is the p95 playback start latency over the last hour?" Grafana is typically used to visualize these queries as dashboards.
-
-**How it works in this project (`backend/src/shared/metrics.ts`):** Several metrics are registered: `http_request_duration_seconds` (histogram for API latency by method, route, status), `playback_start_latency_seconds` (time from stream request to manifest delivery), `active_streams_total` (gauge for concurrent streams by quality and device type), `manifest_generation_duration_seconds` (histogram for HLS manifest build time), `streaming_errors_total` (counter by error type), `circuit_breaker_state` (gauge per dependency), `watch_progress_updates_total` (counter for sync operations), and `idempotent_requests_total` (counter for cache hits/misses). Node.js default metrics (CPU, memory, event loop lag) are also collected.
-
-**Why it matters at scale:** A streaming service must know, in real-time, how many users are experiencing buffering, what the playback start latency distribution looks like, and which CDN regions are underperforming. Metrics make these invisible problems visible. The SLI/SLO targets defined in the Observability section (e.g., "playback start latency p95 < 2s") are only enforceable if you are measuring them. Without metrics, the team discovers problems from user complaints, which means thousands of users were already affected.
-
-### Idempotency
-
-**What it is:** An idempotent operation produces the same result whether it is executed once or multiple times. In the context of an API, idempotency means that if a client sends the same request twice (due to a network timeout, a retry, or a user double-clicking), the server processes it only once and returns the same response both times. Without idempotency, retrying a "add to watchlist" request could create duplicate entries, or retrying a "create profile" request could create two identical profiles.
-
-**How it works in this project (`backend/src/shared/idempotency.ts`):** Clients include an `Idempotency-Key` header with mutation requests. The middleware checks Redis for a cached response under that key. If found and completed, the cached response is returned with an `X-Idempotency-Replayed: true` header. If found but in-progress, a 409 Conflict is returned. If not found, a Redis lock is acquired, the operation executes, and the result is cached for 24 hours. Watch progress updates are inherently idempotent via the database `ON CONFLICT` upsert with `client_timestamp` comparison.
-
-**Why it matters at scale:** Network unreliability is the norm on mobile devices, especially during video playback when the device may switch between Wi-Fi and cellular. A client that sends "update progress to 45:30" and does not receive a response will retry. Without idempotency, this could create duplicate progress records or trigger unnecessary server-side processing. For profile creation, it could create duplicate profiles. The idempotency middleware makes all retries safe by design.
-
-### Health Checks
-
-**What it is:** Health checks are HTTP endpoints that report whether the application is functioning correctly. They are consumed by infrastructure systems (load balancers, container orchestrators, monitoring) rather than by humans. There are typically two types: a liveness check ("is the process running?") and a readiness check ("can the process serve traffic?").
-
-**How it works in this project (`backend/src/index.ts`):** Three endpoints are exposed. `GET /health/live` returns 200 if the process is running (liveness probe). `GET /health/ready` checks PostgreSQL and Redis connectivity with latency measurements, returning 503 if either is unreachable (readiness probe). `GET /health` performs a deep check that includes component latency, circuit breaker state for all dependencies, and overall system status.
-
-**Why it matters at scale:** In a production deployment with multiple server instances, health checks enable automatic traffic management. If an instance loses its database connection, the readiness check fails, and the load balancer stops routing traffic to it -- before users see 500 errors. The deep health check is used by monitoring systems to detect degraded states (e.g., DRM circuit breaker is open) that are not outright failures but reduce service quality. The graceful shutdown handler (SIGTERM/SIGINT) closes Redis connections and drains the database pool, ensuring in-flight requests complete before the process exits.
-
-### Rate Limiting
-
-**What it is:** Rate limiting restricts how many requests a client can make to an API within a given time window. When a client exceeds the limit, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header indicating when the client can try again. It protects the server from being overwhelmed and ensures fair access across users.
-
-**How it works in this project:** Although not implemented as a standalone shared module (rate limiting is configured in the API Gateway layer of the production architecture), the Express server applies rate limiting via middleware on the streaming and admin endpoints. The production design specifies Redis-backed rate limiting for consistency across multiple server instances, with different limits per endpoint category.
-
-**Why it matters at scale:** A streaming service is particularly vulnerable to abuse. A single user writing a script to download every available title by requesting manifests and segments in rapid succession could consume bandwidth intended for legitimate users. Rate limiting caps the damage any single client can inflict while legitimate usage patterns (browsing, watching one stream at a time) fall well within the limits.
-
----
+| Media preparation | Validated release before publish | Encode on first play | Predictable startup and reusable objects |
+| Delivery | Private origin + authorized CDN | API proxy for every segment | Separate media scale from account storage |
+| Playback adaptation | Established media engine | Application-written ABR loop | Device and buffer behavior require specialized handling |
+| Resume conflicts | Sequences + handoff generation | Unbounded client-clock LWW | Preserve rewinds and reject superseded sessions |
+| Derived discovery | Eventual projections | Synchronous ranking in playback | Keep recommendation failures off the playback path |
+| Mutation replay | Durable scoped receipts | Redis-only cached responses | Recover after SQL commit and cache loss |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation.
+### Actual runtime and feature map
 
-### Local Architecture
+[backend/src/index.ts](./backend/src/index.ts) mounts all domains in one Express process. PostgreSQL and Valkey are shared; MinIO is initialized but no media read/write flow uses it. [Compose](./docker-compose.yml) has no queue, worker, CDN, proxy or observability server. API development uses 3001, Vite 5173; start defaults to 3000. Configuration and both fresh seed alternatives are explained in [README](./README.md).
 
+[content.ts](./backend/src/routes/content.ts) uses PostgreSQL filters and ILIKE search. Public list requires ready non-episodes, but details and episode lists do not enforce the same readiness or kids policy. Public view increments are unauthenticated and have no playback caller in the frontend. Content creation sets processing; admin updates can set ready directly without any assets. Deleting a series sets child series_id to null, leaving orphaned episodes.
+
+[recommendations.ts](./backend/src/routes/recommendations.ts) combines featured/trending/new releases, movies/series and history-derived genres. Trending means accumulated view_count, not recent velocity; new means the last 90 days. Main personalized sections query SQL and ignore the requested overall limit. Ratings are stored separately and unused in scoring. Continue Watching can appear twice on home: its explicit row and a recommendation section.
+
+Current caches are featured (300 seconds), genre metadata (one hour), public trending/new releases (900 seconds) and admin stats (300 seconds). Trending/new-release keys omit the requested limit. Admin metadata changes clear only selected catalog keys, leaving other cached lists/statistics stale. Continue Watching, individual progress and main recommendations are not cached. Cache read errors commonly return 500 rather than falling back to SQL.
+
+### Player and media scaffolding
+
+[VideoPlayer.tsx](./frontend/src/components/VideoPlayer.tsx) calls usePlaybackSimulation, incrementing time every second. [VideoOverlay](./frontend/src/components/player/VideoOverlay.tsx) renders an image. [playerStore](./frontend/src/stores/playerStore.ts) loads playback metadata and then progress serially; it never attaches the manifest to a media element. Playback-info returns only id/title/duration/status, so the player also lacks an image source, variants and track metadata; its quality menu is empty. There is no HLS.js, native video, DRM exchange, ABR, actual buffer measurement or download manager.
+
+The quality menu only assigns a variant in state; there is no Auto option. Volume/mute are state changes, subtitles have an inert button, and audio/subtitle store actions are uncalled. The progress bar shows a simulated full buffer and handles mouse input, without keyboard slider semantics. Several icon buttons lack accessible names, controls can hide while focused, keyboard handling does not exclude inputs, and fullscreen state does not subscribe to external fullscreen changes.
+
+The save interval is recreated on every currentTime change. During steady one-second playback it may never reach ten seconds. Back and unmount attempt saves, but the parent watch route resets the shared player during cleanup; no durable handoff, visibility/unload sender or offline queue exists. End-of-duration can advance beyond the server's accepted bound. No playback-end request is sent. These are source findings, not runtime reproductions.
+
+[streaming.ts](./backend/src/routes/streaming.ts) returns an unsigned base64 playbackToken that the browser and streaming authorization never consume. Cookie authentication and a stored subscription tier/expiry gate routes. Playback-info checks content ready but not selected-profile ownership, kids policy, device registration or concurrency.
+
+Master playlists query metadata and construct fixed codec strings. Variant/audio playlists use content duration without verifying the requested track belongs to that title; lower routes do not repeat all readiness checks. video_segments is unused. Video segments return an empty Buffer, audio segments return an empty string, and captions are a fixed two-cue sample. Segment request counters use Redis keys without expiry.
+
+The manifest builder can reference absent audio/subtitle groups and mark multiple English tracks DEFAULT=YES. Both contradict HLS group rules; codec and bandwidth metadata also need validation against actual media. [RFC 8216, rendition groups and alternative renditions](https://www.rfc-editor.org/rfc/rfc8216#section-4.3.4.1.1)
+
+### Accounts, profiles and subscription behavior
+
+[auth.ts](./backend/src/routes/auth.ts) hashes passwords with bcryptjs and stores session user/profile fields in Redis-backed express-session. Registration creates user and default profile separately. Login does not regenerate the session or clear a previously selected profile. `/me` reads user role/tier from the session, not a fresh users row. Profile selection verifies ownership once; subsequent personal routes often trust the stored profileId without repeating that check. Separate account/profile foreign keys do not enforce their association.
+
+Client persistence stores only currentProfile under appletv-auth. Restored auth does not reconcile it with server selection. Logout clears the auth store but not content/player stores or pending requests; profile changes have no request-generation guards. New profile responses use isKids while the frontend model reads is_kids. The count-before-create/delete checks can race beyond six profiles or below one.
+
+[subscription.ts](./backend/src/routes/subscription.ts) exposes illustrative prices and features. Subscribe assigns monthly/yearly expiry from now and updates only the current session; there is no payment. Cancel changes nothing. The middleware checks time against the stored expiry on each protected call, so sessions do expire with time, but other sessions do not learn intervening database changes until refreshed/login.
+
+Kids filtering exists on selected recommendation queries, not public catalog/details or playback. No rate limiter, device lease, persistent license or download endpoints are connected. SQL user_devices/downloads and many audit event names are unused scaffolding.
+
+### Progress and replay limitations
+
+[watchProgress.ts](./backend/src/routes/watchProgress.ts) conditionally upserts position/duration/completed when client_timestamp increases. It always advances updated_at, even on a stale SQL update; equality can report was_updated even when position was unchanged. The browser sends no clientTimestamp, so normal ordering is server arrival time. Caller-provided future timestamps are unbounded and can suppress subsequent changes.
+
+Completion uses position / supplied duration > 0.9; Continue Watching uses catalog duration, position > 60, fraction < 0.9 and completed=false. Exactly 90% falls into neither state. Input validation does not fully enforce positive integral canonical duration, and direct zero-duration series progress can break the continue query. Responses can describe the incoming completion flag rather than accepted stored state.
+
+The 60-second Redis progress marker is written after upsert but before a separate random-ID history insert. Marker/history failures can produce partial outcomes; ON CONFLICT DO NOTHING does not deduplicate history by viewing session. Repeated completed updates can append multiple history rows. History clearing uses two SQL statements and does not reset all concurrent or cached progress state. The batch route is unreachable for ordinary batch payloads because the earlier parameter route consumes them.
+
+The optional generic [idempotency middleware](./backend/src/shared/idempotency.ts) illustrates a Redis claim:
+
+```typescript
+const lockAcquired = await redis.set(lockKey, '1', {
+  NX: true,
+  EX: LOCK_TTL
+});
 ```
-┌─────────────────┐         ┌─────────────────┐
-│   React + Vite  │────────▶│  Express API    │
-│   :5173         │  HTTP   │  :3000          │
-│                 │◀────────│                 │
-│ - Home (Hero)   │         │ - Auth          │
-│ - Content Detail│         │ - Content CRUD  │
-│ - Video Player  │         │ - Streaming     │
-│ - Profile Mgmt  │         │ - Watch Progress│
-│ - Watchlist     │         │ - Watchlist     │
-│ - Account       │         │ - Subscriptions │
-│ - Admin Panel   │         │ - Recommendations│
-└─────────────────┘         │ - Admin         │
-                            └────────┬─────────┘
-                                     │
-              ┌──────────────────────┼──────────────────────┐
-              ▼                      ▼                      ▼
-     ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-     │   PostgreSQL    │    │  Valkey/Redis   │    │     MinIO       │
-     │   :5432         │    │  :6379          │    │  :9000 / :9001  │
-     │                 │    │                 │    │                 │
-     │ - All tables    │    │ - Sessions      │    │ - videos        │
-     │ - Full schema   │    │ - Idempotency   │    │ - thumbnails    │
-     │ - Audit log     │    │ - Cache         │    │                 │
-     └─────────────────┘    └─────────────────┘    └─────────────────┘
+
+A 30-second lock reduces simultaneous work for one key; cached JSON responses last 24 hours. However, the key binds only user-or-anonymous and supplied key, not method/path/profile/payload. Middleware runs before route authorization and validation. Replayed login responses do not recreate session side effects; reusing a key across actions can return unrelated or stale privileged data. The browser supplies no generic key.
+
+Response interception caches errors as well as successes, asynchronously and separately from SQL. json/send interception overlaps, lock deletion has no owner token, expiration can admit another worker, and Redis errors fail open. A committed SQL change can therefore repeat after response/cache loss. Helpers such as createIdempotencyKey are not called by application routes. This is not durable exactly-once processing.
+
+### Implemented operational patterns and their limits
+
+**Opossum:** [circuitBreaker.ts](./backend/src/shared/circuitBreaker.ts) wraps the master content SQL lookup under storage and simulated segment Redis operations under cdn. Timed calls illustrate limiting repeated dependency pressure at scale. Thresholds are error percentages with volume thresholds, not five consecutive failures. CDN uses 5 seconds/30%/10 calls, storage 10 seconds/40%/5 calls; reset periods are 15 and 30 seconds. Transcoding/DRM configurations have no active callers. Fallback objects contain no cached video; the storage fallback lacks rows and breaks the consumer, while a CDN fallback can become a non-media 200 response. Timeout does not cancel underlying work.
+
+**Metrics:** [metrics.ts](./backend/src/shared/metrics.ts) attaches HTTP duration/count observation at response finish:
+
+```typescript
+httpRequestDuration.observe(labels, duration);
+httpRequestTotal.inc(labels);
 ```
 
-### Production Patterns Actually Implemented
+This is useful for API latency, but route-local paths can collide across mounts and unmatched paths create unbounded labels. PlaybackStartLatency measures metadata lookup, not a rendered frame. The active-stream map keys content/quality/device type, so starts for different viewers collide while the gauge increments each time. End removes at most one entry, accepts no ownership proof and is never called by the browser. Counts have no expiry, are process-local, and do not enforce limits. CDN/DRM/transcoding instruments are mostly declarations, not real pipeline measurements.
 
-**1. Prometheus Metrics** (`backend/src/shared/metrics.ts`)
+**Logging:** [logger.ts](./backend/src/shared/logger.ts) provides request child loggers and a separate Pino audit logger. Request middleware runs before session parsing, so it does not automatically capture authenticated account/profile context. Client request IDs are accepted unvalidated; no redaction configuration is present. Audit calls cover selected events, not an immutable ledger; the audit_log SQL table is unwritten. Production audit output uses ./logs/audit.log, whose directory/deployment handling is not provided.
 
-Full `/metrics` endpoint with HTTP request duration histogram, playback start latency histogram, active streams gauge, manifest generation timing, streaming error counter, and circuit breaker state gauge. Includes Node.js default metrics (CPU, memory, event loop lag). Accessible at `GET /metrics`.
+**Health:** `/health` and `/health/ready` check PostgreSQL SELECT 1 and Redis PING without a total request deadline. They do not validate schema, media, MinIO, jobs or playback. Liveness is a response after global middleware and session handling, so Redis/session failure can affect it. Startup requires Redis but only warns on MinIO failure and does not require a database query before listening. SIGINT/SIGTERM close Redis and the SQL pool without first draining the HTTP listener.
 
-**2. Structured Logging with Pino** (`backend/src/shared/logger.ts`)
+### Simplified, substituted and omitted
 
-JSON-formatted request logging with request correlation via `X-Request-Id` header. Child loggers carry user/profile/content context. Audit events logged for security-relevant operations (login, license issuance, content access, profile changes).
+PostgreSQL provides all catalog/personal storage; Valkey substitutes for a production cache/session cluster; MinIO is provisioned as an S3-compatible placeholder. Metadata fixtures substitute for encoded assets and subscription assignments substitute for billing. The UI is a browser demo, not a native TV application.
 
-**3. Circuit Breaker (Opossum)** (`backend/src/shared/circuitBreaker.ts`)
-
-Circuit breakers wrapping external service calls (CDN, transcoding, DRM, storage) using the `opossum` library. Configured with per-service timeouts and error thresholds. Health status exposed via `/health` endpoint and Prometheus gauge metrics.
-
-**4. Idempotency Middleware** (`backend/src/shared/idempotency.ts`)
-
-Global `Idempotency-Key` header support with Redis-backed response caching. 24-hour TTL. Concurrent duplicate detection via Redis lock. Watch progress uses database-level LWW via `client_timestamp` column.
-
-**5. HLS Manifest Generation** (`backend/src/routes/streaming.ts`)
-
-Generates HLS master playlists with quality variants from `encoded_variants` table data. Includes audio track groups and subtitle groups. Variant playlists list simulated segments. Note: actual video segments are simulated -- no real FFmpeg transcoding pipeline.
-
-**6. Enhanced Health Checks** (`backend/src/index.ts`)
-
-Three-tier health checks: `/health/live` (liveness), `/health/ready` (DB + Redis connectivity), `/health` (deep check with component latency and circuit breaker state).
-
-**7. Graceful Shutdown** (`backend/src/index.ts`)
-
-SIGTERM/SIGINT handlers that close Redis connections and drain the database pool before exit.
-
-### What Was Simplified or Substituted
-
-| Production Component | Local Substitute | Rationale |
-|----------------------|------------------|-----------|
-| CDN (multi-tier) | MinIO direct URLs | No edge caching needed locally |
-| FairPlay DRM | No encryption | Requires Apple developer certificates |
-| FFmpeg transcoding | Simulated variants in DB | No actual encoding pipeline |
-| Video segments | Simulated HLS playlists | No real .ts segment files |
-| OAuth/Apple ID | Session + bcrypt | Simpler for development |
-| Geo-licensing | No region enforcement | Single-region setup |
-| Multi-region DB | Single PostgreSQL | One machine |
-| Message queue | Synchronous processing | No Kafka/RabbitMQ needed at local scale |
-
-### What Was Omitted
-
-- **Real video transcoding** -- no FFmpeg pipeline; variants are seeded into the database
-- **Actual HLS segment delivery** -- manifests are generated but reference simulated URLs, not real .ts files
-- **DRM/FairPlay integration** -- no content encryption or license server
-- **Offline downloads** -- schema exists but no download manager or license generation
-- **Cross-device sync push** -- no WebSocket/push notification when progress updates on another device
-- **Real ABR client** -- video player simulates playback; no actual adaptive bitrate logic
-- **CDN with edge caching** -- all content served from MinIO or simulated URLs
-- **Kubernetes / auto-scaling** -- runs as single-process Express server
-- **Distributed tracing** -- OpenTelemetry not integrated despite being referenced in observability design
-- **Backup/restore scripts** -- documented in architecture but not implemented
+Omitted components include actual media upload/encoding, publication jobs, private delivery credentials, DRM, CDN, offline licensing, durable event/outbox processing, search indexing, ML recommendations, cross-region ownership, sharding and tested operational failover. The [README](./README.md) documents fresh setup, conflicting seed paths, actual scripts and smoke-test limitations. Documentation review used source/configuration and isolated password verification; no runtime playback or concurrency benchmark was performed.

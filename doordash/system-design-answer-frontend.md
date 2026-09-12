@@ -1,349 +1,390 @@
-# DoorDash (Food Delivery) — System Design Answer (Frontend Focus)
+# DoorDash — frontend system design interview
 
-*45-minute system design interview format — Frontend Engineer Position*
+A proposed design for a 45-minute frontend interview. The local application is a useful
+starting point, but the reliability behaviors below are proposals unless the final
+implementation comparison says otherwise.
 
----
+## 🗣️ Opening and scope — 3 minutes
 
-## 📋 Opening Statement
+> “I'd design three experiences around the same order: a customer choosing dinner, a restaurant working through a queue, and a driver completing a delivery. They need different screens, but they must agree about whether an order exists and what can happen next.”
 
-"There isn't one frontend here — there are three, and they disagree about almost everything. The customer app is a browse-and-buy experience that goes quiet after checkout and then becomes a live tracker. The restaurant app is a single screen someone glances at across a hot kitchen. The driver app runs in a pocket, on cellular, while its user is driving.
+I'd first clarify whether the driver experience must run in a browser or can use a native
+app. Reliable background location is a platform requirement, not something a React component
+can guarantee. I'll design the customer and restaurant web apps, plus a foreground driver
+web experience whose tracking limits are explicit.
 
-They share a domain and a WebSocket, and almost nothing else — different session lengths, different failure tolerances, different definitions of 'fast'.
+The initial scope is one restaurant per order and one active order per driver. Customers
+browse, maintain a cart, place an order, track it, and cancel within policy. Restaurants
+confirm and advance preparation. Drivers receive an offer, accept it online, and confirm
+pickup and delivery.
 
-I'll focus on the three problems that decide whether this works: keeping a cart correct when prices and availability change underneath it, tracking an order in real time without lying to the customer when the connection drops, and building a driver client that assumes the network is unreliable rather than treating that as an error case."
+I would leave payment collection, multi-order batching, chat, and promotions outside this
+interview. Checkout still needs a correct agreed total and a durable order receipt; adding a
+card provider later would introduce a separate confirmation and recovery workflow.
 
----
+### What success means to each user
 
-## 🎯 Requirements
+| Persona | Important outcome | Failure the interface must reveal |
+|---------|-------------------|----------------------------------|
+| Customer | Understand the total and whether the order was accepted | A timed-out request whose outcome is unknown |
+| Restaurant | See every accepted order and its next permitted action | A disconnected tablet displaying an apparently empty queue |
+| Driver | Know the current assignment and report progress | An expired offer or delivery confirmation still pending |
 
-### Functional
+For discussion, assume 200,000 connected clients across markets and up to 100,000 drivers
+reporting every ten seconds at peak. Those numbers motivate bounded subscriptions and
+efficient rendering; they are not load-test results.
 
-| Surface | Must do |
-|---------|---------|
-| **Customer** | Browse restaurants, build a cart, check out, track the order live |
-| **Restaurant** | See incoming orders immediately, advance them through preparation states |
-| **Driver** | Receive offers, accept, navigate, stream location, mark delivered |
+I'd target committed order changes appearing within two seconds for connected clients. For
+location, I'd display the observation age and mark points stale after an initial
+thirty-second threshold. Socket connectivity and point freshness are separate signals.
 
-### Non-functional
+## 🏗️ Client architecture and state — 5 minutes
 
-| Requirement | Target | Why |
-|-------------|--------|-----|
-| New-order visibility (restaurant) | < 2s, impossible to miss | A missed order is a refund and a lost customer |
-| Location update cadence | ~5s while active | Faster drains battery for imperceptible gain |
-| Cart correctness | Never charge a stale price | Silent price drift is a trust and chargeback problem |
-| Customer tracking staleness | Visible when stale | A frozen map that looks live is worse than an honest "reconnecting" |
-| Driver app on poor connectivity | Degrades, never blocks | The driver is moving; the network will drop |
-
-### Non-goals
-
-No in-app payments UI, no chat between parties, no route optimization across multiple orders. Each is a substantial product on its own.
-
-I'd also flag one thing the current build doesn't have and a real deployment would need: **push notifications.** Every surface has a moment where the user isn't looking at the app — a restaurant during prep, a driver between deliveries, a customer who switched tabs — and in-app alerts reach none of them. That's a platform capability rather than a UI decision, but designing around it changes how much the in-app alerting has to carry.
-
----
-
-## 🏗️ Three Clients, One Event Stream
+This is the diagram I would draw, leaving backend service decomposition for follow-up:
 
 ```
-   CUSTOMER              RESTAURANT             DRIVER
-   browse → cart         order queue            offer → accept
-   checkout              advance status         location stream
-   live tracking         (single screen)        mark delivered
-        │                     │                      │
-        └──────────┬──────────┴──────────┬───────────┘
-                   │      WebSocket      │
-                   ▼                     ▼
-        ┌────────────────────────────────────────┐
-        │        API  ·  broadcast(orderId)      │
-        └───┬────────────────┬───────────────┬───┘
-            │                │               │
-       PostgreSQL      Redis GEO set      Kafka
-      (order truth)   (driver positions)  (event log,
-                                           produce-only)
+┌──────────────────────────────────────────────────────┐
+│ Customer routes │ Restaurant queue │ Driver delivery │
+└──────────────────────────┬───────────────────────────┘
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│ View state + server snapshots + pending operations   │
+└───────────────────┬────────────────────┬─────────────┘
+                    ▼                    ▼
+          ┌──────────────────┐  ┌──────────────────┐
+          │ HTTP API client  │  │ Socket lifecycle │
+          └─────────┬────────┘  └─────────┬────────┘
+                    ▼                    ▼
+          ┌────────────────────────────────────────┐
+          │ Authorized API and event gateway       │
+          └────────────────────────────────────────┘
 ```
 
-The three clients also differ in a way the diagram doesn't show: **only one of them is ever left unattended.** The customer closes the app, the driver puts the phone away, and the restaurant tablet stays on a wall for twelve hours. That asymmetry drives most of the reliability decisions later in this answer.
+The server owns order state, current catalog facts, assignment authority, and permissions.
+The client owns unsubmitted choices, navigation, presentation, and the record of an
+operation awaiting acknowledgement. A pending action is not the same thing as a new
+authoritative order status.
+
+| State | Location | Reason |
+|-------|----------|--------|
+| Cuisine/search/page | URL | Links and back navigation reproduce the query |
+| Restaurant/menu response | Server-data cache keyed by query | Prevent unrelated queries overwriting one another |
+| Cart quantities and last displayed prices | Persisted client store | Instant editing and reload continuity |
+| Current order and revision | Server-data cache keyed by order ID | HTTP and socket updates reconcile into one view |
+| Pending checkout/action ID | Small persisted operation record | Recover after a reload or uncertain response |
+| Drawer, focus, selected tab | Component state | No cross-route owner is needed |
+| Connection generation and subscriptions | One transport service | Mounting cards must not create sockets |
+
+I'd use TanStack Router for navigation and Zustand for the small shared client-owned state.
+A dedicated server-data layer can coordinate request cancellation, keys, and freshness. I
+would not put every fetched response into an undifferentiated global store.
+
+The API boundary normalizes response shape and money before components render. A TypeScript
+type assertion cannot turn a numeric string into a number or rename `isActive` to
+`is_active`. The boundary should reject malformed essential data and provide a recoverable
+error instead of silently drawing zero dollars or an offline driver.
+
+Shared code should include money formatting, status vocabulary, contract parsing, and
+operation recovery. The kitchen queue and driver card can have separate layouts because they
+prioritize different information. I'd share a component when its behavior really matches,
+rather than forcing every role through a long list of flags.
+
+## 🔧 Deep Dive 1: Checkout when the cart is stale — 9 minutes
+
+### Decision: keep cart editing local and validate an agreed quote at submission
+
+> “The cart remembers what the customer selected. It cannot certify that a restaurant is still open or that yesterday's price is still available.”
+
+Suppose a customer adds a meal for $15 and returns after the restaurant changes it to $17.
+Updating the total silently at submission produces an order they did not review. Rejecting
+everything and clearing the cart also loses useful intent. I would retain the selection,
+display the changed line, and ask the customer to accept the revised quote.
+
+The cart stores menu IDs, quantities, configuration, and last displayed prices. The server
+provides a short-lived quote that binds current item revisions, fees, delivery address,
+currency, and total. The client shows that quote as the submission amount. If it expires or
+a required item changes, the server returns a structured reconciliation result.
+
+| Choice | Benefit | Cost for this product |
+|--------|---------|-----------------------|
+| ✅ Local cart plus authoritative quote | Quantity taps stay instant; submission has an agreed boundary | Quote expiry and item-level reconciliation need UI |
+| ❌ Trust persisted prices | Very simple client | A restored cart can submit obsolete terms |
+| ❌ Send every cart edit to the server | Centralized drafts | A weak connection delays ordinary browsing interactions |
+
+A server-owned cart can help cross-device shopping later. It still needs checkout
+validation, because a saved server draft can also outlive a menu revision. The trade-off is
+about where edits happen, not whether stale data can exist.
+
+### One operation survives an uncertain response
+
+After the user confirms the quote, mint one operation ID and persist it with the agreed
+payload before sending. Disable additional submission for that operation, but do not rely on
+a disabled button for backend deduplication.
+
+The server must atomically create the order, its lines, and an operation receipt. The
+frontend then has three meaningful outcomes:
+
+| Outcome | What the customer sees | Next step |
+|---------|------------------------|-----------|
+| Accepted with order ID | Order confirmation | Clear the submitted cart and navigate to that order |
+| Explicit rejection | Specific item/address/quote problem | Preserve selections and repair the rejected request |
+| Timeout or connection loss | “Checking whether your order was placed” | Look up or retry the same operation ID |
+
+A timeout is not evidence of rejection. Minting a new UUID for the next button click defeats
+deduplication even if the backend has a good idempotency implementation. If the customer
+edits the basket while an operation is unresolved, keep the new draft separate until the
+earlier operation's outcome is known.
+
+A generic conflict is not automatically success either. The operation lookup must identify
+this user and the same agreed payload. A response belonging to another payload is a real
+conflict that should be surfaced, not treated as an existing order.
+
+### Persistence and restaurant switching
+
+I would keep cart persistence small and versioned. Save selection data, not a whole growing
+history of API responses. Validate the persisted shape when loading, and partition or clear
+account-specific details at logout. Delivery addresses do not need indefinite storage merely
+because quantities do.
+
+Opening another restaurant should not erase the current basket. If the user adds an item
+from the new restaurant, explain the single-restaurant constraint and let them confirm
+replacing the basket. This makes the destructive moment explicit and avoids accidental loss
+during browsing.
+
+For total calculations, display the server's rounded line, fee, and total amounts. Integer
+minor units with a currency contract are easier to reason about than accumulating binary
+floating-point values throughout components. The client can show a draft estimate, but it
+should not invent its own tax rules.
+
+The cost of this design is more states than “loading/success/error.” That complexity pays
+for an understandable answer to the most important checkout question: did I place an order
+already?
+
+## 🔧 Deep Dive 2: Live tracking and missed events — 9 minutes
+
+### Decision: use push for responsiveness and snapshots for recovery
+
+A WebSocket can deliver updates quickly while connected, but reconnecting does not replay
+everything missed. A kitchen tablet may lose its network, miss three new orders, and
+reconnect to an apparently empty queue. Without reconciliation, the successful reconnect
+makes the screen look healthier than it is.
+
+I would use one authenticated connection per active application session, with subscriptions
+scoped to the current user's permitted resources. The server must authorize each
+subscription; hiding a channel name in the UI is not access control.
 
-**One event stream, three subscriptions.** All three clients listen to the same order channel and filter for what concerns them. The alternative — a per-role socket protocol — means three implementations of reconnection and three chances for the party views to disagree about an order's state.
-
-The design consequence worth stating: **the order status enum is a shared vocabulary, and each client renders its own view of the same value.** `READY_FOR_PICKUP` is a green banner to the driver, a "waiting for courier" line to the customer, and a completed row to the restaurant. Nobody derives their own status; they interpret one.
-
----
-
-## 🔍 Deep Dive 1: A Cart That Can Go Stale Underneath You (11 minutes)
-
-The cart is the most deceptively hard piece of state in the product, because it's client-owned data about server-owned facts.
-
-### Why it's not just a list
-
-A cart holds item IDs, quantities, and prices. All three can be invalidated by things the customer never sees: a price change, an item going out of stock, or the restaurant closing. And carts persist — someone adds items at 11pm and checks out at noon the next day, by which point the cart describes a world that no longer exists.
-
-**The failure isn't a crash, it's a wrong charge or a phantom order.** A cart holding yesterday's price either charges the wrong amount or fails at checkout with an error the customer can't interpret.
-
-### Options
-
-| Approach | Correctness | Cost |
-|----------|-------------|------|
-| ❌ Store price in the cart, trust it at checkout | Wrong charges | Simplest; a chargeback generator |
-| ❌ Store only IDs, re-price on every render | Always correct | A request per render; cart unusable offline |
-| ✅ **Store IDs + last-known price, re-validate at checkout** | Correct where it matters | Needs a reconciliation UI when they differ |
-| ✅ Server-owned cart | Always correct | Every quantity tap is a round trip |
-
-### What I'd build
-
-**Client-owned cart, server-validated at the boundary.** The cart lives locally so adding items is instant and works while browsing offline. Displayed prices are labeled as last-known. At checkout, the server re-prices from truth and the client compares.
-
-The interesting part is what happens when they differ. **A silent update is the wrong answer** — a customer who reviewed a total and gets charged more has been deceived, even by two dollars. Equally, dumping them back to an empty cart with "something changed" destroys the purchase.
-
-So the reconciliation is explicit and itemized: this item went up, this one is unavailable, here's the new total, confirm or edit. That's more UI than either alternative and it's the only version that's both correct and completable.
-
-**The client-owned choice also decides persistence.** A cart in `localStorage` survives reloads, which is what customers expect — but it must be **scoped per restaurant and invalidated when the restaurant changes**, or someone returns to a cart of items from a restaurant that's now closed. And it must never persist a price it will silently reuse; the stored price is for display continuity only.
-
-> "The rule I'd apply is that the client can *remember* a price but never *assert* one. Money comes from the server at the moment of the charge, and any difference gets shown rather than resolved quietly."
-
----
-
-## 🔍 Deep Dive 2: Live Tracking That Doesn't Lie (10 minutes)
-
-After checkout the customer app becomes a tracker, and tracking is where real-time UIs most often mislead.
-
-### The core problem
-
-The customer sees a driver position and an ETA. Both come over WebSocket. When that socket drops — a phone sleeps, a network switches — **the last position stays on screen, frozen, looking exactly like a driver who has stopped moving.** The customer draws a conclusion ("my driver is parked") from an absence of data. That's the failure mode: not a crash, a confident wrong impression.
-
-### What the UI owes the user
-
-| Situation | Naive behavior | What it should do |
-|-----------|---------------|-------------------|
-| Socket connected, driver moving | Position updates | ✅ Correct |
-| Socket dropped | Position freezes, looks live | ⚠️ Mark stale, show last-updated time |
-| Reconnected, position jumped | Marker teleports | Interpolate, or show the jump honestly |
-| Driver genuinely stopped | Position freezes | Same visual as a dropped socket — **must be distinguishable** |
-
-The last row is the crux: **a stopped driver and a broken connection produce identical pixels.** Only the client can tell them apart, and only if it tracks its own connection state rather than inferring liveness from data arrival.
-
-### The design
-
-Two independent signals, always both visible: **connection state** ("live" vs "reconnecting") and **data age** ("updated 4s ago"). Together they disambiguate. Position alone never implies freshness.
-
-For movement, I'd interpolate between updates arriving every ~5 seconds so the marker glides rather than teleporting — but **interpolation must stop when the data goes stale.** A marker that keeps smoothly gliding on extrapolated positions after the connection dropped is actively fabricating information, which is worse than a frozen one. Animation is a presentation of received data, never a substitute for it.
-
-**ETA deserves the same skepticism.** A countdown that keeps ticking during a dropped connection is a lie that gets worse every second. It should freeze and grey out with the rest of the stale data.
-
-> "My test for any real-time UI is: if the backend went away right now, would the screen start lying? For a tracking map the answer is yes by default, and everything here is about making it no."
-
----
-
-## 🔍 Deep Dive 3: A Driver Client Where the Network Is Expected to Fail (10 minutes)
-
-The driver app inverts the assumptions the other two make. Its user is moving through varying coverage, the screen is often off, and the phone is doing navigation at the same time.
-
-### Location streaming is the whole battery budget
-
-The app streams position while a delivery is active. Cadence is the dominant power decision:
-
-| Interval | Tracking quality | Battery | Verdict |
-|----------|-----------------|---------|---------|
-| ❌ 1s | Marginally smoother | Heavy GPS + radio | Imperceptible gain, real cost |
-| ✅ **~5s while active** | Smooth with interpolation | Acceptable | Client-side interpolation covers the gaps |
-| ✅ Adaptive (slower when stationary) | Same | Better | Motion detection to suppress redundant pings |
-| ❌ On-demand only | Poor | Best | Customer sees a stale driver |
-
-**Interpolation on the customer side is what buys the driver's battery.** A 5-second cadence looks like 1-second tracking once the receiving client smooths between points — so the optimization lives in a different app than the cost it saves. That's worth calling out because it's easy to tune each client in isolation and miss the trade.
-
-### Offline is normal, not exceptional
-
-The driver will lose signal mid-delivery. If "mark delivered" requires connectivity, the driver stands in a dead zone unable to complete a finished job.
-
-So state-changing actions are **queued locally and replayed** when the connection returns, with clear pending indication. That immediately requires idempotency: a queued "delivered" that gets replayed twice must not double-fire. Each action carries a client-generated ID, minted when the driver taps — the same pattern as an idempotency key, for the same reason.
-
-**What can't be queued is acceptance.** An offer has a timeout and may be reassigned; accepting one offline and syncing later would assign a driver to an order someone else already took. So accept requires connectivity and says so plainly, while delivery confirmation does not. **Queueability follows from whether the action is contended, not from whether it's convenient.**
-
-### Screen and glanceability
-
-The driver reads this while driving. Large targets, high contrast for sunlight, one primary action per screen, and no interaction requiring precision. The app should also assume it's backgrounded most of the time — which means arrival at a state that needs attention has to survive the app not being in the foreground, pushing this toward notifications rather than in-app banners.
-
----
-
-## 🧭 Questions I'd Ask First
-
-**"Is the customer app primarily mobile web or a native shell?"** It changes the driver app entirely — background location and push notifications are native capabilities, and a pure web driver client can't reliably stream position with the screen off. I'll design the web version and flag that limit rather than pretend it away.
-
-**"How many orders does a busy restaurant handle concurrently?"** Four and forty are different screens. At four, cards work; at forty, the single-screen constraint breaks and I need grouping by state.
-
-**"Do we need to support order modification after placement?"** It sounds small and it reshapes the state machine, the cart, and every party's view — a customer editing an order the kitchen has started is a coordination problem, not a UI one.
-
-> "The one I'd push hardest on is the first. If the driver client must be web, then location streaming with the screen off is unreliable, and that changes what we can promise the customer about tracking."
-
----
-
-## 🍳 The Restaurant Screen Is a Different Product
-
-Worth its own section because the constraints are unlike the other two: a tablet on a wall or counter, in a loud kitchen, viewed from a distance, by someone with their hands full.
-
-- **A new order must be unmissable** — sound plus a persistent visual state, not a toast. A toast that auto-dismisses while the cook is plating is a lost order.
-- **The screen never navigates.** Single view, orders as cards, state advanced by large buttons. Any flow requiring navigation will be abandoned mid-service.
-- **Legibility beats density.** Reading distance is a metre or more; showing twelve orders in small type is worse than four in large type with scrolling.
-- **Sound needs an unlock affordance.** Browsers block autoplay audio until a user gesture, so an alert that silently never plays is a real and common failure. The UI must verify audio is armed and say so.
-
-The interesting tension: this screen is the one that most needs to never miss a WebSocket message, and it's the one most likely to be left open for twelve hours on cheap hardware. **Reconnection has to be relentless here**, with an unmistakable disconnected state — a kitchen believing it has no orders when it has six is the worst outcome in the system.
-
----
-
-## ⏱️ ETA Is a Promise, So Present It Like One
-
-The server computes ETA from travel time, prep time, and traffic multipliers. How the client displays that number is a product decision with real consequences.
-
-**A single precise time invites disappointment.** "Arriving 7:42" is wrong by a minute most of the time, and a customer who reads a precise number treats it as a commitment. A range — "7:40–7:50" — communicates the actual confidence and absorbs normal variance without feeling like a failure.
-
-**Precision should narrow as certainty grows.** Before a driver is assigned, the estimate is mostly guesswork about dispatch; once the driver is en route with a known position, it's a real calculation. Showing the same format throughout implies constant confidence the system doesn't have.
-
-**Never let the ETA run backwards silently.** Estimates worsen — traffic, a slow kitchen. A number that jumps from "10 minutes" to "25 minutes" with no acknowledgement reads as a bug or a lie. A brief explanation ("kitchen is running behind") converts a broken promise into an informed wait, and it costs nothing because the server already knows which component of the estimate changed.
-
-This is the clearest example of a broader point: **the client's job is to represent the server's certainty accurately, not to make it look better than it is.** That's the same principle as marking stale tracking data, applied to a number instead of a map.
-
----
-
-## 🗄️ State: Ownership Decides Placement
-
-| State | Owner | Home | Note |
-|-------|-------|------|------|
-| Cart | Client | Local, persisted per restaurant | Prices display-only |
-| Restaurant/menu data | Server | Fetched, cached briefly | Availability changes underneath |
-| Active order status | Server | WebSocket-pushed, never locally advanced | Single source of truth for all three clients |
-| Driver location | Server | Pushed; interpolated locally | Interpolation is presentation, not state |
-| Connection status | Client | Store | Drives the honesty signals in Deep Dive 2 |
-| Queued driver actions | Client | Persisted queue | Must survive app restart |
-
-**No client ever advances an order's status locally**, not even optimistically. Three parties observe one state machine; a client that guesses at a transition can show the restaurant "picked up" while the driver hasn't arrived. Status is displayed, never predicted.
-
----
-
-## 🛒 Browsing: Where the Customer Actually Spends Time
-
-Most of a customer's session is browsing, so it deserves attention even though it's the least novel part.
-
-**Filtering belongs in the URL.** Cuisine, sort order, and price band are shareable and back-button-able; a filter set held only in a store means "send me that vegan place list" doesn't work and the back button escapes the results entirely. This is the same argument as elsewhere — state a user would want to share is URL state.
-
-**Search results and the restaurant list are the same component under different queries.** Treating "search" as a separate screen duplicates card rendering, pagination and empty states. One list, different parameters.
-
-**Images dominate perceived performance.** A restaurant list is mostly photography, and three things matter more than any framework choice: explicit dimensions so cards don't reflow as images arrive, lazy loading below the fold, and appropriately sized sources rather than full-resolution originals scaled down in CSS. Layout shift while scrolling a list is the single most-felt performance defect in this kind of app, and none of the fixes involve React.
-
-**Availability has to be honest at the item level.** A restaurant that's open with half its menu unavailable is a worse experience than a closed one, because the customer builds a cart before discovering it. Unavailable items should be visibly unavailable in the list, not rejected at checkout.
-
----
-
-## ♿ Accessibility Across Three Very Different Contexts
-
-Each surface has a distinct dominant need, which is why a single checklist wouldn't serve them:
-
-- **Customer:** menus are long lists with structure — headings, prices, dietary markers — and screen-reader users navigate by heading. Prices must be in the accessible name of the item, not implied by adjacency.
-- **Restaurant:** distance legibility, high contrast, and audio alerts that don't depend on hearing them — a persistent visual state is the accessible equivalent of the chime.
-- **Driver:** one-handed reach, huge targets, and never requiring sustained attention. The strongest accessibility feature here is not needing to look at the screen at all.
-
-Status must never be conveyed by color alone in any of the three — order states carry text and shape, because a red-green deficiency in a kitchen shouldn't turn "ready" into "preparing".
-
----
-
-## 🧪 Testing Three Clients Against One Stream
-
-The valuable tests here simulate the network and the clock, not the clicks.
-
-| Scenario | Simulation | Protects |
-|----------|-----------|----------|
-| Stale price at checkout | Change price between add-to-cart and submit | The reconciliation flow, not a silent charge |
-| Cart survives reload | Persist, reload, re-price | Per-restaurant scoping and invalidation |
-| Socket drop during tracking | Kill the connection mid-delivery | Marker marked stale; ETA freezes; no extrapolation |
-| Driver goes offline then delivers | Queue the action, restore connectivity | Replay happens once, not twice |
-| Duplicate replay | Fire the queued action twice | Client action ID makes it idempotent |
-| Restaurant misses nothing | Drop and restore the socket with orders arriving | Missed orders appear on reconnect; disconnected state was visible |
-| Audio blocked | Load without a user gesture | UI reports that alerts are not armed |
-
-The last one is easy to overlook and operationally severe — an alert that silently fails is indistinguishable from no orders.
-
-I'd drive all of these from **recorded WebSocket event sequences** rather than a live backend. Replaying a real delivery's event stream — placed, confirmed, preparing, assigned, twenty location pings, delivered — exercises all three clients deterministically, including the interleavings that only happen under load.
-
----
-
-## 📦 Bundle Strategy Across Three Apps
-
-The three surfaces have opposite tolerances, so a single bundle serves none of them well.
-
-| App | Constraint | Approach |
-|-----|-----------|----------|
-| Customer | First visit on mobile decides conversion | Route-split; browsing loads without tracking or checkout code |
-| Restaurant | Loaded once, runs all day | Size barely matters; reliability does |
-| Driver | Cellular, frequently reloaded | Smallest possible; no browsing or authoring code |
-
-**Splitting by role at the route boundary is the whole strategy.** A driver should never download restaurant browsing; a kitchen tablet should never download the cart. Because the three apps share a domain module and nothing else, this split is natural rather than something to engineer around.
-
-The one shared cost worth watching is the WebSocket client and the domain module, which every surface needs. Keeping the domain module free of UI dependencies is what stops it dragging component code into all three bundles.
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Rejected | Rationale |
-|----------|--------|----------|-----------|
-| Cart ownership | ✅ Client-owned, server-validated | ❌ Server cart | Instant interaction; correctness enforced where money changes hands |
-| Price drift | ✅ Explicit itemized reconciliation | ❌ Silent re-price | A changed total the customer didn't see is deception |
-| Cart persistence | ✅ Per restaurant, invalidated on change | ❌ Global cart | Prevents ordering from a closed restaurant |
-| Tracking freshness | ✅ Connection state + data age, both shown | ❌ Position alone | A stopped driver and a dead socket look identical otherwise |
-| Marker movement | ✅ Interpolate, stop when stale | ❌ Extrapolate | Continued animation fabricates data |
-| Location cadence | ✅ ~5s + client interpolation | ❌ 1s | Battery cost with no perceptible gain |
-| Driver offline | ✅ Queue non-contended actions | ❌ Require connectivity | A driver in a dead zone must still complete a delivery |
-| Accepting offers | ✅ Requires connectivity | ❌ Queue like other actions | Contended resource; stale accept assigns a taken order |
-| Status transitions | ✅ Server-pushed only | ❌ Optimistic | Three observers of one machine must not diverge |
-| Restaurant alerts | ✅ Persistent state + sound | ❌ Toast | Auto-dismiss loses orders |
-
----
-
-## 🧱 Component Boundaries That Earn Their Keep
-
-I'd resist a shared component library across the three apps, with two exceptions.
-
-**Share the domain vocabulary, not the widgets.** Status labels, currency formatting, and the order state machine's allowed transitions belong in one place — they're correctness, and divergence means the driver and the customer describe the same order differently. That's a shared *module*, not a shared component.
-
-**Don't share layout components.** An order card for a kitchen tablet and an order card for a phone have different information hierarchies, different densities, and different touch targets. A single configurable card serving both accumulates a prop for every difference until nobody can predict what it renders. Two components that look similar are cheaper than one that's conditionally everything.
-
-The test I'd apply: **if a change for one surface would require a conditional, it shouldn't be shared.** Formatting money never needs a conditional. Rendering an order card always does.
-
----
-
-## 🚀 What Breaks First
-
-**Restaurant reconnection, before anything else.** A tablet open for a full service day will drop its socket. If reconnection is silent and imperfect, the kitchen misses orders and doesn't know. This is the highest-severity failure in the system and it's a client-side one.
-
-**Then the customer's restaurant list.** Long lists with images are the classic virtualization case — but the first fix is image loading discipline, not windowing: lazy loading and correct dimensions to prevent layout shift buy more than virtualization at realistic list lengths.
-
-**Then location fan-out.** Every active order pushes positions to at least two clients. Fan-out is a server concern, but the client contributes by not subscribing to orders it isn't showing — a customer with the app open shouldn't receive updates for a completed order.
-
-**Then cart complexity**, as modifiers and options multiply. A cart line stops being an ID and quantity and becomes a configured object, and equality — "is this the same line item?" — gets genuinely hard.
-
----
-
-## 🔌 One Socket, Three Subscription Patterns
-
-The clients share a transport and use it very differently, which shapes the connection layer.
-
-| Client | Subscribes to | Connection lifetime | Reconnect urgency |
-|--------|--------------|--------------------|--------------------|
-| Customer | One active order | Minutes, during delivery | Moderate — stale tracking is visible |
-| Restaurant | All orders for the store | Hours, all service | **Critical** — silence means missed orders |
-| Driver | Their assignment + offers | Whole shift | High — a missed offer is lost income |
-
-Two consequences.
-
-**Subscriptions must be scoped, not global.** A customer receiving every order event for a restaurant is a privacy problem before it's a performance one. The client subscribes to what it's authorized to see, and the server enforces that rather than trusting the subscription request.
-
-**Reconnection must reconcile, not just resume.** Every client needs to re-fetch current state on reconnect, because messages sent while disconnected are gone — a WebSocket has no replay. Resuming the socket without re-fetching leaves the UI showing whatever it had before the drop, silently missing every transition in between. This is the same gap described in Deep Dive 2, and it's why connection state and data freshness are tracked separately: reconnecting is the trigger to distrust local state, not to assume it's fine.
-
----
-
-## 📝 Summary
-
-Three ideas:
-
-1. **The client may remember prices but never assert them.** Local carts for speed, server pricing for truth, and an explicit reconciliation when they disagree — because a silently corrected total is a trust failure, not a UX detail.
-2. **Real-time UIs lie by default.** Frozen data looks like stopped movement, and smooth animation over missing data is fabrication. Connection state and data age must be first-class, visible, and independent of the data itself.
-3. **Three clients, three sets of assumptions.** A shared event stream and status vocabulary keeps them consistent; everything above that — persistence, cadence, offline behavior, legibility — is decided per surface, because a kitchen tablet and a phone in a moving car have nothing in common but the order.
+| Transport strategy | Benefit | Trade-off |
+|--------------------|---------|-----------|
+| ✅ Push plus snapshot reconciliation | Fast updates and explicit recovery | Requires versions, lifecycle handling, and reconnect logic |
+| ❌ Push alone | Small happy-path implementation | Lost messages leave the screen permanently incomplete |
+| ❌ Rapid polling everywhere | Simple recovery semantics | Repeated unchanged responses create large peak load |
+
+At 200,000 connected clients, polling every two seconds could create 100,000 requests per
+second before user actions. Slower polling is a useful fallback, but it cannot meet a
+two-second kitchen visibility target consistently. Push earns its complexity when many
+clients wait for infrequent but important changes.
+
+### Closing the snapshot/subscription gap
+
+On initial load or reconnect, establish the authorized subscription and buffer incoming
+versioned updates while fetching a current snapshot. Apply the snapshot, then apply only
+relevant updates newer than it. The server must define how its snapshot revision and
+subscription acknowledgement relate; otherwise there is still a gap where an event can
+disappear.
+
+For one order, an order version supports monotonic updates. A restaurant queue also needs a
+collection cursor or a full authoritative refresh, because an order absent from the old list
+has no local version to compare. Limit buffering; if the gap or buffer grows too large,
+fetch again instead of retaining unlimited events.
+
+Events with an old order version should not move a delivered order back to preparing. Events
+from a previous route, account, or connection generation should be discarded even if they
+arrive late. Request cancellation helps save work, but a generation check is still useful
+when cancellation loses a race.
+
+### Position and status have different clocks
+
+Location needs a tracking-session ID, sequence, and observation timestamp. Order state needs
+its own revision. A delayed GPS report cannot undo delivery completion, and a newer order
+revision does not make an old position fresh.
+
+The tracker displays both connection state and last observation age. A connected socket can
+carry stale GPS because the driver's device stopped reporting. Conversely, a brief socket
+interruption may leave a reasonably recent observation on screen. Label those conditions
+independently.
+
+I'd animate between received positions only within a bounded interval. Smoothing can make
+sparse updates easier to follow, but it introduces presentation delay and cannot establish
+where the driver actually traveled between two points. Stop animation when observations
+become stale; do not extrapolate movement indefinitely.
+
+ETA should be a range with an update time and stage context. If the estimate is stale, say
+so rather than keeping a confident countdown running. Explain a delay only when the backend
+supplies a supported reason; the client cannot deduce traffic from a slow marker.
+
+### Transport lifecycle is owned in one place
+
+The connection owner tracks intentional shutdown, active generation, reconnect timer,
+subscriptions, and a bounded retry policy with jitter. Unmounting a route unsubscribes it.
+Logging out cancels timers and prevents an old `onclose` callback from opening a new socket
+under stale identity.
+
+A heartbeat detects dead connections, but it does not prove that the server delivered every
+event. Reconnect still requires a snapshot. If push remains unavailable, show that condition
+and use a bounded refresh fallback instead of silently spinning forever.
+
+For slow consumers, keep the latest location per active order. Business events cannot simply
+be dropped without a recovery signal; after a gap, force snapshot reconciliation. A browser
+should not process a minute of obsolete movement before learning that an order was
+delivered.
+
+## 🔧 Deep Dive 3: A driver action during a network outage — 8 minutes
+
+### Decision: retain intent locally, but reserve authority for the server
+
+> “The phone can remember that the driver tapped ‘Delivered.’ It cannot declare the assignment complete to everyone else until the server accepts that operation.”
+
+The driver may reach a building with poor reception after physically handing over the order.
+Losing that action forces them to repeat work later, but showing a final success before
+acknowledgement may free capacity or trigger downstream effects incorrectly.
+
+I would persist a minimal pending delivery operation with its operation ID, order ID,
+assignment identity, expected state, and observation time. The screen says “Delivery
+confirmation pending” and retries that same operation after reconnecting. Once the server
+returns the matching receipt, it becomes complete.
+
+| Action | Can retain intent while offline? | Server condition on replay |
+|--------|---------------------------------|----------------------------|
+| Delivery confirmation | Yes, as visibly pending | Same assignment and permitted current state, or same accepted receipt |
+| Pickup confirmation | Potentially, with a pending state | Assignment and order remain valid; no blind replay after cancellation |
+| Offer acceptance | Do not present as accepted offline | Exact unexpired offer must still reserve this driver/order |
+| Going online | Remember desired preference only | Server confirms eligibility and starts a fresh tracking session |
+
+These actions are not inherently safe just because the UI queues them. Cancellation,
+reassignment, or a manual support action may change authority before replay. A rejected
+pending operation needs a resolution screen, not endless automatic retries or a forced local
+state change.
+
+An offer is particularly time-sensitive. The client can show a countdown based on the server
+deadline, but only the server can decide whether acceptance won the race against expiry. A
+local countdown reaching zero should disable acceptance, while an apparently positive
+countdown is still not permission to override a server rejection.
+
+### Cost of local persistence
+
+| Approach | Why choose it or avoid it? |
+|----------|----------------------------|
+| ✅ Persist a small operation record until resolved | Survives app restart and supports an honest pending state |
+| ❌ Treat every offline tap as final success | Other clients and dispatch may disagree about reality |
+| ❌ Drop all failed actions immediately | Driver loses the record of a completed physical task |
+
+The trade-off is recovery complexity and sensitive data retention. Store only what is needed
+to identify the operation, scope it to the account, expire resolved records, and handle
+logout explicitly. A queued operation must never be replayed under the next person's session
+on a shared device.
+
+Location is different from delivery intent. I would keep the latest unsent observation
+rather than replay every old point after reconnecting. Include sample time and sequence,
+stop tracking when appropriate, and discard late GPS callbacks from a prior tracking
+generation.
+
+Start with a ten-second foreground cadence, then measure battery cost and freshness before
+introducing adaptive intervals. GPS acquisition, device state, and radio behavior matter;
+interpolation alone does not prove a particular interval is optimal.
+
+The driver interface should support use when safely stopped: large targets, short
+instructions, high contrast, and one clear primary action. It should avoid requiring
+sustained interaction during driving. Native background tracking and push are separate
+platform capabilities to evaluate if the product needs them.
+
+## 🍳 Restaurant queue, discovery, and accessibility — 5 minutes
+
+The restaurant screen should show an unmistakable disconnected state and a persistent count
+of unacknowledged new orders. A transient toast is insufficient for a tablet someone checks
+between tasks. Optional sound needs an explicit enable/test control, and visual alerts must
+remain useful without hearing it.
+
+A successful transition response should immediately reconcile the corresponding card using
+its returned revision. Waiting only for the socket event makes a successful button press
+appear ineffective when push is delayed. The event may then arrive again; version-aware
+merging makes that harmless.
+
+At a busy restaurant, group orders by preparation stage and show age or promised-ready time.
+Keep focus stable when a card moves, and announce meaningful status changes accessibly.
+Don't read every GPS update through a screen reader or reorder a focused card unexpectedly.
+
+For discovery, start with paginated results and stable image dimensions. Use correctly sized
+images, lazy loading below the fold, and URL-backed filters. Virtualize genuinely large
+lists if profiling shows DOM cost, preserving keyboard navigation and focus. Five seeded
+restaurants do not justify claiming virtualization is already necessary or implemented.
+
+A search error should be distinguishable from “no restaurants match.” If a request for one
+cuisine finishes after the user selects another, its response should stay under its original
+cache key. Similar protection is needed when switching restaurant dashboards or accounts.
+
+| Accessibility concern | Design response |
+|-----------------------|-----------------|
+| Status conveyed only by color | Text labels and explicit next actions |
+| Quantity controls are just “+” and “−” | Accessible names include item and action |
+| Checkout error is disconnected from a field | Associate message, focus the invalid field, preserve inputs |
+| Tracking depends on a map | Text status, freshness, ETA, and address remain available |
+| Long kitchen shift | Strong contrast, scalable text, stable focus and persistent alerts |
+
+I'd split substantial route code and optional map dependencies so browsing does not download
+the full driver workflow. Measure real bundle output and interaction latency rather than
+assuming file-based routing automatically provides the desired split.
+
+## 🧪 Validation and implementation comparison — 6 minutes
+
+The most valuable tests control the network, clock, and event order. I would combine
+deterministic client tests with API contract tests and a small three-persona end-to-end
+journey.
+
+| Scenario | Expected result |
+|----------|-----------------|
+| Price changes before checkout | Revised quote appears; no silent acceptance |
+| Create commits but response is lost | Reload resolves the original operation; one order exists |
+| Restaurant disconnects while new orders arrive | Reconciliation restores all current relevant orders |
+| Old snapshot arrives after a newer event | UI does not move backward |
+| GPS stops while socket stays connected | Position becomes stale independently |
+| Logout with a reconnect timer pending | No old-session socket or queued action restarts |
+| Delivery replay after reassignment | Pending intent is rejected or escalated, not blindly applied |
+| Driver receives readiness update | Correct next action becomes available without a manual reload |
+
+I would monitor client connection age, snapshot recovery failures, unresolved checkout
+operations, and user-visible stale tracking. Avoid recording precise location or full
+addresses in routine frontend error telemetry.
+
+### What the checked-in application actually does
+
+The React/TanStack Router app uses local route state plus persisted auth and cart stores. It
+fetches through one API module and reuses an `OrderCard`. The cart performs optimistic local
+quantity edits, but there is no server quote, item reconciliation screen, or durable
+pending-operation record.
+
+Checkout generates random San Francisco coordinates and a fresh idempotency UUID per API
+call. Opening another restaurant clears the existing basket. Auth state persists, but the
+existing session-refresh action is not called at startup; logout does not clear cart/address
+persistence.
+
+The tracker displays coordinates in a placeholder, not a map. Its socket hook reconnects
+without snapshot recovery or visible freshness, and array-dependent effects plus uncancelled
+reconnect timers can churn connections. Server subscriptions are unauthenticated. The
+restaurant dashboard sends the wrong open-state property and waits solely for socket status
+updates; driver stats use a different field naming convention from the UI, and driver
+subscriptions miss subsequent preparation events.
+
+There is no offline action queue, offer acceptance flow, native background location,
+audio-alert workflow, or menu-management UI. Those are proposed improvements in this answer.
+The [architecture](./architecture.md#implementation-notes) traces the current behavior to
+source; the [README](./README.md) explains setup and demo constraints.
+
+### Trade-offs I would defend
+
+| Decision | Chosen | Alternative | Cost accepted |
+|----------|--------|-------------|---------------|
+| Cart and checkout | ✅ Local edits plus agreed server quote | ❌ Trust saved prices | Reconciliation and pending-operation UI |
+| Tracking | ✅ Push with snapshots and freshness | ❌ Socket connection alone | Versioning and lifecycle complexity |
+| Offline driver actions | ✅ Persist pending intent, require server acceptance | ❌ Local final success | Conflict resolution after reconnect |
+
+> “I'd finish with the uncertainty boundaries: a cart is a draft, a timeout can hide a successful order, and a received coordinate may already be old. Making those distinctions explicit gives all three users a screen they can act on.”

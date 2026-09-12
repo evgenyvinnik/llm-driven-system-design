@@ -1,72 +1,93 @@
-# Design DoorDash - Food Delivery Platform
+# DoorDash: food delivery coordination
 
-## Codebase Stats
+A local learning project for a three-sided delivery marketplace: customers browse and order, restaurant owners advance preparation, and drivers receive assignments and report delivery. The useful design problems are coordinating those views, matching nearby drivers, estimating arrival time, and deciding which updates require durable consistency.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 10,642 |
-| Source Files | 72 |
-| .ts | 5,672 |
-| .md | 2,251 |
-| .tsx | 2,155 |
-| .sql | 226 |
-| .json | 148 |
+This is an independent teaching implementation, not DoorDash's production architecture. Read [architecture.md](./architecture.md) for the proposed production design and an exact account of the current implementation. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) answers explain a proposed design in a 45-minute interview format.
 
-## Overview
+## What the application contains
 
-A simplified DoorDash-like platform demonstrating real-time order tracking, restaurant aggregation, delivery optimization, and three-sided marketplace dynamics. This educational project focuses on building a food delivery system with real-time logistics.
+| Surface | Implemented behavior | Current limits |
+|---------|----------------------|----------------|
+| Customer | Search by restaurant name, filter cuisine, view categorized menus, persist a single-restaurant cart, place orders, view history and status, cancel a placed order | Checkout generates random San Francisco coordinates; tracking shows coordinate text, not a map; history displays the first page |
+| Restaurant | Select an owned restaurant, view active orders, confirm, start preparation, mark ready | Menu management is a placeholder; the open/closed toggle sends `is_open`, while the API expects `isOpen`, so it does not change the flag |
+| Driver | Location reporting through browser geolocation, availability toggle, assigned orders, pickup/delivery controls, fee/tip statistics | Stats return camelCase profile fields while the UI reads snake_case; preparation updates do not reach its subscribed driver channel; background tracking is not provided |
+| Backend | Session authentication, restaurant/menu CRUD, order routes, heuristic matching and ETA, local WebSocket broadcasts, Kafka producers, audit rows, metrics and health endpoints | No payment processing, dispatch offers, durable retry worker, replayable socket stream, reviews API, or separate admin interface |
 
-## Features
+The project demonstrates these mechanisms, but it does **not** currently guarantee atomic checkout, exclusive driver assignment, safe status transitions under concurrency, or authorized WebSocket subscriptions. Important source findings are collected in [Implementation Notes](./architecture.md#implementation-notes). Use synthetic data on a local machine.
 
-### Customer Features
-- Browse restaurants with filtering by cuisine
-- View restaurant menus and add items to cart
-- Place orders with delivery address and tip
-- Real-time order tracking with status updates
-- View order history
+## Stack and processes
 
-### Restaurant Features
-- Restaurant dashboard to manage incoming orders
-- Update order status (confirm, preparing, ready)
-- Toggle restaurant open/closed status
-- View active orders in real-time
+- **Frontend:** React 19, TypeScript, Vite 6, TanStack Router, Zustand, Tailwind CSS.
+- **Backend:** one Express 4/TypeScript process, `ws`, PostgreSQL via `pg`, node-redis, KafkaJS, Opossum, Pino, and `prom-client`.
+- **Compose infrastructure:** PostgreSQL 16, Valkey 7 with AOF, and Confluent Kafka/ZooKeeper 7.5.0. PostgreSQL and Valkey have named volumes; Kafka and ZooKeeper have no configured data volumes.
 
-### Driver Features
-- Driver dashboard with online/offline toggle
-- Receive order assignments automatically
-- Real-time location tracking (GPS)
-- Pickup and delivery confirmation
-- View earnings and delivery stats
+Node.js **20 or newer** and npm are required. Infrastructure runs separately from the two application processes. Choose one infrastructure option; both use the same host ports.
 
-## Tech Stack
+## Option A: Docker Compose (recommended)
 
-- **Frontend:** TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
-- **Backend:** Node.js + Express + WebSocket
-- **Database:** PostgreSQL (orders, users, restaurants) + Redis (geo commands, sessions, real-time)
-- **Message Queue:** Kafka (order events, location updates, dispatch events)
-- **Real-time:** WebSocket for live updates
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js 20+
-- Docker and Docker Compose
-- npm or yarn
-
-### 1. Start Infrastructure
+Run from this project's directory (`doordash/`):
 
 ```bash
-cd doordash
-docker-compose up -d
+docker compose up -d
+docker compose ps
+docker compose exec -T postgres pg_isready -U doordash -d doordash
+docker compose exec -T redis redis-cli ping
+docker compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list
 ```
 
-This starts:
-- PostgreSQL on port 5432 (with seed data)
-- Redis on port 6379
-- Kafka on port 9092 (event streaming)
+Wait for the services to become healthy. Compose mounts [backend/src/db/init.sql](./backend/src/db/init.sql), which creates the schema **only when PostgreSQL initializes an empty data directory**. It does not load sample data. On a fresh schema, seed once:
 
-### 2. Start Backend
+```bash
+docker compose exec -T postgres psql -U doordash -d doordash -v ON_ERROR_STOP=1 --single-transaction < backend/db-seed/seed.sql
+```
+
+The seed assumes fresh serial IDs for its users, restaurants, and driver. Its initial inserts are not repeatable; running it against an existing database can fail or associate records incorrectly. Inspect existing data before reseeding. There is no `db:migrate` or `db:seed` npm script.
+
+To stop infrastructure while retaining PostgreSQL and Valkey volumes:
+
+```bash
+docker compose down
+```
+
+For an intentional reset of this project's development data, `docker compose down -v` removes those volumes. Kafka/ZooKeeper state is not protected by named volumes even with ordinary `down`.
+
+## Option B: Native installation on macOS (no Docker)
+
+Homebrew supplies [PostgreSQL 16](https://formulae.brew.sh/formula/postgresql@16), [Valkey](https://formulae.brew.sh/formula/valkey), and [Kafka](https://formulae.brew.sh/formula/kafka). Current Homebrew Kafka uses KRaft and initializes its local storage during installation; this differs from the ZooKeeper-based Compose setup. See the [formula's installation and service configuration](https://raw.githubusercontent.com/Homebrew/homebrew-core/master/Formula/k/kafka.rb). Native versions are not pinned to the Compose images.
+
+```bash
+brew install postgresql@16 valkey kafka
+brew services start postgresql@16
+brew services start valkey
+brew services start kafka
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+pg_isready -h localhost -p 5432
+valkey-cli ping
+kafka-topics --bootstrap-server localhost:9092 --list
+```
+
+On a fresh local PostgreSQL cluster, create the application role and database. Use `doordash_dev` at the password prompt to match the development defaults:
+
+```bash
+createuser --pwprompt doordash
+createdb --owner=doordash doordash
+PGPASSWORD=doordash_dev psql -h localhost -U doordash -d doordash -v ON_ERROR_STOP=1 --single-transaction -f backend/src/db/init.sql
+PGPASSWORD=doordash_dev psql -h localhost -U doordash -d doordash -v ON_ERROR_STOP=1 --single-transaction -f backend/db-seed/seed.sql
+```
+
+If the role/database already exist, inspect them rather than rerunning creation blindly. These schema and seed commands are for an empty project database. Kafka can auto-create the three producer topics; an explicit local setup is:
+
+```bash
+for topic in order-events location-updates dispatch-events; do
+  kafka-topics --bootstrap-server localhost:9092 --create --if-not-exists --topic "$topic" --partitions 1 --replication-factor 1
+done
+```
+
+Stop native services with `brew services stop kafka`, `brew services stop valkey`, and `brew services stop postgresql@16` when finished. The application can serve orders without Kafka, but publications made while the producer is unavailable are lost.
+
+## Start the application
+
+From `doordash/`, start the API in one terminal:
 
 ```bash
 cd backend
@@ -74,9 +95,7 @@ npm install
 npm run dev
 ```
 
-The API server starts on http://localhost:3000
-
-### 3. Start Frontend
+In another terminal, also starting in `doordash/`:
 
 ```bash
 cd frontend
@@ -84,189 +103,88 @@ npm install
 npm run dev
 ```
 
-The frontend starts on http://localhost:5173
+Open [the application](http://localhost:5173). Vite proxies `/api` and `/ws` to port 3000. Redis must be reachable before the backend starts because its module awaits the connection. The backend does not load `.env` files; export variables in its shell when changing defaults.
 
-### 4. Access the Application
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PORT` | `3000` | HTTP and WebSocket server |
+| `FRONTEND_URL` | `http://localhost:5173` | Allowed HTTP CORS origin |
+| `DB_HOST`, `DB_PORT` | `localhost`, `5432` | PostgreSQL server |
+| `DB_USER`, `DB_PASSWORD`, `DB_NAME` | `doordash`, `doordash_dev`, `doordash` | PostgreSQL credentials/database |
+| `REDIS_URL` | `redis://localhost:6379` | Valkey connection; no local password |
+| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker addresses |
+| `KAFKA_CLIENT_ID` | `doordash-api` | Producer client ID |
+| `LOG_LEVEL`, `SERVICE_NAME`, `APP_VERSION` | `info`, `doordash-api`, `dev` | Pino configuration |
 
-Open http://localhost:5173 in your browser.
+The database module reads the `DB_*` variables above, not `DATABASE_URL`. Kafka's Compose listener advertises `localhost:9092` for host-based clients; it is not an application-container networking configuration.
 
-## Demo Accounts
+## Demo accounts and walkthrough
 
-The database is seeded with demo accounts:
+All four seeded accounts use **`password123`**; the bcrypt hash was verified against that password during the documentation review.
 
-| Role | Email | Password |
-|------|-------|----------|
-| Customer | customer@example.com | password123 |
-| Restaurant Owner | restaurant@example.com | password123 |
-| Driver | driver@example.com | password123 |
-| Admin | admin@example.com | password123 |
+| Email | Role | Seeded resources |
+|-------|------|------------------|
+| `customer@example.com` | Customer | One sample order |
+| `restaurant@example.com` | Restaurant owner | Five restaurants, 25 menu items |
+| `driver@example.com` | Driver | One profile with a stored San Francisco location |
+| `admin@example.com` | Admin | Role-based API privileges, no separate admin UI |
 
-## Running Multiple Backend Instances
+Use separate browser profiles for the three personas because they otherwise share a session cookie and persisted stores. Browse a restaurant, add enough items to meet its minimum, and place a customer order. Its address text is retained, but checkout creates random nearby coordinates rather than geocoding it. No card is charged.
 
-For testing distributed scenarios:
+The restaurant owner can advance an order through confirmed, preparing, and ready for pickup. Matching runs once during confirmation. A driver needs a fresh location within 5 km of the restaurant; browser permission and the actual device location affect the demo. If no candidate is found, there is no automatic rematching job. A fresh Redis database has an empty geo set even though SQL contains the seeded driver; an empty geo result does not trigger the SQL fallback.
+
+The driver dashboard receives assignment events, but subsequent restaurant status broadcasts omit its driver channel. Reload it to see the current state before pickup. Reloading also exposes the stats field-name mismatch: the online indicator may not reflect SQL availability. Toggling online sets availability even for an assigned driver, so it is not a safe repair for dispatch state.
+
+The pre-existing sample order is a **display fixture**, not a valid completed checkout: it is `PREPARING` at Burger Barn with an assigned driver still flagged available, an address shaped as street/city/state/zip rather than address/lat/lon, and totals inconsistent with its three line items. It has no ETA. Do not use it as proof that delivery calculations or financial totals work.
+
+Registration alone does not create a driver profile. `POST /api/auth/become-driver` creates a profile for the current user but does not change their role; the dashboard requires role `driver`. The seeded driver avoids this onboarding gap.
+
+## Verification and useful commands
+
+Backend checks, from `backend/`:
 
 ```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
+npm run type-check
+npm run build
+npm run lint
 ```
 
-## API Endpoints
+Frontend checks, from `frontend/`:
 
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
-
-### Restaurants
-- `GET /api/restaurants` - List restaurants (with filters)
-- `GET /api/restaurants/:id` - Get restaurant with menu
-- `GET /api/restaurants/meta/cuisines` - Get cuisine types
-
-### Orders
-- `POST /api/orders` - Place order
-- `GET /api/orders` - Get customer's orders
-- `GET /api/orders/:id` - Get order details
-- `PATCH /api/orders/:id/status` - Update order status
-
-### Drivers
-- `POST /api/drivers/location` - Update driver location
-- `POST /api/drivers/status` - Toggle online/offline
-- `GET /api/drivers/orders` - Get driver's orders
-- `POST /api/drivers/orders/:id/pickup` - Confirm pickup
-- `POST /api/drivers/orders/:id/deliver` - Confirm delivery
-
-## WebSocket Events
-
-Connect to `ws://localhost:3000/ws`
-
-### Subscribe to Channels
-```javascript
-// Subscribe to order updates
-ws.send(JSON.stringify({ type: 'subscribe', channel: 'order:123' }))
-
-// Subscribe to customer orders
-ws.send(JSON.stringify({ type: 'subscribe', channel: 'customer:1:orders' }))
-
-// Subscribe to restaurant orders
-ws.send(JSON.stringify({ type: 'subscribe', channel: 'restaurant:1:orders' }))
+```bash
+npm run type-check
+npm run build
+npm run lint
 ```
 
-### Events Received
-- `new_order` - New order placed (for restaurants)
-- `order_status_update` - Order status changed
-- `driver_location` - Driver location update
-- `order_assigned` - Order assigned to driver
+Readiness and metrics, with the backend running:
 
-## Kafka Events
-
-Order and location events are published to Kafka for analytics, auditing, and downstream services.
-
-### Topics
-- `order-events` - Order lifecycle events (created, confirmed, preparing, ready, picked_up, delivered, cancelled)
-- `location-updates` - Real-time driver GPS location updates
-- `dispatch-events` - Driver assignment events (assigned, accepted, declined)
-
-### Example Events
-```javascript
-// order-events topic
-{
-  "orderId": "123",
-  "eventType": "created",
-  "timestamp": "2024-01-15T10:30:00.000Z",
-  "customerId": 1,
-  "restaurantId": 2,
-  "total": "25.99"
-}
-
-// location-updates topic
-{
-  "driverId": "5",
-  "latitude": 37.7749,
-  "longitude": -122.4194,
-  "orderId": "123",
-  "timestamp": "2024-01-15T10:35:00.000Z"
-}
-
-// dispatch-events topic
-{
-  "orderId": "123",
-  "driverId": "5",
-  "eventType": "assigned",
-  "timestamp": "2024-01-15T10:32:00.000Z",
-  "score": 85.5,
-  "distance": 1.2
-}
+```bash
+curl -fsS http://localhost:3000/health
+curl -fsS http://localhost:3000/health/ready
+curl -fsS http://localhost:3000/health/live
+curl -fsS http://localhost:3000/metrics
 ```
 
-## Order Flow
+Readiness checks PostgreSQL and Redis, not successful Kafka delivery or WebSocket authorization. Metrics are per process and several business gauges drift; they are not authoritative order counts.
 
-```
-PLACED -> CONFIRMED -> PREPARING -> READY_FOR_PICKUP -> PICKED_UP -> DELIVERED
-  |           |           |              |                |
-  +---------->+---------->+<-- Restaurant updates these --+
-                                         |
-                                         +-- Driver updates these --+
-```
+The project-root `npm run test:e2e` launches Playwright and can start Vite, but not the backend/infrastructure. [tests/smoke.spec.ts](./tests/smoke.spec.ts) uses `alice@example.com`, which the seed does not create, and asserts broad page visibility rather than a complete order journey. The repository's [screenshot configuration](../scripts/screenshot-configs/doordash.json) uses the actual seeded customer/driver/owner accounts; run `node scripts/screenshots.mjs --start doordash` from the repository root for that automation. Captured pages still do not establish transactional correctness.
 
-## Architecture
+Backend `dev:server1`, `dev:server2`, and `dev:server3` scripts use ports 3001–3003. There is no load balancer or cross-instance WebSocket relay, and Vite still targets 3000. Multiple processes illustrate those missing coordination boundaries; they are not a working horizontal deployment.
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+This documentation review traced source/configuration and ran isolated checks with mocked dependencies. It did not start the complete stack, run the builds, or claim a passing end-to-end delivery test.
 
-## Key Technical Challenges
+## Source guide
 
-1. **Three-Sided Marketplace**: Balancing customers, restaurants, and drivers
-2. **Delivery Matching**: Optimal order-to-driver assignment using scoring
-3. **Real-Time Tracking**: Location updates with WebSocket and Redis geo
-4. **ETA Accuracy**: Multi-factor calculation with traffic adjustments
-5. **Order State Machine**: Managing complex status transitions
+| Area | Entry point |
+|------|-------------|
+| API setup and probes | [backend/src/index.ts](./backend/src/index.ts) |
+| Schema and fixtures | [init.sql](./backend/src/db/init.sql), [seed.sql](./backend/db-seed/seed.sql) |
+| Checkout, transitions, assignment | [order routes](./backend/src/routes/orders/index.ts) |
+| Driver actions and location | [drivers.ts](./backend/src/routes/drivers.ts) |
+| ETA | [geo.ts](./backend/src/utils/geo.ts) |
+| Retry response cache | [idempotency.ts](./backend/src/shared/idempotency.ts) |
+| Broadcast transport | [websocket.ts](./backend/src/websocket.ts), [useWebSocket.ts](./frontend/src/hooks/useWebSocket.ts) |
+| Frontend API and cart | [api.ts](./frontend/src/services/api.ts), [cartStore.ts](./frontend/src/stores/cartStore.ts) |
 
-## Project Structure
-
-```
-doordash/
-├── backend/
-│   ├── src/
-│   │   ├── routes/          # API route handlers
-│   │   ├── services/        # Business logic
-│   │   ├── middleware/      # Auth middleware
-│   │   ├── utils/           # Geo calculations, helpers
-│   │   ├── db.js            # PostgreSQL connection
-│   │   ├── redis.js         # Redis connection
-│   │   ├── websocket.js     # WebSocket server
-│   │   └── index.js         # App entry point
-│   └── db/
-│       └── init.sql         # Database schema and seeds
-├── frontend/
-│   ├── src/
-│   │   ├── components/      # React components
-│   │   ├── routes/          # Tanstack Router routes
-│   │   ├── stores/          # Zustand stores
-│   │   ├── services/        # API client
-│   │   ├── hooks/           # Custom hooks
-│   │   └── types/           # TypeScript types
-│   └── ...
-├── docker-compose.yml       # PostgreSQL + Redis
-└── README.md                # This file
-```
-
-## Development Notes
-
-See [claude.md](./claude.md) for development insights and design decisions.
-
-## References & Inspiration
-
-- [How DoorDash Optimizes Delivery Logistics](https://doordash.engineering/2024/03/05/how-doordash-optimizes-delivery-logistics/) - Real-time dispatch and routing optimization
-- [DoorDash's Evolving Dispatch Architecture](https://doordash.engineering/2021/06/29/doordashs-evolving-dispatch-architecture/) - Building a scalable logistics platform
-- [Next-Generation Optimization for Dasher Dispatch](https://doordash.engineering/2020/02/28/next-generation-optimization-for-dasher-dispatch-at-doordash/) - ML-based driver assignment
-- [Building Faster Indexing with Apache Kafka and Elasticsearch](https://doordash.engineering/2021/07/14/building-faster-indexing-with-apache-kafka-and-elasticsearch/) - Real-time search infrastructure
-- [How We Reduced Hotspot Issues on Our Cassandra Cluster](https://doordash.engineering/2021/03/02/how-we-reduced-hotspot-issues-on-our-cassandra-cluster/) - Scaling time-series data
-- [Managing Supply and Demand Balance Through Machine Learning](https://doordash.engineering/2021/04/14/managing-supply-and-demand-balance-through-machine-learning/) - Dynamic pricing and demand forecasting
-- [How DoorDash is Scaling its Data Platform](https://doordash.engineering/2020/04/27/how-doordash-is-scaling-its-data-platform/) - Data infrastructure at scale
-- [Building DoorDash's Self-Serve Analytics Platform](https://doordash.engineering/2020/05/27/building-doordashs-self-serve-analytics-platform/) - Real-time analytics for operations
+[CLAUDE.md](./CLAUDE.md) contains historical collaboration notes; implementation claims there should be read alongside the source findings in the architecture.

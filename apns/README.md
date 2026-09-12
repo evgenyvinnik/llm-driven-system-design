@@ -1,366 +1,201 @@
-# Design APNs - Apple Push Notification Service
+# APNs: a local push notification simulator
 
-## Codebase Stats
+This project explores device registration, online routing, offline storage, collapse identifiers, and delivery status. A React administration console sends notifications through a Node.js service; simulated devices receive them over WebSockets. PostgreSQL stores registrations and notification history, while Valkey provides token caches, sessions, and cross-process pub/sub.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 9,107 |
-| Source Files | 53 |
-| .ts | 5,282 |
-| .md | 2,291 |
-| .tsx | 917 |
-| .sql | 259 |
-| .json | 147 |
+It does not connect to Apple or deliver notifications to native Apple devices. The `/3/device/:token` route resembles the APNs request path but runs over ordinary HTTP and implements a different contract. See [architecture.md](./architecture.md) for the proposed production design, source-backed implementation notes, and comparison with Apple's protocol.
 
-## Overview
+## What you can explore
 
-A simplified APNs-like platform demonstrating push notification delivery, device token management, and guaranteed delivery at scale. This educational project focuses on building a reliable notification system for millions of devices.
+| Flow | Current behavior |
+|------|------------------|
+| Dashboard | Database counts, top 50 subscription topics, ten recent notifications; refreshes every 30 seconds |
+| Device list | Read-only pages of 20 registrations, validity, token hashes, and registration timestamps |
+| Notification list | Pages of 20 history records with a status filter |
+| Send form | Send by internal device UUID, subscription topic, or broadcast; alert, badge, sound, and priority fields |
+| Device APIs | Register a simulated token, look it up, invalidate it, and manage subscriptions |
+| Simulated device | Connect to `/ws`, identify a device UUID, receive messages, and acknowledge IDs |
+| Multiple servers | Route a send through Valkey to the process holding the target socket |
 
-## Features
+The console has no registration form, payload inspector, feedback page, charts, live event stream, or integrated device simulator. API clients cover registration and feedback operations. `last_seen` is updated by registration, not by heartbeat or every delivery.
 
-### Core Functionality
-- **Device Token Registration**: Register and manage device tokens with app bundle ID associations
-- **Push Notifications**: Send notifications with priority levels (high, medium, low)
-- **Topic Subscriptions**: Subscribe devices to topics for targeted notifications
-- **Delivery Tracking**: Track notification status (pending, queued, delivered, failed, expired)
-- **Store-and-Forward**: Queue notifications for offline devices
-- **Feedback Service**: Report invalid/unregistered tokens to providers
+## Stack and prerequisites
 
-### Admin Dashboard
-- Real-time statistics (devices, notifications, topics)
-- Device management interface
-- Notification history with filtering
-- Send notifications to devices, topics, or broadcast
-- Session-based authentication
+- Node.js 20 or later and npm.
+- React 19, TypeScript, Vite 5, TanStack Router, Zustand, Tailwind CSS 3.
+- Express 4, `ws`, `pg`, `ioredis`, Pino, and `prom-client`.
+- PostgreSQL 16 and Valkey 7 in Compose. Opossum is installed, but its circuit-breaker helpers are not connected to delivery.
 
-## Tech Stack
+Choose one infrastructure option below. Application processes run on the host in both cases. Default ports are frontend **5173**, API/WebSocket **3000**, PostgreSQL **5432**, and Valkey **6379**. Stop conflicting development services first.
 
-- **Backend**: Node.js + Express + TypeScript
-- **Frontend**: React 19 + Vite + Tanstack Router + Zustand + Tailwind CSS
-- **Database**: PostgreSQL 16
-- **Cache**: Redis 7
-- **WebSocket**: Real-time device connections
+## Option A: Docker Compose (recommended)
 
-## Quick Start
-
-### Prerequisites
-
-- Node.js 20+
-- Docker and Docker Compose
-- npm or yarn
-
-### Option 1: Using Docker (Recommended)
-
-1. **Start infrastructure services**:
-   ```bash
-   docker-compose up -d
-   ```
-
-2. **Install backend dependencies**:
-   ```bash
-   cd backend
-   cp .env.example .env
-   npm install
-   ```
-
-3. **Start the backend**:
-   ```bash
-   npm run dev
-   ```
-
-4. **Install frontend dependencies** (in a new terminal):
-   ```bash
-   cd frontend
-   npm install
-   ```
-
-5. **Start the frontend**:
-   ```bash
-   npm run dev
-   ```
-
-6. **Access the application**:
-   - Frontend: http://localhost:5173
-   - Backend API: http://localhost:3000
-   - Health check: http://localhost:3000/health
-
-### Option 2: Native Services
-
-If you prefer to run PostgreSQL and Redis natively:
-
-#### macOS (Homebrew)
+From the repository root:
 
 ```bash
-# Install PostgreSQL
-brew install postgresql@16
+cd apns
+docker compose up -d
+docker compose ps
+docker compose exec -T postgres pg_isready -U apns -d apns
+docker compose exec -T redis redis-cli ping
+```
+
+Compose mounts [init.sql](./backend/src/db/init.sql), which creates the schema on the first start of an empty PostgreSQL volume. It does **not** load sample accounts. After PostgreSQL is ready, run the seed once:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U apns -d apns < backend/db-seed/seed.sql
+```
+
+For an existing database that lacks the tables, apply the schema explicitly before seeding:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U apns -d apns < backend/src/db/init.sql
+```
+
+There is no migration runner. Reapplying `CREATE TABLE IF NOT EXISTS` does not migrate an incompatible existing table definition.
+
+Useful lifecycle commands, from `apns/`:
+
+```bash
+docker compose down
+# Remove this project's database and Valkey volumes as well:
+docker compose down -v
+```
+
+The second command deletes local data. The current Valkey volume is named `redis_state`; an older `redis_data` volume is not used by this configuration.
+
+## Option B: Native installation (no Docker)
+
+On macOS, install and start the services:
+
+```bash
+brew install postgresql@16 valkey
 brew services start postgresql@16
-
-# Create database
-createdb apns
-psql -d apns -f backend/src/db/init.sql
-
-# Install Redis
-brew install redis
-brew services start redis
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
 ```
 
-#### Ubuntu/Debian
+Create the role and database once, connecting as the Homebrew PostgreSQL administrator:
 
 ```bash
-# Install PostgreSQL
-sudo apt install postgresql postgresql-contrib
-sudo systemctl start postgresql
-sudo -u postgres createdb apns
-sudo -u postgres psql -d apns -f backend/src/db/init.sql
-
-# Install Redis
-sudo apt install redis-server
-sudo systemctl start redis-server
+psql postgres -c "CREATE ROLE apns WITH LOGIN PASSWORD 'apns_password';"
+createdb -O apns apns
 ```
 
-#### Environment Configuration
-
-Update `backend/.env`:
-```
-DATABASE_URL=postgres://your_user:your_password@localhost:5432/apns
-REDIS_URL=redis://localhost:6379
-PORT=3000
-NODE_ENV=development
-```
-
-### Running Multiple Server Instances
-
-For distributed testing:
+From the repository root, load the schema and seed:
 
 ```bash
-# Terminal 1 - Server on port 3001
+cd apns
+PGPASSWORD=apns_password psql -h localhost -U apns -d apns -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+PGPASSWORD=apns_password psql -h localhost -U apns -d apns -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql
+PGPASSWORD=apns_password psql -h localhost -U apns -d apns -c 'SELECT COUNT(*) FROM admin_users;'
+valkey-cli ping
+```
+
+The last two commands should report three seeded users and `PONG` on a fresh setup. Reuse existing roles/databases rather than recreating them.
+
+## Start the application
+
+In one terminal, from `apns/`:
+
+```bash
 cd backend
-npm run dev:server1
-
-# Terminal 2 - Server on port 3002
-npm run dev:server2
-
-# Terminal 3 - Server on port 3003
-npm run dev:server3
+npm install
+cp .env.example .env
+npm run dev
 ```
 
-## API Reference
+The entry point loads `.env` through `dotenv/config`. Defaults are:
 
-### Device Registration
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DATABASE_URL` | `postgres://apns:apns_password@localhost:5432/apns` | PostgreSQL pool |
+| `REDIS_URL` | `redis://localhost:6379` | Valkey connection |
+| `PORT` | `3000` | HTTP/WebSocket listener and server ID |
+| `NODE_ENV` | `development` in the example | Development logging |
+| `LOG_LEVEL` | `debug` in development, otherwise `info` | Pino level |
+
+In another terminal, from `apns/`:
 
 ```bash
-# Register a device token
-curl -X POST http://localhost:3000/api/v1/devices/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-    "app_bundle_id": "com.example.myapp",
-    "device_info": {
-      "platform": "iOS",
-      "os_version": "17.0",
-      "device_model": "iPhone 15"
-    }
-  }'
+cd frontend
+npm install
+npm run dev
 ```
 
-### Send Notification
+Open [the console](http://localhost:5173), then log in with **admin / password123**. `operator` and `developer` also use `password123`; all three seeded accounts have the same `admin` role. The login screen's `admin123` hint is stale. Passwords use unsalted SHA-256, despite an obsolete bcrypt comment in the seed.
+
+The seed contains eight devices, thirteen subscriptions, seven history records, six delivery-log entries, two pending messages, and two feedback entries. These are illustrative fixtures: pending IDs do not have matching history records, and stored token hashes do not supply usable raw tokens. Use an internal seeded device UUID in the send form, or register a new raw token for token-based requests.
+
+Seeding is not fully repeatable: a pending row with a null collapse ID can hit its primary-key conflict on rerun, and feedback inserts append when reached. With `ON_ERROR_STOP=1`, a failed seed stops at that statement; earlier statements may already have committed.
+
+## Try a simulated delivery
+
+Register a demonstration token:
 
 ```bash
-# Send to device by token
-curl -X POST http://localhost:3000/api/v1/notifications/device/a1b2c3d4... \
-  -H "Content-Type: application/json" \
-  -d '{
-    "payload": {
-      "aps": {
-        "alert": {
-          "title": "Hello",
-          "body": "World"
-        },
-        "badge": 1,
-        "sound": "default"
-      }
-    },
-    "priority": 10
-  }'
-
-# Send to topic
-curl -X POST http://localhost:3000/api/v1/notifications/topic/news.sports \
-  -H "Content-Type: application/json" \
-  -d '{
-    "payload": {
-      "aps": {
-        "alert": "Breaking news!"
-      }
-    }
-  }'
+curl -sS http://localhost:3000/api/v1/devices/register \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","app_bundle_id":"com.example.test","device_info":{"platform":"iOS"}}'
 ```
 
-### Topic Subscription
-
-```bash
-# Subscribe to topic
-curl -X POST http://localhost:3000/api/v1/devices/topics/subscribe \
-  -H "Content-Type: application/json" \
-  -d '{
-    "device_token": "a1b2c3d4...",
-    "topic": "news.sports"
-  }'
-```
-
-### APNs-Compatible Endpoint
-
-```bash
-# APNs-style endpoint
-curl -X POST http://localhost:3000/3/device/a1b2c3d4... \
-  -H "Content-Type: application/json" \
-  -H "apns-priority: 10" \
-  -H "apns-topic: com.example.myapp" \
-  -d '{
-    "aps": {
-      "alert": "Hello from APNs-style endpoint!"
-    }
-  }'
-```
-
-## WebSocket Connection
-
-Devices can maintain persistent connections for real-time notification delivery:
+Copy the returned `device_id`. In the browser developer console on the local dashboard, replace `DEVICE_UUID` below:
 
 ```javascript
-const ws = new WebSocket('ws://localhost:3000/ws');
-
-ws.onopen = () => {
-  // Register device connection
-  ws.send(JSON.stringify({
-    type: 'connect',
-    device_id: 'your-device-uuid'
-  }));
-};
-
-ws.onmessage = (event) => {
+const deviceSocket = new WebSocket('ws://localhost:3000/ws');
+deviceSocket.onopen = () => deviceSocket.send(JSON.stringify({
+  type: 'connect', device_id: 'DEVICE_UUID'
+}));
+deviceSocket.onmessage = (event) => {
   const message = JSON.parse(event.data);
-
+  console.log(message);
   if (message.type === 'notification') {
-    console.log('Received notification:', message.payload);
-
-    // Acknowledge delivery
-    ws.send(JSON.stringify({
-      type: 'ack',
-      notification_id: message.id
-    }));
+    deviceSocket.send(JSON.stringify({ type: 'ack', notification_id: message.id }));
   }
 };
 ```
 
-## Admin Dashboard
-
-### Default Credentials
-
-- Username: `admin`
-- Password: `password123`
-
-### Creating Additional Admin Users
+Send through the API, or paste that UUID into the console's send form:
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/admin/users \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -d '{
-    "username": "newadmin",
-    "password": "securepassword",
-    "role": "admin"
-  }'
+curl -sS http://localhost:3000/api/v1/notifications/device/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  -H 'Content-Type: application/json' \
+  -d '{"payload":{"aps":{"alert":{"title":"Local test","body":"Hello from the simulator"}}},"priority":10}'
 ```
 
-## Project Structure
+Close the socket, send again, and reconnect to explore offline storage. The response's `delivered` label means the service published to Valkey; the history record changes to `delivered` only after acknowledgement. Refresh the notification list after receipt. Reconnection removes pending rows before acknowledgement, so this experiment does not establish reliable store-and-forward delivery.
 
-```
-apns/
-├── docker-compose.yml       # PostgreSQL + Redis
-├── backend/
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── src/
-│       ├── index.ts         # Express app + WebSocket server
-│       ├── db/
-│       │   ├── index.ts     # PostgreSQL connection
-│       │   ├── redis.ts     # Redis connection
-│       │   └── init.sql     # Database schema
-│       ├── routes/
-│       │   ├── devices.ts   # Device registration
-│       │   ├── notifications.ts
-│       │   ├── feedback.ts
-│       │   └── admin.ts     # Admin dashboard API
-│       ├── services/
-│       │   ├── tokenRegistry.ts
-│       │   ├── pushService.ts
-│       │   └── feedbackService.ts
-│       ├── types/
-│       │   └── index.ts
-│       └── utils/
-│           └── index.ts
-├── frontend/
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── tailwind.config.js
-│   └── src/
-│       ├── main.tsx
-│       ├── routes/
-│       │   ├── __root.tsx
-│       │   ├── index.tsx    # Dashboard
-│       │   ├── login.tsx
-│       │   ├── devices.tsx
-│       │   ├── notifications.tsx
-│       │   └── send.tsx     # Send notification form
-│       ├── stores/
-│       │   ├── authStore.ts
-│       │   └── dashboardStore.ts
-│       ├── services/
-│       │   └── api.ts
-│       └── types/
-│           └── index.ts
-├── README.md
-├── architecture.md
-└── claude.md
-```
+## API reference
 
-## Implementation Status
+| Method and path | Purpose |
+|-----------------|---------|
+| `POST /api/v1/admin/login`, `POST /api/v1/admin/logout`, `GET /api/v1/admin/me` | Session creation, deletion, lookup |
+| `GET /api/v1/admin/stats`, `/devices`, `/notifications`, `/feedback` | Console data; lists accept `limit` and `offset` |
+| `POST /api/v1/admin/broadcast`, `/cleanup`, `/users` | Broadcast, expire messages, create account |
+| `POST /api/v1/devices/register` | Register raw token and bundle ID |
+| `GET /api/v1/devices/token/:token`, `GET /api/v1/devices/:deviceId` | Token or UUID lookup |
+| `DELETE /api/v1/devices/token/:token` | Invalidate and record feedback |
+| `POST /api/v1/devices/topics/subscribe`, `/unsubscribe` | Body contains `device_token` and `topic` |
+| `GET /api/v1/devices/:deviceId/topics` | List subscriptions |
+| `POST /api/v1/notifications/device/:token`, `/device-id/:deviceId`, `/topic/:topic` | Send `payload` with optional `priority`, `expiration`, `collapse_id` |
+| `GET /api/v1/notifications`, `/:notificationId`, `/:notificationId/status` | List, inspect, check history |
+| `GET /api/v1/feedback/:appBundleId`, `DELETE /api/v1/feedback/:appBundleId` | Read after `since`, clear through `before` |
+| `POST /3/device/:token` | HTTP simulator route with selected `apns-*` headers and bare payload |
+| `GET /health`, `GET /metrics` | Dependency health and Prometheus output |
 
-- [x] Docker Compose setup (PostgreSQL, Redis)
-- [x] Device token management
-- [x] Provider API (HTTP REST)
-- [x] Push delivery pipeline
-- [x] Store-and-forward for offline devices
-- [x] Feedback service
-- [x] Topic subscriptions
-- [x] WebSocket device connections
-- [x] Admin dashboard
-- [ ] HTTP/2 support
-- [ ] JWT authentication for providers
-- [ ] Geographic routing
-- [ ] Load testing
+The frontend sends a 24-hour Valkey session as `Authorization: Bearer ...`, stored in localStorage. **Most APIs, including admin writes, do not enforce that session.** `/me` checks it, but login redirects are only a browser UI gate. WebSocket device IDs and acknowledgements are also unauthenticated. Treat this as a local learning service.
 
-## Key Technical Challenges
+## Distributed experiment and verification
 
-1. **Scale**: Designed for billions of notifications per day
-2. **Latency**: Sub-second delivery worldwide
-3. **Reliability**: Guaranteed delivery to online devices
-4. **Efficiency**: Persistent connections at massive scale
-5. **Battery**: Minimize device wake-ups with priority levels
+From `apns/backend`, run `npm run dev:server1`, `npm run dev:server2`, and optionally `npm run dev:server3` in separate terminals. They use ports 3001–3003 and IDs derived from those ports. Connect a device to one port and send to another. Share the same PostgreSQL and Valkey instances. There is no load balancer; Vite still proxies to port 3000 unless its configuration is changed.
 
-## Architecture
+Backend scripts include `build`, `type-check`, `lint`, and `start` after a build. Frontend scripts include `build`, `type-check`, `lint`, and `preview`. Neither package defines a unit-test script. From the repository root, `npm run test:smoke apns` runs five page smoke checks once the stack is up. They do not test acknowledgement loss, authorization, collapse races, or retry safety.
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+Other limitations appear in [Implementation Notes](./architecture.md#implementation-notes): no provider authentication/TLS/HTTP2, no active priority worker, no heartbeat leases, incomplete idempotency, and inconsistent expiration/collapse behavior. This documentation review checked source and configuration; it did not run the stack or certify delivery behavior.
 
-## Development Notes
+## Design and interview material
 
-See [claude.md](./claude.md) for development insights and design decisions.
-
-## References & Inspiration
-
-- [Apple Push Notification Service Documentation](https://developer.apple.com/documentation/usernotifications) - Official APNs developer documentation covering device tokens, payloads, and delivery
-- [Sending Push Notifications Using Command-Line Tools](https://developer.apple.com/documentation/usernotifications/sending-push-notifications-using-command-line-tools) - Apple's guide on APNs HTTP/2 API usage
-- [Setting Up a Remote Notification Server](https://developer.apple.com/documentation/usernotifications/setting-up-a-remote-notification-server) - Apple's architecture guidance for push notification providers
-- [Firebase Cloud Messaging Architecture](https://firebase.google.com/docs/cloud-messaging/concept-options) - Google's push notification system design patterns
-- [How We Scaled Push Notifications at Airbnb](https://medium.com/airbnb-engineering/how-we-scaled-push-notifications-at-airbnb-64f5c09ffa7) - Engineering insights on scaling notification delivery
-- [Scaling Push Messaging for Millions of Devices at Netflix](https://netflixtechblog.com/scaling-push-messaging-for-millions-of-devices-netflix-702d3a9a08fa) - Netflix's approach to high-volume push notifications
+- [Architecture and implementation evidence](./architecture.md)
+- [Frontend interview answer](./system-design-answer-frontend.md)
+- [Backend interview answer](./system-design-answer-backend.md)
+- [Fullstack interview answer](./system-design-answer-fullstack.md)
+- [Project development history](./CLAUDE.md)

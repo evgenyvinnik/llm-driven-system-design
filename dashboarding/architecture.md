@@ -1,222 +1,168 @@
-# Dashboarding System - Metrics Monitoring and Visualization - Architecture Design
+# Dashboarding architecture
 
 ## System Overview
 
-A metrics monitoring and visualization system similar to Datadog or Grafana for collecting, storing, and visualizing time-series data. Core challenges involve high-throughput metrics ingestion, efficient time-series storage with automatic downsampling, real-time dashboard rendering, and alert evaluation.
+A metrics dashboard collects observations, answers time-series queries, displays comparable charts, and evaluates alert conditions. Its central responsibility is preserving meaning: a missing sample is not zero, an unavailable query is not a healthy service, and an acknowledged batch must have crossed a defined durability boundary.
 
-**Learning Goals:**
-- Design high-throughput time-series ingestion pipelines
-- Implement automatic aggregation and downsampling
-- Build real-time dashboards with multiple visualization types
-- Design alert evaluation engines with state tracking
-
----
+This document separates the **proposed production system** from the **current local implementation**. Production targets and mechanisms below are design proposals, not measured capabilities. The schema/API sections describe existing code, and the final Implementation Notes trace its actual behavior and limitations.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed production system
 
-- **Metrics Ingestion**: Collect metrics via HTTP batch API from applications and agents
-- **Time-Series Storage**: Store raw metrics with automatic partitioning (hypertables)
-- **Aggregation**: Automatic downsampling to 1-minute and 1-hour rollups
-- **Dashboards**: Custom dashboard creation with multiple panel types (line, area, bar, gauge, stat)
-- **Alerting**: Rule-based alerts with configurable thresholds, durations, and notification channels
-- **Query Engine**: Flexible metric queries with time range selection and tag filtering
-- **Retention**: Automatic data lifecycle management (raw → aggregated → purged)
+- Accept authenticated metric batches with stable retry identity, timestamp validation, and explicit sample semantics.
+- Discover series by metric name and labels within an authorized tenant.
+- Query bounded time ranges, filters, grouping, and aggregations at a stated resolution.
+- View and configure dashboards containing time-series charts, gauges, and numeric summaries.
+- Evaluate versioned alert rules with separate query windows, sustained-condition durations, and missing-data behavior.
+- Keep incident history and deliver identifiable notifications through a repairable pipeline.
+- Retain raw observations briefly and useful aggregate states longer, with a defined late-data policy.
 
-### Non-Functional Requirements
+Initial scope includes scalar gauges and cumulative counters. Histograms require a distribution-aware representation before percentile queries are offered. Logs, traces, arbitrary panel plugins, PromQL compatibility, and sub-second browser streaming are extensions, not requirements of this first design.
 
-- **Throughput**: 100K metrics/second ingestion at production scale
-- **Query Latency**: p95 < 500ms for 24-hour ranges, p95 < 2s for 7-day ranges
-- **Availability**: 99.95% uptime for ingestion, 99.9% for dashboards
-- **Consistency**: Eventual consistency for metrics (seconds-level lag acceptable), strong consistency for dashboard/alert configurations
-- **Retention**: Raw data 7 days, 1-min aggregates 30 days, 1-hour aggregates 1 year
+### Non-functional requirements — proposed targets
 
----
+| Concern | Target or contract |
+|---------|--------------------|
+| Ingestion | 100,000 points/second sustained under a benchmarked workload |
+| Availability | 99.95% ingestion, 99.9% dashboard query service |
+| Query latency | p95 <500 ms for bounded 24-hour queries; <2 seconds for bounded seven-day queries |
+| Acceptance | Acknowledged batches are durable in the ingestion log; visibility occurs later |
+| Retry effects | Redelivery of the same immutable batch does not add duplicate sample effects |
+| Display | Explicit resolution, observation age, coverage, and partial/error status |
+| Alerts | No transition to healthy solely because telemetry is missing or a query failed |
+| Isolation | Tenant and metric authorization on every read and write path |
+
+A target must specify series count, returned buckets, label cardinality, hardware, and latency percentiles. “100K points/second” alone cannot establish storage cost or query performance. Retention and maximum supported outage/replay duration bound the durability promise.
 
 ## Capacity Estimation
 
-### Production Scale
+Assume one million active series reporting every ten seconds: 100,000 samples/second and 8.64 billion/day. Assume 10,000 concurrent viewers, ten panels each, and a ten-second refresh cadence: 10,000 panel queries/second before deduplication. Batching can reduce HTTP requests but does not automatically reduce distinct database work.
 
-| Metric | Value | Rationale |
-|--------|-------|-----------|
-| Metrics ingestion | 100K/sec | 1000 services x 100 metrics each |
-| Data points/day | 8.64B | 100K/sec x 86,400 sec/day |
-| Raw storage/day | ~200 GB | 8.64B x 24 bytes avg per point |
-| Active dashboards | 10K | Across all teams |
-| Query throughput | 5K queries/sec | 10K dashboards x 10 panels x 0.05 refresh/sec |
-| Alert rules | 50K | Across all services |
-| Unique metric series | 10M | Cardinality across all tags |
+The following are logical payload estimates, not physical database measurements. Use 24 bytes per raw observation and 48 bytes per aggregate state as illustrative budgets; rows, indexes, labels, WAL, replicas, and compression change actual storage.
 
-### Storage Growth
+| Tier | Assumed observations/states | Retention | Approximate retained payload |
+|------|----------------------------|-----------|------------------------------|
+| Raw | 8.64 billion/day | 7 days | 1.45 TB |
+| One-minute state | 1.44 billion/day if every series is active | 30 days | 2.07 TB |
+| One-hour state | 24 million/day | 365 days | 420 GB |
 
-| Tier | Resolution | Retention | Storage/Year |
-|------|-----------|-----------|-------------|
-| Raw | 1-second | 7 days | ~1.4 TB (rolling) |
-| 1-minute aggregate | 1 minute | 30 days | ~150 GB (rolling) |
-| 1-hour aggregate | 1 hour | 1 year | ~30 GB |
+Longer retention can make an aggregate tier larger than a shorter raw tier. Rollups do not imply an arbitrary compression ratio. Sparse series, label dictionaries, compression, and retention choices must be measured independently.
+
+A 1,200-pixel chart cannot usefully show millions of raw samples. A proposed response budget might permit about 1,000 time buckets per series and a bounded number of series, with stricter total-point and query-cost limits. Exact exports are a separate workload.
 
 ### Local Development Scale
 
-| Metric | Target | Sizing Rationale |
-|--------|--------|------------------|
-| Metrics ingestion | 1,000/sec | 10 simulated services x 100 metrics each |
-| Data points/day | 86.4M | 1,000/sec x 86,400 sec/day |
-| Raw storage/day | ~2 GB | 86.4M x 24 bytes avg per point |
-| Query throughput | 50 queries/sec | 5 dashboards x 10 panels x 1 refresh/sec |
-| Retention (raw) | 7 days | ~14 GB total raw data |
-
----
+The SQL seed creates 18 series and 6,498 observations across the previous hour on a fresh schema. The TypeScript seed creates 36 series and 12,996 observations. Neither continues collecting data afterward. Six panels polling every ten seconds generate about 0.6 data requests/second, in addition to metadata and alert polling. This is substantially different from the production workload.
 
 ## High-Level Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                    Metrics Sources                                    │
-│     (Applications, Prometheus exporters, StatsD agents)              │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                       API Gateway / Load Balancer                    │
-│                  (Rate limiting, auth, routing)                       │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              ▼                                    ▼
-     ┌──────────────┐                     ┌──────────────┐
-     │  Ingestion   │                     │  Query API   │
-     │  API (N)     │                     │  (N)         │
-     │              │                     │              │
-     │ POST /metrics│                     │ POST /query  │
-     │  → 202       │                     │ GET /dash    │
-     └──────┬───────┘                     └──────┬───────┘
-            │                                    │
-            ▼                                    │
-     ┌──────────────┐                            │
-     │  Message     │                            │
-     │  Queue       │                            │
-     │  (Kafka)     │                            │
-     └──────┬───────┘                            │
-            │                                    │
-            ▼                                    │
-     ┌──────────────┐                            │
-     │  Ingestion   │                            │
-     │  Workers (N) │                            │
-     │              │                            │
-     │  Batch COPY  │                            │
-     │  to TSDB     │                            │
-     └──────┬───────┘                            │
-            │                                    │
-            ▼                                    ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                       TimescaleDB Cluster                            │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │ metrics      │  │ metrics_1min │  │ metrics_1hr  │              │
-│  │ (hypertable) │  │ (cont. agg)  │  │ (cont. agg)  │              │
-│  │ 7-day retain │  │ 30-day       │  │ 1-year       │              │
-│  └──────────────┘  └──────────────┘  └──────────────┘              │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │ dashboards   │  │ panels       │  │ alert_rules  │              │
-│  └──────────────┘  └──────────────┘  └──────────────┘              │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              ▼                 ▼                  ▼
-     ┌──────────────┐  ┌──────────────┐   ┌──────────────┐
-     │  Redis       │  │  Alert       │   │  React       │
-     │  (Query      │  │  Evaluator   │   │  Frontend    │
-     │   cache +    │  │  (Periodic)  │   │              │
-     │   sessions)  │  │              │   │  Recharts    │
-     └──────────────┘  └──────────────┘   └──────────────┘
+### Proposed production system
+
+```text
+┌──────────────────────┐       ┌───────────────────────────┐
+│ Metric producers     │──────▶│ Authenticated ingest      │
+└──────────────────────┘       │ Validate / quota          │
+                               └─────────────┬─────────────┘
+                                             │
+                                             ▼
+                               ┌───────────────────────────┐
+                               │ Durable log               │
+                               │ Identified batches        │
+                               └─────────────┬─────────────┘
+                                             │
+                                             ▼
+┌──────────────────────┐       ┌───────────────────────────┐
+│ Browser              │       │ Storage workers           │
+│ Refresh + charts     │       │ Samples + receipts        │
+└───────────┬──────────┘       └─────────────┬─────────────┘
+            │                                │
+            ▼                                ▼
+┌──────────────────────┐       ┌───────────────────────────┐
+│ Query API            │◀─────▶│ Time-series storage       │
+│ Plan / authorize     │       │ Raw + aggregate states    │
+└──────────────────────┘       └─────────────┬─────────────┘
+                                             │
+                                             ▼
+                               ┌───────────────────────────┐
+                               │ Alert evaluators          │
+                               │ State + delivery log      │
+                               └─────────────┬─────────────┘
+                                             │
+                                             ▼
+                               ┌───────────────────────────┐
+                               │ Notification workers      │
+                               └───────────────────────────┘
 ```
 
-### Request Flow: Metrics Ingestion
+PostgreSQL stores dashboard, rule, tenant, and access metadata. TimescaleDB initially supplies time-series storage within the relational deployment; separate pools and resource budgets protect ingestion from analytical reads. Redis caches reusable query results and sessions. A CDN serves the browser assets. These supporting components need not occupy most of an interview whiteboard.
 
-```
-1. Client sends POST /api/v1/metrics with batch of data points
-2. API validates payload (metric names, tag constraints, timestamps)
-3. API resolves metric definitions (cache metric IDs in Redis, 1-hour TTL)
-4. API publishes batch to message queue (Kafka topic: metrics.ingest)
-5. API returns 202 Accepted immediately (fire-and-forget)
-6. Ingestion Worker consumes batch, buffers for 100ms or 1000 points
-7. Worker bulk-inserts to TimescaleDB via COPY command (10x faster than INSERT)
-8. TimescaleDB routes to appropriate hypertable chunk (1-day intervals)
-9. Continuous aggregates automatically update 1-min and 1-hour rollups
-```
+Kafka is a possible durable ingestion log at the assumed scale. Its presence in the local Compose profile does not implement this path. Independent database instances with application-level routing are a possible later scaling choice; do not plan around the old TimescaleDB multi-node feature, whose last supported release was 2.13. [TimescaleDB multi-node deprecation](https://github.com/timescale/timescaledb/blob/main/docs/MultiNodeDeprecation.md)
 
-### Request Flow: Dashboard Query
+## Core Components / Request Flows
 
-```
-1. Frontend requests POST /api/v1/query with metric name, time range, aggregation
-2. API generates deterministic cache key from query parameters (SHA-256)
-3. API checks Redis cache:
-   - Live data (last 1 hour): 10-second TTL
-   - Historical data (> 1 hour ago): 5-minute TTL
-4. Cache miss → route query to appropriate table:
-   - Time range <= 1 hour: metrics (raw, 1s resolution)
-   - Time range <= 24 hours: metrics_1min (1-min resolution)
-   - Time range > 24 hours: metrics_1hour (1-hour resolution)
-5. API caches result in Redis, returns JSON
-6. Frontend renders chart with Recharts
-```
+### Series identity and metric meaning
 
-### Request Flow: Alert Evaluation
+A series is identified by tenant, metric descriptor, and a canonical label map. Serialize names/labels unambiguously rather than joining arbitrary strings with delimiters. Enforce allowed labels, label length/count, new-series rate, and total active-series quotas before allocating unbounded metadata or cache entries.
 
-```
-1. Alert Evaluator runs every 10-30 seconds
-2. Fetch all enabled alert rules from PostgreSQL
-3. For each rule:
-   a. Query recent metric data (window_seconds)
-   b. Evaluate condition (gt, lt, eq, ne) against threshold
-   c. If condition true:
-      - Check Redis for existing alert state
-      - If firing duration exceeds configured window: trigger notification
-      - Record alert_instance in PostgreSQL
-   d. If condition false and previously firing: resolve alert
-4. Send notifications (email, webhook, console)
-```
+The descriptor records type and unit. A gauge is an observed level; a cumulative counter needs reset-aware change over time before it becomes a rate. A distribution cannot be reduced to an average if later queries need percentiles. [Prometheus metric types](https://prometheus.io/docs/concepts/metric_types/)
 
----
+Define whether an average means average observed samples, equal weighting of hosts, or time-weighted value. These are different calculations under irregular sampling. The initial gauge query supports sample averages with counts and coverage metadata; a time-weighted gauge operation requires additional interval semantics. Rate samples already expressed in requests/second must not be summed across time and still labeled requests/second.
 
-## Core Components
+The local schema stores names, tags, timestamps, and scalar values without descriptors, units, observation identity, or a metric-type distinction. Panel units are display strings, not enforced measurement semantics.
 
-### 1. Ingestion API
+### Accept a batch
 
-Stateless HTTP API accepting metric batches. Validates metric names (alphanumeric + underscores, max 255 chars), tag constraints (max 64-char keys, max 256-char values), and timestamps (within [now - 1 year, now + 5 minutes]). Returns 202 Accepted after queueing.
+1. Authenticate the producer and resolve tenant scope independently of client-supplied labels.
+2. Validate a bounded immutable batch: batch identity, payload digest, sample types, labels, timestamps, and quota usage.
+3. Append it to the durable log with the required broker acknowledgement policy. Return accepted identity only after that boundary succeeds.
+4. A storage worker consumes a bounded batch, resolves series identities, and writes observations and a durable processed-batch receipt in one database transaction.
+5. After commit, advance the consumer checkpoint. Redelivery finds the same receipt and does not reapply observations.
 
-### 2. Ingestion Workers
+Producers retry the same immutable batch identity and payload; repacking old observations under new identities is not part of this deduplication contract. The receipt is scoped by producer/epoch and retained longer than supported broker replay and client retry windows. A changed payload under an old identity is rejected. If storage is later sharded, each identified storage fragment must have a single transactional owner and a defined relationship to the accepted submission.
 
-Consume from message queue, buffer data points, and bulk-insert to TimescaleDB using the COPY protocol (10x faster than individual INSERTs). Workers are horizontally scalable: adding more consumers increases throughput linearly.
+A broker outage returns an explicit retryable failure, not an accepted count. A database outage accumulates bounded log lag. When backlog approaches the retention/capacity limit, apply backpressure before accepting work the system cannot retain. No finite queue makes all bursts or outages harmless.
 
-### 3. Query API
+Local ingestion instead performs series resolution and a direct array insert in the HTTP request, returning HTTP 200. There is no active broker/worker/receipt path, and its open-breaker fallback can report acceptance without an insert.
 
-Serves dashboard queries with automatic query routing: short time ranges hit raw data, medium ranges hit 1-minute aggregates, long ranges hit 1-hour aggregates. Results are cached in Redis with TTLs based on data freshness.
+### Query a dashboard
 
-### 4. TimescaleDB (Time-Series Storage)
+The browser chooses one absolute query window and a refresh generation for all visible panels. A coordinator deduplicates equivalent plans, limits concurrency, pauses hidden work, and distributes independent panel results. A batch HTTP endpoint is a transport optimization; authorization and cost checks still apply per plan.
 
-PostgreSQL extension providing hypertables (automatic time-based partitioning), continuous aggregates (materialized rollups), and retention policies (automatic chunk deletion). Single database for both time-series data and metadata (dashboards, alerts, users).
+The API validates tenant, metric scope, time bounds, aggregation, grouping, and result budget. It selects a source based on available retention, materialization coverage, and requested resolution—not just the duration of the request. A short range from last year cannot use a seven-day raw tier.
 
-### 5. Alert Evaluator
+Return canonical series identity, UTC bucket timestamps, effective interval/bounds, coverage, observation age, and any approximation/degraded status. The browser aligns series by timestamps, leaves missing values absent, and formats time only at presentation. One panel's error must not replace successful sibling results or an old query with a new range's title.
 
-Background process that periodically evaluates all enabled alert rules against recent metric data. Tracks alert state (pending → firing → resolved) with duration-based triggering to prevent flapping. Sends notifications via email (Mailhog for local) or webhooks.
+The local browser has independent ten-second timers. The backend returns per-complete-series results, ignores `group_by`, and provides no resolution/coverage/error metadata on a successful empty fallback.
 
-### 6. Redis (Query Cache + Sessions)
+### Evaluate a rule and notify
 
-Caches query results with short TTLs (10s for live, 5min for historical), metric definition IDs (1-hour TTL), and session data. Rate limiting uses sorted sets for sliding window implementation.
+Separate the query window from the required duration of a continuously true condition. A five-minute mean above 90 at one evaluation does not prove CPU stayed above 90 for five minutes.
 
----
+Assign each rule/group instance to one fenced evaluator and use a consistent evaluation cutoff. Persist rule version, last accepted evaluation, pending-since time, and incident state. Track data quality separately: no-data or query-error cannot silently resolve a firing incident. Product policy can open a telemetry incident while preserving the original condition's uncertainty.
+
+A transaction changes incident state and appends a notification obligation. Notification workers retry identifiable deliveries, track actual outcomes, and retain permanent failures for repair. At-least-once delivery may still duplicate an external effect unless the receiver honors the delivery identity. Disable/delete semantics and rule revisions explicitly determine what happens to open incidents.
+
+The local evaluator starts in each API process, queries a moving window, and checks/creates firing rows without serialization. Webhooks only produce a log message, after which `notification_sent` is set true.
 
 ## Database Schema
 
+### Current local schema
+
+This is [backend/db/init.sql](./backend/db/init.sql), reproduced exactly. It creates seven tables, the raw hypertable, and a raw retention policy. It does not create rollups or the additional production records described afterward.
+
 ```sql
+-- Dashboarding System Schema
+-- TimescaleDB extension for time-series data
+
+-- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
--- Users
+-- ============================================================================
+-- Users table (for authentication)
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS users (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     username        VARCHAR(100) NOT NULL UNIQUE,
@@ -227,7 +173,9 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- ============================================================================
 -- Metric definitions (cached in Redis for fast lookups)
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS metric_definitions (
     id              SERIAL PRIMARY KEY,
     name            VARCHAR(255) NOT NULL,
@@ -238,19 +186,26 @@ CREATE TABLE IF NOT EXISTS metric_definitions (
 CREATE INDEX IF NOT EXISTS idx_metric_definitions_name ON metric_definitions(name);
 CREATE INDEX IF NOT EXISTS idx_metric_definitions_tags ON metric_definitions USING GIN(tags);
 
--- Raw metrics (hypertable with 1-day chunks)
+-- ============================================================================
+-- Metrics (time-series hypertable)
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS metrics (
     time            TIMESTAMPTZ NOT NULL,
     metric_id       INTEGER NOT NULL REFERENCES metric_definitions(id),
     value           DOUBLE PRECISION NOT NULL
 );
+
+-- Convert to hypertable with 1-day chunks
 SELECT create_hypertable('metrics', 'time',
     chunk_time_interval => INTERVAL '1 day',
     if_not_exists => TRUE
 );
+
 CREATE INDEX IF NOT EXISTS idx_metrics_metric_time ON metrics(metric_id, time DESC);
 
+-- ============================================================================
 -- Dashboards
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS dashboards (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -264,28 +219,32 @@ CREATE TABLE IF NOT EXISTS dashboards (
 CREATE INDEX IF NOT EXISTS idx_dashboards_user ON dashboards(user_id);
 CREATE INDEX IF NOT EXISTS idx_dashboards_public ON dashboards(is_public);
 
--- Panels
+-- ============================================================================
+-- Panels (visualization widgets on dashboards)
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS panels (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     dashboard_id    UUID NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
     title           VARCHAR(255) NOT NULL,
-    panel_type      VARCHAR(50) NOT NULL,  -- line, area, bar, gauge, stat
+    panel_type      VARCHAR(50) NOT NULL,
     query           JSONB NOT NULL,
-    position        JSONB NOT NULL,  -- {x, y, w, h}
+    position        JSONB NOT NULL,
     options         JSONB DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_panels_dashboard ON panels(dashboard_id);
 
--- Alert rules
+-- ============================================================================
+-- Alert Rules
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS alert_rules (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name            VARCHAR(255) NOT NULL,
     description     TEXT,
     metric_name     VARCHAR(255) NOT NULL,
     tags            JSONB DEFAULT '{}'::jsonb,
-    condition       JSONB NOT NULL,  -- {operator: 'gt', value: 90}
+    condition       JSONB NOT NULL,
     window_seconds  INTEGER NOT NULL DEFAULT 300,
     severity        VARCHAR(20) DEFAULT 'warning',
     notifications   JSONB NOT NULL DEFAULT '[{"channel": "console", "target": "default"}]'::jsonb,
@@ -296,7 +255,9 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 CREATE INDEX IF NOT EXISTS idx_alert_rules_metric ON alert_rules(metric_name);
 CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled);
 
--- Alert instances (fired alerts)
+-- ============================================================================
+-- Alert Instances (fired alerts)
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS alert_instances (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     rule_id         UUID NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
@@ -309,506 +270,215 @@ CREATE TABLE IF NOT EXISTS alert_instances (
 CREATE INDEX IF NOT EXISTS idx_alert_instances_rule ON alert_instances(rule_id, fired_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_instances_status ON alert_instances(status);
 
--- Retention policy for raw metrics
+-- ============================================================================
+-- Retention policy for raw metrics (7 days)
+-- ============================================================================
 SELECT add_retention_policy('metrics', INTERVAL '7 days', if_not_exists => TRUE);
 ```
 
-### Redis Cache Structure
+### Proposed production additions
 
-| Pattern | Type | TTL | Purpose |
-|---------|------|-----|---------|
-| `cache:query:{hash}` | String (JSON) | 10s / 5min | Query result cache (live vs historical) |
-| `cache:metric:name:{name}` | String | 1 hour | Metric definition ID lookup |
-| `session:{sessionId}` | Hash | 24 hours | User session data |
-| `ratelimit:ingest:{ip}` | Sorted set | 1 minute | Ingestion rate limiting (10K/min) |
-| `ratelimit:query:{userId}` | Sorted set | 1 minute | Query rate limiting (100/min) |
-| `alert:state:{ruleId}` | String (JSON) | 1 hour | Alert firing duration tracking |
+| Record or invariant | Purpose |
+|---------------------|---------|
+| Tenant and metric descriptor | Scope access and define type/unit/aggregation meaning |
+| Canonical series identity and cardinality accounting | Prevent ambiguous cache identity and uncontrolled series growth |
+| Processed-batch receipt with digest | Couple repeatable ingestion effects to committed samples |
+| Rollup states: sum, count, min, max, observation/coverage metadata | Support valid recombination and honest chart resolution |
+| Materialization/retention coverage and data generation | Plan queries against data that actually exists |
+| Versioned dashboard/panel configuration | Reject stale concurrent layout/query replacement |
+| Rule version and serialized evaluation state | Separate pending duration, incident state, and data quality |
+| Notification outbox and delivery attempts | Distinguish recorded incidents from actual delivery |
+| Appropriate unique active-incident constraint | Prevent duplicate firing instances for one rule/group |
 
----
+The current raw table has no observation uniqueness. Repeating one value can alter averages if only some samples are duplicated, and always changes the observation count; sums change when duplicated values have a nonzero total. UUID primary keys on dashboard creation do not deduplicate retries that generate new IDs.
 
 ## API Design
 
-### Core Endpoints
+### Current routes
 
-```
-# Metrics Ingestion
-POST   /api/v1/metrics              → Bulk ingest metrics (returns 202)
+Business paths use `/api/v1`; operational paths below are absolute. Responses are route-specific objects, not a uniform shared envelope. Types are separately defined in frontend and backend, and Zod validation runs on selected backend routes only.
 
-# Metrics Query
-POST   /api/v1/query                → Execute time-series query
-GET    /api/v1/metrics              → List metric definitions
-GET    /api/v1/metrics/:name/tags   → Get tag values for metric
+| Method | Path | Current behavior |
+|--------|------|------------------|
+| POST | `/metrics/ingest` | Public; up to 10,000 scalar points; HTTP 200 `{ accepted }` |
+| POST | `/metrics/query` | Public; returns `{ results }` for a name, tags, bounds, aggregation, interval |
+| GET | `/metrics/latest/:metricName` | Latest raw value from one arbitrary matching definition |
+| GET | `/metrics/stats/:metricName` | Raw min/max/avg/count across matching definitions |
+| GET | `/metrics/names`, `/metrics/definitions` | Public discovery without pagination |
+| GET | `/metrics/tags/keys`, `/metrics/tags/values/:key` | Public tag discovery |
+| GET / POST | `/dashboards` | Public/owned list; create requires editor or admin |
+| GET / PUT / DELETE | `/dashboards/:id` | Read with public/owner/admin check; mutation requires login and owner/admin helper |
+| GET / POST | `/dashboards/:dashboardId/panels` | List with dashboard access check; create uses owner/admin helper |
+| GET / PUT / DELETE | `/dashboards/:dashboardId/panels/:panelId` | Single read lacks dashboard privacy check; mutations lack target-parent binding |
+| POST | `/dashboards/:dashboardId/panels/:panelId/data` | Checks target parent and dashboard access, then queries the stored panel plan |
+| GET / POST | `/alerts/rules` | Public rule list/create |
+| GET / PUT / DELETE | `/alerts/rules/:id` | Public rule read/update/delete |
+| POST | `/alerts/rules/:id/evaluate` | Public predicate test; does not itself create/resolve an incident |
+| GET | `/alerts/instances` | Public history with loosely parsed optional limit/status |
+| POST | `/auth/login`, `/auth/logout` | Email/password session login and logout |
+| GET | `/auth/me` | Authenticated current user |
+| POST / GET | `/auth/register`, `/auth/users` | Admin account creation/listing |
+| GET | `/health`, `/health/live`, `/health/ready`, `/metrics` | Operational endpoints on these absolute paths |
 
-# Dashboards
-GET    /api/v1/dashboards           → List dashboards
-POST   /api/v1/dashboards           → Create dashboard
-GET    /api/v1/dashboards/:id       → Get dashboard with panels
-PUT    /api/v1/dashboards/:id       → Update dashboard
-DELETE /api/v1/dashboards/:id       → Delete dashboard
+The ingestion body contains a `metrics` array with `name`, `value`, `tags`, and optional numeric timestamp. Omission uses receipt time; timestamp zero also takes that fallback. Names have a length check but no name regex; label cardinality, timestamp bounds, and query cost are not constrained. Query dates and intervals lack complete semantic validation.
 
-# Panels
-POST   /api/v1/dashboards/:id/panels    → Add panel
-PUT    /api/v1/panels/:id               → Update panel
-DELETE /api/v1/panels/:id               → Delete panel
-
-# Alerts
-GET    /api/v1/alerts               → List alert rules
-POST   /api/v1/alerts               → Create alert rule
-PUT    /api/v1/alerts/:id           → Update alert rule
-DELETE /api/v1/alerts/:id           → Delete alert rule
-GET    /api/v1/alerts/:id/history   → Get alert history
-POST   /api/v1/alerts/:id/evaluate  → Manually evaluate alert
-
-# Auth
-POST   /api/v1/auth/login           → Login
-POST   /api/v1/auth/logout          → Logout
-GET    /api/v1/auth/me              → Current user
-```
-
----
+For production, add explicit accepted-batch identity, per-plan partial/error status, canonical series IDs, coverage metadata, bounded pagination, and optimistic configuration versions. Distinguish unavailable queries from legitimate empty results. Validate that a panel belongs to the dashboard whose permissions were checked on every read and mutation.
 
 ## Key Design Decisions
 
-### TimescaleDB vs InfluxDB vs ClickHouse
+### Durable batches versus direct writes
 
-**Chosen: TimescaleDB (PostgreSQL extension).**
+Direct writes are a good local teaching choice because the database can be the acceptance boundary without another service. They require reporting the actual write outcome and preserving retry identity. An empty read fallback is never evidence that a write succeeded.
 
-The fundamental advantage is having a single database for both time-series data and metadata. Dashboards, alert rules, and user accounts live alongside metrics in the same PostgreSQL instance, enabling SQL joins (e.g., "show all alert rules for metrics on dashboard X") without cross-database coordination. Hypertables transparently partition by time, and continuous aggregates provide materialized rollups without application-level aggregation code.
+At the proposed sustained load, a durable log can absorb bounded bursts and let storage batch work independently. The cost is visibility lag, consumer recovery, retention planning, and backpressure. It does not provide unlimited buffering or linear scaling: partition concurrency, database capacity, WAL, and series resolution can still limit throughput. There is no universal tenfold COPY improvement or thousandfold WAL reduction to promise without measurements.
 
-InfluxDB offers higher raw write throughput, but its query language (InfluxQL/Flux) is less expressive than SQL and it would require a separate database for metadata. ClickHouse excels at OLAP analytics but is overkill for the monitoring use case and has a steeper operational learning curve.
+### Aggregate states versus raw scans
 
-The trade-off is write latency: TimescaleDB is slightly slower than purpose-built TSDBs for individual inserts. We mitigate this with batch COPY writes (10x faster than INSERT) via the ingestion worker pipeline. At 100K points/second, this is well within TimescaleDB's documented throughput ceiling.
+Raw observations support precise re-querying, but long dashboard ranges should not repeatedly scan billions of rows. Store mergeable states, then choose a resolution aligned with the display and retention policy. For an average, combine sums and counts; do not average bucket averages unless their sample counts are equal.
 
-### Async Ingestion via Message Queue
+For example, one bucket averaging 0 from one observation and another averaging 100 from nine observations combine to 90, not 50. Keep min/max if a chart must expose spikes. Percentiles need a compatible histogram/sketch or raw observations; averages and per-bucket percentiles cannot reconstruct a global percentile.
 
-**Chosen: Fire-and-forget ingestion with queue-backed batch writes.**
+This saves repeated query work but gives up information. A coarse bucket cannot answer an exact sub-bucket range after raw data expires. Report adjusted bounds/resolution or reject an exact request. Do not manufacture high-resolution points from coarse states.
 
-The ingestion API returns 202 Accepted immediately after publishing to the message queue, decoupling ingestion rate from database write speed. This has three critical benefits:
+### Coordinated polling versus independent timers or push
 
-1. **Backpressure handling**: If the database slows down, the queue absorbs the burst. Workers process at their own pace without dropping metrics.
-2. **Write amplification**: Individual INSERTs at 100K/sec would create enormous WAL pressure. Batching 1000 points into a single COPY command reduces write amplification by 1000x.
-3. **Horizontal scaling**: Adding more workers linearly increases write throughput without changing the API layer.
+A ten-second polling coordinator matches trend monitoring without a persistent browser stream. It shares an absolute time window, deduplicates plans, caps in-flight work, and keeps partial results. Push becomes useful when a tighter freshness requirement justifies subscription state, recovery, and backend fan-out.
 
-The cost is eventual consistency: metrics appear in queries a few hundred milliseconds after ingestion. For a monitoring system where dashboards refresh every 10 seconds, this latency is invisible.
+Independent panel timers are small and convenient for six local panels, but drift, overlap, and multiply work as dashboards grow. Batching ten panels into one request reduces network overhead only; ten distinct queries still cost database work. Polling frequency, aggregation delay, ingestion lag, and cache age all contribute to visible freshness.
 
-### Polling vs WebSocket for Dashboard Updates
+## Consistency and Idempotency
 
-**Chosen: HTTP polling with 10-second intervals.**
+Production ingestion is at-least-once transport with repeatable database effects for an identified immutable batch. Consumer checkpoints advance after the samples/receipt transaction. Configuration updates use expected versions and durable mutation identity where retries could create duplicates. Alert state transitions and notification obligations commit together.
 
-WebSocket would reduce latency from ~10 seconds to sub-second, but monitoring dashboards do not require sub-second updates. The typical use case is watching trends over minutes and hours, not reacting to individual data points. Polling is dramatically simpler to implement, debug, and cache. Each poll is a standard HTTP request that benefits from Redis query caching, load balancer distribution, and standard observability tooling.
+Production queries may be stale within the declared freshness budget, but must accurately describe that state. Use non-overlapping, half-open time intervals when joining tiers. Combine closed materialized buckets with an unmaterialized raw tail only at a known boundary; partial edge buckets require raw data or a disclosed coarser effective range.
 
-The trade-off is 6x higher request volume (polling every 10s vs a single WebSocket connection). At 5K dashboards with 10 panels each, this means 5K requests/second, which is easily handled by the stateless query API with Redis caching absorbing repeated identical queries.
+Late observations and corrections mean historical data is not automatically immutable. Refresh policies need a lookback that covers supported lateness, a controlled backfill path for older changes, and cache invalidation or data-generation changes. Keep raw data until required rollups are verified. Refreshing an aggregate over a region whose raw data has already been removed can erase retained aggregate history. [Timescale continuous-aggregate refresh policies](https://github.com/timescale/docs/blob/latest/use-timescale/continuous-aggregates/refresh-policies.md)
 
----
+## Security / Auth
 
-## Aggregation and Downsampling
+Apply tenant/metric scope checks to direct queries, discovery, dashboards, panels, alert rules, history, and ingestion. A private dashboard does not protect its metrics if the same data is available from an unrestricted query endpoint. Mutations bind the target panel to the exact authorized dashboard in the database operation.
 
-### Strategy
+Production sessions require secure transport, regeneration at login, request-origin/CSRF protection, and appropriate revocation checks. Producer credentials and human sessions serve different access patterns. Quotas cover points, bytes, new series, query work, and active rules rather than request counts alone.
 
-TimescaleDB continuous aggregates provide zero-application-code rollups:
-
-| Tier | Resolution | Retention | Source | Update Interval |
-|------|-----------|-----------|--------|-----------------|
-| Raw (`metrics`) | 1 second | 7 days | Direct ingest | Real-time |
-| 1-minute (`metrics_1min`) | 1 minute | 30 days | Continuous aggregate | Every 1 minute |
-| 1-hour (`metrics_1hour`) | 1 hour | 1 year | Continuous aggregate | Every 1 hour |
-
-### Query Routing Logic
-
-The query API (`queryService.selectTable()`) automatically selects a table based on the requested time range:
-
-| Requested Range | Table Used | Resolution | Why |
-|-----------------|-----------|------------|-----|
-| <= 6 hours | `metrics` | raw (10s ingest in seed data) | Full fidelity for recent data |
-| <= 7 days | `metrics_hourly` | 1 hour | Efficient for medium ranges |
-| > 7 days | `metrics_daily` | 1 day | Efficient for long-range trends |
-
-This routing is transparent to the frontend. **Local-implementation caveat:** the `metrics_hourly` and `metrics_daily` rollups are *referenced* by the query router but are **not created** in `init.sql` (no continuous aggregates are configured locally). Consequently, queries with a range longer than 6 hours hit a non-existent table; the circuit breaker around the query catches the error and returns an empty result set rather than crashing. In practice the seed data spans one hour, so panels operate in the raw-table path. Materializing the two continuous aggregates is the first production hardening step and is tracked in CLAUDE.md.
-
----
-
-## Security
-
-### Authentication
-
-Session-based authentication with Redis store (connect-redis). Sessions have 24-hour TTL. Cookies set with HttpOnly, Secure (in production), SameSite=Lax. Passwords hashed with bcrypt.
-
-### Authorization (RBAC)
-
-| Role | Permissions |
-|------|-------------|
-| `viewer` | View dashboards, query metrics |
-| `editor` | Create/edit own dashboards, create alerts |
-| `admin` | All operations, user management, system configuration |
-
-### Rate Limiting
-
-| Endpoint | Limit | Window | Implementation |
-|----------|-------|--------|----------------|
-| Metrics ingestion | 10,000 req/min per IP | Sliding window | Redis sorted set |
-| Query API | 100 req/min per user | Sliding window | Redis sorted set |
-| Login | 5 attempts/min per IP | Fixed window + lockout | Redis counter |
-
-### Input Validation
-
-Metric names: alphanumeric + underscores, max 255 chars. Tag keys: alphanumeric + underscores, max 64 chars. Tag values: any string, max 256 chars. Timestamps: within [now - 1 year, now + 5 minutes]. All SQL queries use parameterized statements (Zod validation on API inputs).
-
----
+Local authentication is partial: protected middleware revalidates the user/role from PostgreSQL, but public metrics/alert routes bypass it. Optional authentication is a no-op. Dashboard read paths can rely on stale session role, and the owner helper permits null/unknown owners. No rate-limit middleware is installed. Helmet is enabled with CSP explicitly disabled.
 
 ## Observability
 
-### Self-Monitoring Metrics
+The production platform needs independent monitoring of itself: durable acceptance versus visible sample count, log age, duplicate rejection, series creation rate, query cost/coverage, rollup lag, evaluation lag, open incidents with missing telemetry, and actual delivery outcomes. Its own collection failure must remain detectable outside the same failing ingestion path.
 
-The dashboarding system monitors itself using the same infrastructure:
+Locally, [metrics.ts](./backend/src/shared/metrics.ts) exposes Prometheus HTTP, ingestion/query, cache, circuit-breaker, dashboard/panel, and process metrics. Pool gauges update every five seconds. This exposition is separate from the demo's stored observations; there is no automatic self-ingestion bridge or Prometheus server in Compose. `alerts_firing` is defined but never updated. Query cache-hit labels are guesses such as `unknown`/`possibly`, not measured hit decisions.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `ingest_requests_total` | Counter | Total ingestion requests |
-| `ingest_points_total` | Counter | Total data points ingested |
-| `ingest_latency_seconds` | Histogram | Ingestion API latency |
-| `query_requests_total` | Counter | Total query requests |
-| `query_latency_seconds` | Histogram | Query execution time |
-| `cache_hits_total` / `cache_misses_total` | Counter | Cache hit rate |
-| `queue_depth` | Gauge | Message queue size |
-| `db_connections_active` / `idle` / `total` | Gauge | Connection pool usage |
-| `alert_evaluations_total` | Counter | Alert rule evaluations |
-| `alerts_firing` | Gauge | Currently firing alerts |
-
-### Structured Logging
-
-Pino-based JSON logging with pino-http for automatic request logging. Health check requests are filtered from logs to reduce noise. Log levels: error (unhandled exceptions), warn (rate limits, slow queries > 2s), info (request completion), debug (query plans, cache operations).
-
-### Health Checks
-
-| Endpoint | Purpose | Checks |
-|----------|---------|--------|
-| `/health` | Liveness | Process running |
-| `/health/live` | K8s liveness probe | Simple OK |
-| `/health/ready` | Readiness probe | TimescaleDB + Redis connectivity |
-
----
+`/health` checks PostgreSQL and Redis; database failure yields 503 and Redis-only failure yields a degraded 200. `/health/ready` checks only PostgreSQL; `/health/live` is constant process liveness. None validates rollup existence or notification delivery. Breaker timeouts do not cancel underlying SQL, so database-side time limits and bounded queues are also needed.
 
 ## Failure Handling
 
-### Retry Strategies
-
-| Operation | Strategy | Max Attempts | Backoff |
-|-----------|----------|--------------|---------|
-| DB write (worker) | Retry with backoff | 3 | 1s, 2s, 4s |
-| Redis cache | Fail open (skip cache) | 1 | None |
-| Alert notification | Retry with backoff | 3 | 30s, 60s, 120s |
-| Query execution | No retry (return error) | 1 | None |
-
-### Circuit Breaker Pattern
-
-Applied to database queries (Opossum library) and external notification endpoints (webhooks). Separate breakers for different operation types (query, ingest, dashboard CRUD). Configuration: timeout 10s, error percentage 40%, reset timeout 60s.
-
-### Dead Letter Queue
-
-Failed ingestion messages go to `metrics.dlq`. Inspectable via RabbitMQ Management UI. Auto-purge after 7 days.
-
-### Graceful Degradation
-
-| Failure | Degraded Behavior |
-|---------|-------------------|
-| Redis down | Skip caching, queries hit DB directly (higher latency) |
-| Message queue down | API returns 503 for ingestion, queries still work |
-| DB read replica down | Route to primary (higher latency) |
-| Alert notification fails | Log error, mark alert as "notification_failed" |
-
-### Cardinality Management
-
-High-cardinality tags (e.g., `request_id`) cause performance degradation. Prevention: reject metrics with > 100 unique tag combinations per name, limit tag value length to 256 chars. Alert when any metric exceeds 10K unique tag combinations.
-
----
+| Failure | Proposed response | Current behavior |
+|---------|-------------------|------------------|
+| Broker unavailable | Retryable rejection before durable acceptance | Broker unused |
+| Raw insert fails | Failure/unknown outcome resolved through identity | Actual SQL errors propagate; open breaker returns fallback and reports accepted points |
+| Long-range source unavailable | Explicit unavailable/partial coverage | Missing rollup errors can open shared breaker; subsequent results become empty |
+| Uneven series timestamps | Timestamp alignment and missing values | Array-position alignment and zero substitution |
+| No telemetry for a firing rule | Preserve incident uncertainty; expose no-data state | Can resolve the incident |
+| Evaluator overlaps or runs on multiple APIs | Fenced ownership and conditional transition | Duplicate firing records can race into existence |
+| Notification fails | Retain delivery state and retry | Webhook is a log-only simulation; delivery flag still set |
+| Redis unavailable | Bounded cache bypass; session policy explicit | Cache helpers catch errors; default session paths can fail |
+| User changes dashboard/range during fetch | Discard obsolete response | No request-generation or cancellation guard |
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+First bound avoidable work: series discovery, matching definitions, response points, query spans, alert rules, and parallel cache misses. Current ingestion resolves every point concurrently and can issue repeated upserts for one uncached identity; deduplicate identities within a batch and cap lookup concurrency before adding API instances.
 
-1. **Ingestion API**: Add more stateless instances behind load balancer
-2. **Ingestion Workers**: Add more queue consumers (Kafka distributes partitions)
-3. **Query API**: Add more stateless instances (Redis absorbs cache hits)
-4. **TimescaleDB**: Read replicas for query load, multi-node for distributed hypertable chunks
-5. **Redis**: Redis Cluster for cache sharding
+For dashboard reads, choose a shared aligned refresh anchor and normalize equivalent queries. Exact millisecond timestamps from independent clients currently defeat much cross-request cache reuse. Cache only within the authorized scope and declared data generation; do not hide a dependency failure inside a long-lived successful empty entry.
 
-### What Breaks First
+Separate ingestion, interactive query, rollup maintenance, and evaluator resource budgets. Read replicas can serve suitable historical work, but alerts and recent panels need a declared visibility boundary. If the measured workload exceeds one storage node, partition tenants/series with explicit ownership and cross-partition aggregation rules; adding workers cannot create database capacity by itself.
 
-At 10x scale (1M metrics/sec):
-- **Ingestion write throughput**: Single TimescaleDB node saturates. Solution: multi-node TimescaleDB with distributed hypertables, or separate write nodes.
-- **Cardinality explosion**: 100M unique series degrades query performance. Solution: aggressive tag cardinality limits, pre-aggregation.
-- **Alert evaluation latency**: 500K alert rules at 10-second intervals creates evaluation backlog. Solution: partition rules across multiple evaluator instances by metric name hash.
-
----
+Scale rule evaluation by stable partitions and track scheduling delay. A timer in every HTTP process is not distributed scheduling. Rate-limit notification retries and preserve incident/delivery identities across ownership changes.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Time-series DB | TimescaleDB | InfluxDB | SQL flexibility, single DB for all data |
-| Time-series DB | TimescaleDB | ClickHouse | Simpler setup, sufficient for monitoring |
-| Message queue | Kafka | RabbitMQ | Better for high-throughput ingestion, partitioned consumers |
-| Dashboard updates | Polling (10s) | WebSocket | Simpler, cacheable, sufficient for monitoring |
-| Auth | Session + Redis | JWT | Immediate revocation, simpler |
-| Cache | Redis (10s/5min TTL) | No cache | 10-100x query reduction |
-| Aggregation | Continuous aggregates | Application-level rollups | Zero code, incremental updates |
-| Alert evaluation | Pull-based (periodic) | Push-based (stream) | Simpler, configurable interval |
-
----
-
-## Frontend Architecture
-
-This section documents the React frontend implementation, covering component hierarchy, state management, routing, data fetching, and key UI patterns.
-
-### Component Hierarchy
-
-```
-__root.tsx (RootLayout)
-├── Navbar (components/Navbar.tsx)
-│   └── Navigation links (Dashboards, Alerts, Metrics Explorer)
-├── AlertBanner (components/AlertBanner.tsx)
-│   └── Persistent banner showing currently firing alerts
-├── index.tsx (Dashboard List)
-│   └── Dashboard cards with name, description, create/delete actions
-├── dashboard.$dashboardId.tsx (Dashboard View)
-│   ├── TimeRangeSelector (components/TimeRangeSelector.tsx)
-│   │   └── Preset buttons (15m, 1h, 6h, 24h, 7d) + refresh interval
-│   └── DashboardGrid (components/DashboardGrid.tsx)
-│       └── DashboardPanel (components/DashboardPanel.tsx) [repeated per panel]
-│           ├── PanelChart (line, area, bar via Recharts)
-│           ├── GaugePanel (radial gauge visualization)
-│           └── StatPanel (single large number with label)
-├── alerts.tsx (Alert Management)
-│   ├── AlertRuleForm (components/alerts/AlertRuleForm.tsx)
-│   │   └── Form for creating rules: metric, condition, threshold, severity
-│   ├── AlertRuleList (components/alerts/AlertRuleList.tsx)
-│   │   └── AlertRuleCard (components/alerts/AlertRuleCard.tsx) [repeated]
-│   │       └── Rule summary, enable/disable toggle, evaluate, delete
-│   └── AlertHistoryTable (components/alerts/AlertHistoryTable.tsx)
-│       └── Table of alert instances with status, value, timestamps
-├── metrics.tsx (Metrics Explorer)
-│   └── Metric name selector, tag filter, time range, query results chart
-```
-
-### Zustand Stores
-
-The frontend uses two Zustand stores:
-
-**`useDashboardStore`** (`stores/dashboardStore.ts`) -- Manages dashboard UI state: the list of all dashboards, the currently selected dashboard, the active time range (default: `1h`), the auto-refresh interval (default: 10 seconds / 10000ms), and loading/error states. This store holds UI state only -- it does not make API calls directly. Instead, route components fetch data via the API module and push results into the store via `setDashboards` and `setCurrentDashboard`.
-
-**`useAlertStore`** (`stores/alertStore.ts`) -- Manages alert-related state: alert rules, alert instances (firing and historical), currently firing alerts (filtered subset), and loading/error states. Like the dashboard store, it provides setters for data pushed in by the `useAlerts` hook rather than making API calls itself.
-
-### Custom Hooks
-
-**`useAlerts`** (`hooks/useAlerts.ts`) -- A custom React hook that encapsulates all alert data fetching and CRUD operations. On mount, it fetches alert rules and instances in parallel via `Promise.all`, then sets up a 30-second polling interval for live updates. It exposes `createRule`, `deleteRule`, `toggleRule` (enable/disable), and `evaluateRule` (manual test) actions. Each mutation triggers a full data re-fetch to ensure consistency. This hook owns the loading and error state independently from the Zustand store, giving the alerts page self-contained data management.
-
-### Routing
-
-The frontend uses TanStack Router with file-based routing:
-
-- `/` -- Dashboard list page showing all accessible dashboards with create/delete actions
-- `/dashboard/$dashboardId` -- Dashboard view with time range selector and panel grid (dynamic route segment)
-- `/alerts` -- Alert rule management with creation form, rule list, and firing history
-- `/metrics` -- Metrics explorer for ad-hoc querying and visualization
-
-The root layout renders the `Navbar` and `AlertBanner` above all child routes. The `AlertBanner` is always visible across all pages, providing persistent visibility of firing alerts regardless of which page the user is on.
-
-### Data Fetching
-
-API communication uses a function-based module (`services/api.ts`) rather than a class. Each function is independently importable and typed:
-
-- **Dashboard API**: `getDashboards`, `getDashboard`, `createDashboard`, `updateDashboard`, `deleteDashboard`
-- **Panel API**: `createPanel`, `updatePanel`, `deletePanel`, `getPanelData` (fetches time-series data for rendering)
-- **Metrics API**: `queryMetrics`, `getMetricNames`, `getMetricDefinitions`, `getMetricLatest`, `getMetricStats`, `ingestMetrics`
-- **Alerts API**: `getAlertRules`, `createAlertRule`, `updateAlertRule`, `deleteAlertRule`, `getAlertInstances`, `evaluateAlertRule`
-
-All functions use a shared `fetchJson` wrapper that handles JSON serialization, error extraction, and 204 No Content responses. The dashboard view page uses the `refreshInterval` from the dashboard store to set up periodic re-fetching of panel data, implementing the 10-second polling described in the architecture.
-
-### Key UI Patterns
-
-- **Polling-based refresh**: The dashboard view polls for panel data at the interval set in the dashboard store (default 10 seconds). This matches the architecture decision to use HTTP polling over WebSocket. Each poll benefits from Redis query caching on the backend.
-- **Time range as global state**: The `TimeRangeSelector` component updates the dashboard store's `timeRange`, which all panels read from. Changing the time range triggers a re-fetch of all panel data simultaneously, providing a synchronized view across all visualizations.
-- **Multiple chart types**: Panels support five visualization types: `line` (time-series trends), `area` (filled time-series), `bar` (comparison), `gauge` (radial progress toward a threshold), and `stat` (single large number). The `DashboardPanel` component dispatches to `PanelChart`, `GaugePanel`, or `StatPanel` based on the panel's `panel_type` field.
-- **Persistent alert banner**: The `AlertBanner` component sits between the navbar and content area on every page. When alerts are firing, it displays a warning banner that cannot be dismissed by navigation. This ensures operators are always aware of active incidents.
-- **Alert evaluation feedback**: The `evaluateRule` action in the `useAlerts` hook manually triggers alert evaluation on the backend and displays the result (should_fire + current_value) via a browser alert dialog. This enables testing alert rules against live data without waiting for the periodic evaluation cycle.
-- **Separated state ownership**: Dashboard and alert stores hold only UI state (selections, lists, flags), while data fetching logic lives in route components and the `useAlerts` hook. This separation keeps stores simple and testable.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers who may be encountering these concepts for the first time.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is an authorization model where permissions are assigned to roles rather than individual users, and users are assigned one or more roles. Instead of checking "can user X create a dashboard?" the system checks "does user X have a role that includes the create-dashboard permission?"
-
-In this project, there are three roles: `viewer`, `editor`, and `admin`. Viewers can see dashboards and query metrics but cannot change anything. Editors can create and edit their own dashboards and alert rules. Admins have full control including user management and system configuration. When a request arrives, the auth middleware extracts the user's role from their session and checks whether that role permits the requested operation.
-
-The key advantage over per-user permission lists is simplicity: with thousands of monitoring users, you manage 3 role definitions instead of per-user ACLs. The `editor` role also includes ownership checks -- editors can only modify dashboards they created, not dashboards owned by other editors. This combines role-based and resource-based authorization for finer-grained control without per-user complexity.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for managing the cache. On every read, the application first checks the cache. If the data is there (a "cache hit"), it returns immediately. If not (a "cache miss"), the application fetches from the database, stores the result in the cache with a TTL (time-to-live), and then returns it.
-
-In this project, cache-aside is used for query results with a two-tier TTL strategy: live data (queries covering the last hour) gets a 10-second TTL because the data changes rapidly, while historical data (queries for time ranges older than one hour) gets a 5-minute TTL because the data is immutable. Cache keys are deterministic SHA-256 hashes of the query parameters, ensuring identical queries always hit the same cache entry.
-
-With 5K queries/second from dashboards polling every 10 seconds, caching provides a 10-100x reduction in database load. Multiple dashboards displaying the same metric at the same time range all share a single cached result. The trade-off is that live data may be up to 10 seconds stale, but for a monitoring system where dashboards refresh every 10 seconds, this staleness is invisible.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents a failing service from being called repeatedly, giving it time to recover. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and immediately rejects all requests for a cooldown period, rather than letting them pile up and make the problem worse.
-
-The circuit breaker has three states. In the **closed** state (normal operation), requests flow through to the downstream service. If failures exceed a configured threshold (40% error rate in this project), the breaker transitions to the **open** state. In the open state, all requests are immediately rejected without contacting the downstream service, returning an error or fallback response. After a configured timeout (60 seconds), the breaker enters the **half-open** state, where it allows a small number of test requests through. If those succeed, the breaker closes again; if they fail, it reopens.
-
-In this project, circuit breakers (via the Opossum library) wrap database queries and external notification endpoints (webhooks for alert notifications). Separate breakers are used for different operation types (query, ingest, dashboard CRUD). When the database is slow or unreachable, the query circuit breaker opens and dashboard panels show an error state rather than timing out. This prevents slow queries from accumulating and exhausting the connection pool. The ingestion path has its own breaker so that query failures do not affect metric ingestion, and vice versa.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Instead of `console.log('Query took 2.5s for metric cpu_usage')`, structured logging produces `{"level":"warn","metric":"cpu_usage","queryDuration":2500,"timeRange":"7d","timestamp":"..."}`.
-
-This project uses Pino with pino-http for automatic request logging. Every HTTP request generates a log entry with method, path, status code, duration, and user ID. Health check requests (`/health/*`) are filtered from logs to reduce noise -- on a 10-second polling interval, health check logs would overwhelm actual operational data. Log levels are assigned by severity: `error` for unhandled exceptions, `warn` for rate limit hits and slow queries (>2s), `info` for request completions, `debug` for query plans and cache operations.
-
-A dashboarding system monitoring itself is a meta-scenario where good logging is especially important. When a dashboard query is slow, the structured log entry contains the exact metric name, time range, and query duration, enabling direct correlation with the performance issue the dashboard is trying to visualize.
-
-### Prometheus Metrics
-
-Prometheus is a time-series monitoring system that collects numerical metrics from applications by periodically "scraping" an HTTP endpoint (typically `/metrics`). The application exposes counters, histograms, and gauges in a text format that Prometheus understands, and Prometheus stores and queries this data over time.
-
-This project's self-monitoring aspect is unique: the dashboarding system uses the same metrics infrastructure it provides to its users. The three main metric types are:
-- **Counters**: Values that only go up (e.g., `ingest_requests_total`, `ingest_points_total`, `cache_hits_total`). Useful for computing rates (ingestion throughput, cache hit ratio).
-- **Histograms**: Track the distribution of values (e.g., `ingest_latency_seconds`, `query_latency_seconds`). Enable percentile monitoring -- "are 95% of queries completing within 500ms?"
-- **Gauges**: Values that go up or down (e.g., `queue_depth`, `db_connections_active`, `alerts_firing`). Show current state -- for example, connection pool saturation.
-
-The `db_connections_active`, `idle`, and `total` gauges provide visibility into connection pool health, which is critical for a system that handles both high-throughput ingestion writes and concurrent query reads on the same database pool.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse, prevents any single client from monopolizing resources, and ensures fair resource distribution.
-
-This project implements rate limiting using Redis sorted sets for a sliding window algorithm. Unlike fixed window counters (which can allow burst traffic at window boundaries), sliding windows count requests over a continuously moving time window:
-- Ingestion: 10,000 requests/minute per IP (high limit because agents send frequent metric batches)
-- Query API: 100 requests/minute per user (prevents expensive queries from monopolizing database resources)
-- Login: 5 attempts/minute per IP with lockout (brute force protection)
-
-The sliding window works by storing each request's timestamp in a Redis sorted set. When checking the limit, the system removes timestamps older than the window, counts the remaining entries, and allows or rejects the request. This is more accurate than fixed window counters but uses slightly more memory (one entry per request vs. one counter per window).
-
-For the ingestion endpoint, a high limit (10K/min per IP) is appropriate because metrics agents typically send batches every 10-30 seconds. A legitimate agent sending 100 metrics per batch at 10-second intervals would use only 600 requests/minute. The 10K limit provides headroom for burst scenarios without exposing the system to abuse.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a dashboarding system, this is important at the metrics ingestion layer -- if a metrics agent retries a failed batch submission, the system should not double-count data points.
-
-This project achieves idempotency through the ingestion pipeline design. Metric data points are identified by the combination of `(metric_id, time, value)`. If the same data point is inserted twice (due to a retry), the database handles it based on the insert method. For batch COPY ingestion, duplicate timestamps for the same metric create additional rows, but aggregation queries (AVG, MAX, MIN) over time windows produce correct results because the duplicate values are identical.
-
-Dashboard and alert rule operations use UUID primary keys. Creating the same dashboard twice (via a client retry) would generate a new UUID each time, but this is acceptable because dashboards are user-created entities -- the user simply deletes the duplicate. Alert rule evaluation is naturally idempotent: evaluating the same rule twice in the same 10-second window produces the same firing/not-firing result because it reads the same underlying metric data.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether a service is alive and ready to handle traffic. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing and restarts.
-
-This project implements three health check endpoints:
-- **`/health`** (liveness): Returns 200 if the process is running. No dependency checks.
-- **`/health/live`** (K8s liveness probe): Simple OK response. If this fails, the orchestrator should restart the container.
-- **`/health/ready`** (readiness probe): Checks TimescaleDB and Redis connectivity. If TimescaleDB is unreachable, both ingestion and queries will fail, so the instance should be removed from the load balancer. If Redis is unreachable, the system degrades (uncached queries, no rate limiting) but can still function.
-
-The readiness check is particularly important for a dashboarding system because TimescaleDB is a single point of failure -- without it, neither metric ingestion nor query serving works. Redis failure is treated as degraded but not down, because the system can fall back to direct database queries (at higher latency). Health check requests are filtered from Pino logs to prevent log flooding from frequent liveness probes.
-
----
+| Production acceptance | Durable log acknowledgement | Best-effort buffering | Explicit retention and replay boundary |
+| Local ingestion | Direct array insert | Unwired broker dependency | Simple demonstration if actual write success is honored |
+| Retry semantics | Immutable batch identity + database receipt | Unconditional duplicate rows | Preserve sums/counts and selective-retry averages |
+| Long-range queries | Mergeable aggregate states | Repeated raw scans | Bound cost while exposing lost precision |
+| Browser refresh | Coordinated polling | One timer per panel | Shared window, bounded work, partial status |
+| Missing telemetry | Separate quality state | Empty interpreted as healthy | Avoid false incident resolution |
+| Alert delivery | Transactional outbox | Log/flag after best effort | Distinguish an incident from delivery success |
+| Configuration | Versioned relational records | Unconditional replacement | Detect stale edits and preserve ownership boundaries |
 
 ## Implementation Notes
 
-This section maps the production architecture to the actual local implementation running on Docker + Node.js + Express.
+### Local topology, scripts, and seeds
 
-### Local Architecture
+[Compose](./docker-compose.yml) runs TimescaleDB on PostgreSQL 16 and Valkey 7 by default. Kafka/Zookeeper require an optional profile and are not imported by application source. No RabbitMQ, Mailhog, notification worker, Prometheus server, or Grafana is configured. The API defaults to port 3000, matching the Vite proxy. Instance scripts on 3001–3003 work but do not configure a load balancer.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Frontend (Vite)                        │
-│                  localhost:5173                           │
-│                                                          │
-│  Routes:                                                 │
-│    / (dashboard list)                                    │
-│    /dashboard/:id (dashboard view with panels)           │
-│    /alerts (alert rule management + history)             │
-│    /metrics (metrics explorer)                           │
-│                                                          │
-│  Components: Recharts (line, area, bar, gauge, stat)     │
-│              TimeRangeSelector, DashboardGrid             │
-│              AlertRuleForm, AlertRuleCard, AlertHistory   │
-└───────────────────────────┬──────────────────────────────┘
-                            │ HTTP (polling every 10s)
-                            ▼
-┌──────────────────────────────────────────────────────────┐
-│              API Server (Express)                         │
-│           localhost:3001 / 3002 / 3003                    │
-│                                                          │
-│  /api/v1/auth/*           Session auth                   │
-│  /api/v1/metrics          Ingest + query + list          │
-│  /api/v1/dashboards/*     CRUD + panels                  │
-│  /api/v1/alerts/*         Rules + history + evaluate     │
-│  /health, /health/live, /health/ready                    │
-│  /metrics                 Prometheus endpoint            │
-│                                                          │
-│  Background: Alert evaluator (every 30s)                 │
-└─────┬──────────────┬────────────────────────────────────┘
-      │              │
-      ▼              ▼
-┌──────────┐  ┌──────────┐
-│TimescaleDB│  │  Valkey   │
-│  :5432   │  │  :6379   │
-│          │  │          │
-│  metrics │  │ Sessions │
-│  metricsdb│ │ Cache    │
-│  metrics123│ │ Alerts   │
-└──────────┘  └──────────┘
+[Backend startup](./backend/src/index.ts) reads shell environment directly, listens without waiting for dependency readiness, and starts alert evaluation immediately and every 30 seconds. There is no `.env` loader or migration script. The consolidated schema is mounted for fresh volumes; the README also gives a non-destructive explicit reapplication command. Backend TypeScript uses NodeNext without a package `type: module`, emits to `dist`, and has working build/start script paths; frontend/backend types are separate definitions.
+
+The SQL seed creates 18 production series, a fixed public dashboard, six fixed panels, and three rules. Reapplication appends samples and skips fixed-ID configuration conflicts. The TypeScript seed creates 36 production/staging series, writes points before trying the fixed dashboard insert, then creates random-ID panels/rules. It can fail after partial seeding on a repeat and does not close Redis on success. Neither creates users or ongoing telemetry. Admin-only registration therefore has no first-user bootstrap, and the browser has no authentication screen.
+
+### Ingestion and identity behavior
+
+[metricsService.ts](./backend/src/services/metricsService.ts) looks up IDs through an unbounded process Map, Redis with a one-hour TTL, and a PostgreSQL upsert. Its key concatenates sorted `key=value` pairs without escaping. Distinct maps such as `{a: "x,b=y"}` and `{a: "x", b: "y"}` collide and can store observations under the wrong series ID. The isolated check returned the same ID with only one definition write. Clearing the process Map does not clear Redis IDs.
+
+The batch uses `Promise.all` across points before one `INSERT ... SELECT FROM unnest(...)`. It uses neither COPY nor a queue. Definition upserts are outside the final insert transaction, so a failed batch can leave metadata. Requests validate up to 10,000 points and a 10 MB JSON body, but not label count/length, series quotas, timestamp age, or query cost. There is no raw sample uniqueness or idempotency receipt.
+
+The service passes an empty result into [withCircuitBreaker](./backend/src/shared/circuitBreaker.ts), then unconditionally increments success counters and returns the input count. The wrapper only returns that fallback for an open-breaker error; ordinary database errors and timeouts propagate. The decisive existing branch is:
+
+```typescript
+if (error instanceof Error && error.message.includes('Breaker is open')) {
+  logger.warn({ query: query.substring(0, 100) }, 'Query rejected - circuit breaker open');
+  return fallback;
+}
+throw error;
 ```
 
-### Production-Grade Patterns Actually Implemented
+A breaker can reduce pressure on a failing dependency, but its fallback must preserve the operation's success/failure meaning. The isolated actual-module check forced the ingestion breaker open and observed `accepted: 1` with zero sample insert calls. An Opossum timeout does not cancel a write that may later complete.
 
-| Pattern | File | Description |
-|---------|------|-------------|
-| Structured logging | `backend/src/shared/logger.ts` | Pino + pino-http, auto-filtered health check logs, startup/shutdown logging |
-| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP latency histograms, ingestion counters, DB pool gauges, cache hit/miss counters |
-| Circuit breakers | `backend/src/shared/circuitBreaker.ts` | Opossum-based breakers for DB queries, configurable thresholds, fallback handlers |
-| Query caching | `backend/src/shared/cache.ts` | Redis cache-aside with TTL strategy (10s live, 5min historical), SHA-256 cache keys |
-| Health checks | `backend/src/shared/health.ts` | `/health`, `/health/live`, `/health/ready` with TimescaleDB + Redis checks |
-| RBAC auth | `backend/src/shared/auth.ts` | Session-based auth, role middleware (viewer/editor/admin), ownership checks |
-| TimescaleDB hypertables | `backend/db/init.sql` | Automatic time-based partitioning, retention policy (7-day raw) |
-| Alert evaluation | `backend/src/services/alertService.ts` | Periodic evaluator with state tracking, configurable interval |
-| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT handlers, pool draining, Redis disconnect |
-| Security headers | `backend/src/index.ts` | Helmet middleware, CORS, response compression |
-| Input validation | `backend/src/routes/metrics.ts` | Zod schema validation for metric payloads |
-| DB connection pooling | `backend/src/db/pool.ts` | pg Pool with periodic metric reporting |
-| Metric ID caching | `backend/src/services/metricsService.ts` | In-memory + Redis cache for metric definition lookups |
+### Query selection, aggregation, and caching
 
-### Simplifications for Local Development
+[queryService.ts](./backend/src/services/queryService.ts) selects raw data for spans up to six hours, `metrics_hourly` up to seven days, and `metrics_daily` for longer spans. The latter tables do not exist. Table selection ignores requested age and actual retention/materialization coverage. Missing-table errors initially return errors; after failures open the shared query breaker, definition/data reads can instead return empty fallbacks. Those can be cached as successful results and affect unrelated raw queries and alerts using the same breaker.
 
-| Production Design | Local Substitute | Why |
-|-------------------|------------------|-----|
-| Kafka for ingestion queue | Direct DB writes (synchronous) | No Kafka/Zookeeper overhead (Kafka in docker-compose only via profile) |
-| Ingestion worker cluster | Inline writes in API handler | No separate worker process needed at 1K/sec |
-| TimescaleDB multi-node | Single TimescaleDB instance | Sufficient for local data volume |
-| Continuous aggregates (`metrics_hourly`/`metrics_daily`) | Not created; query router references them but only the raw `metrics` path returns data (long ranges fall back to empty via the circuit breaker) | Seed data spans 1 hour, so raw path suffices; materializing the rollups is the first hardening step |
-| Read replicas | Single database | Low query volume |
-| Redis Cluster | Single Valkey instance | < 256 MB cache |
-| CDN / edge cache | Direct Vite dev server | No CDN needed locally |
-| API Gateway + LB | Direct connection on port 3001-3003 | No nginx needed |
-| SMTP provider | Mailhog (docker-compose optional) | Captures emails locally |
-| WebSocket for sub-second updates | HTTP polling (10s) | Simpler, sufficient |
+`group_by` is included in the cache key but ignored during execution. Queries always return one series per full metric definition. Raw aggregation uses inclusive start/end bounds and `time_bucket`; malformed intervals default to one minute, while zero or huge numeric intervals remain possible. The proposed rollup branch averages `avg_value` without count weighting and expects columns such as `sum_value`; creating arbitrary tables with the referenced names would not make that logic correct.
 
-### What Was Omitted
+Latest-value reads choose one matching definition with an unordered `LIMIT 1`, not the newest sample across all matches. Stats aggregate all raw matching observations. The seed's request-rate panel sums gauge-like rate samples across time, so its `req/s` display label does not describe the calculation correctly.
 
-- CDN for static assets
-- Multi-region deployment and geo-routing
-- Kubernetes orchestration and auto-scaling
-- OAuth/OIDC integration (uses session auth instead)
-- WebSocket for real-time sub-second dashboard updates
-- Query result streaming for large results
-- Metric sharding across database nodes
-- Pre-computed dashboard snapshots
-- Anomaly detection (ML-based alerting)
-- Multi-tenancy with organization isolation
-- Drag-and-drop panel layout editing
-- PromQL query language parser
-- Continuous aggregates for automatic rollups
+[cache.ts](./backend/src/shared/cache.ts) recursively canonicalizes parameter keys and uses the first 16 hex characters of SHA-256. Query keys include exact ISO bounds; the browser's independent millisecond anchors reduce reuse. TTL is ten seconds unless the query ends more than an hour ago, when it is 300 seconds. Late writes mean historical results can still change. Cache get/set errors are caught; writes happen asynchronously and there is no single-flight miss coordination. The nominal 1 MB entry limit measures string length, not encoded bytes. Metric invalidation is a no-op and dashboard invalidation has no active callers; dashboard CRUD is not cached through this helper.
+
+### Alert semantics and notifications
+
+[alertService.ts](./backend/src/services/alertService.ts) runs window queries with default one-minute buckets. It averages bucket averages without sample weights, and for `count` returns the number of returned buckets rather than summing their sample counts. An isolated result containing bucket counts 40 and 60 evaluated to 2, not 100. The condition applies across all matching series, not an independently tracked incident for every host.
+
+There is no pending-duration state, hysteresis, data-quality state, Redis alert state, or rule-version binding. No results returns `shouldFire: false`; the periodic evaluator then resolves an active incident. The isolated no-data case confirmed that update. A query exception logs an evaluation error instead, making a breaker-open empty response materially different from an ordinary failure.
+
+Every API process evaluates all enabled rules, and async interval callbacks may overlap even in one process. Checking for an existing firing row and inserting a new one are separate operations without a unique active-incident constraint. Repeated evaluations while firing do not update the recorded incident value; the evaluation counter also omits that already-firing/true branch. Disabled rules are skipped, so existing firing rows need not resolve. Deleting a rule cascades its history.
+
+Manual Test only evaluates the predicate. Notifications log to console or log that a webhook would be sent; neither an HTTP webhook nor email is implemented. The code then sets `notification_sent = true`, even for an empty notification list. There is no retry queue, delivery outcome, or notification breaker. Failure after incident creation can leave delivery unrecorded without another notification attempt while it remains firing.
+
+### Authentication and dashboard operations
+
+[auth.ts](./backend/src/shared/auth.ts) hashes passwords with bcrypt cost 12 and rechecks user existence/role on protected requests. Registration/listing users requires admin. The schema's default `user` role differs from the viewer/editor/admin middleware roles. Login does not regenerate the session; cookies use HttpOnly, SameSite=Lax, and production-only Secure. The app has no explicit CSRF token or rate limiter. `DISABLE_REDIS=true` switches only sessions to process memory; caches/health still call Redis.
+
+Dashboard creation requires editor/admin. Other dashboard mutations use an owner/admin helper that permits null or unknown owners and does not independently require editor role. The public seeded dashboard has no owner. Optional-auth reads do not revalidate a session's role against the database. Metrics and all alert routes are public, so the permission catalog is not a complete data-access boundary.
+
+[Dashboard routes](./backend/src/routes/dashboards.ts) protect whole-dashboard and panel-list/data reads, but a single-panel GET omits the parent dashboard's privacy check. Panel update/delete authorizes the dashboard ID in the URL and then mutates by panel ID without verifying the relationship, allowing an authorized or nonexistent supplied parent to be used for another panel. Service CRUD uses direct pool queries, not the defined dashboard breaker. Configuration saves have no expected-version check, and dashboard/panel reads use separate queries rather than one consistent snapshot.
+
+### Browser behavior
+
+The generated routes render under a root outlet. Routes/hooks use React local state; both Zustand stores are unused. There is no panel plugin registry, Module Federation runtime, iframe integration, shared data coordinator, drag/resize editor, or panel error boundary. The table panel is a placeholder; supported visual renderers are line/area/bar charts, CSS gauge, and stat.
+
+[PanelChart.tsx](./frontend/src/components/PanelChart.tsx) maps the first series' timestamps and takes each other series' value at the same array index, substituting zero when absent. An isolated run of this actual mapping placed a sample from 00:01 at 00:00 and created zero at 00:02. It does not align by timestamp. Series keys use concatenated tag values without names/escaping, and colors depend on result order. Labels show only `HH:mm`; the computed full timestamp is not used by the tooltip.
+
+[GaugePanel.tsx](./frontend/src/components/GaugePanel.tsx) and [StatPanel.tsx](./frontend/src/components/StatPanel.tsx) display the last bucket of the first returned series, without declaring its complete identity or freshness. The gauge clamps its geometry to 0–100 regardless of unit, while the numeric label can exceed that range. The explorer also plots only the first returned series; tags are displayed as metadata but cannot be selected as query filters in that UI.
+
+Each renderer polls independently every ten seconds with its own current-time anchor, no cancellation, no request generation, no backoff, and no hidden-tab suspension. Late results can replace a new range/dashboard's data. Errors replace a previously populated panel rather than showing a labeled stale snapshot. The dashboard Refresh action reloads metadata, while its “Updated” label can advance before panel data changes. Dashboard cards show zero panels because the list response does not include them. Grid coordinates are fixed and are not adapted to a narrow viewport.
+
+The alert banner separately polls up to ten firing rows and all rules every 30 seconds. It displays the returned count, not an exact global active count, and retains old state silently on errors. The alerts page uses a separate local hook with its own polling; create/toggle/delete refetch after success, without optimistic rollback or shared banner invalidation. An empty description is sent as `null` and rejected by the backend's optional-string schema. Form failures can propagate a rejected handler promise; rule toggles/deletes lack pending guards. Dashboard list/view errors are not cleared by later successful fetches.
+
+### Operational wiring and verification limits
+
+Opossum settings differ by operation: query 10 seconds/40%/60-second reset with volume 3; ingestion 5 seconds/60%/30-second reset with volume 5. The dashboard breaker is created and instrumented but never used by CRUD. Cache and breaker helpers demonstrate useful patterns, with the limits above. Pino logs requests and errors; only exact `/health` and `/health/live` URLs are excluded from automatic request logs. There is no complete query plan, slow-query policy, or notification trace pipeline.
+
+Shutdown calls `server.close` without awaiting HTTP drain, stops the interval without awaiting an active evaluation, then closes PostgreSQL and Redis and schedules process exit. The pool metric interval is not cleared. This is a cleanup attempt, not a verified graceful drain of all work.
+
+The documentation audit read all five documents, application source, schema/seeds, configuration, and smoke tests. Isolated checks used the actual TypeScript services and Opossum with mocked database/cache/metrics, plus the chart mapping with a formatting stub; they verified identity collision, false acceptance, failure propagation, count/no-data alert behavior, and timestamp misalignment. No external systems were contacted by those checks. Builds, native installs, database/queue startup, browser interactions, real concurrency, and load tests were not run. Four existing Playwright tests check page headings, not these correctness properties.

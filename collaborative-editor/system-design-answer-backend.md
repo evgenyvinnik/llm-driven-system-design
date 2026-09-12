@@ -1,413 +1,384 @@
-# Collaborative Editor - System Design Answer (Backend Focus)
+# 📝 Design a collaborative editor: backend interview
 
-## 45-minute system design interview format - Backend Engineer Position
+> “I would organize the backend around one accepted history for each document.
+> WebSockets deliver edits quickly, but the service still needs to decide their
+> order, make each acknowledgement durable, and recover the same history after a
+> failure.”
 
-## Opening Statement (1 minute)
+This is a proposed production design for a 45-minute interview. The local
+application includes an operation log and RabbitMQ fanout, but lacks the authority
+and recovery guarantees described here. [Implementation
+Notes](./architecture.md#implementation-notes) trace the checked-in behavior.
 
-"I'll design a real-time collaborative document editor like Google Docs, where multiple users can simultaneously edit the same document and see each other's changes instantly. My backend focus will be on implementing Operational Transformation (OT) for conflict resolution, designing the WebSocket sync protocol, managing document state persistence, and ensuring consistency across distributed sync servers.
+| Time | Discussion |
+|------|------------|
+| 4 minutes | Requirements and capacity |
+| 5 minutes | Architecture and data model |
+| 9 minutes | Deep dive: document ordering and OT |
+| 9 minutes | Deep dive: durable acceptance and delivery |
+| 8 minutes | Deep dive: snapshots and reconnect recovery |
+| 6 minutes | Scaling, access control, and operations |
+| 4 minutes | Verification and implementation boundary |
 
-The core technical challenges are: implementing a correct OT algorithm that preserves user intent during concurrent edits, designing a scalable sync server architecture that can broadcast operations across multiple instances, and building a reliable persistence layer with snapshots and operation logs for fast document loading and complete history."
+## 🎯 Requirements and capacity — 4 minutes
 
-## Requirements Clarification (3 minutes)
+I would scope the service to collaboratively edited plain text. It supports document
+creation, discovery, rename, view/edit permissions, live edits, and participant
+presence. Historical preview and restore use the same durable history rather than a
+separate conflicting source of truth.
 
-### Functional Requirements
-- **Edit**: Multiple users edit document simultaneously
-- **Sync**: Real-time updates visible to all editors (< 50ms latency)
-- **History**: Version history with restore capability
-- **Presence**: Track who's editing and their cursor positions
-- **Share**: Control document access and permissions
+The client applies typing locally without waiting for the server. The server's
+responsibility is to admit authorized operations, assign a canonical order,
+acknowledge durable acceptance, and make missed history recoverable. I would not
+promise that an open WebSocket means every local character is already saved.
 
-### Non-Functional Requirements
-- **Latency**: < 50ms for local changes to appear, < 100ms for cross-client sync
-- **Consistency**: All clients converge to same document state
-- **Scale**: Support 50+ simultaneous editors per document
-- **Durability**: Never lose user edits
-- **Availability**: Graceful degradation when dependencies fail
+Extended offline branches, embedded media, and rich-text structure are outside the
+first version. Short interruptions should recover automatically where history
+permits; unsupported old drafts should remain available to their owners for explicit
+recovery.
 
-### Scale Estimates
-- 1M documents, 100K daily active users
-- Most documents have 1-5 editors (typical)
-- Some popular documents may have 50+ simultaneous editors
-- Documents can be MB in size with years of history
-- Peak: 10K concurrent editing sessions, 50K operations/second
+I would target p99 acknowledgement below 200 ms and peer visibility below 300 ms
+within a region under normal load. A 99.95% regional availability target is
+reasonable, while an uncertain document owner or unavailable durable store
+temporarily stops writes for that document.
 
-## High-Level Architecture (5 minutes)
+Assume 100,000 connected sessions across 20,000 active documents. If 20% of users
+are actively typing and each sends two batches per second, peak admission is about
+40,000 operations/s. At 600 bytes per operation before indexes and replication, the
+raw peak log rate is 24 MB/s.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Editor                                │
-│  ┌─────────────────┐  ┌──────────────┐  ┌─────────────────────┐ │
-│  │  Rich Text      │  │  Operation   │  │  Sync               │ │
-│  │  Editor         │  │  Transform   │  │  Engine             │ │
-│  └─────────────────┘  └──────────────┘  └─────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                           │ WebSocket
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Load Balancer                                │
-│  (Sticky sessions by documentId for connection affinity)        │
-└─────────────────────────────────────────────────────────────────┘
-          │                    │                    │
-          ▼                    ▼                    ▼
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│  Sync Server 1   │  │  Sync Server 2   │  │  Sync Server 3   │
-│  :3001           │  │  :3002           │  │  :3003           │
-│                  │  │                  │  │                  │
-│ - WebSocket mgr  │  │ - WebSocket mgr  │  │ - WebSocket mgr  │
-│ - OT engine      │  │ - OT engine      │  │ - OT engine      │
-│ - Presence       │  │ - Presence       │  │ - Presence       │
-└──────────────────┘  └──────────────────┘  └──────────────────┘
-          │                    │                    │
-          └────────────────────┼────────────────────┘
-                               │
-                    RabbitMQ (fanout)
-                               │
-          ┌────────────────────┼────────────────────┐
-          │                    │                    │
-          ▼                    ▼                    ▼
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│   PostgreSQL     │  │     Redis        │  │   Object Store   │
-│                  │  │                  │  │                  │
-│ - Documents      │  │ - Active docs    │  │ - Attachments    │
-│ - Operations     │  │ - Presence       │  │ - Media files    │
-│ - Snapshots      │  │ - Cursors        │  │                  │
-│ - Access control │  │ - Idempotency    │  │                  │
-└──────────────────┘  └──────────────────┘  └──────────────────┘
-```
+The sustained rate matters for storage: 10,000 operations/s on average is about 518
+GB/day of raw history. I would establish retention and archival policy early. It is
+not enough to say that text documents are small while ignoring years of edit
+history.
 
-### Core Components
-1. **Sync Server** - WebSocket connections, OT engine, version management
-2. **Document State Manager** - In-memory state with persistence
-3. **RabbitMQ** - Cross-server operation broadcast
-4. **PostgreSQL** - Snapshots and operation log
-5. **Redis** - Presence, cursors, idempotency cache
+A document with 50 active writers at two batches/s receives 100 ordered commands/s
+and can require 4,900 peer deliveries/s. That distinction suggests a serialized
+admission path with separately scalable delivery. Adding database shards helps many
+documents; it does not eliminate contention on one document head.
 
-## Deep Dive: Operational Transformation Engine (10 minutes)
+These figures are assumptions for discussion, not a capacity claim for the
+repository. I would validate workload distributions, document size, paste behavior,
+and writer/viewer ratios before final sizing.
 
-### Operation Types
+## 🏗️ Architecture and data model — 5 minutes
 
-**TextOperation class**:
-- `ops[]`: Array of operations
-- `baseLength`: Document length before applying
-- `targetLength`: Document length after applying
-
-**Operation Methods**:
-- `retain(n)`: Keep n characters unchanged, merge with previous retain
-- `insert(str, attributes?)`: Add text, track in targetLength
-- `delete(n)`: Remove n characters, merge with previous delete
-- `apply(document)`: Execute operation on string
-
-**Apply Logic**:
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    apply(document)                               │
-├─────────────────────────────────────────────────────────────────┤
-│  For each op in ops:                                            │
-│    retain(n) ──▶ result += document[index..index+n], index += n │
-│    insert(s) ──▶ result += s                                    │
-│    delete(n) ──▶ index += n (skip characters)                   │
-│  Return result                                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Transform Function
-
-The heart of OT - transforms operations so they can be applied in any order.
-
-**Transform Property**:
-```
-transform(op1, op2) => [op1', op2']
-
-Such that: apply(apply(doc, op1), op2') === apply(apply(doc, op2), op1')
-```
-
-**Transform Cases**:
-
-| op1 | op2 | Result |
-|-----|-----|--------|
-| insert | insert | op1 inserts first, op2 retains past it |
-| retain | retain | Both retain minimum length |
-| delete | delete | Both skip (cancel out) |
-| delete | retain | op1 deletes, op2 skips |
-| retain | delete | op2 deletes, op1 skips |
-
-**Compose Function**:
-```
-compose(op1, op2) => combined
-
-Such that: apply(apply(doc, op1), op2) === apply(doc, compose(op1, op2))
-```
-
-### Transform Example
+I would draw a document owner between connection handling and durable storage:
 
 ```
-Document: "Hello"
-
-User A at position 1: retain(1), insert("X")  ──▶ "HXello"
-User B at position 3: retain(3), insert("Y")  ──▶ "HelYlo"
-
-Without transform: Conflicts and corruption.
-
-With transform:
-┌────────────────────────────────────────────────────────────────┐
-│ Transform A against B: retain(1), insert("X")                  │
-│   (unchanged, B's insert is after)                             │
-│                                                                │
-│ Transform B against A: retain(4), insert("Y")                  │
-│   (skip past A's inserted X)                                   │
-│                                                                │
-│ Final result after both: "HXelYlo" (convergent)                │
-└────────────────────────────────────────────────────────────────┘
+┌──────────────────┐       ┌──────────────────┐
+│ WebSocket        │──────▶│ Document owner   │
+│ gateways         │◀──────│ Ordered commands │
+└──────────────────┘       └────────┬─────────┘
+                                    │ atomic append
+                           ┌────────▼─────────┐
+                           │ PostgreSQL       │
+                           │ Head/log/receipt │
+                           │ Snapshot/outbox  │
+                           └────────┬─────────┘
+                                    │ committed events
+                           ┌────────▼─────────┐
+                           │ Fanout / workers │
+                           └──────────────────┘
 ```
 
-## Deep Dive: Document State Manager (8 minutes)
+Gateways authenticate and hold connections. They route edits to a single logical
+owner per document. The owner validates and transforms operations, coordinates
+durable acceptance, and provides an ordered stream to subscribers. Multiple gateways
+can deliver that stream without becoming independent authorities.
 
-### Server-Side State
+The first implementation can use a shared PostgreSQL cluster with document-based
+partitioning later. Keep each document's head, log, receipts, and outbox in the same
+transactional partition. Redis holds expiring presence and optional caches, not the
+authoritative document text.
 
-**DocumentState class**:
-- `documentId`: Unique identifier
-- `version`: Monotonic counter
-- `content`: Current document string
-- `clients`: Map of connected clients
-- `operationBuffer`: Map of recent operations for transforms
+| Record | Key information | Why it exists |
+|--------|-----------------|---------------|
+| Document | ID, title, owner, metadata revision | Discovery and independent metadata changes |
+| Access grant | Document, principal, role | Explicit read/edit/manage admission |
+| Document head | Document, committed version, authority generation | One current history and fenced ownership |
+| Operation | Document/version, transformed edit, actor, receipt ID | Replayable canonical history |
+| Operation receipt | Document/actor/operation ID, original fingerprint, result | Resolve duplicate and ambiguous requests |
+| Snapshot | Document/version, content, checksum, format version | Bound reconstruction work |
+| Outbox | Event ID, document sequence, publication state | Recover delivery after the commit |
 
-**load() Method**:
-1. Query latest snapshot from `document_snapshots`
-2. Set initial version and content
-3. Query operations after snapshot version
-4. Apply each operation to content
-5. Store in operation buffer
+A snapshot is an exact representation of a committed version. Presence is different:
+it is the latest approximate cursor and activity state for a live participant.
+Persisting every cursor movement in the operation log would make document recovery
+more expensive without improving text durability.
 
-**applyOperation() Method**:
+The API surface can stay compact:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│          applyOperation(clientId, clientVersion, op, opId)      │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Check idempotency cache ──▶ return cached if exists         │
-│  2. Get concurrent ops (clientVersion..serverVersion)           │
-│  3. Transform against each concurrent op                        │
-│  4. Validate base length matches content length                 │
-│  5. Apply to content: this.content = transformedOp.apply()      │
-│  6. Increment version                                           │
-│  7. Buffer for future transforms                                │
-│  8. Persist to operations table                                 │
-│  9. Snapshot if version % 50 === 0                              │
-│ 10. Cache result for idempotency (1 hour TTL)                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET / POST | `/api/documents` | List permitted documents or create one |
+| GET / PATCH | `/api/documents/:id` | Read metadata or conditionally rename |
+| GET | `/api/documents/:id/versions` | Browse retained history |
+| POST | `/api/documents/:id/restore` | Restore a preview as a new edit |
+| GET | `/api/documents/:id/operations/:operationId` | Resolve a submitted operation |
 
-**getConcurrentOperations()**:
-- Check in-memory buffer first (last 100 ops)
-- Fall back to database query if needed
+An authenticated WebSocket handles edit submission, acknowledgement, ordered remote
+edits, baseline/replay, and presence. History, restore, and receipt endpoints are
+proposed additions; they are not available in the current demo.
 
-**Snapshot Strategy**:
-- Save every 50 operations
-- Enables fast document loading
-- Complete history preserved in ops table
+## 🔧 Deep dive: document ordering and OT — 9 minutes
 
-### WebSocket Sync Server
+I would choose one serialized admission stream per document. Clients may edit
+optimistically in parallel, but their accepted operations enter one history. This
+gives each operation an unambiguous committed base against which it can be
+transformed.
 
-**SyncServer class**:
-- `documents`: Map of active DocumentState
-- `clients`: Map of WebSocket to ClientConnection
+Suppose Alice and Bob both open “cat.” Alice inserts X after c and commits first.
+Bob had inserted Y after a using the original document. The server transforms Bob's
+position through Alice's committed edit, producing the combined text “cXaYt.” The
+server broadcasts the canonical transformed operation with its assigned version.
 
-**handleConnection()**:
-1. Generate clientId
-2. Load or get document state
-3. Register client with assigned color
-4. Send `init` message with full state
-5. Broadcast `client_join` to others
-6. Store presence in Redis (5 min TTL)
+The same-position case needs a deliberate priority rule. In this proposal, an
+already committed insertion precedes a newly admitted concurrent insertion. Browser
+reconciliation must use the same priority between a remote committed operation and
+local pending work. A pairwise transform that converges when used correctly can
+still fail within an inconsistent protocol.
 
-**handleOperation()**:
+I would describe retain, insert, and delete at a high level, then insist on tested
+operation algebra and a tested client state machine. I would not attempt to
+implement every transform branch on a whiteboard. Handling partially consumed
+operations and overlapping deletions is exactly where attractive pseudocode tends to
+hide errors.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   handleOperation Flow                          │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Parse operation from JSON                                   │
-│  2. Apply to document state (may transform)                     │
-│  3. Log conflict resolution if transforms occurred              │
-│  4. Send ACK to sender with new version                         │
-│  5. Broadcast to local clients                                  │
-│  6. Publish to RabbitMQ for cross-server sync                   │
-│                                                                 │
-│  On error:                                                      │
-│    - Log failure                                                │
-│    - Send resync with full content                              │
-└─────────────────────────────────────────────────────────────────┘
-```
+Input validation must establish that the operation fully consumes the stated base,
+produces the declared target length, contains legal finite counts, and fits
+size/work limits. The base version must exist in supported history. An operation
+with a plausible base length can still contain invalid component totals or refer to
+the wrong text.
 
-**handleCursor()**:
-- Update client cursor in document state
-- Store in Redis (60s TTL)
-- Broadcast to other clients
+The owner processes an entire command before admitting the next one, including
+asynchronous storage. JavaScript running on one thread does not achieve this
+automatically: another handler can run while the first awaits a database query. A
+per-document command queue provides the required workflow serialization.
 
-**handleDisconnect()**:
-- Remove from document state
-- Broadcast `client_leave`
-- Remove from Redis presence/cursors
-- Clean up empty documents after 30s delay
+For failover, routing to one process is insufficient. The database head carries an
+authority generation that every append checks. When a replacement owner takes over,
+it advances that generation while locking the head; subsequent commits from the old
+generation fail. Takeover and appends must serialize through the same authority
+record.
 
-**Color Assignment**:
-- Hash clientId to index into color array
-- Consistent color per client
+An old owner that committed before takeover may still have a valid event to deliver.
+It cannot invent a new sequence afterward. Gateways and clients deduplicate and
+check sequence numbers, while the replacement owner reconstructs the committed head
+before accepting new work.
 
-## Deep Dive: Cross-Server Synchronization (5 minutes)
+| Authority model | Benefits | Costs |
+|-----------------|----------|-------|
+| ✅ One fenced owner per document | Single transform context and accepted history | Brief write interruption during recovery; hot-document limit |
+| ❌ Independent mutable owners with fanout | Easy to accept local writes | Concurrent heads, stale transforms, and conflicting snapshots |
+| ❌ Unique version constraint alone | Rejects duplicate version rows | Does not repair speculative memory or decide failover ownership |
 
-### RabbitMQ Fanout Architecture
+A CRDT is a credible alternative when independent offline writers are a core
+requirement. It changes operation identity and merge semantics. It does not remove
+the need for authorization, durable storage, delivery, or a coherent product
+history. I would choose the concurrency model based on that requirement rather than
+claim OT is always simpler or CRDTs always waste memory.
 
-**Queue Setup**:
-- Topic exchange: `doc.operations`
-- Per-server queue: `op.broadcast.{SERVER_ID}`
-- Bind pattern: `doc.*` (all documents)
-- Prefetch: 50 messages for backpressure
-- Dead letter exchange: `doc.dlx`
+The cost of central admission is intentional: when ownership is uncertain, I stop
+writes for that document. Other documents can continue. Accepting edits from both
+sides of a partition and promising to reconcile later would require a different
+authority and merge design.
 
-**Message Flow**:
+> “A load balancer chooses where a request goes. A document owner decides which edit
+> becomes part of history. I would not treat those as the same guarantee.”
 
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Sync Server 1│    │   RabbitMQ   │    │ Sync Server 2│
-│ (publisher)  │──▶ │ doc.operations──▶ │ (consumer)   │
-└──────────────┘    │   exchange   │    └──────────────┘
-                    └──────────────┘           │
-                           │                   ▼
-                           │           ┌──────────────┐
-                           │           │ Skip if self │
-                           │           │ Deduplicate  │
-                           │           │ Update state │
-                           │           │ Broadcast    │
-                           │           └──────────────┘
-                           │
-                    ┌──────────────┐
-                    │ Dead Letter  │
-                    │ doc.failed   │
-                    └──────────────┘
-```
+## 🔧 Deep dive: durable acceptance and delivery — 9 minutes
 
-**Consumer Logic**:
-1. Skip messages from self (same SERVER_ID)
-2. Check deduplication via Redis (`seen:{messageId}`)
-3. Update local document state
-4. Broadcast to local WebSocket clients
-5. Mark as seen (1 hour TTL)
-6. ACK message
+I would define acknowledgement precisely: this operation has committed to the
+configured durable database authority. The acknowledgement includes its stable
+operation ID and assigned version. It does not mean every peer has received it or
+that a snapshot was just written.
 
-**Error Handling**:
-- On failure: NACK with requeue (once)
-- On second failure: goes to DLQ
-- Log failures for manual inspection
+The command flow is short enough to explain as a sequence:
 
-### Dead Letter Queue
+1. Authenticate, authorize, validate, and resolve any existing operation receipt.
+2. Transform an unseen edit against the committed suffix and compute candidate text without replacing committed memory.
+3. In one transaction, check authority, advance the head, append the operation and receipt, and record an outbox event.
+4. After commit, update owner memory, acknowledge the exact request, and continue the document queue.
+5. Deliver committed events through the relay; recover missed delivery from durable state.
 
-**Setup**:
-- Exchange: `doc.dlx`
-- Queue: `doc.failed`
-- Binding: `operation.failed`
+The distinction between candidate and committed memory matters. If I change memory
+first and the insert fails, a later reader or disconnect snapshot can receive text
+that never became part of the log. Rolling back the SQL transaction does not
+automatically roll back JavaScript objects.
 
-**Consumer**:
-- Log error with death reason
-- Store in `failed_messages` table for inspection
-- ACK to prevent infinite loop
+A database timeout during commit is ambiguous. I pause the document's queue and
+resolve the receipt/head before proceeding. Retrying immediately against changed
+memory could transform or duplicate an edit that actually committed.
 
-## Database Schema (3 minutes)
+Receipts are scoped to the authenticated actor and document, with a fingerprint of
+the original payload and base. Reusing an ID for different content is rejected. The
+database uniqueness rule resolves concurrent duplicate requests; a Redis check
+followed by a later write leaves a race window.
 
-### Tables Overview
+After commit, a process may crash before publishing to RabbitMQ. The outbox keeps a
+recoverable delivery obligation in the same transaction as the operation. A relay
+may publish twice after a crash, so downstream consumers still need sequence-aware
+deduplication.
 
-| Table | Purpose | Key Fields |
-|-------|---------|------------|
-| `documents` | Document metadata | id, title, owner_id, timestamps |
-| `document_snapshots` | Periodic checkpoints | document_id, version, content |
-| `operations` | Complete edit history | document_id, version, client_id, operation (JSONB) |
-| `document_access` | Permissions | document_id, user_id, permission |
-| `document_comments` | Threaded comments | document_id, range_start/end, content, resolved |
-| `audit_log` | Security events | event_type, user_id, document_id, action, details |
-| `failed_messages` | DLQ inspection | routing_key, content, headers |
+The broker's publisher confirmation proves a different boundary from its consumer
+acknowledgement. Neither establishes browser rendering. I would use confirmed
+publication plus outbox retry, and acknowledge consumer delivery only after the
+intended gateway processing. [RabbitMQ documents these separate acknowledgement
+boundaries](https://www.rabbitmq.com/docs/confirms).
 
-### Indexes
+Deduplication scope matters in fanout. If gateway A records a global “seen event”
+flag before gateway B receives its copy, B may suppress a delivery that its own
+clients still need. Each subscription tracks its own last applied sequence or event
+identity.
 
-| Table | Index | Purpose |
-|-------|-------|---------|
-| documents | owner_id | User's documents |
-| operations | (document_id, version) | UNIQUE, fast lookup |
-| operations | created_at | Cleanup queries |
-| document_access | user_id | Permission checks |
-| document_comments | document_id | Load comments |
-| audit_log | (user_id, created_at) | User activity |
-| audit_log | (document_id, created_at) | Document history |
+A gateway should not silently discard a missing document operation to keep up. If
+its bounded queue overflows, it disconnects or pauses the affected subscription and
+resumes from a known sequence. Presence can be coalesced to the newest cursor,
+because its contract is different.
 
-### Permission Levels
+| Acceptance strategy | Benefits | Costs |
+|---------------------|----------|-------|
+| ✅ Atomic log/head/receipt/outbox commit | Durable meaning for acknowledgements and recoverable delivery | Transaction latency and outbox operations |
+| ❌ Acknowledge before persistence | Lower apparent latency | A crash can erase work already labeled saved |
+| ❌ Commit then publish without recovery state | Small implementation | A crash between the two leaves peers permanently behind |
 
-- `view`: Read-only access
-- `comment`: Can add comments
-- `edit`: Full editing rights
-- `admin`: Can manage access
+I would not put a distributed transaction across PostgreSQL, RabbitMQ, Redis, and
+every browser. A durable append is one atomic boundary; replayable, idempotent
+delivery is another. That division gives a meaningful guarantee without requiring
+all collaborators to be online at commit time.
 
-## Deep Dive: Version History (3 minutes)
+Presence should also stay outside the critical commit path. Redis failure may hide
+active cursors, but it should not turn a durably accepted text edit into an apparent
+failure. Separate statuses and metrics make that degradation understandable.
 
-### VersionHistoryService
+## 🔧 Deep dive: snapshots and reconnect recovery — 8 minutes
 
-**getVersions()**:
-- Query snapshots ordered by version DESC
-- Include: version, timestamp, size, author name
-- Limit default: 50
+I would reconstruct a document from a verified snapshot and an ordered log suffix.
+Saving full content for every keystroke repeatedly writes mostly unchanged text;
+loading from the first operation forever makes old documents slow to open.
 
-**getVersion(targetVersion)**:
+A snapshot records content at exactly version V. A worker reads a committed baseline
+and replays through V, verifies the result, and publishes the snapshot manifest only
+after the content is durable. The previous verified snapshot remains available until
+the new one is safe to use.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│               Reconstruct Version at Point-in-Time               │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Find closest snapshot <= targetVersion                       │
-│  2. Start with snapshot content and version                     │
-│  3. Query operations between snapshot and target                │
-│  4. Apply each operation in order                               │
-│  5. Return { version, content }                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+I would trigger snapshots by replay cost, accumulated operation bytes, and elapsed
+time. A fixed interval of 50 operations is understandable in a teaching
+implementation but can generate excessive full-text writes for large documents or
+frequent small edits.
 
-**restoreVersion()**:
-1. Get historical version content
-2. Get current (latest) version content
-3. Create restore operation: delete all current, insert all historical
-4. Apply as new operation (goes through OT)
-5. Log to audit table
-6. Return new version number
+History retention has two uses: reconstructing past versions and transforming
+clients whose base is older than the current head. Taking a snapshot solves neither
+policy automatically. Deleting the whole preceding log can make an old client's
+operation impossible to rebase safely.
 
-## Trade-offs and Alternatives (3 minutes)
+I would define a supported automatic recovery window. Within that window, replay the
+missing suffix and resolve the in-flight receipt. Beyond it, provide a fresh
+coordinated baseline while preserving the client's old draft for explicit recovery.
+Do not pretend that applying an old positional edit to arbitrary new text is a
+merge.
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Sync Algorithm | OT | CRDT | Simpler, more efficient for text, well-established |
-| Transport | WebSocket | HTTP Polling | True bidirectional, lower latency |
-| Storage | Snapshot + Op Log | Full Snapshots | Storage efficient, complete history |
-| Authority | Server | Peer-to-Peer | Consistent ordering, simpler conflict resolution |
-| Cross-server | RabbitMQ | Redis Pub/Sub | Persistence, dead letter queues, backpressure |
-| Presence | Redis | In-memory | Multi-server coordination, automatic expiry |
+Opening or reconnecting needs an exact subscription boundary. The owner supplies a
+baseline at V and buffers subsequent committed events until the subscriber is ready.
+Fetching a snapshot and subscribing afterward leaves a gap that can survive
+indefinitely even though both requests succeeded.
 
-### OT vs CRDT
+A historical restore is a new command against the current head. The UI previews the
+old version, and the server checks the current revision when accepting the restore.
+If other work arrived meanwhile, the user should reconsider the restore rather than
+overwrite it under an obsolete assumption.
 
-**Chose OT because:**
-- Simpler to understand and implement
-- More efficient for text (smaller operations)
-- Well-established in production (Google Docs uses OT)
-- CRDTs have higher memory overhead for unique character IDs
+| Storage strategy | Benefits | Costs |
+|------------------|----------|-------|
+| ✅ Verified snapshots + ordered history | Bounded replay with meaningful version recovery | Snapshot verification and retention management |
+| ❌ Full snapshot on every edit | Straightforward latest-content read | High write amplification for small changes |
+| ❌ Operation log without checkpoints | Minimal snapshot machinery | Open/recovery cost grows with document age |
 
-**Trade-off:** Requires server for ordering (not peer-to-peer)
+Recovery must distinguish an invalid operation from damaged durable history. A
+malformed request can be rejected without affecting the document. A missing
+committed revision or snapshot checksum mismatch should stop admission and trigger
+reconstruction or operator attention, rather than continue from a guessed string.
 
-### Snapshot Frequency
+I would test snapshot restore regularly and retain the format/protocol version
+needed to interpret old operations. Schema evolution is part of replay correctness:
+archived bytes are only useful if the service can still decode their intended
+semantics.
 
-- Every 50 operations
-- Balance between load time and storage
-- Configurable per document size
+> “The snapshot is a shortcut to a known point in history. It is not permission to
+> forget which edits committed or to overwrite a client's unresolved draft.”
 
-## Future Enhancements
+## ⚖️ Scaling, access control, and operations — 6 minutes
 
-1. **Rich Text Formatting** - Extend operations with attributes
-2. **Offline Mode** - Local operation queue with sync on reconnect
-3. **Presence Improvements** - Selection ranges, activity indicators
-4. **Performance** - Binary operation format, delta compression
-5. **Sharding** - Partition documents across servers by ID hash
-6. **Global Scale** - Multi-region deployment with regional affinity
+Once the single-document protocol is correct, shard by document ID. A bounded cache
+of recent committed operations avoids querying the same suffix repeatedly during
+active collaboration. Older supported bases can fall back to the database.
+
+Each document's owner cache is disposable. Moving ownership requires fencing,
+loading the committed head, and replaying before admission. Consistent hashing helps
+distribute documents, but changing the hash ring alone does not coordinate old and
+new writers.
+
+For a hot document, scale its delivery gateways and reduce presence traffic before
+splitting text into independently owned sections. Section-level ownership changes
+the semantics of operations spanning boundaries and is a substantial
+product/algorithm decision.
+
+The initial global design uses a home region per document. Other regions can serve
+static assets and retained history, but active editing routes to the authority.
+Cross-region disaster recovery needs an explicit data-loss and recovery-time policy;
+asynchronous replicas do not justify an unqualified “never lose edits” claim.
+
+Security checks cover metadata, baseline content, edits, history, and presence. A
+user-supplied UUID is not a session. Permission revocations are ordered with
+admission, prevent new writes, and remove future delivery to revoked connections.
+The system cannot retract text already disclosed.
+
+I would bound message size, operation counts, document size, reconnect frequency,
+transform history, and queued bytes. These limits protect the event loop and
+database from expensive malformed edits or slow peers. A broker prefetch setting
+only bounds that consumer's unacknowledged messages; it is not a global system
+limit.
+
+Useful metrics include admission queue time, durable-ack latency, replay length,
+operation validation failures, receipt ambiguity, owner recovery time, and delivery
+sequence lag. Snapshot backlog and verification failures need their own alerts.
+Count active sessions separately from approximate collaborator presence.
+
+Readiness should reflect the dependencies needed for the advertised behavior. A
+process that can query PostgreSQL but has lost its document consumer or authority is
+not ready for the same traffic as a fully functioning owner. Shutdown should stop
+admission, settle or preserve pending commands, and then close dependencies.
+
+## 🧪 Verification and implementation boundary — 4 minutes
+
+I would verify operation algebra first, then the protocol: two clients editing the
+same position, overlapping deletes, buffered edits, duplicate delivery, and a lost
+acknowledgement. Convergence checks compare final text and accepted sequence after
+all pending work settles, rather than checking only that both sockets stayed
+connected.
+
+Durability tests inject failure before append, during an unknown commit result,
+after commit before publication, and during owner takeover. Snapshot tests rebuild
+from an older verified checkpoint. A broker restart test must establish that
+consumers resume and missed sequences are replayed.
+
+The repository has PostgreSQL operation/snapshot tables, a Redis presence hash,
+RabbitMQ queues, structured logging, and metrics. However, it mutates memory before
+persistence, lacks serialized ownership, forwards remote edits without updating
+receiving server state, and does not consume its snapshot queue.
+
+The browser sends no stable operation ID, and the optional server deduplication
+cache is not a durable receipt. Isolated checks also reproduced transform/compose
+failures and a same-position insertion disagreement. The existing smoke test only
+checks page rendering. These are implementation gaps, not evidence against the
+proposed ordering model.
+
+| Decision | Interview choice | Main cost |
+|----------|------------------|-----------|
+| Authority | One fenced document owner | Per-document recovery pauses and throughput limit |
+| Acceptance | Transactional head/log/receipt/outbox | Durable write latency and delivery recovery machinery |
+| History | Verified checkpoints plus retained log | Replay validation, retention, and storage operations |
+
+I would prove a single document's accepted history and recovery first, then increase
+the number of owners and gateways while preserving those same boundaries.

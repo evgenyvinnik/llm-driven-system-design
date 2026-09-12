@@ -1,637 +1,345 @@
-# Distributed Cache - Architecture Design
+# Distributed Cache Architecture
 
 ## System Overview
 
-A high-performance distributed caching layer that partitions data across multiple nodes using consistent hashing, evicts entries via LRU when capacity is reached, and supports TTL-based expiration. The system demonstrates core distributed systems concepts: data partitioning, fault tolerance, graceful rebalancing, and comprehensive observability.
+This project explores a cache whose entries are partitioned across memory-owning servers. Consistent hashing determines placement; each server manages recency and expiration; a coordinator routes client requests. The operator console makes those behaviors visible.
+
+The sections before **Implementation Notes** describe a proposed production cache and identify relevant local interfaces. The final section traces the checked-in TypeScript implementation, including incomplete or incorrect behavior. Production targets are design assumptions, not benchmarks of this repository. The [README](./README.md) contains local setup and current launch limitations.
+
+The production use case is **rebuildable application data** with an explicit freshness policy. The application owns its durable database and the cache-aside refill path. Neither that database nor a refill service is implemented here. Losing a cache entry is acceptable; overwhelming the origin or representing an unavailable read as confirmed absence is not.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-- **Key-Value Operations**: GET, SET, DELETE with optional TTL per key
-- **Eviction Policies**: LRU (Least Recently Used) eviction when capacity or memory limit is reached
-- **Sharding**: Consistent hashing with virtual nodes for even key distribution across cache nodes
-- **TTL Support**: Time-to-live with lazy expiration (check on access) and active expiration (background sampling)
-- **Cluster Management**: Dynamic node addition/removal with graceful key rebalancing
-- **Hot Key Detection**: Identify keys receiving disproportionate traffic within sliding time windows
-- **Persistence**: Periodic snapshots for warm restarts after node failures
-- **Admin Operations**: Cluster topology management, forced health checks, manual rebalancing
+- Read, replace, and delete an individually addressed key, with an explicit expiration deadline.
+- Enforce per-entry, per-tenant, and per-node capacity limits; evict disposable entries under pressure.
+- Partition keys across nodes and change placement without allowing obsolete owners to serve stale generations.
+- Bound origin refill during failures, planned transitions, and bulk invalidation.
+- Inspect health, placement, sampled distribution, capacity, and operation outcomes through an authenticated console.
+- Make incomplete observations and uncertain mutation outcomes visible.
 
-### Non-Functional Requirements
+Increment is an optional cache-local operation, suitable only where its loss or duplication is acceptable. Durable counters, authorization decisions, distributed locks, transactions across keys, and arbitrary query execution are outside this cache contract.
 
-- **Scalability**: Horizontal scaling via consistent hashing -- adding a node rehashes only ~1/N of keys
-- **Availability**: 99.9% uptime with automatic health checking, circuit breakers, and node failover
-- **Latency**: Sub-5ms p99 for cache operations (in-memory storage with network hop)
-- **Consistency**: Eventual consistency -- no replication, single-owner per key
-- **Throughput**: 50,000+ ops/sec per node for sub-KB payloads
+### Non-functional targets
+
+| Requirement | Proposed target | Qualification |
+|-------------|-----------------|---------------|
+| Cache response latency | Regional p99 below 5 ms | Small values, admitted traffic, warm connection pools; exclude origin fetch time |
+| API availability | 99.9% monthly | A bounded MISS or explicit overload response is distinct from retaining every cached value |
+| Peak traffic | 1 million operations/second | Sizing scenario to validate with skewed workloads |
+| Working set | 100 million entries | Mean value 1 KiB; large values separately bounded |
+| Freshness | Application-defined deadline, e.g. five minutes | Cache age does not by itself establish source freshness |
+| Operational visibility | Health observations usually within 10 seconds | Show sample age and unavailable nodes; no instantaneous global snapshot claim |
+| Failure containment | Bound downstream concurrency and refill QPS | An origin capacity budget controls recovery speed |
 
 ## Capacity Estimation
 
-### Production Scale (100-node cluster)
+For 100 million entries, 1 KiB values occupy 102.4 GB. Assuming another 200 bytes per key and metadata record gives 122.4 GB, about 114 GiB. This is an estimate for a designed storage engine; a JavaScript object graph may have a very different footprint.
 
-| Metric | Value | Calculation |
-|--------|-------|-------------|
-| Total nodes | 100 | Scaled based on data volume |
-| Per-node capacity | 1M entries, 10 GB memory | Memory-optimized instances |
-| Total capacity | 100M entries, 1 TB | 100 nodes x 10 GB |
-| Throughput | 5M ops/sec | 50K ops/sec x 100 nodes |
-| Virtual nodes | 150 per physical node | 15,000 ring positions |
-| Key distribution variance | < 5% | With 150 virtual nodes |
-| Rebalance on node add | ~1% of keys migrate | 1/100 of total |
+A starting scenario of 100 nodes with 2 GiB of usable cache budget each provides 200 GiB total before accounting for skew, maintenance, and process headroom. It is not a claim that 100 Node.js processes in this repository support those limits. One copy is the initial cost choice; a second full copy roughly doubles cached data storage, with additional replication traffic and coordination.
+
+At one million operations/second, 95% reads, and a 95% read hit rate, the origin sees approximately 47,500 misses/second. If a failed node held 1% of previously successful hits, it adds roughly 9,025 misses/second. A celebrity key can make that increase much larger than the node's share of entries suggests.
+
+That arithmetic determines whether cold recovery is affordable. Capacity planning must measure request-weighted placement, value sizes, event-loop delay, response bytes, and origin headroom, not just count keys per node.
 
 ### Local Development Scale
 
-| Metric | Value |
-|--------|-------|
-| Nodes | 3 cache nodes + 1 coordinator |
-| Per-node capacity | 10,000 entries, 100 MB |
-| Total capacity | 30,000 entries, 300 MB |
-| Expected throughput | ~10,000 ops/sec per node |
+The provided scripts run three cache nodes, each configured for 10,000 entries and 100 MiB of estimated key/value memory, plus one coordinator and one dashboard. The nominal sum is 30,000 entries and 300 MiB. It is neither a heap limit nor an effective hard capacity guarantee: current mutation paths have accounting and enforcement defects.
+
+A source-level sample of 100,000 keys named `key:0` through `key:99999`, using native node URLs and 150 virtual nodes each, mapped 35,914 / 32,044 / 32,042 keys. This is a deterministic placement example, not a load benchmark or universal balance bound. The busiest node has about 7.7% more keys than the equal-share mean.
 
 ## High-Level Architecture
 
+Proposed production components:
+
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Client Applications                          │
-│                    (Services, Frontends, CLI tools)                     │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │ HTTPS
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            API Gateway / LB                            │
-│                    (Rate limiting, TLS termination)                     │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          Coordinator Layer                             │
-│                                                                        │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐     │
-│  │  Coordinator 1   │  │  Coordinator 2   │  │  Coordinator N   │     │
-│  │  ┌────────────┐  │  │  ┌────────────┐  │  │  ┌────────────┐  │     │
-│  │  │ Hash Ring  │  │  │  │ Hash Ring  │  │  │  │ Hash Ring  │  │     │
-│  │  │ (150 VN/  │  │  │  │ (150 VN/  │  │  │  │ (150 VN/  │  │     │
-│  │  │  node)    │  │  │  │  node)    │  │  │  │  node)    │  │     │
-│  │  └────────────┘  │  │  └────────────┘  │  │  └────────────┘  │     │
-│  │  ┌────────────┐  │  │  ┌────────────┐  │  │  ┌────────────┐  │     │
-│  │  │ Circuit    │  │  │  │ Circuit    │  │  │  │ Circuit    │  │     │
-│  │  │ Breakers   │  │  │  │ Breakers   │  │  │  │ Breakers   │  │     │
-│  │  └────────────┘  │  │  └────────────┘  │  │  └────────────┘  │     │
-│  │  ┌────────────┐  │  │  ┌────────────┐  │  │  ┌────────────┐  │     │
-│  │  │ Health     │  │  │  │ Health     │  │  │  │ Health     │  │     │
-│  │  │ Monitor    │  │  │  │ Monitor    │  │  │  │ Monitor    │  │     │
-│  │  └────────────┘  │  │  └────────────┘  │  │  └────────────┘  │     │
-│  └──────────────────┘  └──────────────────┘  └──────────────────┘     │
-└─────────────────────┬──────────────┬──────────────┬────────────────────┘
-                      │              │              │
-          ┌───────────┘    ┌─────────┘    ┌────────┘
-          ▼                ▼              ▼
-┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-│  Cache Node 1  │ │  Cache Node 2  │ │  Cache Node N  │
-│                │ │                │ │                │
-│ ┌────────────┐ │ │ ┌────────────┐ │ │ ┌────────────┐ │
-│ │ LRU Cache  │ │ │ │ LRU Cache  │ │ │ │ LRU Cache  │ │
-│ │ (in-memory)│ │ │ │ (in-memory)│ │ │ │ (in-memory)│ │
-│ └────────────┘ │ │ └────────────┘ │ │ └────────────┘ │
-│ ┌────────────┐ │ │ ┌────────────┐ │ │ ┌────────────┐ │
-│ │ TTL Mgr    │ │ │ │ TTL Mgr    │ │ │ │ TTL Mgr    │ │
-│ │ Lazy+Active│ │ │ │ Lazy+Active│ │ │ │ Lazy+Active│ │
-│ └────────────┘ │ │ └────────────┘ │ │ └────────────┘ │
-│ ┌────────────┐ │ │ ┌────────────┐ │ │ ┌────────────┐ │
-│ │ Hot Key    │ │ │ │ Hot Key    │ │ │ │ Hot Key    │ │
-│ │ Detector   │ │ │ │ Detector   │ │ │ │ Detector   │ │
-│ └────────────┘ │ │ └────────────┘ │ │ └────────────┘ │
-│ ┌────────────┐ │ │ ┌────────────┐ │ │ ┌────────────┐ │
-│ │ Snapshot   │ │ │ │ Snapshot   │ │ │ │ Snapshot   │ │
-│ │ Persistence│ │ │ │ Persistence│ │ │ │ Persistence│ │
-│ └────────────┘ │ │ └────────────┘ │ │ └────────────┘ │
-└────────────────┘ └────────────────┘ └────────────────┘
-        │                  │                  │
-        ▼                  ▼                  ▼
-   ./data/node-1/     ./data/node-2/     ./data/node-N/
-   (JSON snapshots)   (JSON snapshots)   (JSON snapshots)
+┌───────────────────────┐       ┌──────────────────────────┐
+│ Application services  │──────▶│ Durable origin           │
+│ Cache-aside + budgets │       │ Owned by the application │
+└───────────────────────┘       └──────────────────────────┘
+            │ cache requests
+            ▼
+┌───────────────────────┐       ┌─────────────────────────┐
+│ Regional router pool  │◀──────│ Membership authority    │
+│ Deadlines + admission │       │ Versioned placement     │
+└───────────────────────┘       └─────────────────────────┘
+            │ one current owner
+            ▼
+┌────────────────────────────────────────────────────────┐
+│ Cache nodes: bounded storage, TTL, owner-generation    │
+│ checks, eviction, capacity and health reporting        │
+└────────────────────────────────────────────────────────┘
+            │ sampled observations
+            ▼
+┌───────────────────────┐       ┌─────────────────────────┐
+│ Observation service   │──────▶│ Authenticated console   │
+│ Per-node age/coverage │       │ Inspect + scoped admin  │
+└───────────────────────┘       └─────────────────────────┘
 ```
 
-## Core Components
+The origin is outside the cache service. The membership authority is responsible for accepted placement versions; individual routers do not independently reshape the ring whenever a probe fails. The observation service protects the data path from per-viewer fan-out and does not become a prerequisite for ordinary cache reads.
 
-### Consistent Hash Ring
+A smart client can later perform routing locally using the same placement contract. That removes a hop while introducing SDK rollout, topology refresh, and stale-client handling. Neither a router pool nor a smart client removes the need to reject obsolete ownership generations at nodes.
 
-The hash ring maps keys to nodes using MD5 hashing with virtual nodes for uniform distribution.
+## Core Components / Request Flows
 
-**Algorithm**:
-1. Each physical node gets 150 virtual nodes on the ring (positions 0 to 2^32-1)
-2. A key is hashed to a position on the ring
-3. Binary search finds the first virtual node clockwise from that position
-4. The physical node owning that virtual node handles the request
+### Cache read and refill
 
-**Why 150 virtual nodes**: Testing with 1,000 keys shows variance < 5% across nodes. Fewer than 100 virtual nodes causes significant imbalance (some nodes receive 2x the average load). Above 200 yields diminishing returns while increasing memory for the routing table.
+1. The application sends a namespaced key with a request deadline.
+2. The router selects the owner using an accepted placement version and includes the ownership generation.
+3. The node rejects an obsolete generation or expired entry; otherwise it returns a HIT with value metadata.
+4. A MISS lets the application attempt an origin read within its refill budget. A transport failure remains an unavailable observation, even if application policy allows a controlled origin fallback.
+5. Concurrent same-key misses share work within an application instance. Cluster-wide admission limits bound the remaining duplicate refills across instances.
+6. The application writes back only a result that is still within its freshness deadline. The cache rejects obsolete-generation fills.
 
-**Why MD5**: MD5 provides excellent uniformity for hash ring distribution. Cryptographic strength is irrelevant here -- we need uniform bit distribution, not collision resistance. MD5 is fast (~500ns per hash) and has well-studied distribution properties.
+A TTL chosen at cache insertion time can extend a stale origin read if that read was delayed. The proposed fill therefore carries an absolute deadline derived from the origin observation, bounded by the application policy and clock assumptions. Strict source consistency requires a stronger source-version or invalidation protocol and is outside the basic stale-tolerant contract.
 
-### LRU Cache (per node)
+### Cache mutation and admission
 
-Each cache node maintains an in-memory LRU cache backed by a doubly-linked list and a hash map.
+Validate key length, value size, numeric fields, namespace permissions, and total request size before allocating large intermediate structures. Replacing a value must check the final memory budget as carefully as inserting a new key. Reject a value that cannot fit by itself; do not acknowledge it and immediately discard it while reporting successful retention.
 
-**Operations (all O(1))**:
-- **GET**: Hash map lookup, move to front of linked list, check TTL
-- **SET**: Insert at front, evict from tail if at capacity
-- **DELETE**: Hash map lookup, remove from linked list
+Map lookup and recency-list changes can be constant-time. End-to-end SET includes value serialization, memory allocation, and potentially several evictions. List and pattern operations need an explicit cursor/work budget; a small response limit alone does not limit server work.
 
-**Eviction triggers**:
-1. Entry count exceeds `maxSize` (default: 10,000)
-2. Memory usage exceeds `maxMemoryMB` (default: 100 MB, estimated via JSON serialization)
+### Placement and node transitions
 
-**TTL expiration (dual strategy)**:
-- **Lazy expiration**: On GET, check if `expiresAt < now`. If expired, delete and return miss.
-- **Active expiration**: Background task samples 20 random keys every second, deleting expired ones. This prevents memory bloat from keys that are set with TTL but never accessed again.
+Consistent hashing limits the fraction of assignments affected by a membership change. It does not transfer bytes, handle a failed owner's missing data, or make two routers agree on membership. This distinction follows the separation between hash assignment and cache protocols in the [original consistent-hashing paper](https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf).
 
-### Coordinator
+For this rebuildable-data use case, the initial production policy is a **controlled cold cutover of bounded partition groups**. Prepare a target, stop admitting old-generation work for a group, fence obsolete owners, publish the new generation, and admit refills at a bounded rate. Old copies may remain physically present but cannot serve the new generation.
 
-The coordinator is the single entry point for all client requests. It maintains the hash ring, routes requests to the correct cache node, and manages cluster health.
+A transition is not declared complete until old writers are fenced. If a partition prevents that guarantee, reject affected cache operations or wait for an enforceable ownership lease to expire; do not let both sides claim authority. Healthy unrelated partitions can continue.
 
-**Request flow**:
-```
-1. Client sends GET /cache/user:123 to Coordinator
-2. Coordinator hashes "user:123" → position 0x7A3F...
-3. Binary search finds Node 2 owns this position
-4. Coordinator forwards request to Node 2 via circuit breaker
-5. Node 2 performs LRU lookup, returns value
-6. Coordinator returns response to client
-```
+Copying warm data is an optional optimization. It needs version-aware transfer, absolute deadlines, tombstones or equivalent deletion fencing, and a catch-up barrier before cutover. Blind GET/SET/DELETE migration is not sufficient under concurrent writes.
 
-**Why coordinator pattern (not smart client)**:
-- Centralizes hash ring state -- clients don't need to track node membership
-- Easier to visualize in dashboard (single endpoint)
-- Circuit breakers and health monitoring live in one place
-- Trade-off: extra network hop adds ~1ms latency. At production scale, a smart client library eliminates this hop, but for a learning system the coordinator simplifies operations.
+### Operator observations
 
-### Health Monitor
+Return a stable membership version plus separately timed node samples. Include expected node count, successful sample count, errors, collection interval, and per-node sample time. Combining them in one response gives a convenient observation envelope, not a transactionally consistent view of all nodes.
 
-The coordinator periodically probes each cache node via `GET /health`.
+Key browsing reports a bounded page with scan coverage and a placement version. Owner lookup reports intended routing; a value inspection reports which node actually served it. During a transition those are different questions.
 
-**Failure detection**:
-- Health check interval: 5 seconds
-- Node marked unhealthy after 3 consecutive failures
-- Unhealthy nodes are removed from the hash ring
-- Node re-added when health checks pass again
+## Database Schema
 
-**Why not gossip protocol**: Gossip (like Memberlist or SWIM) is better at scale (O(log N) detection time) but adds significant complexity. Direct health checks from the coordinator work well for clusters under ~50 nodes.
+There is no relational database in the local cache. The concrete storage representation is defined in [lru-cache.ts](./backend/src/lib/lru-cache.ts), [consistent-hash.ts](./backend/src/lib/consistent-hash.ts), and [persistence.ts](./backend/src/shared/persistence.ts).
+
+| Local structure | Stored fields | Actual meaning |
+|-----------------|---------------|----------------|
+| Entry Map | `key` → cache item | One entry per string key |
+| Cache item | `key`, `value`, `size`, `expiresAt`, `createdAt`, `updatedAt`, `prev`, `next` | `value` is unknown/JSON-compatible on HTTP paths; timestamps are epoch milliseconds; zero expiration means none |
+| Recency list | Head/tail sentinels and entry links | GET and SET move an entry toward the head |
+| Statistics | hits, misses, sets, deletes, evictions, expirations, current size/bytes | Process-local counters; some update paths are incomplete |
+| Hash ring | Map of 32-bit hash → node string; sorted hash array; node Set | Coordinator passes URL strings as identities |
+| Snapshot envelope | `version: 1`, `nodeId`, `timestamp`, `entries`, `stats` | JSON file, not a journal |
+| Snapshot entry | `key`, `value`, `expiresAt`, `createdAt`, `updatedAt` | No linked-list order, source version, tombstone, or owner generation |
+| Health Map | URL, healthy flag, optional node/cache metadata, last check, consecutive failures | Last probe result, separate from ring membership |
+
+A production entry would add namespace, accepted ownership generation, source observation/version where available, absolute freshness deadline, and admission accounting. A membership record would contain partition assignments, versions, and transition state. Administrative operations need identity, requested effect, status, and per-target results. These are proposed records, not hidden local tables.
 
 ## API Design
 
-### Cache Operations (via Coordinator)
+The following is the implemented API surface. Production would add authentication, consistent error envelopes, owner generations, deadlines, scan cursors, and operation status resources.
 
-```
-GET    /cache/:key              → Get cached value
-POST   /cache/:key              → Set value { value, ttl? }
-PUT    /cache/:key              → Update value { value, ttl? }
-DELETE /cache/:key              → Delete key
-GET    /keys                    → List all keys (with optional pattern)
-POST   /cache/bulk              → Batch GET/SET { operations: [...] }
+| Method | Coordinator path | Local behavior |
+|--------|------------------|----------------|
+| GET | `/cache/:key` | Single-owner read; 404 miss; successful response adds `_routing.nodeUrl` |
+| POST / PUT | `/cache/:key` | Replace or create from `value` and optional TTL seconds; status 201 / 200 |
+| DELETE | `/cache/:key` | Delete from current owner; 404 if absent |
+| POST | `/cache/:key/incr` | Numeric increment on current owner; no deduplication |
+| GET | `/keys` | Fan-out pattern query; per-node and aggregate truncation, no cursor |
+| POST | `/flush` | Public handler fans out; protected later handler is unreachable |
+| GET | `/cluster/info`, `/cluster/stats` | Membership/health and separately collected aggregate counters |
+| GET | `/cluster/locate/:key` | Current intended owner, not an existence check |
+| POST | `/cluster/distribution` | Hashes supplied `keys` array; does not inspect stored data |
+| GET | `/cluster/hot-keys` | Per-node top-key summaries |
+| GET | `/health`, `/metrics` | Health JSON and Prometheus exposition |
+| POST / DELETE | `/admin/node` | Add URL to monitored list / attempt removal |
+| POST | `/admin/health-check`, `/admin/rebalance`, `/admin/snapshot` | Protected control operations |
+| GET | `/admin/rebalance/analyze` | Protected impact analysis; currently mutates the live ring |
+| GET / POST | `/admin/circuit-breakers`, `/admin/circuit-breakers/reset` | Inspect/reset helper registry; normal requests do not populate it |
+| GET | `/admin/config` | Public nonsecret auth configuration |
+
+Direct nodes expose core cache operations plus `/cache/:key/exists`, `/ttl`, `/info`, and POST `/expire`; the suffixes are attached to `/cache/:key`. They also expose GET `/keys`, `/info`, `/stats`, `/hot-keys`, `/health`, `/metrics`, `/snapshots` and POST `/mget`, `/mset`, `/flush`, `/snapshot`. No direct-node route uses admin-key middleware.
+
+Examples at the coordinator:
+
+```http
+POST /cache/demo:profile
+Content-Type: application/json
+
+{"value":{"name":"Ada"},"ttl":60}
 ```
 
-### Cluster Management
-
-```
-GET    /cluster/info            → Cluster topology (nodes, hash ring)
-GET    /cluster/stats           → Aggregated cache statistics
-GET    /health                  → Coordinator health
-GET    /metrics                 → Prometheus metrics
+```json
+{"key":"demo:profile","value":{"name":"Ada"},"ttl":59,"_routing":{"nodeUrl":"http://localhost:3001"}}
 ```
 
-### Admin Operations (protected by X-Admin-Key)
-
-```
-POST   /admin/node              → Add node to cluster { url }
-DELETE /admin/node              → Remove node from cluster { url }
-POST   /admin/health-check      → Force health check cycle
-POST   /admin/rebalance         → Trigger key rebalancing
-GET    /admin/rebalance/analyze → Preview rebalance impact
-POST   /admin/snapshot          → Force snapshot on all nodes
-POST   /flush                   → Clear all cache data
-```
-
-### Per-Node Endpoints (internal)
-
-```
-GET    /cache/:key              → Local cache lookup
-POST   /cache/:key              → Local cache set
-DELETE /cache/:key              → Local cache delete
-GET    /keys                    → List local keys
-GET    /stats                   → Node-level statistics
-GET    /health                  → Node health
-GET    /metrics                 → Node Prometheus metrics
-POST   /admin/snapshot          → Force local snapshot
-POST   /admin/flush             → Flush local cache
-GET    /admin/hot-keys          → Current hot keys
-```
+The GET owner and remaining TTL above are illustrative; the hash ring chooses the actual node. No endpoint implements cross-key atomicity. Direct `/mset` applies entries one by one and can leave earlier entries written when a later entry fails.
 
 ## Key Design Decisions
 
-### Consistent Hashing vs. Modular Hashing
+### A cache contract before a durability mechanism
 
-**Chosen**: Consistent hashing with 150 virtual nodes.
+Choose rebuildable, stale-tolerant data with a defined freshness deadline. That allows eviction and controlled cold recovery. Using the same service as the only copy of a session revocation, financial balance, or durable counter would change the requirements: loss and delayed invalidation become correctness failures, not cache misses.
 
-**Why modular hashing fails**: With `hash(key) % N` and 3 nodes, adding a 4th node changes the mapping for ~75% of keys. All those keys become cold simultaneously, causing a cache storm that hammers the database. At 50,000 ops/sec, that is 37,500 sudden cache misses per second flowing to the origin.
+Snapshots reduce warmup cost but do not turn cache acknowledgements into durable commits. Requiring a synchronous journal and replicas for every write is a valid alternative for a durable store; here it spends latency and capacity on a guarantee the selected data does not need. The price of the cache choice is a real origin, measured refill headroom, and restricted admissible workloads.
 
-**Why consistent hashing works**: Adding a 4th node to a 3-node cluster remaps only ~25% of keys (1/N), and those keys migrate gradually via the rebalance manager. The remaining 75% continue serving from their existing nodes with zero disruption.
+### Placement stability versus safe transitions
 
-**What we give up**: Consistent hashing requires maintaining the ring data structure and virtual node mapping. The hash ring consumes ~100 KB of memory per node (150 virtual nodes x ~700 bytes each). For a cache system managing gigabytes, this overhead is negligible.
+Choose versioned placement and bounded cold cutovers initially. The main benefit is understandable ownership: old data cannot silently overwrite a new owner's value. The cost is temporary misses and reduced transition speed while origin refill is rate-limited.
 
-### Coordinator Pattern vs. Smart Client
+A fully warm migration is better when refilling a large or expensive shard is unacceptable, but it must capture concurrent writes and deletions. Copying first and deleting later can restore stale values; deleting first can lose the only cached copy. If origin headroom cannot support cold transitions, budget for a proper migration protocol or warm replicas instead of calling an unsafe copy loop graceful.
 
-**Chosen**: Central coordinator that routes all requests.
+### Recency eviction versus protecting the working set
 
-**Why smart client would be better at scale**: A smart client library embedded in each application server hashes keys locally and connects directly to cache nodes. This eliminates the coordinator as a bottleneck and removes one network hop (~1ms savings). Memcached and Redis Cluster use this approach.
+Choose bounded LRU as the initial eviction policy, with admission checks and expiration cleanup. It is easy to explain and responds to changing recent demand. A one-time scan can nevertheless evict frequently reused entries: recency alone cannot distinguish a useful working set from a stream read once.
 
-**Why coordinator works for our design**: The coordinator provides a single HTTP endpoint for any client (curl, browser, SDK). It centralizes health monitoring, circuit breakers, and admin operations. The coordinator can handle ~10,000 requests/sec, which is sufficient for our scale. At production scale, the coordinator would become a stateless pool behind a load balancer, or we would switch to a smart client.
+Frequency-aware admission can reduce that pollution at the cost of bookkeeping, policy tuning, and approximate counts. Measure origin work avoided per byte before changing policies. Adding virtual nodes does not fix a large entry, a hot key, or poor admission.
 
-**What we give up**: Single point of failure (mitigated by running multiple coordinators behind a load balancer), extra network hop, and throughput ceiling on the coordinator.
+### Proxy routing versus client complexity
 
-### In-Memory Only vs. Persistent Storage
+Choose a router pool for a small number of heterogeneous client stacks. Central routing simplifies deadlines, access controls, and observability. It adds network and serialization work and creates another capacity tier.
 
-**Chosen**: In-memory cache with periodic JSON snapshots for warm restart.
-
-**Why not Redis-style AOF (Append-Only File)**: AOF provides durability but adds write amplification -- every SET operation appends to disk. For a cache, durability is less critical than throughput. If the cache node crashes, the origin database has the authoritative data. The snapshot approach (every 60 seconds) means at most 60 seconds of data loss, which for a cache is acceptable.
-
-**Why not write-through to database**: A cache that writes through to a database on every SET operation defeats the purpose of caching. Write-through adds latency to every write and couples cache availability to database availability.
-
-**What we give up**: Up to 60 seconds of data can be lost on crash. Popular keys will experience cache misses until they are naturally re-populated. The snapshot warmup restores the majority of the cache state, and the LRU policy ensures the most-accessed keys are loaded first.
+A smart SDK avoids the hop and can scale independently with application instances. It also distributes topology-version handling and retry behavior across deployments. Introduce it when measured router cost justifies that operating burden, while preserving the same node-side fencing checks.
 
 ## Consistency and Idempotency
 
-### Consistency Model
+The proposed cache is allowed to return values within its freshness policy and to lose entries. Single-owner execution only orders operations accepted by that owner during a valid ownership generation. It does not establish durable, cross-generation, or source-database consistency.
 
-The cache uses a single-owner consistency model -- each key is owned by exactly one node, determined by the hash ring. There is no replication, so reads always go to the owner node.
+A request timeout means the effect may have occurred. Reads can be retried within a deadline; retrying writes needs a defined policy. Replaying a SET may extend a relative TTL and overwrite another writer. Replaying DELETE can erase a newly recreated value. Increment can apply twice. Conditional versions or scoped operation receipts are required when repeat effects matter.
 
-**Trade-off**: This means if a node goes down, all keys owned by that node are unavailable until either:
-1. The node recovers and loads its snapshot
-2. The health monitor removes the node from the ring and keys are re-hashed to surviving nodes (losing cached values)
+For bulk control operations, return an operation identifier and per-target outcomes. A successful HTTP envelope must not imply all nodes flushed or all keys migrated. A retry should resume or report the same operation, not silently start an unrelated second change.
 
-For a cache, this is acceptable because the origin database remains the source of truth.
+Replica quorum arithmetic alone does not establish linearizability. Version ordering, conflict resolution, membership changes, incomplete writes, and failover behavior still matter. This project implements no replica reads, quorum writes, or read repair.
 
-### Idempotency
+## Security / Auth
 
-Cache operations are naturally idempotent:
-- **GET**: Always safe to retry
-- **SET**: Setting the same key/value is idempotent
-- **DELETE**: Deleting a non-existent key returns success
+Production data APIs require service identity and namespace authorization; administration requires a person or scoped automation identity. Keep node ports private, restrict registered endpoints to allowed cache services, validate redirects/address resolution, and enforce request and scan budgets.
 
-The coordinator forwards requests without transformation, so retries from clients are safe.
+An operator-facing backend can translate an authenticated session into scoped service requests. A hidden admin key in a browser bundle is not a secret, and a reverse proxy that injects a key without authenticating and authorizing the user does not solve access control. Cookie-based mutations also need CSRF protection.
 
-## Security
-
-### Admin Endpoint Authentication
-
-Admin endpoints that can modify cluster topology are protected by an API key in the `X-Admin-Key` header. The key is compared using constant-time comparison to prevent timing attacks.
-
-**Protected operations**: Adding/removing nodes, flushing cache, forcing rebalances, triggering snapshots.
-
-**Unprotected operations**: Cache GET/SET/DELETE (per-key operations), health checks, cluster info reads, metrics.
-
-**Rate limiting**: Admin endpoints are limited to 10 requests per minute to prevent brute-force or accidental cluster damage.
+Local API-key checks cover selected coordinator admin routes only. The custom comparison avoids an early content mismatch return but is not a reviewed cryptographic authentication design. The default shared key, public writes/flush, unrestricted node URLs, and direct-node access make this an isolated development service.
 
 ## Observability
 
-### Prometheus Metrics
+Measure admitted request rate, hit/miss/unavailable outcomes, end-to-end latency, payload bytes, capacity, eviction reason, expiration work, event-loop delay, origin refill load, and rejected obsolete-generation requests. Separate cache-node time from routing and origin time.
 
-All metrics are exposed via `/metrics` in Prometheus exposition format.
+For transitions, report operation ID, old/new placement version, affected partitions, pending work, failures, and origin budget. For snapshots, report time of the last validated complete file rather than assuming a timer proves recovery readiness.
 
-**Cache Performance**:
-- `cache_hits_total{node}` / `cache_misses_total{node}` -- Hit/miss counters per node
-- `cache_hit_rate{node}` -- Computed hit rate gauge (0.0 to 1.0)
-- `cache_operation_duration_ms{node,operation}` -- Histogram with buckets [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100]ms
+Use bounded labels for tenant and operation classes. Exporting arbitrary keys or node URLs as time-series labels can cause unbounded series churn and reveal sensitive identifiers. A bounded top-key diagnostic view is more appropriate than preserving every historical key label.
 
-**Capacity**:
-- `cache_entries_current{node}` -- Current entry count
-- `cache_memory_bytes{node}` -- Current memory usage
-- `cache_memory_limit_bytes{node}` -- Memory limit
-- `cache_evictions_total{node}` / `cache_expirations_total{node}` -- Eviction and TTL expiration counters
-
-**Hot Keys**:
-- `cache_hot_key_accesses{node,key}` -- Access count for keys exceeding 1% of traffic in 60-second window
-- `cache_key_accesses_total{node}` -- Total key accesses for hot key detection baseline
-
-**Cluster Health**:
-- `cluster_nodes_healthy` / `cluster_nodes_total` -- Node availability gauges
-- `node_health_check_failures_total{node}` -- Health check failure counter
-
-**Circuit Breakers**:
-- `circuit_breaker_state{target_node}` -- 0=closed, 0.5=half-open, 1=open
-- `circuit_breaker_trips_total{target_node}` -- Times circuit opened
-
-**Rebalancing**:
-- `rebalance_in_progress{node}` -- Binary gauge
-- `rebalance_keys_moved_total{from_node,to_node}` -- Migration counter
-- `rebalance_duration_seconds` -- Histogram of rebalance durations
-
-**Persistence**:
-- `snapshots_created_total{node}` / `snapshots_loaded_total{node}` -- Snapshot lifecycle
-- `snapshot_entries_loaded{node}` -- Entries restored from last snapshot
-- `snapshot_duration_seconds{node}` -- Snapshot creation time
-
-### Structured Logging (Pino)
-
-JSON-formatted logs with component-based child loggers for filtering:
-
-| Logger | Events |
-|--------|--------|
-| `cache` | `cache_hit`, `cache_miss`, `cache_set`, `cache_delete`, `cache_eviction`, `cache_expiration` |
-| `cluster` | `node_healthy`, `node_unhealthy`, `node_added`, `node_removed` |
-| `admin` | `admin_auth_failure`, `admin_operation` |
-| `circuit-breaker` | `circuit_breaker_state_change`, `circuit_breaker_timeout`, `circuit_breaker_reject` |
-| `persistence` | `snapshot_created`, `snapshot_loaded`, `old_snapshot_deleted` |
-| `rebalance` | `rebalance_start`, `rebalance_progress`, `rebalance_complete` |
-
-Sensitive headers (`X-Admin-Key`, `Authorization`) are automatically redacted. Health check and metrics endpoints are excluded from access logs to reduce noise.
-
-### Health Checks
-
-```
-GET /health           → Basic liveness (200 if process running)
-GET /health/ready     → Readiness (checks node connectivity)
-```
-
-### Alerting Rules
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| Cache hit rate low | `cache_hit_rate < 0.80` for 5 min | Warning |
-| Cache node down | Health check fails for 30s | Critical |
-| Memory usage high | `cache_memory_bytes / cache_memory_limit_bytes > 0.90` for 2 min | Warning |
-| Hot key detected | `cache_hot_key_accesses > 10,000` for 1 min | Info |
-| Rebalance stuck | `rebalance_in_progress == 1` for > 5 min | Warning |
-| Circuit breaker open | `circuit_breaker_state == 1` for > 1 min | Warning |
+Local prom-client counters and Pino logs are useful instrumentation, with the coverage limits documented below. There is no checked-in Prometheus/Grafana service or historical telemetry backend for this project.
 
 ## Failure Handling
 
-### Circuit Breakers (Opossum)
+| Failure | Proposed response | Current local limit |
+|---------|-------------------|---------------------|
+| Owner unreachable | Deadline, explicit unavailable result, controlled origin fallback | Five-second fetch timeout until headers; no active breaker |
+| Node declared failed | Authoritative generation change; refuse obsolete owners | Coordinator removes from in-memory ring after three failed probes |
+| Returning old node | Fence or invalidate old generation before serving | First successful probe immediately restores routing |
+| Snapshot corrupt | Validate and try an older complete compatible file | Only newest filename is attempted |
+| Transition interrupted | Persist progress and expose partial state | Process-local busy flag; no resumable operation |
+| Origin saturated | Queue within bounds, reject excess work, preserve allowed stale data only within policy | No origin integration or refill limiter |
+| Observation incomplete | Preserve samples with age and coverage | Failed node stats are omitted from aggregates |
 
-Each coordinator-to-node communication path has a circuit breaker that prevents cascading failures:
-
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| Timeout | 5 seconds | Fail fast if node unresponsive |
-| Error threshold | 50% | Open circuit after half of requests fail |
-| Volume threshold | 5 requests | Minimum samples before opening |
-| Reset timeout | 30 seconds | Time before half-open test |
-| Rolling window | 10 seconds | Error rate calculation window |
-
-**State transitions**:
-- **CLOSED → OPEN**: Error rate exceeds 50% over 5+ requests in 10-second window
-- **OPEN → HALF-OPEN**: 30 seconds pass, one test request allowed through
-- **HALF-OPEN → CLOSED**: Test request succeeds
-- **HALF-OPEN → OPEN**: Test request fails
-
-**Fallback behavior**: When circuit is open, coordinator returns `{ success: false, circuitOpen: true }`. Clients can decide to retry, use stale data, or hit the origin database.
-
-### Node Failure Scenarios
-
-| Scenario | Detection | Recovery |
-|----------|-----------|----------|
-| Node crash | 3 failed health checks (15s) | Node removed from ring, keys re-hash to surviving nodes |
-| Node slow | Circuit breaker opens after timeout | Requests fail fast, node gets breathing room |
-| Node restart | Health checks resume passing | Node re-added to ring, loads snapshot for warm start |
-| Network partition | Health checks fail | Same as crash -- node removed from ring |
-
-### Graceful Rebalancing
-
-When nodes are added or removed, the `RebalanceManager` migrates keys gradually:
-
-1. **Identify affected keys**: Scan existing nodes, check which keys should now belong to the new node
-2. **Batch migration**: Move keys in batches of 100 with 50ms delays between batches
-3. **Timeout protection**: Abort after 5 minutes to prevent indefinite blocking
-4. **Progress tracking**: Log and expose metrics at 10% intervals
-
-**Why gradual migration matters**: Without it, adding a node to a 3-node cluster makes 25% of keys "cold" simultaneously. At 50,000 ops/sec, that is 12,500 sudden misses per second. Gradual migration ensures keys are warm on the new node before traffic arrives.
-
-### Snapshot Persistence for Recovery
-
-Each node creates JSON snapshots of its cache state every 60 seconds:
-- Keeps last 3 snapshots (configurable)
-- On startup, loads the most recent valid snapshot
-- Filters out expired entries during load
-- Loads entries ordered by `updatedAt` descending (most active keys first)
-- Creates a final snapshot on graceful shutdown
+Circuit breakers should distinguish dependency failure from ordinary cache misses and invalid input. A 404 must not trip a healthy node's failure breaker. Timeouts must cover the response body as well as connection/headers, and abandoning a client request must not be mistaken for cancelling a completed mutation.
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+Scale from measured bottlenecks. A busy router may need more routers or a smart client; an overloaded owner may need less request skew rather than more aggregate storage. A single key still maps to one owner regardless of virtual-node count.
 
-1. **3-10 nodes**: Single coordinator, hash ring with virtual nodes. Current architecture.
-2. **10-50 nodes**: Multiple coordinators behind a load balancer. Coordinators share ring state via configuration service (etcd/ZooKeeper).
-3. **50-200 nodes**: Smart client library replaces coordinator. Clients hash locally and connect directly to nodes.
-4. **200+ nodes**: Hierarchical sharding -- partition key space into regions, each managed by a separate ring.
+Very hot, stale-tolerant values may use a small application-local cache with a bounded lifetime, or deliberately managed read copies. Replication requires explicit refresh/invalidation semantics; appending random suffixes to a mutable key does not maintain coherent copies automatically.
 
-### Bottleneck Analysis
+The control plane should publish accepted placement, while the observation plane collects bounded samples once for many viewers. Avoid polling every node's full key list from every open dashboard. Key enumeration, expiration sampling, and full JSON snapshots are likely local event-loop pressure points well before hash lookup itself.
 
-| Component | Bottleneck | Threshold | Solution |
-|-----------|------------|-----------|----------|
-| Coordinator | Request throughput | ~10K ops/sec | Multiple coordinators, then smart client |
-| Cache node | Memory | 10 GB per node | Add more nodes, data shards automatically |
-| Hash ring | Ring recomputation on node changes | ~50 nodes | Incremental ring updates, separate ring service |
-| Snapshots | Disk I/O during snapshot creation | 1M+ entries | Incremental snapshots, copy-on-write |
-| Health checks | O(N) probes per interval | ~100 nodes | Gossip protocol, peer-based health |
-
-### Hot Key Mitigation (production)
-
-The `HotKeyDetector` identifies keys receiving > 1% of traffic in 60-second windows. At production scale, mitigation strategies include:
-1. **Coordinator-level cache**: Cache hot keys at the coordinator for 1 second (serves stale data but absorbs load)
-2. **Key sharding**: Split `product:12345` into `product:12345:shard{0-3}`, round-robin reads
-3. **Read replicas**: Replicate hot keys to multiple nodes, fan out reads
+The local 32-bit hash representation also needs collision handling before large rings: distinct virtual nodes can hash to the same position. A deterministic secondary ordering or wider identifier avoids one token overwriting another. Stable node identity should be distinct from its current network address.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Key distribution | Consistent hashing (150 VN) | Modular hash | Only ~1/N keys rehash on node change |
-| Request routing | Coordinator pattern | Smart client | Simpler ops, single endpoint; trade-off is extra hop |
-| Cache storage | In-memory + JSON snapshots | Redis-style AOF | Cache tolerates data loss; snapshots are simpler |
-| Eviction | LRU with doubly-linked list | LFU, Random | O(1) operations, good general-purpose policy |
-| TTL expiration | Lazy + active sampling | Lazy only | Active prevents memory bloat from unaccessed keys |
-| Health detection | Direct polling (5s interval) | Gossip protocol | Simple for < 50 nodes; gossip adds complexity |
-| Cluster communication | HTTP/JSON | Binary protocol (RESP) | Easier to debug, test with curl; trade-off is overhead |
-| Admin auth | API key header | OAuth, mTLS | Sufficient for internal service; simple to configure |
-
-## Frontend Architecture
-
-The frontend is a React SPA built with Vite, TypeScript, TanStack Router, Zustand, and Tailwind CSS. It serves as an admin dashboard for monitoring and interacting with the distributed cache cluster.
-
-### Component Hierarchy
-
-```
-__root.tsx (RootLayout)
-├── Header                         ← Global nav with links to Dashboard, Keys, Cluster, Test
-├── index.tsx (Dashboard)
-│   ├── StatsCard (x8)             ← Total keys, hit rate, memory, active nodes, misses, sets, deletes, evictions
-│   ├── NodeCard (per node)        ← Per-node health indicator with stats (hit rate, memory, entries)
-│   └── Hash Ring Info             ← Virtual node count and active node list
-├── keys.tsx (KeysPage)
-│   ├── KeyListItem (per key)      ← Key name with View/Delete actions
-│   └── Key Details Panel          ← Value inspector, TTL, node location
-├── cluster.tsx (ClusterPage)
-│   ├── Coordinator Info           ← Port, uptime, virtual nodes, active nodes
-│   ├── Add Node Form              ← URL input to add a node to the cluster
-│   ├── NodeCard (per node)        ← Same card as Dashboard, plus Remove button
-│   └── Hash Ring Visualization    ← Color-coded node badges showing ring membership
-└── test.tsx (TestPage)
-    ├── Operations Form            ← Key/value/TTL inputs with SET, GET, DELETE, INCR, LOCATE buttons
-    ├── Bulk Operations            ← Insert 100 test keys button
-    └── Results Console            ← Terminal-style scrolling log of operation results
-```
-
-### Zustand Store
-
-**`useCacheStore`** (`stores/cache-store.ts`): A single store manages all dashboard state. It holds `clusterInfo` (node list, hash ring metadata), `clusterStats` (aggregated and per-node statistics), and `keys` (key listing with per-node counts). The store provides `refreshAll()` which fetches cluster info, stats, and keys in parallel via `Promise.all`. An `autoRefresh` toggle enables a 5-second polling interval on the Dashboard page -- the `useEffect` in `Dashboard` sets up and tears down the interval based on this flag. Individual pages (Keys, Cluster, Test) manage their own local state with `useState` rather than the global store, since their data is page-specific and does not need to persist across navigation.
-
-### Routing
-
-TanStack Router file-based routing with four routes:
-
-| Route | File | Purpose |
-|-------|------|---------|
-| `/` | `routes/index.tsx` | Dashboard with cluster overview, stats cards, and node health grid |
-| `/keys` | `routes/keys.tsx` | Key browser with pattern search, value inspector, and flush |
-| `/cluster` | `routes/cluster.tsx` | Cluster management: add/remove nodes, force health checks, hash ring visualization |
-| `/test` | `routes/test.tsx` | Interactive cache operations: SET/GET/DELETE/INCR/LOCATE with a results console |
-
-The root layout (`__root.tsx`) wraps all routes with `Header` and a centered `max-w-7xl` content area.
-
-### Data Fetching
-
-The API service (`services/api.ts`) is a thin `fetch` wrapper using a `fetchJson<T>` helper that prepends `/api`, sets `Content-Type: application/json`, and throws on non-200 responses. All functions are grouped in a `cacheApi` object. There is no authentication -- the cache admin dashboard is a public interface. The Vite dev server proxies `/api` requests to the coordinator at `:3000`.
-
-### Key UI Patterns
-
-- **Auto-refreshing dashboard**: The Dashboard polls every 5 seconds when `autoRefresh` is enabled, showing live cluster health. The user can toggle auto-refresh and manually trigger a refresh.
-- **Key browser with detail panel**: The Keys page uses a master-detail layout. Selecting a key fetches both the value (`cacheApi.get`) and its node location (`cacheApi.locateKey`) in parallel, displaying TTL, value (JSON-formatted for objects), and which cache node stores it.
-- **Terminal-style results console**: The Test page appends timestamped operation results to a scrolling `<pre>` block styled as a dark terminal, allowing users to see a history of operations and their outcomes.
-- **Hash ring visualization**: The Cluster page displays active nodes as color-coded pills using a rotating palette of 6 colors, making it easy to visually distinguish nodes in the ring.
+| Data role | Rebuildable cache | Durable primary store | Permit loss while bounding refill and freshness |
+| Routing | Router pool initially | Smart client | Central policy across heterogeneous clients |
+| Placement | Consistent hashing with versions | Modulo by node count | Reduce assignment churn without confusing it with migration |
+| Transition | Bounded cold cutover | Concurrent warm copy | Simpler ownership at the cost of controlled misses |
+| Eviction | LRU with admission | Frequency-aware admission | Explainable baseline; measure scan pollution |
+| Recovery | Optional warm snapshots | Synchronous durable journal | Reduce refill cost without promising durable SET |
+| Observation | Shared samples with age/coverage | Per-viewer full fan-out | Bound load during incidents |
 
 ## Implementation Notes
 
-This section maps the production architecture above to what is actually running locally, documenting production-grade patterns implemented, simplifications made, and what was omitted.
+### What actually runs
 
-### Local Setup
+One backend package has a [node entry point](./backend/src/server/index.ts) and a [coordinator entry point](./backend/src/coordinator/index.ts). Native scripts run three nodes and one coordinator; the React application is an operator/test interface. There is no application origin, database adapter, queue, replica, router pool, membership authority, or shared cluster state.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    React Dashboard (:5173)                      │
-│              Cluster overview, key browser, test UI             │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ HTTP
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Coordinator (:3000)                            │
-│         Hash ring routing, health monitor, admin API            │
-│         Circuit breakers (Opossum), Prometheus metrics          │
-└────────┬──────────────────┬──────────────────┬──────────────────┘
-         │                  │                  │
-         ▼                  ▼                  ▼
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│ Cache Node 1 │   │ Cache Node 2 │   │ Cache Node 3 │
-│   (:3001)    │   │   (:3002)    │   │   (:3003)    │
-│ LRU + TTL    │   │ LRU + TTL    │   │ LRU + TTL    │
-│ Hot Key Det. │   │ Hot Key Det. │   │ Hot Key Det. │
-│ Persistence  │   │ Persistence  │   │ Persistence  │
-│ Metrics      │   │ Metrics      │   │ Metrics      │
-└──────────────┘   └──────────────┘   └──────────────┘
-```
+The coordinator starts listening before its asynchronous initial health pass finishes. Its ring begins empty. Optional demo seeding runs once after that pass and counts attempts even when `nodeRequest` returns failure. Simultaneous startup can miss nodes and skip some or all seed keys.
 
-All services run as Node.js processes using `tsx watch` for hot reload. No external databases -- the cache nodes are the storage layer.
+The [Dockerfiles](./backend/Dockerfile) still target nonexistent JavaScript entry points; [Compose](./docker-compose.yml) has no snapshot volumes and uses unavailable `curl` probes. Native `tsx` scripts match current source. The [README](./README.md#setup) records this rather than claiming a verified Docker launch.
 
-### Production-Grade Patterns Implemented
+### Hashing and routing
 
-**Consistent hashing with virtual nodes** (`backend/src/lib/consistent-hash.ts`): Full implementation with MD5 hashing, 150 virtual nodes per physical node, binary search for O(log N) lookups, and dynamic node add/remove. This is the core data partitioning algorithm used by DynamoDB, Cassandra, and similar systems.
+The ring hashes each node URL plus `:vn<i>` and every key with MD5, retaining the first eight hexadecimal digits. It stores hash→URL in a Map plus a sorted numeric array and binary-searches clockwise, wrapping at the end. Default virtual-node count is 150.
 
-**LRU cache with O(1) operations** (`backend/src/lib/lru-cache.ts`): Doubly-linked list + hash map providing O(1) GET/SET/DELETE. Implements both entry-count and memory-based limits with approximate memory tracking via JSON serialization.
+Lookup after hashing is O(log V), where V is total virtual nodes; hashing itself depends on key length. Addition re-sorts the full token array. Removal performs an array search and splice per token. Hash collisions overwrite the Map entry while duplicate positions remain in the array; there is no collision-resolution invariant. `getNodes` exists but is unused by requests and can fail to terminate if collisions leave a registered physical node with no reachable token.
 
-**TTL with lazy + active expiration** (`backend/src/lib/lru-cache.ts`): Lazy expiration checks on access; active expiration samples 20 random keys per second in the background, deleting expired ones. This dual approach is the same strategy Redis uses.
+[Routing](./backend/src/coordinator/routing.ts) calls exactly one URL. Successful data operations add routing metadata; upstream HTTP failures keep their status, transport failures normally become status 500 with a JSON string, and absence of any ring owner produces 503. No alternate replica, retry, or origin fetch exists.
 
-**Circuit breakers (Opossum)** (`backend/src/shared/circuit-breaker.ts`): Full circuit breaker pattern for coordinator-to-node communication. Configurable timeout, error threshold, reset timeout, and volume threshold. Integrates with Prometheus metrics and Pino logging on state transitions. Prevents cascading failures when a cache node becomes unresponsive.
+The active [node-request helper](./backend/src/coordinator/node-request.ts) uses fetch plus AbortController. Its timer is cleared as soon as headers arrive, before JSON body parsing, so the nominal five-second timeout is not a complete-response deadline. It never calls `createNodeClient` or another breaker execution helper. Breaker management endpoints inspect an otherwise unused registry; importing its module does not protect requests.
 
-**Prometheus metrics (prom-client)** (`backend/src/shared/metrics.ts`): 25+ metrics covering cache performance (hits, misses, hit rate, latency histograms), capacity (entries, memory), hot keys, cluster health, circuit breaker state, rebalancing progress, and persistence. Exposed via `/metrics` endpoint. Includes default Node.js metrics (CPU, memory, event loop).
+### Cache storage, TTL, and validation
 
-**Hot key detection** (`backend/src/shared/metrics.ts` -- `HotKeyDetector` class): Tracks per-key access counts in sliding 60-second windows. Keys exceeding 1% of total traffic are flagged and exposed via Prometheus gauges and an admin endpoint.
+[LRUCache](./backend/src/lib/lru-cache.ts) performs synchronous Map/list mutations. GET checks expiration, updates hits/misses, and moves a live entry to the head. Expiration is tested with `Date.now() > expiresAt`; at the exact deadline it is still considered live. `ttl` rounds remaining seconds upward.
 
-**Structured logging (Pino)** (`backend/src/shared/logger.ts`): JSON output in production, pretty-print in development. Component-based child loggers (cache, cluster, admin, persistence, rebalance, circuit-breaker). Automatic redaction of sensitive headers. HTTP request logging via pino-http with auto-generated request IDs.
+SET with positive TTL computes a relative deadline. Zero uses a positive node default if configured; otherwise it means no expiration. Negative or malformed TTL inputs are not consistently rejected. Direct EXPIRE with a nonpositive number clears expiration, which differs from SET zero with a positive default.
 
-**Graceful rebalancing** (`backend/src/shared/rebalance.ts`): Batched key migration (100 keys at a time, 50ms delay between batches) when nodes are added or removed. Includes timeout protection, progress tracking, and impact analysis preview via `/admin/rebalance/analyze`.
+The estimated size is twice the JSON string length plus twice the key length, excluding object/Map/list overhead and temporary serialized copies. Eviction runs only for new keys. Existing-value growth can exceed the budget; a new value larger than the entire budget can evict itself while SET returns true. Eviction decrements byte estimates but not `stats.currentSize`; `stats.size` uses the actual Map size.
 
-**Snapshot persistence** (`backend/src/shared/persistence.ts`): Periodic JSON snapshots every 60 seconds. Warm restart from latest snapshot on node startup, filtering expired entries and prioritizing recently-updated keys. Configurable retention (default: 3 snapshots). Final snapshot on graceful shutdown.
+Increment calls GET then synchronously adjusts the value, preserving a live key's TTL. It recalculates the item's size but not total memory, set counters, or update timestamp. Its delta lacks runtime numeric validation. It is not safe for a durable or deduplicated distributed counter.
 
-**Admin authentication** (`backend/src/shared/auth.ts`): API key middleware protecting cluster-modifying operations. Rate limited to 10 requests/minute. Audit logging of all admin operations with client IP.
+The sentinel-name check inside eviction compares strings rather than object identity. User keys `__HEAD__` or `__TAIL__` can be detached without removal from the Map; an over-budget cache can then loop indefinitely. The HTTP API does not reserve these names.
 
-### Simplifications
+Every active expiration cycle first allocates an array of **all** keys, then samples up to twenty with replacement. High expired-sample ratios schedule another cycle. Cleanup therefore includes O(N) work despite the small sample count. Pattern listing scans all entries, does not delete skipped expired ones, and passes regex metacharacters through after replacing `*` and `?`; invalid patterns can throw and expensive expressions have no budget.
 
-| Production Design | Local Simplification |
-|-------------------|---------------------|
-| Multiple coordinators behind LB | Single coordinator process |
-| Smart client SDK for high throughput | HTTP API via coordinator for all requests |
-| Binary protocol (RESP) for wire efficiency | HTTP/JSON for debuggability |
-| etcd/ZooKeeper for ring state consensus | Ring state in coordinator memory |
-| WAL or AOF for durability | JSON snapshots every 60s |
-| Memory estimation via native allocator stats | JSON serialization for size estimation |
-| TLS for inter-node communication | Plaintext HTTP |
-| Docker compose orchestration available | Processes started via npm scripts or Docker |
+The 10 MiB JSON body limit is the main request-size boundary. TypeScript interfaces do not validate JSON. Single SET only requires a defined value; bulk operations validate the outer array, then process items without a transactional boundary. The async timing wrapper records duration in `finally` but does not forward rejections to Express 4's error middleware, so some malformed single-operation requests can become unhandled rejections.
 
-### What Was Omitted
+### Health and rebalancing
 
-- **Replication**: No leader-follower or multi-primary replication. Single owner per key.
-- **Gossip protocol**: Health detection uses direct polling, not peer-based gossip.
-- **Connection pooling**: Each coordinator request creates a new HTTP connection to cache nodes.
-- **Binary protocol**: HTTP/JSON instead of RESP or custom binary wire format.
-- **CDN / edge caching**: No content delivery network layer.
-- **Multi-region**: No geographic distribution or cross-datacenter replication.
-- **Kubernetes**: No container orchestration, health-based pod replacement, or horizontal pod autoscaling.
-- **Consensus protocol**: No Raft/Paxos for ring state agreement across coordinators.
+The [health monitor](./backend/src/coordinator/health-monitor.ts) probes all configured URLs concurrently every five seconds. It has no pass-overlap guard. One failed result updates displayed health to false; three consecutive failures remove that URL from the ring. A success adds it immediately, then starts addition rebalancing in the background. A successful HTTP/JSON response is treated as healthy without a richer readiness contract.
 
-## Deep Pattern Explanations
+Only additions automatically invoke the [rebalance manager](./backend/src/shared/rebalance.ts). Failure-driven removal drops the ring member without copying anything. On explicit graceful removal, [the admin route](./backend/src/coordinator/admin-routes.ts) calls migration **before** removing the URL from the ring. Keys correctly owned there still select the departing URL, so the migration loop skips them as failures before the route removes the node anyway.
 
-This section explains each production-grade pattern implemented in this project from first principles, describing what the pattern is, what problem it solves, and how this project uses it.
+Addition scans other nodes after the new ring is already live. Each source `/keys` returns at most 1,000 keys. For each selected key it reads the old value, writes to the target, and attempts source deletion. No versions, CAS, tombstones, or generation fencing protect this sequence: a source copy can overwrite a newer target write, and deletes can race updates. A failed source DELETE still increments `keysMoved`.
 
-### Circuit Breaker
+Removal copying does not delete the source. Remaining TTL is converted from rounded seconds into a new relative TTL, extending the original deadline by rounding and transfer time; a zero/no-expiration value can take on a destination's positive default TTL. Recovery can route to stale retained or snapshot-loaded entries.
 
-A circuit breaker is a stability pattern borrowed from electrical engineering. In an electrical system, a circuit breaker trips to prevent a short circuit from causing a fire. In software, a circuit breaker wraps calls to an external service and monitors for failures. When failures exceed a threshold, the circuit "opens" and immediately rejects all subsequent calls for a cooldown period, rather than letting them pile up and wait for timeouts. This prevents a slow or crashed dependency from consuming all your threads, connections, or memory -- a failure mode called cascading failure, where one sick service brings down everything that depends on it.
+Batches default to 100, but keys inside a batch run sequentially. The 50 ms delay is between batches, not a concurrency limit. The five-minute timeout is checked only at batch boundaries; key enumeration and response-body waits can exceed it. Timeouts, failed source reads, and skipped nodes can still yield `success: true`. Concurrent jobs are rejected by one process-local busy flag, with no queue or retry; simultaneous startup additions can miss a migration.
 
-The circuit breaker has three states. **Closed** is the normal state: requests flow through, and the breaker tracks the error rate. **Open** means the breaker has tripped: all requests are immediately rejected with a fast failure, giving the downstream service time to recover instead of being hammered with retries. **Half-open** is the recovery probe: after a cooldown period, the breaker allows one test request through. If it succeeds, the circuit closes and normal traffic resumes. If it fails, the circuit reopens for another cooldown period.
+`currentRebalance` is never assigned beyond null. The impact analyzer repeatedly adds/removes the target on the **live** ring for each enumerated key. If the target already exists, add is a no-op but remove is not, so an apparent analysis request can alter routing. Its duration estimate counts batch delays only, excluding scanning and network work.
 
-In this project, the coordinator uses Opossum circuit breakers for every communication path to each cache node (`backend/src/shared/circuit-breaker.ts`). The breaker opens when 50% of requests fail within a 10-second window (with a minimum of 5 requests to avoid false positives from small samples). When open, the coordinator immediately returns `{ success: false, circuitOpen: true }` instead of waiting 5 seconds for a timeout on a dead node. The breaker resets after 30 seconds to try one test request. Each state transition is logged via Pino and exposed as a Prometheus gauge (`circuit_breaker_state`), so the dashboard can show which nodes have tripped breakers.
+### Snapshots and shutdown
 
-### Prometheus Metrics
+The persistence manager creates a full pretty-printed JSON file every 60 seconds and retains three filenames by default. It gathers live records synchronously, serializes them, writes directly to the final filename, then cleans older files. There is no temporary-file rename, checksum, fsync durability contract, or fallback across files. A forced snapshot while disabled or already busy returns null, but the node route still responds with a “Snapshot created” message.
 
-Prometheus is a time-series monitoring system that works by "pulling" metrics from your application. Your application exposes a `/metrics` HTTP endpoint that returns all current metric values in a specific text format. A Prometheus server periodically scrapes this endpoint (typically every 15 seconds), stores the data points, and makes them queryable for dashboards and alerts.
+Loading selects only the newest filename and requires version 1. It sorts entries by descending `updatedAt`, skips deadlines at or before startup time, rounds remaining TTL upward, and calls SET. Each SET becomes most recent, so loading newer records first actually leaves older ones nearer the head; a reduced capacity can retain the older subset. Read recency was never stored. Original timestamps/counters are not restored, and the reported loaded count counts insert attempts rather than final retained entries.
 
-There are four metric types. **Counters** only go up (total requests, total errors) and are useful for computing rates. **Gauges** go up and down (current memory usage, active connections, cache entries). **Histograms** track the distribution of values by putting them into configurable buckets (request latency: how many requests took 0-1ms, 1-5ms, 5-10ms, etc.), which lets you compute percentiles like p99. **Summaries** are similar to histograms but calculate percentiles on the client side.
+Snapshots can resurrect post-snapshot deletions and flushes. No-expiration records are reinserted with TTL zero and can inherit a new positive default. A failed snapshot or lost directory means the recovery gap is unbounded by the one-minute timer.
 
-This project uses the `prom-client` library to expose 25+ metrics at `/metrics` on both the coordinator and each cache node (`backend/src/shared/metrics.ts`). Cache performance metrics include hit/miss counters and a latency histogram with buckets from 0.1ms to 100ms. Capacity metrics track current entries and memory usage as gauges. The hot key detector exposes per-key access counts for keys exceeding 1% of traffic. Cluster health metrics show healthy vs total nodes. Circuit breaker state is exposed as a gauge (0=closed, 0.5=half-open, 1=open). Rebalance progress and snapshot lifecycle are also tracked. Default Node.js metrics (CPU, memory, event loop lag) are included automatically.
+A node closes HTTP acceptance, then attempts persistence shutdown, stops cache/hot-key timers, and exits, with a ten-second forced-exit timer. If a snapshot is already running, `createSnapshot` returns null; shutdown does not wait for that write and may log completion anyway. Coordinator shutdown closes HTTP but does not explicitly stop health checks or drain rebalance jobs before exiting.
 
-### Structured Logging
+### Metrics, logging, and access controls
 
-Structured logging means emitting log entries as machine-parseable data (typically JSON) rather than free-form text strings. Instead of `"2024-01-16 12:00:00 INFO Cache hit for key user:123 on node-1"`, a structured log emits `{"timestamp":"2024-01-16T12:00:00Z","level":"info","component":"cache","event":"cache_hit","key":"user:123","node":"node-1"}`. Each piece of information is a separate field that can be filtered, searched, and aggregated by log management systems (Elasticsearch/Kibana, Datadog, Grafana Loki).
+[Metrics](./backend/src/shared/metrics.ts) cover core route hits/misses/sets/deletes, timed GET/SET/DELETE, capacity gauges, health checks, snapshots, and rebalance operations. Wrappers count active-expiration and eviction work after snapshot loading. Lazy expirations, increments, bulk timing, and restore evictions have different or missing metric coverage. Counter ratios describe these observed operations, not exclusively application traffic: inspections and migrations also perform GETs.
 
-The key benefit is queryability. With unstructured logs, finding all cache misses on node-2 requires regex parsing. With structured logs, it is a simple field filter: `component=cache AND event=cache_miss AND node=node-2`. Structured logs also enable automatic dashboards -- you can count events by type, compute error rates by component, and set up alerts on specific field combinations.
+Hot-key detection keeps at most 10,000 tracked keys, sorts to prune, and returns the ten largest shares at or above 1% of accesses. Its windows reset every minute; they are tumbling, not sliding. Exported hot-key gauges update at reset using the completed window, while JSON endpoints read the current one. Detection does not install a hot-key cache or replicas.
 
-This project uses Pino (`backend/src/shared/logger.ts`), a high-performance JSON logger for Node.js. It creates component-based child loggers (cache, cluster, admin, persistence, rebalance, circuit-breaker) that automatically include the component name in every log line. HTTP request logging is handled by pino-http, which generates a unique request ID for each request and includes method, URL, status code, and response time. Sensitive headers like `X-Admin-Key` are automatically redacted from logs. Health check and metrics endpoints are excluded from access logs to reduce noise -- these endpoints are called every few seconds by monitoring systems and would overwhelm the log output.
+[Pino](./backend/src/shared/logger.ts) uses component child loggers, request IDs, development pretty output, and structured production output. Standard authorization/admin headers are redaction targets; request serialization omits headers. URLs and logged hot-key names can still contain sensitive identifiers, and custom header names need deliberate handling. Per-operation debug log durations are passed as zero even though histograms measure real local elapsed time.
 
-### Rate Limiting
+[Admin auth](./backend/src/shared/auth.ts) uses a process-local per-IP fixed window, ten attempts/minute by default, before checking a shared header key. The 429 response includes a body field named `retryAfter`, not a `Retry-After` header. The protected flush registration is shadowed by the earlier public router; node admin-named routes contain no middleware. Arbitrary node registration can make the coordinator fetch supplied URLs. CORS is unrestricted, with no general service or user authentication.
 
-Rate limiting restricts how many requests a client can make within a time window. Without rate limiting, a single client (whether malicious or buggy) can consume all server resources, degrading service for everyone else. Rate limiting serves three purposes: protecting against denial-of-service attacks, preventing accidental resource exhaustion (a developer's script running in a tight loop), and enforcing fair usage across clients.
+### Frontend behavior and remaining production work
 
-The most common algorithm is the sliding window: track the number of requests from each client (identified by IP address, API key, or user ID) within a rolling time window. When the count exceeds the limit, reject the request with HTTP 429 (Too Many Requests) and include a `Retry-After` header telling the client when to try again. More sophisticated algorithms include token bucket (allows bursts up to a maximum, then rate-limits) and leaky bucket (smooths traffic to a constant rate).
+The [dashboard store](./frontend/src/stores/cache-store.ts) fetches info, stats, and keys independently. The overview polls every five seconds even though it does not render the fetched key list. Requests can overlap, and one successful response advances a shared `lastUpdated` even while another dataset remains stale. Background tabs do not explicitly back off.
 
-In this project, admin endpoints are rate limited to 10 requests per minute (`backend/src/shared/auth.ts`). This prevents brute-force attacks against the admin API key and protects against accidental damage from rapid-fire admin operations (flushing cache, adding/removing nodes). The rate limiter is implemented as Express middleware that tracks request counts per client IP using an in-memory store.
+The [Keys page](./frontend/src/routes/keys.tsx) refetches on every pattern edit as well as Search. Selection fetches value and owner separately without an abort or selection-generation check; slow results can replace a newer selection. TTL is a sampled label, not a live countdown. Rows are not virtualized, and duplicate physical keys can produce duplicate React keys. The coordinator silently omits failed node results and counts truncated lists, so “Found” is not a complete cluster census.
 
-### Health Checks
+The [Cluster page](./frontend/src/routes/cluster.tsx) refreshes on mount, manual refresh, and completed actions; it does not poll. Its ring visualization is colored URL badges, not actual token arcs. The [API client](./frontend/src/services/api.ts) sends no admin header, has no timeout or runtime response validation, and often loses details when transport errors are JSON strings. The test page stores a growing text log and performs 100 sequential single-key SETs; it has no isolated test namespace enforcement.
 
-Health checks are HTTP endpoints that report whether a service is alive and ready to accept traffic. They serve two audiences: load balancers use health checks to decide which backend instances should receive traffic, and orchestration systems (Kubernetes, ECS) use them to decide whether to restart a container.
-
-There are two types. A **liveness** check answers "is the process running and not deadlocked?" -- it returns 200 if the HTTP server can respond at all. A **readiness** check answers "can this instance actually serve requests?" -- it verifies that all dependencies (database connections, cache connections, downstream services) are reachable. A service might be alive but not ready (e.g., still warming up its cache, or a database connection is down). Load balancers should only route traffic to instances that pass both checks.
-
-This project implements both: `GET /health` is the liveness check (returns 200 if the process is running), and `GET /health/ready` is the readiness check (verifies connectivity to all cache nodes). The coordinator's health monitor uses the cache nodes' `/health` endpoints to detect failures: it polls every 5 seconds and marks a node as unhealthy after 3 consecutive failures (15 seconds). When a node is marked unhealthy, it is removed from the hash ring so requests are rerouted to surviving nodes. When health checks start passing again, the node is re-added to the ring.
-
-### Idempotency
-
-An operation is idempotent if performing it multiple times produces the same result as performing it once. This is critical in distributed systems where network failures can cause retries. If a client sends a SET request and the response is lost due to a network timeout, the client does not know whether the server processed the request. If the client retries, an idempotent operation guarantees the system ends up in the correct state regardless of how many times the request was delivered.
-
-Cache operations are naturally idempotent by design: GET is a read (always safe to retry), SET with the same key and value produces the same state regardless of repetition, and DELETE on a non-existent key is a no-op that returns success. This means clients can safely retry any cache operation on timeout without risk of data corruption or duplication. The coordinator does not need to maintain an idempotency key store or deduplication log because the operations themselves are inherently safe to replay.
+Production work therefore includes validated storage/admission, fenced membership, origin integration and refill budgets, coherent error/observation contracts, authenticated scoped controls, complete bounded scans, robust optional snapshots, and failure-oriented tests. Existing three-page Playwright smoke tests do not cover these guarantees. Isolated source checks reproduced the LRU/accounting, removal, overwrite, analyzer, restore, and health-state behaviors above; no application stack, image build, or throughput test was run for this review.

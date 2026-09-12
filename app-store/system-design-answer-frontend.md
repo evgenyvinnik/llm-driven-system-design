@@ -1,372 +1,366 @@
-# App Store - System Design Answer (Frontend Focus)
+# App Store — frontend system design interview
 
-*45-minute system design interview format - Frontend Engineer Position*
+> “I would build two connected experiences: a fast public catalog and a developer
+> console that makes publishing state understandable. The difficult part is keeping
+> what the browser says aligned with what the server has actually committed.”
 
-## Problem Statement
+This is a proposed 45-minute design, not a claim that the local demo implements
+all of it. I would draw one diagram and spend most of the discussion on three
+flows: finding an app, writing a review, and publishing a release.
 
-Design the frontend architecture for the App Store, Apple's digital marketplace with 2M+ apps. Key frontend challenges include:
-- Building responsive search with instant results and filters
-- Displaying app rankings with charts and category navigation
-- Creating review interfaces with integrity indicators
-- Implementing secure purchase flows with receipt handling
-- Designing developer dashboards for app management
+| Discussion | Minutes |
+|------------|---------|
+| Scope and user journeys | 5 |
+| UI architecture and API contracts | 7 |
+| Deep dive: search and navigation state | 9 |
+| Deep dive: reviews and honest feedback | 8 |
+| Deep dive: developer publication | 9 |
+| Performance, accessibility, and verification | 5 |
+| Trade-offs and local implementation boundary | 2 |
+| Total | 45 |
 
-## Requirements Clarification
+## 🎯 Scope and user journeys
 
-### Functional Requirements
-1. **Discovery**: Search apps with filters, browse categories, view charts
-2. **App Details**: View app info, screenshots, reviews, ratings
-3. **Reviews**: Submit and read reviews, see developer responses
-4. **Purchase**: Buy apps with secure checkout flow
-5. **Developer Portal**: Manage apps, view analytics, respond to reviews
+I would clarify whether this is a browser marketplace or a native app store.
+I will assume the browser manages discovery, reviews, and developer submission.
+A native installer is a separate client with its own completion signals.
 
-### Non-Functional Requirements
-1. **Performance**: < 100ms time to interactive for search
-2. **Responsiveness**: Support iPhone, iPad, Mac, Apple TV
-3. **Accessibility**: WCAG 2.1 AA compliance
-4. **Offline**: Cache recently viewed apps
+The public journey is search → app detail → eligible release access.
+The developer journey is draft → upload → submit → approval → publish.
+A review has a third lifecycle: saved, pending moderation, published, or rejected.
+Those lifecycles should have different labels and different recovery actions.
 
-### User Personas
-- **Consumer**: Browse, search, purchase apps
-- **Developer**: Manage apps, respond to reviews, view analytics
+The first version supports categories, search filters, app details, review reading
+and writing, developer editing, and publication status. Payments and subscriptions
+are outside this discussion. If paid apps are required, the server supplies price
+and entitlement state; the browser does not infer ownership from a download count.
 
----
+My main product requirements are:
 
-## High-Level Architecture
+- Search results must belong to the visible query and filters.
+- Returning from detail should restore the search position and selected filters.
+- A failed request should preserve a user's review or developer draft.
+- The UI should distinguish an accepted mutation from completed background work.
+- Keyboard and small-screen users should reach every core action.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      React Application                          │
-├─────────────────────────────────────────────────────────────────┤
-│  Routes                                                         │
-│  ├── /                    → Home (Charts, Featured)             │
-│  ├── /search              → Search Results                      │
-│  ├── /category/:id        → Category Browse                     │
-│  ├── /app/:id             → App Details                         │
-│  ├── /developer           → Developer Dashboard                 │
-│  └── /developer/app/:id   → App Management                      │
-├─────────────────────────────────────────────────────────────────┤
-│  State Management                                               │
-│  ├── authStore            → User session, developer status      │
-│  ├── catalogStore         → Categories, featured apps           │
-│  └── searchStore          → Search query, filters, results      │
-├─────────────────────────────────────────────────────────────────┤
-│  Services                                                       │
-│  ├── api.ts               → HTTP client with interceptors       │
-│  └── cdn.ts               → Image/asset URL generation          │
-└─────────────────────────────────────────────────────────────────┘
-```
+I would propose a responsive page shell, useful content on a typical mobile
+connection, and bounded memory while browsing many results. I would measure real
+user experience before assigning ambitious latency numbers to every component.
+Backend latency, image transfer, JavaScript execution, and rendering all contribute.
 
----
+> “A quick spinner is not the outcome I am optimizing for. I want a user to find
+> the right app, trust the displayed state, and recover if their network drops.”
 
-## Component Architecture
+## 🏗️ UI architecture and contracts
+
+I would use React with route-level components and a typed API client.
+The public catalog and developer console can share cards, media components, and
+form controls while keeping their data caches and permissions distinct.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Components                                │
-├──────────────────┬──────────────────┬───────────────────────────┤
-│      app/        │     reviews/     │        search/            │
-├──────────────────┼──────────────────┼───────────────────────────┤
-│ AppCard          │ ReviewCard       │ SearchBar                 │
-│ AppDetails       │ ReviewForm       │ SearchFilters             │
-│ ScreenshotGallery│ RatingBreakdown  │ SearchResults             │
-├──────────────────┴──────────────────┴───────────────────────────┤
-│      charts/            │        developer/                     │
-├─────────────────────────┼───────────────────────────────────────┤
-│ ChartSection            │ DeveloperAppHeader                    │
-│ ChartRow                │ AppDetailsTab                         │
-│                         │ AppReviewsTab                         │
-│                         │ AppAnalyticsTab                       │
-├─────────────────────────┴───────────────────────────────────────┤
-│                         shared/                                  │
-├─────────────────────────────────────────────────────────────────┤
-│ StarRating              │ LoadingSpinner    │ ErrorBoundary     │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│ Routes: search, app detail, developer workspace        │
+└───────────┬───────────────────────────────┬────────────┘
+            │                               │
+            ▼                               ▼
+┌────────────────────────┐      ┌────────────────────────┐
+│ Query cache            │      │ Local drafts / UI      │
+│ Keyed server results   │      │ Dialogs, edit state    │
+└───────────┬────────────┘      └────────────────────────┘
+            │
+            ▼
+┌────────────────────────────────────────────────────────┐
+│ Typed API client: auth, errors, request identity       │
+└───────────┬────────────────────────────────────────────┘
+            │
+            ▼
+┌────────────────────────────────────────────────────────┐
+│ Catalog / reviews / publishing API                     │
+│ Authoritative revisions and operation status           │
+└────────────────────────────────────────────────────────┘
 ```
 
----
+The URL owns shareable navigation state: query, category, price filter, sort,
+and the current page or continuation position when appropriate.
+Server results belong in a query cache, keyed by those inputs.
+Unsaved review text, open tabs, and form validation belong in component state.
+Small global UI preferences can live in Zustand.
 
-## Deep Dive: Search Experience
+Putting all four kinds of state in one global object is initially convenient,
+but makes a loading flag for search interfere with a developer save or app detail.
+It also makes ownership unclear when two requests finish out of order.
 
-### Debounced Search with Suggestions
+The server contract needs a few fields that directly support the experience:
 
-**Key Implementation Details:**
-- 150ms debounce on API calls to reduce server load
-- Minimum 2 characters before fetching suggestions
-- Keyboard navigation (ArrowUp/Down, Enter, Escape)
-- Suggestion types: app, developer, category
-- ARIA attributes for accessibility (combobox pattern)
+| Resource | Fields the browser needs | Why |
+|----------|--------------------------|-----|
+| Search page | Query identity, results, continuation, ranking snapshot | Associate the page with its inputs |
+| App detail | App ID, public revision, release state, compatibility | Render an eligible current release |
+| My review | Review ID, revision, moderation state, saved contents | Restore and explain pending work |
+| Developer draft | App ID, revision, editable fields, allowed actions | Detect concurrent edits |
+| Publication operation | Operation ID, committed status, indexing status | Recover after uncertain responses |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  SearchBar Component Flow                                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  User Types → Debounce (150ms) → Fetch Suggestions → Display    │
-│       │                                                  │      │
-│       └──────────── Update State ◄──────────────────────┘      │
-│                                                                 │
-│  Keyboard Events:                                               │
-│  ├── ArrowDown → Select next suggestion                         │
-│  ├── ArrowUp   → Select previous suggestion                     │
-│  ├── Enter     → Navigate to selected or submit search          │
-│  └── Escape    → Close dropdown, blur input                     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+Public app metadata and developer drafts use separate endpoints or explicitly
+separate response shapes. A draft must not become public merely because the
+browser knows its app ID. Authorization remains a server responsibility.
 
-### Search Results with Filters
+I would use a small consistent error vocabulary: unauthenticated, forbidden,
+validation error, revision conflict, unavailable, and unknown operation outcome.
+Different outcomes require different actions; one generic red toast loses that meaning.
 
-**Key Implementation Details:**
-- TanStack Query for infinite scrolling with `useInfiniteQuery`
-- Virtual scrolling with `@tanstack/react-virtual` for 1000+ results
-- Filter persistence via URL search params (shareable, back-button works)
-- Filter sidebar with category, price (free/paid), rating options
+## 🔧 Deep dive 1: Search and navigation state
 
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                    Search Results Layout                           │
-├───────────────┬───────────────────────────────────────────────────┤
-│               │                                                    │
-│   Filters     │              Virtualized Results                   │
-│   Sidebar     │                                                    │
-│   (w-64)      │   ┌───────────────────────────────────────────┐   │
-│               │   │  AppCard (horizontal layout)               │   │
-│ ┌───────────┐ │   ├───────────────────────────────────────────┤   │
-│ │ Category  │ │   │  AppCard                                   │   │
-│ ├───────────┤ │   ├───────────────────────────────────────────┤   │
-│ │ Price     │ │   │  AppCard                                   │   │
-│ ├───────────┤ │   ├───────────────────────────────────────────┤   │
-│ │ Rating    │ │   │  ...                                       │   │
-│ └───────────┘ │   └───────────────────────────────────────────┘   │
-│               │                                                    │
-│               │              [Load More] button                    │
-│               │                                                    │
-└───────────────┴───────────────────────────────────────────────────┘
-```
+> “I would make the URL the description of the search, and the query key the
+> identity of its result. Every response must still belong to that identity
+> before the browser treats it as the current page.”
 
----
+Consider a user searching for “camera,” changing the category, and immediately
+opening a result. The original search can finish after the filtered search.
+Without request identity, the original response replaces the visible list and
+makes the selected category appear ineffective.
 
-## Deep Dive: App Card Component
+I would normalize the search inputs once and derive both the request and cache
+key from that representation. Changing a filter resets pagination. A response is
+stored under the key that created it, not whichever key happens to be current.
+Aborting obsolete requests saves work, but correct keying remains necessary:
+an aborted request may already have completed at the server.
 
-**Supports two layouts:**
+### Search interaction
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Vertical Layout (for grids)                                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│           ┌──────────┐                                          │
-│           │   Icon   │  (w-24, h-24, rounded-3xl)               │
-│           └──────────┘                                          │
-│              App Name                                           │
-│              Category                                           │
-│            ★★★★☆ 4.5                                            │
-│           ┌────────┐                                            │
-│           │  GET   │  or  │ $4.99 │                             │
-│           └────────┘                                            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+I would start with explicit search submission for full results.
+Optional autocomplete can use a short debounce and a smaller response budget.
+A user selecting a suggestion commits a new URL; typing alone need not rewrite
+browser history for every character.
 
-┌─────────────────────────────────────────────────────────────────┐
-│  Horizontal Layout (for lists/search)                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  [Rank] ┌──────┐  App Name                           ┌────────┐ │
-│         │ Icon │  Developer Name                     │  GET   │ │
-│         └──────┘  ★★★★☆ (12.5K)                      └────────┘ │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+The results panel can keep the previous list visible during a refinement, with a
+clear updating indicator. It must not imply that old results satisfy new filters.
+For a substantial query change, a scoped skeleton may be less confusing.
 
-**Features:**
-- Lazy loading for images
-- Truncation for long names
-- Star rating component with formatted download count
-- Price button styling (blue for paid, gray for free)
+A failed search gets an error and retry action for that same query.
+“No matches” is reserved for a successful response with zero results.
+This distinction matters when search depends on a separate index service.
 
----
+### Pagination and restoration
 
-## Deep Dive: Review System
+For the first release, I would use explicit pages or a Load more control.
+They are easy to explain, navigate with a keyboard, and restore after detail.
+Infinite scrolling is useful when discovery is the primary interaction, but it
+requires more careful history, focus, and memory management.
 
-### Review Card with Voting
+The server must supply stable ordering with a tiebreaker. If relevance changes
+between pages, the browser cannot reliably deduplicate its way to a complete list.
+For a long search session, a ranking snapshot plus continuation token provides
+more predictable results than offsets over a constantly changing ranking.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  ReviewCard Layout                                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  "Review Title Here"                                            │
-│  ★★★★★  userName  •  3 days ago                                 │
-│                                                                 │
-│  Review body text goes here. This is the user's detailed        │
-│  feedback about the application...                              │
-│                                                                 │
-│  ┌──────────────────────┐                                       │
-│  │ 👍 12  Mark as helpful │  (disabled after voting)            │
-│  └──────────────────────┘                                       │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Developer Response (blue-50 bg, blue-400 left border)    │   │
-│  │ Developer Response  •  2 days ago                        │   │
-│  │ Response text from the developer...                      │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+On returning from detail, I would restore the prior query key, loaded pages,
+and a scroll anchor based on an app ID and offset. That is more robust than an
+absolute pixel position when images or responsive columns change height.
+If the anchor no longer exists, fall back to the nearest retained page position.
 
-### Rating Breakdown Chart
+I would bound retained pages and invalidate a continuation when the query changes.
+A cache is not an instruction to retain every result a user has ever seen.
+The storage budget should follow the expected session length and device class.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  RatingBreakdown Layout                                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌───────────┐    5 ★ ████████████████████████  (60%)          │
-│  │   4.5     │    4 ★ ████████████              (25%)          │
-│  │  ★★★★★    │    3 ★ ██████                    (10%)          │
-│  │  12.5K    │    2 ★ ██                        (3%)           │
-│  │  Ratings  │    1 ★ █                         (2%)           │
-│  └───────────┘                                                  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+### The trade-off
 
----
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ URL plus keyed server cache | Shareable searches, safe overlapping requests, back navigation | Key design and invalidation rules |
+| ❌ One global current-results slot | Small initial implementation | Late responses overwrite unrelated pages |
+| ❌ URL as storage for all UI state | One apparent source of truth | Draft text and transient controls leak into navigation |
 
-## Deep Dive: Developer Dashboard
+The key distinction is who owns a value. The URL owns the search request,
+the server owns its results, and the user owns unsaved input.
+Keeping these boundaries costs some coordination but makes races understandable.
 
-### App Management Tabs
+### App detail loading
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Developer App Page Layout                                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  DeveloperAppHeader (app icon, name, status)                    │
-│                                                                 │
-│  ┌─────────────┬─────────────┬─────────────┐                   │
-│  │ App Details │   Reviews   │  Analytics  │  ← Tab Navigation  │
-│  └─────────────┴─────────────┴─────────────┘                   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                          │   │
-│  │              Active Tab Panel Content                    │   │
-│  │                                                          │   │
-│  │  - AppDetailsTab: Edit metadata, upload screenshots      │   │
-│  │  - AppReviewsTab: View/respond to reviews                │   │
-│  │  - AppAnalyticsTab: Downloads, revenue, ratings charts   │   │
-│  │                                                          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+I would load essential metadata first and allow reviews and similar apps to fail
+independently. A recommendations timeout should not hide an otherwise valid app.
+The detail cache includes app identity; a response for app A must never appear
+under app B's heading after rapid navigation.
 
-### Analytics Dashboard
+Public details can remain briefly cached, but the acquisition action revalidates
+release eligibility at the server. The browser can display “This release is no
+longer available” if a withdrawal occurred since the detail page was loaded.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Analytics Tab Layout                                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐   │
-│  │  Total     │ │  Total     │ │  Average   │ │ Conversion │   │
-│  │ Downloads  │ │  Revenue   │ │  Rating    │ │   Rate     │   │
-│  │  125,432   │ │  $45,678   │ │   4.5      │ │   2.3%     │   │
-│  │  +12.5%    │ │  +8.3%     │ │   +0.2     │ │   -0.5%    │   │
-│  └────────────┘ └────────────┘ └────────────┘ └────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Downloads Over Time (LineChart with Recharts)           │   │
-│  │  ─────────────────────────────────────────────────────   │   │
-│  │       /\      /\                                         │   │
-│  │      /  \    /  \     /\                                 │   │
-│  │  ───/────\──/────\───/──\────────────────────────────   │   │
-│  │  Jan   Feb   Mar   Apr   May   Jun   Jul   Aug          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep dive 2: Reviews and honest feedback
 
----
+A review has user-authored text and server-owned publication state.
+I would preserve that distinction throughout submission and moderation.
+It allows the UI to feel responsive without claiming that unreviewed content is public.
 
-## Deep Dive: Screenshot Gallery
+The user selects a rating, writes text, and presses Submit.
+The browser validates basic length and required fields, then sends an identified
+operation. It keeps the draft until the server acknowledges a saved review.
+Disabling duplicate clicks helps usability but does not provide server idempotency.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Screenshot Gallery Component                                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Thumbnail Strip (horizontal scroll):                           │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐  │
-│  │ Screen1 │ │ Screen2 │ │ Screen3 │ │ Screen4 │ │ Screen5 │  │
-│  │  (h-80) │ │         │ │         │ │         │ │         │  │
-│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘  │
-│       ↓ click                                                   │
-│                                                                 │
-│  Lightbox Modal (AnimatePresence + motion):                     │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    [X] Close                             │   │
-│  │  [◀]              ┌─────────────┐              [▶]       │   │
-│  │                   │             │                        │   │
-│  │                   │  Full-size  │                        │   │
-│  │                   │ Screenshot  │                        │   │
-│  │                   │             │                        │   │
-│  │                   └─────────────┘                        │   │
-│  │                     ○ ● ○ ○ ○  (pagination dots)         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Features:                                                      │
-│  - Swipe gestures (react-swipeable)                             │
-│  - Keyboard navigation (Arrow keys, Escape)                     │
-│  - Framer Motion animations                                     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+### What the user sees
 
----
+| State | User-visible meaning | Appropriate action |
+|-------|----------------------|--------------------|
+| Draft | Text exists only in the editor or local draft storage | Continue editing |
+| Sending | A request is in progress | Keep text; avoid duplicate submission |
+| Outcome unknown | Connection failed after sending | Check the existing operation |
+| Pending | Server saved the review for moderation | Show the author's saved review and status |
+| Published | Review is eligible for the public list | Show returned revision; refresh related views |
+| Rejected | Server made a moderation decision | Explain allowed correction or appeal |
 
-## Accessibility Patterns
+I would not optimistically add a new review to the public rating average.
+The server may hold it pending, reject it, or return a previous result for a retry.
+Updating the author's private “My review” panel gives immediate feedback without
+inventing a public contribution.
 
-### Keyboard Navigation
+If submission times out, I would query the operation or the account's current
+review before offering a new submission. Reusing the same operation identity is
+necessary when the first attempt may have committed.
 
-**Focus Management for Modals:**
-- Save previously focused element before opening
-- Focus modal on open
-- Restore focus on close
+### Editing while moderation is running
 
-**Roving Tabindex for Chart Navigation:**
-- Single tab stop per chart row
-- Arrow keys to move between items
-- Enter/Space to select
+Suppose review revision 1 is pending and the user changes its text and stars.
+The UI sends revision 2 with the expected prior revision.
+A later moderation result for revision 1 must not mark revision 2 as approved.
+The server owns this check; the browser displays the returned current revision.
 
-### Screen Reader Announcements
+The editor should also protect against a background refresh overwriting unsaved
+text. I would keep server data and the local draft separately, then show a conflict
+when the saved revision changes under the editor.
 
-**Live Regions for Dynamic Content:**
-- `role="status"` with `aria-live="polite"` for search result counts
-- Announce: "12 apps found for 'photography'"
-- Use `sr-only` class for visually hidden announcements
+For helpful votes, I prefer a desired-state operation such as “my vote is helpful”
+to an ambiguous toggle. That permits optimistic rendering and safe retry against
+a server-enforced account/review uniqueness rule.
+A failed request restores the prior confirmed state and leaves a visible retry.
 
----
+### Refreshing related views
 
-## Trade-offs Summary
+After a confirmed mutation, update the returned review and invalidate the affected
+review page and rating summary. The server may return a rating revision or freshness
+marker if aggregates update asynchronously. I would not claim exact agreement
+between a fresh review and a stale search card during that propagation interval.
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Search debounce | 150ms | Instant | Balance responsiveness with server load |
-| Result virtualization | @tanstack/react-virtual | Native scroll | Performance with 1000+ results |
-| Screenshot gallery | Swipeable lightbox | Modal carousel | Mobile-first, touch-friendly |
-| State management | Zustand + TanStack Query | Redux | Simpler, separates server/client state |
-| Rating display | Interactive star component | Static SVG | Reusable, accessible |
-| Filter persistence | URL search params | Local state | Shareable, back-button works |
+Pending decisions can use bounded polling while the relevant panel is open.
+A WebSocket connection for every catalog visitor is unnecessary for this workflow.
+If moderators need a high-volume live queue, that can justify a separate stream.
 
----
+### The trade-off
 
-## Future Frontend Enhancements
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Immediate private receipt, server-confirmed public state | Responsive feedback with truthful moderation status | More explicit UI states |
+| ❌ Optimistically publish every review | Fast apparent success | Rejected content and false rating totals flash publicly |
+| ❌ Wait silently for full moderation | Simple public-state model | Slow or uncertain submission experience |
 
-1. **Offline Support**: Service worker for caching recently viewed apps
-2. **Skeleton Loading**: Content placeholders during data fetch
-3. **Lazy Loading**: Code split routes for faster initial load
-4. **Dark Mode**: System preference detection with toggle
-5. **Gesture Navigation**: Swipe to go back on mobile
-6. **Voice Search**: Web Speech API integration
+> “I would make the user's contribution feel safely saved as soon as it is saved.
+> I would reserve the word published for the actual publication decision.”
+
+## 🔧 Deep dive 3: Developer publication
+
+The developer console is a workspace for durable work, so failure recovery matters
+more than making every button complete instantly. I would separate metadata
+editing, artifact upload, review submission, and public publication.
+
+A draft editor starts with a server revision and creates a local editable copy.
+Saving sends the expected revision. If another tab or teammate changed the draft,
+the server returns a conflict and the UI preserves both the user's input and the
+latest saved data for comparison.
+
+For a small console, explicit Save is easier to reason about than continuous
+background autosave. Autosave can be added later with serialized revisions and
+clear saved/saving/error feedback. A debounce alone does not prevent stale writes.
+
+### Upload and submission
+
+Large package bytes should go directly to object storage under a server-issued
+upload session. The browser displays transfer progress and can resume or retry
+parts if the upload contract supports it.
+
+Reaching 100% uploaded means bytes were transferred; it does not mean the release
+was scanned, approved, or published. After completion, the server verifies the
+object and starts validation. The UI should show those stages separately.
+
+The submission binds a metadata revision to an immutable artifact digest.
+If the developer edits the description or changes the binary after approval,
+the previous approval cannot silently apply to the new contents.
+The UI can show a new draft alongside the currently published release.
+
+I would expose allowed actions from server state, while retaining server checks
+on every command. Hiding a Publish button is guidance, not access control.
+
+### Recovering an uncertain publication
+
+The developer presses Publish, then loses connectivity.
+I keep the operation identity and show “Checking publication status.”
+On reconnection, the browser retrieves that operation or the current release.
+It does not immediately send an unrelated second publication.
+
+A successful response can say the release is published while search indexing is
+pending. The app's direct public detail may work before it appears in search.
+Showing both states prevents unnecessary repeat publishing and support confusion.
+
+A withdrawal should be a distinct action with explicit consequences.
+The browser refreshes the release state after confirmation and the server rejects
+new access grants. Existing signed URLs may remain valid until expiry, so the
+product must define the withdrawal window rather than promise instant recall.
+
+### The trade-off
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Revisioned drafts and tracked publication operations | Safe concurrent editing and recovery after lost responses | Conflict UI and operation status |
+| ❌ One mutable app object with a publish boolean | Few screens and fields | Approval can refer to changed contents; retries are ambiguous |
+| ❌ Browser-controlled publication steps | Flexible interface | Closing a tab can strand critical work |
+
+The server owns the workflow after acceptance. The browser can close and later
+reconstruct its state from saved revisions and operations.
+That makes reliability part of the API contract rather than a long-lived tab's job.
+
+## ⚡ Performance, accessibility, and verification
+
+I would prioritize small initial JavaScript, route-level loading, and appropriately
+sized images. Public pages benefit from server-rendered metadata or prerendering
+when discoverability matters; the authenticated developer workspace can be a SPA.
+This adds rendering complexity, so I would choose it based on traffic and indexing needs.
+
+For short pages of 20 results, ordinary rendering is usually sufficient.
+If measured long-list cost grows, virtualize the results with stable item keys,
+measured heights where needed, and a deliberate focus strategy.
+Virtualization reduces DOM work; it does not fix oversized images or slow API queries.
+
+App cards should be real links, and action buttons should have distinct labels.
+Star ratings need a numeric accessible name. Review errors should be associated
+with their fields, and submission status should be announced without stealing focus.
+Developer dialogs need focus management, Escape behavior, and draft preservation.
+A small screen needs actual navigation, not merely hidden desktop controls.
+
+My most useful tests would exercise failure and identity boundaries:
+
+- A slow old search cannot replace the current filtered results.
+- Returning from detail restores the correct query and scroll anchor.
+- A lost review response retains the draft and resolves the existing submission.
+- An obsolete moderation result cannot change the displayed newer review revision.
+- A developer conflict preserves unsaved text, and reload restores an active operation.
+
+I would measure search-to-result time, detail rendering, failed mutation recovery,
+and draft loss separately. Page-shell smoke tests do not establish these behaviors.
+
+## ⚖️ Trade-offs and implementation boundary
+
+The design spends complexity on query identity, review publication state, and
+revision-bound developer work. These are the places where an attractive interface
+can otherwise tell the user something that never happened.
+
+The local project provides React routes, Zustand stores, search/detail pages, and
+a developer metadata console. It does not use a query library, virtualized lists,
+server rendering, or a completed release workflow. Get buttons and public review
+writing/voting are not connected; search pagination controls do not change pages.
+
+Only the session ID is persisted and no startup caller restores the user.
+Shared result slots lack request-context guards, and developer replies clear text
+before acknowledgement. The backend also has a new-review schema mismatch and
+incomplete publication/indexing semantics, documented in the
+[architecture](./architecture.md#implementation-notes).
+
+> “For the first implementation pass, I would make browsing identity-safe and
+> developer saves recoverable, then connect reviews and publication through the
+> explicit server states we agreed on. That gives each visible action a meaning
+> we can test.”

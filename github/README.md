@@ -1,261 +1,162 @@
-# Design GitHub - Code Hosting Platform
+# GitHub — code hosting and review
 
-## Codebase Stats
+A GitHub-inspired learning project that combines real bare Git repositories with PostgreSQL collaboration metadata, Redis sessions/cache, and an Elasticsearch code-search adapter. The useful design problem is keeping a moving branch, the code somebody reviewed, and the recorded pull request outcome consistent. This is not documentation of GitHub's internal architecture.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 11,262 |
-| Source Files | 78 |
-| .ts | 5,811 |
-| .tsx | 2,516 |
-| .md | 2,077 |
-| .sql | 448 |
-| .json | 171 |
+The local application is a partially connected prototype. Its repository overview and authentication have concrete implementations, while several deeper screens and production guarantees are incomplete. Read [architecture.md](./architecture.md) for the proposed system and the verified implementation boundaries.
 
-## Overview
+## What the project contains
 
-A simplified GitHub-like platform demonstrating Git hosting, pull request workflows, code search, and collaborative development features. This educational project focuses on building a collaborative code hosting system with version control features.
+| Area | Current behavior |
+|------|------------------|
+| Accounts | Register, sign in, and sign out with bcrypt passwords and seven-day Redis sessions |
+| Repositories | Create a personal repository, optionally initialize a README, list metadata, and star/unstar from the repository overview |
+| Git reads | REST handlers for immediate directory entries, file text, branches, tags, and commit history using system Git through simple-git |
+| Collaboration APIs | Issues, labels, comments, discussions, basic reviews, and pull request creation/update/merge handlers |
+| Search | PostgreSQL search for public repositories/issues and users; Elasticsearch code/symbol search helpers with no automatic indexing caller |
+| Operations | Pino request logs, selected audit writes, Prometheus metrics, health probes, and admin breaker/audit APIs |
 
-## Key Features
+**UI limitation:** The generated router nests tree, blob, issues, pulls, and discussions under the repository route, but `RepoPage` contains no `Outlet`. The issues list also lacks the outlet needed by issue detail. Those child components exist in source but cannot be described as reachable working screens in the current composition. Other unfinished controls include the branch selector, Fork/Watch/Code buttons, repository Settings, and links to profile, Explore, compare/new PR, new issue, and discussion detail/create pages.
 
-### 1. Repository Management
-- Create and manage repositories
-- Public and private visibility
-- Branch management
-- Collaborator permissions
+**Data and workflow limitations:** Private-repository checks do not cover all Git/content/collaboration/search routes. Merge is a Git operation followed by a separate SQL update, without required-review enforcement or a durable merge receipt. Use disposable learning data. There is no SSH/Smart HTTP Git server, branch-editing API, web editor, fork implementation, webhook sender, CI runner, or live notification channel.
 
-### 2. Git Operations
-- Push/pull/clone support
-- Branch management
-- Commit history visualization
-- Diff viewing
+## Stack and prerequisites
 
-### 3. Pull Requests
-- Create PRs from branches
-- Code review with comments
-- Merge strategies (merge, squash, rebase)
-- Review workflow
+Use Node.js 22, npm, and system Git. The repository requires Node 20 or later; the installed router requires at least 20.19 and Opossum 9 supports the 20/22/24 release lines.
 
-### 4. Issues & Discussions
-- Create and manage issues
-- Labels and assignees
-- Discussions with threaded comments
-- Upvoting and marking answers
+- Frontend: React 19, Vite 5, TanStack Router, Zustand 4, Tailwind 3, highlight.js, and lucide-react.
+- Backend: TypeScript ES modules, tsx, Express 4, pg, node-redis 4, simple-git, and Elasticsearch 8 client.
+- Infrastructure: PostgreSQL 16, Valkey 7, Elasticsearch 8.12.0, plus a writable local Git repository directory.
 
-### 5. Code Search
-- Full-text code search via Elasticsearch
-- Symbol search (functions, classes)
-- Cross-repository search
-- Language-aware indexing
+The declared react-markdown, isomorphic-git, and express-session dependencies are not wired into their corresponding rendering, Git, or session flows.
 
-### 6. User Profiles & Organizations
-- User profiles with bio and stats
-- Organization management
-- Team memberships
+## Run locally
 
-## Tech Stack
+Commands below use the repository root unless a working directory is stated. Install application dependencies:
 
-- **Frontend:** TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
-- **Backend:** Node.js + Express
-- **Database:** PostgreSQL
-- **Cache/Sessions:** Redis
-- **Search:** Elasticsearch
-- **Git:** simple-git library for Git operations
+```bash
+npm install --prefix github/backend
+npm install --prefix github/frontend
+```
 
-## Quick Start
-
-### Prerequisites
-
-- Node.js 18+
-- Docker and Docker Compose
-- Git
-
-### 1. Start Infrastructure
+### Option A: Docker Compose (recommended)
 
 ```bash
 cd github
-docker-compose up -d
+docker compose up -d
+docker compose ps
+docker compose exec -T postgres pg_isready -U github -d github
+docker compose exec -T redis redis-cli ping
+curl --fail http://localhost:9200/_cluster/health
 ```
 
-This starts:
-- PostgreSQL on port 5432
-- Redis on port 6379
-- Elasticsearch on port 9200
+Compose starts PostgreSQL (`github` / `github_dev_password`, database `github`) on 5432, Valkey on 6379, and Elasticsearch on 9200 with a 512 MB JVM heap. Elasticsearch security is disabled for the local demo. Its transport port 9300 is also exposed. These ports overlap other projects.
 
-### 2. Install Dependencies
+PostgreSQL applies [init.sql](./backend/src/db/init.sql) only when creating a fresh data volume. There is no migration script. To apply missing schema objects to an existing development database, run this from `github`; `IF NOT EXISTS` does not upgrade existing table definitions:
 
 ```bash
-# Backend
-cd backend
-npm install
-
-# Frontend
-cd ../frontend
-npm install
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U github -d github < backend/src/db/init.sql
 ```
 
-### 3. Start Development Servers
+`docker compose down` stops the infrastructure. `docker compose down -v` also deletes its database/cache/search volumes. The host Git repositories survive that command; database and Git storage must be handled together when resetting a demo.
+
+### Option B: Native installation on macOS (no Docker)
+
+Install PostgreSQL and Valkey, then create the local database once:
 
 ```bash
-# Terminal 1 - Backend
-cd backend
-npm run dev
-
-# Terminal 2 - Frontend
-cd frontend
-npm run dev
+brew install postgresql@16 valkey
+brew services start postgresql@16
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+psql postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE github LOGIN PASSWORD 'github_dev_password';"
+createdb -O github github
+PGPASSWORD=github_dev_password psql -h localhost -U github -d github -v ON_ERROR_STOP=1 -f github/backend/src/db/init.sql
+pg_isready -h localhost -U github -d github
+valkey-cli ping
 ```
 
-- Backend runs on http://localhost:3000
-- Frontend runs on http://localhost:5173
-
-### 4. Seed Demo Data (Optional)
+For Elasticsearch, download the matching macOS Intel or Apple Silicon archive and its checksum from the [official 8.12.0 release](https://www.elastic.co/downloads/past-releases/elasticsearch-8-12-0). Verify with `shasum -a 512 -c` and extract the archive as described in the [archive installation guide](https://www.elastic.co/guide/en/elasticsearch/reference/8.12/targz.html). From the extracted `elasticsearch-8.12.0` directory, start a foreground instance matching the demo's local connection model:
 
 ```bash
-cd backend
+ES_JAVA_OPTS="-Xms512m -Xmx512m" ./bin/elasticsearch -Ediscovery.type=single-node -Enetwork.host=127.0.0.1 -Expack.security.enabled=false
+```
+
+In another terminal, verify it with `curl --fail http://localhost:9200/_cluster/health`. Stop it with Ctrl-C. The backend creates the `code` index if absent, but does not populate it.
+
+### Seed the demo and start the backend
+
+In a backend terminal:
+
+```bash
+cd github/backend
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=init.defaultBranch
+export GIT_CONFIG_VALUE_0=main
 npm run db:seed
+npm run dev
 ```
 
-This creates demo users:
-- `johndoe` / `password123`
-- `janedoe` / `password123`
-- `admin` / `password123` (admin user)
+The Git configuration applies to subprocesses in this terminal without changing global Git settings. It matters because `initWithReadme` initializes a working repository without naming its branch, then explicitly pushes `main`. A Git installation defaulting to `master` can otherwise produce an empty repository while the API still reports creation success.
 
-## Project Structure
+`db:seed` first creates `johndoe`, `janedoe`, and `admin`, each with `password123`, then seeds five public repositories: `johndoe/awesome-api`, `johndoe/react-charts`, `janedoe/go-cache`, `janedoe/ml-toolkit`, and `admin/infra-scripts`. Existing users/repository rows are skipped, so this does not reset passwords or repair missing Git data. Each new repository gets a short generated README; the longer sample README strings in the seeder are unused. Stars/forks/watchers are illustrative counters, not populated relationships. No issues, pull requests, feature branches, labels, or search documents are seeded by this command.
 
-```
-github/
-├── docker-compose.yml      # PostgreSQL, Redis, Elasticsearch
-├── backend/
-│   ├── package.json
-│   └── src/
-│       ├── index.js        # Express server entry point
-│       ├── db/
-│       │   ├── index.js    # PostgreSQL connection
-│       │   ├── redis.js    # Redis connection
-│       │   ├── elasticsearch.js  # ES connection
-│       │   ├── init.sql    # Database schema
-│       │   └── seed.js     # Demo data seeder
-│       ├── middleware/
-│       │   └── auth.js     # Session-based authentication
-│       ├── routes/
-│       │   ├── repos.js    # Repository endpoints
-│       │   ├── pulls.js    # Pull request endpoints
-│       │   ├── issues.js   # Issues endpoints
-│       │   ├── discussions.js  # Discussions endpoints
-│       │   ├── users.js    # User/org endpoints
-│       │   └── search.js   # Search endpoints
-│       └── services/
-│           ├── git.js      # Git operations
-│           └── search.js   # Elasticsearch operations
-├── frontend/
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── tailwind.config.js
-│   └── src/
-│       ├── main.tsx        # React entry point
-│       ├── index.css       # Global styles
-│       ├── components/     # Reusable UI components
-│       ├── routes/         # Tanstack Router routes
-│       ├── stores/         # Zustand stores
-│       ├── services/       # API client
-│       └── types/          # TypeScript definitions
-└── repositories/           # Git bare repositories (created at runtime)
-```
+When a named seed repository has no database row, the seeder deletes its corresponding directory before recreating it. Do not run it over valuable host Git data after wiping only PostgreSQL.
 
-## API Endpoints
+The separate [SQL fixture](./backend/db-seed/seed.sql) is a different dataset: Alice/Bob/Carol/David/Admin, ten repository metadata rows, collaboration records, and placeholder commit IDs, without real Git directories. It uses explicit IDs without resetting sequences and can conflict with the TypeScript seed. Do not combine the fixtures. Screenshot automation prefers this SQL fixture, while its login and repository URLs expect the TypeScript fixture, so a fresh automated setup is inconsistent.
 
-### Authentication
-- `POST /api/auth/login` - Login
-- `POST /api/auth/register` - Register
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
+### Start the frontend
 
-### Repositories
-- `GET /api/repos` - List repositories
-- `POST /api/repos` - Create repository
-- `GET /api/repos/:owner/:repo` - Get repository
-- `DELETE /api/repos/:owner/:repo` - Delete repository
-- `GET /api/repos/:owner/:repo/tree/:ref` - Get file tree
-- `GET /api/repos/:owner/:repo/blob/:ref/:path` - Get file content
-- `GET /api/repos/:owner/:repo/commits` - Get commits
-- `GET /api/repos/:owner/:repo/branches` - Get branches
-
-### Pull Requests
-- `GET /api/:owner/:repo/pulls` - List PRs
-- `POST /api/:owner/:repo/pulls` - Create PR
-- `GET /api/:owner/:repo/pulls/:number` - Get PR
-- `GET /api/:owner/:repo/pulls/:number/diff` - Get PR diff
-- `POST /api/:owner/:repo/pulls/:number/merge` - Merge PR
-- `POST /api/:owner/:repo/pulls/:number/reviews` - Add review
-
-### Issues
-- `GET /api/:owner/:repo/issues` - List issues
-- `POST /api/:owner/:repo/issues` - Create issue
-- `GET /api/:owner/:repo/issues/:number` - Get issue
-- `PATCH /api/:owner/:repo/issues/:number` - Update issue
-- `POST /api/:owner/:repo/issues/:number/comments` - Add comment
-
-### Search
-- `GET /api/search` - Search repos, issues, users
-- `GET /api/search/code` - Search code
-- `GET /api/search/symbols` - Search symbols
-
-### Users
-- `GET /api/users/:username` - Get user profile
-- `GET /api/users/:username/repos` - Get user repos
-- `GET /api/users/:username/starred` - Get starred repos
-
-## Running Multiple Backend Instances
-
-For load balancing testing:
+In another terminal:
 
 ```bash
-npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
-npm run dev:server3  # Port 3003
+cd github/frontend
+npm run dev
 ```
 
-## Implementation Status
+Open [the application](http://localhost:5173). Vite proxies `/api` to port 3000. Try signing in, opening a seeded repository overview, and creating a disposable repository. The child-route limitation described above affects file and collaboration navigation.
 
-- [x] Repository creation and storage
-- [x] Git operations (init, tree, blob, commits)
-- [x] Pull request workflow
-- [x] Code review system
-- [x] Issues and comments
-- [x] Discussions
-- [x] Code search with Elasticsearch
-- [x] User profiles and organizations
-- [x] Session-based authentication
-- [ ] Branch protection rules
-- [ ] CI/CD runner
-- [ ] Webhooks delivery
+## Configuration
 
-## Key Technical Challenges
+No dotenv loader is installed or called. Export overrides in the backend process's shell; placing them in `.env` alone has no effect.
 
-1. **Git Storage**: Using bare repositories with simple-git library
-2. **Code Search**: Elasticsearch with language-aware tokenization
-3. **Diff Computation**: Using git diff between branches
-4. **Session Management**: Redis-backed sessions
-5. **File Tree**: Lazy loading with efficient tree traversal
+| Variable | Default / use |
+|----------|---------------|
+| `PORT` | `3000` |
+| `FRONTEND_URL` | `http://localhost:5173`, allowed CORS origin |
+| `DB_HOST`, `DB_PORT` | `localhost`, `5432` |
+| `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `github`, `github`, `github_dev_password` |
+| `REDIS_URL` | `redis://localhost:6379` |
+| `ELASTICSEARCH_URL` | `http://localhost:9200` |
+| `REPOS_PATH` | `repositories` under the backend process working directory |
+| `NODE_ENV` | Set to development by `dev`, production by `start` |
+| `LOG_LEVEL`, `APP_VERSION` | Environment-dependent logging level, `dev` version label |
 
-## Architecture
+`DATABASE_URL` is not read. Run backend commands from `github/backend` or set an absolute `REPOS_PATH`; otherwise Git data may be created somewhere unexpected. No object store is needed.
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+`npm run dev:server1`, `dev:server2`, and `dev:server3` select ports 3001–3003. They do not supply a load balancer, change Vite's port-3000 proxy, or serialize concurrent merges across processes. Shared Redis and PostgreSQL do not make local Git writes a distributed storage system.
 
-## Development Notes
+## API and verification guide
 
-See [claude.md](./claude.md) for development insights and design decisions.
+The local API uses `/api`, without `/v1`. Repository settings update at `PATCH /api/repos/:owner/:repo`, not a `/settings` endpoint. `POST /api/repos/:owner/:repo/push` is a cache-invalidation notification; it neither receives Git objects nor runs indexing. The [architecture API table](./architecture.md#api-design) lists the implemented route families and their limitations.
 
-## References & Inspiration
+| Command / endpoint | Purpose |
+|--------------------|---------|
+| Frontend `npm run build` | TypeScript check followed by Vite build |
+| Frontend `npm run type-check` | Check frontend source without emitting files |
+| Backend `npx tsc --noEmit` | Check backend source; no backend build/type-check npm script exists |
+| Backend `npm run lint` | Existing ESLint configuration |
+| `GET :3000/health`, `/health/ready` | PostgreSQL and Redis probes; no Elasticsearch or Git-storage check |
+| `GET :3000/health/live`, `/metrics` | Process liveness and Prometheus metrics |
+| `GET /api/admin/circuit-breakers`, `/api/admin/audit-logs` | Admin-only APIs; no admin UI |
 
-- [Git Internals - Plumbing and Porcelain](https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain) - Official Git documentation on internal architecture
-- [Git Wire Protocol v2](https://git-scm.com/docs/protocol-v2) - Modern Git network protocol specification
-- [GitHub Engineering Blog](https://github.blog/category/engineering/) - Engineering insights from GitHub
-- [How We Made Diff Pages Faster](https://github.blog/engineering/how-we-made-diff-pages-faster/) - Optimizing diff computation at scale
-- [How We Built the GitHub Globbing Library](https://github.blog/engineering/how-we-built-the-github-globbing-library/) - File pattern matching implementation
-- [Scaling Git at Microsoft](https://devblogs.microsoft.com/devops/the-largest-git-repo-on-the-planet/) - Virtual File System for Git (VFS for Git)
-- [Semantic: Code Parsing and Analysis](https://github.com/github/semantic) - GitHub's open-source code analysis library
-- [Building GitHub's Code Review](https://github.blog/engineering/building-github-code-review/) - Design insights for PR workflows
-- [CI/CD Pipelines Explained](https://www.redhat.com/en/topics/devops/what-cicd-pipeline) - Overview of continuous integration patterns
-- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book on distributed systems
+The frontend lint script uses `--ext` with a flat configuration; use `npx eslint . --max-warnings 0` from `github/frontend` if the installed ESLint rejects that flag. This does not imply the existing source is lint-clean.
+
+The single [Playwright smoke test](./tests/smoke.spec.ts) checks that the homepage has a `main` element and no generic error text. It does not verify repository child routing, Git writes, authorization, search indexing, or merge recovery. Run it only with the application and required data already prepared. This documentation review used source inspection and isolated mocked checks; it did not run the application stack or claim passing builds/browser tests.
+
+## Design reading
+
+- [Architecture and implementation notes](./architecture.md)
+- [Frontend interview answer](./system-design-answer-frontend.md)
+- [Backend interview answer](./system-design-answer-backend.md)
+- [Fullstack interview answer](./system-design-answer-fullstack.md)
+- [Development history](./CLAUDE.md)

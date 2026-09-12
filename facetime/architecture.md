@@ -1,255 +1,201 @@
-# Design FaceTime - Architecture
+# FaceTime Calling Architecture
 
 ## System Overview
 
-FaceTime is a real-time video calling service with end-to-end encryption, supporting 1:1 and group video/audio calls across multiple Apple devices. Core challenges involve achieving sub-150ms latency, reliable NAT traversal, group call scaling beyond P2P mesh limits, and seamless device handoff.
+This is a FaceTime-inspired learning project for understanding the boundary between call control and real-time media. A React client captures audio/video and creates a WebRTC peer connection; an Express/WebSocket process coordinates identities, ringing, and negotiation; PostgreSQL and Redis hold call-related records. It is not a description of Apple's deployed system.
 
-**Learning Goals:**
-- Build real-time media pipelines with WebRTC
-- Design WebRTC-based calling systems with STUN/TURN
-- Implement E2E encryption for calls
-- Handle network adaptation and quality management
+This document separates a **proposed production architecture** from **current local behavior**. Requirements, sizing, the main diagram, and design decisions describe the proposal. Database Schema reproduces the local initialization SQL, API Design inventories actual routes/messages, and Implementation Notes traces the source and its limitations. The [README](./README.md) supplies setup; the interview answers present bounded, role-specific designs.
+
+The current implementation does not authenticate users or enforce call membership. It also has a named circuit-breaker closure defect that reuses earlier request values, non-atomic call transitions, and browser signaling/media lifecycle races. Presence, idempotency, or metrics helpers do not by themselves establish a reliable calling service.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — production proposal
 
-1. **1:1 Calls**: Video and audio calls between two users
-2. **Group Calls**: Multi-party video calls (up to 32 participants)
-3. **Multi-Device Ring**: Ring all registered devices simultaneously on incoming call
-4. **Device Handoff**: Transfer an active call between devices seamlessly
-5. **SharePlay**: Shared media experiences during calls
+Start with one-to-one audio/video calls, ringing across a user's registered devices, one accepted answering device, mute/video controls, call history, and recovery from short signaling interruptions. Public identity discovery is not permission to impersonate a user or enter their calls. A user has at most one accepted call under the initial busy policy.
 
-### Non-Functional Requirements
+The production extension supports bounded group rooms through an SFU with explicit participant admission, selective subscriptions, and encryption appropriate to that topology. Device transfer is a new, authorized endpoint claim with a later generation; it must not leave both old and new devices controlling the same seat. Push notification integration, screen sharing, effects, recording, and shared media experiences are separate features rather than prerequisites for the one-to-one call path.
 
-| Metric | Target |
-|--------|--------|
-| End-to-end latency | < 150ms (same region) |
-| Call setup time | < 3 seconds from tap to ring |
-| Video quality | Up to 1080p adaptive |
-| Concurrent calls | Millions globally |
-| Availability | 99.99% for signaling |
-| Security | End-to-end encryption for all media |
-| Packet loss tolerance | < 5% before quality degradation |
+A call acceptance is a control-plane decision. Media connected is an observed endpoint condition. The interface and metrics distinguish ringing, acceptance, negotiating media, an active media path, and a temporary loss of either signaling or media.
+
+### Non-functional requirements — proposed, unmeasured targets
+
+| Concern | Initial target / invariant | Boundary |
+|---------|----------------------------|----------|
+| Online ringing | p95 below two seconds from call request to first online-device ring | Excludes offline push delivery and human response |
+| Media setup | p95 below three seconds from acceptance to usable media | Supported devices/networks and working relay capacity |
+| Media delay | Aim below 200 ms one-way within a region | Includes capture/encode/network/playout; RTT is a different measurement |
+| Availability | 99.9% regional call-control availability | Existing direct media may outlive a signaling outage |
+| Acceptance | At most one winning device per invited user/seat | Atomic claim, including busy-state and deadline checks |
+| Retry behavior | Same actor/operation/body returns one durable outcome | No phantom call ID after partial creation |
+| Recovery | Reconcile call state and endpoint generations after reconnect | Do not replay obsolete SDP into a new negotiation |
+| Access | Authenticated devices and authorized call membership | Enforced independently of browser controls |
+| Group envelope | Evaluate up to 32 participants with bounded subscriptions | No universal mesh cutoff or server-users-per-core promise |
+
+TURN improves connectivity but cannot guarantee it through every firewall or outage. Likewise, no fixed packet-loss percentage defines when all codecs and devices will degrade. Validate these targets against representative network, device, codec, and room profiles.
 
 ## Capacity Estimation
 
-### Production Scale
+These are exercise assumptions, not production measurements:
 
-- **Peak concurrent calls**: 5 million
-- **Average call duration**: 8 minutes
-- **Calls per day**: ~500 million
-- **Signaling messages per call**: ~20 (setup) + ~5/minute (ICE keepalive)
-- **Peak signaling load**: ~100M messages/minute
-- **TURN relay rate**: ~15% of calls require relay (corporate NATs, symmetric NATs)
-- **TURN bandwidth**: 15% of 5M calls * 4 Mbps bidirectional = 3 Tbps TURN capacity
-- **P2P success rate**: ~85% via STUN (direct or port-mapped)
+| Assumption | Consequence |
+|------------|-------------|
+| 100,000 concurrent one-to-one calls | 200,000 media endpoints |
+| Five-minute average duration at steady occupancy | About 333 new calls/second |
+| 30 application signaling messages per completed call | About 10,000 signaling messages/second at that steady rate |
+| Two million online sockets sending a heartbeat every 30 seconds | About 66,667 heartbeat messages/second, separate from call setup |
+| 20% of calls use a relay, each party sends 1.5 Mb/s | 60 Gb/s TURN ingress and 60 Gb/s egress across the fleet |
+| 32-person mesh, each sender supplies 1.5 Mb/s per peer | 496 total peer pairs and 46.5 Mb/s upload per endpoint |
+
+A six-person mesh has fifteen total peer pairs, not fifteen uploads per person; each endpoint has five peers. An SFU removes that endpoint connection multiplication, but forwarding every source to every receiver still has quadratic aggregate egress. With one 1.5 Mb/s source and five subscribed remote sources per participant, a 32-person example has 48 Mb/s ingress and 240 Mb/s egress before audio, extra encoding layers, and protocol overhead.
+
+Simulcast can publish several encodings, so “one upload” means one server relationship, not necessarily one encoded layer or fixed bitrate. TURN ratios, bitrates, and subscription counts require measurement. ICE consent and transport keepalives are not automatically application WebSocket messages.
 
 ### Local Development Scale
 
-- 2-5 concurrent calls
-- 2-4 participants per call
-- Single signaling server, single Coturn instance
-- All services on localhost
+The fixture creates four users and four sample device rows, with no calls. The application maintains one peer connection and one remote stream per browser. One Node process owns its connected clients, user index, and ring timers. PostgreSQL and Valkey are single instances; Coturn exposes a small relay-port range. No load or media-quality benchmark was run for this review.
 
 ## High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Client Layer                                  │
-│            iPhone │ iPad │ Mac │ Apple Watch │ Apple TV              │
-└─────────────────────────────────────────────────────────────────────┘
-          │                       │                       │
-          │ WebSocket             │ STUN                  │ SRTP
-          │ (signaling)           │ (NAT mapping)         │ (media)
-          ▼                       ▼                       ▼
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│  API Gateway     │    │  STUN Cluster    │    │  TURN Cluster    │
-│  (L7 + WS)      │    │                  │    │                  │
-│  - Rate limiting │    │  - NAT discovery │    │  - Media relay   │
-│  - Auth          │    │  - Server        │    │  - Bandwidth     │
-│  - Routing       │    │    reflexive     │    │    allocation    │
-└────────┬─────────┘    └──────────────────┘    └──────────────────┘
-         │
-         ├─────────────────────┬─────────────────────┐
-         ▼                     ▼                     ▼
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│  Signaling       │  │  Call Management │  │  Presence        │
-│  Service         │  │  Service         │  │  Service         │
-│                  │  │                  │  │                  │
-│  - WebSocket     │  │  - Call CRUD     │  │  - Device online │
-│  - Offer/Answer  │  │  - Participant   │  │  - Multi-device  │
-│  - ICE exchange  │  │    tracking      │  │  - Heartbeat     │
-│  - Room mgmt     │  │  - Call history  │  │  - Routing       │
-└────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
-         │                     │                     │
-         ▼                     ▼                     ▼
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│  Redis Cluster   │  │  PostgreSQL      │  │  Redis Cluster   │
-│  (call state,    │  │  (users, calls,  │  │  (presence,      │
-│   idempotency,   │  │   devices,       │  │   sessions,      │
-│   signaling      │  │   call history)  │  │   device map)    │
-│   buffer)        │  │                  │  │                  │
-└──────────────────┘  └──────────────────┘  └──────────────────┘
-```
-
-### P2P Media Flow (1:1 Calls)
+The proposed control path is separate from the media path:
 
 ```
-Device A                                               Device B
-    │                                                      │
-    │──── STUN Binding Request ────▶ STUN Server           │
-    │◀─── Server Reflexive Addr ────┘                      │
-    │                                                      │
-    │──── WebSocket: Offer (SDP) ──────────────────────────▶│
-    │◀─── WebSocket: Answer (SDP) ─────────────────────────│
-    │                                                      │
-    │──── ICE Candidate ───────────────────────────────────▶│
-    │◀─── ICE Candidate ──────────────────────────────────│
-    │                                                      │
-    │◀═══════════ DTLS Handshake ═══════════════════════▶│
-    │                                                      │
-    │◀═══════════ SRTP Media (P2P) ═════════════════════▶│
+┌──────────────────────┐     ┌──────────────────────┐
+│ Authenticated device │────▶│ HTTPS / WS gateway   │
+└──────────────────────┘     └──────────┬───────────┘
+                                        ▼
+┌──────────────────────┐     ┌──────────────────────┐
+│ Device routing / push│◀────│ Call authority       │
+└──────────────────────┘     └──────────┬───────────┘
+                                        ▼
+                             ┌──────────────────────┐
+                             │ PostgreSQL + outbox  │
+                             │ Claims / receipts    │
+                             └──────────────────────┘
+
+┌──────────────────────┐     ┌──────────────────────┐
+│ Browser A            │◀───▶│ Browser B            │
+└──────────────────────┘     └──────────────────────┘
+      Direct encrypted media, or opaque TURN relay
+
+┌──────────────────────┐     ┌──────────────────────┐
+│ Group endpoints      │◀───▶│ SFU media forwarding │
+└──────────────────────┘     └──────────────────────┘
 ```
 
-### Group Call Architecture (SFU)
+The gateway authenticates a connection and routes commands to the call authority. PostgreSQL commits call transitions, unique claims, retry receipts, and notification outbox records together. Redis holds bounded presence/routing caches and optional delivery hints. A socket itself remains on a particular gateway; Redis does not make that process stateless.
 
-For calls beyond 4 participants, an SFU (Selective Forwarding Unit) replaces the mesh:
+Media takes a direct candidate pair where appropriate, a TURN relay when necessary or selected for address privacy, or an SFU path for groups. STUN discovers candidate addresses and ICE tests connectivity. Neither STUN nor the signaling API is the steady-state video pipeline.
 
-```
-                    ┌──────────────────────┐
-                    │    SFU Controller    │
-                    │    (routing layer)   │
-                    └──────────┬───────────┘
-                               │
-            ┌──────────────────┼──────────────────┐
-            ▼                  ▼                   ▼
-     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-     │  SFU Worker 1│  │  SFU Worker 2│  │  SFU Worker N│
-     │  (CPU Core)  │  │  (CPU Core)  │  │  (CPU Core)  │
-     │  ~200 users  │  │  ~200 users  │  │  ~200 users  │
-     └──────────────┘  └──────────────┘  └──────────────┘
-```
+## Core Components / Request Flows
 
-Each participant sends one stream to the SFU, which selectively forwards it to all others — O(N) server connections vs O(N^2) in mesh.
+### Device registration and presence — production proposal
 
-## Core Components
+Validate the session and origin at upgrade, then bind an authenticated account to a server-verified device identity. Maintain separate connection IDs for several tabs or sockets on the same device. A device identity is not a proof of account ownership merely because it came from localStorage.
 
-### 1. Signaling Service
+Presence is a per-connection lease with a last-seen time and route. Heartbeats refresh that lease; cleanup removes only the matching connection generation. User-level indexes are derived from live connections. Updating an entire user's hash TTL cannot independently expire an abandoned device while another keeps the hash alive.
 
-The signaling server mediates WebRTC session establishment without touching media bytes:
+Fan-out uses this registry to reach each invited user's gateways. Durable call events are delivered at least once with a call revision and expiry; a stale ring is discarded after checking current call state. Offline delivery can use a platform notification service, but the returning client still reauthorizes and synchronizes before showing an actionable invitation.
 
-**Signaling Protocol:**
+### Initiation, acceptance, and terminal transitions — production proposal
 
-| Direction | Message | Purpose |
-|-----------|---------|---------|
-| Client → Server | `register` | Register device with userId, deviceId, deviceType |
-| Server → Client | `registered` | Confirm registration, assign clientId |
-| Client → Server | `call-initiate` | Start call with target userId(s), call type |
-| Server → Client | `incoming-call` | Ring on all target user's online devices |
-| Client → Server | `call-response` | Accept/decline with device selection |
-| Server → Client | `call-accepted` | Notify initiator, include SDP answer |
-| Client → Server | `offer` | WebRTC SDP offer |
-| Server → Client | `offer` | Forward SDP offer to callee |
-| Client → Server | `answer` | WebRTC SDP answer |
-| Server → Client | `answer` | Forward SDP answer to caller |
-| Client → Server | `ice-candidate` | ICE candidate from local gathering |
-| Server → Client | `ice-candidate` | Forward ICE candidate to peer |
-| Client → Server | `call-end` | End the call |
-| Server → Client | `call-ended` | Notify all participants |
-| Client → Server | `heartbeat` | Keep presence alive |
+1. A caller submits an actor-scoped operation ID, intended recipients, and modality. Validate recipients, blocked/busy policy, limits, and the request digest.
+2. One SQL transaction creates the call and invitations, reserves the caller's active-call slot, and writes the retry receipt and ring outbox entries. A duplicate returns the original committed outcome.
+3. Each invited device receives the same call ID, revision, and absolute ringing deadline. Delivery acknowledgment is separate from human acceptance.
+4. An answering device atomically claims its invited seat while the call is still eligible and before the deadline. Its busy slot, participant state, call revision, receipt, and sibling-dismiss events commit together.
+5. The winner negotiates media with the caller. Other devices receive the canonical winner and stop ringing. An acceptance does not yet prove a working audio path.
+6. End, decline, cancel, and timeout commands use conditional transitions and receipts. A timeout worker checks the durable deadline and state; a stale timer cannot overwrite an accepted or ended call.
 
-### 2. Presence Service
+For one-to-one calls, define Decline as declining the invitation for that user across their devices. A temporary dismiss on one device would be a separate action. Group invitations claim seats independently; accepting one participant must not close admission for every other invited participant.
 
-Tracks which devices are online for each user, enabling multi-device ring:
+Lock active-user slots in a stable order where several are involved, or enforce equivalent uniqueness transactionally. Merely locking one call row would not prevent the same user from accepting two different calls concurrently. For cross-dialing, return an explicit busy/conflict result or reconcile the invitations through a defined product rule.
 
-- **Write-through pattern**: Device registration updates Redis immediately
-- **Heartbeat refresh**: 30-second heartbeat keeps presence TTL alive (60s TTL)
-- **Multi-device awareness**: Hash map per user (`presence:{userId}` → `{deviceId: presenceData}`)
-- **Fast routing**: Sub-millisecond lookup of all online devices during call setup
+### Negotiation and media ownership — production proposal
 
-When a call arrives, the signaling service queries presence to find all online devices for the target user, then sends `incoming-call` to every device simultaneously. The first device to accept wins.
+The client call controller owns the peer connection, media tracks, pending descriptions/candidates, timers, and an attempt generation. UI state contains serializable status and participant identity; mutable browser resources live behind that controller. Every asynchronous callback carries a call, endpoint, and negotiation generation.
 
-### 3. Call Management Service
+Obtain current ICE configuration before constructing a peer, or explicitly acknowledge a degraded STUN-only attempt. Request microphone/camera through a user action. If permission resolves after cancellation, stop the returned tracks immediately rather than attaching them to a newer call.
 
-Handles call lifecycle and persistence:
+Use offer/answer to negotiate session parameters and trickle candidates as they are discovered. Queue candidates only for their matching peer and negotiation generation until a remote description is installed. A designated initial offerer avoids the first collision; later renegotiations need serialized operations and a glare-resolution policy. Queueing all candidates in one global array is insufficient.
 
-- **Call creation**: Generates call record with idempotency key protection
-- **Participant tracking**: Records join/leave timestamps per device
-- **Call history**: Stores completed calls with duration, quality rating, participants
-- **Multi-device ring**: Routes incoming calls to all registered devices
+Keep signaling and media status separate. A brief WebSocket outage can leave direct media functioning; reconnect authenticates again and reconciles current call state before renegotiation. A failed media path can require an ICE restart with new generation/credentials, not a replay of the old candidate list. Use bounded retry and a clear failed state.
 
-### 4. NAT Traversal (STUN/TURN)
+### Topology, quality, and encryption — production proposal
 
-The ICE (Interactive Connectivity Establishment) framework handles NAT traversal:
+For one-to-one calls, begin with direct ICE candidates plus reachable TURN fallback. A relay can also deliberately conceal peer addresses. For group rooms, use an SFU with per-receiver subscriptions and suitable encoding layers, preserving audio when bandwidth is constrained. An MCU is an alternative when a mixed stream substantially reduces receiver work, at the cost of server processing and plaintext access for mixing.
 
-**ICE Candidate Gathering Order:**
-1. **Host candidates** — Direct LAN addresses
-2. **Server reflexive (srflx)** — Public IP:port learned via STUN
-3. **Relay candidates** — TURN-allocated relay addresses (fallback)
+Browser WebRTC secures media with DTLS-SRTP; TURN forwarding does not require terminating that browser-to-browser encryption. Secure signaling and verified endpoint identities remain necessary to bind the intended people to those endpoints. See [RFC 8827](https://www.rfc-editor.org/rfc/rfc8827.html#section-6.5).
 
-**TURN is the fallback for hostile networks.** Approximately 15% of calls require TURN relay because the client is behind a symmetric NAT or corporate firewall that blocks UDP hole-punching. TURN adds ~20-50ms latency but guarantees connectivity.
+An SFU normally terminates each transport leg. Protecting media from the SFU requires an additional endpoint-controlled frame encryption mechanism and authenticated group-key management. [SFrame](https://www.rfc-editor.org/rfc/rfc9605.html) describes such a media framing layer; it does not itself solve membership or key distribution. Removing a participant requires an appropriate key-epoch change. The local project implements neither an SFU nor this group layer.
 
-**Credential rotation**: TURN credentials are time-limited (5 minutes). The client requests fresh credentials from the API before each call. This prevents credential reuse if intercepted.
+Use measured client statistics to distinguish round-trip delay, jitter, loss, actual frame delivery, and selected candidate type. Browser congestion control and requested echo/noise processing exist independently of an application quality dashboard. A fixed capture constraint is a preference, not a promise that every camera supplies that resolution or frame rate.
 
 ## Database Schema
 
+### Current local initialization SQL
+
+This is the exact [initialization file](./backend/src/db/init.sql). It creates five tables and seven indexes, and delegates fixtures to a separate seed file.
+
 ```sql
+-- Database initialization for FaceTime
+-- Run this when creating the database
+
+-- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Users: Apple ID-linked accounts
-CREATE TABLE users (
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   username VARCHAR(50) UNIQUE NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
   display_name VARCHAR(100) NOT NULL,
   avatar_url VARCHAR(500),
   role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Multi-device registration
-CREATE TABLE user_devices (
+-- User devices for multi-device support
+CREATE TABLE IF NOT EXISTS user_devices (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   device_name VARCHAR(100),
-  device_type VARCHAR(50),  -- 'desktop', 'mobile', 'tablet'
-  push_token VARCHAR(500),  -- APNs token for offline ring
+  device_type VARCHAR(50), -- 'desktop', 'mobile', 'tablet'
+  push_token VARCHAR(500),
   is_active BOOLEAN DEFAULT TRUE,
-  last_seen TIMESTAMPTZ DEFAULT NOW(),
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Call records
-CREATE TABLE calls (
+-- Active calls
+CREATE TABLE IF NOT EXISTS calls (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   initiator_id UUID REFERENCES users(id),
-  call_type VARCHAR(20) NOT NULL,       -- 'video', 'audio', 'group'
-  state VARCHAR(20) NOT NULL,           -- 'ringing', 'connected', 'ended', 'missed', 'declined'
+  call_type VARCHAR(20) NOT NULL, -- 'video', 'audio', 'group'
+  state VARCHAR(20) NOT NULL, -- 'ringing', 'connected', 'ended', 'missed', 'declined'
   room_id VARCHAR(100),
   max_participants INTEGER DEFAULT 2,
-  started_at TIMESTAMPTZ,
-  ended_at TIMESTAMPTZ,
+  started_at TIMESTAMP WITH TIME ZONE,
+  ended_at TIMESTAMP WITH TIME ZONE,
   duration_seconds INTEGER,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Per-device participation in calls
-CREATE TABLE call_participants (
+-- Call participants
+CREATE TABLE IF NOT EXISTS call_participants (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   call_id UUID REFERENCES calls(id) ON DELETE CASCADE,
   user_id UUID REFERENCES users(id),
   device_id UUID REFERENCES user_devices(id),
-  state VARCHAR(20) NOT NULL,           -- 'ringing', 'connected', 'left', 'declined'
+  state VARCHAR(20) NOT NULL, -- 'ringing', 'connected', 'left', 'declined'
   is_initiator BOOLEAN DEFAULT FALSE,
-  joined_at TIMESTAMPTZ,
-  left_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  joined_at TIMESTAMP WITH TIME ZONE,
+  left_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Denormalized call history for fast user-facing queries
-CREATE TABLE call_history (
+-- Call history for analytics
+CREATE TABLE IF NOT EXISTS call_history (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   call_id UUID REFERENCES calls(id),
   user_id UUID REFERENCES users(id),
@@ -257,452 +203,210 @@ CREATE TABLE call_history (
   call_type VARCHAR(20),
   duration_seconds INTEGER,
   quality_rating INTEGER,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Performance indexes
-CREATE INDEX idx_user_devices_user_id ON user_devices(user_id);
-CREATE INDEX idx_user_devices_active ON user_devices(user_id, is_active);
-CREATE INDEX idx_calls_initiator ON calls(initiator_id);
-CREATE INDEX idx_calls_state ON calls(state);
-CREATE INDEX idx_call_participants_call ON call_participants(call_id);
-CREATE INDEX idx_call_participants_user ON call_participants(user_id);
-CREATE INDEX idx_call_history_user ON call_history(user_id, created_at DESC);
+-- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_devices_active ON user_devices(user_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_calls_initiator ON calls(initiator_id);
+CREATE INDEX IF NOT EXISTS idx_calls_state ON calls(state);
+CREATE INDEX IF NOT EXISTS idx_call_participants_call ON call_participants(call_id);
+CREATE INDEX IF NOT EXISTS idx_call_participants_user ON call_participants(user_id);
+CREATE INDEX IF NOT EXISTS idx_call_history_user ON call_history(user_id);
+
+-- Seed data is in db-seed/seed.sql
 ```
+
+The local schema has no password/session model, unique call-operation receipt, transition revision, answer claim, ringing deadline, device-account uniqueness rule beyond device ID, or legal-state CHECK constraints. Participant identity fields are nullable foreign keys; there is no unique call/user/seat constraint. `call_history` is not written or read by the running routes; the history API derives data from `calls` and `call_participants`.
+
+### Proposed extensions — not local tables
+
+| Record / constraint | Purpose |
+|---------------------|---------|
+| Authenticated device and connection generation | Bind routing to an account and distinguish old sockets |
+| Call revision, deadline, terminal reason | Conditional transitions and restart-safe expiration |
+| Invitation / seat with winning device | One winner per invited user; independent group admission |
+| Active-user slot | Enforce the initial one-accepted-call busy policy across calls |
+| Actor + operation ID + body digest receipt | Atomic, durable retry outcome |
+| Call-event outbox | Deliver rings, dismissal, and termination after commit |
+| Media attempt / endpoint generation | Reject stale SDP and ICE after reconnect or transfer |
+
+History can initially be queried from normalized records with a stable cursor and suitable indexes. A later per-user projection must be idempotent and respect visibility. Caching live routes is useful, but optional cache availability should not decide whether an accepted call transition exists.
 
 ## API Design
 
-### REST Endpoints
+### Actual HTTP endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/users` | List all users (contact discovery) |
-| GET | `/api/users/:id` | Get user profile |
-| POST | `/api/users/:id/devices` | Register a device |
-| GET | `/api/calls/history/:userId` | Get call history for a user |
-| GET | `/api/calls/active` | List active calls (admin) |
-| GET | `/turn-credentials` | Get time-limited TURN credentials |
-| GET | `/health` | Health check with dependency status |
-| GET | `/metrics` | Prometheus metrics |
-| GET | `/stats` | Online users and connection count |
+| Method | Path | Current behavior |
+|--------|------|------------------|
+| GET | `/api/users` | All users with display/profile/role fields, no authentication or pagination |
+| GET | `/api/users/:id` | Public profile lookup |
+| POST | `/api/users/login` | Exact username lookup and returned user; no session creation |
+| GET | `/api/calls/history/:userId` | Public call/participant history, default limit 50 and offset 0; no maximum or nonnegative validation |
+| GET | `/api/calls/:id` | Public call detail and participant records |
+| GET | `/turn-credentials` | Three public STUN URLs and static TURN credentials |
+| GET | `/stats` | Process-local registered-user/device counts; resets the connection gauge to the registered count |
+| GET | `/metrics` | Prometheus text |
+| GET | `/health`, `/health/ready` | PostgreSQL/Redis probes; full health also returns memory and breaker state |
+| GET | `/health/live` | Process liveness |
 
-### WebSocket Protocol
+There is no HTTP device-registration endpoint, active-call admin endpoint, registration/password endpoint, or authenticated history filter. Express uses its default JSON parser limit, CORS for one configured origin, and Helmet with CSP disabled. CORS is not authentication and does not authorize `/ws` upgrades.
 
-Connection: `ws://host/ws`
+### Actual WebSocket messages
 
-All messages are JSON with a `type` field. See the Signaling Service section for the full message protocol.
+Messages use underscores, not the hyphenated names formerly shown in this document. The `/ws` connection has no session or origin verification.
+
+| Message | Direction | Current behavior |
+|---------|-----------|------------------|
+| `register` | Both | Client claims user/device; response returns success/profile under the same type |
+| `call_initiate` | Both | Request has calleeIds/callType and optional data.idempotencyKey; response returns call ID |
+| `call_ring` | Server → invited devices | Caller profile, modality, group flag |
+| `call_answer` | Both | Request accepts by call ID; caller learns answering device and answerer gets confirmation |
+| `call_decline` | Both | Decline by call ID; caller receives user and allDeclined flag |
+| `call_end` | Both | End by call ID; notifications include reason, including answered_elsewhere |
+| `offer`, `answer` | Relayed | SDP payload forwarded to Redis-listed participating devices |
+| `ice_candidate` | Relayed | Candidate, sdpMid, sdpMLineIndex; best-effort deduplication |
+| `ping`, `pong` | Client / server | JSON heartbeat; updates process-local lastPing only |
+| `error` | Server → client | Registration/processing errors; frontend call hook does not handle them |
+
+Registration is required to populate the handler's current client, but does not establish authenticated identity. Signaling checks only that a call cache entry exists; it does not verify sender membership or legal negotiation state. `call_busy`, `user_joined`, and `user_left` appear in backend types without implemented flows. Payloads have TypeScript casts rather than comprehensive runtime validation, application message limits, or rate controls.
 
 ## Key Design Decisions
 
-### P2P vs SFU vs MCU
+### Atomic control state over independent Redis and SQL writes
 
-| Architecture | Pros | Cons |
-|-------------|------|------|
-| **P2P (chosen for 1:1)** | Zero server media cost, lowest latency, true E2E encryption | Cannot scale past ~4 participants |
-| **SFU (for groups)** | O(N) server connections, preserves individual streams | Requires media server infrastructure |
-| MCU | Lowest client bandwidth (single mixed stream) | Highest server CPU, destroys E2E encryption, loses individual stream control |
+A single durable acceptance transaction provides a meaningful winner across devices, retries, and restarts. PostgreSQL is appropriate for the comparatively small number of call lifecycle transitions; every media packet or candidate does not need a SQL transaction. Redis can cache routes and current revisions without becoming a second authority.
 
-We use P2P for 1:1 calls because it eliminates media server cost entirely and provides the lowest possible latency — the media path is direct between devices. For group calls (5+ participants), P2P mesh creates N*(N-1)/2 connections, which at 6 participants means 15 simultaneous upstream connections per device. Mobile bandwidth cannot sustain this. The SFU approach reduces this to 1 upload + (N-1) downloads per participant.
+Independent read/check/write operations allow two devices to observe ringing and both accept. Writing an idempotency key first creates a different gap: it can identify a call that was never committed. The proposed receipt and outbox close these boundaries in the same transaction. The cost is storage coordination and delivery/recovery machinery, rather than an assumed universal database latency penalty.
 
-The trade-off is infrastructure complexity: SFU requires dedicated media servers with high CPU and bandwidth, whereas P2P has zero ongoing server cost. For a product like FaceTime where the vast majority of calls are 1:1, optimizing the common case with P2P and reserving SFU for groups is the right balance.
+### Direct media with TURN fallback over always relaying every one-to-one call
 
-### WebSocket vs HTTP Polling for Signaling
+A direct candidate pair can reduce relay bandwidth and avoid a server detour. It is not zero total server cost: signaling, presence, and any fallback relay still require infrastructure. Nor is the direct Internet route always faster than a well-placed relay. Measure selection and quality rather than assuming a fixed 85% direct success rate.
 
-WebSocket is mandatory for WebRTC signaling. The ICE/DTLS handshake requires sub-second round-trip message exchanges across multiple steps: offer, answer, and typically 4-8 ICE candidates per side. HTTP polling at 1-second intervals would add 500ms average latency to each step of a multi-step negotiation that must complete in under 3 seconds for acceptable UX. The total setup time would balloon from ~2 seconds to ~8-10 seconds, causing users to hang up before the call connects.
+Always relaying simplifies some routing/privacy choices and can conceal endpoint addresses, but spends bandwidth on calls that could connect directly. Either option still requires reachable relay transport, capacity, credential policy, and network tests. The initial choice favors direct paths with operational TURN support and a deliberate relay-only privacy mode when required.
 
-Additionally, incoming call notifications must arrive within 1 second of initiation. Polling creates an unacceptable 50-500ms variable delay where one device rings noticeably before another.
+### SFU subscriptions over an unrestricted group mesh
 
-### Redis for Call State vs Database
+In a mesh, each participant sends to every other participant, putting upload and encoding pressure on the weakest device. An SFU concentrates forwarding in infrastructure and lets each receiver subscribe to useful streams/layers. Connections scale linearly with participants, but total traffic does not become linear if everyone receives everything.
 
-Active call state (who is in a call, which device, current ICE state) lives in Redis rather than PostgreSQL. Call setup involves 10-20 state reads/writes within 3 seconds — PostgreSQL's row-level locking and WAL overhead would add ~5ms per operation, totaling ~100ms of database latency in the critical path. Redis handles these as in-memory operations in ~0.1ms each.
-
-The trade-off is durability: if Redis crashes, all active calls lose state and cannot gracefully resume. We mitigate this with Redis AOF persistence and by designing the client to re-establish calls after brief disconnections. Completed call records are persisted to PostgreSQL for permanent history.
-
-### Coturn vs Commercial TURN
-
-Coturn is the dominant open-source TURN server. At production scale, TURN is the most expensive component because it relays actual media traffic — every relayed call consumes server bandwidth equal to the call's bitrate. Commercial alternatives (Twilio TURN, Xirsys) offer managed infrastructure but at $0.40-0.80/GB, which at millions of calls becomes prohibitive.
-
-We chose Coturn because it provides full RFC 5766 compliance, supports UDP/TCP/TLS transport, and can be horizontally scaled behind DNS-based load balancing. The trade-off is operational complexity: Coturn requires careful capacity planning, port allocation management, and geographic distribution.
+The cost is media-server operations, egress, selective-subscription logic, and additional encryption design if the SFU must not see content. An MCU can lower receiver decode work through a mixed output, but adds server processing and prevents an ordinary plaintext mixer from being outside the media trust boundary. There is no universal four-person cutoff independent of bitrate and device capacity.
 
 ## Consistency and Idempotency
 
-### Idempotent Call Initiation
+In the proposal, commands carry stable actor-scoped IDs and digests. Conditional state transitions, seat/busy claims, receipts, and outbox events commit atomically. Durable deadlines survive process loss. Notification delivery is at least once and receivers ignore superseded revisions; this is not an exactly-once network guarantee.
 
-Call initiation uses an `X-Idempotency-Key` header (client-generated UUID) stored in Redis with a 5-minute TTL. If the client retries due to network timeout, the server returns the existing call ID instead of creating a duplicate. This prevents the "phantom call" problem where a user sees multiple incoming call notifications from a single tap.
+Negotiation identity is separate from call identity. An ICE restart or endpoint transfer creates a later generation. SDP/candidates are addressed to the authorized endpoint pair and generation, with ordered processing and bounded queues. Deduplicating only the candidate string cannot establish that a candidate belongs to the current negotiation or was delivered successfully.
 
-Without idempotency, a mobile client on a flaky network might retry 3 times, creating 3 separate call records. The callee would see 3 incoming call overlays stacked on each other, and accepting one would leave 2 orphaned "ringing" calls that never resolve.
+Locally, the optional initiation key is stored at `idempotency:call:<key>` for 300 seconds, with no actor/body binding. GET and SETEX are separate and fail open. The key is written before SQL and is not removed after failure; duplicate handling echoes the new request's recipients/type alongside the old call ID. The frontend never supplies the key.
 
-### ICE Candidate Deduplication
-
-ICE candidates are deduplicated using a SHA-256 hash of `callId:deviceId:candidateString`. The hash is stored in Redis with SETNX (set-if-not-exists) and a 1-hour TTL. Duplicate candidates from network retries are silently dropped.
-
-This matters because ICE gathering can produce identical candidates from multiple network interfaces, and client-side retries during the gathering phase can flood the signaling server with duplicates. Each duplicate would be forwarded to the peer, wasting bandwidth and confusing the ICE agent.
-
-### Call State Consistency
-
-Call state transitions follow a strict state machine: `ringing → connected → ended`, `ringing → missed`, `ringing → declined`. Invalid transitions (e.g., `ended → connected`) are rejected. State transitions are atomic in Redis using Lua scripts to prevent race conditions where two devices try to accept the same call simultaneously.
+ICE uses the first sixteen hex characters of SHA-256 over call ID, device ID, and candidate text. `SETNX` and the one-hour expiry are separate operations; a crash can leave an unexpired key. Marking a candidate before forwarding can suppress a retry after a failed delivery. The key omits media-section and negotiation-generation identity, and errors allow forwarding. It is duplicate suppression, not a reliable signaling protocol.
 
 ## Security / Auth
 
-- **Session-based authentication** with Redis-backed sessions
-- **CORS** restricted to frontend origin
-- **Helmet** security headers (CSP disabled for WebSocket compatibility)
-- **TURN credential rotation**: Credentials valid for 5 minutes, generated per-call
-- **Audit logging**: TURN credential requests logged with IP, userId, timestamp
+The proposal authenticates account/device claims, checks call membership and endpoint generation, validates socket origins and payload bounds, and limits ringing, credential issuance, connection admission, and message volume. TURN credentials are issued to an authorized caller with an expiry using a supported Coturn credential mechanism; expiry and renewal policy must accommodate allocations and long calls. The [Coturn reference](https://github.com/coturn/coturn/wiki/turnserver) documents its shared-secret mode. It is not a time-limited credential feature defined by the STUN RFC cited in the old answer.
 
-In production:
-- **E2E encryption**: SRTP with per-call keys derived from identity keys via X3DH
-- **Identity verification**: Short authentication string (SAS) for contact verification
-- **Certificate pinning**: Prevent MITM on signaling channel
-- **Push notification encryption**: Encrypted APNs payloads for incoming call alerts
+Local HTTP routes are public. `POST /api/users/login` returns a profile without setting a cookie. `handleRegister` verifies the existence of a supplied user ID, then trusts it. It also trusts a supplied device ID; the device upsert conflict branch does not update or verify its stored account owner. Re-registering a connection does not remove its old user index.
+
+Any registered client can answer or end a known call, or inject negotiation data into it. Answer does not require an invitation; its SQL participant update can affect zero rows and still produce success. Decline does not require a ringing call or invited actor. Static TURN credentials are returned to anonymous requests. Role values and installed session packages do not provide RBAC or sessions.
 
 ## Observability
 
-### Metrics (Prometheus via prom-client)
+[Pino](./backend/src/shared/logger.ts) provides request IDs, scoped socket loggers, call events, and an audit logger. Some database/REST paths still use console logging. Audit actors are claimed identities, and the separate logger is not automatically tamper-evident storage. SDP/media contents are not logged by the signaling event helper.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `facetime_calls_initiated_total` | Counter | Call volume by type (video/audio/group) |
-| `facetime_calls_answered_total` | Counter | Answer rate, combined with initiated for success rate |
-| `facetime_calls_ended_total` | Counter | End reasons (normal, timeout, error) |
-| `facetime_call_duration_seconds` | Histogram | Call duration distribution (30s-3600s buckets) |
-| `facetime_call_setup_latency_seconds` | Histogram | Time from initiation to connection (SLI) |
-| `facetime_active_calls` | Gauge | Current active call count |
-| `facetime_active_websocket_connections` | Gauge | Live WebSocket connections |
-| `facetime_websocket_connections_total` | Counter | Total connections established |
-| `facetime_websocket_errors_total` | Counter | Connection errors by type |
-| `facetime_ice_connection_type_total` | Counter | ICE types (host/srflx/relay) for NAT analysis |
-| `facetime_ice_candidate_latency_seconds` | Histogram | ICE gathering time |
-| `facetime_signaling_latency_seconds` | Histogram | Per-message processing latency |
-| `facetime_idempotency_hits_total` | Counter | Duplicate call initiations prevented |
-| `facetime_circuit_breaker_state` | Gauge | Circuit breaker state (0=closed, 1=open, 2=half-open) |
-| `facetime_cache_hits_total` | Counter | Cache hit rate by type (profile, presence, call_state) |
-| `facetime_cache_misses_total` | Counter | Cache miss rate by type |
+[Prometheus metrics](./backend/src/shared/metrics.ts) cover call initiation/answer/end, durations, connections, handler latency/errors, idempotency, breakers, and cache helpers. ICE type and gathering latency instruments are declared but never updated; the client does not call `getStats`. Call setup latency measures initiation to acceptance, including human ringing time, not time to ICE/media connection. Duration begins at server acceptance.
 
-### Structured Logging (Pino)
+Active-call counts can drift with races, failures, expiry, restarts, and inconsistent group labels. Connection gauge increments include unregistered sockets, whereas `/stats` overwrites it with registered-client count. Message-type and call-type labels accept unbounded supplied strings. Health probes check PG/Redis, not TURN allocation, media flow, permissions, or valid call transitions.
 
-- JSON-formatted logs with service metadata (`facetime-signaling`, version, PID)
-- Request-level correlation via `requestId` (UUID, propagated from `X-Request-Id` header)
-- Dedicated WebSocket logger with `clientId`, `userId`, `deviceId` context
-- Call event logger with `callId` and event type for tracing full call lifecycle
-- Audit logger (separate Pino instance) for security-sensitive operations (TURN credentials, auth)
-- Signaling event logger for WebRTC debugging (`offer`, `answer`, `ice-candidate`)
-
-### Health Checks
-
-- `GET /health` — Full health with database/Redis latency, circuit breaker states, memory usage
-- `GET /health/live` — Liveness probe (process running)
-- `GET /health/ready` — Readiness probe (database + Redis connectivity)
+Proposed operational signals separate request-to-ring, ring-to-answer, accept-to-first-media, signaling outage, media outage, relay ratio, reconnect outcome, candidate-pair quality, rejected stale generations, and missed deadlines. Summarize client metrics at a bounded interval; do not serialize every video frame through application state or log private candidate addresses indiscriminately.
 
 ## Failure Handling
 
-### Circuit Breaker (Opossum)
+| Failure | Proposed behavior | Current local behavior |
+|---------|-------------------|------------------------|
+| Lost initiation response | Retry same operation and retrieve durable receipt | No browser key/replay; optional server key may identify nonexistent call |
+| Two devices answer | One atomic seat winner; canonical outcome to siblings | Both can pass Redis read and receive success |
+| SQL fails after ring timer cleared | Recoverable transition with durable deadline | Separate updates can leave SQL/cache inconsistent and timer absent |
+| Signaling disconnect | Reauthenticate and reconcile; preserve healthy media briefly | Re-register only; no call-state resume or reconciliation |
+| Media path fails | Bounded ICE restart, generation change, visible failure | Logs failed/disconnected; no restart or user-facing recovery |
+| Server restarts during ringing | Deadline worker expires the durable invitation | In-memory timeout disappears; SQL can stay ringing |
+| Long accepted call | Refresh live leases independently of retention | Redis call expires two hours after last state write |
+| Logout | Stop reconnects and dispose the current call controller | Socket close schedules reconnect with retained identity |
+| Slow or abusive client | Bounded admission, input, and output queues | No application socket rate/backpressure policy |
 
-Wraps database and Redis operations with configurable thresholds:
-- **Error threshold**: 50% failure rate triggers open circuit
-- **Timeout**: 3 seconds per operation
-- **Reset timeout**: 10 seconds before half-open probe
-- **Volume threshold**: Minimum 5 requests before circuit can trip
-
-Circuit breaker state changes emit Prometheus metrics and structured log entries for alerting.
-
-### WebSocket Reconnection
-
-Client implements exponential backoff:
-- Attempts: 5
-- Delays: 1s, 2s, 4s, 8s, 16s
-- On reconnect: re-register device, rejoin active call if one exists
-
-### Graceful Shutdown
-
-Server handles SIGTERM/SIGINT:
-1. Stop accepting new connections
-2. Close all WebSocket connections with code 1001 ("going away")
-3. Wait 5 seconds for in-flight requests
-4. Close database pool and Redis connections
-5. Exit process
-
-### Call Recovery
-
-If a signaling connection drops during an active call:
-- P2P media continues flowing (independent of signaling)
-- Client has 30 seconds to reconnect signaling
-- If reconnected, call state is restored from Redis
-- If not reconnected within 30 seconds, the call is marked as ended
+The backend stops accepting HTTP connections and requests socket closure on shutdown, then exits after five seconds. It does not await all asynchronous call/presence work, close the PG pool/Redis client, reconcile calls, or persist ring timers. Startup logs dependency failures and can still listen; Redis connection attempts have no application-level bounded deadline.
 
 ## Scalability Considerations
 
-### Signaling Server Scaling
+Distribute socket connections across gateways and route call commands to an authority with storage-enforced revisions. Redis pub/sub can assist delivery, but cannot supply durable winner selection, missed-message recovery, or restart-safe timeouts by itself. A global busy policy must coordinate across different call IDs as well as across devices.
 
-Signaling servers are stateless — all state lives in Redis. Scale horizontally behind an L7 load balancer with WebSocket-aware sticky sessions (based on connection, not cookie). At 100M signaling messages/minute, with each server handling ~50K concurrent WebSocket connections, approximately 100 signaling servers are needed.
+Scale TURN by region, reachable allocation ranges, bandwidth, and tested UDP/TCP/TLS paths. Use real selected-pair measurements for capacity estimates. Draining a relay or SFU involves existing media sessions, not merely moving HTTP requests to another server. Group subscriptions and simulcast/SVC should match receiver capabilities and visible tiles rather than forwarding every high-resolution stream.
 
-### TURN Server Scaling
-
-TURN is the hardest to scale because it handles actual media traffic:
-- **Geographic distribution**: TURN servers in every major region (reduces relay latency)
-- **DNS-based routing**: GeoDNS routes clients to nearest TURN cluster
-- **Capacity planning**: Each TURN server handles ~5,000 concurrent relayed calls at ~4 Mbps each = 20 Gbps per server
-- **Graceful drain**: New calls routed away before server maintenance
-
-### Database Scaling
-
-- **Read replicas**: Call history queries (user's recent calls) served from replicas
-- **Write primary**: Call creation and state updates on primary
-- **Sharding**: At extreme scale, shard by `user_id` hash to keep each user's history on one shard
-- **Archive**: Calls older than 90 days moved to cold storage
-
-### Redis Scaling
-
-- **Redis Cluster**: Shard by call ID for call state, by user ID for presence
-- **Separate clusters**: Presence cluster (high write, short TTL) separate from call state cluster (moderate write, longer TTL)
-- **Sentinel**: Automatic failover with <30 second detection
+The current three backend scripts choose distinct ports, but all maps and timers remain process-local. Redis presence readers are not used for cross-server ring routing. More instances can therefore partition users into unreachable islands instead of increasing capacity for a shared calling service.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| 1:1 media | P2P (WebRTC) | SFU relay | Zero server cost, lowest latency, true E2E |
-| Group media | SFU | MCU / P2P mesh | O(N) connections, preserves stream control |
-| Signaling | WebSocket | HTTP polling / SSE | Sub-second bidirectional, mandatory for ICE |
-| Call state | Redis | PostgreSQL | Sub-ms latency in call setup critical path |
-| Presence | Redis hash per user | PostgreSQL polling | Real-time device tracking with TTL expiry |
-| TURN | Coturn (self-hosted) | Twilio / Xirsys | Cost control at scale, full RFC compliance |
-| Idempotency | Redis with TTL | Database unique constraint | Catches duplicates before DB, 5-min window |
-| NAT traversal | ICE (STUN+TURN) | Always relay | 85% P2P success rate saves TURN bandwidth |
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-App (conditional rendering based on login + call state)
-├── [Not logged in]
-│   └── LoginScreen (user list with click-to-login -- no passwords)
-├── [Logged in, idle]
-│   ├── Header (FaceTime logo, user info, logout button)
-│   ├── ContactList
-│   │   └── Contact rows (avatar, name, username, audio/video call buttons)
-│   └── Connection status indicator (bottom-left, green/yellow dot)
-├── [Incoming call ringing]
-│   └── IncomingCall (caller info, accept/decline buttons, ring animation)
-└── [Active call -- any non-idle state]
-    └── ActiveCall
-        ├── VideoPlayer (local + remote video streams)
-        └── CallControls (mute, video toggle, end call)
-```
-
-### Zustand Store
-
-A single unified store (`useStore`) manages all application state across four domains:
-
-**Auth**: `currentUser` (User object or null), `isLoggedIn` (boolean). The `setCurrentUser` action updates both fields atomically. There is no session persistence -- the "login" flow is simplified to clicking a username from a pre-seeded list (no passwords), suitable for demonstrating WebRTC without auth complexity.
-
-**Contacts**: `contacts` (array of all users). Set once on app mount by fetching from the REST API. Used to display the contact list and to resolve user IDs to display names during calls.
-
-**Call state**: `callState` (object with `callId`, `caller`, `callees`, `callType`, `state`, `direction`, `startTime`, `isGroup`). The `state` field drives all rendering logic: `idle` shows contacts, `ringing` with `direction: incoming` shows IncomingCall, any other non-idle state shows ActiveCall. `setCallState` does a partial merge (spread). `resetCallState` cleans up media streams (stopping all tracks) and resets all call-related state to defaults.
-
-**WebRTC streams**: `localStream` and `remoteStream` (MediaStream objects or null). Set by the `useWebRTC` hook during call setup. The store also manages UI toggles (`isMuted`, `isVideoOff`) that directly manipulate the local stream's track `enabled` property -- toggling `isMuted` disables/enables all audio tracks on the local stream.
-
-### Routing
-
-The FaceTime frontend does not use a router library. The entire application is a single-page experience with conditional rendering based on two state variables: `isLoggedIn` (from the store) and `callState.state` (from the store). The rendering logic in `App.tsx` follows a priority chain:
-
-1. If not logged in: render `LoginScreen`
-2. If call state is `ringing` and direction is `incoming`: render `IncomingCall`
-3. If call state is any non-idle value: render `ActiveCall`
-4. Otherwise: render the main contacts screen
-
-This approach is appropriate because FaceTime has no navigable pages -- it is a real-time communication tool where the UI is entirely driven by the current call state.
-
-### Data Fetching
-
-API communication uses two separate modules:
-
-**`services/api.ts`**: REST API calls for user listing (`fetchUsers`), login (`login`), and TURN credential fetching (`fetchTurnCredentials`). These are simple `fetch` wrappers called during initialization and call setup.
-
-**`services/signaling.ts`**: A singleton `SignalingService` class managing the WebSocket connection to the signaling server. This is the primary communication channel for the application. It handles:
-- Connection lifecycle with automatic reconnection (exponential backoff: 1s, 2s, 4s, 8s, 16s, up to 5 attempts)
-- 30-second heartbeat pings to maintain presence
-- Device registration on connect (auto-detects device type from user agent)
-- Persistent device ID stored in `localStorage`
-- Call control methods: `initiateCall`, `answerCall`, `declineCall`, `endCall`
-- WebRTC signaling relay: `sendOffer`, `sendAnswer`, `sendIceCandidate`
-- Message fan-out to registered handlers via `onMessage` subscription pattern
-
-### Key UI Patterns
-
-**WebRTC hook (`useWebRTC`)**: A custom React hook that encapsulates all WebRTC peer connection management. It handles media stream acquisition (with configurable video resolution and audio processing), RTCPeerConnection setup with ICE server configuration, ICE candidate exchange through the signaling service, and SDP offer/answer negotiation. The hook subscribes to signaling messages via `useEffect` and processes the WebRTC handshake state machine: `call_initiate` -> `call_ring` -> `call_answer` -> `offer` -> `answer` -> `ice_candidate` -> connected. It manages an ICE candidate queue for candidates that arrive before the remote description is set.
-
-**State-driven rendering**: The entire UI is driven by the `callState.state` field in the store. There are no imperative show/hide calls. When the signaling service receives an `incoming-call` message, it updates `callState` in the store, and React re-renders the appropriate screen automatically. This makes the UI predictable and easy to reason about.
-
-**Media stream lifecycle**: The store's `resetCallState` function handles cleanup: it iterates all tracks on both local and remote streams and calls `track.stop()` to release camera and microphone access. This prevents the common bug where ending a call leaves the camera indicator light on because tracks were not properly stopped.
-
-**Connection status indicator**: A fixed-position indicator in the bottom-left corner shows whether the WebSocket signaling connection is active (green dot + "Connected") or attempting to reconnect (yellow pulsing dot + "Connecting..."). This gives the user immediate feedback about their ability to make or receive calls.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade backend pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and why it matters for a system operating at scale.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is a method for restricting system access based on the roles assigned to individual users. In this project, users have a `role` column in the `users` table (default value `'user'`). The FaceTime implementation uses a simplified auth model (no passwords, click-to-login) focused on demonstrating WebRTC rather than access control, but the role column exists in the schema for admin endpoint protection.
-
-The purpose of RBAC is to separate "who can do what" from "who is who." Rather than checking individual user permissions on every request, the system checks the user's role against the required role for the endpoint. Admin-only endpoints (like active call listing) verify the role server-side. This pattern scales to millions of users because the permission check is a simple string comparison rather than a database lookup of per-user permissions.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database, and populates the cache on a miss.
-
-This project implements cache-aside with three distinct strategies:
-
-**User profiles** (1-hour TTL): User profile data (display name, avatar) changes infrequently. Caching it avoids repeated database lookups during contact list rendering and call history display. The 1-hour TTL balances freshness against database load.
-
-**Device presence** (60-second TTL with heartbeat refresh): Device online status is cached in Redis hash maps (`HSET`/`HGETALL`) keyed by user ID. Each device's presence entry includes device type, last heartbeat timestamp, and connection metadata. The 30-second heartbeat from the frontend refreshes the TTL, so a device that stops heartbeating is automatically removed from presence after 60 seconds.
-
-**Call state** (2-hour TTL): Active call metadata (participants, state, timestamps) is cached in Redis for sub-millisecond access during the call setup critical path. Call setup involves 10-20 state reads and writes within 3 seconds -- PostgreSQL's row-level locking overhead would add approximately 5ms per operation, totaling 100ms of unnecessary latency. Redis handles these as in-memory operations in approximately 0.1ms each.
-
-The presence caching pattern uses write-through rather than cache-aside: every heartbeat and registration event writes directly to Redis (not just the database), ensuring that presence data is always current. This is critical because stale presence data would cause calls to ring devices that are offline.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service. This project uses Opossum-based circuit breakers wrapping database and Redis operations.
-
-The circuit breaker has three states:
-
-1. **Closed** (normal): Requests pass through. The breaker monitors the error rate. If 50% of recent requests fail, it transitions to Open.
-2. **Open** (failing fast): All requests are immediately rejected without contacting the service. After a 10-second reset timeout, it transitions to Half-Open.
-3. **Half-Open** (probing): A limited number of requests test whether the service recovered. Success closes the breaker; failure reopens it.
-
-Configuration: 50% error threshold, 3-second timeout per operation, 10-second reset timeout, minimum 5 requests before the circuit can trip.
-
-The factory pattern (`createCircuitBreaker`) with a singleton registry ensures that only one breaker exists per operation name. A convenience wrapper `withCircuitBreaker` handles breaker creation, fallback registration, and execution in a single call, reducing boilerplate.
-
-State changes emit Prometheus metrics (`facetime_circuit_breaker_state` gauge) and structured log entries, enabling automated alerting when a breaker opens. This is critical in a real-time system because an open circuit breaker means calls cannot be initiated or history cannot be retrieved, and the on-call engineer needs to know immediately.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. This project uses Pino with several specialized logger configurations:
-
-- **Service metadata**: Every log entry includes the service name (`facetime-signaling`), version, and process ID. This is essential when running multiple instances behind a load balancer.
-- **Request correlation**: Each HTTP request gets a UUID (`requestId`) propagated from the `X-Request-Id` header or generated server-side. All log entries for that request share the ID.
-- **WebSocket logger**: A dedicated child logger with `clientId`, `userId`, and `deviceId` context. When debugging "why did user X not receive the incoming call ring?", filtering by `userId` across all log entries instantly reveals the answer.
-- **Call event logger**: Logs every call lifecycle event (initiated, answered, declined, ended) with `callId` and event type. This produces a complete, searchable timeline for any call.
-- **Audit logger**: A separate Pino instance for security-sensitive operations (TURN credential generation, authentication events). This can be routed to tamper-evident storage for compliance.
-- **Signaling event logger**: Logs every WebRTC signaling message (offer, answer, ICE candidate) for debugging connectivity issues. These logs are verbose and can be filtered out in production via log level configuration.
-
-At production scale with millions of concurrent calls, structured logging is the only practical way to debug issues. When a user reports "my call dropped after 30 seconds," the engineer filters by `callId`, sees the complete signaling sequence, identifies that ICE negotiation failed (no relay candidate gathered), and determines the root cause (TURN server was at capacity).
-
-### Prometheus Metrics
-
-This project exposes 16 custom Prometheus metrics covering the full call lifecycle:
-
-**Call volume metrics** (Counters): `facetime_calls_initiated_total`, `facetime_calls_answered_total`, `facetime_calls_ended_total` -- segmented by call type (video/audio/group) and end reason (normal/timeout/error). Computing the answer rate (answered/initiated) reveals the percentage of calls that connect successfully.
-
-**Latency metrics** (Histograms): `facetime_call_setup_latency_seconds` measures time from initiation to ICE connection -- this is the primary SLI (Service Level Indicator) for the product. `facetime_signaling_latency_seconds` measures per-message processing time in the signaling server. `facetime_ice_candidate_latency_seconds` measures ICE gathering duration.
-
-**Connection health** (Gauges): `facetime_active_calls` and `facetime_active_websocket_connections` show current system load. Combined with call duration histograms, these enable capacity planning: "at peak, we have 5000 active calls averaging 8 minutes each, so we need TURN capacity for 750 concurrent relayed calls."
-
-**Infrastructure insights** (Counters): `facetime_ice_connection_type_total` tracks how calls connect (host/srflx/relay). If the relay percentage increases from 15% to 30%, it indicates network environment changes requiring more TURN server capacity. `facetime_idempotency_hits_total` tracks duplicate call initiations prevented.
-
-Default Node.js metrics (CPU, memory, event loop lag, GC pause time) are collected automatically with the `facetime_` prefix, enabling correlation between application metrics and system resource consumption.
-
-### Rate Limiting
-
-This project does not implement explicit rate limiting middleware in the backend because the primary communication channel is WebSocket (not HTTP), and WebSocket connections are inherently limited by the connection count per client. However, the signaling server does implement implicit rate control through call state validation: a client cannot initiate a new call while already in a call, preventing call-initiation spam.
-
-At production scale, rate limiting would be applied at the API Gateway level: (1) TURN credential requests limited to 10/minute per user (prevents credential harvesting), (2) WebSocket message rate limited to 100/second per connection (prevents signaling flooding), (3) Call initiation limited to 5/minute per user (prevents ring spam).
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. This project implements two forms of idempotency:
-
-**Call initiation idempotency**: The client sends an `X-Idempotency-Key` header (client-generated UUID) stored in Redis with a 5-minute TTL. If the client retries due to network timeout, the server returns the existing call ID instead of creating a duplicate call. Without this, a mobile client on a flaky network might retry 3 times, creating 3 separate calls. The callee would see 3 incoming call notifications stacked on each other, and accepting one would leave 2 orphaned "ringing" calls.
-
-**ICE candidate deduplication**: ICE candidates are deduplicated using `SHA-256(callId:deviceId:candidateString)` stored in Redis with `SETNX` (set-if-not-exists) and a 1-hour TTL. This prevents duplicate candidates from network retries or redundant gathering from flooding the peer. Each duplicate is silently dropped rather than forwarded.
-
-Idempotency metrics track hit/miss rates, revealing how frequently clients are retrying and whether the network conditions are degrading.
-
-### Health Checks
-
-This project implements a three-tier health check system:
-
-1. **`/health/live`** (liveness probe): Returns 200 if the process is running. Kubernetes uses this to decide whether to restart a container.
-
-2. **`/health/ready`** (readiness probe): Tests connectivity to PostgreSQL and Redis by executing lightweight operations. A server that is alive but cannot reach the database should not receive WebSocket connections.
-
-3. **`/health`** (full health check): Returns detailed status including database and Redis latency measurements, circuit breaker states (open/closed/half-open), memory usage, and active connection counts. This is used by monitoring dashboards.
-
-The health check is particularly important for this project because WebSocket connections are sticky (a client stays on the same server for the duration of the connection). If a server becomes unhealthy, existing connections may continue working (P2P media flows independently of signaling), but new connections should be routed elsewhere. The readiness probe enables this routing without disrupting active calls.
-
----
+| Call authority | Transactional SQL transitions/receipts | Independent Redis and SQL writes | One durable outcome across concurrent devices |
+| Notifications | Outbox with revision-aware delivery | In-process send after partial writes | Retryable rings and dismissals after restart |
+| One-to-one media | Direct ICE plus TURN fallback | Always relay | Reduce avoidable relay traffic while supporting difficult networks |
+| Group media | SFU with bounded subscriptions | Unrestricted mesh / MCU | Control endpoint upload and receiver workload |
+| Presence | Per-connection leases | One user-hash TTL | Expire abandoned connections independently |
+| Client ownership | Call controller with attempt generations | Shared mutable refs and unscoped callbacks | Prevent late negotiation/media from affecting another call |
 
 ## Implementation Notes
 
-### Local Architecture
+### Actual topology and request path
 
+[index.ts](./backend/src/index.ts) creates Express and `/ws` on one server. [The signaling entry point](./backend/src/services/signaling/index.ts) attaches independent asynchronous message handlers without serialization. [connection-manager.ts](./backend/src/services/signaling/connection-manager.ts) holds clients, user-to-client indexes, ring timers, and creation timestamps in memory. Redis does not transport messages between these maps.
+
+[Registration](./backend/src/services/signaling/registration-handler.ts) reads the user profile cache, falls back to a database lookup, inserts local mappings, writes presence, and launches a device upsert without waiting for it. A subsequent call can race device creation and hit a foreign-key failure. Errors after inserting mappings can leave a registered map entry while the connection handler still has no current client. Repeated registration can also leave old user-index entries or multiple connections sharing one device ID.
+
+[Initiation](./backend/src/services/signaling/call-initiate-handler.ts) stores an optional key before creating a SQL call and caller participant through two breakers. It then stores Redis state, increments metrics, reads caller metadata, inserts each callee participant separately, fans out rings, and finally schedules a thirty-second timer and confirms initiation. There is no transaction, busy guard, recipient/type bound, or rollback of earlier writes when a later step fails.
+
+[Answer/decline/end](./backend/src/services/signaling/call-response-handler.ts) and [room teardown](./backend/src/services/signaling/room-manager.ts) use separate Redis reads and unconditional SQL/cache writes. Answer clears the timer before database success. Concurrent answers both succeed; full-state Redis replacement can lose one participant. Timeout can race an answer and still end the call. End writes left_at but does not change participant state to left; concurrent termination can repeat metrics and notifications. The server does not write the dedicated history table.
+
+### Wired patterns and implementation defects
+
+**Circuit breakers.** The [Opossum helper](./backend/src/shared/circuit-breaker.ts) is actually wired around user lookup, device upsert/offline, call creation, and caller-participant creation. It uses a three-second timeout, 50% failure threshold after five calls, and ten-second reset. Other queries and Redis operations bypass it; a breaker timeout does not cancel the underlying SQL operation.
+
+Its registry stores the first action for each name:
+
+```typescript
+if (breakers.has(name)) {
+  return breakers.get(name)!;
+}
 ```
-┌───────────────┐     ┌───────────────────────────────────────┐
-│   Browser     │     │        Docker Compose                 │
-│   (React)     │     │                                       │
-│               │     │  ┌────────────┐  ┌────────────┐      │
-│  :5173        │────▶│  │ PostgreSQL │  │   Valkey   │      │
-│  Vite Dev     │     │  │   :5432    │  │   :6379    │      │
-└───────┬───────┘     │  └────────────┘  └────────────┘      │
-        │             │                                       │
-        │             │  ┌────────────┐                       │
-        │ WS + HTTP   │  │  Coturn    │                       │
-        ▼             │  │ :3478 UDP  │                       │
-┌───────────────┐     │  │ :3478 TCP  │                       │
-│  Express +    │     │  │ :5349 TLS  │                       │
-│  WebSocket    │────▶│  │ :49152-    │                       │
-│  :3000        │     │  │  49200 UDP │                       │
-│  (signaling)  │     │  └────────────┘                       │
-└───────────────┘     └───────────────────────────────────────┘
-```
 
-### Production-Grade Patterns Implemented
+Call sites pass fresh zero-argument closures capturing request values. Subsequent executions therefore run the first closure rather than the new request. Isolated execution with the installed Opossum confirmed that a later registration reads the first user and repeats the first device upsert; a second call retries the first call ID and fails a simulated primary-key check. This is a correctness defect, not resilience. A reusable breaker needs a stable action receiving current arguments, or an equivalent correctly parameterized dispatch.
 
-**Structured logging** (`backend/src/shared/logger.ts`): Pino with JSON output, request correlation via UUID, dedicated child loggers for WebSocket connections (with `clientId`/`userId`/`deviceId` context), call events, and security audit events. Separate audit logger instance for compliance-sensitive operations. This pattern is critical at production scale where text logs are unsearchable across thousands of server instances.
+**Caching and presence.** [services/redis.ts](./backend/src/services/redis.ts) stores the full call JSON at `call:<id>` for 7,200 seconds; answer resets this TTL, but heartbeat does not. Profile cache-aside in [shared/cache.ts](./backend/src/shared/cache.ts) uses `user:profile:<id>` for one hour. Registration concurrently invokes two presence writers on `presence:<userId>`: one sets 3,600 seconds, the other sets sixty seconds through a transaction. The last expiry wins, and either expiry is for the whole hash. Ping changes only lastPing in the local client; the TTL-refresh helper is unused. Presence readers and metric-bearing call-cache wrappers are also unused by active routing/call handlers.
 
-**Prometheus metrics** (`backend/src/shared/metrics.ts`): 16 custom metrics covering call lifecycle (initiated/answered/ended counters, duration histogram, setup latency histogram), connection health (active WebSocket gauge, error counter), ICE/TURN analysis (connection type counter, candidate latency histogram), idempotency tracking, circuit breaker state, and cache hit/miss rates. Default Node.js metrics (CPU, memory, event loop) collected automatically with `facetime_` prefix.
+**Idempotency and metrics.** [idempotency.ts](./backend/src/shared/idempotency.ts) implements the best-effort key and candidate suppression described above, not durable receipts. Opossum and several cache/metric helpers have real call sites, but metric declarations for ICE do not prove measured media quality. Basic PG/Redis checks are useful for dependency visibility, while end-to-end call and relay checks are omitted.
 
-**Circuit breaker** (`backend/src/shared/circuit-breaker.ts`): Opossum-based with configurable thresholds (50% error rate, 3s timeout, 10s reset). Factory pattern (`createCircuitBreaker`) with singleton registry. State changes emit Prometheus metrics and structured logs. Includes a convenience wrapper `withCircuitBreaker` that handles breaker creation, fallback registration, and execution in one call.
+**Connection cleanup.** Heartbeat checks run every thirty seconds and terminate registered clients whose last ping is over sixty seconds old. Termination calls disconnect cleanup directly, and socket close calls it again. Cleanup removes maps/presence and asynchronously marks a device offline; it does not end calls. Unregistered sockets are absent from that heartbeat map. Old connections sharing a device can remove presence or mark it offline while another remains open.
 
-**Idempotency** (`backend/src/shared/idempotency.ts`): Redis-backed idempotency keys for call initiation with 5-minute TTL. Prevents duplicate calls from network retries. Also includes ICE candidate deduplication via SHA-256 hashing with SETNX. Metrics track hit/miss rates for monitoring duplicate request frequency.
+### Frontend media and state
 
-**Caching** (`backend/src/shared/cache.ts`): Three caching strategies — cache-aside for user profiles (1h TTL), write-through for device presence (60s TTL with heartbeat refresh), and direct cache for call state (2h TTL). Presence uses Redis hash maps (`HSET`/`HGETALL`) for per-user device tracking with pipeline support for batch queries. All cache operations emit hit/miss metrics.
+[App.tsx](./frontend/src/App.tsx) fetches contacts once, performs username lookup, and switches screens without a router. Identity lives only in memory. The socket's deviceId persists in localStorage independently of account; separate profiles avoid sharing it, but do not fix server authorization or closure bugs. The contact list shows no online presence. The connection indicator reads `isConnected()` without a reactive subscription.
 
-**WebSocket signaling** (`backend/src/services/signaling/`): Full signaling protocol across 6 handler modules — registration, call initiation, call response, signaling relay (offer/answer/ICE), connection management, and room management. Device registration, multi-device ring, and call state machine are implemented.
+[useWebRTC.ts](./frontend/src/hooks/useWebRTC.ts) fetches credentials once at mount; [Vite](./frontend/vite.config.ts) does not proxy `/turn-credentials`. The default request cannot retrieve the backend JSON and falls back to two public STUN servers. The server's third STUN URL and local TURN entry therefore do not reach that normal path. Coturn's container publishes 5349 but passes `--no-tls --no-dtls`; there is no configured secure TURN fallback.
 
-**Health checks** (`backend/src/index.ts`): Three-tier health system — `/health` (full dependency check with latency), `/health/live` (liveness probe), `/health/ready` (readiness probe). Reports database/Redis connectivity, circuit breaker states, and process memory.
+Capture requests ideal 1280×720 at 30 fps for video and requests echo cancellation, noise suppression, and automatic gain control for audio. These are browser constraints/preferences. It is incorrect to say audio processing and transport encryption are entirely absent. The application has no getStats collection, quality policy, simulcast/SVC configuration, ICE restart, or device-change handling.
 
-**Graceful shutdown** (`backend/src/index.ts`): SIGTERM/SIGINT handlers that close WebSocket connections with code 1001, drain HTTP server, and allow 5 seconds for in-flight operations before process exit.
+The caller creates a peer before receiving a call ID. Its onicecandidate callback captures the then-current empty ID, so later trickle candidates are not sent through that callback. An SDP offer may contain candidates already gathered, so this is a concrete loss of trickle signaling rather than proof that every direct connection must fail. The caller creates an initial local offer and another after call acceptance; offer/answer and candidate handlers have no serialized negotiation or glare policy.
 
-### What Was Simplified or Substituted
+Incoming messages do not check the current call ID/generation. A late call_end can terminate another call, a new ring can overwrite an active call, and the shared candidate queue is never cleared on reset. Late getUserMedia results can allocate/attach streams after cancellation. Error/reset paths stop current store tracks but do not consistently close the peer ref, and hook teardown only unsubscribes messages. There is no error/busy handler in the call hook or acceptance retry state.
 
-| Production Component | Local Substitute | Impact |
-|---------------------|-----------------|--------|
-| Apple Push Notification Service | WebSocket-only ring | Offline devices do not ring |
-| STUN cluster (geo-distributed) | Google public STUN + local Coturn | Works for LAN/localhost only |
-| Redis Cluster (sharded) | Single Valkey instance | No failover, no sharding |
-| E2E encryption (SRTP + key exchange) | Unencrypted WebRTC media | Media not encrypted in transit |
-| OAuth / Apple ID | Simple user selection (no passwords) | No real authentication |
-| SFU for group calls | P2P only | Group calls limited to ~4 participants |
-| CDN for static assets | Vite dev server | No caching, no edge distribution |
-| L7 load balancer | Direct connection to single server | No horizontal scaling |
+[signaling.ts](./frontend/src/services/signaling.ts) resolves connect on socket open before registration acknowledgment, sends no initiation idempotency key, drops closed-socket sends, and reconnects after 1/2/4/8/16 seconds without jitter or call-state resume. Disconnect retains user/device identity and triggers the same retry path; timers are not tracked for cancellation. Repeated connect can overlap sockets and heartbeat intervals.
 
-### What Was Omitted
+[useStore.ts](./frontend/src/stores/useStore.ts) stops currently stored local/remote tracks on reset, and mute/video toggles change track.enabled. It does not dispose the peer connection or candidate queue. Outgoing initiation clears the callee selected by App, producing an Unknown name. [VideoPlayer.tsx](./frontend/src/components/VideoPlayer.tsx) binds a non-null srcObject and uses autoplay/playsInline, with a muted mirrored local preview; it does not explicitly clear null streams, handle playback rejection, or display audio-only/video-muted state. Incoming-call icon buttons have visible adjacent text but lack explicit accessible names; call-state announcements and focus/reduced-motion handling are absent.
 
-- **SFU implementation** — Group calls beyond 4 participants
-- **E2E encryption** — SRTP key exchange, identity verification, SAS
-- **Adaptive bitrate** — Network quality detection and codec adjustment
-- **Simulcast / SVC** — Multiple quality layers for receivers
-- **SharePlay** — Shared media experiences during calls
-- **Device handoff** — Transferring active call between devices
-- **Push notifications** — APNs for ringing offline devices
-- **Multi-region deployment** — Geographic distribution of signaling and TURN
-- **Kubernetes orchestration** — Container management and auto-scaling
-- **Call recording** — Server-side recording and storage
-- **Audio processing** — Echo cancellation, noise suppression, automatic gain control
+### Local substitutions, omissions, and verification
+
+Compose supplies PostgreSQL 16, Valkey 7, and Coturn with static credentials and a small port range. Schema initialization and seeding are separate; there are no migration/seed scripts or dotenv loading. SQL seed users are skipped on username conflict, while randomly identified devices accumulate on reruns. `npm run build` emits the CommonJS-compatible NodeNext backend to dist, and start runs dist/index.js. The [README](./README.md) documents both infrastructure options and exact environment defaults.
+
+Omitted production mechanisms include real identity/session authorization, atomic invitation/busy claims, durable receipts/outbox/deadline recovery, cross-gateway delivery, short-lived TURN issuance, authenticated endpoint negotiation, group media/key handling, push, handoff, screen sharing, and media-quality telemetry. The browser controls demonstrate one-to-one intent, not a validated mesh or SFU.
+
+The only checked-in browser test asserts that the login container renders; screenshot configuration additionally selects Alice and captures contacts. There is no backend test script or two-party media/relay test. This review executed eight isolated checks with mocked services/sockets/media and the actual circuit-breaker wrapper, confirming the closure, acceptance, membership, logout, and caller-candidate findings. It did not start infrastructure, modify application source, run a build, or claim measured media performance.

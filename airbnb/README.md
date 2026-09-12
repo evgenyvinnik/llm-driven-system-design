@@ -1,274 +1,262 @@
-# Design Airbnb - Two-Sided Marketplace
+# Airbnb — Vacation Rental Marketplace
 
-## Codebase Stats
+A local learning project for a two-sided rental marketplace. Guests browse places,
+select dates, request or instantly confirm a booking, message hosts, and review
+completed stays. Hosts can create listings and respond to reservation requests.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 14,081 |
-| Source Files | 84 |
-| .ts | 7,329 |
-| .tsx | 3,333 |
-| .md | 2,461 |
-| .sql | 627 |
-| .json | 153 |
+The useful system design problem is the boundary between discovery and commitment:
+a search result may be stale, but two guests must not acquire the same property
+for overlapping nights. The implementation demonstrates a transactional booking
+path and also contains gaps that make this invariant worth studying.
 
-## Overview
+This is a teaching application, not Airbnb's implementation. There is no payment
+processor, map UI, identity verification service, or complete host editing workflow.
+The production design and the source-grounded implementation assessment are in
+[architecture.md](./architecture.md).
 
-A simplified Airbnb-like platform demonstrating two-sided marketplace dynamics, availability calendars, search ranking, and trust & safety systems. This educational project focuses on building a property rental marketplace with complex booking workflows.
+## What is implemented
 
-## Tech Stack
+| Area | Current behavior |
+|------|------------------|
+| Discovery | Listing cards, destination suggestions, PostGIS radius search, filters and sorting |
+| Listing details | Photos, amenities, host information, visible reviews, date selector and price preview |
+| Reservations | Instant or host-approved bookings, guest trips, host reservations, cancellation and completion APIs |
+| Host tools | Become a host, create a listing, view owned listings, confirm or decline requests |
+| Communication | Stored conversations and messages fetched when opened; no live delivery or polling |
+| Reviews | Completed-stay reviews; a database trigger reveals reviews after both parties submit |
+| Infrastructure | PostgreSQL/PostGIS, Valkey sessions and caches, RabbitMQ publishing and worker prototypes |
+| Diagnostics | Pino request logs, audit records, Prometheus endpoint, health/readiness/liveness endpoints |
 
-- **Frontend:** TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
-- **Backend:** Node.js + Express (TypeScript, ESM)
-- **Database:** PostgreSQL with PostGIS extension
-- **Cache:** Redis / Valkey
-- **Message Queue:** RabbitMQ (async notifications, analytics, search reindex)
-- **Containerization:** Docker Compose
+The listing creation wizard currently navigates to an edit route that does not
+exist. The host list's Edit and Calendar links open the public listing page.
+Listing updates, photo uploads, and availability changes are available through the
+API, but do not have complete corresponding host screens. An admin role exists in
+the schema and seed; there is no admin dashboard or admin route group.
 
-## Quick Start
+## Stack and layout
 
-### Prerequisites
+- **Frontend:** React 19, TypeScript, Vite, TanStack Router, Zustand, Tailwind CSS and date-fns.
+- **Backend:** TypeScript, Node.js, Express, node-postgres and cookie sessions.
+- **Infrastructure:** PostgreSQL 16 with PostGIS 3.4, Valkey 7, RabbitMQ 3 management image in Compose.
+- **Images:** Local files under `backend/uploads/listings`; seed images use external Picsum URLs.
 
-- Node.js 20+
-- Docker and Docker Compose
-- npm or yarn
+| Location | Purpose |
+|----------|---------|
+| [frontend/src/routes](./frontend/src/routes) | Guest and host pages |
+| [frontend/src/services/api.ts](./frontend/src/services/api.ts) | Central fetch wrapper and API clients |
+| [backend/src/routes](./backend/src/routes) | HTTP business operations |
+| [backend/src/db/init.sql](./backend/src/db/init.sql) | Schema, indexes, functions and triggers |
+| [backend/src/shared](./backend/src/shared) | Cache, circuit breaker, queue, logging, audit and metrics helpers |
+| [backend/src/workers](./backend/src/workers) | Incomplete booking, notification and analytics consumers |
 
-### 1. Start Infrastructure
+## Local setup
+
+Use Node.js 20 or newer and npm. Run commands from the stated directories. Choose
+one infrastructure option; both use the same application connection defaults.
+
+### Option A: Docker Compose (recommended)
+
+From the repository root:
 
 ```bash
-# Start PostgreSQL (with PostGIS), Redis/Valkey, and RabbitMQ
-docker-compose up -d
-
-# Verify containers are running
-docker-compose ps
+cd airbnb
+docker compose up -d
+docker compose ps
+docker compose exec postgres pg_isready -U airbnb -d airbnb
+docker compose exec redis redis-cli ping
+docker compose exec rabbitmq rabbitmq-diagnostics -q ping
 ```
 
-### 2. Start Backend
+Compose loads `backend/src/db/init.sql` when it initializes an **empty** PostgreSQL
+volume. There is no `db:migrate` npm script. The schema contains ordinary table
+creation statements; replaying it against an initialized database is not a migration.
+
+To stop services while retaining data:
 
 ```bash
-cd backend
+docker compose down
+```
+
+For an intentional clean reset, `docker compose down -v` removes all three service
+volumes and their data. Starting Compose again recreates the schema.
+
+### Option B: Native installation (no Docker, macOS)
+
+Homebrew's current PostGIS formula supports PostgreSQL 17/18, so this native example
+uses PostgreSQL 17; Compose remains the reproducible PostgreSQL 16 setup. Check the
+[PostGIS formula](https://formulae.brew.sh/formula/postgis) if that packaging changes.
+Do not start a second PostgreSQL service on an already occupied port 5432.
+
+```bash
+brew install postgresql@17 postgis valkey rabbitmq
+export PATH="$(brew --prefix postgresql@17)/bin:$(brew --prefix rabbitmq)/sbin:$PATH"
+brew services start postgresql@17
+brew services start valkey
+brew services start rabbitmq
+pg_isready -h localhost -p 5432
+valkey-cli ping
+rabbitmq-diagnostics -q ping
+```
+
+Create the application role and database once, using the local PostgreSQL
+administrator account established by Homebrew:
+
+```bash
+psql postgres -c "CREATE ROLE airbnb LOGIN PASSWORD 'airbnb_dev_password';"
+createdb -O airbnb airbnb
+psql airbnb -c 'CREATE EXTENSION IF NOT EXISTS postgis;'
+```
+
+From the repository root, initialize the fresh database:
+
+```bash
+PGPASSWORD=airbnb_dev_password psql -h localhost -U airbnb -d airbnb -v ON_ERROR_STOP=1 -f airbnb/backend/src/db/init.sql
+```
+
+Create the RabbitMQ account and grant access to the default virtual host:
+
+```bash
+rabbitmqctl add_user airbnb airbnb_dev
+rabbitmqctl set_permissions -p / airbnb '.*' '.*' '.*'
+rabbitmqctl set_user_tags airbnb management
+```
+
+Verify both data services with the application credentials:
+
+```bash
+PGPASSWORD=airbnb_dev_password psql -h localhost -U airbnb -d airbnb -c 'SELECT PostGIS_Version();'
+rabbitmqctl list_permissions -p /
+```
+
+No object storage bucket is required. Uploads are local disk files.
+
+### Install, seed, and start the backend
+
+From the repository root:
+
+```bash
+cd airbnb/backend
 npm install
-npm run seed  # Seed database with sample data
-npm run dev   # Start on port 3000
+npm run seed
+npm run dev
 ```
 
-### 3. Start Frontend
+`seed` is for a disposable demo database: it **deletes existing listings**, creates
+eight example listings and sample accounts, and adds a past completed stay with
+reviews. Existing user passwords are not reset by its upsert, and cached listing
+or search data is not invalidated. Prefer seeding a fresh database before browsing.
+
+For newly created demo accounts, the password is `password123`:
+
+| Account | Persona |
+|---------|---------|
+| `guest1@example.com` | Guest |
+| `host1@example.com`, `host2@example.com` | Hosts |
+| `admin@example.com` | Schema-level admin role; no admin UI |
+
+Start the backend from `airbnb/backend` so the upload writer and static file server
+agree on the directory. The API listens at [localhost:3000](http://localhost:3000).
+
+### Start the frontend
+
+In another terminal, from the repository root:
 
 ```bash
-cd frontend
+cd airbnb/frontend
 npm install
-npm run dev   # Start on port 5173
+npm run dev
 ```
 
-### 4. Access the Application
+Open [localhost:5173](http://localhost:5173). Vite proxies `/api` and `/uploads` to
+port 3000. Explore a seeded destination without dates first; date-filtered search
+has a known query defect described below.
 
-- **Frontend:** http://localhost:5173
-- **Backend API:** http://localhost:3000/api
+| Page | Purpose |
+|------|---------|
+| `/`, `/search`, `/listing/$id` | Discovery and listing details |
+| `/login`, `/register`, `/become-host` | Account flows |
+| `/trips`, `/booking/$id`, `/messages` | Guest reservations, reviews and conversations |
+| `/host/listings`, `/host/listings/new`, `/host/reservations` | Implemented host pages |
 
-### Sample Login Credentials
+### Environment variables
 
-| Role   | Email                  | Password     |
-|--------|------------------------|--------------|
-| Host   | host1@example.com      | password123  |
-| Host   | host2@example.com      | password123  |
-| Guest  | guest1@example.com     | password123  |
-| Guest  | guest2@example.com     | password123  |
-| Admin  | admin@example.com      | password123  |
+Defaults are defined directly in source. The backend does not load a `.env` file;
+export overrides in the shell before starting it.
 
-## Key Features
+| Variable | Default | Used for |
+|----------|---------|----------|
+| `PORT` | `3000` | HTTP listener |
+| `DB_HOST`, `DB_PORT` | `localhost`, `5432` | PostgreSQL address |
+| `DB_USER`, `DB_PASSWORD` | `airbnb`, `airbnb_dev_password` | PostgreSQL credentials |
+| `DB_NAME` | `airbnb` | Database |
+| `REDIS_URL` | `redis://localhost:6379` | Sessions, cache and consumer markers |
+| `RABBITMQ_URL` | `amqp://airbnb:airbnb_dev@localhost:5672` | Broker |
+| `FRONTEND_URL` | `http://localhost:5173` | Credentialed CORS origin |
+| `NODE_ENV`, `LOG_LEVEL` | `development`, `info` | Cookies and logging behavior |
 
-### 1. Property Listings
-- Host property management with photos
-- Amenities and house rules
-- Custom pricing per night
-- Availability calendar management
+RabbitMQ management is at [localhost:15672](http://localhost:15672), using
+`airbnb` / `airbnb_dev`.
 
-### 2. Search & Discovery
-- Location-based search using PostGIS
-- Date availability filtering
-- Price range and amenity filters
-- Property type filtering
+## Commands and verification
 
-### 3. Booking System
-- Availability calendar with date ranges
-- Instant book vs request-to-book
-- Double-booking prevention with database transactions
-- Cancellation handling
-
-### 4. Trust & Safety
-- Two-sided reviews (hidden until both submit)
-- Rating aggregation
-- Host verification status
-
-### 5. Messaging
-- Host-guest communication
-- Pre-booking inquiries
-- Conversation threading
-
-## Project Structure
-
-```
-airbnb/
-├── docker-compose.yml      # PostgreSQL + Redis/Valkey + RabbitMQ
-├── backend/
-│   ├── src/
-│   │   ├── index.ts        # Express server
-│   │   ├── db.ts           # PostgreSQL connection + transaction helper
-│   │   ├── redis.ts        # Redis connection
-│   │   ├── seed.ts         # Sample-data seeder (npm run seed)
-│   │   ├── routes/         # API endpoints
-│   │   │   ├── auth.ts
-│   │   │   ├── listings.ts
-│   │   │   ├── search.ts
-│   │   │   ├── bookings.ts
-│   │   │   ├── reviews.ts
-│   │   │   └── messages.ts
-│   │   ├── shared/           # Common modules
-│   │   │   ├── cache.ts      # Redis caching with cache-aside pattern
-│   │   │   ├── queue.ts      # RabbitMQ producer/consumer
-│   │   │   ├── metrics.ts    # Prometheus metrics
-│   │   │   ├── logger.ts     # Pino structured logging
-│   │   │   ├── audit.ts      # Audit logging for compliance
-│   │   │   └── circuitBreaker.ts  # Circuit breaker pattern
-│   │   ├── services/       # Business logic (auth hashing, etc.)
-│   │   ├── workers/        # RabbitMQ consumers (booking, notification, analytics)
-│   │   ├── middleware/     # Auth middleware
-│   │   └── db/
-│   │       └── init.sql    # Database schema (mounted into Postgres initdb.d)
-├── frontend/
-│   ├── src/
-│   │   ├── routes/         # Tanstack Router pages
-│   │   ├── components/     # React components
-│   │   ├── stores/         # Zustand stores
-│   │   ├── services/       # API client
-│   │   └── types/          # TypeScript types
-│   └── index.html
-├── architecture.md
-├── claude.md
-└── README.md
-```
-
-## API Endpoints
-
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
-- `POST /api/auth/become-host` - Become a host
-
-### Listings
-- `GET /api/listings` - Get all listings
-- `GET /api/listings/:id` - Get listing by ID
-- `POST /api/listings` - Create listing (host only)
-- `PUT /api/listings/:id` - Update listing
-- `GET /api/listings/:id/availability` - Get availability
-- `PUT /api/listings/:id/availability` - Update availability
-
-### Search
-- `GET /api/search` - Search listings with filters
-- `GET /api/search/suggest` - Location suggestions
-- `GET /api/search/popular-destinations` - Popular destinations
-
-### Bookings
-- `GET /api/bookings/check-availability` - Check dates
-- `POST /api/bookings` - Create booking
-- `GET /api/bookings/my-trips` - Guest's bookings
-- `GET /api/bookings/host-reservations` - Host's reservations
-- `PUT /api/bookings/:id/respond` - Accept/decline
-- `PUT /api/bookings/:id/cancel` - Cancel booking
-
-### Reviews
-- `POST /api/reviews` - Create review
-- `GET /api/reviews/listing/:id` - Get listing reviews
-
-### Messages
-- `POST /api/messages/start` - Start conversation
-- `GET /api/messages` - Get conversations
-- `GET /api/messages/:id` - Get messages
-- `POST /api/messages/:id/messages` - Send message
-
-### Observability Endpoints
-- `GET /health` - Detailed health check (Redis, PostgreSQL, RabbitMQ, Circuit Breakers)
-- `GET /metrics` - Prometheus metrics endpoint
-- `GET /ready` - Kubernetes readiness probe
-- `GET /live` - Kubernetes liveness probe
-- `GET /debug/circuit-breakers` - Circuit breaker status
-
-## Observability & Reliability Features
-
-### Caching (Redis)
-- **Cache-aside pattern** for listing details and availability
-- **TTL strategy**: 15 min for listings, 1 min for availability, 5 min for search results
-- **Cache invalidation** on booking/update operations
-
-### Message Queue (RabbitMQ)
-- **Async notifications** for booking confirmations and host alerts
-- **At-least-once delivery** with idempotency protection
-- **Dead-letter queues** for failed message handling
-- Access RabbitMQ Management UI at http://localhost:15672 (airbnb/airbnb_dev)
-
-### Prometheus Metrics
-Key metrics tracked:
-- `airbnb_bookings_total` - Booking counts by status
-- `airbnb_search_latency_seconds` - Search performance histogram
-- `airbnb_availability_checks_total` - Availability check counts
-- `airbnb_cache_hits_total` / `airbnb_cache_misses_total` - Cache efficiency
-- `airbnb_queue_depth` - RabbitMQ queue sizes
-
-### Structured Logging (Pino)
-- JSON-formatted logs for aggregation (Loki, ELK)
-- Request ID tracing across all logs
-- Pretty-printed output in development mode
-
-### Audit Logging
-- Complete audit trail for bookings (create, confirm, cancel)
-- Before/after state capture for changes
-- IP address and session tracking for dispute resolution
-
-### Circuit Breaker (Opossum)
-- Search and availability operations protected
-- Automatic fallback on service degradation
-- Self-healing with half-open state testing
-
-## Multi-Instance Testing
-
-Run multiple backend instances for load testing:
+In `airbnb/backend`:
 
 ```bash
-# Terminal 1
-PORT=3001 npm run dev
-
-# Terminal 2
-PORT=3002 npm run dev
-
-# Terminal 3
-PORT=3003 npm run dev
+npm run type-check
+npm run build
+npm test
 ```
 
-## Key Technical Challenges
+`npm run start` runs source through `tsx`; it does not execute the compiled output.
+`dev:server1`, `dev:server2`, and `dev:server3` start API instances on ports
+3001–3003 against shared infrastructure. No load balancer is supplied, and the
+frontend proxy still targets port 3000 until reconfigured.
 
-1. **Availability Calendar**: Date ranges stored as blocks with overlap detection
-2. **Search Ranking**: PostGIS for geographic queries with availability filtering
-3. **Double-Booking Prevention**: Database transactions with row-level locking
-4. **Two-Sided Reviews**: Visibility triggered when both parties submit
-5. **Geographic Search**: GIST index on PostGIS geography column
+In `airbnb/frontend`, `npm run build` performs TypeScript checking and a Vite build.
+Backend Vitest route tests mock the database, authentication and shared services;
+they do not prove real transaction isolation or broker delivery.
 
-## Architecture
+For the page smoke tests, first start and seed the backend. From `airbnb`:
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+```bash
+npm install
+npx playwright install chromium
+npm run test:e2e
+```
 
-## Development Notes
+The Playwright configuration can start the frontend, but not the database or API.
+The tests primarily check page rendering and login, not concurrent reservations.
 
-See [claude.md](./claude.md) for development insights and design decisions.
+| Diagnostic endpoint | Actual scope |
+|---------------------|--------------|
+| `GET /live` | Process responds |
+| `GET /ready` | PostgreSQL query succeeds |
+| `GET /health` | Database/cache checks and diagnostic queue/breaker data; not a worker readiness check |
+| `GET /metrics` | Metrics collected in this API process |
+| `GET /debug/circuit-breakers` | Registered circuit breaker state |
 
-## References & Inspiration
+Worker commands exist (`dev:worker:booking`, `dev:worker:notification`,
+`dev:worker:analytics`, `dev:workers`), but the consumers are incomplete: they do
+not connect their Redis client and reference tables absent from `init.sql`.
+Do not treat starting them as working email delivery or analytics processing.
 
-- [Airbnb's Search Ranking Algorithm](https://medium.com/airbnb-engineering/listing-search-ranking-at-airbnb-4ab8ec5d76fb) - How Airbnb ranks search results using machine learning
-- [Improving Deep Learning for Airbnb Search](https://medium.com/airbnb-engineering/improving-deep-learning-for-airbnb-search-5fb2c22ec31e) - Deep learning approaches for personalized search ranking
-- [Dynamic Pricing at Airbnb](https://medium.com/airbnb-engineering/dynamic-pricing-1a82fbb21f14) - Airbnb's Smart Pricing system for hosts
-- [Building a Trustworthy Marketplace](https://medium.com/airbnb-engineering/building-a-trustworthy-marketplace-60b3b0df2fc4) - Trust and safety systems at scale
-- [Machine Learning-Powered Search Ranking of Airbnb Experiences](https://medium.com/airbnb-engineering/machine-learning-powered-search-ranking-of-airbnb-experiences-110b4b1a0789) - ML for experiences ranking
-- [How Airbnb Avoids Double Payments](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) - Idempotency in payment systems
-- [Chronon, Airbnb's ML Feature Platform](https://medium.com/airbnb-engineering/chronon-airbnbs-ml-feature-platform-is-now-open-source-d9c4dba859e8) - Feature engineering for ML models
-- [Nebula: Airbnb's Data Marketplace](https://medium.com/airbnb-engineering/data-quality-at-airbnb-e582465f3ef7) - Data quality and governance at Airbnb
+This documentation review traced the source and configuration; it did not run the
+application stack or claim passing build, integration, or concurrency tests.
+
+## Known limitations worth studying
+
+- **Reservation integrity:** creation locks the listing and checks conflicts in one transaction. Host response, cancellation and calendar edits do not follow one shared locking/state-transition protocol; a confirm-after-cancel race can leave a confirmed booking unblocked.
+- **Search correctness:** the count query misnumbers date parameters. Its breaker can return HTTP 200 with an empty fallback, which the UI presents as no results. Anonymous search cache keys truncate encoded parameters and can collide across filters.
+- **Calendar and pricing:** the browser treats checkout boundaries inclusively, unlike the backend. Host range splitting compares database Date objects with request strings. Price overrides are stored but ignored by booking calculations; there is no payment collection or automatic pending-request expiry.
+- **Delivery guarantees:** database changes and RabbitMQ publication are separate. Consumer deduplication is shared across queues, and requeued messages do not receive the incremented retry count. There is no reliable outbox/replay workflow.
+- **Product completeness:** search has no map or pagination controls; host editing is incomplete; messages do not refresh automatically; reviews have no timed reveal; authorization, upload handling and session expiry need hardening.
+
+See the final Implementation Notes in [architecture.md](./architecture.md) for
+source links and concrete failure cases. These are documented limitations, not
+fixes made during the documentation review.
+
+## Interview versions
+
+- [Frontend](./system-design-answer-frontend.md): search state, date selection, booking feedback and host editing.
+- [Backend](./system-design-answer-backend.md): inventory invariants, geographic search and recoverable side effects.
+- [Full stack](./system-design-answer-fullstack.md): the complete search-to-reservation journey.

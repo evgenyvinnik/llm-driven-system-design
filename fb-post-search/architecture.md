@@ -1,218 +1,134 @@
-# Facebook Post Search - Architecture Design
+# Facebook Post Search Architecture
 
 ## System Overview
 
-A privacy-aware search engine for social media posts with real-time indexing, personalized ranking, and sub-second latency. The core challenge is filtering search results based on who can see each post without sacrificing query performance -- solved via precomputed visibility fingerprints stored alongside documents in the search index.
+Social search combines relevance with authorization. An inverted index can retrieve useful posts quickly, but its copied content and audience fields may lag the source database. The main design problem is using those copies to narrow candidates without treating a stale search document as a current permission grant.
 
-**Learning goals:** Elasticsearch query construction with privacy filtering, visibility fingerprint design, two-phase ranking (retrieval + re-ranking), circuit breaker patterns for search availability, search suggestion systems.
+**Production proposal:** asynchronous versioned indexing, efficient visibility-token retrieval, current authorization/content-version checks, stable search sessions, and privacy-aware suggestions. **Local implementation:** one Express API, PostgreSQL, Elasticsearch, Valkey, and a React search/admin interface. The final Implementation Notes trace the actual wiring and known gaps. This is a Facebook-inspired teaching project, not an account of Facebook's infrastructure.
 
 ## Requirements
 
-### Functional Requirements
+| Area | Proposed contract |
+|------|-------------------|
+| Search | Keyword/phrase/hashtag search over posts; date, type, author, and audience filters |
+| Relevance | Text relevance with measured social/engagement signals; predictable page continuation |
+| Privacy | Check current authoritative access and content version before returning private text/snippets |
+| Indexing | Durable accepted writes; target ordinary search visibility within 10 seconds |
+| Suggestions | Fast public-safe dictionary plus explicitly scoped personal history/directory results |
+| UX | Responsive typing, committed query/filter state, independent page errors, accessible result navigation |
+| Availability | Target 99.9% regional search-serving availability |
+| Latency | Healthy-path p95 search API below 300 ms, p99 below one second; first useful browser results within one second on a defined network/device |
+| Resources | Bounded query lengths, page sizes, candidate scans, search-session lifetimes, indexing batches, and browser cache |
 
-- **Full-text search** - Search posts by keywords, phrases, and hashtags
-- **Filtering** - Filter by date range, post type, visibility, and author
-- **Privacy-aware results** - Only show posts the searcher has permission to see
-- **Personalized ranking** - Prioritize results from friends and engaged content
-- **Real-time indexing** - New posts should be searchable immediately
-- **Typeahead suggestions** - Autocomplete as users type
+These are design targets, not measurements. The initial audience model is Public, accepted Friends, and Private/author-only. Friends-of-friends, custom groups, saved searches, semantic ranking, and media processing are extensions. The local schema accepts friends_of_friends but search gives it direct-friend semantics; other read routes differ again.
 
-### Non-Functional Requirements
-
-- **Scalability**: Designed for 2+ billion users, 500M+ posts per day
-- **Availability**: 99.99% uptime target
-- **Latency**: < 200ms p99 for search results
-- **Consistency**: Eventual consistency for search; strong consistency for privacy
+A privacy decision has a defined validation point. Requests checked after a completed revocation must be denied. Already downloaded content cannot be recalled; active views should remove invalidated content and revalidate on resume. A ten-minute cache TTL is not a substitute for this contract.
 
 ## Capacity Estimation
 
-**Traffic:**
-- 2 billion DAU
-- Average 5 searches per user per day = 10 billion searches/day
-- Peak QPS: ~350K searches/second
+An illustrative production workload, independent of the tiny fixtures:
 
-**Indexing:**
-- 500 million new posts per day
-- Average post size: ~1KB indexed
-- Daily index growth: ~500GB/day
+| Assumption/calculation | Result |
+|------------------------|--------|
+| 100M daily searchers × five submitted searches | 500M searches/day, about 5,787/second average |
+| Five-times-average search peak | About 28,935 searches/second |
+| 100M new posts/day | About 1,157/second average |
+| 1 KB raw searchable record per post | 100 GB/day, 36.5 TB/year, 182.5 TB over five years |
+| Four suggestion requests per committed search | Up to 2B suggestion requests/day before coalescing/caching |
+| 500M response pages × 20 results | 10B returned result items/day before candidate overfetch |
 
-**Storage:**
-- 5-year retention = 900TB+ of index data
-- Sharding strategy required from day one
+Raw record bytes exclude term dictionaries, postings, stored fields, doc values, replicas, and merge headroom. Select shard counts after measuring indexed size, query fan-out, and recovery time; “1,000 shards” is not a capacity plan. Long friend lists also increase query payload and intersection work; visibility filtering is not constant-time authorization over an arbitrary graph.
 
 ### Local Development Scale
 
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Users | 100 | Seeded test accounts |
-| Posts | 10,000 | Seeded sample content |
-| Searches/day | 500 | Manual + automated testing |
-| Elasticsearch index | < 100MB | Single shard, no replicas |
+Compose has PostgreSQL 16, Valkey 7, and Elasticsearch 8.11.0 with a 512 MB Java heap. The posts index has one primary shard and zero replicas. The SQL fixture contains six users and fifteen posts; the destructive JavaScript seeder contains nine users and twenty-five posts. No 100-user/10,000-post benchmark was performed.
 
 ## High-Level Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              CDN / Edge Cache                                 │
-│                    (Static assets, suggestion responses)                       │
-└───────────────────────────────┬──────────────────────────────────────────────┘
-                                │
-┌───────────────────────────────▼──────────────────────────────────────────────┐
-│                         API Gateway / Load Balancer                            │
-│                   (Rate limiting, auth, SSL termination)                       │
-└──────┬─────────────────┬─────────────────┬──────────────────────────────────┘
-       │                 │                 │
-       ▼                 ▼                 ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│Search Service│  │ Post Service │  │ Auth Service  │
-│- Query build │  │- CRUD        │  │- Sessions     │
-│- Privacy     │  │- Index sync  │  │- RBAC         │
-│  filtering   │  │              │  │               │
-│- Ranking     │  │              │  │               │
-│- Suggestions │  │              │  │               │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │                 │                 │
-       │    ┌────────────▼──────────┐      │
-       │    │  Indexing Pipeline    │      │
-       │    │  (Kafka consumers)   │      │
-       │    │  - Extract hashtags  │      │
-       │    │  - Compute           │      │
-       │    │    fingerprints      │      │
-       │    │  - Bulk index to ES  │      │
-       │    └────────────┬─────────┘      │
-       │                 │                 │
-  ┌────▼─────────────────▼─────────────────▼────┐
-  │            Data Layer                         │
-  │                                               │
-  │  ┌──────────────┐  ┌──────────────────────┐  │
-  │  │ Elasticsearch│  │     PostgreSQL        │  │
-  │  │ Cluster      │  │     (Sharded)         │  │
-  │  │              │  │                       │  │
-  │  │ - Posts index │  │ - Users              │  │
-  │  │ - BM25 + rank│  │ - Posts (source of    │  │
-  │  │ - Visibility │  │   truth)              │  │
-  │  │   filtering  │  │ - Friendships         │  │
-  │  │              │  │ - Search history      │  │
-  │  └──────────────┘  └──────────────────────┘  │
-  │                                               │
-  │  ┌──────────────┐                             │
-  │  │    Redis     │                             │
-  │  │              │                             │
-  │  │ - Visibility │                             │
-  │  │   cache      │                             │
-  │  │ - Sessions   │                             │
-  │  │ - Trending   │                             │
-  │  │   searches   │                             │
-  │  │ - Suggestion │                             │
-  │  │   cache      │                             │
-  │  └──────────────┘                             │
-  └───────────────────────────────────────────────┘
-```
-
-### Core Components
-
-| Component | Responsibility | Production Technology |
-|-----------|---------------|----------------------|
-| **Search Service** | Query building, privacy filtering, ranking | Stateless microservice |
-| **Post Service** | Post CRUD, triggers indexing pipeline | Stateless microservice |
-| **Auth Service** | Session management, RBAC | Stateless microservice |
-| **Indexing Pipeline** | Async post indexing with fingerprint computation | Kafka consumer workers |
-| **Elasticsearch** | Full-text search, relevance scoring, filtering | ES Cluster (1000+ shards) |
-| **PostgreSQL** | Source of truth for users, posts, friendships | Sharded cluster |
-| **Redis** | Visibility cache, sessions, trending searches | Redis Cluster |
-
-## Request Flows
-
-### Search Flow (Privacy-Aware)
+Production proposal; a CDN serves the static application and authorized/public media through a separate media contract.
 
 ```
-1. Client ──▶ POST /api/v1/search { query: "birthday party", filters: {...} }
-                    │
-                    ▼
-2. Auth middleware validates session token (Redis lookup)
-                    │
-                    ▼
-3. Build visibility set for user:
-   a. Check Redis cache (visibility:{userId}, TTL 15min)
-   b. On miss: Query friendships table for accepted friends
-   c. Construct fingerprint set:
-      ["PUBLIC", "PRIVATE:{userId}", "FRIENDS:{userId}",
-       "FRIENDS:{friend1}", "FRIENDS:{friend2}", ...]
-   d. Cache result in Redis
-                    │
-                    ▼
-4. Build Elasticsearch query:
-   - must: multi_match on content, author_name, hashtags (BM25)
-   - filter: terms query on visibility_fingerprints (privacy)
-   - filter: date_range, post_type (user filters)
-   - should: boost posts from friends (terms on author_id, boost: 2.0)
-   - should: boost own posts (term on author_id, boost: 3.0)
-   - sort: _score DESC, engagement_score DESC, created_at DESC
-                    │
-                    ▼
-5. Execute via circuit breaker (timeout 5s, retry 2x)
-                    │
-                    ▼
-6. Transform results: extract highlights, compute snippets
-                    │
-                    ▼
-7. Record search in history (async), update trending searches (async)
-                    │
-                    ▼
-8. Return { results, next_cursor, total_estimate, took_ms }
+┌────────────────────────────┐       ┌────────────────────────────┐
+│ Search API + auth          │       │ Post / graph authority     │
+│ PIT / rank / validation    │       │ SQL + receipts + outbox    │
+└─────────────┬──────────────┘       └─────────────┬──────────────┘
+              ▼                                    ▼
+┌────────────────────────────┐       ┌────────────────────────────┐
+│ ES candidate projection    │◀──────│ Versioned index workers    │
+│ Exact visibility tokens    │       │ Bulk + retries + repair    │
+└────────────────────────────┘       └────────────────────────────┘
 ```
 
-### Post Indexing Flow
+Search serving builds an exact token filter from the viewer's graph context, retrieves a bounded candidate window, and checks current authoritative visibility and record versions before releasing content. The index is a retrieval projection. Outbox workers maintain that projection, while separate suggestion policy prevents hidden content or personal queries leaking through another endpoint.
 
-```
-1. Client ──▶ POST /api/v1/posts { content, visibility, post_type }
-                    │
-                    ▼
-2. Insert into PostgreSQL (source of truth)
-                    │
-                    ▼
-3. Compute visibility fingerprints:
-   - public ──▶ ["PUBLIC"]
-   - friends ──▶ ["FRIENDS:{authorId}"]
-   - private ──▶ ["PRIVATE:{authorId}"]
-                    │
-                    ▼
-4. Extract hashtags (#word) and mentions (@word) from content
-                    │
-                    ▼
-5. Calculate engagement score: likes + (comments × 2) + (shares × 3)
-                    │
-                    ▼
-6. Index document to Elasticsearch with refresh=true
-                    │
-                    ▼
-7. Post is immediately searchable
-```
+## Core Components / Request Flows
 
-### Friendship Change Flow
+### Publish, edit, and delete
 
-```
-1. User A accepts friend request from User B
-                    │
-                    ▼
-2. Update friendships table (bidirectional rows)
-                    │
-                    ▼
-3. Invalidate visibility cache for both users:
-   - DEL visibility:{userA}
-   - DEL visibility:{userB}
-                    │
-                    ▼
-4. Next search recomputes fresh visibility set
-   (no post re-indexing needed -- fingerprints are stable)
-```
+1. Authenticate the actor and validate the operation and audience.
+2. Commit the post change, monotonically increasing revision, operation receipt, and outbox event in one transaction.
+3. Return accepted canonical state independently of Elasticsearch health.
+4. A worker reads the event/current record, extracts fields, and submits bounded bulk operations.
+5. Inspect every item result; retry transient failures and isolate invalid records with an explicit repair state.
+6. Apply revisions monotonically so a delayed edit cannot overwrite a newer restriction or resurrect deleted content.
+
+Use durable tombstones or equivalent retained version state for deletions; physically deleting an index document must not erase the only protection against an older event arriving later. An idempotent document ID prevents duplicate copies, but does not enforce revision order or deduplicate two independently created source posts.
+
+Refresh controls when an indexed change becomes searchable. It is separate from durable acceptance and from the total worker backlog. The proposed normal path batches changes and defines a freshness target; a “wait for refresh” option cannot guarantee a fixed one-second end-to-end delay under every refresh configuration or load.
+
+### Query, rank, and authorize
+
+Normalize syntax according to an explicit query contract. Phrase search needs a phrase operator/parser; a fuzzy multi_match alone is not a phrase-search implementation. Treat exact hashtags separately from analyzed prose when appropriate. Apply date/type/author filters and an exact visibility-token filter before ranking.
+
+Tokens such as PUBLIC, FRIENDS:author, and PRIVATE:author avoid copying every recipient into every post document. A friendship change normally changes the reader's eligible token set, not all the author's post fingerprints. A post's own audience change does require updating its projection. Cache graph-derived sets with versions/invalidation, and retain authoritative checks for stale projections and invalidation races.
+
+Initially, rank within Elasticsearch using BM25 and modest query-time social boosts. Engagement can be a calibrated signal rather than an unbounded substitute for text relevance. A later application reranker must overfetch a meaningful candidate window; reranking only twenty retrieved rows cannot promote a candidate it never saw. Its resulting order must also participate in the pagination contract.
+
+Hydrate a bounded batch against current posts/relationships and compare the indexed revision with the canonical revision. Drop inaccessible, deleted, or stale-version records before returning content, snippets, or action capabilities. Underselecting temporarily after a grant/update is an indexing freshness issue; returning stale private text is an authorization failure.
+
+### Stable search sessions
+
+For the initial in-engine ranker, use a short-lived Elasticsearch point in time (PIT) and search_after. Bind an opaque server cursor to viewer identity, normalized query/filters, fixed social ranking context, index generation, and the returned sort tuple. Freeze time-dependent ranking inputs as well as index state. Close/expire contexts and bound active PITs.
+
+Use the latest returned PIT identifier and the full sort tuple, including its tie-breaker. A unique ID handles equal scores but cannot freeze a changing index/ranking context by itself. The local offset cursor has neither PIT nor search_after. Elasticsearch documents the deep-offset cost, default 10,000-hit window, and PIT continuation behavior in its [pagination guide](https://www.elastic.co/guide/en/elasticsearch/reference/8.11/paginate-search-results.html).
+
+Authorization remains current despite the PIT. Keep the retrieval query fixed and validate candidates after retrieval; a graph-context revision change may explicitly expire the session rather than silently change its query. Scan a bounded number of extra candidates to fill gaps, advancing the cursor through the last examined hit. Distinguish scan-budget exhaustion, partial dependency results, and true end of this search session.
+
+Do not return an exact-looking total or facet count obtained from stale/private candidates. Prefer verified loaded counts and continuation; provide counts only through an equally authorized computation with an explicit relation/approximation contract. A PIT freezes old records, not permission to disclose them.
+
+### Suggestions and browser state
+
+Use a curated/moderated public suggestion corpus for shared caching. Personal history is viewer-scoped; directory suggestions follow the directory's access policy. If suggestions derive from posts, they need current audience/version protection too. A threshold over distinct users and a time window can reduce accidental exposure in trends, but is not by itself a formal privacy guarantee. Do not publish every submitted private query globally.
+
+The browser separates draft text/filter edits from committed search intent. Suggestions use a short debounce; full results start on Enter/selection/Apply. Each request captures account and search generation; cancellation saves work, while identity checks decide whether a response may commit. Pagination always uses the committed filters and session cursor, not the mutable filter panel.
+
+Render snippets as validated text fragments and marked ranges. Maintain independent first-page, next-page, and suggestion states. Revalidate protected cached results before redisplaying after navigation/resume; account changes clear pages/history and invalidate old requests. Query URLs represent intent, not authorization or private result payloads.
 
 ## Database Schema
 
-### PostgreSQL Tables
+The following is the **exact local initialization SQL** from [init.sql](./backend/src/db/init.sql): five tables, ten explicit indexes, one function, and two updated-at triggers. Guarded creation makes repeat application possible, but it does not reconcile an older table definition with this one.
 
 ```sql
-CREATE TABLE users (
+-- =============================================================================
+-- Facebook Post Search - Consolidated Database Schema
+-- =============================================================================
+-- This file contains the complete database schema for the fb-post-search project.
+-- It consolidates all migrations into a single file for easier review and fresh installs.
+--
+-- Usage:
+--   psql -U postgres -d fb_search -f init.sql
+--
+-- For development, prefer using migrations:
+--   npm run db:migrate
+-- =============================================================================
+
+-- =============================================================================
+-- TABLE: users
+-- =============================================================================
+-- Central user entity storing account information and authentication data.
+-- This is the primary identity table referenced by all other entities.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(50) UNIQUE NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
@@ -220,586 +136,326 @@ CREATE TABLE users (
   password_hash VARCHAR(255) NOT NULL,
   avatar_url VARCHAR(500),
   role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE posts (
+-- =============================================================================
+-- TABLE: posts
+-- =============================================================================
+-- Stores user-generated content with visibility controls and engagement metrics.
+-- Posts are indexed to Elasticsearch for full-text search.
+-- Denormalized counters (like_count, comment_count, share_count) avoid expensive
+-- aggregation queries and are updated via triggers or application logic.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS posts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   content TEXT NOT NULL,
-  visibility VARCHAR(20) DEFAULT 'friends'
-    CHECK (visibility IN ('public', 'friends', 'friends_of_friends', 'private')),
-  post_type VARCHAR(20) DEFAULT 'text'
-    CHECK (post_type IN ('text', 'photo', 'video', 'link')),
+  visibility VARCHAR(20) DEFAULT 'friends' CHECK (visibility IN ('public', 'friends', 'friends_of_friends', 'private')),
+  post_type VARCHAR(20) DEFAULT 'text' CHECK (post_type IN ('text', 'photo', 'video', 'link')),
   media_url VARCHAR(500),
   like_count INTEGER DEFAULT 0,
   comment_count INTEGER DEFAULT 0,
   share_count INTEGER DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE friendships (
+-- =============================================================================
+-- TABLE: friendships
+-- =============================================================================
+-- Represents directional friendship relationships between users.
+-- Each accepted friendship requires two rows (user_id -> friend_id and vice versa).
+-- This enables efficient lookups for "who are my friends" queries.
+-- The status column supports pending requests and blocking functionality.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS friendships (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   friend_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  status VARCHAR(20) DEFAULT 'pending'
-    CHECK (status IN ('pending', 'accepted', 'blocked')),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'blocked')),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   UNIQUE(user_id, friend_id)
 );
 
-CREATE TABLE search_history (
+-- =============================================================================
+-- TABLE: search_history
+-- =============================================================================
+-- Tracks user search queries for analytics and personalization.
+-- Used to generate trending searches and improve search suggestions.
+-- Subject to 90-day retention policy (see architecture.md).
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS search_history (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   query VARCHAR(500) NOT NULL,
   filters JSONB,
   results_count INTEGER DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE sessions (
+-- =============================================================================
+-- TABLE: sessions
+-- =============================================================================
+-- Stores authentication sessions for session-based auth.
+-- Tokens are unique per session and have explicit expiration.
+-- Sessions are also cached in Redis for faster validation.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   token VARCHAR(255) UNIQUE NOT NULL,
-  expires_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- =============================================================================
+-- INDEXES
+-- =============================================================================
+-- Strategic indexes to optimize common query patterns.
+-- Each index is designed for specific use cases documented below.
+-- =============================================================================
+
+-- Posts: Find all posts by a specific author (user profile pages)
+CREATE INDEX IF NOT EXISTS idx_posts_author_id ON posts(author_id);
+
+-- Posts: Support chronological feeds and date range filtering
+CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC);
+
+-- Posts: Filter by visibility level for privacy-aware queries
+CREATE INDEX IF NOT EXISTS idx_posts_visibility ON posts(visibility);
+
+-- Friendships: Find all friendships for a user (friend list, visibility computation)
+CREATE INDEX IF NOT EXISTS idx_friendships_user_id ON friendships(user_id);
+
+-- Friendships: Find users who have friended a specific user (reverse lookup)
+CREATE INDEX IF NOT EXISTS idx_friendships_friend_id ON friendships(friend_id);
+
+-- Friendships: Filter by status (accepted, pending, blocked)
+CREATE INDEX IF NOT EXISTS idx_friendships_status ON friendships(status);
+
+-- Search History: Find a user's search history (recent searches, suggestions)
+CREATE INDEX IF NOT EXISTS idx_search_history_user_id ON search_history(user_id);
+
+-- Search History: Support chronological ordering and retention cleanup
+CREATE INDEX IF NOT EXISTS idx_search_history_created_at ON search_history(created_at DESC);
+
+-- Sessions: Fast token lookup for authentication validation
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+
+-- Sessions: Find all sessions for a user (logout all devices)
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+
+-- =============================================================================
+-- FUNCTIONS AND TRIGGERS
+-- =============================================================================
+-- Automatic updated_at timestamp management for auditing.
+-- =============================================================================
+
+-- Function: Automatically update updated_at column on row modification
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Trigger: Auto-update users.updated_at
+DROP TRIGGER IF EXISTS update_users_updated_at ON users;
+CREATE TRIGGER update_users_updated_at
+BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger: Auto-update posts.updated_at
+DROP TRIGGER IF EXISTS update_posts_updated_at ON posts;
+CREATE TRIGGER update_posts_updated_at
+BEFORE UPDATE ON posts
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 ```
 
-### Key Indexes
+The schema has no like-membership table, comments table, operation receipts, outbox, post revision, or deletion tombstone. Counts are integer fields; local likes simply increment. Friendship symmetry and audience enforcement are not database invariants. Only users/posts receive automatic updated_at changes, and no nonnegative-count or post-length checks are declared.
 
-```sql
-CREATE INDEX idx_posts_author_id ON posts(author_id);
-CREATE INDEX idx_posts_created_at ON posts(created_at DESC);
-CREATE INDEX idx_posts_visibility ON posts(visibility);
-CREATE INDEX idx_friendships_user_id ON friendships(user_id);
-CREATE INDEX idx_friendships_friend_id ON friendships(friend_id);
-CREATE INDEX idx_friendships_status ON friendships(status);
-CREATE INDEX idx_search_history_user_id ON search_history(user_id);
-CREATE INDEX idx_search_history_created_at ON search_history(created_at DESC);
-CREATE INDEX idx_sessions_token ON sessions(token);
-CREATE INDEX idx_sessions_user_id ON sessions(user_id);
-```
+| Proposed record | Purpose / invariant |
+|-----------------|---------------------|
+| Post revision/tombstone | Monotonic canonical version, audience, deletion state |
+| Operation receipt | Actor + operation key unique, payload digest, durable result |
+| Outbox event | Post ID/revision and recoverable index work |
+| Graph revision | Current accepted relationship context and invalidation ordering |
+| Search session | Viewer, PIT/generation, query/ranking context, expiry |
+| Index repair task | Failed item, error class, retry state, reconciliation progress |
 
-### Triggers
+### Actual Elasticsearch and Redis structures
 
-`update_updated_at_column()` function automatically sets `updated_at = NOW()` on any row modification for users and posts tables.
+[elasticsearch.ts](./backend/src/config/elasticsearch.ts) maps IDs, visibility tokens, hashtags, mentions, type, and language as keyword fields; content and author_name as text; timestamps as dates; counters as integers; engagement as float. Content also has a keyword subfield limited to 256 characters. The custom standard analyzer uses English stop words. There is no n-gram field, stemmer configuration, embedding, or media URL in the indexed document; language is hardcoded to en.
 
-### Elasticsearch Document Schema
+| Redis key | Actual contents / lifetime |
+|-----------|----------------------------|
+| visibility:user | JSON fingerprints/friendIds/userId/updatedAt; 900 seconds |
+| session:token | JSON userId/role/expiresAt; initially 86,400 seconds |
+| suggestions:prefix | JSON truncated suggestion array; 60 seconds, no viewer/limit in key |
+| trending:searches | Cumulative sorted-set query counts; trimmed to 1,000, no TTL or decay |
 
-```json
-{
-  "post_id": "uuid",
-  "author_id": "user_uuid",
-  "author_name": "Alice Johnson",
-  "content": "Happy birthday party!",
-  "hashtags": ["#birthday", "#party"],
-  "mentions": ["@friend1"],
-  "created_at": "2024-01-15T10:30:00Z",
-  "updated_at": "2024-01-15T10:30:00Z",
-  "visibility": "friends",
-  "visibility_fingerprints": ["FRIENDS:user123"],
-  "post_type": "text",
-  "engagement_score": 125.0,
-  "like_count": 50,
-  "comment_count": 25,
-  "share_count": 0,
-  "language": "en"
-}
-```
-
-### Redis Data Structures
-
-| Key Pattern | Type | TTL | Purpose |
-|-------------|------|-----|---------|
-| `visibility:{userId}` | String (JSON) | 15 min | Cached visibility fingerprint set |
-| `session:{token}` | String (JSON) | 24h | User session data |
-| `trending:searches` | Sorted Set | Rolling | Trending search queries (score = frequency) |
-| `suggestions:{prefix}` | String (JSON) | 1 min | Cached typeahead suggestions |
+The retention constants contain a 3,600-second suggestion TTL, but the active suggestion service hardcodes 60 seconds. Cache helpers propagate Redis errors; they are not a general fallback-to-SQL-on-outage layer.
 
 ## API Design
 
-### Core Endpoints
+### Actual local routes
 
-```
-Search
-POST   /api/v1/search                Search posts with filters
-GET    /api/v1/search/suggestions     Typeahead suggestions
-GET    /api/v1/search/trending        Trending search queries
-GET    /api/v1/search/recent          User's recent searches
-DELETE /api/v1/search/history         Clear search history
+| Method | Path | Contract |
+|--------|------|----------|
+| POST | /api/v1/search | Optional bearer auth; query/filters/pagination body |
+| GET | /api/v1/search/suggestions | q and limit; optional auth |
+| GET | /api/v1/search/trending | Global cumulative query strings |
+| GET | /api/v1/search/filters | Advertised types/audiences/sorts; sorts are not implemented |
+| GET / DELETE | /api/v1/search/recent / /api/v1/search/history | Personal recent queries / clear history |
+| POST | /api/v1/auth/register, /api/v1/auth/login, /api/v1/auth/logout | Account/session lifecycle |
+| GET | /api/v1/auth/me | Current user row |
+| POST | /api/v1/posts | Save SQL, await synchronous indexing |
+| GET | /api/v1/posts/feed, /api/v1/posts/user/:userId, /api/v1/posts/:id | Different local visibility rules |
+| PUT / DELETE | /api/v1/posts/:id | Owner/admin edit / hard-delete |
+| POST | /api/v1/posts/:id/like | Any authenticated user increments and receives the post |
+| GET | /api/v1/admin/stats, /api/v1/admin/users, /api/v1/admin/posts | Admin overview/lists |
+| GET | /api/v1/admin/search-history, /api/v1/admin/health | Admin history/health |
+| POST | /api/v1/admin/reindex | Bulk upsert all current SQL posts |
 
-Posts
-POST   /api/v1/posts                  Create post (triggers indexing)
-GET    /api/v1/posts/:id              Get single post
-PUT    /api/v1/posts/:id              Update post (re-indexes)
-DELETE /api/v1/posts/:id              Delete post (removes from index)
-
-Auth
-POST   /api/v1/auth/register          Create account
-POST   /api/v1/auth/login             Login, returns session token
-POST   /api/v1/auth/logout            Invalidate session
-GET    /api/v1/auth/me                Get current user
-
-Admin
-GET    /api/v1/admin/stats            System statistics
-GET    /api/v1/admin/users            List all users
-GET    /api/v1/admin/posts            List all posts
-GET    /api/v1/admin/search-history   View search history
-POST   /api/v1/admin/reindex          Trigger full reindex
+```json
+{"query":"code","filters":{"post_type":["text"]},"pagination":{"limit":20}}
 ```
 
-### Search Request/Response
+The actual response has results, optional next_cursor, total_estimate, and took_ms. Each result includes full content as well as a snippet, but no media URL, viewer-like state, query ID, PIT, result version, or structured highlight ranges. took_ms is application search duration, not only Elasticsearch's own took value. Client-supplied user_id is ignored; the controller supplies identity from auth middleware.
 
-```
-POST /api/v1/search
-{
-  "query": "birthday party",
-  "filters": {
-    "date_range": {"start": "2024-01-01", "end": "2024-12-31"},
-    "post_type": ["text", "photo"],
-    "visibility": ["public", "friends"]
-  },
-  "pagination": {"cursor": null, "limit": 20}
-}
+### Proposed contract additions
 
-Response:
-{
-  "results": [...],
-  "next_cursor": "20",
-  "total_estimate": 1500,
-  "took_ms": 45
-}
-```
+Add a query echo/search-session ID, opaque continuation, expiry/reset and partial-result status, structured snippets, and verified result versions/capabilities. Validate query strings, enum arrays, date ranges, IDs, and positive bounded integer limits at runtime. A shared generated type/schema package can reduce drift, but local frontend/backend types are duplicated and controllers do not use Zod request schemas.
 
 ## Key Design Decisions
 
-### Privacy-Aware Search with Visibility Fingerprints
+### Indexed tokens plus authoritative checks
 
-This is the most critical design decision. The naive approach -- searching for all matching posts, then filtering by permission -- is O(n) in the number of results and would time out at scale (10M results x permission check = seconds).
+Token filtering reduces wasted retrieval work. It does not make arbitrary social-graph intersection O(1), eliminate friendship-cache races, or protect copies of posts whose audience changed. The final current check operates on a bounded candidate batch, not all matching documents in the corpus. Overfetch and cursor progress address sparse authorized results without claiming unlimited work to fill every page.
 
-**Chosen: Precomputed visibility fingerprints.** Each post stores an array of fingerprint strings in its Elasticsearch document. At query time, we compute the user's visibility set (the set of fingerprints they can access) and use an Elasticsearch `terms` filter to include only matching documents. Elasticsearch handles this as an inverted index lookup -- O(1) per document, evaluated during query execution, not post-hoc.
+The cost is extra batched source/graph reads, possible short pages, and conservative omission while indexing catches up. Trusting only the index is cheaper, but a failed public-to-private update or stale PIT would disclose old content. Bloom filters may reject obvious nonmatches as a preliminary optimization; positive matches cannot grant privacy access without exact verification.
 
-The trade-off: when friendships change, visibility sets must be recomputed. But fingerprints are stable -- `FRIENDS:user123` means "visible to friends of user123" and doesn't change when user123 gains or loses friends. Only the user's visibility set (cached in Redis for 15 minutes) needs invalidation. No post re-indexing is required for friendship changes. This is a decisive advantage over alternatives that embed friend lists directly in documents.
+### In-engine ranking first, reranking only when justified
 
-### Two-Phase Ranking
+The local social should clauses add score contributions for friends/self; they are not a blanket multiplication of the entire BM25 score by two/three. Engagement is likes + 2×comments + 3×shares and is the second sort field, followed by creation time. It only decides ordering after equal relevance scores. There is no recency decay, ML, or application reranking.
 
-**Phase 1 (Elasticsearch retrieval):** BM25 text relevance with fuzziness, engagement score boost, recency decay. This phase retrieves the top-N candidates efficiently using Elasticsearch's inverted index.
+A larger reranking stage can improve quality at a latency/candidate-recall cost. Keep a fixed reranked candidate order for a session if introduced; sorting each independently retrieved page is not a global ranked continuation. Calibrate features with judged queries and experiments rather than treating raw ES scores as probabilities or comparable scores across users.
 
-**Phase 2 (Application-layer re-ranking):** Friend relationship boosting (2x for friends' posts, 3x for own posts). This requires social graph data not available in the search index. The two-phase approach avoids denormalizing the entire social graph into Elasticsearch while still delivering personalized results.
+### Asynchronous indexing with explicit repair
 
-The alternative -- embedding friend IDs in Elasticsearch function_score queries -- would require updating documents whenever friendships change, creating write amplification proportional to post count.
+PostgreSQL supplies durable accepted state, while Elasticsearch is rebuilt asynchronously. This lets posts survive index outages at the cost of temporary search lag and worker operations. Receipts, outbox recovery, version checks, and item-level bulk accounting close failure gaps that a sequential SQL insert followed by index() cannot.
 
-### Synchronous vs Asynchronous Indexing
-
-**Chosen for learning: Synchronous indexing** with `refresh=true`. Posts are immediately searchable after creation. This is simple and provides a better developer experience for testing.
-
-**Production alternative: Kafka-based async indexing.** Posts are published to a Kafka topic, consumed by indexer workers, and bulk-indexed to Elasticsearch. This decouples write throughput from index throughput, enables replay on index corruption, and allows the indexing pipeline to include enrichment (language detection, toxicity scoring). The trade-off is indexing lag (typically < 5 seconds), which is acceptable for a social search product.
+Rebuild into a new index generation, backfill from a consistent boundary, replay subsequent changes/tombstones, validate coverage, then switch an alias atomically. Continue supporting or explicitly expire PITs on the previous generation within retention limits. An alias swap alone does not capture concurrent writes, and a bulk upsert alone does not remove orphan documents.
 
 ## Consistency and Idempotency
 
-### Search Consistency Model
+Locally, source writes and index writes are separate. createPost catches an indexing failure and returns null after SQL committed; the API returns 500, and a retry can create another UUID/post. updatePost can commit a restriction then return 500, leaving old searchable content. deletePost hard-deletes SQL; deletePostFromIndex catches every error as if it were “not found,” so deletion may return success with a stale index document.
 
-| Data | Consistency | Rationale |
-|------|-------------|-----------|
-| Post visibility | Eventually consistent (< 15 min) | Visibility cache TTL; friendship changes invalidate cache |
-| Search index | Eventually consistent (< 5s production, immediate local) | Async indexing pipeline in production |
-| Search history | Strong (PostgreSQL) | Direct insert, no caching |
-| Trending searches | Eventually consistent | Redis sorted set, approximate counts |
+Like requests increment the counter repeatedly without a viewer/post uniqueness key, access check, or unlike operation. Their returned object includes private content. Concurrent reindex/update calls have no external revision check, so a late older index write can overwrite newer state. bulkIndexPosts does not inspect item errors, use the breaker, or remove IDs absent from SQL.
 
-### Privacy Consistency
+The proposal gives meaningful writes actor-scoped receipts and uses at-least-once workers with idempotent, version-checked effects. Search history is best-effort asynchronous telemetry; it is not part of the accepted-search durability contract. A duplicate document ID is only one of these invariants.
 
-Privacy filtering must never show a post to an unauthorized user, even at the cost of temporarily hiding authorized content. The visibility cache TTL (15 minutes) means a newly accepted friend may not see your posts in search for up to 15 minutes. This is acceptable because: (1) the friendship itself is confirmed immediately, (2) the friend's feed shows posts regardless, (3) 15-minute search delay is not user-visible.
+## Security / Auth
 
-## Security
+[authService.ts](./backend/src/services/authService.ts) compares an unsalted SHA-256 hash, not bcrypt. The login identifier is username. UUID bearer sessions are persisted in SQL for 24 hours and cached with userId, role, and absolute expiresAt. Cache hits check that timestamp but do not re-read the user/role; role revocation or user deletion can leave cached authority. Cache refill sets a 24-hour TTL but still checks the original absolute expiry on each hit.
 
-### Authentication
+Redis failure prevents normal session validation; optionalAuth silently continues anonymously, while required/admin auth returns 401. Logout deletes SQL then Redis separately, and the browser ignores logout failure before removing auth_token. The cookie fallback is inert without a cookie parser; no cookie is issued. SESSION_SECRET is parsed but unused. Production needs an adaptive password hash, hardened session transport/lifecycle, and coherent role revocation.
 
-- **Session-based auth**: Token stored in Redis with 24-hour expiry, PostgreSQL as backup
-- **Password hashing**: bcrypt with salt
-- **Token format**: UUID v4, passed via `Authorization: Bearer {token}` header
+### Actual audience gaps
 
-### Authorization (RBAC)
+- Search trusts copied fingerprints/visibility and cached accepted outgoing edges; it does not hydrate from current SQL.
+- Friends-of-friends produces the same token as friends, with no second-hop traversal. The invalidation/friend-check helpers have no callers, and no friendship mutation API exists.
+- Single-post reads allow public or owner only, denying actual friends. Author lists expose friends posts to any signed-in viewer, while excluding friends-of-friends except for the owner.
+- The SQL feed includes public, own, and direct friends posts, but omits friends-of-friends from other authors. Likes accept any signed-in actor and return the full post.
+- Hashtag aggregation has no audience filter, and global trends contain submitted queries. A prefix-only suggestion cache mixes authentication context and requested limits.
 
-| Role | Permissions |
-|------|-------------|
-| **user** | Search, create/edit/delete own posts, manage friendships |
-| **admin** | All user permissions + view all users/posts, system stats, trigger reindex |
-
-### Input Validation
-
-- Zod schemas for all request validation
-- SQL injection prevention via parameterized queries
-- IP-based rate limiting (1000 requests per 15 minutes per IP)
-- Content length limits on search queries and post content
+[SearchResultCard.tsx](./frontend/src/components/SearchResultCard.tsx) passes snippet directly to dangerouslySetInnerHTML. The backend supplies an ES highlight without an HTML encoder or falls back to raw content.substring. Both are untrusted paths. Prefer structured text/ranges or a rigorously encoded and allowlisted markup contract; Elastic documents the difference between default and HTML-encoded highlights in its [highlight settings](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/highlighting.html#highlighting-settings).
 
 ## Observability
 
-### Metrics (Prometheus Format)
+Pino logs search text, viewer, filters, counts, and duration; these logs contain potentially sensitive query data. A request ID is inserted into incoming headers, but successful domain logs do not use the exported request logger, and no response-header propagation is wired. LOG_LEVEL is not read: development is debug/pretty, production info/JSON, test silent.
 
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| `search_queries_total` | Counter | status, has_user | Search volume and error rate |
-| `search_latency_seconds` | Histogram | status | SLA monitoring (p50, p95, p99) |
-| `search_results_total` | Counter | has_results | Zero-result query tracking |
-| `cache_hits_total` | Counter | cache_type | Cache effectiveness |
-| `cache_misses_total` | Counter | cache_type | Cache effectiveness |
-| `indexing_lag_seconds` | Histogram | - | Post creation to searchable lag |
-| `posts_indexed_total` | Counter | operation | Index write volume (create/update/delete) |
-| `circuit_breaker_state` | Gauge | service | ES circuit breaker state |
-| `http_requests_total` | Counter | method, path, status_code | API traffic |
-| `http_request_duration_seconds` | Histogram | method, path | Endpoint latency |
-| `db_query_latency_seconds` | Histogram | operation | Database performance |
-| `elasticsearch_docs_count` | Gauge | - | Index document count |
-| `elasticsearch_index_size_bytes` | Gauge | - | Index storage size |
+Fifteen custom metric families plus default process metrics are declared. Search result metrics increment once per response rather than by returned result count. Database query latency is never observed by the query wrapper. Index-size/connection gauges update during health checks, not on a background collector. Creation lag is observed on indexPost only; boot backfill/update/bulk do not provide a complete freshness measurement.
 
-### Health Check Endpoints
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /health` | Comprehensive check (PostgreSQL, Elasticsearch, Redis) |
-| `GET /livez` | Kubernetes liveness probe |
-| `GET /readyz` | Kubernetes readiness probe (all dependencies) |
-| `GET /metrics` | Prometheus metrics (text format) |
-
-### Alerting Thresholds
-
-| Metric | Warning | Critical | Action |
-|--------|---------|----------|--------|
-| Search latency p95 | > 300ms | > 500ms | Check ES cluster, add caching |
-| Elasticsearch heap | > 70% | > 85% | Increase JVM heap or add nodes |
-| PostgreSQL connections | > 80 | > 95 | Check connection leaks |
-| Cache hit rate | < 80% | < 60% | Review TTLs, increase cache size |
-| Error rate | > 0.5% | > 2% | Check logs, rollback if needed |
-| Indexing lag p99 | > 5s | > 30s | Scale indexer workers |
-
-### Logging
-
-Structured JSON logs via Pino with domain-specific log functions: `logSearch()` (query, userId, filters, resultsCount, durationMs), `logIndexing()` (postId, operation, durationMs, lagMs), `logCircuitBreakerStateChange()` (service, state). Log levels configurable via `LOG_LEVEL` environment variable.
+Production monitoring should distinguish accepted-write latency, oldest unindexed revision, item-level failures, stale-version/authorization drops, session expiry, partial search results, and rendered latency. Sampled privacy tests and reconciliation are needed; a zero-valued privacy counter alone would prove nothing. Do not expose raw private queries in routine analytics.
 
 ## Failure Handling
 
-### Circuit Breaker for Elasticsearch
+The active Cockatiel policy wraps a five-second aggressive timeout around a five-consecutive-failure breaker with a 30-second cooldown. Its separately defined retry policy is unused by executeWithCircuitBreaker; the Elasticsearch transport still has its own default retry behavior. Callbacks ignore the cancellation signal, so a timeout does not cancel underlying work. A late success can leave the inner breaker closed despite outer timeouts.
 
-The circuit breaker (cockatiel library) protects against cascading failures when Elasticsearch is unavailable. Without it, application threads block on ES timeouts (5-30 seconds), exhausting the connection pool and causing the entire API to hang.
+Search and health pre-check whether the breaker is Open. In the installed Cockatiel implementation, the transition to a recovery probe happens inside execute(), after the cooldown. Those pre-checks can keep search/health stuck open until another protected operation, such as indexing or a hashtag lookup, invokes the policy. The isolated checks confirmed this behavior with the actual library.
 
-**Configuration:** Opens after 5 consecutive failures, half-opens after 30 seconds. Timeout of 5 seconds per request. Retry up to 2 times with exponential backoff (100ms to 2s).
+| Failure | Local result | Proposed contract |
+|---------|--------------|-------------------|
+| Index write fails after SQL commit | Failed creation/update reply, unrepaired projection | Durable receipt/outbox and versioned repair |
+| Delete/index bulk partly fails | Success can conceal leftover/missing documents | Inspect item status; retry/reconcile tombstones |
+| Elasticsearch outage | Search 500; no cached search fallback | Explicit unavailable/partial result with a bounded deadline |
+| Hashtag lookup fails | Caught; no trending/user fallback in that branch | Independent public-safe suggestions and clear degradation |
+| Redis outage | Session/visibility/suggestion paths may fail | Defined auth behavior and bounded authorized fallback |
+| Old client request completes | Can replace current query/account results | Account/search generations and cancellation |
 
-**Graceful degradation when circuit is open:**
-- Search returns "service temporarily unavailable" error
-- Suggestions fall back to trending searches (Redis-only, no ES call)
-- Health check shows degraded status
-- Post creation still works (PostgreSQL insert succeeds, indexing queued for retry)
+The global process-local IP limiter allows 1,000 requests per 15-minute window and is installed before probes/metrics, despite a comment claiming they are exempt. Rate-limited requests bypass the later HTTP metrics middleware. This is not a distributed or exact sliding-window limit.
 
-### Data Lifecycle Policies
-
-| Data Type | Retention | Rationale |
-|-----------|-----------|-----------|
-| Posts (PostgreSQL) | Forever | Source of truth, soft delete only |
-| Posts (Elasticsearch) | 2 years hot, 5 years warm | Older posts rarely searched |
-| Search history | 90 days | Privacy and storage efficiency |
-| Visibility cache (Redis) | 15 minutes | Invalidated on friendship changes |
-| Session data (Redis) | 24 hours | Short-lived auth sessions |
-| Trending searches (Redis) | Rolling 24 hours | Recency-weighted rankings |
+/health is unhealthy only when PostgreSQL is down; Elasticsearch/Redis failures with SQL up are degraded/200. /readyz accepts degraded status. Probes have no explicit end-to-end deadline, and missing index stats do not make ES unhealthy. Startup binds HTTP first, retries ES initialization ten times, and catches/skips backfill failures. SIGINT/SIGTERM call process.exit immediately without draining requests or closing pools.
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+Bound authorized candidate scans, friend-token payloads, and open PITs. PITs retain index resources; short lifetimes and explicit restart are preferable to indefinitely retaining every abandoned search. Date filters can prune time-based indices, but queries spanning years still fan out and require coordination. Choose time partitioning/shard sizes from measured query/recovery workloads.
 
-1. **Search Services**: Stateless, add instances behind load balancer.
-2. **Elasticsearch**: Add shards and replicas as data grows. Target: < 50GB per primary shard.
-3. **PostgreSQL**: Read replicas for friendship queries. Shard by user_id when write throughput demands it.
-4. **Redis**: Cluster mode for visibility cache distribution.
-5. **Indexing Pipeline**: Scale Kafka consumer workers independently based on consumer lag.
-
-### Data Partitioning
-
-- **Elasticsearch**: Hash by post_id across 1000+ shards. Hot/cold tiers with ILM (hot < 60 days on SSDs, warm 60-730 days on HDDs, cold > 730 days frozen).
-- **PostgreSQL**: Partition posts by created_at for efficient time-range queries. Shard friendships by user_id.
-- **Geographic**: Regional ES clusters with cross-cluster search for global queries.
-
-### Search Quality at Scale
-
-- **Bloom filters**: Compact visibility set representation for users with thousands of friends (reduces terms filter size).
-- **ML re-ranking**: Gradient boosted trees trained on click-through rate for Phase 2 ranking.
-- **Query caching**: Cache results for popular queries (10-second TTL) to handle search spikes.
-- **Federated search**: Merge results from multiple regional clusters with latency-weighted scoring.
+Batch indexing, apply revisions in order, and keep a reconciliation path for missed events. A search-result cache must include query/ranking/viewer context and still meet current authorization requirements. Shared CDN caching is appropriate for static assets and explicitly public-safe suggestions, not arbitrary personalized result JSON.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Privacy filtering | Visibility fingerprints | Per-query permission checks | O(1) filter vs O(n) post-hoc check |
-| Ranking | Two-phase (ES + app) | Full ES function_score | Avoids denormalizing social graph into ES |
-| Indexing | Synchronous (local) / Kafka (production) | Direct ES writes only | Decouples write path, enables replay |
-| Search engine | Elasticsearch | Solr, Meilisearch | Better real-time indexing, operational maturity |
-| Primary database | PostgreSQL | MongoDB | Relational data (friendships), ACID guarantees |
-| Cache | Redis | Memcached | Data structures (sorted sets for trending), TTL |
-| Session storage | Redis + PostgreSQL | JWT | Immediate revocation, simpler token management |
-| Input validation | Zod schemas | Manual validation | Type-safe, composable, auto-documentation |
-| Circuit breaker | Cockatiel | Opossum | Composable policies (retry + timeout + breaker) |
-
-## Frontend Architecture
-
-### Routing (TanStack Router, File-Based)
-
-```
-frontend/src/routes/
-├── __root.tsx      → Root layout (Header + auth check on mount)
-├── index.tsx       → / (search page with SearchBar, SearchFilters, SearchResults)
-├── login.tsx       → /login (username + password form)
-├── register.tsx    → /register (registration form)
-└── admin.tsx       → /admin (admin dashboard with tabs, role-gated)
-```
-
-The root component checks authentication on mount via `checkAuth()` and renders a loading spinner until the session is validated. The `Header` component is always visible and includes navigation links and a logout button. No route guards are implemented at the router level -- the admin page checks `user.role === 'admin'` and redirects to login if unauthorized.
-
-### Component Hierarchy
-
-```
-RootComponent (__root.tsx)
-├── Header                     (nav bar with logo, links, user menu)
-└── Outlet
-    ├── IndexPage (/)
-    │   ├── SearchBar           (input with typeahead suggestions dropdown)
-    │   ├── SearchFilters       (date range, post type, visibility dropdowns)
-    │   └── SearchResults       (result list with pagination)
-    │       └── SearchResultCard (single result with highlights, hashtags, metadata)
-    │
-    ├── LoginPage (/login)
-    ├── RegisterPage (/register)
-    │
-    └── AdminPage (/admin)
-        ├── HealthStatusBar     (PostgreSQL/ES/Redis status + reindex button)
-        ├── AdminTabs           (overview, users, posts, searches tab navigation)
-        ├── OverviewTab         (stat cards: users, posts, index size)
-        │   └── StatCard        (single metric with label and value)
-        ├── UsersTable          (paginated user list)
-        ├── PostsTable          (paginated post list)
-        └── SearchHistoryTable  (search query log with user and timestamp)
-```
-
-### Zustand Stores
-
-**`authStore`** -- Manages authentication state:
-
-| State | Purpose |
-|-------|---------|
-| `user` | Currently authenticated user object (or null) |
-| `isLoading` | True during auth checks (blocks UI rendering) |
-| `isAuthenticated` | Derived from user presence |
-| `error` | Last authentication error message |
-
-Actions: `login()`, `register()`, `logout()`, `checkAuth()`, `clearError()`. The auth token is persisted to `localStorage` by the API client and sent as a `Bearer` token in the `Authorization` header on all requests.
-
-**`searchStore`** -- Manages search state and interactions:
-
-| State | Purpose |
-|-------|---------|
-| `query` | Current search query text |
-| `filters` | Active filter criteria (date range, post type, visibility) |
-| `results` | Array of search result objects |
-| `suggestions` | Typeahead suggestions from Elasticsearch |
-| `trending` | Popular search queries from Redis sorted set |
-| `recentSearches` | User's personal search history |
-| `totalResults` | Estimated total match count |
-| `nextCursor` | Pagination cursor for "load more" |
-| `searchTime` | Server-reported query duration in ms |
-
-Actions: `search()`, `loadMore()`, `fetchSuggestions()`, `fetchTrending()`, `fetchRecentSearches()`, `clearResults()`, `clearSuggestions()`. Search and loadMore call the API client and merge results. Suggestions are fetched on every keystroke (debounced by the component, not the store).
-
-### Data Fetching
-
-**API Client (`services/api.ts`):** A singleton `ApiClient` class encapsulates all HTTP communication. It manages the auth token lifecycle (set on login/register, stored in localStorage, cleared on logout) and automatically injects the `Authorization` header into every request. All methods return typed promises. The class groups endpoints into categories: auth (login, register, logout, getCurrentUser), search (search, getSuggestions, getTrending, getRecentSearches), posts (createPost, getFeed, likePost, deletePost), and admin (getAdminStats, getAdminUsers, getAdminPosts, getAdminSearchHistory, reindexPosts, getAdminHealth).
-
-**Search flow:** When the user types in `SearchBar`, each keystroke triggers `fetchSuggestions()` via the search store, which calls `api.getSuggestions()`. On Enter or suggestion click, `search()` calls `api.search()` with the query, filters, and pagination cursor. Results are stored in the search store and rendered by `SearchResults`. The "load more" button calls `loadMore()`, which appends new results to the existing array.
-
-**Admin lazy loading:** The admin page loads stats and health on mount via `Promise.all`. Tab-specific data (users, posts, search history) is loaded lazily on first tab selection and cached in local state.
-
-### Key UI Patterns
-
-- **Typeahead suggestions:** `SearchBar` renders a dropdown that shows three types of content depending on context. When the user has typed 2+ characters, it shows API-sourced suggestions (hashtags, users, queries). When the input is empty or has fewer than 2 characters, it shows recent searches (personal history) and trending searches (platform-wide). Each suggestion type gets a distinct icon (Hash, User, Search, Clock, TrendingUp from lucide-react). Click-outside detection closes the dropdown.
-
-- **Cursor-based pagination:** Search results use cursor-based pagination rather than page numbers. The server returns a `next_cursor` value with each response. The `loadMore` action passes this cursor to the next API call, appending results to the existing array. This approach handles new posts being indexed between page loads without causing duplicate or missing results.
-
-- **Admin role gating:** The admin page checks `user.role === 'admin'` on mount and redirects to login if the check fails. This is a UI-level guard only; the backend enforces authorization independently via RBAC middleware.
-
-- **Health status visualization:** The `HealthStatusBar` component shows colored indicators for PostgreSQL, Elasticsearch, and Redis connectivity. The reindex button triggers a full re-indexing of all posts to Elasticsearch and displays the count of indexed documents on completion.
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in this project. Each explanation describes what the pattern is, why it exists, and how it works -- assuming no prior knowledge.
-
-### RBAC (Role-Based Access Control)
-
-**What it is:** RBAC is an authorization model where permissions are assigned to roles rather than to individual users. Each user is assigned a role, and the role determines what actions they can perform. This simplifies permission management: instead of configuring permissions for each of millions of users, you define permissions for a small number of roles and assign users to roles.
-
-**Why it matters:** A search system needs different access levels. Regular users can search and create posts. Admins need to view all users, inspect search history for abuse detection, trigger reindexing when the search index drifts, and view system health. Without RBAC, permission checks become scattered conditional statements that are error-prone and difficult to audit.
-
-**How it works here:** Two roles are defined: `user` (search, create/edit/delete own posts, manage friendships) and `admin` (all user permissions plus view all users/posts, system stats, trigger reindex, view search history). The role is stored in the `users.role` column with a CHECK constraint. The backend checks the role in route-level middleware before executing admin operations. The frontend additionally checks `user.role` to show or hide the admin navigation link.
-
-### Redis Cache-Aside
-
-**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache before querying the primary data store. On a cache miss, the application queries the database, stores the result in the cache, and returns it. On a cache hit, the database is skipped entirely.
-
-**Why it matters:** The most expensive operation in this system is computing a user's visibility set -- the list of all fingerprints they are authorized to see. This requires querying the friendships table for all accepted friends, then constructing strings like `"FRIENDS:{friendId}"` for each friend. For a user with 500 friends, this means a database query returning 500 rows, followed by string construction. At 350K searches per second, recomputing this for every search would overwhelm the friendships table. Caching the result in Redis for 15 minutes reduces database load by 99%+ for active users.
-
-**How it works here:** When a user searches, the visibility service checks Redis for key `visibility:{userId}`. If present (cache hit), the cached JSON array of fingerprints is used directly. If absent (cache miss), the service queries the friendships table, constructs the fingerprint set, stores it in Redis with a 15-minute TTL, and returns it. When a friendship changes (accepted or removed), both users' visibility cache keys are explicitly deleted (`DEL visibility:{userA}`, `DEL visibility:{userB}`), forcing recomputation on the next search.
-
-**File:** `backend/src/services/visibilityService.ts`
-
-### Circuit Breaker
-
-**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing dependency. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the actual operation. After a cooldown period, the circuit enters a "half-open" state where it allows one probe request through. If the probe succeeds, the circuit closes and normal operation resumes.
-
-**Why it matters:** Elasticsearch is the most critical dependency for search. If Elasticsearch becomes slow or unresponsive (JVM garbage collection pause, cluster rebalancing, network partition), every search request would block for the full timeout (5 seconds). With thousands of concurrent searches, this blocks all Express request handlers, and the entire API becomes unresponsive -- including health checks, auth endpoints, and post creation that do not require Elasticsearch. The circuit breaker prevents this cascade by failing search requests instantly when Elasticsearch is known to be unhealthy.
-
-**How it works here:** The Cockatiel library wraps all Elasticsearch calls with a composed policy: timeout (5 seconds per request), retry (2 attempts with exponential backoff from 100ms to 2s), and consecutive breaker (opens after 5 consecutive failures, half-opens after 30 seconds). When the circuit is open: search returns a "service temporarily unavailable" error, suggestions fall back to trending searches from Redis (no Elasticsearch needed), health check shows degraded status, and post creation still succeeds (PostgreSQL insert works, Elasticsearch indexing is queued for retry).
-
-**File:** `backend/src/shared/circuitBreaker.ts`
-
-### Structured Logging
-
-**What it is:** Structured logging writes log entries as machine-parseable JSON objects rather than free-form text strings. Each log entry includes standardized fields (timestamp, level, message) plus context-specific metadata (user ID, query text, result count, duration).
-
-**Why it matters:** When debugging why search is slow for a specific user, you need to find their search logs, see what query they ran, how many results were returned, how long it took, and whether the circuit breaker was involved. With free-form text logs, this requires fragile regex parsing. With structured JSON logs, it is a simple query: `level=info AND event=search AND userId=abc123 | sort by durationMs DESC`.
-
-**How it works here:** Pino is configured with domain-specific log functions. `logSearch()` records query, userId, filters, resultsCount, and durationMs. `logIndexing()` records postId, operation (create/update/delete), durationMs, and lagMs (time from post creation to searchable). `logCircuitBreakerStateChange()` records the service name and new state (closed/open/half-open). In development, pino-pretty formats JSON as colored human-readable output. The `LOG_LEVEL` environment variable controls verbosity.
-
-**File:** `backend/src/shared/logger.ts`
-
-### Prometheus Metrics
-
-**What it is:** Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics on an HTTP endpoint in a specific text format. Prometheus scrapes this endpoint periodically and stores time-series data for visualization and alerting.
-
-**Why it matters:** Metrics answer operational questions that logs cannot efficiently answer: "What is the p95 search latency right now?" "What is the cache hit rate for visibility lookups?" "How many posts were indexed in the last hour?" "Is the Elasticsearch circuit breaker flapping?" Without metrics, operators must manually aggregate log entries -- a process that takes minutes instead of the seconds a dashboard provides.
-
-**How it works here:** The `prom-client` library exposes 15+ custom metrics. Key examples: `search_latency_seconds` (Histogram) records search query duration for SLA monitoring. `cache_hits_total` and `cache_misses_total` (Counters) track visibility cache effectiveness. `circuit_breaker_state` (Gauge) reports the Elasticsearch circuit breaker state. `indexing_lag_seconds` (Histogram) measures the time from post creation to searchability. `elasticsearch_docs_count` and `elasticsearch_index_size_bytes` (Gauges) track index growth. Default Node.js metrics (CPU, memory, event loop lag, GC) are collected automatically via `collectDefaultMetrics()`.
-
-**File:** `backend/src/shared/metrics.ts`
-
-### Rate Limiting
-
-**What it is:** Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse (automated scraping, brute-force attacks) and ensures fair resource allocation across users.
-
-**Why it matters:** Search is computationally expensive -- each query hits Elasticsearch with multi-field matching, visibility filtering, and relevance scoring. A bot scraping all public posts could issue thousands of searches per second, consuming Elasticsearch CPU that should serve real users. Rate limiting caps the damage any single source can cause.
-
-**How it works here:** IP-based rate limiting is implemented via `express-rate-limit` middleware. The global limit is 1000 requests per 15 minutes per IP address. This is a simple sliding window counter. When the limit is exceeded, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. The limit applies to all API endpoints uniformly. In production, per-user rate limiting (separate from IP-based) and tiered limits (lower for search, higher for reads) would be added.
-
-**File:** `backend/src/index.ts`
-
-### Idempotency
-
-**What it is:** Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a search system, idempotency is primarily relevant for write operations (post creation, friendship changes) where network retries could cause duplicates.
-
-**Why it matters:** If a user creates a post, the server inserts it into PostgreSQL and indexes it in Elasticsearch. If the response is lost and the client retries, the post could be created twice. This creates duplicate search results and corrupts engagement metrics.
-
-**How it works here:** Post creation uses PostgreSQL's UUID primary key as a natural idempotency mechanism -- duplicate UUIDs cause a constraint violation rather than a duplicate insert. For indexing, each post is indexed by its UUID as the Elasticsearch document ID. Re-indexing the same post with the same ID overwrites the existing document rather than creating a duplicate. The admin reindex operation is fully idempotent: it deletes and recreates the index, then bulk-indexes all posts from PostgreSQL. Running it multiple times always produces the same result.
-
-### Health Checks
-
-**What it is:** Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators, and monitoring systems to detect and route around failures.
-
-**Why it matters:** This system depends on three external services: PostgreSQL (source of truth), Elasticsearch (search index), and Redis (cache and sessions). If any one fails, different parts of the application degrade differently. Health checks enable automated systems to detect exactly what is failing and respond appropriately.
-
-**How it works here:** Three endpoints serve different consumers. `/health` performs a comprehensive check of all three dependencies (PostgreSQL query, Elasticsearch ping, Redis ping) and returns a JSON object with the status of each. `/livez` confirms the process is alive (Kubernetes liveness probe). `/readyz` checks that all dependencies are reachable (Kubernetes readiness probe -- if Elasticsearch is down, the instance is removed from the load balancer but not restarted, allowing it to serve cached results or non-search endpoints). The admin dashboard's `HealthStatusBar` component polls the health endpoint to display colored indicators for each service.
-
-**File:** `backend/src/shared/healthCheck.ts`
+| Privacy | Token retrieval + current batch validation | Trust copied ACLs alone | Stale projections cannot grant access |
+| Ranking | ES baseline, measured later reranker | Page-only reranking | Candidate recall and stable serving remain explicit |
+| Pagination | Bounded PIT/search_after session | Offset into refreshed rank | Predictable continuation with expiry costs |
+| Indexing | Transactional outbox + versioned workers | SQL then inline ES | Accepted changes survive index outages |
+| Rebuild | New generation + change catch-up + alias | In-place bulk upsert | Coverage and deletions are verifiable |
+| Suggestions | Public-safe corpus + scoped history | Global private-query/hashtag mining | Auxiliary responses respect privacy |
 
 ## Implementation Notes
 
-This section maps the production architecture to the actual local implementation.
+### Implemented patterns and wiring
 
-### Local Architecture
+[searchService.ts](./backend/src/services/searchService.ts) sends a single ES query: content^3, author_name^2, hashtags^2, best_fields, AUTO fuzziness, visibility token filtering, friend/self should boosts, then score/engagement/time sorting. It maps hits directly to results. Offset is parseInt(cursor); total.relation and shard/timed_out metadata are discarded. Normal refreshes can shift pages, and the default result window limits deep offsets.
 
-```
-┌─────────────────┐
-│  React Frontend │
-│  Vite :5173     │
-│                 │
-│  Search Bar     │
-│  + Typeahead    │
-│  Search Filters │
-│  Result Cards   │
-│  Admin Dashboard│
-└────────┬────────┘
-         │ HTTP
-         ▼
-┌─────────────────┐
-│  Express API    │
-│  :3000          │
-│                 │
-│  Search Service │
-│  Post Service   │
-│  Visibility Svc │
-│  Indexing Svc   │
-│  Auth Service   │
-│  Admin Ctrl     │
-└──┬──────┬───┬───┘
-   │      │   │
-   ▼      ▼   ▼
-┌─────┐┌─────┐┌──────────────┐
-│ PG  ││Redis││Elasticsearch │
-│:5432││:6379││    :9200     │
-│fb_  ││     ││              │
-│post_││     ││  posts index │
-│srch ││     ││  (1 shard,   │
-│     ││     ││   0 replicas)│
-└─────┘└─────┘└──────────────┘
+[visibilityService.ts](./backend/src/services/visibilityService.ts) supplies PUBLIC, PRIVATE:self, FRIENDS:self, and FRIENDS:friend tokens from accepted outgoing SQL rows. Redis caches the JSON for 900 seconds. Neither invalidation nor friendship-check helper is connected to a mutation flow.
+
+[indexingService.ts](./backend/src/services/indexingService.ts) extracts lowercase hashtags/mentions including their prefix, computes likes + 2×comments + 3×shares, hardcodes language=en, and uses refresh=true for writes. In outline, the local post service does:
+
+```typescript
+const post = await queryOne<Post>(insertSql, values);
+await indexPost(post, authorName);
 ```
 
-### Production Patterns Actually Implemented
+This illustrates two separate stores; it is not a transaction/outbox. See [postService.ts](./backend/src/services/postService.ts) for the actual null/author checks and error handling. [circuitBreaker.ts](./backend/src/shared/circuitBreaker.ts) supplies the timeout/breaker wrapper with the ordering/recovery limits above. [healthCheck.ts](./backend/src/shared/healthCheck.ts), [metrics.ts](./backend/src/shared/metrics.ts), and [logger.ts](./backend/src/shared/logger.ts) provide the wired operational surface.
 
-| Pattern | File | What It Does |
-|---------|------|-------------|
-| **Visibility fingerprints** | `backend/src/services/visibilityService.ts` | Computes user visibility set from friendships, caches in Redis for 15 min |
-| **Privacy-aware search** | `backend/src/services/searchService.ts` | Builds ES bool query with visibility_fingerprints terms filter |
-| **Friend-boosted ranking** | `backend/src/services/searchService.ts` | Adds should clauses for friend posts (2x) and own posts (3x) |
-| **Real-time indexing** | `backend/src/services/indexingService.ts` | Synchronous ES indexing with fingerprint computation, hashtag/mention extraction |
-| **Bulk indexing** | `backend/src/services/indexingService.ts` | Batch index for seeding and reindex operations |
-| **Circuit breaker** (Cockatiel) | `backend/src/shared/circuitBreaker.ts` | Wraps all ES calls with timeout (5s) + retry (2x) + consecutive breaker (5 failures) |
-| **Prometheus metrics** (prom-client) | `backend/src/shared/metrics.ts` | 15+ custom metrics: search, cache, indexing, circuit breaker, HTTP, DB |
-| **Structured logging** (Pino) | `backend/src/shared/logger.ts` | Domain-specific log functions (logSearch, logIndexing, logCircuitBreakerStateChange) |
-| **Health checks** | `backend/src/shared/healthCheck.ts` | /health (comprehensive), /livez, /readyz with PostgreSQL + ES + Redis checks |
-| **Alert thresholds** | `backend/src/shared/alertThresholds.ts` | Configurable thresholds for circuit breaker, retention, cache TTLs |
-| **Data retention** | `backend/src/shared/retention.ts` | Retention constants for search history (90 days), sessions, visibility cache |
-| **Search history cleanup** | `backend/src/scripts/cleanup-search-history.ts` | Removes search_history entries older than retention period |
-| **Database migrations** | `backend/src/shared/migrations.ts` | Migration runner with rollback support |
-| **Rate limiting** (express-rate-limit) | `backend/src/index.ts` | IP-based rate limiting (1000 req/15min) |
-| **Input validation** (Zod) | Controllers | Schema-based request validation |
-| **Typeahead suggestions** | `backend/src/services/searchService.ts` | Hashtag aggregations (ES), trending searches (Redis), user name matching (PG) |
-| **ES index management** | `backend/src/config/elasticsearch.ts` | Index creation with mapping, analyzers, field types |
-| **Admin dashboard** | `frontend/src/routes/admin.tsx` + `frontend/src/components/admin/` | System stats, user/post management, health status, search history, reindex trigger |
+### Setup, seed, and maintenance distinctions
 
-### What Was Simplified or Substituted
+[config/index.ts](./backend/src/config/index.ts) loads .env before clients initialize. Zod validates NODE_ENV and string presence/types with defaults; it does not ensure numeric port validity or implement request validation. The database pool has max=20, a two-second connection timeout, and thirty-second idle timeout; queries have no statement deadline. CORS origins are fixed.
 
-| Production Design | Local Implementation | Why |
-|-------------------|---------------------|-----|
-| API Gateway (Kong/Envoy) | Direct Express routing | Single service |
-| Kafka indexing pipeline | Synchronous indexing with refresh=true | No async infra needed |
-| ES Cluster (1000+ shards) | Single-node ES (1 shard, 0 replicas) | Dev scale |
-| PostgreSQL sharding | Single PostgreSQL instance | 100 users |
-| Redis Cluster | Single Valkey instance | All cache fits in memory |
-| OAuth/JWT auth | Session-based with bcrypt | Simpler |
-| ML re-ranking | Friend boost + engagement score | No training data |
-| CDN for static assets | Vite dev server | Local only |
-| ILM hot/warm/cold tiers | Single index, no lifecycle | Dev scale |
-| Bloom filters for visibility | Full fingerprint arrays | Small friend lists |
+[db/migrate.ts](./backend/src/db/migrate.ts) reads exported DATABASE_URL or a default, independently of .env and POSTGRES_*; it executes the consolidated schema without version records. The separate numbered-migration helper used by status/rollback points to a nonexistent directory. db:index points to a missing script. [retention.ts](./backend/src/shared/retention.ts) contains unused ILM/template/rollover helpers; only manual db:cleanup invokes the 90-day search-history cleanup. No session/trend cleanup scheduler is installed.
 
-### What Was Omitted
+The two seed paths differ in users, graph, posts, passwords, and destructiveness; the [README](./README.md#fixtures-and-credentials) documents both. Startup backfill only runs if ES count is zero, catches failures per post, and treats any nonempty index as populated on the next boot. Admin reindex reads all SQL IDs and performs a single bulk upsert without checking item errors or deleting orphan IDs. It does not recreate mappings or swap an alias.
 
-- CDN / edge caching
-- Kafka for async indexing pipeline and event replay
-- Elasticsearch ILM (Index Lifecycle Management) for hot/warm/cold tiers
-- ML-based re-ranking (gradient boosted trees)
-- Bloom filter visibility optimization
-- Multi-region deployment with cross-cluster search
-- Kubernetes orchestration
-- MinIO/S3 for cold storage archival
-- Query result caching for popular searches
-- Language detection for multilingual search
-- Content moderation integration
-- A/B testing hooks for ranking algorithm experiments
-- Load balancer (nginx/HAProxy) -- though multi-instance is supported via `npm run dev:server1/2/3`
+### Browser behavior and gaps
+
+- [searchStore.ts](./frontend/src/stores/searchStore.ts) keeps one global query/filter/result array, with no identity guards, deduplication, or bounds. Slow first-page replies overwrite newer results; Load More captures an old array and can append a different query/filter response. Filters mutate immediately in the store even before Apply. Logout leaves search results/history behind.
+- [SearchBar.tsx](./frontend/src/components/SearchBar.tsx) fetches suggestions per keystroke without debounce, cancellation, IME handling, or stale-response checks. It supports Enter/Escape but no active-option arrow navigation/combobox roles. User suggestions submit display-name text, not an author ID filter.
+- Hashtag suggestions remove # before building an aggregation regex even though indexed values retain #. The prefix is not regex-escaped. Normal suggestions inspect only the top 100 global trend entries and optionally five SQL user matches; cache truncation can poison a later larger limit. Personal recent-search SQL combines DISTINCT with MAX(created_at) ordering without valid grouping.
+- [SearchResults.tsx](./frontend/src/components/SearchResults.tsx) maps all accumulated cards, with no virtualizer. Existing results remain during a new request without a committed-query label; a later-page error hides them. Filter-only results are hidden because the route/result component require a nonempty query. No query/filter URL state or explicit scroll restoration exists.
+- [admin.tsx](./frontend/src/routes/admin.tsx) checks role in an effect, reads stats/health on mount or after reindex, and lazily loads each first-page table. There are no pagination controls or polling. Its health type expects top-level booleans, while the server returns services.*.healthy, so indicator colors are wrong. Empty/error table loads have limited feedback.
+- Auth uses localStorage auth_token and an in-memory API token; there is no cross-tab synchronization or account generation. Root isLoading replaces the entire route while login/register is pending. Result cards expose no working engagement or detail controls, and no media asset is rendered.
+
+### Simplified and omitted components
+
+One process and three data services substitute for search shards/replicas, graph authorities, durable index workers, and distributed caches. There is no Kafka, transactional outbox, receipt/revision protocol, active ILM, ML model, service-worker/offline result cache, live channel, upload service, or shared runtime API schema package. Proposed privacy and snapshot guarantees should not be inferred from the presence of helper names.
+
+### Verification boundary
+
+Ten isolated source-execution checks confirmed offset/lower-bound-total behavior, raw index/snippet return, hashtag/cache scoping defects, ignored bulk/delete failures, SQL/index split outcomes, inconsistent post access and repeated private likes, request/filter races, NaN defaults, SHA-256 fixtures/cached roles, and actual Cockatiel timeout/recovery behavior. Dependencies were mocked except the installed Cockatiel library; no browser payload was executed. No app code, live data, full-stack runtime, build, or load test was changed/run. The smoke/screenshot limitations are recorded in the README.

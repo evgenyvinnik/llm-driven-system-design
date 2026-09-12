@@ -1,301 +1,434 @@
-# Apple TV+ - System Design Answer (Backend Focus)
+# Apple TV+ — backend system design interview
 
-*45-minute system design interview format - Backend Engineer Position*
+A proposed subscription video-on-demand backend, discussed in 45 minutes. This is not
+a description of Apple's private infrastructure. The local repository has
+catalog/account APIs and simulated streaming routes; the production design
+deliberately extends them.
 
-## Problem Statement
+| Discussion | Minutes |
+|------------|---------|
+| Scope and scale | 4 |
+| Architecture and data ownership | 5 |
+| Deep dive: publish complete media | 10 |
+| Deep dive: authorize scalable playback | 9 |
+| Deep dive: progress and viewing history | 8 |
+| Catalog, operations and scaling | 5 |
+| Validation and implementation comparison | 4 |
+| Total | 45 |
 
-Design the backend infrastructure for a premium video streaming service that:
-- Ingests and transcodes master video files to multiple quality variants
-- Delivers adaptive bitrate streaming via HLS
-- Provides global content delivery with < 2s playback start
-- Manages DRM licensing and content protection
+## 🎯 Scope and scale — 4 minutes
 
-## Requirements Clarification
+> “I will design a subscription library rather than live broadcasting. That lets us
+> encode ahead of time and concentrate on reliable publication, fast playback starts
+> and cross-device resume.”
 
-### Functional Requirements
-1. **Video Ingestion**: Accept 4K HDR master files and transcode to 10+ variants
-2. **Manifest Generation**: Create HLS master and variant playlists
-3. **DRM Licensing**: Issue FairPlay licenses for authorized devices
-4. **Watch Progress**: Sync playback position across devices
-5. **Content Catalog**: Serve metadata, recommendations, and search
+The core requirements are movie/series discovery, protected playback for entitled
+accounts, household profiles, progress and watchlists. Content administrators need to
+ingest, validate and publish a title, then withdraw it when rights change.
 
-### Non-Functional Requirements
-1. **Latency**: < 2s from play request to first frame
-2. **Quality**: Support 4K HDR with Dolby Vision and Atmos
-3. **Availability**: 99.99% for streaming, 99.9% for catalog
-4. **Scale**: Millions of concurrent streams globally
+I would ask whether we own the clients and rights policy. I will assume supported web
+and native clients, a billing provider, and region-specific availability. Exact
+subscription prices and licensing terms are product inputs, not architecture
+constants.
 
-### Scale Estimates
-- Thousands of movies and shows
-- Millions of subscribers
-- Each title: 10+ encoded variants (4K HDR to 360p)
-- Petabytes of video content
+Offline downloads and live channels are later extensions. Offline playback adds a
+device license lifecycle; live streaming adds ingestion timing and live-edge
+constraints that this VOD design does not need.
 
-## High-Level Architecture
+Proposed service targets are p99 authorization below 200 milliseconds within a region,
+and 99.99% authorization availability. The end-to-end p95 first-frame goal is two
+seconds on an agreed network/device cohort. We must measure that on the client,
+because the backend can respond quickly while media still fails to decode.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Load Balancer (nginx)                           │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-            │ API Server  │ │ API Server  │ │ API Server  │
-            │   (Node)    │ │   (Node)    │ │   (Node)    │
-            └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-                   │               │               │
-                   └───────────────┼───────────────┘
-                                   │
-            ┌──────────────────────┼──────────────────────┐
-            │                      │                      │
-            ▼                      ▼                      ▼
-    ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-    │    Valkey    │      │  PostgreSQL  │      │     CDN      │
-    │   (Cache +   │      │   (Primary)  │      │    Edges     │
-    │   Sessions)  │      │              │      │              │
-    └──────────────┘      └──────────────┘      └──────────────┘
-                                   │
-                          ┌────────┴────────┐
-                          ▼                 ▼
-                  ┌──────────────┐  ┌──────────────┐
-                  │   RabbitMQ   │  │    MinIO     │
-                  │  (Job Queue) │  │  (Segments)  │
-                  └──────────────┘  └──────────────┘
-```
+For planning, assume ten million daily viewers averaging two viewing hours and two
+million concurrent streams at peak. These are exercise assumptions, not measurements
+of the repository or Apple.
 
-## Deep Dive: Transcoding Pipeline
+| Quantity | Rough estimate | Design consequence |
+|----------|----------------|--------------------|
+| Average concurrency | 20 million viewing hours / 24 ≈ 833,000 | Sustained media demand |
+| Peak media bandwidth | 2 million × 6 Mb/s = 12 Tb/s | CDN delivery is essential |
+| Video segment rate | 2 million / 6 seconds ≈ 333,000/s | Account APIs cannot sit in every segment path |
+| Progress updates | 2 million / 15 seconds ≈ 133,000/s | Coalesce and partition writes |
+| Encoded storage | 50,000 hours at aggregate 40 Mb/s ≈ 900 TB | Encoding and replication need cost control |
 
-### Database Schema
+The segment estimate excludes separate audio, retries and startup requests. I would
+keep units explicit and refine assumptions with traffic data rather than quoting a
+database's universal writes-per-second capacity.
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| **content** | id (UUID PK), title, description, duration (seconds), content_type (movie/series/episode), series_id (self-ref FK), season_number, episode_number, master_resolution, hdr_format, status (default 'processing') | — | Content catalog with hierarchical series/episode support |
-| **encoded_variants** | id (UUID PK), content_id (FK), resolution, codec, hdr (boolean), bitrate, file_path, file_size, encoding_time | idx_variants_content (content_id) | One row per encoded quality variant |
-| **video_segments** | id (UUID PK), content_id (FK), variant_id (FK), segment_number, duration, segment_url, byte_size | idx_segments_variant (content_id, variant_id) | HLS segments for each variant |
-| **watch_progress** | profile_id + content_id (composite PK), position, duration, client_timestamp, completed (boolean) | idx_progress_profile (profile_id, updated_at DESC) | Tracks playback position per profile per content |
-| **license_grants** | id (UUID PK), user_id, content_id (FK), device_id, granted_at, expires_at | idx_license_user (user_id, content_id) | DRM license grants with expiration |
+## 🏗️ Architecture and data ownership — 5 minutes
 
-### Ingestion Service
-
-The ingestion service processes master files through a multi-step pipeline:
-
-1. **Validate master file quality** - Analyze the video file to confirm it meets the 4K HDR minimum requirement (resolution >= 3840, bit depth >= 10). Reject files that do not meet the quality bar.
-
-2. **Create content record** - Insert a new row into the content table with status "ingesting", recording the title, duration, resolution, and HDR format from the master file metadata.
-
-3. **Queue transcoding jobs** - Determine the encoding profiles based on the master resolution (see encoding ladder below), then publish a job to the "transcode" queue for each profile. Higher resolutions (2160p+) receive "high" priority; lower ones receive "normal" priority.
-
-4. **Process audio tracks** - For each audio stem (language), publish a job to the "audio-encode" queue requesting AAC stereo, AAC surround, and Dolby Atmos variants.
-
-**Encoding Ladder:**
-
-| Resolution | Codec | HDR | Bitrate (kbps) | Target Device |
-|------------|-------|-----|----------------|---------------|
-| 2160p | HEVC | Yes | 25,000 | Apple TV 4K, high-end |
-| 2160p | HEVC | Yes | 15,000 | Apple TV 4K |
-| 2160p | HEVC | No | 12,000 | 4K SDR fallback |
-| 1080p | HEVC | No | 8,000 | Most common |
-| 1080p | H.264 | No | 6,000 | Broad compatibility |
-| 1080p | H.264 | No | 4,500 | Moderate bandwidth |
-| 720p | H.264 | No | 3,000 | Mobile, limited bandwidth |
-| 720p | H.264 | No | 1,500 | Low bandwidth |
-| 480p | H.264 | No | 800 | Very low bandwidth |
-| 360p | H.264 | No | 400 | Minimum quality |
-
-Only profiles at or below the master resolution are generated.
-
-### Transcoding Worker
-
-Each transcoding worker consumes jobs from the queue and processes them through these steps:
-
-1. **Build FFmpeg encode** - Construct the FFmpeg command with the appropriate codec (libx265 for HEVC, libx264 for H.264), target bitrate, max rate at 1.5x target, buffer size at 2x target, and resolution scaling. For HDR profiles, include BT.2020 color primaries, SMPTE 2084 transfer characteristics, and BT.2020 non-constant luminance colorspace metadata.
-
-2. **Run the encode** - Execute FFmpeg against the source file to produce the encoded output. Audio is stripped (encoded separately).
-
-3. **Create HLS segments** - Re-mux the encoded video into 6-second HLS segments using FFmpeg with VOD playlist type. Each segment is named sequentially (segment_0000.ts, segment_0001.ts, etc.) and a variant playlist (playlist.m3u8) is generated.
-
-4. **Upload to origin storage** - Push all segments and the variant playlist to MinIO (S3-compatible object storage).
-
-5. **Record completion** - Insert a row into the encoded_variants table with the content ID, resolution, codec, HDR flag, bitrate, and file path.
-
-## Deep Dive: HLS Manifest Generation
-
-### Master Manifest Service
-
-The manifest service generates an HLS master playlist (M3U8) for a given content ID:
-
-1. **Query all encoded variants** for the content, ordered by resolution descending and bitrate descending.
-2. **Query all audio tracks** for the content.
-3. **Build the manifest header** with the M3U8 version tag.
-4. **Add audio group entries** - For each audio track, add an EXT-X-MEDIA line specifying the language, name, and URI.
-5. **Add video variant entries** - For each encoded variant, add an EXT-X-STREAM-INF line with bandwidth (bitrate * 1000), resolution, codec string, and audio group reference, followed by the variant playlist URL.
-
-**Codec string mapping:**
-- HEVC + HDR: `hvc1.2.4.L150.B0,mp4a.40.2`
-- HEVC (SDR): `hvc1.1.6.L150.90,mp4a.40.2`
-- H.264: `avc1.640029,mp4a.40.2`
-
-## Deep Dive: DRM License Service
-
-### FairPlay Integration
-
-The DRM license service handles FairPlay Streaming requests through a six-step process:
-
-1. **Verify playback token** - Validate the token from the playback request. Reject with 401 if invalid.
-2. **Verify device authorization** - Confirm the requesting device is registered and authorized for this user account. Reject if the device is not recognized.
-3. **Process Server Playback Context (SPC)** - Decrypt the SPC message sent by the client's FairPlay module to extract the content key request.
-4. **Retrieve content key from HSM** - Fetch the content encryption key from the Hardware Security Module for the requested content ID.
-5. **Generate Content Key Context (CKC)** - Combine the SPC data with the content key to produce the CKC response, setting policies such as offline playback permission, HDCP requirement, and 24-hour expiration.
-6. **Log for compliance** - Insert a record into the license_grants table with the user ID, content ID, device ID, grant time, and expiration time (24 hours from now).
-
-The service returns the CKC to the client, which uses it to decrypt and play the protected content.
-
-## Deep Dive: CDN and Edge Delivery
-
-### Edge Selection Service
-
-The CDN service determines the optimal playback URLs for a given user and device:
-
-1. **Check regional availability** - Verify the content is licensed for distribution in the user's region. Return an error if not available.
-2. **Select optimal edge** - Find CDN edge servers in the user's region with load below 80% (tracked in Valkey sorted sets). If no healthy edges are available, fall back to the origin server. Among available edges, select the one with the lowest historical latency for this user.
-3. **Generate signed playback token** - Create a time-limited token (24-hour expiry) containing the content ID, user ID, device ID, and maximum bitrate allowed for the device type.
-4. **Return playback URLs** - Provide the manifest URL, playback token, and license URL, all routed through the selected edge server.
-
-**Device bitrate limits:**
-
-| Device Type | Max Bitrate (kbps) |
-|-------------|-------------------|
-| Apple TV 4K | 25,000 |
-| Mac | 25,000 |
-| iPad | 15,000 |
-| iPhone | 12,000 |
-| Browser | 8,000 |
-| Default | 6,000 |
-
-## Deep Dive: Watch Progress Sync
-
-### Last-Write-Wins Implementation
-
-**Updating progress:** The service uses an UPSERT with a client timestamp comparison. On conflict (same profile + content), the position is only updated if the incoming client timestamp is newer than the stored one, using a GREATEST function to always keep the latest timestamp. After updating, the continue-watching cache for that profile is invalidated.
-
-**Continue watching list:** The service first checks Valkey for a cached result (5-minute TTL). On cache miss, it queries PostgreSQL for the profile's watch progress, joining with the content table to get titles and thumbnails. It filters to items where the user watched at least 60 seconds but less than 90% of the content, ordered by most recently updated, limited to 10 items. The result includes a progress percentage (position / duration). The query result is cached in Valkey for 300 seconds.
-
-## Deep Dive: Circuit Breaker Pattern
-
-The circuit breaker protects against cascading failures by wrapping external service calls in a state machine with three states:
-
-- **Closed** (normal): Requests pass through. Failures are counted. After 5 consecutive failures, the breaker transitions to Open.
-- **Open** (blocking): All requests are immediately rejected (or routed to a fallback) without calling the downstream service. After a 30-second timeout, transitions to Half-Open.
-- **Half-Open** (probing): The next request is allowed through as a test. If it succeeds, the breaker resets to Closed. If it fails, it returns to Open.
-
-On success, the failure counter resets and state returns to Closed. On failure, the counter increments and the last failure timestamp is recorded.
-
-Each external service gets its own circuit breaker instance with tuned thresholds:
-
-| Service | Failure Threshold | Timeout |
-|---------|------------------|---------|
-| CDN | 5 failures | 30 seconds |
-| Transcoding | 10 failures | 120 seconds |
-| DRM | 3 failures | 60 seconds |
-
-## API Design
-
-### RESTful Endpoints
+> “I would separate the control path from the media path. The account service decides
+> whether someone can play; the CDN delivers the bytes.”
 
 ```
-Content Ingestion:
-POST   /api/admin/content                   Ingest new content
-GET    /api/admin/content/:id/status        Check transcoding status
-POST   /api/admin/content/:id/publish       Publish content
-
-Streaming:
-GET    /api/stream/:contentId/master.m3u8   Get master manifest
-GET    /api/stream/:contentId/:variant      Get variant playlist
-POST   /api/drm/license                     Request FairPlay license
-
-Watch Progress:
-POST   /api/watch/progress                  Update watch position
-GET    /api/watch/continue                  Get continue watching list
-POST   /api/watch/progress/batch            Batch sync (offline)
-
-Catalog:
-GET    /api/content                         List content
-GET    /api/content/:id                     Get content details
-GET    /api/recommendations                 Get personalized recommendations
+┌────────────────┐                  ┌────────────────┐
+│ Viewer apps    │─ media ─────────▶│ CDN + shield   │
+│                │                  │                │
+└────────────────┘                  └────────────────┘
+        │ control                           │ cache miss
+        ▼                                   ▼
+┌────────────────┐                  ┌────────────────┐
+│ Domain APIs    │                  │ Private origin │
+│ SQL / cache    │                  │                │
+└────────────────┘                  └────────────────┘
+                                            ▲ publish
+                                            │
+                                    ┌────────────────┐
+                                    │ Encode workers │
+                                    │ Queue / jobs   │
+                                    └────────────────┘
 ```
 
-### Request/Response Examples
+The domain APIs own catalog, accounts/profiles, entitlement, progress and subscription
+state. The license service is a separate protected dependency of playback, with access
+to key management. I would draw its connection when discussing authorization rather
+than add every dependency to the opening picture.
 
-**Get Master Manifest**:
+Catalog metadata changes infrequently compared with media requests. PostgreSQL is a
+reasonable authority for title revisions, rights and subscription references. Redis
+can hold sessions and bounded caches, while object storage holds immutable media.
 
-A GET request to `/api/stream/movie-123/master.m3u8` with a Bearer playback-token returns an HLS master playlist. The response contains audio media entries (e.g., English audio track) and stream variant entries listing bandwidth, resolution, codecs, and audio group. For example, a 4K HDR variant at 25 Mbps with HEVC codec and a 1080p variant at 8 Mbps with H.264 codec, each pointing to their respective variant playlist files.
+Ingestion workers run independently of latency-sensitive APIs. They consume durable
+jobs, produce encoded assets and record validation results. A publication coordinator
+switches the active media revision only after required work succeeds.
 
-## Caching Strategy
+The ownership model is small enough to explain at the board:
 
-### Cache Layers
+| Entity | Identity and important fields | Invariant |
+|--------|-------------------------------|-----------|
+| Account/profile | Account ID, profile ID, policy/version | Personal requests validate association |
+| Title/revision | Title ID, source revision, active media revision | Published pointer refers to a validated set |
+| Encoding job | Source revision + encoding profile | Repeated delivery has one accepted result |
+| Playback session | Session ID, account/profile, title revision, expiry | Bounded authorization for a fixed context |
+| Progress | Profile/title, active generation, sequence, position | Older session cannot silently overwrite handoff |
+| Completion event | Event ID, playback session, title | Replay does not duplicate its contribution |
+| Subscription | Provider ID, status, expiry, processed events | Provider retries do not repeat transitions |
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Request Flow                            │
-│                                                              │
-│  Manifest ──► CDN Edge (1h) ──► Origin Shield ──► API       │
-│  Segments ──► CDN Edge (24h) ──► Origin ──► MinIO           │
-│  Continue ──► Valkey (5min) ──► PostgreSQL                  │
-│  Sessions ──► Valkey (7 days)                               │
-└─────────────────────────────────────────────────────────────┘
-```
+I would not put every media segment in the hot relational request path. Validated
+manifests and revisioned objects let the CDN serve playback without asking SQL which
+file comes next.
 
-### Cache Key Design
+## 🔧 Deep dive: publish complete media — 10 minutes
 
-| Cache Key Pattern | Purpose | TTL |
-|-------------------|---------|-----|
-| `continue:{profileId}` | Continue watching list | 5 min |
-| `recs:{profileId}` | Personalized recommendations | varies |
-| `content:{contentId}` | Content metadata | varies |
-| `edge:load:{edgeId}` | Edge server health/load | real-time |
-| `idempotency:{key}` | Request idempotency | 24h |
+### Treat publication as a state transition
 
-## Scalability Considerations
+> “The most damaging ingestion bug is a ready title whose playlist points to missing
+> media. I would make publication depend on a validated revision, not a manually
+> edited status flag.”
 
-### Read Scaling
+An administrator first creates a draft with source identity, metadata and required
+tracks. The upload service gives bounded access to private storage. It verifies the
+completed upload's checksum and format before scheduling expensive work.
 
-1. **CDN Multi-tier**: Edge POPs -> Regional Shields -> Origin
-2. **Read Replicas**: Route catalog queries to PostgreSQL replicas
-3. **Connection Pooling**: PgBouncer for API server connections
+A source does not have to be 4K HDR to be valid. The required quality follows the
+content contract. Encoding cannot create meaningful source detail that was never
+present, and an SDR source should not acquire an HDR label just because a flag was
+set.
 
-### Write Scaling
+The service creates durable jobs for a measured rendition ladder and required
+audio/caption work. Job identity includes source revision and encoding profile.
+Changing the source creates new jobs rather than mutating an output under an old URL.
 
-1. **Distributed Transcoding**: Multiple workers per profile
-2. **Partitioned Tables**: Shard watch_progress by profile_id hash
-3. **Async Processing**: Queue non-critical operations
+Each worker writes to an immutable revision namespace. After upload, it checks
+expected objects and stores a validation result. A partially uploaded directory is not
+a successful rendition merely because one playlist exists.
 
-### Estimated Capacity
+Validation covers media references, duration/timeline agreement, compatible tracks and
+representative decode checks. The exact ladder is tuned to content and supported
+devices; I would avoid spending whiteboard time listing ten codec command lines.
 
-| Component | Single Node | Scaled (16x) |
-|-----------|-------------|--------------|
-| PostgreSQL writes | 5K/sec | 80K/sec (sharded) |
-| PostgreSQL reads | 20K/sec | 320K/sec (replicas) |
-| Valkey cache | 200K/sec | 200K/sec |
-| CDN throughput | N/A | 100+ Tbps |
+### Recover between SQL, queue and storage
 
-## Trade-offs Summary
+Creating a database job and publishing a queue message are two systems. If SQL commits
+and queue publication fails, the title must remain visibly pending and the job must
+still be discoverable.
 
-| Decision | Pros | Cons |
+I would write the job and an outbox dispatch record in one transaction. A dispatcher
+publishes it, records acknowledgement and retries uncertain outcomes. The queue may
+deliver twice; the worker claims the durable job and checks whether that
+revision/profile already has a validated result.
+
+Worker leases let another worker recover after a crash. A lease alone is not enough: a
+late original worker must not overwrite the replacement's accepted result. Conditional
+updates or fencing versions ensure only the current claim can advance job state.
+
+Storage uploads also need stable object identity. If a retry finds an object, compare
+the expected revision/checksum rather than assuming any matching filename is correct.
+Temporary or abandoned assets can be collected after a safe retention window.
+
+The publication coordinator reads the required rendition set and validation state. It
+atomically updates the title's active revision with an expected-draft revision check.
+A late encode from yesterday cannot publish over today's editorial change.
+
+The previous active revision remains playable during this work. Viewers already
+watching it keep stable URLs; new playback sessions receive the new revision after
+publication. That avoids mixing old audio with new video during an update.
+
+### Explain the cost trade-off
+
+| Approach | Pros | Cons |
 |----------|------|------|
-| HLS over DASH | Native Apple support, FairPlay | Less efficient than DASH |
-| HEVC + H.264 | Universal decode support | HEVC licensing costs |
-| Per-segment encryption | Secure seeking, offline | Key management overhead |
-| 6-second segments | Good quality switching | Slightly higher latency |
-| PostgreSQL for catalog | ACID, complex queries | Write scaling limits |
-| Last-write-wins progress | Low latency, simple | Potential stale reads |
-| Circuit breakers per service | Isolated failures | Configuration complexity |
+| ✅ Encode and validate before publish | Predictable startup, shared cache objects, simple rollback | Upfront compute/storage, including unpopular titles |
+| ❌ Encode on the first viewer request | Avoids some unused work | First viewers wait; launches create unpredictable compute spikes |
+| ❌ Publish each file as it finishes | Earlier partial availability | Viewers can receive incomplete or incompatible track sets |
 
-## Future Backend Enhancements
+I would accept the upfront cost because playback latency is central to this product.
+To control waste, publish a valid baseline set first when policy permits and add
+optional high-quality renditions as a new validated revision.
 
-1. **Event Sourcing**: Store playback events for analytics replay
-2. **Multi-Region Active-Active**: Global availability with regional affinity
-3. **Real-time Analytics**: ClickHouse for playback quality monitoring
-4. **AV1 Codec**: Better compression when hardware support improves
-5. **Predictive Pre-positioning**: ML-based content caching
-6. **Webhook Notifications**: Real-time transcoding status updates
+A per-title encoding analysis can reduce unnecessary bitrate. That is an optimization
+after the publication invariant works; it should not make the release depend on an
+opaque pipeline with no retriable job identity.
+
+### Rollback and withdrawal differ
+
+Rollback changes the active pointer to an earlier validated revision. Existing
+playback sessions may continue their original revision, so we need a retention period
+before garbage collection.
+
+Withdrawal changes rights eligibility and denies new authorization. Old signed access
+and licenses remain subject to their expiry or supported revocation behavior. Deleting
+a catalog row or purging a cache cannot retract bytes already buffered on a device.
+
+I would surface these states to administrators: processing, validation failed, ready
+for publication, published and withdrawn. “Request accepted” should not appear as
+“Available to viewers” while the queue is still working.
+
+## 🔧 Deep dive: authorize scalable playback — 9 minutes
+
+### Make one bounded decision, then deliver at the edge
+
+> “With roughly 333,000 video-segment requests per second, checking PostgreSQL on each
+> request makes the account database part of the media bottleneck. I would authorize a
+> playback session, then validate bounded credentials at the delivery boundary.”
+
+The playback API checks the authenticated account, selected profile ownership, current
+subscription, territory/rights and supported device policy. It chooses a published
+media revision and returns a playback session with expiring access.
+
+The CDN validates authorization before serving protected cached bytes. Origin remains
+private. Cache identity is based on immutable media revision/rendition while the edge
+uses its supported mechanism to separate authorization from reusable object identity.
+
+A unique token in every cache key can destroy reuse. Removing tokens from keys without
+validating them creates an access bypass. The exact CDN integration must make both
+concerns explicit.
+
+The client requests a license through a protected service. License issuance rechecks
+the relevant session and rights policy, and uses a controlled key-management boundary.
+User-specific licenses and clear keys are not publicly cached media objects.
+
+For Apple-platform DRM, I would use the documented FairPlay SDK and approved
+production credentials. The service and client follow the supported key exchange
+rather than inventing their own SPC/CKC cryptography. [Apple FairPlay
+Streaming](https://developer.apple.com/streaming/fps/)
+
+HLS allows alternate renditions and fragmented MP4 as well as transport-stream media.
+I would choose packaging based on actual device and protection compatibility, not
+claim that HLS is inherently less efficient than DASH. [RFC
+8216](https://www.rfc-editor.org/rfc/rfc8216)
+
+### Bound authorization staleness
+
+Short-lived access reduces the time after a rights or subscription change during which
+old authorization remains usable. Very short expiry increases renewal traffic and can
+interrupt otherwise healthy playback during an authorization outage.
+
+I would define a renewal window with jitter and coordinate one renewal per playback
+session. The client renews before expiry, while the server retains the session
+identity and fixed media revision.
+
+A cancelled renewal or billing webhook does not necessarily mean an immediate stop.
+Product policy distinguishes entitlement paid through a date from revocation for a
+security or rights reason. The backend models those transitions explicitly.
+
+Device/concurrency enforcement uses uniquely identified playback leases with heartbeat
+expiry, scoped to the account. An in-memory counter keyed only by title or device
+class cannot establish which viewer owns a stream or recover cleanly after a crash.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Authorized CDN access with bounded lifetime | Scales media independently; preserves access policy | Credential renewal and revocation-window complexity |
+| ❌ Proxy every segment through account APIs | Central checks are straightforward | Media traffic and dependency failures overwhelm the control path |
+| ❌ Public origin bucket | Easy caching | Anyone with an object URL bypasses entitlement |
+
+The chosen design gives up instant universal revocation of all delivered material. I
+would state the actual revocation window and platform guarantees rather than call any
+token TTL “secure” without context.
+
+### Fail without manufacturing success
+
+If a CDN request fails, try a bounded retry or alternate healthy delivery path. Do not
+route an unbounded failover wave directly to an origin sized only for cache misses.
+
+If a license service fails, new protected playback may be unavailable while already
+licensed buffered playback continues. Returning a placeholder license with HTTP 200
+cannot repair that dependency.
+
+Circuit breakers and bulkheads protect scarce downstream capacity. Their timeout does
+not guarantee cancellation, so work already sent may finish later. Retrying a mutating
+operation therefore still requires durable identity.
+
+I would alert on the gap between successful authorization and actual client
+first-frame events. That detects failures hidden by happy API status codes, such as
+empty segments or unsupported packaging.
+
+## 🔧 Deep dive: progress and viewing history — 8 minutes
+
+### Preserve the latest accepted intent
+
+> “A resume pointer is mutable user intent. Viewing history is a sequence of events.
+> Combining the two leads to incorrect rewinds and duplicate completions.”
+
+The progress key is profile plus title. Each update also carries playback session
+generation, an increasing sequence and position. Within a session, lower or repeated
+sequences cannot replace a newer accepted value.
+
+A duplicate request with the same identity and payload returns the stored accepted
+result. Reusing its identity with a different payload is a conflict. The receipt and
+progress transition commit together so a lost response can be recovered after a
+restart.
+
+The server validates position against canonical media duration and the chosen
+timeline/revision. It does not trust a caller to redefine a two-hour film as ten
+seconds long and declare it complete.
+
+For a handoff, the service establishes a newer active generation. A delayed update
+from the old device can be retained for analytics but cannot move the resume pointer.
+This is a deliberate product policy that needs an understandable client experience.
+
+Taking maximum position is insufficient: a viewer can rewind. Ordering entirely by
+wall-clock time is also insufficient: a clock far in the future can win indefinitely.
+Server arrival order alone mistakes delayed offline delivery for current intent.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Session sequences and explicit handoff | Stable retries, intentional rewinds, bounded conflicts | Extra session state and ownership policy |
+| ❌ Highest position wins | Simple monotonic merge | Rewinds and restarts disappear |
+| ❌ Client-clock last-write-wins | Minimal coordination | Skew or delayed uploads can suppress valid progress |
+
+If simultaneous independent viewing on one profile is required, I would clarify which
+session owns resume or present both candidates. There is no universal timestamp rule
+that knows what the person wants.
+
+### Keep completion repeatable
+
+Crossing the completion policy creates a uniquely identified completion event for that
+viewing session. Store its contribution and outbox record consistently with the
+accepted transition. A repeated final progress update must not add another completed
+viewing.
+
+A later rewatch gets a new viewing session and can have its own completion. Completion
+and current position are separate enough that rewinding does not erase historical
+evidence or force the pointer to remain at the end.
+
+Continue Watching is a projection of accepted progress and catalog metadata. Use one
+documented threshold policy, including exact boundary values, and filter
+unavailable/restricted titles. Do not compare caller duration in one path with catalog
+duration in another.
+
+Deleting history needs an explicit policy for pending devices. A deletion generation
+or tombstone can prevent an old queued update from immediately resurrecting cleared
+history. Privacy expectations matter more than an implementation that simply runs two
+DELETE statements.
+
+### Scale without losing acknowledgement meaning
+
+At the proposed 133,000 updates per second, I would coalesce snapshots within each
+session and partition ownership by profile. Critical ordering stays within one owner;
+aggregate analytics and recommendations are asynchronous.
+
+If acceptance moves to a durable log, define whether the acknowledgement means durably
+queued or visible in the resume view. A handoff read must be able to obtain the
+acknowledged revision even when a projection lags.
+
+Retries need backoff, jitter and bounded storage. A temporary progress outage should
+let video continue while exposing unsaved state; it should not trigger a synchronous
+write storm that harms playback authorization.
+
+I would start with relational conditional updates at a measured smaller scale, then
+preserve the same acceptance contract when partitioning. “Add Kafka” is not a
+substitute for specifying ordering, deduplication and read-after-ack behavior.
+
+## ⚙️ Catalog, operations and scaling — 5 minutes
+
+Catalog search and recommendations can be eventually consistent. Publication and
+playback authorization remain authoritative. If a stale recommendation points to a
+withdrawn title, playback denies it gracefully and discovery converges to the newer
+revision.
+
+Start with metadata search and explicit indexes suited to the access pattern. Add a
+search projection when relevance, query shape or load requires it. Track projection
+revision and lag so a failed index update is recoverable.
+
+For recommendations, a genre/popularity baseline is explainable and useful. A model
+can improve ranking later, but it does not belong on the critical media path. A
+fallback list should still respect rights and profile policy.
+
+Use deterministic pagination and capped limits. Caches must include dimensions that
+affect the response, such as profile/policy, filters and page size, or cache a
+canonical complete result and slice deliberately.
+
+Subscription webhooks are verified and deduplicated by provider event ID. Out-of-order
+events use provider state/version or reconciliation so an old success cannot undo a
+later cancellation. The browser's Subscribe success message alone is not proof of paid
+entitlement.
+
+| Operational signal | Why it matters |
+|--------------------|----------------|
+| Failed starts and first-frame latency | Measures the viewer's actual outcome |
+| CDN hit rate and origin bytes | Explains media delivery cost and failover pressure |
+| Oldest unprocessed encoding job | Detects stalled releases even when workers are alive |
+| Outbox/projection lag | Shows accepted changes not yet propagated |
+| Progress conflict/replay rate | Exposes device races and retry storms |
+| Entitlement denial versus service error | Separates policy behavior from outages |
+
+Use bounded metric dimensions; title, account and session IDs belong in controlled
+event/log correlation, not unbounded histogram labels. Logs should redact credentials,
+license material and sensitive personal context.
+
+Readiness should reflect the dependencies needed for the intended operation, with a
+deadline. A SELECT 1 proves a connection, not a valid schema, completed publication or
+decodable title. An ongoing synthetic playback check provides different evidence.
+
+For multiple regions, choose ownership for mutable profile and subscription state and
+define failover. Media replicas and a global CDN help reads, but do not automatically
+preserve write ordering during a partition.
+
+## 🧪 Validation and implementation comparison — 4 minutes
+
+I would verify failure windows rather than only endpoint responses. Kill a worker
+after upload but before recording completion, then redeliver the job. Exactly one
+validated revision should become active, and incomplete assets should remain
+unpublished.
+
+Commit a progress update and lose its response. A retry must return the accepted
+position without another history contribution. Then delay an old-device update until
+after a handoff and confirm it cannot overwrite the new session.
+
+Try expired credentials against cached media, withdraw rights during playback, and
+simulate a license outage. The observed behavior must match the stated authorization
+lifetime and recovery policy.
+
+Load tests need realistic cache-hit ratios, segment sizes, device cohorts and progress
+frequency. A high rate of tiny JSON responses cannot substantiate terabit delivery or
+a two-second first-frame claim.
+
+| Decision | Main benefit | Cost accepted |
+|----------|--------------|---------------|
+| Revision-gated publication | Viewers receive complete, consistent media | Durable job/release coordination |
+| Edge delivery with bounded authorization | Separates media scale from account storage | Renewal and revocation policy |
+| Durable progress identity | Predictable retries and handoff | Explicit conflict/ownership model |
+
+The repository currently uses one Express application, PostgreSQL, Valkey and
+provisioned MinIO. It generates playlist text but returns empty video/audio segments;
+no upload, encoding worker, real CDN or DRM service is connected. Subscription updates
+are simulated.
+
+Its timestamp upserts and Redis replay cache illustrate useful patterns with
+limitations: progress/history writes are separate, batch routing is shadowed, and
+replay keys lack operation/payload binding. The [architecture implementation
+notes](./architecture.md#implementation-notes) contain the source audit. I would
+present those as gaps to build and test, not as production guarantees already
+achieved.

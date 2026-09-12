@@ -1,200 +1,144 @@
-# Confluence Wiki/Knowledge Base - Architecture
+# Confluence architecture
 
 ## System Overview
 
-Confluence is a wiki-based knowledge management platform that enables teams to create, organize, and collaborate on documentation. The system supports hierarchical page organization within spaces, rich-text content with macros, version control with diffing, full-text search, threaded comments, and content approval workflows.
+A team wiki organizes knowledge into spaces and page hierarchies. Authors edit durable revisions, readers follow stable links, reviewers approve identifiable content, and search makes that content discoverable. The difficult boundaries are between an author's draft and the committed revision, a committed revision and the search index, and a visible navigation item and the viewer's actual permission to read it.
 
-**Learning Goals:**
-- Design a wiki data model with hierarchical page trees
-- Implement version control with efficient diff computation
-- Build full-text search with Elasticsearch and async indexing
-- Create a macro expansion system for structured content
-- Design an approval workflow for content governance
-- Understand space-based access control patterns
+This document separates a **proposed production design** from the **current teaching implementation**. The production sections describe intended guarantees, not measured or implemented behavior. The schema and API sections identify what exists today; the final Implementation Notes trace the local paths and defects to source.
 
 ## Requirements
 
-### Functional Requirements
-1. Users can create and manage **spaces** (organizational containers for pages)
-2. Pages are organized in a **hierarchical tree** within each space
-3. Pages support **rich-text editing** with macros (info, warning, note, code, toc)
-4. Every page edit creates a **version** with full diff capability
-5. **Full-text search** across all spaces with filtering and highlighting
-6. **Threaded comments** on pages with resolve/unresolve
-7. **Content approval workflow** (request, approve, reject)
-8. **Labels/tags** for cross-cutting page categorization
-9. **Templates** for standardized page creation
+### Functional requirements — proposed production system
 
-### Non-Functional Requirements (Production Scale)
-| Metric | Target |
-|--------|--------|
-| Page load latency (p99) | < 200ms |
-| Search latency (p99) | < 500ms |
-| Availability | 99.95% |
-| Concurrent editors | 10,000+ |
-| Total pages | 100M+ |
-| Daily page views | 50M+ |
+- Create spaces, manage membership, and browse pages through a hierarchy and stable links.
+- Read published revisions; allow authorized authors to edit drafts without silently overwriting a newer revision.
+- Keep immutable revision history, compare revisions, and restore an old revision as a new one.
+- Publish directly where space policy permits, or approve a specific revision before publication.
+- Search authorized published content by text, space, and label.
+- Support comments and bounded reply threads, with explicit authorship and moderation rules.
+- Offer reusable templates and a small, validated set of content macros.
+
+Live character-level co-editing, arbitrary executable macros, attachments, and offline synchronization are outside the initial design. A disconnected draft can be preserved locally without promising that it will merge automatically.
+
+### Non-functional requirements — proposed targets
+
+| Concern | Initial target or contract |
+|---------|----------------------------|
+| Availability | 99.9% monthly for authorized page reads and saves |
+| Latency | p95 page read <200 ms, save <500 ms, search <500 ms under the agreed workload |
+| Persistence | A successful save means its revision and durable mutation receipt committed together |
+| Conflicts | A save against an obsolete base returns a conflict, preserving the author's draft |
+| Search freshness | 99% of committed searchable changes visible within 5 seconds during normal operation |
+| Access control | Newly authorized reads after a completed revocation cannot rely on an obsolete permission cache |
+| Recovery | Database backups and restore drills; search reconstructible from authoritative state |
+
+Search lag is permitted; exposing a private or unpublished revision is not. Revocation cannot erase content a user has already read or copied. Page size, hierarchy depth, query cost, and retained revision history need explicit limits.
 
 ## Capacity Estimation
 
-### Production Scale
-- 500K active users, 10K concurrent
-- 100M pages across 50K spaces
-- Average page size: 50KB HTML, 10KB text
-- 1M page edits/day (creating 1M versions)
-- 5M search queries/day
-- Storage: 100M pages x 50KB = 5TB content + versions
+These are sizing assumptions, not project benchmarks. Assume one million daily active users, 20 million current pages, 40 million page reads, ten million searches, and 500,000 accepted revisions per day.
+
+| Quantity | Approximate estimate | Design implication |
+|----------|----------------------|--------------------|
+| Page reads | 463/s average; plan an initial 5,000/s peak | Cache immutable revision payloads; scale read API capacity |
+| Searches | 116/s average; plan a 1,000/s peak | Independent search capacity and bounded query budgets |
+| Revisions | 5.8/s average; plan a 100/s peak | One relational transaction per accepted edit is reasonable initially |
+| Current canonical content | 20 million × 40 KB ≈ 800 GB | Separate large content from frequent navigation queries |
+| New revision content | 500,000 × 40 KB ≈ 20 GB/day | About 600 GB/month before compression and retention policies |
+
+HTML, extracted text, indexes, replicas, and backups add to these estimates. Skew matters more than the average: one very large space can dominate tree reads or move operations. Measure that distribution before deciding to shard.
 
 ### Local Development Scale
-- 2-5 users, 2-3 spaces, 50-100 pages
-- Single PostgreSQL, Redis, Elasticsearch, RabbitMQ instances
-- All services on localhost with Docker Compose
+
+The seed contains nine pages across two spaces. Compose runs one PostgreSQL, one Valkey, one Elasticsearch node with a 256 MB heap, and one RabbitMQ broker. API and worker processes run on the host. This demonstrates boundaries, not the throughput or availability targets above.
 
 ## High-Level Architecture
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│                 │     │                 │     │                 │
-│   Web Browser   │────▶│   CDN / Edge    │────▶│  Load Balancer  │
-│   (React SPA)   │     │  (Static Assets)│     │  (NGINX / ALB)  │
-│                 │     │                 │     │                 │
-└─────────────────┘     └─────────────────┘     └────────┬────────┘
-                                                         │
-                    ┌────────────────────────────────────┼────────────────────┐
-                    │                                    │                    │
-           ┌────────▼────────┐   ┌──────────────────┐   │    ┌──────────────▼──────┐
-           │                 │   │                  │   │    │                     │
-           │   Wiki API      │   │   Wiki API       │   │    │   Wiki API          │
-           │   Server        │   │   Server         │   │    │   Server            │
-           │                 │   │                  │   │    │                     │
-           └──┬──────┬───────┘   └──────────────────┘   │    └─────────────────────┘
-              │      │                                  │
-              │      │    ┌─────────────────────────────┤
-              │      │    │                             │
-     ┌────────▼─┐    │  ┌─▼────────┐   ┌─────────────┐│   ┌──────────────┐
-     │          │    │  │          │   │             ││   │              │
-     │PostgreSQL│    │  │  Valkey  │   │  RabbitMQ   │├──▶│Search Indexer│
-     │ (Primary │    │  │ (Cache,  │   │ (page-index ││   │  (Worker)    │
-     │  + Read  │    │  │ Sessions,│   │   queue)    ││   │              │
-     │ Replicas)│    │  │  Rate    │   │             ││   └──────┬───────┘
-     │          │    │  │ Limits)  │   │             ││          │
-     └──────────┘    │  └──────────┘   └─────────────┘│   ┌──────▼───────┐
-                     │                                │   │              │
-                     └────────────────────────────────┘   │Elasticsearch │
-                                                          │  (Cluster)   │
-                                                          │              │
-                                                          └──────────────┘
+### Proposed production system
+
+```text
+┌─────────────────────┐       ┌────────────────────────────┐
+│ Browser editor      │──────▶│ Gateway + session auth     │
+│ Reader / search     │       └──────────────┬─────────────┘
+└─────────────────────┘                      │
+                                 ┌───────────┴──────────────────────┐
+                                 ▼                                  ▼
+                    ┌─────────────────────────┐        ┌─────────────────────────┐
+                    │ Wiki API                │        │ Search API              │
+                    │ Pages / policy          │◀───────│ Candidate checks        │
+                    └────────────┬────────────┘        └────────────┬────────────┘
+                                 │                                  │
+                                 ▼                                  ▼
+                    ┌─────────────────────────┐        ┌─────────────────────────┐
+                    │ PostgreSQL              │        │ Search index            │
+                    │ Revisions / outbox      │        │ Derived documents       │
+                    └────────────┬────────────┘        └────────────▲────────────┘
+                                 │                                  │
+                                 ▼                                  │
+                    ┌─────────────────────────┐        ┌────────────┴────────────┐
+                    │ Outbox publisher        │───────▶│ Queue + indexers        │
+                    └─────────────────────────┘        └─────────────────────────┘
 ```
 
-## Core Components
+A CDN serves versioned application assets. Redis can hold sessions and reusable revision payloads; neither decides the authoritative revision or access policy. The logical Wiki and Search APIs may begin in one deployable application. Separating every feature into a service would add transactions and failure modes without improving the initial workload.
 
-### 1. Wiki Data Model
+## Core Components / Request Flows
 
-The core data model revolves around **spaces** containing hierarchical **pages**:
+### Read a page
 
-- **Spaces**: Organizational containers with key, name, description, visibility, and a designated homepage
-- **Pages**: Wiki content nodes with parent-child hierarchy via `parent_id`, storing content in three formats (JSON for macros, HTML for rendering, plain text for search)
-- **Page Versions**: Immutable history records created on every edit, enabling diff between any two versions
+Resolve the stable page ID and evaluate current read permission and publication policy. Select an immutable revision, then fetch that payload from cache or PostgreSQL. Return the page ID, revision, canonical URL, breadcrumbs, and permitted actions. Fetch small navigation metadata separately from the document body.
 
-**Page tree** is implemented using an adjacency list model (`parent_id` self-reference). Tree operations:
-- **Get tree**: Load all pages for a space, build in-memory tree by mapping parent-child relationships
-- **Move page**: Update `parent_id` and `position`, reorder siblings
-- **Get breadcrumbs**: Recursive CTE walking up the ancestor chain
+Cache keys include the immutable revision and rendering format version. A cache hit never bypasses authorization. If the access authority is unavailable, private reads fail closed. A page whose latest authoring revision differs from its published revision still presents the approved published content to ordinary readers.
 
-### 2. Request Flows
+The local implementation instead resolves mutable, non-unique slugs, caches entire current page rows for 120 seconds, and does not enforce space read permissions.
 
-**Page View Flow:**
-```
-Client ──▶ GET /pages/space/:key/slug/:slug
-         ──▶ Check Redis cache (page data)
-         ──▶ If miss: Query PostgreSQL (page + author + labels)
-         ──▶ Build breadcrumbs (recursive CTE)
-         ──▶ Cache result (120s TTL)
-         ──▶ Return page with metadata
-```
+### Save an edit
 
-**Page Edit Flow:**
-```
-Client ──▶ PUT /pages/:id (title, contentHtml, contentText)
-         ──▶ BEGIN transaction
-         ──▶ Increment version number
-         ──▶ UPDATE pages table
-         ──▶ INSERT page_versions record
-         ──▶ COMMIT
-         ──▶ Invalidate Redis cache (space tree + page)
-         ──▶ Publish to RabbitMQ "page-index" queue
-         ──▶ Return updated page
-```
+1. The client submits page identity, expected base revision, content, and a mutation ID tied to this exact request.
+2. The API validates the canonical document schema and derives safe HTML and plain text. It checks write permission within the transaction's policy boundary.
+3. A transaction checks for an existing mutation receipt, conditionally advances the page head from the expected revision, inserts the immutable snapshot, and writes the receipt and outbox event.
+4. A base mismatch produces a conflict with current revision metadata. A matching receipt returns the original outcome; reuse with another payload is rejected.
+5. After commit, the response identifies the accepted revision. The browser retains any additional typing performed while the request was in flight.
+6. Indexing proceeds asynchronously. It does not determine whether the save succeeded.
 
-**Search Flow:**
-```
-Client ──▶ GET /search?q=query&space=KEY
-         ──▶ Build ES query (multi_match on title^3, content, labels^2)
-         ──▶ Apply filters (space, status=published)
-         ──▶ Execute search with highlighting
-         ──▶ If ES fails: fallback to PostgreSQL ILIKE
-         ──▶ Return results with highlighted snippets
-```
+A receipt is needed for create and restore as well as edit. A timeout after commit is an unknown result, not evidence that no revision exists. A client retries the same immutable request or queries its receipt before submitting a new mutation.
 
-### 3. Version Control and Diffing
+The local transaction inserts a page revision, but it has neither the expected-base condition nor a receipt/outbox. Its cache invalidation can fail after commit and turn a successful database write into an HTTP error.
 
-Every page edit creates an immutable version record:
+### Publish or approve
 
-```
-Page (version=3) ──┐
-                   ├── page_versions (v1) ──┐
-                   ├── page_versions (v2) ──┤── diff(v1, v2) = line changes
-                   └── page_versions (v3) ──┤── diff(v2, v3) = line changes
-                                            └── diff(v1, v3) = full diff
-```
+Keep an authoring head and a published revision pointer. A direct publication, where permitted, advances that pointer in an authorized transaction. An approval request names one immutable revision; reviewing it does not implicitly approve later edits. Publication validates the request's state, reviewer authority, and target revision, then writes its event atomically.
 
-Diff computation uses the `diff` library's `diffLines()` function on `content_html`. Each change is classified as added, removed, or unchanged. The frontend renders these as green/red highlighted lines.
+An approval can remain a useful historical decision even when the author has moved on. Product policy determines whether an older approved revision can be published; the UI must name it explicitly. Publication changes are searchable state changes even when the content revision number stays the same.
 
-### 4. Search Architecture
+The prototype defaults new pages to `published`. Approval records name only a page, and approval publishes whatever content that page currently contains.
 
-Asynchronous indexing via RabbitMQ ensures page operations are not blocked by search indexing:
+### Index and search
 
-```
-Page Create/Update ──▶ RabbitMQ (page-index queue)
-                                   │
-                      Search Indexer Worker
-                                   │
-                                   ▼
-                      Elasticsearch Index
-                      ┌──────────────────┐
-                      │ page_id (keyword) │
-                      │ space_id (keyword)│
-                      │ title (text^3)    │
-                      │ content_text      │
-                      │ labels (keyword[])│
-                      │ status (keyword)  │
-                      └──────────────────┘
-```
+Write a durable outbox event with a per-page **search generation** covering content, publication, labels, and deletion. Its immutable payload represents one consistent authoritative state. A publisher retries until the broker confirms acceptance; an indexer acknowledges only after applying the effect or proving an equal/newer generation is already present. Permanent failures enter a repair queue with enough context to replay.
 
-The search indexer worker consumes messages from the `page-index` queue, fetches the page data and labels from PostgreSQL, and indexes the document in Elasticsearch. The `wiki_analyzer` uses standard tokenizer with lowercase, stop word, and snowball (stemming) filters for intelligent matching. Search queries use `multi_match` with field boosting (title x3, labels x2) and `AUTO` fuzziness for typo tolerance.
+Use the generation for conditional search writes. Elasticsearch's external versioning rejects an index operation whose version is not greater than the stored one; duplicate conflicts need deliberate classification, not blanket error suppression. Keep versioned deletion tombstones until all permitted replay and rebuild paths can no longer resurrect older content. [Elasticsearch Index API](https://www.elastic.co/guide/en/elasticsearch/reference/8.11/docs-index_.html)
 
-When Elasticsearch is unavailable, search falls back to PostgreSQL `ILIKE` queries. The fallback produces results without relevance scoring or highlighting but keeps the system functional.
+Search returns candidate IDs with indexed revision information. Before returning titles, snippets, or counts that could disclose private material, apply current permissions and verify the candidate still represents the allowed published revision. Fetch current safe metadata or discard stale candidates. Limit overfetching; return a continuation cursor rather than pretending a filtered raw hit count is an exact authorized total.
 
-### 5. Macro System
+An accepted index write is not immediately visible to search; refresh introduces another delay after transport and worker processing. The freshness target measures the whole path. [Elasticsearch near real-time search](https://www.elastic.co/guide/en/elasticsearch/reference/8.11/near-real-time.html)
 
-Macros are structured content blocks embedded in pages:
+### Move a subtree
 
-| Macro | Purpose | Visual |
-|-------|---------|--------|
-| `info` | Informational callout | Blue background, blue border |
-| `warning` | Warning callout | Yellow background, orange border |
-| `note` | Note callout | Purple background, purple border |
-| `code` | Code block | Gray background, monospace font |
-| `toc` | Table of contents | Generated from headings |
+Use page IDs and adjacency-list parent references. In a transaction, serialize hierarchy changes within the space, validate both nodes' space membership, walk ancestry to reject cycles, and update parent/order plus a hierarchy generation. All parent-changing operations must participate in that protocol. Bound depth and sibling counts so validation and reordering remain predictable.
 
-Macros are stored in `content_json.macros[]` and can be expanded server-side by the macro service or rendered client-side by the MacroRenderer React component.
+The space-wide lock is a simple initial choice because moves are uncommon. It serializes independent moves too. If measurements show contention, introduce narrower locks with a defined acquisition order and prove cycle prevention under concurrent moves before removing the coarse boundary.
 
 ## Database Schema
+
+### Current local schema
+
+The following is the consolidated schema from [backend/src/db/init.sql](./backend/src/db/init.sql). It documents the implementation; its constraints do **not** establish all production requirements described above.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(30) UNIQUE NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
@@ -206,7 +150,7 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE spaces (
+CREATE TABLE IF NOT EXISTS spaces (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   key VARCHAR(10) UNIQUE NOT NULL,
   name VARCHAR(100) NOT NULL,
@@ -218,17 +162,16 @@ CREATE TABLE spaces (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE space_members (
+CREATE TABLE IF NOT EXISTS space_members (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   space_id UUID NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role VARCHAR(20) NOT NULL DEFAULT 'member'
-    CHECK (role IN ('admin', 'member', 'viewer')),
+  role VARCHAR(20) NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member', 'viewer')),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(space_id, user_id)
 );
 
-CREATE TABLE pages (
+CREATE TABLE IF NOT EXISTS pages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   space_id UUID NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
   parent_id UUID REFERENCES pages(id) ON DELETE SET NULL,
@@ -238,8 +181,7 @@ CREATE TABLE pages (
   content_html TEXT DEFAULT '',
   content_text TEXT DEFAULT '',
   version INT DEFAULT 1,
-  status VARCHAR(20) DEFAULT 'published'
-    CHECK (status IN ('draft', 'published', 'archived')),
+  status VARCHAR(20) DEFAULT 'published' CHECK (status IN ('draft', 'published', 'archived')),
   position INT DEFAULT 0,
   created_by UUID NOT NULL REFERENCES users(id),
   updated_by UUID REFERENCES users(id),
@@ -247,10 +189,13 @@ CREATE TABLE pages (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-ALTER TABLE spaces ADD CONSTRAINT fk_homepage
-  FOREIGN KEY (homepage_id) REFERENCES pages(id) ON DELETE SET NULL;
+-- Guarded so init.sql is re-runnable: the schema is applied both by the docker
+-- initdb mount and by `npm run db:migrate`, so a bare ADD CONSTRAINT fails the
+-- second time with "constraint already exists".
+ALTER TABLE spaces DROP CONSTRAINT IF EXISTS fk_homepage;
+ALTER TABLE spaces ADD CONSTRAINT fk_homepage FOREIGN KEY (homepage_id) REFERENCES pages(id) ON DELETE SET NULL;
 
-CREATE TABLE page_versions (
+CREATE TABLE IF NOT EXISTS page_versions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   version_number INT NOT NULL,
@@ -264,7 +209,7 @@ CREATE TABLE page_versions (
   UNIQUE(page_id, version_number)
 );
 
-CREATE TABLE page_labels (
+CREATE TABLE IF NOT EXISTS page_labels (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   label VARCHAR(50) NOT NULL,
@@ -272,7 +217,7 @@ CREATE TABLE page_labels (
   UNIQUE(page_id, label)
 );
 
-CREATE TABLE page_comments (
+CREATE TABLE IF NOT EXISTS page_comments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id),
@@ -283,7 +228,7 @@ CREATE TABLE page_comments (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE templates (
+CREATE TABLE IF NOT EXISTS templates (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   space_id UUID REFERENCES spaces(id) ON DELETE CASCADE,
   name VARCHAR(100) NOT NULL,
@@ -294,363 +239,230 @@ CREATE TABLE templates (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE page_approvals (
+CREATE TABLE IF NOT EXISTS page_approvals (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   requested_by UUID NOT NULL REFERENCES users(id),
   reviewed_by UUID REFERENCES users(id),
-  status VARCHAR(20) DEFAULT 'pending'
-    CHECK (status IN ('pending', 'approved', 'rejected')),
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
   comment TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   reviewed_at TIMESTAMPTZ
 );
 
 -- Indexes
-CREATE INDEX idx_pages_space ON pages(space_id, parent_id, position);
-CREATE INDEX idx_pages_slug ON pages(space_id, slug);
-CREATE INDEX idx_page_versions_page ON page_versions(page_id, version_number DESC);
-CREATE INDEX idx_page_comments_page ON page_comments(page_id, created_at);
-CREATE INDEX idx_page_labels_page ON page_labels(page_id);
-CREATE INDEX idx_page_labels_label ON page_labels(label);
-CREATE INDEX idx_space_members_space ON space_members(space_id);
-CREATE INDEX idx_space_members_user ON space_members(user_id);
-CREATE INDEX idx_templates_space ON templates(space_id);
-CREATE INDEX idx_page_approvals_page ON page_approvals(page_id, status);
+CREATE INDEX IF NOT EXISTS idx_pages_space ON pages(space_id, parent_id, position);
+CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(space_id, slug);
+CREATE INDEX IF NOT EXISTS idx_page_versions_page ON page_versions(page_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_page_comments_page ON page_comments(page_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_page_labels_page ON page_labels(page_id);
+CREATE INDEX IF NOT EXISTS idx_page_labels_label ON page_labels(label);
+CREATE INDEX IF NOT EXISTS idx_space_members_space ON space_members(space_id);
+CREATE INDEX IF NOT EXISTS idx_space_members_user ON space_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_templates_space ON templates(space_id);
+CREATE INDEX IF NOT EXISTS idx_page_approvals_page ON page_approvals(page_id, status);
 ```
 
-Key schema design decisions:
+### Proposed production additions and invariants
 
-1. **Triple content storage**: `content_json` stores structured content for macro expansion; `content_html` stores rendered HTML for direct rendering; `content_text` stores plain text for search indexing. This denormalization avoids runtime parsing and enables each consumer (editor, renderer, search) to read its optimal format.
-2. **Soft status**: Pages have `status` (draft/published/archived) rather than hard deletes, supporting approval workflows and content governance.
-3. **Position ordering**: `position` column enables ordered siblings within each parent.
-4. **Composite indexes**: `(space_id, parent_id, position)` for efficient tree queries; `(space_id, slug)` for URL resolution.
+| Record or constraint | Purpose |
+|----------------------|---------|
+| Tenant/space ownership on authorization paths | Prevent cross-space access through page, history, comment, and search APIs |
+| Page head plus published revision pointer | Separate saved drafts from content approved for readers |
+| Mutation receipt unique within actor/space scope | Resolve ambiguous retries, with payload digest and committed response |
+| Outbox row in the revision/publication transaction | Repairable delivery of every searchable change |
+| Monotonic search generation and retained deletion state | Prevent out-of-order jobs from regressing or resurrecting documents |
+| Approval target revision and unique pending-policy key | Bind review to content and prevent duplicate active requests |
+| Same-space parent relationship plus transactional cycle check | Preserve a valid hierarchy under all mutation paths |
+| Canonical stable-ID URL and optional slug aliases | Keep links valid after renames and disambiguate titles |
+| Canonical document schema and rendering version | Reproduce safe HTML and text from one authoritative representation |
+| Comment same-page parent and bounded reply depth | Make stored discussion topology match the API's supported shape |
+
+The current slug index is non-unique. Parent and homepage foreign keys do not establish same-space membership. Page version uniqueness prevents duplicate version numbers, but it is not a stale-editor check. There is no mutation receipt, outbox, search-generation, or approval-version column today.
 
 ## API Design
 
-RESTful API under `/api/v1/`. Session-based authentication with Redis-backed sessions.
+### Current routes
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/auth/register` | Register new user |
-| POST | `/api/v1/auth/login` | Login, create session |
-| POST | `/api/v1/auth/logout` | Destroy session |
-| GET | `/api/v1/auth/me` | Get current user |
-| GET | `/api/v1/spaces` | List spaces |
-| POST | `/api/v1/spaces` | Create space |
-| GET | `/api/v1/spaces/:id` | Get space details |
-| PUT | `/api/v1/spaces/:id` | Update space |
-| POST | `/api/v1/spaces/:id/members` | Add space member |
-| GET | `/api/v1/pages/space/:key/tree` | Get page tree for space |
-| POST | `/api/v1/pages` | Create page |
-| GET | `/api/v1/pages/:id` | Get page with metadata |
-| GET | `/api/v1/pages/space/:key/slug/:slug` | Get page by space key + slug |
-| PUT | `/api/v1/pages/:id` | Update page (creates version) |
-| DELETE | `/api/v1/pages/:id` | Delete page (hard delete; children reparented via `ON DELETE SET NULL`) |
-| GET | `/api/v1/pages/:id/versions` | Get version history |
-| GET | `/api/v1/pages/:id/versions/:v1/diff/:v2` | Diff two versions |
-| GET | `/api/v1/pages/:id/comments` | Get threaded comments |
-| POST | `/api/v1/pages/:id/comments` | Add comment |
-| POST | `/api/v1/pages/:id/approvals` | Request approval |
-| PUT | `/api/v1/approvals/:id` | Approve/reject |
-| GET | `/api/v1/search` | Full-text search with filters |
-| GET | `/api/v1/templates` | List templates |
-| GET | `/api/health` | Health check |
-| GET | `/api/metrics` | Prometheus metrics |
+Business routes below use `/api/v1`; health and metrics use the absolute paths shown. Unless stated otherwise, reads are public and mutations check login only. These are existing endpoints, not a claim that their authorization is sufficient.
+
+| Method | Path | Actual purpose |
+|--------|------|----------------|
+| POST | `/auth/register`, `/auth/login` | Create an account or establish a session |
+| POST / GET | `/auth/logout`, `/auth/me` | End session / return authenticated user |
+| GET / POST | `/spaces` | List public spaces / create space and creator membership |
+| GET / PUT / DELETE | `/spaces/:key` | Read, update, or delete a space |
+| GET / POST | `/spaces/:key/members` | Read members including email / upsert membership |
+| GET | `/pages/recent` | Twenty recently updated published pages |
+| GET | `/pages/space/:spaceKey/tree` | Server-built nested tree containing complete page rows |
+| GET | `/pages/space/:spaceKey/slug/:slug`, `/pages/:id` | Page with original author, labels, and breadcrumbs |
+| POST / PUT / DELETE | `/pages`, `/pages/:id`, `/pages/:id` | Create, save a new revision, or hard-delete |
+| POST | `/pages/:id/move` | Change parent and sibling positions; root cases currently fail |
+| GET / POST / DELETE | `/pages/:id/labels`, `/pages/:id/labels`, `/pages/:id/labels/:label` | List, add, or remove labels |
+| GET | `/versions/:pageId` | Entire snapshot history without pagination |
+| GET | `/versions/:pageId/diff?from=1&to=2` | Line-based difference between stored HTML strings |
+| POST | `/versions/:pageId/restore` | Copy an old snapshot into a new revision |
+| GET / POST | `/comments/page/:pageId`, `/comments/page/:pageId` | Read roots/direct replies / add a comment |
+| PUT / DELETE | `/comments/:id` | Author-only edit or deletion |
+| POST | `/comments/:id/resolve` | Toggle resolution for any logged-in caller |
+| GET / POST | `/templates`, `/templates` | List global/space templates / create a template |
+| GET / DELETE | `/templates/:id` | Read / delete a template |
+| POST | `/approvals/request`, `/approvals/:id/review` | Request review / approve or reject |
+| GET | `/approvals/page/:pageId`, `/approvals/pending` | Public page review records / all pending records for a logged-in user |
+| GET | `/search?q=...&space=ENG&page=1&pageSize=20` | Published-content search; no membership filter |
+| GET | `/api/health`, `/api/metrics` | Constant process status / Prometheus exposition |
+
+For example, the current page update takes `title`, `contentJson`, `contentHtml`, `contentText`, and optional `changeMessage`, returning `{ page }`. It accepts neither an expected revision nor a mutation ID. Restore takes `versionNumber` and returns a message, so clients must fetch the new page themselves.
+
+### Proposed contract changes
+
+Use stable page IDs for navigation and mutation. Save/create/restore return a durable receipt, accepted revision, and canonical URL. Conflicts use a distinct status and include the current head; permission failures and temporary unavailability remain distinct. History returns paginated metadata, with individual snapshots or bounded comparisons fetched on demand.
+
+Search validates scope and pagination, returns safe snippet segments, and distinguishes empty results from degraded or unavailable search. Unknown space keys do not silently broaden the query. Move requests carry hierarchy context; review requests carry the immutable revision and explicit decision state.
 
 ## Key Design Decisions
 
-### Adjacency List vs Nested Sets for Page Tree
+### Full snapshots with optimistic concurrency
 
-| Approach | Reads | Writes | Complexity |
-|----------|-------|--------|------------|
-| Adjacency List (chosen) | O(n) load + build | O(1) move | Low |
-| Nested Sets | O(log n) subtree | O(n) recalculate | Medium |
-| Materialized Path | O(1) ancestors | O(n) reparent | Low |
+A wiki is read frequently and edited in relatively coarse submissions. Full revision snapshots make historical reading and restore independent of a long chain of changes. An expected-version condition catches the common “two tabs editing the same page” problem at the database boundary. An immutable receipt answers whether a particular submission committed.
 
-Adjacency list was chosen because wiki trees are typically shallow (3-5 levels deep) and wide. The entire space page set (usually < 1000 pages) fits easily in memory for tree construction. Nested sets would optimize subtree queries at the cost of making every move operation an O(n) recalculation of left/right bounds across the entire tree. For a wiki where pages are moved infrequently but the tree is displayed on every page view, the adjacency list's O(1) move cost matters more than the O(n) tree-load cost -- especially since the tree-load result is cached in Redis with a 120-second TTL.
+A distributed character-operation log could support live co-editing, but introduces editor-specific transformation or merge semantics, reconnect history, and additional recovery state. It does not by itself define publication or approval. Start with explicit conflicts because simultaneous live typing is outside scope; accept extra snapshot storage and occasional manual conflict resolution. Add co-editing only when the product needs it.
 
-Materialized path (`/root/parent/child`) is a reasonable alternative for ancestor queries, but reparenting a subtree requires updating the path of every descendant. With shallow trees and PostgreSQL recursive CTEs available, adjacency list provides the best balance.
+### Search as a repairable projection
 
-### HTML Storage vs Block-Based Storage
+Separate search capacity when the chosen corpus and relevance requirements justify it. Weighted title/body fields, typo handling, and independent search tuning are useful; the cost is a delayed second representation that needs reliable transport, ordering, deletion handling, and rebuilds.
 
-Chose storing content as HTML strings rather than a block-based model (like Notion):
-- **HTML**: Simple to implement, works with contentEditable, easy to render, no custom editor framework required
-- **Blocks**: Better for collaborative editing, granular version tracking, structured queries per block
+PostgreSQL full-text search is a credible smaller deployment option: it supports lexical processing, ranking, and highlighting. It is inaccurate to dismiss it as incapable of these features. The current fallback does not use those facilities; it performs `ILIKE` substring matches. [PostgreSQL text search controls](https://www.postgresql.org/docs/16/textsearch-controls.html)
 
-The trade-off is that HTML diffs are noisier than block-level diffs -- a tag attribute change affects the entire line. Production Confluence uses a custom XHTML storage format with macro markup. For a system that prioritizes simplicity of editing and rendering over collaborative editing precision, HTML storage is sufficient. If collaborative editing were added later, migrating to a block model or integrating a CRDT library (like Yjs) would be necessary.
+Synchronous dual writes cannot make PostgreSQL and Elasticsearch commit atomically. Returning an error after the database committed makes retries ambiguous; ignoring the error silently loses search updates. The outbox makes the obligation durable without waiting for search in the save path. It adds publisher/consumer operations and a lag budget rather than eliminating distributed failure.
 
-### Elasticsearch vs PostgreSQL Full-Text Search
+### Adjacency lists and bounded hierarchy operations
 
-| Feature | Elasticsearch | PostgreSQL FTS |
-|---------|---------------|----------------|
-| Relevance scoring | BM25, field boosting | ts_rank (TF-IDF) |
-| Fuzzy matching | Built-in AUTO fuzziness | Limited (pg_trgm) |
-| Highlighting | Built-in with pre/post tags | Manual with ts_headline |
-| Horizontal scaling | Shard across nodes | Read replicas only |
-| Operational complexity | High (JVM, cluster mgmt) | Low (built into DB) |
+One parent reference is easy to understand and moves do not rewrite every descendant's stored path. Index child queries by space, parent, and order; fetch navigation metadata on demand. A space-level serialization point makes initial cycle prevention understandable.
 
-Elasticsearch was chosen because a wiki's primary discovery mechanism is search. Users expect typo-tolerant queries, relevant ranking (title matches above content matches), and highlighted snippets showing where the query matched. PostgreSQL's `tsvector`/`tsquery` can handle basic full-text search, but producing quality highlighted snippets and fuzzy matches requires significant custom code. Elasticsearch delivers these features out of the box.
-
-The cost is operational complexity: Elasticsearch requires its own cluster, monitoring, and index management. The mitigation strategy is the PostgreSQL ILIKE fallback -- if Elasticsearch becomes unavailable, users still get results (without ranking or highlighting) rather than a broken search page.
+Materialized paths speed some ancestry and subtree reads, but moving a large subtree rewrites descendant paths and requires careful concurrent read semantics. Adjacency lists instead pay for recursive traversal and sibling reordering. The choice follows the expected mix of frequent reads, modest depth, and relatively rare moves; it is not a claim that every move costs one constant-time update.
 
 ## Consistency and Idempotency
 
-### Idempotent Page Operations
+Proposed strong boundaries are per-page revision acceptance, publication transitions, approval decisions, and serialized hierarchy mutations. The database transaction couples authoritative changes, mutation receipts, and outbox obligations. Cache invalidation and search delivery are recoverable consequences, not part of the browser's definition of an accepted save.
 
-Page edit operations (PUT `/api/v1/pages/:id`) use PostgreSQL transactions to atomically increment the version counter, update the page row, and insert the version record. The `UNIQUE(page_id, version_number)` constraint on `page_versions` prevents duplicate versions from concurrent or retried requests. If a client retries a failed edit, the transaction either succeeds (creating the next version) or fails at the unique constraint (if the previous attempt actually committed), in which case the client receives the current page state.
+The receipt key is scoped to the caller and resource domain, bound to the exact canonical request, and retained for a documented retry window. A changed request needs a new identity. A restore uses the current head as its expected base; it never rewinds the version counter or deletes later history. Unknown commit outcomes are resolved before a replacement request is sent.
 
-After a successful page edit transaction, the server performs two non-transactional side effects: invalidating the Redis cache (pattern-based key deletion) and publishing an indexing message to RabbitMQ. Both operations are idempotent. Cache invalidation is idempotent by nature (deleting a non-existent key is a no-op). The search indexer processes the full page state from PostgreSQL, so receiving duplicate index messages results in the same Elasticsearch document.
-
-### Consistency Guarantees
-
-Page operations use PostgreSQL's default READ COMMITTED isolation within transactions. The version increment and version record insert happen atomically -- readers never see a page with version N+1 without the corresponding `page_versions` record. Cross-page consistency (e.g., moving a page between parents) uses single-row updates since the adjacency list model only requires changing the moved page's `parent_id`.
-
-The search index is eventually consistent with the source of truth (PostgreSQL). There is a window between a page edit committing and the search indexer processing the queue message during which a search query may return stale content. This is acceptable for a wiki where search freshness within a few seconds is sufficient.
+Proposed search workers apply monotonically increasing generations. Content revisions alone are insufficient because labels, publication, permissions, and deletion can change search state without a new content snapshot. Rebuilds use a consistent starting point plus subsequent events, and compare generations before switching the read alias. A rebuild must reconcile deletions as well as index existing rows.
 
 ## Security / Auth
 
-- **Session-based auth**: Express sessions stored in Valkey with 24-hour TTL
-- **Password hashing**: bcrypt with 12 salt rounds
-- **Rate limiting**: Redis-backed rate limiter (500 req/15min for API, 20 req/15min for auth)
-- **Space membership**: Role-based (admin, member, viewer) per space
-- **CORS**: Configured for frontend origin only
+Production authorization belongs in shared server policies applied to every page-derived read and write, including trees, history, comments, templates, approvals, and search snippets. UI capability flags help presentation but grant nothing. Permission changes and protected writes need a common transactional policy boundary so a revocation race has a defined ordering.
+
+Use secure session cookies over HTTPS, regenerate session identity on login, validate request origin/CSRF protections for mutations, and limit login attempts and expensive reads. Canonical content validation and a safe renderer prevent stored markup from becoming arbitrary browser code. Search highlighting should be escaped text plus controlled mark segments, not trusted HTML from indexed fields.
+
+The local project implements password hashing, session cookies, login checks, and Redis-backed rate limiting. It does not implement this full authorization or rendering boundary. `requireAdmin` is defined but unused; global and space role fields are not evidence that access is enforced.
 
 ## Observability
 
-- **Metrics**: Prometheus metrics via prom-client -- HTTP request duration histogram, request counters by method/route/status, page operation counters by type (create/update/delete/move), search latency histogram
-- **Structured logging**: Pino logger with JSON output and request correlation via pino-http
-- **Health check**: `GET /api/health` returns service status for load balancer probing
-- **Circuit breaker**: Opossum circuit breaker wrapping external service calls (Elasticsearch, RabbitMQ) -- opens after 50% error rate, resets after 30 seconds
+Production signals should follow the user contract: acknowledged saves, conflict rate, uncertain outcomes resolved by receipts, publication errors, unauthorized access denials, outbox age, oldest unindexed generation, discarded/repaired jobs, and search visibility lag. Trace a mutation from request through commit, event, index write, and observed search result.
+
+Separate process liveness from dependency readiness. Report search degradation independently from page availability. Bound metric labels and measure fallback latency through completion, not only the failed primary attempt.
+
+Locally, [metrics.ts](./backend/src/services/metrics.ts) exports HTTP duration/count, page-operation count, search duration, and default process metrics. [logger.ts](./backend/src/services/logger.ts) and `pino-http` provide structured logs. There is no configured dashboard, indexing-lag metric, tracing pipeline, or dependency-aware readiness endpoint.
 
 ## Failure Handling
 
-- **Elasticsearch unavailable**: Search falls back to PostgreSQL ILIKE queries. Results lose relevance scoring and highlighting but remain functional. The circuit breaker prevents repeated slow calls to a down ES cluster.
-- **RabbitMQ unavailable**: Page create/update operations succeed normally; the indexing message publish is skipped. Pages are fully usable but will not appear in search until RabbitMQ recovers and pages are re-indexed (eventual consistency).
-- **Redis unavailable**: Session validation fails (all requests return 401), and caching degrades gracefully (all requests hit PostgreSQL directly). Rate limiting also stops, creating a temporary denial-of-service risk.
-- **Transaction rollbacks**: All multi-step write operations (page create, edit, move) use PostgreSQL transactions with proper rollback on failure. Partial writes never reach the database.
+| Failure | Proposed behavior | Current implementation |
+|---------|-------------------|------------------------|
+| Two editors save an old base | One accepted revision; other author receives a conflict with draft retained | Sequential stale saves overwrite; overlapping saves can hit version uniqueness and return 500 |
+| Response lost after commit | Resolve/retry the same durable mutation | No receipt; retry may create another revision |
+| Cache invalidation fails | Save remains accepted; repair derived state | Failure after commit can propagate as HTTP failure |
+| Broker unavailable | Outbox accumulates; publisher resumes with confirms | Publication skipped or errors logged and swallowed |
+| Index write fails | Retry transient failures; retain permanent failures for repair | Helper swallows errors and worker acknowledges |
+| Delayed old index job | Reject lower generation; preserve tombstone ordering | Unversioned writes can regress or resurrect content |
+| Search unavailable | Bounded authorized fallback or explicit unavailability | Unbounded-cost SQL substring fallback on ES exception; may also fail |
+| Permission authority unavailable | Deny protected reads and writes | Space authorization is absent |
+| Client changes page during a request | Discard obsolete response; preserve the correct page's draft | Shared state permits stale responses to replace current context |
 
 ## Scalability Considerations
 
-1. **Read scaling**: Page content cached in Redis (120s TTL); page trees cached per space. At 50M daily page views, the cache absorbs the vast majority of reads, with PostgreSQL handling cache misses.
-2. **Write scaling**: Async search indexing via RabbitMQ decouples page writes from Elasticsearch. The API server completes the page edit transaction in ~10ms; the indexer processes asynchronously.
-3. **Search scaling**: Elasticsearch supports horizontal sharding across nodes. With 100M pages, sharding by `space_id` keeps related pages co-located while distributing load.
-4. **Database scaling**: Read replicas for page queries; connection pooling (max 20 connections per API server). At extreme scale, shard PostgreSQL by `space_id` so each space's pages, versions, comments, and labels reside on the same shard.
-5. **Horizontal API scaling**: Stateless API servers behind a load balancer; sessions stored in Redis enable adding/removing API instances without session loss.
+First reduce avoidable payload and database work: navigation should not transfer every page's body, history should not return every snapshot, and queries need bounded page sizes and depth. Add immutable revision caching after establishing permission checks. Measure large-space behavior separately from average pages.
 
-At extreme scale (100M+ pages):
-- Shard PostgreSQL by `space_id`
-- Replace RabbitMQ with Kafka for higher throughput indexing
-- Add CDN for static page content and cached rendered pages
-- Implement collaborative editing with CRDTs/OT
-- Add page-level permissions (beyond space-level)
+Scale stateless APIs and workers independently, then partition by tenant or space when one database's measured load requires it. Route an editing session's acknowledged read to a source that has reached its revision; a lagging replica must not make the save appear lost. Monitor hot spaces before choosing a partition key that might concentrate them.
+
+Search may use independent shards and replicas in production, but shard counts follow corpus size and benchmarks. The single-shard, zero-replica local index is a development setting. Historical snapshots can move to lower-cost storage only with a tested retrieval and retention policy; database backups alone do not provide user-visible history retention guarantees.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Page tree model | Adjacency list | Nested sets | Simpler writes, shallow trees, cached tree loads |
-| Content storage | HTML string | Block-based JSON | Simpler editor, direct rendering, no framework dependency |
-| Search engine | Elasticsearch | PostgreSQL FTS | Better relevance, highlighting, fuzzy matching |
-| Version diffing | Line-level (diff lib) | Block-level | Simple, works with HTML content |
-| Session storage | Redis + cookie | JWT | Immediate revocation, simpler server-side state |
-| Async indexing | RabbitMQ | Sync ES writes | Non-blocking page operations, tolerates ES downtime |
-| Rich text editor | contentEditable | Tiptap/ProseMirror | No extra dependency, sufficient for learning |
-| Macro rendering | Server + client | Server-only SSR | Interactive macros possible on client side |
-
-## Frontend Architecture
-
-The frontend is a React SPA built with Vite, TypeScript, TanStack Router, Zustand, and Tailwind CSS. It replicates core Confluence workflows: browsing spaces, navigating page trees, viewing and editing wiki content, comparing version diffs, threaded commenting, full-text search with highlighted results, and content approval.
-
-### Component Hierarchy
-
-```
-__root.tsx (RootLayout)
-├── Header                              ← Top bar with logo, search input, user menu, login/register links
-├── index.tsx (Dashboard)
-│   ├── SpaceCard (per space)           ← Space name, key, page count; links to space view
-│   ├── Recent Pages List               ← Recently updated pages across all spaces
-│   └── Search Results (when ?q=)       ← Highlighted results from Elasticsearch
-├── login.tsx / register.tsx            ← Auth forms
-├── space.$spaceKey.tsx (SpacePage)
-│   ├── SpaceSidebar                    ← Collapsible page tree sidebar
-│   │   └── PageTreeItem (recursive)   ← Expandable tree nodes with nesting
-│   └── Space Overview                  ← Space name, description, metadata, page count
-├── space.$spaceKey.page.$slug.tsx (PageView)
-│   ├── BreadcrumbNav                   ← Ancestor chain: Space > Parent > Current
-│   ├── ApprovalBanner                  ← Pending/approved/rejected status bar with actions
-│   ├── PageViewer                      ← Renders content_html with wiki styling
-│   │   └── MacroRenderer              ← Renders info/warning/note/code/toc macro blocks
-│   ├── VersionList                     ← Version history timeline with version numbers and authors
-│   ├── VersionDiff                     ← Side-by-side diff viewer (green=added, red=removed)
-│   └── CommentSection                  ← Threaded comments with reply, resolve/unresolve, delete
-│       └── Comment (recursive)         ← Nested reply tree
-└── space.$spaceKey.page.$slug.edit.tsx (PageEdit)
-    └── PageEditor                      ← Rich text editor with formatting toolbar
-        └── TemplatePicker              ← Modal to select a page template for new pages
-```
-
-### Zustand Stores
-
-**`useAuthStore`** (`stores/authStore.ts`): Manages user session state. Holds the `user` object (or null if not logged in) and a `loading` flag. Provides `checkAuth()` (called on app mount in the root layout to restore the session via `GET /api/v1/auth/me`), `login()`, `register()`, and `logout()`. On login/register success, the user object is stored in the Zustand state. On logout or auth check failure, it is cleared to null. The store does not use persistence middleware -- session continuity relies on the server-side cookie.
-
-**`useWikiStore`** (`stores/wikiStore.ts`): Manages wiki content state across spaces and pages. Holds `spaces` (list of all spaces), `currentSpace` (the active space), `currentPage` (the currently viewed page), `pageTree` (hierarchical tree for the sidebar), and `recentPages` (dashboard recent activity). Key actions include `loadSpaces()` for the dashboard, `loadPageTree(spaceKey)` for the sidebar, and `loadPage(spaceKey, slug)` for viewing a page. The store separates space-level loading from page-level loading so that navigating between pages within a space does not re-fetch the tree. Write operations (create, update, delete pages) are handled directly via the API service without going through the store, since they trigger navigation that reloads the relevant data.
-
-### Routing
-
-TanStack Router file-based routing with nested space/page routes:
-
-| Route | File | Purpose |
-|-------|------|---------|
-| `/` | `routes/index.tsx` | Dashboard: recent pages, space list, search results (when `?q=` present) |
-| `/login` | `routes/login.tsx` | Login form |
-| `/register` | `routes/register.tsx` | Registration form |
-| `/space/$spaceKey` | `routes/space.$spaceKey.tsx` | Space overview with sidebar page tree |
-| `/space/$spaceKey/page/$slug` | `routes/space.$spaceKey.page.$slug.tsx` | Page viewer with versions, diff, comments, approval |
-| `/space/$spaceKey/page/$slug/edit` | `routes/space.$spaceKey.page.$slug.edit.tsx` | Page editor with formatting toolbar |
-
-The root layout (`__root.tsx`) calls `checkAuth()` on mount and shows a loading spinner until the auth check completes. It renders the `Header` (with a search form that navigates to `/?q=`) and an `Outlet` for child routes.
-
-### Data Fetching
-
-The API service (`services/api.ts`) is a typed `fetch` wrapper with `credentials: 'include'` for cookie-based session auth. It provides functions grouped by domain: auth (register, login, logout, getMe), spaces (list, get, create), pages (CRUD, tree, by-slug, recent, labels), versions (history, diff, restore), search, comments (threaded CRUD, resolve), templates, and approvals (request, review, pending, by-page). All functions return typed responses matching the backend API. Error handling extracts the `error` field from JSON error responses.
-
-### Key UI Patterns
-
-- **Wiki page tree sidebar**: The `SpaceSidebar` renders a collapsible tree using recursive `PageTreeItem` components. Each item shows its children indented, with expand/collapse toggles. The tree is loaded once when entering a space and persists as you navigate between pages within that space.
-- **Rich text editor**: The `PageEditor` uses `contentEditable` with `document.execCommand` for formatting (bold, italic, headings, lists, links). A toolbar provides quick-insert buttons for macros (info, warning, note, code, toc). Content is saved as HTML. A `TemplatePicker` modal lets users start from a template when creating new pages.
-- **Version diff viewer**: The `VersionDiff` component displays a side-by-side comparison of two page versions. Added lines are highlighted in green, removed lines in red, and unchanged lines are shown for context. Users select two versions from the `VersionList` timeline to compare.
-- **Threaded comments with resolve**: The `CommentSection` renders top-level comments with nested replies. Each comment can be replied to (creating a child comment), resolved/unresolved (toggling a visual indicator), or deleted. Resolved comments are visually muted.
-- **Search with highlighted snippets**: When a search query is present in the URL (`?q=`), the Dashboard switches to search results mode, displaying Elasticsearch results with HTML-highlighted title and content snippets using `dangerouslySetInnerHTML`.
-- **Approval workflow banner**: The `ApprovalBanner` appears at the top of the page viewer when a page has a pending, approved, or rejected approval. It shows the status, reviewer, and provides action buttons (approve/reject for reviewers, request approval for authors).
+| Editing concurrency | Expected revision + explicit conflict | Live operation merge | Matches asynchronous wiki editing without hiding lost updates |
+| History | Immutable full snapshots | Delta-only history | Predictable reads and restores at extra storage cost |
+| Save/search coupling | Transactional outbox | Synchronous dual write | Durable repair without making search availability gate saves |
+| Search deployment | Separate index at assumed scale | PostgreSQL full-text search | Independent relevance/capacity with added operational cost |
+| Hierarchy | Adjacency list + serialized validation | Materialized descendant paths | Simple moves and constraints, with recursive read cost |
+| Content authority | Validated document model | Independently trusted HTML/text/JSON | Reproducible rendering and indexing from one source |
+| Publication | Revision-bound pointer and review | Approval attached only to page | Readers see the content that was actually approved |
 
 ## Implementation Notes
 
-### Local Architecture
+### Local topology and setup
 
-```
-┌─────────────────┐         ┌─────────────────────────────┐
-│   React SPA     │────────▶│   Express API Server        │
-│   Vite :5173    │  REST   │   :3001 (dev)               │
-│                 │◀────────│   :3002, :3003 (optional)   │
-└─────────────────┘         └──┬──────┬──────┬──────┬─────┘
-                               │      │      │      │
-                  ┌────────────┘      │      │      └────────────┐
-                  │                   │      │                   │
-           ┌──────▼──────┐  ┌────────▼───┐  │    ┌──────────────▼──────┐
-           │ PostgreSQL  │  │  Valkey    │  │    │ RabbitMQ            │
-           │ :5432       │  │  :6379    │  │    │ :5672 (AMQP)        │
-           │             │  │  Sessions │  │    │ :15672 (Management) │
-           └─────────────┘  │  Cache    │  │    └──────────┬──────────┘
-                            └───────────┘  │               │
-                                           │    ┌──────────▼──────────┐
-                                    ┌──────▼──┐ │ Search Indexer      │
-                                    │ Elastic │ │ Worker (tsx watch)  │
-                                    │ Search  │ └─────────────────────┘
-                                    │ :9200   │
-                                    └─────────┘
+[Compose](./docker-compose.yml) contains PostgreSQL 16, Valkey 7 with AOF, Elasticsearch 8.11.0, and RabbitMQ 3 with management and persistent volumes. It contains no app or monitoring containers. [Configuration](./backend/src/config/index.ts) reads `.env` from the process working directory and individual database/Redis fields, fixes the index and queue names, and defaults the API to 3001. The README gives both Compose and native setup with matching credentials.
+
+The API awaits queue connection and index setup before listening; helpers catch failures, but their network attempts can still delay startup. There is no API shutdown handler. The worker connects separately, uses prefetch 10, and has a SIGINT queue-close path, not a complete drain of all resources. Queue reconnect/resubscription is absent. The `dev:server2` and `dev:server3` wrappers are overridden by `dev`'s hardcoded port 3001; the README supplies direct commands. Compilation emits `dist/src/index.js`, while the package's `main` names `dist/index.js` and there is no `start` script.
+
+The seed is partly guarded and partly append/fail, so it is for one fresh application. Its users' bcrypt hash was checked with the installed library against `password123`; it has cost 10, while registration uses cost 12. No seed event or automatic index rebuild exists. The README's direct one-time population command addresses a fresh local index only.
+
+### Transaction and history patterns actually implemented
+
+[pageService.ts](./backend/src/services/pageService.ts) stores current page content and a full historical snapshot in the same SQL transaction. This is a useful durability pattern: the current revision and its history record commit together. The core sequence is:
+
+```text
+BEGIN → read current row → update current content/version
+      → insert snapshot → COMMIT → invalidate cache → publish index message
 ```
 
-All infrastructure runs via Docker Compose (`docker-compose.yml`). The API server and search indexer worker run natively with `tsx watch` for hot reload.
+The initial read is not locked and the update has no expected-version condition. Two transactions that both read version 3 can attempt version 4; one may fail the unique history constraint and roll back. A later request with old content can instead read version 4 and successfully overwrite it as version 5. Neither behavior implements an intentional conflict response. Cache errors after `COMMIT` enter the catch block; `ROLLBACK` cannot undo the already committed write. There is no request receipt to disambiguate that HTTP failure.
 
-### Production-Grade Patterns Implemented
+[versionService.ts](./backend/src/services/versionService.ts) restores an old snapshot into a new numbered revision and computes `diffLines` over HTML. Restore does not invalidate page/tree caches, publish an indexing message, or record the page-operation metric. Its slug normalization also differs from normal saves. History downloads all complete snapshots. This is neither a compact metadata endpoint nor a semantic rich-text diff.
 
-1. **Circuit Breaker** (Opossum): Wraps Elasticsearch and RabbitMQ calls. Opens after 50% error rate, resets after 30s. Prevents cascade failures when external services are down. See `src/services/circuitBreaker.ts`.
+### Hierarchy, labels, and deletion
 
-2. **Prometheus Metrics** (prom-client): HTTP request duration histogram with method/route/status labels, request counters, page operation counters (create/update/delete/move), and search latency histogram. Exposed at `/api/metrics`. See `src/services/metrics.ts`.
+The tree query retrieves all page columns and statuses, then builds nested nodes on the server. Redis caches that full result. Breadcrumbs use recursive SQL without a visited-node or depth guard. Parents can cross spaces, and cycles can disappear from root-based trees or cause unbounded breadcrumb recursion.
 
-3. **Structured Logging** (Pino): JSON-formatted logs with request correlation via pino-http. Every log line includes timestamp, level, and request context for log aggregation. See `src/services/logger.ts`.
+For moves involving a root parent, SQL still references `$3` while the argument array has only two entries. Other move paths have no cycle/same-space validation or shared hierarchy lock and can update many sibling positions. The page lookup inside the move uses the pool/cache outside the transaction client. The frontend has no move request or drag interface.
 
-4. **Rate Limiting**: Redis-backed sliding window rate limiter with separate limits -- 500 requests per 15 minutes for API endpoints, 20 per 15 minutes for auth endpoints. See `src/services/rateLimiter.ts`.
+Deleting a page sets children's parent references to null and cascades dependent records, but does not invalidate each child's cached row. Deleting a space bypasses page cache and search deletion publication entirely. Slugs are non-unique, strip non-ASCII characters, change on rename, and have no redirect history. Label changes invalidate a page-ID cache but do not enqueue reindexing.
 
-5. **Async Search Indexing**: RabbitMQ-based queue (`page-index`) decouples page operations from Elasticsearch indexing. The search indexer worker (`src/workers/search-indexer.ts`) consumes messages, fetches page data from PostgreSQL, and indexes documents. Failed messages are nacked without requeue.
+### Queue and search behavior
 
-6. **Transactional Writes**: Page create/update/move operations wrapped in PostgreSQL transactions with proper rollback on failure. Version creation is atomic with page update.
+[queue.ts](./backend/src/services/queue.ts) declares a durable queue and marks messages persistent. This demonstrates broker persistence settings, but uses an ordinary channel without publisher confirms and ignores the backpressure return value. Missing-channel and publish errors are swallowed. No outbox, reconnection loop, delayed retry queue, or dead-letter route is configured.
 
-7. **Health Check**: `GET /api/health` endpoint for load balancer probing.
+[search-indexer.ts](./backend/src/workers/search-indexer.ts) may process up to ten outstanding deliveries. [searchService.ts](./backend/src/services/searchService.ts) fetches current page data and labels, then sends an unversioned index write. Fetching current data does not enforce order: an earlier read can finish its index write after a later one. The helpers catch database/index errors and return normally, so the worker acknowledges failed effects. Unexpected handler errors are negatively acknowledged without requeue; no configured dead-letter destination retains them. A missing source page during indexing does not remove an older search document.
 
-### Simplifications
+Create/update/delete attempt queue events; restore, approval, label changes, and space deletion omit relevant events. The index can therefore remain wrong indefinitely. Search boosts title and labels, requests HTML highlights, filters `published`, and optionally filters space. It does not check membership or current publication state. Unknown space keys become global searches. Page and size inputs lack positive bounds. The response has page IDs but no slug, while the UI treats the ID as a slug.
 
-| Production Feature | Local Substitute | Why |
-|--------------------|-----------------|-----|
-| CDN for static assets | Vite dev server serves assets directly | No global distribution needed locally |
-| Sharded PostgreSQL | Single PostgreSQL instance | < 100 pages, no sharding needed |
-| OAuth 2.0 / SAML SSO | Session auth with bcrypt passwords | Simpler, sufficient for learning |
-| Tiptap/ProseMirror editor | `contentEditable` + `document.execCommand` | Avoids framework complexity |
-| Real-time collaborative editing | Single-user editing only | Would require WebSocket + CRDT |
-| Block-level content diffs | HTML line-level diffs via `diff` library | Simpler, works for demonstration |
-| Multi-region deployment | Single-machine Docker Compose | No replication needed |
-| Elasticsearch cluster | Single ES node (256MB heap) | Single-node mode with security disabled |
+SQL fallback runs only after an Elasticsearch exception. It matches the entire supplied string as an `ILIKE` substring, retains wildcard semantics for `%` and `_`, orders by update time, and reports the returned page's row count as `total`. It is not PostgreSQL full-text search, an exact total, or equivalent relevance. The search timer ends before fallback; a healthy empty index does not cause fallback. The UI receives no degraded-mode flag.
 
-### Omitted
+### Authentication, caching, and instrumentation actually wired
 
-- CDN for static assets and cached page content
-- Multi-region deployment and data replication
-- Real-time collaborative editing (WebSocket + CRDT/OT)
-- File/image attachments (would need MinIO/S3)
-- PDF/Word export
-- SAML/OAuth SSO integration
-- Page-level permissions (only space-level implemented)
-- Audit logging
-- Content replication across data centers
-- Kubernetes orchestration
+[auth.ts](./backend/src/middleware/auth.ts) requires a session for protected mutation routes, and comment edits/deletes check author identity. Space roles and global admin role are otherwise largely unused; direct reads expose private/draft material, and logged-in callers can mutate other spaces or review their own requests through the API. Session cookies are HttpOnly and SameSite=Lax but always `secure: false`; login does not regenerate the session. Login returns `displayName` while the frontend expects `display_name`.
 
-## Deep Pattern Explanations
+[redis.ts](./backend/src/services/redis.ts) supplies 120-second page/slug/tree caches. Cache failures propagate rather than providing a general fail-open cache layer. Invalidation uses `KEYS` patterns, and concurrent fills can repopulate old content. [rateLimiter.ts](./backend/src/services/rateLimiter.ts) uses Redis-backed fixed windows: 500 API requests and 20 authentication attempts per 15 minutes per IP key. Store errors fail through the error path; this is not a sliding-window or fail-open limiter.
 
-This section explains each production-grade pattern implemented in this project from first principles, describing what the pattern is, what problem it solves, and how this project uses it.
+In [app.ts](./backend/src/app.ts), session and API limiter middleware run before HTTP metric collection, including on health/metrics paths. Health returns constant status, not dependency checks. HTTP labels can merge router-local paths or retain unmatched request paths. Page-operation metrics cover only instrumented service paths. Pino provides request/service logs, but does not establish full asynchronous mutation tracing. [circuitBreaker.ts](./backend/src/services/circuitBreaker.ts) defines a factory that has no callers; it does not protect database or search operations.
 
-### Circuit Breaker
+### Browser implementation and incomplete features
 
-A circuit breaker is a stability pattern that prevents a failing dependency from dragging down the entire system. When your application calls an external service (a database, a search engine, a message queue), that call can fail in two ways: fast failure (connection refused, immediate error) or slow failure (the service accepts the connection but takes 30 seconds to respond). Slow failures are far more dangerous because each pending request holds a thread, a connection, and memory. If your application makes 100 requests per second to a service that takes 30 seconds to respond, you will have 3,000 pending requests consuming resources within 30 seconds -- enough to crash your own application even though the downstream service is the one with the problem.
+The generated [route tree](./frontend/src/routeTree.gen.ts) makes the page route a child of the space route and the editor a child of the page route. The two parent components lack an `Outlet`. Nested children need an outlet to render, so the current structure blocks page viewing/editing through normal URLs. This finding is based on source and generated routing, not a browser reproduction. [TanStack Router outlets](https://tanstack.com/router/latest/docs/guide/outlets)
 
-A circuit breaker monitors the error rate of calls to a dependency. When the error rate crosses a threshold, the breaker "opens" and immediately rejects all calls to that dependency without even attempting the request. This is called "failing fast." After a cooldown period, the breaker enters a "half-open" state and allows one probe request through. If the probe succeeds, the circuit closes and normal traffic resumes. If the probe fails, the circuit reopens for another cooldown.
+[wikiStore.ts](./frontend/src/stores/wikiStore.ts) has one shared loading/error/current-page context. Fetches lack cancellation or context checks; old responses can overwrite another page or space, and failures can retain old content or an indefinite loading view. Logout does not clear wiki state. Editor initialization can copy stale shared content. Rename saves navigate to the previous slug, and in-flight save completion can navigate away from later typing.
 
-In this project, Opossum circuit breakers wrap calls to Elasticsearch and RabbitMQ (`src/services/circuitBreaker.ts`). When Elasticsearch goes down, the breaker opens after 50% of requests fail, and the search endpoint falls back to PostgreSQL ILIKE queries. Without the breaker, search requests would hang for the full timeout duration (10 seconds each), causing the API server to run out of connections and affecting all endpoints -- not just search. The breaker ensures that Elasticsearch failures only degrade search quality (losing relevance scoring and highlighting) rather than bringing down page viewing, editing, and comments. The breaker resets after 30 seconds to check if Elasticsearch has recovered.
+[PageEditor.tsx](./frontend/src/components/PageEditor.tsx) uses `contentEditable`, `execCommand`, and HTML replacement during renders, with no explicit selection/IME preservation. Saves are manual and send empty structured JSON alongside HTML/text. There is no dirty-navigation guard, autosave, local draft recovery, or server HTML sanitization. [PageViewer.tsx](./frontend/src/components/PageViewer.tsx) and search results insert raw HTML. These are source-level rendering risks, not browser exploit tests.
 
-### Prometheus Metrics
+[TemplatePicker.tsx](./frontend/src/components/TemplatePicker.tsx) is not wired into a route. [MacroRenderer.tsx](./frontend/src/components/MacroRenderer.tsx) supports simple JSON callouts/code and a table-of-contents placeholder; the editor emits separate HTML callouts. The backend macro helper has no route callers. There is no generated, linked table of contents or syntax-highlighting pipeline.
 
-Prometheus is a monitoring system that collects numerical measurements from your application over time. Unlike logging (which captures individual events), metrics capture aggregated statistics: how many requests per second, what is the 99th percentile latency, how much memory is being used right now. Prometheus works on a "pull" model -- your application exposes a `/metrics` HTTP endpoint that returns all current metric values in a specific text format, and the Prometheus server scrapes this endpoint at regular intervals (typically every 15 seconds).
+Version comparison is a unified colored display of HTML-line changes, not side-by-side semantic comparison. Restore refreshes history without refreshing the current page/tree. Comments and approval components have unguarded asynchronous state updates and limited pending-state protection; only roots and direct replies are returned, although the schema permits deeper/cross-page parents. Approval requests can race into duplicates; a conditional pending-state update prevents two successful decisions on one row, but does not authorize the reviewer or bind a version. Approving can publish a current draft or archived page without history, cache, or index updates. Cancelling the review comment prompt still submits a decision in the browser component.
 
-There are four metric types. **Counters** only go up and are used for things like total requests or total errors -- you derive rates from them. **Gauges** go up and down and represent current values like active connections or queue depth. **Histograms** track the distribution of values across configurable buckets (e.g., request latency buckets: 0-10ms, 10-50ms, 50-100ms, 100ms+), enabling percentile calculations. **Summaries** are similar but compute percentiles on the client side.
+### Simplifications, omissions, and verification limits
 
-This project uses `prom-client` (`src/services/metrics.ts`) to expose HTTP request duration histograms (with method, route, and status code labels), request counters, page operation counters by type (create, update, delete, move), and search latency histograms. These metrics enable dashboards showing requests per second by route, p99 latency trends, and page edit frequency. Default Node.js runtime metrics (CPU usage, memory, event loop lag, garbage collection) are included automatically.
+The local system uses one database and shared services rather than tenant sharding, replicas, a CDN, multi-region operation, or orchestration. Production outbox/receipts, enforced permissions, canonical safe rendering, revision-bound publication, reliable reindexing, co-editing, and draft recovery are not implemented. They are design proposals in the earlier sections.
 
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Traditional logging produces lines like `"2024-01-16 12:00:00 INFO Page updated: Getting Started in space ENG"`. Structured logging produces `{"timestamp":"2024-01-16T12:00:00Z","level":"info","event":"page_updated","pageId":"abc123","title":"Getting Started","spaceKey":"ENG","userId":"user456","responseTime":45}`. Each piece of information is a separate field that can be filtered, searched, and aggregated by log management systems like Elasticsearch/Kibana, Datadog, or Grafana Loki.
-
-The key benefit is queryability at scale. When you have 50 API servers each producing thousands of log lines per second, finding "all page updates in the ENG space that took more than 100ms" requires either regex parsing (slow, fragile) or structured field queries (fast, reliable). Structured logs also enable automatic alerting: you can set up an alert that fires when the count of `event=page_update AND responseTime>500` exceeds a threshold.
-
-This project uses Pino (`src/services/logger.ts`), a high-performance JSON logger for Node.js. HTTP request logging is handled by pino-http, which generates a unique request ID for each request and includes method, URL, status code, response time, and user context. The request ID enables tracing a single request across log lines -- from authentication middleware through page update logic to search indexing -- which is essential for debugging production issues.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. Without it, a single client -- whether a malicious attacker or a developer's buggy script running in a tight loop -- can consume all server resources, degrading service for every other user. Rate limiting provides three protections: defense against brute-force attacks (limiting login attempts prevents credential stuffing), protection against accidental abuse (a misconfigured CI pipeline making thousands of API calls), and fair resource allocation (no single user monopolizes the search index or database connections).
-
-The most common algorithm is the sliding window: for each client (identified by IP address or user ID), count the number of requests within a rolling time window. When the count exceeds the limit, reject the request with HTTP 429 (Too Many Requests). The response includes a `Retry-After` header telling the client when to try again, and `X-RateLimit-Remaining` showing how many requests are left in the current window.
-
-This project uses Redis-backed sliding window rate limiting (`src/services/rateLimiter.ts`) with two tiers: 500 requests per 15 minutes for general API endpoints, and 20 requests per 15 minutes for authentication endpoints (login, register). The tighter auth limit prevents brute-force password guessing -- at 20 attempts per 15 minutes, an attacker would need days to try even a small password dictionary. Redis is used as the backing store (rather than in-memory counters) so that rate limits work correctly across multiple API server instances behind a load balancer.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether a service is operational. They serve two critical functions in production: load balancers use health checks to route traffic only to healthy instances (removing crashed or overloaded servers from the rotation), and orchestration systems like Kubernetes use them to decide whether to restart a container.
-
-There are two types of health check. A **liveness** check answers "is the process running and responsive?" -- returning 200 if the HTTP server can respond at all. If this fails, the process is likely deadlocked or crashed and should be restarted. A **readiness** check answers "can this instance serve real requests?" -- it verifies that the database connection pool is active, Redis is reachable, and other dependencies are functional. A service can be alive but not ready (e.g., during startup while it establishes database connections). Load balancers should only send traffic to instances passing both checks.
-
-This project implements `GET /api/health` as a combined health check that verifies service status. During deployment, a load balancer would poll this endpoint every few seconds and stop sending requests to an instance that returns non-200 responses, ensuring users are never routed to a server that cannot complete their requests.
-
-### RBAC (Role-Based Access Control)
-
-Role-Based Access Control is an authorization model where permissions are not assigned directly to individual users but instead assigned to roles, and users are assigned to roles. Instead of maintaining a list of "Alice can edit page X, Bob can view page X, Carol can admin page X," RBAC defines roles (admin, member, viewer) with specific permissions (admins can edit and delete, members can edit, viewers can only read), and assigns users to roles within a specific scope (Alice is an admin in the Engineering space, Bob is a member).
-
-RBAC simplifies permission management at scale. With direct user-permission assignments, adding a new page requires creating permission entries for every user who should access it. With RBAC, you assign the page to a space, and every user with a role in that space automatically gets the appropriate access. When someone joins a team, you give them a role in the relevant spaces rather than enumerating hundreds of individual resource permissions. When someone leaves, removing their role revokes all associated access in one operation.
-
-In this project, RBAC is implemented at the space level via the `space_members` table (`src/db/init.sql`). Each row maps a user to a space with a role: `admin`, `member`, or `viewer`. The role is enforced by a CHECK constraint and stored as a VARCHAR(20). Space admins can manage members and modify space settings. Members can create and edit pages within the space. Viewers can read pages but cannot create or modify content. The routes (`src/routes/spaces.ts`) check the user's role before allowing space modifications, and page operations check space membership before allowing reads or writes. This is a simplified model -- production Confluence would add page-level permissions, group-based roles (assign a role to "Engineering Team" rather than individual users), and permission inheritance through the page tree hierarchy.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application manages the cache explicitly, rather than the cache being transparent to the application. The pattern works in three steps: (1) the application checks the cache first; (2) if the data is in the cache (a "hit"), return it immediately; (3) if the data is not in the cache (a "miss"), query the database, store the result in the cache with a TTL, and then return it. On write operations, the application updates the database and then invalidates (deletes) the relevant cache entries, so the next read will re-populate the cache with fresh data.
-
-The key insight of cache-aside is that the cache is populated on demand. You do not need to pre-load the cache or keep it in sync with every database change. Frequently accessed data naturally stays cached because it is re-populated on every miss. Rarely accessed data does not waste cache memory because it expires via TTL and is never re-populated. The trade-off is that the first request after a cache miss or invalidation pays the full database query cost.
-
-In this project, the page service (`src/services/pageService.ts`) uses Redis cache-aside with 120-second TTL for three key read paths: individual page lookup by ID (`page:{id}:data`), page lookup by slug (`space:{spaceId}:slug:{slug}`), and the page tree for a space (`space:{spaceId}:tree`). On reads, `cacheGet` checks Redis first; on cache miss, the service queries PostgreSQL and stores the result with `cacheSet(key, data, 120)`. On writes (page update, move, delete, label change), the service invalidates all related cache keys using `cacheDelPattern` with wildcard patterns (`page:{id}:*` and `space:{spaceId}:*`). This pattern-based invalidation ensures that any derived cache entries (page data, slug lookup, tree) are cleared when the source data changes, at the cost of potentially over-invalidating (clearing the tree cache even when only a page's content changed, not its position).
+The mocked backend tests cover basic health/auth/space/recent-page routes. Existing browser smoke tests depend on `main` selectors absent from current layouts. This documentation review inspected source, configuration, generated routes, and tests, and checked the seed hash in isolation. It did not run builds, the Docker stack, browser interactions, real SQL races, or queue recovery tests. Application code remains unchanged.

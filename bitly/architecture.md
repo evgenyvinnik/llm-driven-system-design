@@ -1,212 +1,142 @@
-# Bit.ly - URL Shortener - Architecture Design
+# Bitly architecture
 
 ## System Overview
 
-A URL shortening service that converts long URLs into short, memorable links with analytics tracking. The system is designed to handle billions of redirects per day at production scale, with sub-50ms redirect latency and strong consistency for URL creation.
+Design a URL-shortening service with reliable link creation, fast redirects, owner management, and delayed click analytics. This document describes a proposed production architecture first, then maps it to the local Express, PostgreSQL, Valkey, RabbitMQ, and React implementation. Proposed guarantees are not claims about the current demo or Bitly's private system.
+
+The central distinction is between publishing a durable mapping, deciding whether it may still redirect, and recording an observation about a redirect request. These have different consistency and availability requirements.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-- **URL shortening**: Convert long URLs to 7-character Base62 short codes
-- **URL redirection**: Redirect short URLs to original destinations with 302 response
-- **Analytics tracking**: Record clicks with referrer, device type, and timestamp
-- **Custom short URLs**: Allow users to specify custom short codes
-- **Link expiration**: Support optional expiration dates for URLs
-- **User authentication**: Session-based login for URL management
-- **Admin dashboard**: System-wide statistics, user management, key pool management
+- Create HTTP(S) short links, optionally with a custom alias and expiration.
+- Keep one owner for each code in a shared, case-sensitive namespace; reserve service routes.
+- Resolve valid links without loading the management application.
+- Let authenticated owners list and deactivate their links; let administrators handle abuse.
+- Report request counts, daily activity, referrers, and device categories with explicit freshness and coverage.
 
-### Non-Functional Requirements
+Custom domains, destination editing, billing, authenticated destination access, and unique-person attribution are outside the first production design. A public short code is a locator, not a secret or an authorization credential.
 
-| Requirement | Target | Rationale |
-|-------------|--------|-----------|
-| Availability | 99.99% (52 min downtime/year) | Redirect is a critical path; unavailability breaks all shortened links |
-| Redirect p99 latency | < 50ms | Users perceive redirect delays as broken links |
-| API p99 latency | < 200ms | Standard for CRUD API operations |
-| Write throughput | 1,000 URLs/s | Supports tens of millions of URLs created per day |
-| Read throughput | 100,000 redirects/s | 100:1 read-to-write ratio typical for URL shorteners |
-| Consistency | Strong for URL creation, eventual for analytics | Duplicate short codes are unacceptable; analytics delays are tolerable |
-| Durability | Zero data loss for URL mappings | Lost mappings permanently break links |
+### Non-functional targets
+
+These are planning assumptions, not measured results: redirect availability 99.99%, regional p99 resolution under 50 ms excluding the destination, and p99 creation under 300 ms under the agreed load. Target analytics publication within one minute in normal operation and publish lag during an outage.
+
+A committed code must not later resolve to another owner's target. Expiration must be evaluated at resolution time. Ordinary deactivation has a proposed five-second propagation bound; emergency takedowns require acknowledged enforcement at serving regions or withdrawal of regions that cannot enforce them. Availability during a control-plane partition follows that policy rather than silently extending an unlimited stale mapping.
 
 ## Capacity Estimation
 
-### Production Scale
+| Assumption | Calculation | Design consequence |
+|------------|-------------|--------------------|
+| 50 million creations/day | About 580/s average; plan for 5,000/s peaks | Durable namespace and indexed owner listing |
+| 5 billion redirect requests/day | About 58,000/s average; plan for 200,000/s peaks | Regional caches and separate redirect capacity |
+| 500 bytes per mapping | About 25 GB/day; 9.1 TB/year raw | Partition before this sustained scale; add indexes/replicas separately |
+| 200 bytes per retained event | About 1 TB/day; 90 TB for 90 days raw | Separate analytics storage and bounded retention |
+| Seven base62 characters | 62⁷ = 3,521,614,606,208 possibilities | About 193 years of allocations at 50 million/day before exclusions |
 
-| Metric | Value | Calculation |
-|--------|-------|-------------|
-| Daily Active Users | 10M | |
-| URLs created per day | 50M | ~580 RPS average, ~5,000 RPS peak |
-| Redirects per day | 5B | ~58,000 RPS average, ~200,000 RPS peak |
-| Storage per URL | ~500 bytes | short_code + long_url + metadata |
-| URL storage (1 year) | ~9 TB | 50M/day x 365 x 500B |
-| Click events per day | 5B | ~30 bytes each |
-| Analytics storage (1 year) | ~55 TB | Partitioned by month, archived after 90 days |
-| Cache size (hot URLs) | ~50 GB | Top 100M URLs x 500B |
+The code-space estimate is capacity, not a collision-free lifetime for random draws. After one year, roughly 0.5% of that space is occupied; a new independent draw has a comparable collision probability if assignments are well distributed. Unique constraints and retries remain necessary. Do not reuse retired codes just to save space: old messages and bookmarks can otherwise lead to an unrelated target.
 
-### Key Pool Sizing
-
-With 7-character Base62 codes: 62^7 = 3.5 trillion possible codes. At 50M URLs/day, this provides 192,000 years of unique codes.
+Cache sizing follows the active working set, including keys, metadata, and allocator overhead. A million cached entries at an assumed 600 bytes each is about 600 MB before replication and process overhead. Measure this with representative URLs; a 2,048-character limit does not imply a fixed 2 KB average.
 
 ### Local Development Scale
 
-| Metric | Value |
-|--------|-------|
-| DAU | 10-100 |
-| URLs created per day | 500 |
-| Redirects per day | 10,000 |
-| Total storage (1 year) | ~200 MB |
+One API, one worker, PostgreSQL, Valkey, RabbitMQ, and Vite are sufficient to explore the flows. Additional API and worker processes share infrastructure. There is no configured load balancer, sharding, benchmark, or production-sized event history. See the [README](./README.md) for ports and resource setup.
 
 ## High-Level Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                                CLIENTS                                       │
-│              Web Browser / Mobile App / API Consumer                         │
-└──────────────────────────┬───────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                           CDN / Edge Layer                                   │
-│              (CloudFront / Cloudflare for static assets)                     │
-└──────────────────────────┬───────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                        API Gateway / Load Balancer                           │
-│           (nginx / ALB — rate limiting, TLS termination)                     │
-└────────┬─────────────────┬─────────────────┬────────────────────────────────┘
-         │                 │                 │
-         ▼                 ▼                 ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│  API Server 1   │ │  API Server 2   │ │  API Server N   │
-│  (Express.js)   │ │  (Express.js)   │ │  (Express.js)   │
-└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-         │                   │                   │
-         └───────────────────┼───────────────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-         ▼                   ▼                   ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│  Redis Cluster  │ │  PostgreSQL     │ │   RabbitMQ      │
-│  (URL Cache +   │ │  (Primary +     │ │   (Analytics    │
-│   Sessions +    │ │   Read Replicas)│ │    Events)      │
-│   Rate Limits)  │ │                 │ │                 │
-└─────────────────┘ └─────────────────┘ └────────┬────────┘
-                                                  │
-                                                  ▼
-                                         ┌─────────────────┐
-                                         │ Analytics Worker │
-                                         │ (Batch Insert)   │
-                                         └─────────────────┘
+```text
+┌────────────────┐       ┌────────────────┐
+│ Management UI  │──────▶│ Management API │
+└────────────────┘       └───────┬────────┘
+                                 ▼
+                         ┌────────────────┐
+                         │ Mapping store  │
+                         └───────┬────────┘
+                                 │ revisions / invalidation
+                                 ▼
+┌────────────────┐       ┌────────────────┐
+│ Short-link GET │──────▶│ Regional       │──────▶ Destination
+└────────────────┘       │ resolver/cache │         via 302
+                         └───────┬────────┘
+                                 │ request observations
+                                 ▼
+                         ┌────────────────┐
+                         │ Durable log    │
+                         └───────┬────────┘
+                                 ▼
+                         ┌────────────────┐
+                         │ Analytics      │──────▶ Management API
+                         │ workers/store  │
+                         └────────────────┘
 ```
 
-### Core Components
+A CDN can serve management assets. Redirect response caching is a separate policy because it changes revocation and measurement. Logical services can begin in one application while retaining independent capacity limits; they need separate deployments when redirect traffic or analytics work interferes with management writes.
 
-| Component | Purpose | Technology |
-|-----------|---------|------------|
-| Load Balancer | Distribute requests, TLS termination, rate limiting | nginx / ALB |
-| API Server | Handle URL operations and redirects | Node.js + Express + TypeScript |
-| Cache | Fast URL lookups, session storage, rate limiting | Redis Cluster |
-| Primary Database | URL metadata, users, key pool | PostgreSQL (primary + read replicas) |
-| Message Queue | Async analytics processing | RabbitMQ |
-| Analytics Worker | Batch-insert click events from queue | Node.js background service |
-| CDN | Static asset delivery, edge caching | CloudFront / Cloudflare |
+## Core Components / Request Flows
 
-## Request Flows
+### Creation and namespace ownership
 
-### URL Shortening (Write Path)
+Validate the input, bind a creation attempt to the caller and request contents, then atomically claim the code and record the resulting link. Return success only after that transaction commits. For generated codes, a cryptographic random candidate with a bounded retry on the unique constraint is a reasonable initial production choice. At the assumed creation rate, measure that design before adding an allocator service.
 
-```
-1. Client → POST /api/v1/urls { long_url, custom_code?, expires_at? }
-2. Load balancer routes to API server (least connections)
-3. API validates URL format and length (max 2048 chars)
-4. Idempotency check: hash(long_url + custom_code + user_id) → Redis lookup
-5. If idempotent hit: return cached response
-6. API fetches unused short_code from local key cache (or DB if cache empty)
-7. API inserts URL record into PostgreSQL (transaction)
-8. API writes to Redis cache: url:{short_code} → long_url
-9. API caches idempotency response in Redis with 24h TTL
-10. API returns { short_url, short_code, expires_at }
-```
+Custom aliases enter the same namespace. An availability lookup is advisory; the final insert decides which simultaneous request wins. Define length, character set, case sensitivity, and reserved routes consistently at every boundary. Validate the URL scheme and structure without changing the destination's query semantics or fetching the target in the creation transaction.
 
-### URL Redirect (Read Path)
+The local project's preallocated key pool is a useful alternative for studying batch coordination. A production pool would need one namespace for generated and custom codes, bounded asynchronous refill, fenced allocation ownership, and safe retirement or reclamation. It does not eliminate database coordination or the mapping insert.
 
-```
-1. Client → GET /{short_code}
-2. API checks Redis cache for url:{short_code}         → ~0.5ms
-3. If cache hit: proceed to step 5                      → Total: ~1ms
-4. If cache miss: query PostgreSQL, populate cache      → ~20ms
-5. If URL expired or not found: return 404
-6. API returns 302 redirect to long_url
-7. API publishes click event to RabbitMQ (async, non-blocking)
-8. Analytics worker consumes event, batch-inserts to click_events table
-```
+### Resolution and changes
 
-### Key Pool Allocation
+A cache record carries the target, active state, expiration, revision, and an absolute freshness deadline assigned when the authoritative record is read. Resolve only if it remains active, unexpired, and fresh enough for the deactivation policy. Cache TTL never extends past link expiration.
 
-```
-1. Background job monitors key pool size
-2. When pool drops below 5,000 unused keys, generate 10,000 new keys
-3. Each API server fetches a batch of 100 unused keys to local memory
-4. Keys marked allocated_to={server_id} in database
-5. On URL creation, local cache provides key instantly (no DB round trip)
-6. If local cache empty, fetch new batch from database
-```
+Deactivation commits a new revision and a durable invalidation event. Consumers must reject an older refill after observing a newer revision or tombstone. Even if invalidation is delayed, an old read cannot obtain a new five-second lifetime merely by arriving late: its freshness deadline was fixed at the authoritative read. Account for clock uncertainty when enforcing that bound.
+
+Use explicit redirect cache headers consistent with this policy. A 302 alone is not an end-to-end measurement or revocation contract. Browser and shared-cache rules are separate from the service's Redis cache. [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.5) defines the response `no-store` directive; the proposed mutable-link response uses it to prevent compliant HTTP caches from storing the redirect.
+
+### Analytics admission and processing
+
+Define a click as an observed eligible redirect request, not proof of a human visit or successful destination load. Apply a stated policy to bots, previews, repeated requests, and failed resolutions. A browser retry can be another observation even when it came from one user action.
+
+Assign an event ID once at the observation boundary. Retrying its publication keeps that ID. Decide whether the product requires durable admission before replying: a lossless promise for admitted events requires an acknowledgement from durable infrastructure, with its latency and failure policy. For this product, prioritize redirect availability and disclose analytics gaps if the admission path cannot retain an observation within its budget.
+
+Workers acknowledge only after applying an event's effect durably. Duplicate detection and aggregate updates must share a transaction or an equivalent atomic ingestion contract. Retain deduplication information for at least the supported replay window. Separate retrying the same event from defining unique visitors; these solve different problems.
+
+Use time partitions, aggregated query tables, and a raw-event retention policy in a dedicated analytics store. A popular link should not make all workers contend on one mapping row. Publish processing watermarks and known admission gaps with dashboard results.
 
 ## Database Schema
 
+### Current local schema
+
+The following is the current [initialization SQL](./backend/src/db/init.sql), with comments removed. It is executable local evidence, not a claim that these tables implement the production guarantees above. In particular, `urls.user_id` has no foreign key, roles have no check constraint, and there are no operation receipts, outbox records, mapping revisions, or event deduplication keys.
+
 ```sql
--- Users table
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    is_active BOOLEAN DEFAULT TRUE
-);
-
--- Sessions table
-CREATE TABLE sessions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token VARCHAR(255) UNIQUE NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL
-);
-CREATE INDEX idx_sessions_token ON sessions(token);
-CREATE INDEX idx_sessions_user ON sessions(user_id);
-
--- Pre-generated key pool
-CREATE TABLE key_pool (
-    short_code VARCHAR(10) PRIMARY KEY,
-    is_used BOOLEAN DEFAULT FALSE,
-    allocated_to VARCHAR(50),  -- server instance ID
-    allocated_at TIMESTAMPTZ
-);
-CREATE INDEX idx_key_pool_unused ON key_pool(is_used) WHERE is_used = FALSE;
-
--- URLs table
-CREATE TABLE urls (
+CREATE TABLE IF NOT EXISTS urls (
     short_code VARCHAR(10) PRIMARY KEY,
     long_url TEXT NOT NULL,
-    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    is_custom BOOLEAN DEFAULT FALSE,
-    is_active BOOLEAN DEFAULT TRUE,
-    expires_at TIMESTAMPTZ,
+    user_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE,
     click_count BIGINT DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    is_active BOOLEAN DEFAULT true,
+    is_custom BOOLEAN DEFAULT false
 );
-CREATE INDEX idx_urls_user_id ON urls(user_id);
-CREATE INDEX idx_urls_expires ON urls(expires_at) WHERE expires_at IS NOT NULL;
-CREATE INDEX idx_urls_active ON urls(is_active) WHERE is_active = TRUE;
 
--- Click events (analytics) — partitioned by month at production scale
-CREATE TABLE click_events (
+CREATE INDEX IF NOT EXISTS idx_urls_user_id ON urls(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_urls_expires ON urls(expires_at) WHERE expires_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_urls_active ON urls(is_active) WHERE is_active = true;
+
+CREATE TABLE IF NOT EXISTS key_pool (
+    short_code VARCHAR(10) PRIMARY KEY,
+    is_used BOOLEAN DEFAULT false,
+    allocated_to VARCHAR(50),
+    allocated_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_unused_keys ON key_pool(is_used) WHERE is_used = false;
+
+CREATE TABLE IF NOT EXISTS click_events (
     id BIGSERIAL PRIMARY KEY,
     short_code VARCHAR(10) NOT NULL REFERENCES urls(short_code),
-    clicked_at TIMESTAMPTZ DEFAULT NOW(),
+    clicked_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     referrer TEXT,
     user_agent TEXT,
     ip_address INET,
@@ -214,11 +144,33 @@ CREATE TABLE click_events (
     city VARCHAR(100),
     device_type VARCHAR(20)
 );
-CREATE INDEX idx_click_events_short_code ON click_events(short_code);
-CREATE INDEX idx_click_events_time ON click_events(clicked_at);
 
--- PL/pgSQL function to generate and populate key pool
-CREATE OR REPLACE FUNCTION generate_short_code(length INTEGER DEFAULT 7) RETURNS VARCHAR AS $$
+CREATE INDEX IF NOT EXISTS idx_click_events_short_code ON click_events(short_code);
+
+CREATE INDEX IF NOT EXISTS idx_click_events_time ON click_events(clicked_at);
+
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) DEFAULT 'user',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    is_active BOOLEAN DEFAULT true
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id),
+    token VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+CREATE OR REPLACE FUNCTION generate_short_code(length INTEGER DEFAULT 7)
+RETURNS VARCHAR AS $$
 DECLARE
     chars VARCHAR := 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     result VARCHAR := '';
@@ -231,7 +183,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION populate_key_pool(count INTEGER DEFAULT 1000) RETURNS INTEGER AS $$
+CREATE OR REPLACE FUNCTION populate_key_pool(count INTEGER DEFAULT 1000)
+RETURNS INTEGER AS $$
 DECLARE
     inserted INTEGER := 0;
     new_code VARCHAR;
@@ -249,445 +202,228 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Populate initial key pool
 SELECT populate_key_pool(10000);
 ```
 
-### Storage Strategy
+### Production extensions
 
-| Data Type | Storage | TTL/Retention | Rationale |
-|-----------|---------|---------------|-----------|
-| URL metadata | PostgreSQL | Indefinite (or until expired) | Strong consistency, relational queries |
-| Key pool | PostgreSQL | Indefinite | Transactional allocation |
-| Sessions | Redis + PostgreSQL | 7 days | Fast lookup, DB fallback |
-| URL cache | Redis | 24 hours | Hot path optimization |
-| Click events | PostgreSQL (partitioned) | 90 days hot, then archive | Sufficient for analytics |
-| Rate limit counters | Redis | 1 minute sliding window | Atomic operations |
+| Record or index | Purpose |
+|-----------------|---------|
+| Link revision, status, expiry, owner FK | Enforce lifecycle and preserve authoritative ownership |
+| Creation receipt unique by caller and operation ID | Bind a retried request digest to one committed result |
+| Outbox entry committed with link changes | Recover invalidation after a publisher crash |
+| Common code ownership record, if using a pool | Prevent custom aliases and allocated keys from diverging |
+| Owner plus created-time/code index | Stable cursor pagination without large offsets |
+| Event identity and transactional contribution | Apply a retained event once within the replay horizon |
+| Time-partitioned events and rollups | Retention and dashboard queries independent of redirect writes |
 
-### Redis Key Patterns
-
-```
-url:{short_code}              → long_url (string, 24h TTL)
-session:{token}               → user_id + metadata (hash, 7d TTL)
-rate:{ip}:{endpoint}          → request count (string, 1m TTL)
-idempotency:{request_hash}    → cached response (string, 24h TTL)
-```
+Once mappings span shards, route code claims deterministically to one authority. Owner listing becomes a separate maintained index. Do not promise a transaction spanning unrelated shards without specifying the coordination or changing the receipt layout.
 
 ## API Design
 
-### Core Endpoints
+### Existing application routes
 
+| Method | Path | Current behavior |
+|--------|------|------------------|
+| POST | `/api/v1/auth/register` | Create a user; no automatic login |
+| POST | `/api/v1/auth/login` | Set cookie; also return user and bearer token |
+| POST | `/api/v1/auth/logout` | Delete session and clear cookie if operations succeed |
+| GET | `/api/v1/auth/me` | Require a valid session and active user |
+| POST | `/api/v1/urls` | Create, optionally associated with authenticated user |
+| GET | `/api/v1/urls` | List owned links using limit/offset, including inactive rows |
+| GET | `/api/v1/urls/:shortCode` | Anonymous details; restrict to owner when authenticated |
+| PATCH | `/api/v1/urls/:shortCode` | Owner updates active flag or expiration; no target update |
+| DELETE | `/api/v1/urls/:shortCode` | Owner soft-deactivates; return 204 |
+| GET | `/:shortCode` | 302 on a resolved mapping; cold invalid/expired/inactive links return 404 |
+| GET | `/api/v1/analytics/:shortCode` | Authenticated aggregate lookup without ownership enforcement |
+| GET | `/api/v1/analytics/:shortCode/clicks` | Authenticated raw events without ownership enforcement |
+| GET | `/api/v1/admin/stats`, `/analytics` | Administrative system summaries |
+| GET | `/api/v1/admin/urls`, `/users`, `/key-pool` | Administrative lists and pool counts |
+| POST | `/api/v1/admin/urls/:shortCode/deactivate`, `/reactivate` | Change status in SQL without cache invalidation |
+| PATCH | `/api/v1/admin/users/:userId/role` | Change role to user/admin |
+| POST | `/api/v1/admin/users/:userId/deactivate` | Deactivate a user |
+| POST | `/api/v1/admin/key-pool/repopulate` | Add generated pool keys, default 1,000 |
+| POST | `/api/v1/admin/cleanup-expired` | Manually deactivate expired rows; no scheduler |
+
+Creation example with a database-compatible custom alias:
+
+```http
+POST /api/v1/urls
+Content-Type: application/json
+
+{"long_url":"https://example.com/article","custom_code":"article7","expires_in":86400}
 ```
-# Public API
-POST   /api/v1/urls               Create short URL
-GET    /api/v1/urls/:code          Get URL metadata
-GET    /api/v1/urls/:code/stats    Get click analytics
-DELETE /api/v1/urls/:code          Deactivate URL
 
-# Redirect (no /api prefix)
-GET    /:short_code                302 redirect to long URL
+A successful response is a formatted link with `short_code`, `short_url`, `long_url`, creation/expiration timestamps, click count, and custom-code flag. Normal link responses omit `is_active`. `expires_in` is seconds at the API, while the UI accepts days. The local creation handler generally reports service failures as 400, including some post-commit failures; it does not implement the proposed conflict and unknown-operation contract.
 
-# Authentication
-POST   /api/v1/auth/register       Create account
-POST   /api/v1/auth/login          Start session
-POST   /api/v1/auth/logout         End session
-GET    /api/v1/auth/me             Get current user
-
-# User Dashboard
-GET    /api/v1/user/urls           List user's URLs
-GET    /api/v1/user/stats          User's aggregate stats
-
-# Admin API
-GET    /api/v1/admin/stats         System-wide statistics
-GET    /api/v1/admin/urls          List all URLs (paginated)
-GET    /api/v1/admin/users         List all users
-POST   /api/v1/admin/key-pool      Repopulate key pool
-DELETE /api/v1/admin/urls/:code    Force-delete any URL
-```
+The proposed API adds bounded input schemas, consistent alias lengths, stable cursors, lifecycle revisions, owner checks for every analytics read, and recoverable creation receipts. Those changes require implementation, not just a new header in the browser.
 
 ## Key Design Decisions
 
-### 1. Short Code Generation: Pre-generated Key Pool
+### Random allocation versus a preallocated pool
 
-**Chosen**: Generate random 7-character Base62 codes in advance and store in `key_pool` table.
+A unique mapping insert already arbitrates ownership. Random candidates plus a bounded uniqueness retry keep the initial production write path small and avoid stranded batches. At low namespace occupancy, most inserts need one attempt. This costs collision handling and does not make codes secret.
 
-**Why this works for URL shortening:**
-- No coordination needed between API servers — each server fetches a batch of unused keys to local memory, eliminating write contention
-- Random codes are not predictable, unlike sequential counters that leak business information (total URL count, creation rate)
-- Guaranteed unique at generation time, unlike hash-based approaches that require collision detection and retries
-- 62^7 = 3.5 trillion possible codes provides effectively unlimited capacity
+A pool moves candidate generation and reservation out of many individual requests and can absorb a temporary allocator interruption. It adds refill scheduling, unused reservations, and fencing for a process that appears dead but later resumes. A simple shared counter would expose sequential IDs, but block allocation can avoid a counter round trip per link; it is not inherently incapable of the assumed throughput. Choose additional coordination from measurements and operational needs.
 
-**Why counter-based fails:** A global counter requires coordination. A single counter service becomes a bottleneck at 5,000 writes/s. Distributed counters (Snowflake-style) add operational complexity and still produce predictable codes. The key pool eliminates this coordination entirely by pre-allocating unique codes.
+### Cached resolution versus immediate revocation
 
-**What we give up:** Slight complexity in pool management — a background job must monitor pool size and repopulate when it drops below threshold. Some keys are "wasted" if a server crashes with allocated keys still in its local cache. At 3.5 trillion total keys, this waste is negligible.
+Reading authoritative status on every redirect makes deactivation simpler but transfers viral traffic and database outages directly to the redirect path. Caches reduce that dependence. The cost is a specified interval in which an old decision may still be served.
 
-### 2. Redirect Response: 302 Temporary
+A short, enforced freshness deadline and revision-aware invalidation make that cost bounded. Expiration can be checked locally because its deadline is already in the record. Emergency abuse removal needs an enforcement protocol across active serving regions; deleting one Redis key is insufficient. If the product insists on immediate globally authoritative decisions through a partition, it must accept unavailable regions.
 
-**Chosen**: 302 (Temporary Redirect) instead of 301 (Permanent).
+### Asynchronous analytics versus lossless observation
 
-**Why 302 works for analytics:** 301 redirects are cached by browsers indefinitely. Once cached, subsequent clicks to the same short URL never hit our server — the browser redirects directly. This makes click analytics fundamentally inaccurate. With 302, every click hits our server, ensuring accurate tracking.
+Moving aggregation behind a queue prevents report computation from delaying navigation. It does not by itself retain every observation. Publication must be confirmed to establish admission, and repeated delivery requires repeatable effects.
 
-**Why 301 fails:** For a URL shortener where analytics is a core feature, 301 makes analytics unreliable. You cannot measure what you cannot observe. Bit.ly's entire value proposition (beyond shortening) is click analytics.
-
-**What we give up:** Higher server load. Every redirect requires a server round trip. At 200,000 RPS peak, this is significant. We mitigate this with Redis caching (sub-millisecond lookups) and horizontal scaling of stateless API servers.
-
-### 3. Caching Strategy: Cache-Aside with Redis
-
-**Chosen**: Cache-aside pattern with 24-hour TTL.
-
-```
-Read:  Check cache → if miss, query DB → populate cache → return
-Write: Write to DB → write to cache (write-through)
-Delete: Delete from DB → delete from cache
-```
-
-**Why cache-aside for this workload:** URL shorteners have a Zipf-distributed access pattern — a small percentage of URLs receive the vast majority of traffic. Cache-aside naturally keeps hot URLs in cache while letting cold URLs expire. With a 90%+ cache hit ratio, average redirect latency drops from ~20ms (DB) to ~1ms (Redis).
-
-**Why write-through on URL creation:** New URLs should be immediately available via cache. The write-through on creation eliminates the cold-start problem where the first redirect to a new URL would always miss cache.
-
-**Why not write-behind:** Write-behind (queue writes and batch to DB) risks data loss if Redis crashes before flushing. For URL mappings where durability is critical, this is unacceptable.
-
-### 4. Analytics: Async via Message Queue
-
-**Chosen**: Publish click events to RabbitMQ, process asynchronously with batch inserts.
-
-**Why async analytics works:** Click recording must not slow down redirects. A synchronous DB insert adds 5-20ms to every redirect. At 200,000 RPS, this creates enormous database load. By publishing to a queue (~0.5ms) and batch-inserting in a worker, we decouple redirect latency from analytics write throughput.
-
-**Why not Kafka:** RabbitMQ is simpler to operate and sufficient for this use case. Kafka's log-based architecture provides replay and multi-consumer capabilities we don't need. If analytics grows to require real-time streaming pipelines, Kafka would be the right migration path.
-
-**What we give up:** Analytics have eventual consistency — there's a brief delay (typically <5 seconds) between a click and its appearance in analytics. For a URL shortener's analytics dashboard, this is acceptable.
-
-## Security
-
-### Authentication and Authorization
-
-| Mechanism | Implementation |
-|-----------|----------------|
-| Password hashing | bcrypt (cost factor 12) |
-| Session tokens | 256-bit random (crypto.randomBytes), stored in httpOnly cookie |
-| Cookie settings | httpOnly, sameSite: lax, secure in production |
-| Session expiration | 7 days with sliding window |
-| RBAC | Two roles: `user` (own URLs) and `admin` (all resources) |
-
-### Rate Limiting
-
-| Endpoint | Limit | Window | Scope |
-|----------|-------|--------|-------|
-| POST /api/v1/urls | 100 | 1 hour | Per IP |
-| GET /{short_code} | 1,000 | 1 minute | Per IP |
-| POST /api/v1/auth/* | 5 | 1 minute | Per IP |
-| All authenticated | 200 | 1 minute | Per user |
-
-Implementation: Redis-based sliding window counter with atomic INCR + EXPIRE.
-
-### Input Validation
-
-- URL format: Valid HTTP/HTTPS URL, max 2,048 characters
-- Custom codes: 4-20 alphanumeric characters, no reserved words
-- Reserved paths: `api`, `admin`, `auth`, `static`, `health`, `metrics`
+Waiting for admission adds a dependency to redirects. This design allows redirects to continue during an admission outage and reports reduced coverage. A billing-grade requirement would change that choice: retain before success, or reject the operation when durable admission is unavailable. Neither policy makes request counts equal to human visits.
 
 ## Consistency and Idempotency
 
-### Idempotency for URL Creation
+The proposed creation transaction includes the mapping and a caller-scoped operation receipt. A retry with the same digest returns the stored result; changed input with the same operation ID is rejected. A timeout triggers lookup/retry of that operation, not automatic allocation of a second link. Validation failures before acceptance can be corrected with a new attempt.
 
-Clients may retry URL creation after network failures. Without idempotency, retries create duplicate short URLs for the same long URL, wasting key pool resources.
+Mutation revisions prevent lost updates, and an outbox recovers propagation after a crash. Consumer-side revision checks prevent an old invalidation/refill from overriding newer state. Event deduplication controls repeat processing of admitted events within a defined retention horizon; it cannot recover an observation that was never retained.
 
-**Approach:**
-1. Generate a fingerprint: `hash(long_url + custom_code + user_id)`
-2. Check Redis for `idempotency:{fingerprint}`
-3. If exists: return cached response (no DB operation)
-4. If not: process request, cache response with 24h TTL
+Locally, the URL insert, key-used update, cache write, click insert, and click-counter update do not share these transactions. Idempotency middleware exists but is registered after the creation router. Normal requests therefore receive none of its intended protection.
 
-This ensures the same long URL + user combination always returns the same short code, regardless of how many times the request is retried.
+## Security / Auth
 
-### Consistency Model
+Production enforces owner authorization on details, mutations, and analytics, plus a separate administrator role for moderation. Short-code knowledge only permits public resolution. Return bounded aggregate data by default; protect raw events, define retention, and minimize IP/referrer collection because these can identify users or contain sensitive URL parameters.
 
-| Operation | Consistency | Mechanism |
-|-----------|-------------|-----------|
-| URL creation | Strong | PostgreSQL transaction + unique constraint on short_code |
-| URL redirect | Strong read-your-writes | Cache populated on write (write-through) |
-| Click analytics | Eventual (~5s delay) | Async via RabbitMQ, batch insert by worker |
-| Key pool allocation | Strong | SELECT ... FOR UPDATE with server-level batching |
+Validate HTTP(S) targets and block reserved aliases consistently. Abuse reporting, destination reputation checks, and emergency removal are separate capabilities from syntactic validation. Rate-limit creation and expensive analytics by appropriate actor and network dimensions, with shared accounting across replicas. Preserve legitimate redirect bursts instead of blindly applying a low per-IP cap to all shared-network users.
+
+Keep session expiry authoritative and bound cache TTL to its remaining lifetime. Session deletion must invalidate cached authorization, including concurrent repopulation. Role and active-user checks should reflect current authority. Audit administrative mutations without recording raw session tokens or destination query secrets.
 
 ## Observability
 
-### Metrics (Prometheus)
+Measure redirect latency by cache outcome, authoritative lookup failures, stale-decision rejection, deactivation propagation age, creation conflicts and recovered attempts, admitted/dropped observations, worker lag, duplicate suppression, and poisoned events. Separate HTTP completion from successful destination navigation.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_requests_total{method, endpoint, status}` | Counter | Request volume and error rate |
-| `http_request_duration_seconds{method, endpoint}` | Histogram | Latency percentiles |
-| `url_redirects_total{cached, status}` | Counter | Redirect volume, cache effectiveness |
-| `cache_hits_total` / `cache_misses_total` | Counter | Cache hit ratio (target >90%) |
-| `key_pool_available` | Gauge | Unused keys remaining (alert <1,000) |
-| `rate_limit_hits_total{endpoint}` | Counter | Abuse detection |
-| `circuit_breaker_state{service}` | Gauge | Dependency health (0=closed, 1=open) |
-| `queue_messages_pending` | Gauge | RabbitMQ queue depth (alert >5,000) |
-
-### SLI Targets
-
-| SLI | Target | Alert Threshold |
-|-----|--------|-----------------|
-| Redirect p99 latency | < 50ms | > 100ms for 5m |
-| API p99 latency | < 200ms | > 500ms for 5m |
-| Error rate (5xx) | < 0.1% | > 1% for 5m |
-| Cache hit ratio | > 90% | < 80% for 15m |
-| Key pool available | > 1,000 | < 500 |
-
-### Structured Logging (Pino)
-
-JSON-formatted logs with consistent fields: `level`, `time`, `service`, `server_id`, `req_id`, `method`, `path`, `status`, `duration_ms`, `cache_hit`. Sensitive headers (cookies, authorization) are redacted.
+Use bounded route templates and low-cardinality dimensions. Monitor the age of the oldest unprocessed event and consumer progress; a connected broker socket is not evidence of a functioning pipeline. Analytics responses should expose data freshness to users, not only to operators.
 
 ## Failure Handling
 
-### Retry Strategy
-
-| Operation | Retries | Backoff | Idempotency |
-|-----------|---------|---------|-------------|
-| Cache read/write | 1 | None | Safe (idempotent) |
-| DB write (URL create) | 0 | N/A | Use idempotency key |
-| Queue publish | 3 | Exponential (100ms, 200ms, 400ms) | Message dedup by click_id |
-| External URL validation | 2 | Linear (1s) | Safe (read-only) |
-
-### Circuit Breakers
-
-Applied to database and Redis connections. Configuration: timeout 5s, error threshold 50%, reset timeout 30s. When open, the system degrades gracefully:
-
-| Failure | Degraded Behavior |
-|---------|-------------------|
-| Redis down | Read from DB directly, skip caching |
-| RabbitMQ down | Log click synchronously to DB (slower but functional) |
-| Key pool empty | Generate on-demand with DB function (slower but functional) |
-| DB connection pool exhausted | Return 503, reject new requests |
-
-### Graceful Shutdown
-
-On SIGTERM/SIGINT: stop accepting new connections, drain in-flight requests, close RabbitMQ channel, close Redis connection, close PostgreSQL pool, then exit.
+| Failure | Proposed response | Current local limitation |
+|---------|-------------------|--------------------------|
+| Cache unavailable | Bounded SQL fallback with overload protection | Mapping errors become misses after client retries; auth cache errors propagate |
+| Mapping store unavailable | Serve only eligible fresh records; fail cold requests | Warm target strings can redirect without current expiry/status |
+| Creation response lost | Recover one durable operation result | Retry can allocate another code; no active idempotency handler |
+| Invalidation delayed | Enforce fixed freshness deadline and revision ordering | Most status/expiry writers do not invalidate at all |
+| Broker unavailable | Continue redirects with disclosed observation gaps | Deferred fallback or ignored publish failure; no gap accounting |
+| Worker crashes | Replay retained event with duplicate-safe effect | Event insert and counter update can diverge or repeat |
+| Poisoned event | Bounded retries, quarantine, operator visibility | Requeue loop without backoff or dead-letter handling |
+| Process shutdown | Stop admissions, drain bounded work, close dependencies | API/worker close dependencies without draining HTTP/in-flight work |
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+Redirect reads and analytics writes grow differently. Isolate their pools and capacity first. Cache hot mappings regionally, coalesce concurrent misses, and use a bounded negative cache to resist random-code scans. Negative entries must be invalidated when a new mapping is published.
 
-**Phase 1: Multi-instance** — 3 API servers behind nginx load balancer (least connections). Shared PostgreSQL + Redis + RabbitMQ.
+Partition the mapping namespace by code when a single store cannot meet measured write, storage, or maintenance needs. Keep custom-code claims on the same owner shard. Regional replicas need an explicit new-link visibility policy so a successful create is usable immediately at the returned address.
 
-**Phase 2: Read replicas** — PostgreSQL primary + 2 read replicas. Route analytics queries (read-heavy) to replicas. Redis cluster for cache partitioning.
-
-**Phase 3: Sharding** — Shard URLs by short_code prefix using consistent hashing. Separate analytics cluster (migrate click_events to ClickHouse for OLAP queries). CDN edge workers for sub-10ms redirect latency.
-
-### What Breaks First
-
-1. **Database writes** at ~5,000 RPS — mitigated by key pool pre-generation and async analytics
-2. **Redis memory** at ~100M cached URLs — mitigated by TTL expiration and LRU eviction
-3. **Analytics volume** at ~100,000 events/s — mitigated by batch inserts and eventual migration to ClickHouse
+The first analytics bottleneck is likely the single `urls.click_count` row for a viral link or the raw-event queries, not code-space exhaustion. Move analytics effects to partitioned storage and rollups; size consumers for backlog recovery above normal arrival rate. Define retention and deduplication horizons together.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Short code generation | Pre-generated pool | Counter + Base62 | No coordination, unpredictable codes |
-| Redirect type | 302 Temporary | 301 Permanent | Accurate analytics at cost of higher load |
-| Session storage | Redis + cookie | JWT | Immediate revocation, simpler server-side |
-| Analytics processing | Async (RabbitMQ) | Synchronous DB insert | Decouples redirect latency from analytics |
-| Analytics storage | PostgreSQL | ClickHouse | Simpler for current scale; migrate later |
-| Cache invalidation | TTL-based (24h) | Event-driven | Simpler, acceptable staleness for URLs |
-| Queue technology | RabbitMQ | Kafka | Easier operations, sufficient throughput |
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-__root.tsx (Header + Outlet + Footer)
-├── / (HomePage)
-│   └── UrlShortener
-├── /login (LoginPage)
-│   └── AuthForms
-├── /dashboard (DashboardPage) [auth required]
-│   ├── UrlShortener
-│   └── UrlList
-│       └── AnalyticsModal (per-URL click analytics)
-└── /admin (AdminPage) [admin role required]
-    └── AdminDashboard
-        ├── StatsSection (system overview, top URLs)
-        ├── UrlsSection (search, toggle active/inactive)
-        ├── UsersSection (role management)
-        └── KeyPoolSection (pool stats, repopulate)
-```
-
-The root layout (`__root.tsx`) renders a persistent `Header` with role-aware navigation (Home, Dashboard for users, Admin for admins) and a footer. All child routes render into the `<Outlet />` within this shared layout.
-
-### TanStack Router Structure
-
-The project uses TanStack Router's file-based routing with routes defined in `frontend/src/routes/`. The route tree is auto-generated into `routeTree.gen.ts`.
-
-| Route File | Path | Purpose |
-|------------|------|---------|
-| `__root.tsx` | N/A | Root layout with Header, Outlet, Footer |
-| `index.tsx` | `/` | Public landing page with URL shortener |
-| `login.tsx` | `/login` | Login/register forms; redirects to `/dashboard` if already authenticated |
-| `dashboard.tsx` | `/dashboard` | Authenticated user's URL management |
-| `admin.tsx` | `/admin` | Admin dashboard; redirects non-admins to `/dashboard` |
-
-Route guards are implemented imperatively: each protected route calls `checkAuth()` via `useEffect` and navigates away if the user is missing or lacks the required role. There is no centralized route middleware; each route handles its own auth check.
-
-### Zustand Stores
-
-**`authStore`** -- Manages user session state with `persist` middleware to survive page reloads. Stores the `user` object (id, email, role) in localStorage. Provides `login`, `register`, `logout`, and `checkAuth` actions. `checkAuth` calls `GET /api/v1/auth/me` to validate the server-side session cookie; if the session is expired or invalid, the user is cleared from the store.
-
-**`urlStore`** -- Manages the authenticated user's URL list. Provides `createUrl`, `loadUrls`, and `deleteUrl` actions. On `createUrl`, the new URL is prepended to the local array immediately (optimistic local update) so the user sees the result without waiting for a full list reload. The `createdUrl` field holds the most recently created URL for the success display with copy-to-clipboard functionality.
-
-### Data Fetching Pattern
-
-All API calls are centralized in `frontend/src/services/api.ts` as a single `api` object organized by resource (`auth`, `urls`, `analytics`, `admin`). Each method wraps `fetch` with `credentials: 'include'` to send the httpOnly session cookie. A shared `handleResponse` function parses JSON and throws typed errors on non-2xx responses. There is no query caching library (no React Query or SWR) -- data is fetched imperatively via `useEffect` or Zustand actions and stored in component state or Zustand stores.
-
-### Key UI Patterns
-
-**Tabbed admin dashboard**: The `AdminDashboard` component uses a `useState`-driven tab system (`stats`, `urls`, `users`, `keys`). Each tab is a separate sub-component that fetches its own data on mount. Tabs are not lazy-loaded; switching tabs mounts and unmounts the sub-component, triggering fresh API calls.
-
-**Analytics modal**: Clicking "Analytics" on any URL in `UrlList` opens a modal overlay that fetches `GET /api/v1/analytics/{shortCode}` on mount and displays clicks by day, top referrers, and device breakdown. The modal is rendered conditionally based on `selectedUrl` state.
-
-**Optimistic delete with confirmation**: Delete actions in `UrlList` use a two-step flow -- clicking "Delete" shows "Confirm" and "Cancel" buttons. On confirmation, the URL is removed from the Zustand store immediately and the API call fires in the background. Errors are displayed if the API call fails, but the URL is not re-added (no rollback).
-
-**Copy to clipboard**: Both `UrlShortener` (on creation) and `UrlList` provide clipboard copy for short URLs using `navigator.clipboard.writeText`.
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, why it matters for a URL shortener, and how it works in practice.
-
-### RBAC (Role-Based Access Control)
-
-**What it is:** RBAC is a method of restricting system access based on roles assigned to users rather than checking individual permissions for each action. Each user has a role (in this system, either `user` or `admin`), and each API endpoint checks the caller's role before allowing the operation.
-
-**Why Bitly needs it:** A URL shortener has two distinct user personas with fundamentally different access needs. Regular users should only manage their own URLs and view their own analytics. Admins need system-wide visibility: viewing all URLs, managing any user, monitoring the key pool, and deactivating malicious links. Without RBAC, either every user would have admin power (dangerous -- anyone could deactivate anyone's URLs) or no one would have admin power (no way to moderate abuse).
-
-**How it works here:** The `users` table has a `role` column constrained to `('user', 'admin')`. The auth middleware (`backend/src/middleware/auth.ts`) reads the session cookie, looks up the user, and attaches the user object (including role) to `req.user`. Admin endpoints check `req.user.role === 'admin'` before proceeding. If the check fails, the server returns 403 Forbidden. The frontend mirrors this by conditionally rendering the "Admin" navigation link only when `user.role === 'admin'` in the auth store.
-
-### Redis Cache-Aside
-
-**What it is:** Cache-aside (also called lazy-loading) is a caching strategy where the application checks the cache first for each read request. On a cache hit, the cached value is returned immediately without touching the database. On a cache miss, the application queries the database, stores the result in the cache for future requests, and then returns it. The cache is not automatically synchronized with the database -- the application is responsible for keeping them consistent.
-
-**Why Bitly needs it:** The redirect path (`GET /{short_code}`) is the hottest path in the entire system. At production scale, this endpoint handles 100,000+ requests per second with a 100:1 read-to-write ratio. Every redirect that hits PostgreSQL costs ~20ms; every redirect that hits Redis costs ~0.5ms. Cache-aside naturally adapts to the Zipf-distributed access pattern of URL shorteners -- a small percentage of URLs receive the vast majority of traffic. Those hot URLs stay in cache because they are accessed frequently, while cold URLs expire via TTL and do not consume cache memory.
-
-**How it works here:** The `urlCache` object in `backend/src/utils/cache.ts` provides `get`, `set`, `delete`, and `exists` methods. On redirect, the server calls `urlCache.get(shortCode)`. If the result is non-null (cache hit), it redirects immediately. If null (cache miss), it queries PostgreSQL, calls `urlCache.set(shortCode, longUrl)` with a 24-hour TTL, and then redirects. On URL creation, `urlCache.set` is called immediately (write-through) so the first redirect never misses cache. On URL deactivation, `urlCache.delete` removes the stale entry. Every hit and miss increments a Prometheus counter (`cache_hits_total` / `cache_misses_total`) so operators can monitor the cache hit ratio and alert if it drops below 80%.
-
-### Circuit Breaker
-
-**What it is:** A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing dependency. It works like an electrical circuit breaker: when failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the operation. After a cooldown period, the circuit enters a "half-open" state where a single test request is allowed through. If it succeeds, the circuit closes and normal operation resumes. If it fails, the circuit reopens.
-
-**Why Bitly needs it:** The API server depends on PostgreSQL, Redis, and RabbitMQ. If PostgreSQL becomes slow (e.g., a long-running query is holding locks), continuing to send queries will exhaust the connection pool, causing all requests to hang -- not just database-dependent ones. The circuit breaker detects the slowdown (via timeout or error rate), stops sending queries to PostgreSQL, and returns errors immediately. This prevents cascading failure where one slow dependency brings down the entire service. It also gives the failing dependency time to recover without being hammered by retry storms.
-
-**How it works here:** The `createCircuitBreaker` function in `backend/src/utils/circuitBreaker.ts` wraps async functions with the Opossum circuit breaker library. Configuration: 3-5 second timeout per operation, circuit opens when 50% of requests fail within a 10-second window, and resets after 30 seconds. There are separate configurations for database operations (5s timeout, higher volume threshold) and Redis operations (1s timeout, since cache should be fast). State changes are logged via Pino and exposed as a Prometheus gauge (`circuit_breaker_state`) with values 0 (closed/healthy), 0.5 (half-open/testing), and 1 (open/failing).
-
-### Structured Logging
-
-**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text strings. Each log entry has consistent fields (timestamp, level, service, message) plus context-specific fields that vary by event type. This enables log aggregation tools (ELK stack, Datadog, CloudWatch) to filter, search, and alert on specific fields rather than parsing unstructured text with regular expressions.
-
-**Why Bitly needs it:** A URL shortener running multiple API server instances generates enormous log volume -- every redirect, every cache hit/miss, every rate limit event produces a log entry. At 100,000 redirects per second, searching through unstructured text logs ("redirect for abc123 took 2ms from IP 1.2.3.4") is impractical. Structured logging with fields like `{ "short_code": "abc123", "duration_ms": 2, "cache_hit": true }` enables operators to filter for slow redirects (`duration_ms > 50`), track specific short codes, or aggregate error rates by endpoint -- all without writing custom parsers.
-
-**How it works here:** The `logger` in `backend/src/utils/logger.ts` uses Pino, a high-performance JSON logger for Node.js. Each log entry includes: `level`, `time` (epoch ms), `service` (server instance identifier), `req_id` (request correlation ID), `method`, `path`, `status`, `duration_ms`, and `cache_hit` (for redirect requests). Sensitive headers (cookies, authorization) are redacted from request logs. Child loggers are created per-request to carry the request ID through the entire call chain, enabling correlated log traces across cache, database, and queue operations.
-
-### Prometheus Metrics
-
-**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints at regular intervals. The application exposes a `/metrics` endpoint returning metric values in Prometheus text format. Prometheus stores these time series and enables querying, alerting, and dashboarding (typically via Grafana). Metrics come in three types: counters (monotonically increasing values like total requests), gauges (point-in-time values like active connections), and histograms (distributions like request latency percentiles).
-
-**Why Bitly needs it:** A URL shortener must monitor several critical health signals that are invisible without instrumentation. Is the cache hit ratio above 90%? Is the key pool running low? Is the redirect p99 latency under 50ms? Are rate limit hits spiking (indicating abuse)? Is the analytics queue backing up? Without metrics, operators discover problems only when users complain. With metrics, they can set alerts and detect issues before they impact users. The metrics also enable capacity planning -- if redirects per second are growing 10% monthly, operators can plan infrastructure scaling.
-
-**How it works here:** The `backend/src/utils/metrics.ts` file uses the `prom-client` library to define and register metrics. Key metrics: `http_requests_total` (counter, labeled by method/endpoint/status), `http_request_duration_seconds` (histogram for latency percentiles), `url_redirects_total` (counter, labeled by cache hit/miss), `cache_hits_total` / `cache_misses_total` (counters for cache ratio), `key_pool_available` (gauge for remaining keys), `rate_limit_hits_total` (counter for abuse detection), `circuit_breaker_state` (gauge per dependency), and `queue_messages_pending` (gauge for analytics queue depth). Express middleware records request duration automatically. The `/metrics` endpoint is scraped by Prometheus.
-
-### Rate Limiting
-
-**What it is:** Rate limiting restricts how many requests a client can make to an API within a time window. When a client exceeds the limit, the server responds with HTTP 429 (Too Many Requests) and a `Retry-After` header. Rate limits are typically tracked per IP address for unauthenticated endpoints and per user ID for authenticated endpoints, using atomic counters in Redis with TTL-based expiration.
-
-**Why Bitly needs it:** Without rate limiting, a single malicious actor could exhaust the key pool by creating millions of URLs, overwhelm the analytics pipeline by scripting millions of fake clicks, or brute-force login credentials. URL shorteners are also attractive targets for abuse -- creating thousands of short URLs pointing to phishing sites. Rate limiting provides three defenses: it prevents resource exhaustion (key pool, database connections), it slows down brute-force attacks (5 attempts per minute on auth endpoints), and it ensures fair usage (no single user can monopolize URL creation capacity).
-
-**How it works here:** Rate limiting is implemented in `backend/src/index.ts` using `express-rate-limit` with Redis as the backing store. Four rate limit tiers: URL creation (100 per hour per IP), redirects (1,000 per minute per IP), auth endpoints (5 per minute per IP), and authenticated API calls (200 per minute per user). Redis-based tracking uses atomic `INCR` with `EXPIRE` for sliding window counting. When a client hits the limit, the response includes `X-RateLimit-Remaining` and `Retry-After` headers. Rate limit hits are counted in the `rate_limit_hits_total` Prometheus metric for abuse pattern detection.
-
-### Idempotency
-
-**What it is:** Idempotency means that performing the same operation multiple times produces the same result as performing it once. For API endpoints, this means that if a client sends the same request twice (due to a network timeout, browser retry, or double-click), the server returns the same response without creating duplicate resources. The server achieves this by generating a fingerprint of each request, checking whether that fingerprint was already processed, and returning the cached response if so.
-
-**Why Bitly needs it:** URL creation allocates a unique short code from the key pool. If a client submits a URL creation request, the network drops the response, and the client retries, the server would create two different short codes for the same long URL -- wasting key pool resources and confusing the user who now has two links for the same destination. At scale with millions of URL creations per day, even a 1% retry rate means 10,000 wasted keys daily. Idempotency ensures retries return the original short code without consuming additional keys.
-
-**How it works here:** The `idempotencyMiddleware` in `backend/src/utils/idempotency.ts` intercepts POST requests to URL creation. It generates a SHA-256 fingerprint from `{ long_url, custom_code, user_id }` (or uses a client-provided `Idempotency-Key` header). It checks Redis for `idempotency:{fingerprint}`. If found, it returns the cached response immediately (incrementing `idempotency_hits_total` in Prometheus). If not found, it intercepts `res.json()` to cache the successful response in Redis with a 24-hour TTL. If Redis is down, the middleware degrades gracefully -- it logs the error and proceeds without idempotency protection rather than failing the request.
-
-### Health Checks
-
-**What it is:** Health check endpoints are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers (to route traffic away from unhealthy instances), container orchestrators (to restart failed containers), and monitoring systems (to trigger alerts). There are typically three tiers: liveness (is the process running?), readiness (can it serve traffic?), and deep (are all dependencies healthy?).
-
-**Why Bitly needs it:** A URL shortener running behind a load balancer with multiple API server instances needs health checks to ensure traffic is only routed to healthy instances. If one instance loses its Redis connection, the load balancer should stop sending redirect traffic to it (since every redirect would miss cache and hit the database). If an instance's database connection pool is exhausted, it should be temporarily removed from rotation. Without health checks, the load balancer distributes traffic blindly, and users randomly experience errors depending on which instance their request hits.
-
-**How it works here:** Three endpoints are implemented in `backend/src/index.ts`: `/health` returns 200 if the process is alive (liveness probe for Kubernetes). `/health/detailed` checks each dependency (PostgreSQL connectivity, Redis connectivity, key pool remaining count, RabbitMQ channel status) and returns a JSON report with per-dependency latency measurements and status. `/ready` returns 200 only if all critical dependencies (PostgreSQL and Redis) are reachable, making it suitable as a load balancer health check. If any critical dependency is unreachable, `/ready` returns 503 and the load balancer stops routing traffic to that instance.
+| Initial production allocation | Random candidate plus unique insert | Preallocated pool | Fewer ownership states; add batching if measured need justifies it |
+| Redirect freshness | Cached records with deadlines and revisions | SQL check on every redirect | Bound staleness while absorbing read bursts |
+| Analytics outage | Continue redirects and disclose gaps | Require retained event before response | Navigation availability is the primary product requirement |
+| Dashboard counts | Delayed event-derived projections | Increment mapping row per request | Avoid hot-row contention and enable replay |
+| Link retirement | Preserve code ownership | Reassign expired aliases | Prevent old references from reaching unrelated destinations |
 
 ## Implementation Notes
 
-This section documents the actual local development setup and maps production design decisions to the working implementation.
+### Actual runtime and data setup
 
-### Local Architecture
+[The API entry point](./backend/src/index.ts) serves authentication, URL management, analytics, administration, redirects, and operational endpoints in one Express process. [The worker](./backend/src/workers/analytics-worker.ts) is separate. The browser runs React 18 and uses Zustand plus direct fetch calls; there is no server-query cache library or live event transport.
 
-```
-┌─────────────────┐
-│   Web Browser   │
-│   (React app)   │
-│   Port 5173     │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  API Server     │
-│  (Express.js)   │
-│  Port 3001      │
-│  (or 3002/3003) │
-└────────┬────────┘
-         │
-    ┌────┼────────────────┐
-    │    │                │
-    ▼    ▼                ▼
-┌──────┐ ┌──────────┐ ┌──────────┐
-│Redis │ │PostgreSQL│ │ RabbitMQ │
-│:6379 │ │  :5432   │ │  :5672   │
-└──────┘ └──────────┘ └──────────┘
+[Compose](./docker-compose.yml) starts PostgreSQL 16, Valkey 7 with AOF, and RabbitMQ 3 management. Only PostgreSQL and Valkey have named data volumes. The schema initializes fresh PostgreSQL volumes, and each manual schema execution attempts to add more keys. There are no automatic users or migrations. The optional SQL fixture has nine links and 1,146 events; repeated seeding appends events while retaining existing counters. The administrator hash requires an explicit local reset for a known password, as shown in the README.
+
+[Configuration](./backend/src/config.ts) defaults to API port 3000 and independently defaults `BASE_URL` to that address. Server variants use ports 3001–3003 without adjusting generated URLs or the Vite proxy. There is no load balancer, `.env` loader, or background cleanup service.
+
+### Creation and the actual key pool
+
+[The key service](./backend/src/services/keyService.ts) stores a batch in a process-local array. Allocation uses one transactional `UPDATE` over rows selected with `FOR UPDATE SKIP LOCKED`, preventing two current allocators from claiming the same pool row. The similarly named Redis `keyPoolCache` helper is unused.
+
+```sql
+SELECT short_code FROM key_pool
+WHERE is_used = false AND allocated_to IS NULL
+LIMIT $1 FOR UPDATE SKIP LOCKED
 ```
 
-All infrastructure runs via Docker Compose. The frontend connects to a single API server (no load balancer by default). Multiple API instances can be run on ports 3001-3003 for distributed testing.
+This pattern amortizes reservation across a batch; it still coordinates in PostgreSQL. Startup claims 100 keys. Every request awaits refill below 50 remaining keys, so refill is synchronous on that path, not a background task. Concurrent refill calls are not coalesced. There is no automatic pool generator or allocated-key expiry/reaper. Crashed processes strand unused reservations; reclaiming by age alone would be unsafe if a previous holder resumed.
 
-### Production Patterns Actually Implemented
+When both local and database pools are empty, generation falls back to `Math.random` without reservation or collision retry. SQL pool generation uses `random()` and checks only pool uniqueness. Custom-alias preflight checks both tables, but races with subsequent generation remain; the final URL primary key can reject a collision. A generated/custom common namespace is not enforced as one atomic claim.
 
-| Pattern | File Path | Description |
-|---------|-----------|-------------|
-| Idempotency middleware | `backend/src/utils/idempotency.ts` | Redis-backed request fingerprinting prevents duplicate URL creation on retries |
-| Circuit breakers (Opossum) | `backend/src/utils/circuitBreaker.ts` | Wraps database queries; fails fast when DB is unhealthy |
-| Prometheus metrics (prom-client) | `backend/src/utils/metrics.ts` | Exposes `/metrics` endpoint with HTTP, cache, redirect, and key pool metrics |
-| Structured logging (Pino) | `backend/src/utils/logger.ts` | JSON logs with service ID, request context, and redacted sensitive headers |
-| Rate limiting | `backend/src/index.ts` | express-rate-limit with per-endpoint configuration |
-| Health checks | `backend/src/index.ts` | `/health`, `/health/detailed`, `/ready` endpoints with dependency status |
-| Pre-generated key pool | `backend/src/services/keyService.ts` | Local in-memory cache of keys fetched from DB in batches |
-| Cache-aside with Redis | `backend/src/utils/cache.ts` | URL cache with 24h TTL, cache hit/miss metrics |
-| Async analytics worker | `backend/src/workers/analytics-worker.ts` | Consumes click events from RabbitMQ, writes to PostgreSQL |
-| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT handlers close DB, Redis, and RabbitMQ connections |
-| Security headers (Helmet) | `backend/src/index.ts` | Adds X-Content-Type-Options, X-Frame-Options, etc. |
-| Session-based auth (bcrypt) | `backend/src/middleware/auth.ts` | Cookie-based sessions with Redis storage and DB fallback |
+[URL creation](./backend/src/services/urlService.ts) commits the mapping, then marks a generated key used, then awaits a cache write whose errors are swallowed. A key-mark failure can report 400 after the link already exists. The configured 365-day default expiration is unused; absent or zero duration means no expiration, and negative values can create already-expired rows that are nevertheless cached.
 
-### What Was Simplified or Substituted
+URL validation checks HTTP(S) syntax and 2,048 JavaScript string units, not reachability or reputation. It lacks a complete input schema. Custom codes allow 4–20 characters while both tables allow 10; `metrics` and `ready` are not reserved and collide with earlier routes. Destinations are stored as supplied. PATCH cannot clear expiration with null because the route converts null to undefined.
 
-| Production Design | Local Substitute | Impact |
-|-------------------|------------------|--------|
-| Redis Cluster | Single Valkey instance (Docker) | No cache partitioning; sufficient for dev scale |
-| PostgreSQL primary + replicas | Single PostgreSQL instance (Docker) | No read replicas; all queries hit one instance |
-| nginx load balancer | Direct connection to single API server | Can run manually with multiple servers on ports 3001-3003 |
-| CDN for static assets | Vite dev server on port 5173 | No edge caching |
-| Partitioned click_events table | Single unpartitioned table | No monthly partitioning |
-| OAuth / social login | Email + password with bcrypt | Simpler auth flow |
-| Kafka for high-throughput analytics | RabbitMQ | Sufficient for dev scale |
+### Redirect cache and lifecycle gaps
 
-### What Was Omitted
+[The redirect router](./backend/src/routes/redirect.ts) uses its own lookup helper; the similar URL-service lookup is not the called implementation. [Mapping cache](./backend/src/utils/cache.ts) reads a destination string, with no expiry, active flag, or revision:
 
-- CDN / edge workers for redirect latency
-- Multi-region deployment and global load balancing
-- Kubernetes orchestration
-- Database sharding by short_code prefix
-- ClickHouse migration for analytics OLAP queries
-- URL blacklist / malicious URL detection (Google Safe Browsing API)
-- Bloom filter for non-existent short code detection
-- Webhook notifications on click thresholds
-- Bulk URL creation API
-- Geographic distribution of API servers
+```typescript
+const result = await redis.get(`url:${shortCode}`);
+await redis.setex(`url:${shortCode}`, ttl || CACHE_CONFIG.urlTTL, longUrl);
+```
+
+The default TTL is 86,400 seconds. Only a miss reaches SQL's active/expiration predicates. Creation warms this cache regardless of expiration. Owner deletion or an explicit owner `is_active: false` update deletes it; expiry changes and [administrator status/cleanup writes](./backend/src/services/adminService.ts) do not. An in-flight old SQL read can refill after deletion. The current cache therefore has neither correct expiration nor the proposed five-second deactivation bound.
+
+The response uses 302 without explicit Cache-Control. No human-visit proof follows from that status. Invalid, inactive, and expired cold lookups all return 404; dependency failures can return 500. Redis mapping errors become misses only after client retry behavior, and an awaited failed cache set can also delay a response.
+
+### Click delivery and aggregation
+
+The router schedules both queue publication and its SQL fallback with `setImmediate`, after choosing the redirect response. The fallback named `recordClickSync` is deferred too; it does not synchronously delay that response, though it consumes shared database capacity. A process failure before the callback loses the observation.
+
+[Queue wiring](./backend/src/utils/queue.ts) declares durable `click-events` with a 24-hour message TTL and sends persistent messages through a plain channel. It uses no publisher confirms. Publisher confirmation and consumer acknowledgement cover different legs of delivery. [RabbitMQ's acknowledgement guide](https://www.rabbitmq.com/docs/confirms) explains that distinction.
+
+The router ignores the publisher's boolean result when a connection appeared available, so publication failure does not trigger its SQL fallback. The underlying `sendToQueue` boolean is a buffer-flow signal, not a durable receipt; false requires handling backpressure, not assuming the event was never sent. See the [amqplib channel API](https://amqp-node.github.io/amqplib/channel_api.html#channel_sendToQueue).
+
+Events contain code, timestamp, referrer, user agent, raw request IP, and a heuristic device type. There is no event ID, deduplication, IP hashing, geolocation, or unique-visitor algorithm. Country/city columns are not populated by this path.
+
+The worker prefetches 10 messages but processes each with separate click INSERT and counter UPDATE statements. This is concurrent delivery, not batch insertion. Failure between writes leaves divergent counts; redelivery can duplicate an insert or both effects. Poisoned messages are requeued without backoff, attempt limits, or a dead-letter destination and can churn until TTL expiry.
+
+Initial worker connection retries are bounded. A later connection-close callback reconnects the channel but does not restore the consumer. Broker connectivity can appear healthy while the worker no longer drains events. There is no automatic replay from another retained source.
+
+[Analytics queries](./backend/src/services/analyticsService.ts) read raw PostgreSQL events directly. Total/referrer/device counts are all-time; daily activity covers the recent 30-day window and omits empty days. Queries run separately without a common snapshot. Global hourly grouping uses hour number without date, merging partial hours across the last-24-hour boundary and sorting by clock hour. There are no rollups, analytics cache, ClickHouse instance, or raw-event retention job.
+
+The admin total-click statistic sums denormalized URL counters, while other totals count events. Active URL statistics ignore expiration. Pool-used counts do not include custom links. These quantities can disagree even without a display bug.
+
+### Authentication, authorization, and browser behavior
+
+[Authentication](./backend/src/services/authService.ts) uses bcrypt with 10 rounds and UUID session tokens. SQL sessions expire after seven days; Redis maps tokens to user IDs for seven days. The cookie is HttpOnly, SameSite=Lax, and Secure only in production mode. Login also returns the token for bearer use.
+
+A warm session still reads the current user from PostgreSQL, so role changes and user deactivation take effect on the next authenticated request. It does not recheck the SQL session's expiry or deletion. A cache miss reloads an unexpired SQL session but grants a full new seven-day cache TTL instead of the remaining lifetime; bearer use can outlive SQL expiry. Logout deletes SQL first, then Redis; a cache failure can leave cached access and prevent cookie clearing. There is no coordinated protection from concurrent cache repopulation.
+
+Session-cache errors propagate instead of using the mapping cache's fail-open behavior. [Optional authentication](./backend/src/middleware/auth.ts) catches such failures and continues anonymously, so even a browser with a cookie can create an unowned link during an authentication dependency failure.
+
+Owned list/update/delete routes check the owner. Anonymous details are unrestricted, including inactive and expired rows; an authenticated details request is filtered to its owner. Both analytics routes require authentication but omit ownership checks, including raw events with IPs and user agents. Admin role changes have no last-administrator or self-demotion protection.
+
+[Frontend authentication](./frontend/src/stores/authStore.ts) persists user state. Route guards call the server check only when no stored user exists. There is no universal expired-session interceptor, and logout does not reset [URL state](./frontend/src/stores/urlStore.ts) or invalidate outstanding requests. Older account/query responses can replace newer state.
+
+Creation waits for a response before adding the returned link, but uses no operation key. Its shared loading/error state also covers list/delete operations. Inputs remain editable during submission, and success clears the current draft even if the user changed it. Copy failures only log to the console.
+
+[The link list](./frontend/src/components/UrlList.tsx) fetches 50 rows without paging controls. Delete removes a row after server success, but reload returns inactive rows and the formatter omits status. Analytics fetches have no cancellation/context guard or freshness watermark. [Admin tables](./frontend/src/components/AdminDashboard.tsx) also fetch one page; searches are submitted explicitly, with no debounce or stale-response protection. There is no virtualization or automatic analytics refresh.
+
+### Operational patterns actually wired
+
+This project keeps shared helpers under `backend/src/utils/`, rather than `src/shared/`.
+
+| Pattern | Actual wiring and purpose | Practical limit |
+|---------|---------------------------|-----------------|
+| Database breaker | [database.ts](./backend/src/utils/database.ts) wraps normal queries through [circuitBreaker.ts](./backend/src/utils/circuitBreaker.ts) to reduce repeated failing calls | Transactions and health queries bypass it; fallback replaces all failures with a generic open-circuit error |
+| Prometheus metrics | [metrics.ts](./backend/src/utils/metrics.ts) and HTTP completion hooks record latency, counts, cache outcomes, and breaker state | No queue-depth metric; raw fallback paths can create unbounded labels; successful SQL durations exclude failures/transaction queries |
+| Structured logs | [logger.ts](./backend/src/utils/logger.ts) and Pino HTTP record requests and service events | Most service logs do not use request context; URL error logs can include query secrets; no durable admin audit trail |
+| General API limiter | Entry point applies 200 requests/minute by IP | Process-local store; creation's intended 100/hour middleware is after the terminal router; redirect limiter is unused |
+| Health/readiness | `/health`, `/health/detailed`, and `/ready` inspect liveness, SQL, Redis status, and optional queue connection | No consumer-progress proof or active Redis PING; failed SQL health queries can leak a checked-out client |
+
+The database breaker has a five-second timeout, 50% threshold after a minimum volume of 10, and a 30-second reset period. A timed-out query is not canceled and may commit after the caller sees failure. Its fallback can label ordinary query errors as circuit-open errors even when the circuit remains closed.
+
+`dbConnectionsActive` counts open pool connections, not currently busy queries. `/metrics` first queries pool statistics in PostgreSQL, so a database outage can prevent scraping otherwise useful process metrics. Helmet's CSP is disabled unconditionally. Shutdown handlers close dependencies and exit without stopping HTTP admission or draining in-flight consumers.
+
+### Simplified and omitted production capabilities
+
+The demo uses one PostgreSQL database for mappings, users, sessions, and raw click history; one shared Valkey; and RabbitMQ instead of a large retained analytics log and dedicated warehouse. It omits region ownership, sharding, outbox propagation, durable operation receipts, revision-aware caches, event deduplication, dead-letter recovery, retention, abuse scanning, and CDN configuration.
+
+[Four page smoke checks](./tests/smoke.spec.ts) and screenshot configuration establish only limited rendering coverage. The admin check uses Alice's ordinary user account and can pass after a redirect to another page. No cache-race, queue-recovery, transactional analytics, or production-load result was established by this documentation review; implementation defects are documented rather than repaired here.

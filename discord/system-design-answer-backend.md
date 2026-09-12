@@ -1,461 +1,357 @@
-# Discord (Real-Time Chat System) - System Design Answer (Backend Focus)
+# Baby Discord: backend system design interview
 
-## 45-minute system design interview format - Backend Engineer Position
+## 🎯 Establish message and membership guarantees — 4 minutes
 
----
+> “I would design a text-chat service with a shared domain layer behind TCP and browser adapters. The key contracts are what an accepted message means, how a room is ordered, and how a client recovers when live delivery stops.”
 
-## Introduction
+The first version supports authenticated users, text rooms, message sends, recent and
+paginated history, and room-scoped live delivery. Direct conversations can use the same
+durable model with a restricted participant set. Voice/video, bots, rich attachments,
+search, and complex guild permissions are separate extensions for this interview.
 
-"Today I'll design a real-time chat system similar to Discord. As a backend engineer, I'll focus on the WebSocket gateway architecture, message storage with Cassandra, pub/sub message routing, presence system, and horizontal scaling strategies. The core challenge is enabling millions of users to send and receive messages instantly while maintaining message ordering and handling concurrent connections."
+An accepted message has committed to durable storage. The acknowledgement does not mean
+that every connected recipient received it or that a person read it. If the response is
+lost, retrying the same operation must resolve to the same message rather than insert
+another copy.
 
----
+I would promise order within a room, not a global order across all conversations. A
+client can replay retained committed messages after a room cursor. If that cursor is
+older than the retention boundary, the service explicitly requests a reset instead of
+implying that the client missed nothing.
 
-## Step 1: Requirements Clarification
+Presence can be approximate, but room access cannot depend on an approximate online
+flag. A user may have several devices, and closing one connection must not remove
+another device's permission or confuse its subscription. This distinction affects both
+the data model and the disconnect path.
 
-### Functional Requirements
+| Requirement | Initial contract |
+|-------------|------------------|
+| Send acceptance | Message, operation receipt, and notification obligation commit together |
+| Ordering | One authoritative committed sequence per room |
+| Retry | Same scoped operation ID and payload return the original result |
+| Recovery | Bounded retained replay with explicit cursor-expired response |
+| Access | Validate user and room permission at reads, subscriptions, and sends |
+| Presence | Derived from independent connection leases, not durable membership count |
 
-1. **Servers & Channels**: Users create servers, servers contain text/voice channels
-2. **Real-Time Messaging**: Messages appear instantly for all channel members
-3. **Message History**: Scrollable history with persistent storage
-4. **Presence**: Show who's online/offline/idle
-5. **Direct Messages**: Private 1-on-1 and group DMs
+## 📏 Estimate storage and fan-out — 3 minutes
 
-### Non-Functional Requirements
+Assume one million daily users sending twenty messages each. That is twenty million
+messages per day, about 231 per second on average and roughly 2,300 per second at a
+tenfold peak. I would state those as workload assumptions rather than borrow an
+unsupported throughput claim from a database vendor.
 
-- **Scale**: 100 million users, 10 million concurrent connections
-- **Latency**: Messages delivered in <100ms
-- **Availability**: 99.99% uptime
-- **Ordering**: Messages in a channel must appear in order
-- **Persistence**: Messages stored indefinitely
+At an illustrative 500 bytes per message and compact metadata, the logical payload is
+about 10 GB daily or 3.65 TB yearly. Indexes, receipts, outbox state, replicas, backups,
+and physical row overhead increase storage. Retention and expected history access
+determine how much stays on the primary serving tier.
 
----
+Assume 100,000 concurrent connections across the fleet. A hypothetical 30 KiB of state
+per connection is about 2.9 GiB before room subscriptions and queued output. The actual
+number depends on buffers, TLS, runtime, and traffic; I would measure it rather than
+claim every Node process can hold a fixed number of sockets.
 
-## Step 2: Scale Estimation
+Fan-out can dominate writes. One room producing 100 messages per second for 10,000
+readers generates one million deliveries per second, roughly 500 MB per second of
+payload at the same size assumption. Adding message-storage shards does not solve that
+output load.
+
+Proposed targets are 99.9% command/history availability, regional delivery p95 below 200
+milliseconds under a bounded healthy workload, and a recent-page p95 below 500
+milliseconds. The target workload must include room audience distribution and slow
+readers, not just average insert rate.
+
+## 🏗️ Draw the authority and delivery boundaries — 5 minutes
+
+I would use PostgreSQL for the initial durable message and metadata model, with explicit
+room ownership. A cache and notification bus can accelerate delivery, but neither
+replaces the source used to resolve acceptance and replay.
 
 ```
-Concurrent Users:
-- 10 million WebSocket connections
-- Each connection: ~10KB memory
-- Total: ~100 GB RAM for connections (distributed across 100+ gateways)
-
-Message Volume:
-- 100 million messages per day
-- Peak: 10x average = ~12,000 messages/second
-- Each message: ~200 bytes (text) + metadata
-
-Storage:
-- 100M messages * 365 days * 1KB = ~36 TB/year
-- Need horizontal sharding
+┌──────────────────────┐       ┌─────────────────────────┐
+│ TCP / HTTP           │──────▶│ Room authority          │
+│ adapters             │       │ Policy / order          │
+└──────────────────────┘       └────────────┬────────────┘
+                                            │
+                                            ▼
+                               ┌─────────────────────────┐
+                               │ PostgreSQL              │
+                               │ Messages / receipts     │
+                               │ Outbox                  │
+                               └────────────┬────────────┘
+                                            │
+                                            ▼
+┌──────────────────────┐       ┌─────────────────────────┐
+│ Gateway replay       │◀──────│ Outbox publisher        │
+│ + live fan-out       │       │ Notification bus        │
+└──────────────────────┘       └─────────────────────────┘
 ```
 
----
-
-## Step 3: High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Client Applications                           │
-│           (Web, Desktop, Mobile - WebSocket Connections)             │
-└────────────────────────────────┬────────────────────────────────────┘
-                                 │ WebSocket
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Gateway Layer (WebSocket)                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐       ┌──────────┐       │
-│  │Gateway 1 │  │Gateway 2 │  │Gateway 3 │  ...  │Gateway N │       │
-│  │(100K     │  │(100K     │  │(100K     │       │(100K     │       │
-│  │ conns)   │  │ conns)   │  │ conns)   │       │ conns)   │       │
-│  └──────────┘  └──────────┘  └──────────┘       └──────────┘       │
-└────────────────────────────────┬────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Message Broker (Kafka/NATS)                      │
-│              Topics: messages, presence, typing, reactions           │
-└────────────────────────────────┬────────────────────────────────────┘
-                                 │
-          ┌──────────────────────┼──────────────────────┐
-          ▼                      ▼                      ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Chat Service   │    │Presence Service │    │  Push Service   │
-│  (Message CRUD) │    │ (Online Status) │    │ (Mobile Notif)  │
-└────────┬────────┘    └────────┬────────┘    └─────────────────┘
-         │                      │
-         ▼                      ▼
-┌─────────────────┐    ┌─────────────────┐
-│   Cassandra     │    │     Redis       │
-│  (Messages)     │    │   (Presence,    │
-│                 │    │    Sessions)    │
-└─────────────────┘    └─────────────────┘
-```
-
----
-
-## Step 4: Gateway Layer (WebSocket Servers)
-
-### Gateway Server Design
-
-Each Gateway server handles 100,000 concurrent WebSocket connections. The key is efficient connection management and message fanout.
-
-**Gateway Session Structure:**
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| userId | string | User identifier |
-| socket | WebSocket | Connection handle |
-| subscribedChannels | Set<string> | Channels user is monitoring |
-| currentGuildId | string or null | Active server |
-| lastHeartbeat | Date | Connection liveness |
-
-**Gateway Responsibilities:**
-1. Accept WebSocket connections and authenticate users
-2. Register sessions in Redis for cross-gateway routing
-3. Handle message types: SEND_MESSAGE, SUBSCRIBE_CHANNEL, UNSUBSCRIBE_CHANNEL, HEARTBEAT
-4. Validate permissions and rate limits before publishing to Kafka
-5. Monitor heartbeats and disconnect dead connections (60s timeout)
-
-**Message Flow (Send):**
-```
-┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│  Client  │───▶│ Gateway  │───▶│  Kafka   │───▶│  Chat    │
-│          │    │  Server  │    │ (Topic:  │    │ Service  │
-│          │    │          │    │ messages)│    │          │
-└──────────┘    └──────────┘    └──────────┘    └──────────┘
-     │                                               │
-     │              ┌────────────────────────────────┘
-     │              ▼
-     │         ┌──────────┐    ┌──────────┐
-     │         │Cassandra │    │  Redis   │
-     │         │ (persist)│    │ (pub/sub)│
-     │         └──────────┘    └──────────┘
-     │                              │
-     └──────────────────────────────┘
-           (receive via pub/sub)
-```
-
-### Cross-Gateway Message Routing
-
-When a user on Gateway 1 sends a message, users on Gateway 5 need to receive it:
-
-**Redis Pub/Sub Pattern:**
-1. Each gateway subscribes to Redis channels for rooms it has users in
-2. When message is persisted, Chat Service publishes to Redis channel
-3. All gateways with subscribers receive and fan out to local clients
-
-**Channel Subscription Management:**
-- Track channelId -> Set of sessionIds locally
-- Subscribe to Redis pub/sub when first user joins channel
-- Unsubscribe when last user leaves channel
-- Fan out received messages to all local subscribers
-
----
-
-## Step 5: Message Storage with Cassandra
-
-### Schema Design
-
-Cassandra is ideal for message storage due to its write-heavy optimization and time-series nature of chat data.
-
-**Messages Table:**
-
-| Column | Type | Purpose |
-|--------|------|---------|
-| channel_id | UUID | Partition key (with bucket) |
-| bucket | TEXT | Daily bucket: '2024-01-15' |
-| message_id | TIMEUUID | Clustering key (DESC) |
-| author_id | UUID | Message author |
-| content | TEXT | Message body |
-| attachments | LIST | File attachments |
-| edited_at | TIMESTAMP | Edit timestamp |
-| deleted | BOOLEAN | Soft delete flag |
-
-**Primary Key:** ((channel_id, bucket), message_id)
-- Partition by channel + day for bounded partition sizes
-- Cluster by message_id DESC for chronological reads
-
-**Compaction Strategy:** TimeWindowCompactionStrategy
-- Window: 1 day
-- Optimized for time-series append workloads
-
-**Supporting Tables:**
-
-| Table | Partition Key | Purpose |
-|-------|---------------|---------|
-| message_reactions | (channel_id, message_id) | Emoji reactions per message |
-| user_dm_channels | user_id | Quick lookup of DM conversations |
-
-### Chat Service Implementation
-
-**Message Processing Pipeline:**
-1. Consume from Kafka "messages" topic
-2. Calculate bucket from timestamp (YYYY-MM-DD format)
-3. Write to Cassandra with prepared statement
-4. Publish to Redis for real-time delivery
-5. Update channel's last_message timestamp in Redis sorted set
-
-**Get Messages Query Pattern:**
-- Iterate through recent buckets (last 7 days)
-- Query each bucket until limit reached
-- Support cursor-based pagination with "before" message_id
-
-**Delete Message Flow:**
-1. Verify ownership (query author_id)
-2. Soft delete (set deleted = true)
-3. Publish MESSAGE_DELETE event via Redis
-
----
-
-## Step 6: Presence System
-
-### Presence Data Model
-
-Redis is perfect for presence due to its TTL-based expiration and pub/sub capabilities.
-
-**Redis Key Patterns:**
-
-| Key Pattern | TTL | Value | Purpose |
-|-------------|-----|-------|---------|
-| presence:{userId} | 60s | status string | Current presence |
-| user:{userId}:sessions | 60s | Set of sessionIds | Active sessions |
-| user:{userId}:status | - | Hash with text | Custom status |
-| user:{userId}:guilds | - | Set of guildIds | User's servers |
-
-**Presence States:** online, idle, dnd (do not disturb), offline
-
-**Heartbeat Flow:**
-1. Client sends heartbeat every 30s
-2. Gateway refreshes presence TTL to 60s
-3. Gateway refreshes session set TTL
-4. If heartbeat missed for 60s, key expires = offline
-
-**Publishing Presence Updates:**
-1. Get user's guilds from Redis set
-2. Publish to each guild's presence channel
-3. Only subscribers (users viewing that guild) receive updates
-
-### Lazy Presence Subscription
-
-To avoid the N*M fanout problem (N users with M friends), we use lazy subscriptions:
-
-**Lazy Subscription Pattern:**
-```
-┌─────────────────────────────────────────────────────────────┐
-│  User opens channel                                          │
-│         │                                                    │
-│         ▼                                                    │
-│  ┌─────────────────┐                                        │
-│  │ Get channel     │                                        │
-│  │ members list    │                                        │
-│  └────────┬────────┘                                        │
-│           ▼                                                  │
-│  ┌─────────────────┐    ┌─────────────────┐                 │
-│  │ Bulk get        │───▶│ Send initial    │                 │
-│  │ presence state  │    │ PRESENCE_BATCH  │                 │
-│  └────────┬────────┘    └─────────────────┘                 │
-│           ▼                                                  │
-│  ┌─────────────────┐                                        │
-│  │ Subscribe to    │                                        │
-│  │ channel presence│                                        │
-│  └─────────────────┘                                        │
-│                                                              │
-│  User leaves channel                                         │
-│         │                                                    │
-│         ▼                                                    │
-│  ┌─────────────────┐                                        │
-│  │ Unsubscribe     │                                        │
-│  │ if last user    │                                        │
-│  └─────────────────┘                                        │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Benefits:**
-- Only fetch presence for visible users
-- Only subscribe to updates for active channels
-- Unsubscribe on navigation away
-
----
-
-## Step 7: Message Ordering and Delivery Guarantees
-
-### Kafka for Ordered Processing
-
-**Kafka Configuration:**
-- Topic: "messages"
-- Partition key: channel_id
-- Result: All messages for a channel go to same partition = ordered
-
-**Consumer Group:** chat-service
-- Single consumer per partition
-- Guarantees in-order processing per channel
-
-**Error Handling:**
-- On failure: Send to "messages-dlq" (dead letter queue)
-- Manual review and replay for failed messages
-
-### Message ID with TIMEUUID
-
-**TIMEUUID Properties:**
-1. Natural time ordering
-2. Uniqueness even at same millisecond (random component)
-3. Extractable timestamp
-
-**Format:** {timestamp_hex}-{random_hex}
-- Timestamp: 12 hex chars (milliseconds since epoch)
-- Random: 16 hex chars (collision avoidance)
-
----
-
-## Step 8: Rate Limiting
-
-**Rate Limits by Action:**
-
-| Action | Limit | Window | Purpose |
-|--------|-------|--------|---------|
-| message | 5 | 5 seconds | Prevent spam |
-| reaction | 10 | 1 second | Prevent reaction spam |
-| channel_create | 10 | 60 seconds | Prevent channel flooding |
-| dm_create | 10 | 60 seconds | Prevent DM spam |
-
-**Implementation (Redis Sliding Window):**
-1. Increment key: ratelimit:{action}:{userId}
-2. Set TTL on first increment
-3. Check count against limit
-4. Return retryAfter if exceeded
-
----
-
-## Step 9: Search with Elasticsearch
-
-### Elasticsearch Index
-
-**Index Mapping (messages):**
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| channel_id | keyword | Filter by channel |
-| guild_id | keyword | Scope to server |
-| author_id | keyword | Filter by author |
-| content | text | Full-text search |
-| timestamp | date | Sort and filter |
-| has_attachment | boolean | Filter attachments |
-
-**Indexing Pipeline:**
-1. Consume from Kafka "messages" topic (separate consumer group: search-indexer)
-2. Index document to Elasticsearch
-3. Async - doesn't block message delivery
-
-**Search Query Building:**
-- Must match: guild_id (security)
-- Should match: content (relevance)
-- Optional filters: channel_id, author_id, fromDate
-- Highlight: content field
-- Sort: timestamp DESC
-- Size: 25 results
-
----
-
-## Step 10: Horizontal Scaling
-
-### Multi-Region Architecture
-
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   US Region     │    │   EU Region     │    │  APAC Region    │
-│                 │    │                 │    │                 │
-│  Gateways       │◄──►│  Gateways       │◄──►│  Gateways       │
-│  Cassandra      │    │  Cassandra      │    │  Cassandra      │
-│  Redis Cluster  │    │  Redis Cluster  │    │  Redis Cluster  │
-│  Kafka          │    │  Kafka          │    │  Kafka          │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-        │                      │                      │
-        └──────────────────────┼──────────────────────┘
-                               │
-                    Cross-Region Sync (Cassandra Multi-DC)
-```
-
-### Scaling Components
-
-| Component | Scaling Strategy |
-|-----------|------------------|
-| Gateway | Add servers (100K connections each), DNS-based routing |
-| Kafka | Add partitions (partition by channel_id for ordering) |
-| Chat Service | Stateless, horizontal pod autoscaling |
-| Cassandra | Add nodes, automatic rebalancing, multi-DC replication |
-| Redis | Redis Cluster for presence/pub-sub sharding |
-| Elasticsearch | Add shards for search |
-
----
-
-## Step 11: Failure Handling
-
-### Gateway Failure
-
-**Health Check Components:**
-1. Redis connection status
-2. Kafka connection status
-3. Active connection count
-
-**Graceful Shutdown Sequence:**
-1. Stop accepting new connections
-2. Send RECONNECT event to all clients (reason: "Gateway shutting down")
-3. Wait for clients to disconnect (30s drain period)
-4. Cleanup Redis subscriptions
-5. Exit
-
-### Circuit Breaker for External Services
-
-**Circuit Breaker Configuration:**
-
-| Service | Timeout | Error Threshold | Reset Timeout |
-|---------|---------|-----------------|---------------|
-| Cassandra | 5000ms | 50% | 30s |
-| Redis | 1000ms | 50% | 10s |
-
-**States:**
-- CLOSED: Normal operation
-- OPEN: Fast-fail all requests
-- HALF-OPEN: Allow test requests
-
-**Fallback on Cassandra Open:**
-- Queue message for retry
-- Return error to client with retry hint
-
----
-
-## Step 12: Monitoring and Observability
-
-### Prometheus Metrics
-
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| discord_messages_sent_total | Counter | guild_id | Message volume |
-| discord_message_latency_seconds | Histogram | - | Delivery latency |
-| discord_active_connections | Gauge | gateway_id | Connection count |
-| discord_cassandra_query_seconds | Histogram | query_type | DB performance |
-
-**Histogram Buckets (latency):** [0.01, 0.05, 0.1, 0.25, 0.5, 1] seconds
-
-**Endpoints:**
-- /health: Health check (200 = healthy, 503 = unhealthy)
-- /metrics: Prometheus scrape endpoint
-
----
-
-## Summary
-
-"To summarize my Discord backend design:
-
-1. **Gateway Layer**: WebSocket servers handling 100K connections each, routing via Redis pub/sub
-2. **Message Storage**: Cassandra with time-bucketed partitions for write scalability and efficient reads
-3. **Message Ordering**: Kafka with channel-based partitioning ensures messages are processed in order
-4. **Presence System**: Redis with TTL-based heartbeats, lazy subscription model to avoid N*M fanout
-5. **Search**: Elasticsearch for full-text search with async indexing from Kafka
-
-The key backend insights are:
-- WebSocket connection management is the biggest scaling challenge
-- Cassandra's write performance and partition model fit chat's access patterns perfectly
-- Pub/sub is essential for cross-gateway message routing
-- Presence at scale requires smart subscription patterns, not global broadcast
-- Circuit breakers and graceful degradation are essential for reliability
-
-What aspects would you like me to elaborate on?"
+Adapters handle transport framing, credentials, connection lifetime, and backpressure.
+They pass structured intent to the domain layer: authenticated user, explicit room,
+operation identity, and content. The domain layer does not return a socket-formatted
+string as the canonical message representation.
+
+The room authority validates permission and serializes acceptance. One relational
+transaction can establish the room sequence, message, receipt, and outbox obligation.
+Different rooms proceed independently. A room head row can provide an initial
+serialization point; a later dedicated owner still needs a fenced commit boundary.
+
+The publisher turns durable outbox obligations into fan-out notifications. Gateways with
+interested local subscribers read committed room events and deliver them in order.
+Notifications are wakeups; retained room history supplies catch-up after missed events
+or reconnects.
+
+A shared session-validation service allows requests to reach different gateways.
+Connection handles remain local and need recovery when a gateway dies. A gateway with
+sockets is stateful even if the corresponding account/session can be validated
+elsewhere.
+
+I would separate ingestion/commands, history reads, and fan-out resource budgets before
+splitting every responsibility into a service. At larger measured volume, partition room
+ownership across storage nodes. A durable broker or wide-column history store can be
+introduced with a clear replay and transaction story, not by replacing a database name
+on the diagram.
+
+## 💾 Describe the records and APIs — 4 minutes
+
+The important schema choices are the relationships that prevent ambiguity. I would
+sketch them as a table instead of writing database definitions on the whiteboard.
+
+| Record | Key fields | Correctness purpose |
+|--------|------------|---------------------|
+| User/session | Account ID, credential/session version, expiry | Authenticate independently of display nickname |
+| Room/membership | Room ID, policy revision, authorized members | Enforce durable access |
+| Room head | Last committed sequence, owner generation where used | Serialize room acceptance and fence old owners |
+| Message | Stable ID, room sequence, author, time, content | Ordered durable conversation |
+| Send receipt | User/device scope, operation ID, payload digest, result | Resolve duplicate or unknown sends |
+| Outbox | Event identity, room sequence, publication status | Repair commit-to-notification failures |
+| Connection/subscription | Session, connection generation, room, lease | Manage multiple devices and stream replacement |
+| Retention boundary | Earliest retained replay position | Tell clients when a reset is required |
+
+A display nickname can change while the stable author ID stays fixed. The message
+presentation policy determines whether historical display names are snapshots or current
+profiles. That decision should not accidentally vary between startup history and live
+delivery.
+
+| Proposed operation | Purpose |
+|--------------------|---------|
+| Create authenticated session | Establish account identity and revocation policy |
+| Send to explicit room with operation ID | Return durable message identity and room sequence |
+| Get recent history with cursor | Return a bounded page and synchronization boundary |
+| Stream room events after cursor | Replay retained events and continue live |
+| Get older page before cursor | Read older history without changing the live position |
+| Join/leave durable membership | Update access according to room policy |
+| Close connection/subscription | Remove only the corresponding live device state |
+
+A TCP slash-command parser can translate into these operations without becoming a second
+implementation of permission and persistence rules. Browser APIs can use structured
+requests and errors. Both adapters must enforce a common message-size/rate policy while
+respecting their own framing limits.
+
+## 🔧 Deep dive 1: commit, ordering, and retry identity — 8 minutes
+
+> “I would choose a transaction containing the message, receipt, room head, and outbox record. That makes the acceptance boundary explicit and closes the common gap between saving a message and remembering to deliver it.”
+
+A client supplies an operation ID scoped to its authenticated sender/device and an
+immutable payload containing the intended room. The authority first resolves an existing
+receipt when available. A changed payload under the same identity is a conflict;
+returning success for different content would make the receipt meaningless.
+
+The write transaction acquires the room's serialization boundary and checks the
+permission state required for acceptance. It allocates the next transactional room
+sequence, writes the message, records the operation result, and adds the outbox event.
+The receipt's uniqueness arbitrates concurrent retries; a check outside the transaction
+is only an optimization. Permission changes use that same authority or an equivalent
+policy-revision check, so a cached permission cannot authorize a send after revocation.
+
+On commit, the response can state that the message is accepted. A crash before commit
+leaves no accepted message. A crash after commit but before response leaves a result
+that can be resolved through the same operation identity. The client must not generate a
+fresh identity simply because it did not receive the response.
+
+The publisher processes the outbox independently. If it publishes but crashes before
+recording progress, it may publish again. Stable event identity and replay-aware
+gateway/client handling absorb that duplication. Marking the outbox complete before
+publication would instead create a message that is never announced.
+
+Room order comes from the committed room sequence, not from wall-clock timestamps or a
+global SERIAL column. Sequence allocation can happen before another transaction commits,
+and a global sequence also contains gaps from other rooms. The proposed transactional
+room head is incremented while acceptance is serialized, so rollback does not create a
+falsely completed room position.
+
+If a dedicated room owner later replaces the row-lock approach, include its ownership
+generation in the durable conditional update. A lease that expired in memory does not
+prevent its old worker from committing late. New and old owners must not both create the
+next accepted room event.
+
+Directly inserting a message and publishing afterward is attractive for a small demo,
+and it already gives durable storage when the insert is awaited. Its weakness is the
+dual write: the database and bus can disagree after a crash. A best-effort in-memory
+buffer before persistence weakens the acceptance guarantee further and is not required
+for a responsive UI.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Transactional message, receipt, head, and outbox | Resolvable acceptance and repairable delivery obligations | Additional writes and room serialization |
+| ❌ Insert then untracked publish | Simple synchronous storage path | Commit-to-fan-out gap remains |
+| ❌ Redis check, insert, then cache receipt | Fast common retry path | Concurrent duplicate and crash windows |
+
+The cost is contention within a hot room and receipt/outbox retention. I would preserve
+the contract while batching or partitioning independent rooms. I would not bypass it
+with an acknowledgement issued before the relevant durability boundary merely to improve
+a latency graph.
+
+## 🔧 Deep dive 2: reliable history over imperfect fan-out — 8 minutes
+
+> “I would separate the fast notification path from the authoritative replay path. Redis Pub/Sub can tell a gateway that something changed, but it cannot supply the events a disconnected subscriber missed.”
+
+For a room subscription, the gateway validates access, establishes notification
+coverage, and reads a committed high-water mark. It fetches retained events after the
+client's cursor through that mark, then continues reading new committed events.
+Notifications wake catch-up work; they do not directly establish that every previous
+event has arrived.
+
+A history response contains a bounded page and the high-water mark for synchronization.
+The mark does not imply that the client loaded the entire older conversation. Older-page
+pagination and live catch-up have separate cursors and can proceed without overwriting
+each other's state.
+
+The handoff must tolerate a message committed between the history query and live
+attachment. Replay covers that interval. It also tolerates duplicate notifications and
+reconnect overlap because the gateway/client recognizes already-applied message
+identities and sequences.
+
+A lost notification with no later traffic is another case to handle. Use bounded
+periodic head/catch-up checks shared per room on each interested gateway, or a durable
+event-consumption path at larger scale. Without such a repair mechanism, a committed
+message can remain invisible indefinitely even though future notifications are usually
+reliable.
+
+Redis Pub/Sub provides at-most-once delivery and no replay for missed subscriber
+messages. That is appropriate for this notification role, but insufficient as the only
+record of accepted conversation events. A subscriber reconnecting successfully does not
+recover the time it was absent. [Redis delivery
+semantics](https://redis.io/docs/latest/develop/pubsub/)
+
+A durable broker is an alternative when long replay windows and many independent
+consumers justify it. It adds partitioning, retention, checkpoints, and ownership
+transitions. A single consumer group distributes events among workers; delivery still
+needs routing to every gateway with interested clients, rather than assuming all group
+members see every record.
+
+SSE offers browser reconnection and event IDs, but the server must implement the cursor
+contract and retained data. If a cursor is too old, return a reset-required condition
+with a fresh snapshot path. If a client receives malformed or out-of-order data, it
+should not advance past an unvalidated gap.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Notifications plus authoritative ordered catch-up | Simple low-latency path with repairable gaps | Requires retained history and bounded repair work |
+| ❌ Pub/Sub as the only delivery record | Minimal broker operations | Subscriber failures silently lose messages |
+| ❌ Unbounded client stream-first buffering | Avoids one history-first gap | Can exhaust memory and still lacks a proven boundary |
+
+The trade-off is catch-up load and a retention promise. Share room reads across local
+subscribers, cap replay batches, and disconnect slow consumers with a resumable cursor
+rather than retaining unlimited output. An event's bytes entering a socket buffer is not
+evidence that the client application applied it.
+
+I would test the boundary by committing messages before, during, and after subscription
+establishment, dropping the notification, and replaying an overlapping interval. The
+expected result is a continuous retained room log at the client, with an explicit reset
+when that continuity can no longer be provided.
+
+## 🔧 Deep dive 3: transport independence with correct lifecycle — 7 minutes
+
+> “I would keep domain events structured and transport lifecycle explicit. Sharing a command handler is useful, but it does not by itself make TCP and SSE carry the same information or recover in the same way.”
+
+The domain result contains stable message identity, room, author, content, and committed
+order. The TCP adapter can format a readable line, while the SSE adapter serializes the
+event envelope and frames it correctly. Formatting plain text inside the core and then
+trying to recover JSON fields in the browser loses identity and timestamp information.
+
+JSON also does not preserve a JavaScript Date instance. A typed cast after parsing does
+not recreate one. Normalize timestamps at the boundary or keep the transport contract as
+an explicit UTC string; do not let a downstream Date-method call decide whether a remote
+message can be delivered.
+
+TCP requires bounded incremental framing. A packet is not a command: one packet may
+contain several lines, and one UTF-8 character or line can cross packets. Maintain a
+bounded decoder/buffer and a per-session command queue so asynchronous handling of
+separate data events does not reorder joins and sends.
+
+HTTP requests can overlap too. A send carries its intended room instead of consulting a
+mutable session.currentRoom after several awaits. Joining room B while a send to A is
+pending must not cause that send to be persisted under A and broadcast as B.
+
+Subscriptions need distinct connection generations. Closing an old response removes only
+its own registered connection, even when a replacement has the same user and room.
+Permission and session validity are checked when attaching and according to a revocation
+policy afterward. A URL room name is not itself proof of membership.
+
+Presence is tracked per connection with expiry or explicit closure. Durable membership
+remains separate. Multiple sessions can belong to one user, so removing one connection
+does not delete the shared membership record or declare all devices offline. Distributed
+direct-message routing likewise needs an account-to-gateway directory or durable
+conversation subscriptions.
+
+Both adapters need backpressure. Bound output bytes and in-flight commands; pause or
+close a slow connection while retaining a recovery cursor. During shutdown, stop
+admitting work, track and drain accepted operations within a deadline, then close
+connections and dependencies. Waiting on a timer alone does not prove that asynchronous
+work has finished.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Structured domain events and explicit connection ownership | Consistent semantics across transports and devices | Adapter-specific framing and lifecycle code |
+| ❌ Shared string formatter for every transport | Small common interface | Loses structured identity and can corrupt framing |
+| ❌ User-level online/membership flag | Simple disconnect logic | One device can erase another device's state |
+
+The cost is more precise interfaces and cleanup logic. I would accept that cost because
+the dual-adapter design is valuable only if it preserves the same domain contract.
+Otherwise it shares code while presenting different conversations to terminal and
+browser users.
+
+## 📈 Scale, observe, and verify — 4 minutes
+
+The first limits are likely hot-room fan-out, slow-client buffers, repeated history
+work, and unbounded connection/session maps. I would bound these before adding gateways.
+Maintain room-to-local-subscriber indexes instead of scanning every session for each
+message, and share catch-up work for clients watching the same room.
+
+Separate interactive history from acceptance and delivery budgets. A large history
+export should not block current chat. When storage needs partitioning, keep a room's
+authority, receipt, and ordered append relationship explicit. Cross-region gateways can
+follow a room's home authority; independent writers require a different conflict/order
+design.
+
+Observe accepted commits, retry resolution, outbox age, missed-notification repair,
+replay latency, sequence gaps, per-connection queued bytes, and actual disconnect
+causes. A configured histogram with no observations is not instrumentation. Health
+checks should distinguish process liveness from the ability to accept writes or deliver
+room events.
+
+Verification covers duplicate send races, unknown commit outcomes, publisher crashes,
+lost notifications, expired cursors, stale owners, TCP packet splitting, concurrent room
+changes, and stream replacement. Fault injection should show both durable database state
+and what clients observe. A route test with the chat handler mocked cannot prove
+delivery correctness.
+
+## 🛠️ Relate this to the repository — 2 minutes
+
+The current project uses PostgreSQL, Valkey Pub/Sub, TCP, and HTTP/SSE. It awaits
+message insertion before buffering and broadcast, contrary to its former
+asynchronous-persistence description. It has no send receipt, room sequence, or outbox.
+Sessions and recent buffers are process-local, and subscriptions are established only at
+startup.
+
+Remote JSON messages fail because the router calls a Date method on a string timestamp.
+Local live messages are formatted as plain text, and remote events never update the
+receiving history buffer. Membership, session, and stream lifetimes are not independent,
+while several metrics and configuration options are defined but unused.
+
+The documentation audit read source and ran selected isolated checks; it did not run the
+complete stack, real concurrency, or load tests. I would first repair the wire contract
+and fan-out path, then implement explicit send identity and replay, followed by bounded
+lifecycle and authority changes. [Current implementation
+mapping](./architecture.md#implementation-notes)

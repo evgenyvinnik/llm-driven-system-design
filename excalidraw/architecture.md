@@ -1,85 +1,137 @@
-# Excalidraw - Collaborative Whiteboard Architecture
+# Excalidraw Whiteboard Architecture
 
 ## System Overview
 
-A real-time collaborative whiteboard enabling multiple users to simultaneously create and edit vector shapes (rectangles, ellipses, diamonds, arrows, lines, freehand paths, text) on a shared infinite canvas. The system handles conflict resolution using shape-level Last-Writer-Wins (LWW) CRDT, cursor presence tracking, and persistent storage of drawing state.
+This learning project combines an infinite vector canvas with multi-user shape editing, cursor presence, drawing storage, and sharing. Its useful engineering boundaries are screen versus world coordinates, local gesture feedback versus accepted edits, and transient collaboration state versus durable recovery.
 
-**Learning Goals:**
-- Design real-time collaboration with WebSocket rooms and CRDT conflict resolution
-- Implement HTML5 Canvas rendering with viewport transforms (pan/zoom)
-- Build cursor presence tracking with Redis-backed ephemeral state
-- Understand trade-offs between OT, CRDT, and simpler LWW approaches
+This document separates a **proposed production design** from the **actual implementation**. Requirements, estimates, the main diagram, and design decisions describe the proposal; they are not facts about the real Excalidraw service or measured results. Database Schema reproduces the local SQL, API Design inventories actual routes/messages, and the final Implementation Notes map the code and its limits. The [README](./README.md) provides setup; the three interview answers present smaller, role-focused discussions.
+
+The local app is a single Express/WebSocket process and a React client. **Its WebSocket path does not authenticate users or enforce drawing permissions.** Its merge, client update, and persistence paths also do not establish the convergence or durability guarantees claimed by a complete collaborative editor. HTTP access checks and a helper named CRDT do not supply those missing properties.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed production scope
 
-1. Users can create, edit, and delete drawings
-2. Multiple shape types: rectangle, ellipse, diamond, arrow, line, freehand, text
-3. Real-time collaboration: multiple users editing the same drawing simultaneously
-4. Live cursor presence: see other collaborators' cursor positions
-5. Drawing sharing with view/edit permissions
-6. Pan and zoom on infinite canvas
-7. Shape properties: stroke color, fill color, stroke width, opacity
-8. Persistent storage: drawings survive server restarts
+Users create private drawings, share view/edit access, publish viewable drawings, and collaborate on rectangles, ellipses, diamonds, lines, arrows, freehand paths, and text. A viewport can pan and zoom independently of other users. The same world-space object should render, hit-test, and align with remote cursors at every supported pixel density.
 
-### Non-Functional Requirements (Production Scale)
+Local gestures appear immediately. Accepted edits have a durable acknowledgment and a recoverable sequence position. A reconnecting client retrieves committed changes and reconciles its pending commands instead of blindly replacing the scene. Permissions apply equally to HTTP and sockets and can be revoked during a live session.
 
-| Metric | Target |
-|--------|--------|
-| Collaboration latency | < 50ms peer-to-peer |
-| Concurrent users per drawing | 50+ |
-| Total concurrent drawings | 100K+ |
-| Canvas elements per drawing | 10K+ |
-| Availability | 99.9% |
-| Data durability | 99.99% |
+Begin with connected, regional collaboration and bounded recovery of disconnected drafts. Freehand previews and cursor movements are ephemeral; a completed stroke or gesture is a durable command. Group operations, accessible object navigation, and export can follow the same scene model. Rich concurrent text editing, unrestricted offline branching, image import, and multi-region active writers are separate extensions.
+
+### Non-functional requirements — proposed, unmeasured targets
+
+| Concern | Initial target / invariant | Boundary |
+|---------|----------------------------|----------|
+| Local feedback | Fit gesture rendering within a 16.7 ms frame budget on a defined reference device | Profile actual scene/point complexity |
+| Collaboration | p95 below 150 ms for regional peer preview delivery | Ephemeral previews may be coalesced or dropped |
+| Durable acceptance | p95 below 250 ms for ordinary regional edit acknowledgment | Acknowledge only after configured durable commit |
+| Availability | 99.9% monthly for regional drawing APIs | Local drafts may continue during server unavailability |
+| Recovery | No acknowledged command lost on a room-process crash | Durable operation log and snapshot boundary |
+| Consistency | All connected clients apply the same accepted command order | Single fenced authority per drawing |
+| Access | Current drawing permission required for reads/edits; revoked sessions stop editing | Check at join and mutation; propagate revocation |
+| Scale envelope | Initially evaluate 1,000 ordinary elements and up to 20 participants per drawing | Larger drawings require measured limits, not universal FPS claims |
+
+A saved status describes a committed sequence, not whether another browser happened to receive a broadcast. Database replication, backup/restore, and regional disaster recovery need explicit deployment policies; “99.99% durability” without a failure model is not a useful specification.
+
+## Capacity Estimation
+
+Exercise assumptions, independent of the small local fixtures:
+
+| Assumption | Consequence |
+|------------|-------------|
+| 5,000 active drawings, four connected participants each | 20,000 sockets; distribute rooms across servers |
+| 10% of connected users commit two completed gestures/second | 4,000 durable commands/s across the fleet |
+| 500 bytes per average command | About 2 MB/s or 172.8 GB/day if sustained, before indexes/replicas |
+| 25% of users move cursors, throttled to 10 Hz | 50,000 inbound presence messages/s |
+| Three peers receive each 200-byte presence message | About 30 MB/s payload egress, excluding protocol overhead |
+| 1,000 elements × 500 bytes per active drawing | About 0.5 MB serialized per scene, 2.5 GB across 5,000 active scenes before runtime overhead |
+
+A completed stroke is not sixty durable operations merely because pointer events arrive at sixty Hz. Sampled previews and the final persisted command have different cost models. Long strokes still require point/byte limits, chunked transport if needed, and a bounded finalization protocol.
+
+A single hot room has fan-out proportional to its participants and edit/presence rates; spreading other rooms across more machines does not remove that bottleneck. Snapshot size, stroke complexity, and slow clients can dominate before socket count does.
+
+### Local Development Scale
+
+The fixture has two users, four drawings, 36 total elements, and two edit grants. Compose starts PostgreSQL 16 and Valkey 7 with append-only Redis persistence. There is no message broker, load balancer, object store, or replica topology. The API runs on port 3001 via the development script. The alternate instance scripts also resolve to 3001 because they invoke that same script.
 
 ## High-Level Architecture
 
+Production proposal; these are responsibilities rather than a requirement to deploy one service per box.
+
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          Client (Browser)                            │
-│  ┌────────────┐  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │   Canvas   │  │   Toolbar    │  │  Zustand  │  │  WS Client    │  │
-│  │  Renderer  │  │  Properties  │  │  Stores   │  │  REST Client  │  │
-│  └────────────┘  └──────────────┘  └──────────┘  └───────────────┘  │
-└──────────────────────────┬──────────────────┬────────────────────────┘
-                           │ HTTP/REST        │ WebSocket
-                           ▼                  ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Load Balancer                                │
-│                    (Sticky Sessions / IP Hash)                       │
-└──────────────────────────┬──────────────────┬────────────────────────┘
-                           │                  │
-              ┌────────────┴────┐    ┌────────┴────────┐
-              │  Collab Server 1│    │  Collab Server 2│
-              │  Express + WS   │    │  Express + WS   │
-              │  ┌───────────┐  │    │  ┌───────────┐  │
-              │  │ WS Rooms  │  │    │  │ WS Rooms  │  │
-              │  │ CRDT Merge│  │    │  │ CRDT Merge│  │
-              │  └───────────┘  │    │  └───────────┘  │
-              └───────┬─────────┘    └───────┬─────────┘
-                      │                      │
-         ┌────────────┴──────────────────────┴────────────┐
-         │                                                 │
-    ┌────▼────────┐                                 ┌──────▼──────┐
-    │  PostgreSQL │          Redis Pub/Sub           │ Redis/Valkey│
-    │  (Primary   │◀────────(cross-server────────────│  Sessions   │
-    │  + Replicas)│          fan-out)                │  Cursors    │
-    │  Drawings   │                                  │  Presence   │
-    │  Elements   │                                  │  Cache      │
-    └─────────────┘                                  └─────────────┘
+┌──────────────────────┐      ┌──────────────────────┐
+│ Browser              │─────▶│ CDN / static assets  │
+│ Scene + local drafts │      └──────────────────────┘
+└──────────┬───────────┘
+           ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ HTTP / WS gateway    │─────▶│ Session / access     │
+│ Limits / room routing│      │ PostgreSQL metadata  │
+└──────────┬───────────┘      └──────────────────────┘
+           ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ Drawing authority    │─────▶│ Durable command log  │
+│ Fenced room owner    │      │ Receipts / sequence  │
+└──────────┬───────────┘      └──────────┬───────────┘
+           ▼                             ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ Fan-out / presence   │      │ Snapshot / export    │
+│ Ephemeral delivery   │      │ Background workers   │
+└──────────────────────┘      └──────────────────────┘
 ```
 
-At production scale, multiple WebSocket servers sit behind a load balancer with sticky sessions (IP hash or session cookie affinity). Redis Pub/Sub provides cross-server fan-out so that collaborators connected to different servers still receive each other's edits. The load balancer routes WebSocket upgrades to a consistent server per client, minimizing unnecessary cross-server communication.
+One authority serializes accepted changes for each drawing. Durable storage checks the current owner epoch so a former owner cannot continue committing after failover. Metadata and access changes that affect editing pass through a compatible ordering/version protocol; a separate HTTP full-scene replacement must not race the room writer.
+
+Fan-out carries committed changes to all participants, including the author, and carries separately labeled ephemeral previews. A delivery bus may lose a notification without losing a committed operation because clients can resume from the durable sequence. Client-IP affinity alone does not put all collaborators of a drawing on one owner or prevent competing writers.
+
+## Core Components / Request Flows
+
+### Rendering and local interaction — production proposal
+
+Store shared shape coordinates in world space. Let each user own their viewport and selection. Convert pointer positions from client coordinates to canvas-relative CSS pixels and then through the inverse viewport transform. Multiply the final world-to-screen transform by device pixel ratio exactly once when rendering the backing bitmap.
+
+Use a consistent transform for shapes, hit tests, selection bounds, and DOM cursor/text overlays. Normalize negative geometry or use sign-aware bounds. Hit testing starts with a reverse stacking-order scan; spatial indexing becomes useful when measured scene complexity makes the scan expensive.
+
+A gesture owns a temporary draft layer. Pointer capture ensures release/cancel is handled outside the canvas; pointer events support mouse, touch, and pen. Draw draft strokes during the gesture, coalesce redraws with animation frames, and simplify the final stroke with a screen-space error budget converted to world units. Do not increment document revisions for every local pointer sample.
+
+The proposed client keeps committed scene state, a bounded pending-command queue, and local gesture/viewport state separately. Remote accepted messages update committed state without inventing new local revisions. Pending overlays are reapplied or marked conflicted; an authoritative snapshot is not permission to discard unsent work.
+
+### Command acceptance and conflicts — production proposal
+
+1. Authenticate the socket and authorize drawing access before sending scene data. Bind actor/session identity on the server; the message cannot choose another user.
+2. A mutation carries a stable operation ID, drawing identity/generation, target element, expected property-group revision, and a bounded payload. Geometry is one group; style and text have separate groups so a move and recolor need not conflict.
+3. The room authority validates current permissions and lifecycle, serializes the command, and checks the expected group revision. A conflicting edit receives current canonical state rather than silently overwriting a newer change. The client can explicitly reapply its intent as a new command.
+4. Commit the operation receipt, next drawing sequence, and state/log effect under the current owner epoch. An identical retry returns the existing receipt; conflicting reuse of an ID is rejected.
+5. Return the canonical accepted change and sequence to the author and peers. Clients detect gaps, fetch missing changes, and render the same stacking order, represented explicitly rather than inferred from map insertion order.
+
+This proposal uses a server-ordered command model rather than claiming that arbitrary client clocks form a convergent CRDT. A tested CRDT library becomes a reasonable alternative if unrestricted offline merging or concurrent text requires it. Neither approach removes authorization, persistence, or payload-validation work.
+
+Deletion is a durable lifecycle transition. Delayed updates cannot recreate a deleted element, and an intentional restore is a separate authorized command. Reusing the same ID for a new object must not reinterpret an old pending update as an edit to that object.
+
+### Join, resume, snapshots, and saving — production proposal
+
+A join establishes a consistent snapshot at sequence N and a path to changes N+1 onward. Subscribe/buffer or use a durable cursor so operations committed during snapshot transfer are not lost. Replay reaches a declared high-water mark before the client is considered caught up. Every message is associated with its drawing and connection generation; old-room responses are discarded after navigation.
+
+The client records pending durable commands locally before treating them as recoverable drafts. It removes them only after a durable receipt. On reconnect, it resends the same IDs, loads missing accepted state, and revalidates stale drafts. If the history cursor is older than retention, the server supplies a fresh snapshot and explicit rebase rules; it does not accept arbitrary old snapshots as replacements.
+
+Snapshots store a complete scene and its covered log sequence. Publish a snapshot pointer only after the snapshot is durable and verified. Retain the necessary log tail until recovery is possible from the new boundary. Tombstone compaction requires rejecting commands from unsupported old history/generations; an elapsed 24-hour timer alone does not prove that no stale client exists.
+
+The local implementation instead replaces scene arrays through HTTP and keeps independent process-local room arrays. A two-second inactivity timer writes the full room array, with no log, sequence, receipt, retry queue, or coordinated snapshot boundary.
 
 ## Database Schema
 
+### Current local initialization SQL
+
+The following exactly reproduces [backend/src/db/init.sql](./backend/src/db/init.sql). It is the implemented baseline, not the proposed command-log schema.
+
 ```sql
+-- Excalidraw Collaborative Whiteboard Database Schema
+
+-- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Users
-CREATE TABLE users (
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     username VARCHAR(30) UNIQUE NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -90,31 +142,30 @@ CREATE TABLE users (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Drawings (the canvas container)
-CREATE TABLE drawings (
+-- Drawings table
+CREATE TABLE IF NOT EXISTS drawings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     title VARCHAR(255) NOT NULL DEFAULT 'Untitled',
     owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    elements JSONB DEFAULT '[]'::jsonb,   -- Array of shape elements
-    app_state JSONB DEFAULT '{}'::jsonb,   -- Viewport, grid settings
+    elements JSONB DEFAULT '[]'::jsonb,
+    app_state JSONB DEFAULT '{}'::jsonb,
     is_public BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Drawing collaborators (access control)
-CREATE TABLE drawing_collaborators (
+-- Drawing collaborators
+CREATE TABLE IF NOT EXISTS drawing_collaborators (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     drawing_id UUID NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    permission VARCHAR(10) NOT NULL DEFAULT 'view'
-      CHECK (permission IN ('view', 'edit')),
+    permission VARCHAR(10) NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'edit')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(drawing_id, user_id)
 );
 
--- Drawing versions (periodic snapshots for history)
-CREATE TABLE drawing_versions (
+-- Drawing versions (snapshots for undo/history)
+CREATE TABLE IF NOT EXISTS drawing_versions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     drawing_id UUID NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
     version_number INTEGER NOT NULL,
@@ -123,13 +174,12 @@ CREATE TABLE drawing_versions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Operations log (audit trail for CRDT operations)
-CREATE TABLE operations (
+-- Operations log (for CRDT merge and conflict resolution)
+CREATE TABLE IF NOT EXISTS operations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     drawing_id UUID NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    operation_type VARCHAR(10) NOT NULL
-      CHECK (operation_type IN ('add', 'update', 'delete', 'move')),
+    operation_type VARCHAR(10) NOT NULL CHECK (operation_type IN ('add', 'update', 'delete', 'move')),
     element_id VARCHAR(255) NOT NULL,
     element_data JSONB,
     version INTEGER NOT NULL DEFAULT 1,
@@ -137,440 +187,235 @@ CREATE TABLE operations (
 );
 
 -- Indexes
-CREATE INDEX idx_drawings_owner_id ON drawings(owner_id);
-CREATE INDEX idx_drawings_is_public ON drawings(is_public);
-CREATE INDEX idx_drawing_collaborators_drawing_id ON drawing_collaborators(drawing_id);
-CREATE INDEX idx_drawing_collaborators_user_id ON drawing_collaborators(user_id);
-CREATE INDEX idx_drawing_versions_drawing_id
-  ON drawing_versions(drawing_id, version_number DESC);
-CREATE INDEX idx_operations_drawing_id ON operations(drawing_id, created_at DESC);
-CREATE INDEX idx_operations_element_id ON operations(drawing_id, element_id);
+CREATE INDEX IF NOT EXISTS idx_drawings_owner_id ON drawings(owner_id);
+CREATE INDEX IF NOT EXISTS idx_drawings_is_public ON drawings(is_public);
+CREATE INDEX IF NOT EXISTS idx_drawing_collaborators_drawing_id ON drawing_collaborators(drawing_id);
+CREATE INDEX IF NOT EXISTS idx_drawing_collaborators_user_id ON drawing_collaborators(user_id);
+CREATE INDEX IF NOT EXISTS idx_drawing_versions_drawing_id ON drawing_versions(drawing_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_operations_drawing_id ON operations(drawing_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operations_element_id ON operations(drawing_id, element_id);
 ```
 
-**Why JSONB for elements?** Drawing elements are semi-structured -- different shapes have different properties (`points` for freehand/arrows, `text` and `fontSize` for text elements, `width`/`height` for rectangles). JSONB allows flexible schema evolution without migrations and supports atomic updates via `jsonb_set()`. The trade-off is write amplification: updating a single element requires rewriting the entire JSONB column. PostgreSQL's TOAST compression mitigates this for large payloads, but at extreme scale (10K+ elements per drawing), element-level storage in a separate table would reduce write amplification.
+There are five tables. `operations` is not written by application code. `drawing_versions` is written only by the explicit HTTP update path when elements are supplied, not by WebSocket auto-save. It has no uniqueness constraint on drawing/version. `MAX(version_number) + 1` in concurrent transactions can allocate the same number, so pruning by version number does not guarantee exactly fifty retained rows.
 
-Each element in the `elements` JSONB array carries: `id`, `type`, `x`, `y`, `width`, `height`, `points` (for freehand/arrows), `text`, `strokeColor`, `fillColor`, `strokeWidth`, `opacity`, `fontSize`, `version` (monotonic counter), `isDeleted` (soft delete flag), `createdBy`, and `updatedAt` (high-resolution timestamp for LWW tie-breaking).
+Elements and app state are JSONB with no database shape/schema validation; they can contain malformed or non-array data. There is no drawing revision, command receipt, owner epoch, accepted sequence, or stable stacking-order field. Timestamp defaults are not automatic update triggers. Foreign keys cascade drawings, grants, history, and operations when their referenced parent is deleted.
+
+### Production additions — proposed, not migrated
+
+| Record | Main contents and invariant |
+|--------|-----------------------------|
+| Drawing authority | Drawing generation, current owner epoch, latest committed sequence; reject stale owners |
+| Element state | ID, lifecycle, explicit stacking order, validated geometry/style/text and group revisions |
+| Command / receipt | Unique drawing + actor + operation ID, payload digest, accepted sequence or rejection result |
+| Snapshot | Drawing generation, covered sequence, format version, checksum/location, publication status |
+| Access revision | Current grant/publication state and revocation revision, checked across transports |
+| Presence session | Drawing + connection identity, cursor/selection and last-seen expiry; ephemeral |
+
+Use PostgreSQL transactions for metadata and durable command acceptance initially. Snapshot blobs can remain in SQL at small scale and move to object storage if their size and retention justify it. A normalized element table can retrieve a scene with one range query; it does not require one join per shape. JSONB remains useful inside a row for heterogeneous shape payloads, but changing a JSON field does not remove PostgreSQL row-version/storage write costs.
 
 ## API Design
 
-### Authentication
+### Implemented HTTP routes
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/auth/register` | Register new user |
-| POST | `/api/v1/auth/login` | Login, create session |
-| POST | `/api/v1/auth/logout` | Destroy session |
-| GET | `/api/v1/auth/me` | Get current user |
+| Method | Path | Actual behavior / boundary |
+|--------|------|---------------------------|
+| POST | `/api/v1/auth/register` | Username/email/password, bcrypt cost 12, creates Redis-backed session |
+| POST | `/api/v1/auth/login` | `username` field accepts username or email, plus password |
+| POST / GET | `/api/v1/auth/logout`, `/api/v1/auth/me` | Destroy session / fetch current user |
+| GET | `/api/v1/drawings` | All owned/shared drawings; no pagination; reads full scenes to derive counts |
+| GET | `/api/v1/drawings/public` | Latest twenty public drawings; no cursor/offset contract |
+| POST | `/api/v1/drawings` | Create with title, elements, appState, isPublic; no operation receipt |
+| GET | `/api/v1/drawings/:drawingId` | Scene and collaborators; public or authorized HTTP read |
+| PUT | `/api/v1/drawings/:drawingId` | Owner/edit collaborator can replace elements and change metadata/publicity |
+| DELETE | `/api/v1/drawings/:drawingId` | Owner-only SQL delete; no room eviction protocol |
+| POST | `/api/v1/drawings/:drawingId/collaborators` | Owner-only add/update by username; helper's first SQL statement is invalid |
+| DELETE | `/api/v1/drawings/:drawingId/collaborators/:targetUserId` | Owner-only removal; no socket revocation |
+| GET | `/api/v1/drawings/:drawingId/collaborators` | Requires login but does not check access to the drawing |
+| GET | `/api/v1/export/:drawingId/png`, `/api/v1/export/:drawingId/svg` | Authenticated requests receive 501 placeholders |
+| GET | `/api/health`, `/api/health/live` | Basic process responses after session/general-rate middleware |
+| GET | `/api/health/detailed`, `/api/health/ready` | PostgreSQL/Redis probes; detailed includes process memory |
+| GET | `/metrics` | Prometheus text after session middleware |
 
-### Drawings
+HTTP JSON bodies have a 10 MB parser limit. Application code does not validate element arrays, shape types, finite coordinates, style ranges, point counts, or document revision before replacement. Invalid collaborator permission values fall through to database constraints rather than a clear validation response.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/drawings` | List user's drawings |
-| GET | `/api/v1/drawings/public` | List public drawings |
-| POST | `/api/v1/drawings` | Create drawing |
-| GET | `/api/v1/drawings/:id` | Get drawing with elements |
-| PUT | `/api/v1/drawings/:id` | Update drawing (full save) |
-| DELETE | `/api/v1/drawings/:id` | Delete drawing (owner only) |
-| POST | `/api/v1/drawings/:id/collaborators` | Add collaborator |
-| DELETE | `/api/v1/drawings/:id/collaborators/:userId` | Remove collaborator |
-| GET | `/api/v1/drawings/:id/collaborators` | List collaborators |
+The collaborator helper issues `INSERT … ON CONFLICT … RETURNING dc.*, u.username, u.display_name FROM …`. That is not valid PostgreSQL INSERT syntax; the later simpler query is never reached after the error. The helper catches the error and returns null, and the route responds 201 with a null collaborator. See the [PostgreSQL INSERT grammar](https://www.postgresql.org/docs/16/sql-insert.html) and [drawingService.ts](./backend/src/services/drawingService.ts).
 
-### Health & Metrics
+### Implemented WebSocket messages
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/health` | Simple health check |
-| GET | `/api/health/detailed` | Detailed health with component status |
-| GET | `/metrics` | Prometheus metrics |
+The `/ws` endpoint is attached directly to the HTTP server. Express session, CORS, and rate-limit middleware do not authorize its upgrades or messages.
 
-## WebSocket Protocol
+| Direction | Message | Actual contents / handling |
+|-----------|---------|----------------------------|
+| Client → server | `join-room` | Drawing ID plus optional user ID/name; trusted without access check |
+| Client → server | `leave-room` | Leave the current process-local room |
+| Client → server | `shape-add`, `shape-update`, `shape-move` | Full element payload; operation-specific server rules |
+| Client → server | `shape-delete` | Element ID; server increments its current version and timestamps deletion |
+| Client → server | `elements-sync` | Whole element array merged by version/time helper; browser helper is unused |
+| Client → server | `cursor-move` | World x/y; raw mouse-move frequency, no application throttle |
+| Server → client | `connected` | Assigned palette color |
+| Server → client | `room-state` | Drawing ID and complete process-local array |
+| Server → peers | Shape messages / `elements-sync` | Original shape payloads for individual operations, merged array for bulk sync; excludes sender |
+| Server → peers | `cursor-move`, `user-joined`, `user-left` | Supplied identity/name and cursor information |
+| Server → client | `error` | Some syntax/message errors; asynchronous handler failures are only logged |
 
-All WebSocket communication uses JSON messages over a single `/ws` endpoint.
-
-### Client-to-Server Messages
-
-```
-join-room     { type, drawingId, userId, username }
-leave-room    { type }
-shape-add     { type, elementData }
-shape-update  { type, elementData }
-shape-delete  { type, elementId }
-shape-move    { type, elementData }
-elements-sync { type, elements }
-cursor-move   { type, x, y }
-```
-
-### Server-to-Client Messages
-
-```
-connected     { type, color }           -- Assigned cursor color
-room-state    { type, drawingId, elements }  -- Full state on join
-user-joined   { type, userId, username, color }
-user-left     { type, userId, username }
-shape-add     { type, userId, elementData }  -- Broadcast
-shape-update  { type, userId, elementData }  -- Broadcast
-shape-delete  { type, userId, elementId }    -- Broadcast
-shape-move    { type, userId, elementData }  -- Broadcast
-elements-sync { type, userId, elements }     -- Broadcast
-cursor-move   { type, userId, username, x, y, color } -- Broadcast
-error         { type, message }
-```
-
-## CRDT Approach: Shape-Level LWW
-
-### Why LWW over OT or full CRDT?
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| **LWW (chosen)** | Simple, low overhead, ~50 lines of merge logic | Can lose concurrent edits to same element |
-| OT (Operational Transform) | Precise character-level merges | Complex, requires central server, hard to implement correctly |
-| Full CRDT (Automerge/Yjs) | True conflict-free, decentralized | Large overhead per element, complex data structures |
-
-In a whiteboard, users typically work on different shapes. Two users simultaneously editing the exact same rectangle is rare. When it does happen, keeping the latest version is acceptable -- the "loser" sees their change replaced, which is a natural experience (someone else moved the box I was editing). For text elements where character-level merging matters, a full CRDT library would be appropriate, but for geometric shapes, LWW provides 90% of the value at 10% of the complexity.
-
-The critical insight is that LWW's weakness (losing concurrent edits to the same element) is masked by the whiteboard's UX. Unlike text editing where two people typing in the same paragraph produces a visible mess, two people dragging the same rectangle simply results in one final position. The user who "lost" can see the rectangle moved and drag it again.
-
-### Merge Algorithm
-
-```
-mergeElements(existing[], incoming[]):
-  elementMap = Map<id, element>
-
-  for each in existing:
-    elementMap[el.id] = el
-
-  for each in incoming:
-    current = elementMap[el.id]
-    if !current:
-      elementMap[el.id] = el          // New element
-    else if el.version > current.version:
-      elementMap[el.id] = el          // Higher version wins
-    else if el.version == current.version AND el.updatedAt > current.updatedAt:
-      elementMap[el.id] = el          // Same version, newer timestamp wins
-    // else keep existing
-
-  return elementMap.values()
-```
-
-The merge function is commutative (order-independent), associative (pairwise or all-at-once yields the same result), and idempotent (applying the same update twice has no additional effect). These three properties guarantee that all clients converge to the same state regardless of message delivery order.
-
-### Soft Deletes
-
-Deleted elements are marked `isDeleted: true` with an incremented version rather than removed from the array. This is essential for CRDT convergence: if a delete physically removed an element, a concurrent update arriving after the delete would re-insert the element, violating the user's intent. By keeping deleted elements in the array with a version number, the delete participates in the same LWW comparison as any other update. The renderer filters out deleted elements; the full array (including deleted elements) is kept for merge correctness.
-
-## Cursor Presence
-
-Cursor positions are stored in Redis hashes with a 30-second TTL:
-
-```
-HSET presence:cursors:{drawingId} {userId} '{"userId":"...","username":"...","x":100,"y":200,"color":"#e03131"}'
-EXPIRE presence:cursors:{drawingId} 30
-```
-
-Real-time cursor updates flow directly through WebSocket broadcast (not through Redis) for minimal latency. Redis serves as the persistence layer so that newly joining users can see existing cursor positions. Stale cursors auto-expire after 30 seconds of inactivity.
-
-Cursor colors are assigned from a rotating palette of 12 distinct colors when a WebSocket client connects. This ensures collaborators are visually distinguishable. Cursors are rendered as CSS-positioned SVG elements in a DOM layer above the canvas, avoiding costly full canvas redraws on cursor movement.
+There is no accepted-operation ID, durable acknowledgment, drawing sequence, permission revision, heartbeat, or replay cursor. A nonexistent drawing ID becomes an empty room. No configured application message-size, per-room membership, point-count, or slow-client buffer limit protects the room path.
 
 ## Key Design Decisions
 
-### 1. WebSocket Rooms vs Redis Pub/Sub for Fan-out
+### One ordered drawing authority over ad hoc client-clock merges
 
-**Decision:** In production, Redis Pub/Sub channels (one per drawing) broadcast shape operations across all WebSocket server instances. Each server subscribes to channels for its active rooms and forwards messages to local WebSocket connections.
+The proposed command model assigns a durable order within each drawing and sends the canonical result to every participant. Geometry/style/text groups allow independent changes to coexist while an expected group revision makes an actual conflict explicit. It has a small enough model to test against concrete user intent: a recolor should not undo a simultaneous move.
 
-**Why not in-memory only?** In-memory rooms (`Map<drawingId, Set<WebSocket>>`) work for a single server but cannot fan out messages to collaborators connected to different servers. With horizontal scaling, a user on Server A editing a shape must notify a collaborator on Server B.
+Whole-element LWW is a legitimate possible design if all replicas share a deterministic total order and compatible merge semantics. It still discards concurrent edits at that granularity. The local implementation has neither a total tie-break for equal version/timestamps nor one shared operation rule. Calling it a CRDT does not prove convergence.
 
-**Trade-off:** Redis Pub/Sub adds one network hop per message (server-to-Redis-to-server) compared to in-memory broadcast. For cursor updates at 60Hz, this latency is noticeable. The mitigation is to throttle cursor updates to 10Hz through Redis while keeping shape operations at full speed (they are less frequent but more important).
+A tested CRDT library can support decentralized merging and richer offline/text semantics, but adds state/compaction and integration choices. It does not inherently require keeping every tombstone forever or solve every kind of user-intent conflict. The ordered proposal gives up unrestricted offline acceptance and depends on a regional authority; local feedback remains immediate through drafts.
 
-### 2. JSONB vs Normalized Tables for Elements
+### Durable completed commands plus snapshots over idle-only saves
 
-**Decision:** Store all elements as a JSONB array in the `drawings` table.
+Persist a completed gesture command, optionally group-committing short bounded batches, before acknowledging it as saved. Periodic snapshots shorten replay. Cursor and preview traffic stays ephemeral, so high pointer sample frequency does not become one durable write per sample.
 
-**Why:** Elements are always loaded and saved as a complete set. The system never queries "find all rectangles across all drawings" -- it always operates on one drawing's element set. JSONB enables single read/write for the entire canvas state, no JOIN overhead, and flexible element schemas (freehand has `points`, text has `fontSize`).
+An idle debounce reduces writes but cannot bound data loss while edits keep arriving. An in-memory broadcast also disappears on process failure. The cost of a durable log is receipt storage, replay, snapshot publication, and backpressure. The benefit is a precise saved boundary and a recoverable operation after a lost response.
 
-**Trade-off:** Cannot efficiently query individual elements across drawings. JSONB updates require rewriting the entire column (PostgreSQL TOAST handles large payloads, but write amplification grows linearly with element count). For very large drawings (10K+ elements), the JSONB payload exceeds 1MB, increasing network and parsing overhead. At that scale, a normalized `elements` table with individual rows and `jsonb_set()` updates would be more efficient, but adds JOIN complexity for every drawing load.
+Snapshots and log retention are coordinated. A replay log alone does not automatically supply user-friendly undo; undo requires conditional inverse commands that respect intervening edits. A full-scene REST save must use the same authoritative revision protocol instead of becoming an independent writer.
 
-### 3. Debounced Auto-Save vs Event-Sourced Persistence
+### Canvas 2D with explicit transforms over universal rendering thresholds
 
-**Decision:** Debounced save (2-second idle timer) writing the full element array to PostgreSQL.
+Canvas 2D provides a direct renderer for the small vocabulary of shapes. A draft layer and animation-frame invalidation can keep interaction responsive while React manages controls. Its cost is manual hit testing, selection, text editing, and accessible object navigation.
 
-**Why:** Event sourcing (persisting every individual operation) provides perfect auditability and undo but requires reconstructing state from the operation log on load. A whiteboard with freehand drawing generates ~60 points/second per user. With 50 concurrent users, that is 3,000 operations/second -- the operation log grows at ~260M operations/day per active drawing. Replaying this log on drawing load would take seconds.
-
-**Trade-off:** Up to 2 seconds of work can be lost if the server crashes between the last save and the crash. This is acceptable because the drawing was live in WebSocket memory and each participant's local state survives reconnection. On reconnect, the client's local state is merged with the server's last-saved state via the CRDT merge, recovering any operations the server missed.
+SVG offers per-object DOM semantics and useful event/accessibility integration; WebGL can improve throughput for suitable workloads. There is no universal “SVG fails at 1,000 shapes” boundary. Choose after measuring scene complexity, text, point counts, device resolution, and interaction patterns. Viewport culling and spatial indexing often help before changing the renderer.
 
 ## Consistency and Idempotency
 
-### Idempotent Drawing Operations
+The production receipt binds drawing generation, authenticated actor, stable operation ID, and payload digest. The same retry returns the same accepted sequence/result; changing the payload under the same ID is rejected. All durable mutation paths follow the same owner epoch and revision checks. A late owner, HTTP writer, or snapshot job cannot overwrite a newer committed state.
 
-Every shape operation carries a client-generated element ID and a monotonically increasing version number. These serve as a natural idempotency key. If a WebSocket message is retried due to a transient network failure, the CRDT merge logic ensures processing the same operation twice produces the same result. An add for an existing element ID is treated as an update; an update with a version equal to or lower than the existing element is silently discarded. Duplicate deliveries never create phantom shapes.
+Clients maintain committed state at a known sequence and pending commands separately. Missing sequences trigger catch-up; reconnect does not infer successful delivery from a previous `send()` call. Ephemeral previews and cursor messages can be superseded without replay. A newly joined room receives a snapshot and contiguous tail, including edits committed during loading.
 
-For REST API mutations (creating a drawing, adding a collaborator), database constraints enforce idempotency. The `UNIQUE(drawing_id, user_id)` constraint on `drawing_collaborators` prevents duplicate collaborator entries on retry.
+### Actual merge behavior
 
-### CRDT Convergence Guarantees
+| Code path | Actual rule | Consequence |
+|-----------|-------------|-------------|
+| `mergeElements` | Higher version wins, then higher timestamp; exact ties keep existing | Equal clock/version conflicts depend on input order; array order also depends on insertion order |
+| Add | Unconditional map replacement for the ID | A stale add can replace a newer object or resurrect a tombstone |
+| Update | Accept when incoming version is at least current | Equal-version older timestamp can replace newer state |
+| Delete | Mark current object deleted and increment version using server time | Replaying the same delete increments again |
+| Move | Change x/y regardless of stale version; take max version and server time | Old positions can replace new positions without consistent ordering |
+| Browser remote update | Apply payload but increment from the browser's current version and use local time | Server and browsers do not retain the same version/time metadata |
+| Browser remote add | Append to array | Duplicate IDs can coexist locally |
 
-The shape-level LWW register guarantees convergence across all participants. The merge function's three properties (commutativity, associativity, idempotency) ensure that even when network delays cause operations to arrive out of order or be delivered more than once, all clients converge to the same element state once all messages are processed.
+These rules are in [crdtService.ts](./backend/src/services/crdtService.ts), [the room handler](./backend/src/websocket/handler.ts), [canvasStore.ts](./frontend/src/stores/canvasStore.ts), and [the drawing route](./frontend/src/routes/draw.$drawingId.tsx). Individual broadcasts send original payloads even if server merge rejected or transformed them; the sender gets no canonical correction. Same-user browser tabs ignore each other's shape messages. There is no end-to-end exactly-once or convergence guarantee.
 
-Soft deletes are essential to convergence. If a delete physically removed an element, a concurrent update with a lower version arriving after the delete would re-insert it, violating the user's intent. By marking elements as `isDeleted: true` with an incremented version, the delete participates in LWW comparison. A concurrent update with a higher version intentionally "wins" the delete, which is the correct behavior when the updater has not yet seen the delete.
+## Security / Auth
 
-### Reconnection and State Reconciliation
+In production, authenticate upgrades with the same session authority used by HTTP, validate origins, authorize scene access before join, and bind a server identity to each connection. Check edit permission on mutations and propagate revocation. Bound operation types, payloads, point counts, message frequency, participants, and queued output bytes. A read-only public drawing must remain read-only through every transport.
 
-WebSocket transport provides at-most-once delivery. The system achieves effective exactly-once semantics through idempotent CRDT merge on the receiving side. On reconnection, the client compares its local element versions against the server's authoritative state. Elements where the server has a higher version are updated locally; local elements with higher versions are re-sent to the server. This reconciliation closes gaps without requiring message acknowledgment tracking or sequence numbers.
+Locally, HTTP auth uses bcryptjs (cost 12 for new accounts) and Redis-backed `express-session`. Cookies last seven days, are HttpOnly/SameSite Lax, and are Secure in production. Registration lowercases username/email and enforces username length and a six-character minimum password; it does not regenerate the session on login/register. `SESSION_SECRET` signs cookies; session data lives in Redis. The installed connect-redis adapter supports the supplied ioredis client.
 
-## Security & Auth
+[HTTP drawing routes](./backend/src/routes/drawings.ts) check ownership/edit access for changes and owner access for delete/grant management. Listing collaborators only checks login. Drawing GET uses cached `is_public` to decide whether private access checks are necessary, so stale cache state can also affect read authorization. Edit collaborators can change publicity through the generic PUT. The UI has no public/private toggle despite holding `isPublic` state.
 
-- **Session-based authentication** using Redis-backed express-session
-- **CORS** restricted to frontend origin
-- **Rate limiting** using Redis sliding window (separate limits for auth and drawing operations)
-- **Access control**: Drawings are private by default; only owner and explicit collaborators (view/edit permission) can access
-- **WebSocket auth**: Relies on the session cookie set during HTTP login. In production, WebSocket connections should validate a short-lived token issued during the HTTP handshake.
+[WebSocket setup](./backend/src/index.ts) passes every connection to an anonymous client record, and [join-room](./backend/src/websocket/handler.ts) trusts message identity and drawing ID. There is no session parsing, drawing access check, edit check, origin gate, logout revocation, or deleted-room closure. A socket can read and mutate a known private drawing independently of HTTP credentials.
 
 ## Observability
 
-### Prometheus Metrics
+The production system should report local frame time, command-to-ack latency, committed sequence lag, pending draft age, replay gaps, conflicting edits, unauthorized attempts, snapshot age, and slow-client disconnections. Count a command as durable only after storage commit. Correlate drawing/operation IDs through acceptance, snapshotting, and recovery without logging private scene contents or credentials.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `excalidraw_http_request_duration_seconds` | Histogram | HTTP request latency by method/route/status |
-| `excalidraw_http_requests_total` | Counter | Total HTTP requests by method/route/status |
-| `excalidraw_ws_connections_active` | Gauge | Active WebSocket connections |
-| `excalidraw_ws_messages_total` | Counter | WebSocket messages by type |
-| `excalidraw_drawings_created_total` | Counter | Drawings created |
-| `excalidraw_active_sessions` | Gauge | Active user sessions |
-| `excalidraw_auth_attempts_total` | Counter | Auth attempts by result |
-| `excalidraw_circuit_breaker_state` | Gauge | Circuit breaker states |
+Locally, [metrics.ts](./backend/src/services/metrics.ts) wires HTTP latency/counts, socket connection/message counts, drawing create/delete counters, auth attempts, rate-limit hits, and an active-session gauge. The gauge counts login/register/logout calls rather than actual live sessions and can drift or go negative. Socket message labels accept arbitrary supplied message types; unmatched HTTP path labels can also grow cardinality. There are no merge-conflict, replay, or durable-save metrics.
 
-### Structured Logging
+[Pino logging](./backend/src/services/logger.ts) records HTTP trace IDs, status/duration/user information, and selected room/save events. A caller-supplied `x-trace-id` is accepted or generated and returned, but it is not automatically propagated into all database or WebSocket work. Query timing/logging helpers and the database histogram exist without being used around normal queries.
 
-Pino JSON logger with request tracing (`x-trace-id` header), user context, and query timing.
+Health and readiness check PostgreSQL/Redis, not valid collaboration, permission enforcement, or saved scene state. Basic health routes run behind sessions and the general API limiter. No dashboard stack or distributed tracing collector is configured.
 
 ## Failure Handling
 
-- **Circuit breaker** (Opossum) wrapping database operations -- opens after 50% error rate, resets after 30s. Prevents cascade failures when PostgreSQL is slow or unreachable.
-- **WebSocket reconnection** with exponential backoff (client-side, up to 5 attempts). On reconnection, the client receives the full room state and merges it with local state via CRDT.
-- **Debounced persistence** ensures drawing state survives short server restarts. The last saved state is always in PostgreSQL; in-memory state is reconstructed from the database on room re-creation.
-- **Graceful shutdown**: SIGTERM/SIGINT handlers flush all in-memory room state to PostgreSQL before exit. This minimizes data loss on planned deployments.
-- **Empty room cleanup**: When the last user leaves a room, in-memory elements are flushed to PostgreSQL and the room is removed from memory to prevent memory leaks.
+| Failure | Proposed behavior | Current local behavior |
+|---------|-------------------|------------------------|
+| Response/ack lost | Resend stable operation ID and retrieve receipt | No operation acknowledgment or receipt |
+| Disconnection | Preserve pending commands; catch up and reconcile | Sends while closed are dropped; room-state replaces local elements |
+| Database unavailable | Stop durable acknowledgments, bound pending work | In-memory edits continue; failed idle saves log and disappear from timer tracking |
+| Redis unavailable | Explicit session/access failure; optional caches can fail open where safe | Cache helpers throw; sessions/rate limiting can fail HTTP requests |
+| Room owner crashes | New fenced owner replays log after snapshot | First join reloads last SQL/cache state; unsaved room memory is lost |
+| Last client leaves | Persist or retain retryable state before release | Fire-and-forget flush, then room state and timer are removed |
+| Planned shutdown | Stop admissions, drain/ack work, persist, close sockets and dependencies | Ends database/Redis and exits without draining rooms/server/sockets |
+| Join races editing | Snapshot and tail have a defined sequence boundary | Async scene loading can overwrite edits received before load completes |
+| Permission revoked | Prevent future mutations and remove/restrict connections | Active sockets keep editing |
+
+[The Opossum helper](./backend/src/services/circuitBreaker.ts) configures a 10-second timeout, 50% failure threshold after five requests, a 10-second statistics window, and 30-second reset. It is **unused by the running database path**. There is no database circuit breaker, queued save retry, or Redis-to-memory limiter fallback to claim. PostgreSQL uses a 20-connection pool, 30-second idle timeout, and two-second connection-acquisition timeout; ordinary queries have no explicit execution deadline.
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+Route a drawing's durable commands to one fenced owner and distribute different drawings across owners. A failover must invalidate the old owner's ability to write. Redis Pub/Sub can carry notifications, but adding it alone leaves competing full-scene writers and missed-message recovery unresolved. Avoid assuming that one user's sticky connection routes all peers to the same process.
 
-1. **WebSocket Fan-out**: Add Redis Pub/Sub so shape operations broadcast across all WebSocket server instances. Each server subscribes to channels for its active drawings.
-2. **Drawing Sharding**: Partition the `drawings` table by `drawing_id` hash across database shards. Since drawings are independent entities, no cross-shard queries are needed.
-3. **Read Replicas**: Route read-only drawing loads (gallery, public drawings) to PostgreSQL replicas. WebSocket rooms always read from the primary to ensure consistency.
-4. **CDN for Static Assets**: Serve the frontend bundle and any exported images via CDN.
-5. **CRDT Library Upgrade**: Replace LWW with Yjs or Automerge for character-level text merging. Text elements currently lose concurrent edits; a full CRDT handles this correctly.
+Bound presence frequency and output queues, coalescing the latest cursor/preview state and disconnecting clients that cannot keep up with durable changes. Separate presence by connection identity so two tabs do not erase one another. Per-connection last-seen expiry is different from one TTL for an entire room hash.
 
-### Bottleneck Analysis
+Create snapshots based on size/operation thresholds and elapsed time, without relying on inactivity. Paginate drawing lists and retrieve summaries without loading whole scenes. For large scenes, maintain spatial indexes for viewport queries and hit testing, cache static layers, and move expensive bounded work to workers when measurements justify it. A renderer change does not repair an unbounded network payload or inconsistent merge protocol.
 
-| Component | Bottleneck | Mitigation |
-|-----------|-----------|------------|
-| WebSocket server | Memory per connection (~50KB) | Horizontal scaling with Redis Pub/Sub fan-out |
-| PostgreSQL JSONB writes | Write amplification on large drawings | Element-level `jsonb_set()` or normalized table |
-| Redis cursor presence | High write rate (60 updates/sec/user) | Throttle to 10 updates/sec client-side |
-| Canvas rendering | CPU-bound for 10K+ elements | Web Workers for off-screen rendering, WebGL for 50K+ |
+Global collaboration adds latency and authority placement choices. Start with a regional owner per drawing; move ownership through a fenced handoff. If fully decentralized offline editing becomes a requirement, revisit the data type and merge semantics rather than layering client clocks onto an ordered design without a proof.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Conflict resolution | Shape-level LWW | Full CRDT (Yjs) | Simpler, sufficient for shape editing |
-| Element storage | JSONB column | Normalized elements table | Single read/write, flexible schema |
-| Real-time transport | WebSocket | SSE / Long polling | Bidirectional, low latency |
-| Persistence strategy | Debounced save (2s) | Event sourcing | Lower write amplification, simpler recovery |
-| Cursor presence | Redis hash + WS broadcast | Redis Pub/Sub only | WS for real-time speed, Redis for join-time state |
-| Session storage | Redis + cookie | JWT | Immediate revocation, simpler |
-| Canvas rendering | Canvas 2D API | WebGL | Simpler API, sufficient for ~5K elements at 60fps |
-| Cursor rendering | DOM overlay (SVG) | Canvas-drawn cursors | Avoids full canvas redraws on cursor movement |
-
-## Frontend Architecture
-
-The frontend is a React SPA built with Vite, TypeScript, TanStack Router, Zustand, and Tailwind CSS. It implements a collaborative whiteboard with HTML5 Canvas rendering, real-time WebSocket collaboration, and shape editing tools.
-
-### Component Hierarchy
-
-```
-__root.tsx (RootLayout)
-├── Header                              ← App logo, user menu, login/register links
-├── index.tsx (DrawingList)
-│   └── Drawing Cards                   ← Grid of user's drawings with title, thumbnail, public/private badge
-├── login.tsx / register.tsx            ← Auth forms
-└── draw.$drawingId.tsx (DrawingPage)
-    ├── Top Bar                         ← Back button, editable title input, collaborator avatars, Share/Save buttons
-    ├── Toolbar                         ← Floating left-side tool palette (select, rect, ellipse, diamond, arrow, line, freehand, text, eraser)
-    ├── PropertiesPanel                 ← Floating right-side panel for selected element (stroke color, fill color, stroke width, opacity, font size)
-    ├── Canvas                          ← Full-screen HTML5 Canvas with pan/zoom, shape rendering, hit testing, drawing interactions
-    ├── CollaboratorCursors             ← DOM overlay layer with SVG cursor arrows for each remote user
-    └── ShareDialog                     ← Modal for managing collaborators (add by username, set view/edit permission, remove)
-```
-
-### Zustand Stores
-
-**`useAuthStore`** (`stores/authStore.ts`): Manages user authentication with Zustand's `persist` middleware, storing user and authentication state in localStorage under `excalidraw-auth-storage`. Provides `login()`, `register()`, `logout()`, and `checkAuth()` (validates the session cookie against the server). Persisting auth state allows the app to show the correct UI immediately on page load before the server-side session check completes, avoiding a flash of the logged-out state.
-
-**`useCanvasStore`** (`stores/canvasStore.ts`): The core store managing all drawing state. It holds:
-- **Elements**: The array of `ExcalidrawElement` objects (shapes on the canvas), plus `selectedElementId` for the currently selected shape. Element mutations (`addElement`, `updateElement`, `deleteElement`) automatically increment the element's `version` counter and set `updatedAt` to the current timestamp, which are required for CRDT conflict resolution.
-- **Tool state**: `activeTool` (select, rect, ellipse, etc.), `isDrawing` (whether the user is mid-stroke), `drawingStartPoint`, and `currentPoints` (accumulated freehand points during drawing).
-- **Viewport**: `viewState` with `scrollX`, `scrollY`, and `zoom` for the infinite canvas viewport transform.
-- **Style**: `strokeColor`, `fillColor`, `strokeWidth`, `opacity`, `fontSize` -- applied to newly created elements and modifiable on selected elements via the PropertiesPanel.
-- **Cursors**: Array of `Cursor` objects for remote collaborators, updated in real-time via WebSocket. `updateCursor` upserts by userId, `removeCursor` cleans up when a user leaves.
-
-The store does not persist to localStorage because drawing state is loaded from the server (PostgreSQL) when entering a drawing and saved via debounced auto-save. The store acts as the in-memory working copy during a drawing session.
-
-### Routing
-
-TanStack Router file-based routing:
-
-| Route | File | Purpose |
-|-------|------|---------|
-| `/` | `routes/index.tsx` | Drawing list dashboard (user's drawings and public drawings) |
-| `/login` | `routes/login.tsx` | Login form |
-| `/register` | `routes/register.tsx` | Registration form |
-| `/draw/$drawingId` | `routes/draw.$drawingId.tsx` | Full-screen drawing canvas with collaboration |
-
-The root layout (`__root.tsx`) is minimal -- it renders the Header and Outlet. The drawing page (`draw.$drawingId.tsx`) takes over the full viewport height, hiding the standard layout padding.
-
-### Data Fetching and WebSocket Integration
-
-**REST API** (`services/api.ts`): Typed fetch wrapper with `credentials: 'include'` for session cookies. Provides `authApi` (login, register, logout, getMe) and `drawingApi` (list, get, create, update, delete, collaborator management). Used for initial data loading and explicit save operations.
-
-**WebSocket client** (`services/websocket.ts`): A singleton `WebSocketClient` class that manages the real-time collaboration connection. Key design decisions:
-- **Event-based API**: Uses an `on(type, handler)` pattern returning an unsubscribe function, similar to EventEmitter. The DrawingPage component subscribes to events (`room-state`, `shape-add`, `shape-update`, `shape-delete`, `shape-move`, `elements-sync`, `cursor-move`, `user-joined`, `user-left`) in a `useEffect` and unsubscribes on cleanup.
-- **Auto-reconnect with exponential backoff**: On connection loss, the client retries up to 5 times with delays of 1s, 2s, 4s, 8s, 16s. On successful reconnect, it automatically re-joins the room it was in, triggering a fresh state sync from the server.
-- **Room management**: `joinRoom(drawingId, userId, username)` enters a drawing's collaboration room. The server responds with `room-state` containing the full element array. `leaveRoom()` notifies the server on navigation away.
-- **Operation broadcasting**: Typed methods (`sendShapeAdd`, `sendShapeUpdate`, `sendShapeDelete`, `sendShapeMove`, `sendCursorMove`, `sendElementsSync`) send structured messages. The DrawingPage calls these after local state mutations, and the server broadcasts to other room members.
-
-### Key UI Patterns
-
-- **Infinite canvas with pan/zoom**: The `Canvas` component uses `ctx.setTransform(zoom, 0, 0, zoom, scrollX, scrollY)` to map between screen coordinates and world coordinates. Panning is done by holding the middle mouse button or spacebar+drag. Zooming uses the scroll wheel, centered on the cursor position. Grid dots are drawn in screen space (before the transform) so they remain evenly spaced regardless of zoom level.
-- **Shape rendering pipeline**: The `CanvasRenderer` (`renderer/CanvasRenderer.ts`) redraws the entire canvas on every frame. It draws the background grid, applies the viewport transform, then iterates through non-deleted elements calling type-specific renderers from `renderer/shapes.ts` (rect, ellipse, diamond, arrow, line, freehand, text). The selected element gets selection handles (resize corners).
-- **Freehand drawing with path simplification**: Freehand paths accumulate mouse move coordinates into `currentPoints`. On mouse up, the `pathSimplification.ts` utility applies the Ramer-Douglas-Peucker algorithm to reduce point count while preserving the visual shape. This reduces the data size of freehand elements from potentially hundreds of points to a compact representation.
-- **DOM cursor overlay**: Collaborator cursors are rendered as absolutely positioned SVG arrow elements in a DOM layer above the canvas (`CollaboratorCursors`), rather than being drawn on the canvas itself. This avoids triggering a full canvas redraw on every cursor movement (60 times per second per collaborator). Each cursor shows the user's name and is colored using the server-assigned color.
-- **Optimistic local-first editing**: Shape operations are applied to the local Zustand store immediately (for instant feedback), then broadcast via WebSocket. Remote operations arriving via WebSocket update the store, which triggers a canvas re-render. The CRDT merge logic on the server ensures convergence even if operations arrive out of order.
+| Edit authority | Ordered, fenced room writer | Ad hoc client-clock whole-object merge | Canonical acceptance, explicit conflict handling and recoverable order |
+| Mutation granularity | Geometry/style/text groups | Replace entire element for every edit | Preserve independent intents without splitting geometry invariants |
+| Durability | Completed-command log plus snapshots | Idle-only full-state save | Bound acknowledged recovery independently of user inactivity |
+| Presence | Throttled ephemeral per-connection state | Durable cursor log | Latest position matters; old movement is disposable |
+| Rendering | Canvas 2D with draft layer and measured optimization | Immediate SVG/WebGL migration | Keep model simple while profiling actual complexity |
+| Reconnect | Sequence catch-up and stable pending IDs | Replace local scene on every join | Preserve recoverable drafts and detect missing accepted changes |
 
 ## Implementation Notes
 
-### Local Architecture
+### Actual topology and persistence
 
-```
-┌─────────────────────────────┐
-│   React SPA (Vite :5173)    │
-│   Canvas + Toolbar + Stores │
-├────────────┬────────────────┤
-│  REST API  │   WebSocket    │
-└─────┬──────┴───────┬────────┘
-      │              │
-      ▼              ▼
-┌─────────────────────────────┐
-│   Express + WS Server       │
-│   :3001 (dev)               │
-│   ┌──────────┐ ┌──────────┐ │
-│   │ REST API │ │ WS Rooms │ │
-│   │ Routes   │ │ CRDT     │ │
-│   │          │ │ Merge    │ │
-│   └──────────┘ └──────────┘ │
-└──────┬──────────────┬───────┘
-       │              │
-  ┌────▼────┐   ┌─────▼─────┐
-  │Postgres │   │  Valkey   │
-  │ :5432   │   │  :6379    │
-  │Drawings │   │  Sessions │
-  │Elements │   │  Cursors  │
-  │Users    │   │  Rate     │
-  └─────────┘   │  Limits   │
-                └───────────┘
+[app.ts](./backend/src/app.ts) mounts HTTP routes and sessions; [index.ts](./backend/src/index.ts) attaches `/ws` to the same server. [handler.ts](./backend/src/websocket/handler.ts) holds rooms, clients, element arrays, and timers in process-local maps. Redis is used for HTTP sessions, rate counters, a full-drawing cache, and cursor writes; it is not used for room fan-out or durable operations.
+
+Socket edits reset a two-second inactivity timer. The callback captures the full array and calls `updateDrawing`; errors are logged, with no automatic retry. Continuous mutations can postpone the timer indefinitely. An in-flight old save can overlap newer work, and timer cleanup has no generation guard. On last departure, the handler starts a flush and immediately discards memory; a new join can race that flush and load older SQL/cache state. Shutdown does not invoke a room flush at all.
+
+HTTP Save replaces the entire array through [drawingService.ts](./backend/src/services/drawingService.ts). The frontend first filters out deleted elements, so it removes tombstones from SQL. It does not update room memory or broadcast metadata/style changes. A subsequent socket flush can overwrite that save with an older in-memory scene. There is no compare-and-swap or common save authority.
+
+`saveVersion` is launched asynchronously only after an HTTP PUT containing elements succeeds. Its separate transaction selects max version plus one, inserts the submitted scene, and deletes versions at least fifty numbers behind the new maximum. Concurrent numbers can collide and the saved snapshot need not correspond to a unique live-scene revision. No route reads/restores those versions; `operations` remains unused.
+
+### Wired patterns and helper boundaries
+
+**Caching.** `getDrawing` caches the entire drawing row, including elements, owner fields, and publicity, at `drawing:<id>` for 300 seconds. Lists and collaborator permissions are queried separately. Cache get/set/delete errors are not swallowed: a cache failure can fail a read, or return failure after an SQL update/delete already committed. Invalidation can also race an older read filling the cache. There is no stampede control or revision fence.
+
+**Rate limiting.** [rateLimiter.ts](./backend/src/services/rateLimiter.ts) uses express-rate-limit with rate-limit-redis: general `/api/` traffic is 1,000/minute, login allows five failed attempts/minute with successful attempts removed, and drawing creation is thirty/hour. Other drawing writes only receive the general limit. Keys use session user ID or normalized IP. The installed Redis store uses expiring fixed-window counters, not a sliding event log; there is no WebSocket limiter.
+
+**Presence.** [presenceService.ts](./backend/src/services/presenceService.ts) performs the following pattern for each cursor update:
+
+```text
+HSET presence:cursors:<drawingId> <userId> <cursor JSON>
+EXPIRE presence:cursors:<drawingId> 30
 ```
 
-Both infrastructure services run via Docker Compose (`docker-compose.yml`). The Express + WebSocket server runs natively with `tsx watch` for hot reload. A single server process handles both HTTP REST and WebSocket upgrade on the same port.
+The expiry belongs to the whole hash, so one moving user keeps every field alive. It does not expire an idle user's cursor independently. `getCursors` is never called by the join path; Redis data does not initialize late joiners. Browser cursors have no timestamp expiry either and disappear only on explicit leave notifications. See [Redis EXPIRE semantics](https://redis.io/docs/latest/commands/expire/). Multiple tabs share a user field and can remove one another's presence.
 
-### Production-Grade Patterns Implemented
+**Metrics/logs.** HTTP and WebSocket counters and Pino request logging are wired. Circuit-breaker, query-timing, and cache-log helpers are not automatically connected merely because they are exported. The Observability and Failure Handling sections distinguish actual wiring from the proposed instrumentation.
 
-1. **CRDT Merge Engine** (`src/services/crdtService.ts`): Shape-level Last-Writer-Wins merge with version counters and timestamp tie-breaking. Supports add, update, delete (soft), and move operations. ~125 lines of pure logic with no external dependencies.
+### Browser state, rendering, and interaction
 
-2. **WebSocket Room Management** (`src/websocket/handler.ts`): In-memory `Map<drawingId, Set<ClientInfo>>` for room membership. Handles join/leave, operation broadcasting (excluding the sender), and room cleanup when the last user disconnects. Flushes in-memory state to PostgreSQL on room teardown.
+The [canvas store](./frontend/src/stores/canvasStore.ts) is in memory; [auth state](./frontend/src/stores/authStore.ts) persists user/auth flags under `excalidraw-auth-storage` and [main.tsx](./frontend/src/main.tsx) validates the session on mount. The drawing route starts requests/sockets from the current user object before that check necessarily finishes. All canvas subscribers read the whole store, so cursor updates still rerender React subscribers even though the canvas drawing effect does not depend on cursors.
 
-3. **Debounced Auto-Save** (`src/websocket/handler.ts`): 2-second idle timer per drawing. Collapses rapid operations into a single PostgreSQL write. Timers are cleaned up on room close.
+[Canvas.tsx](./frontend/src/components/Canvas.tsx) redraws through a React effect on elements, viewport, selection, and size. There is no animation-frame loop, viewport culling, dirty-rectangle rendering, offscreen layer, or error isolation per element. It allocates a fixed 2× backing bitmap, then [CanvasRenderer.ts](./frontend/src/renderer/CanvasRenderer.ts) calls:
 
-4. **Cursor Presence** (`src/services/presenceService.ts`): Redis HSET with 30-second TTL per drawing. Cursor updates flow via WebSocket for real-time speed; Redis provides persistence for join-time state.
+```typescript
+ctx.setTransform(viewState.zoom, 0, 0, viewState.zoom, viewState.scrollX, viewState.scrollY);
+```
 
-5. **Prometheus Metrics** (`src/services/metrics.ts`): HTTP request duration histograms, WebSocket connection gauges, message counters by type, drawing creation counters, auth attempt counters, circuit breaker state gauges.
+`setTransform` replaces the previous transform; it does not multiply the earlier 2× scale. Shapes/selection therefore render at half the expected CSS size/position in that backing store, while hit tests and cursor overlays use the unscaled viewport. The grid is drawn before this replacement; its spacing scales with zoom rather than staying constant. See [Canvas setTransform](https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/setTransform).
 
-6. **Circuit Breaker** (`src/services/circuitBreaker.ts`): Opossum-based breaker for database operations with 50% error threshold, 30s reset timeout, and 10s call timeout.
+The renderer supports the seven shapes, smoothed freehand lines, multiline text, and decorative selection handles. Hit testing is a reverse linear scan. Negative-size diamond hit testing divides by signed dimensions and can accept distant points. Freehand selection bounds do not include the minimum point offset. Path simplification uses a fixed two-world-unit tolerance and distance to an infinite line, so collinear backtracking excursions can disappear; no zoom-aware error guarantee is provided.
 
-7. **Structured Logging** (`src/services/logger.ts`): Pino JSON logger with request tracing and user context.
+[Canvas input](./frontend/src/components/Canvas.tsx) stores freehand points during mouse movement and commits/sends a completed shape only on mouseup. Dragging updates locally on movement and sends a move at mouseup. The preview renderer is unused; points/draft geometry are not drawn during capture. There is no pointer capture, pointer cancel, touch support, resize handling, Shift constraints, snapping, or existing-text editor. [PropertiesPanel.tsx](./frontend/src/components/PropertiesPanel.tsx) changes local state without sending a shape update, and its controls display global defaults rather than synchronizing to each selected element's values.
 
-8. **Rate Limiting** (`src/services/rateLimiter.ts`): Redis-backed sliding window for authentication and drawing operations.
+[websocket.ts](./frontend/src/services/websocket.ts) drops sends unless open, reconnects after 1/2/4/8/16 seconds without jitter, and rejoins without replaying pending operations. `room-state` replaces local elements. It can create another socket while an earlier one is still connecting; leaving a drawing does not close the connection, and pending reconnect timers are not tracked/cancelled. The route ignores messages carrying its own user ID, so two tabs of the same account miss each other's operations.
 
-### Simplifications
+REST scene loading and socket initialization run independently and can overwrite each other. Route handlers do not reject stale drawing IDs or request generations; navigation can receive old scene responses. Store viewport, selection, tool, and cursors are not fully reset between drawings/accounts. A save error replaces the editor with an error page rather than preserving an actionable unsaved state.
 
-| Production Feature | Local Substitute | Why |
-|--------------------|-----------------|-----|
-| Redis Pub/Sub cross-server fan-out | In-memory room broadcast | Single server, no cross-server messaging needed |
-| Distributed room state (Redis Streams) | In-memory `Map<drawingId, CrdtElement[]>` | Single server, all collaborators on same process |
-| OAuth / JWT for WebSocket auth | Session cookie from HTTP login | Simpler, sufficient for learning |
-| Element-level `jsonb_set()` updates | Full JSONB column rewrite | Acceptable for < 1K elements per drawing |
-| Multiple WebSocket server instances | Single Express + WS process | No horizontal scaling needed locally |
-| CDN for frontend bundle | Vite dev server | No global distribution needed |
-| WebGL rendering | Canvas 2D API | Sufficient for < 5K elements |
+The share dialog appends the null collaborator returned by the broken helper and then dereferences it while rendering. It has no link-copy/public-toggle workflow, focus trap, or dialog semantics. Drawing cards use clickable divs and hover-only actions; toolbar/property controls and form labels need additional keyboard/accessible naming work. Anonymous public viewers see editing controls but have no normal authenticated save/socket session; authenticated view-only users can still edit through the unprotected socket path.
 
-### Omitted
+### Local substitutions and omitted production work
 
-- CDN for frontend bundle and exported images
-- Multi-region deployment with conflict resolution across regions
-- Kubernetes orchestration with auto-scaling WebSocket pods
-- Yjs/Automerge for character-level text CRDT
-- Server-side canvas rendering for PNG/SVG export (node-canvas or Puppeteer)
-- Undo/redo via operation stack
-- Offline mode with local-first sync
-- Copy/paste and group selection
-- WebGL renderer for large drawings (50K+ elements)
+Compose provides PostgreSQL/Valkey with volumes, not a distributed room cluster. Configuration loads an optional backend `.env`; PostgreSQL uses individual `POSTGRES_*` fields and Redis uses `REDIS_HOST`/`REDIS_PORT`, leaving `REDIS_URL` unused. CORS is hardcoded to the two local frontend origins. The development script pins 3001, including when called by the other instance scripts. `npm start` uses production-mode `tsx` source, not the TypeScript build output.
 
-## Deep Pattern Explanations
+The SQL fixture creates Alice/Bob (`password123`), four drawings, and two edit grants. It is neither transaction-wrapped nor rerunnable without conflicts. Registration hashes use cost 12, while seeded hashes have cost 10. The [README](./README.md) describes one-time seeding and the existing two-account collaboration demo.
 
-This section explains each production-grade pattern implemented in this project from first principles, describing what the pattern is, what problem it solves, and how this project uses it.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents a failing external dependency from cascading into a system-wide outage. When your application calls a database, and that database becomes slow or unresponsive, each request waits for the full timeout (e.g., 10 seconds). If your application handles 100 requests per second, within 10 seconds you have 1,000 requests blocked waiting for the database, consuming all available connections and threads. Now even requests that do not need the database cannot be served because the server has exhausted its resources. One slow dependency has brought down everything.
-
-A circuit breaker monitors the success and failure rate of calls to a dependency. It has three states. **Closed** is normal operation: all calls go through, and the breaker tracks the error rate over a rolling window. **Open** means the breaker has tripped: all calls are immediately rejected without attempting the request. This is called "failing fast" -- rather than waiting 10 seconds for a timeout, the client gets an immediate error and can show a fallback or retry later. **Half-open** is the recovery state: after a cooldown period, the breaker lets one test request through. If it succeeds, the circuit closes. If it fails, the circuit reopens.
-
-In this project, an Opossum circuit breaker wraps PostgreSQL database operations (`src/services/circuitBreaker.ts`). If the database becomes slow or unreachable, the breaker opens after 50% of requests fail within a 10-second window, with a 30-second reset timeout before trying again. This protects the Express server from accumulating blocked requests. In-flight WebSocket operations continue to work with in-memory state; only persistence is deferred until the database recovers. The breaker state is exposed as a Prometheus gauge so the monitoring system can alert when the database circuit opens.
-
-### Prometheus Metrics
-
-Prometheus is a time-series monitoring system designed for cloud-native applications. Unlike traditional monitoring that pushes metrics to a central server, Prometheus uses a "pull" model: your application exposes a `/metrics` HTTP endpoint that returns all current metric values in a specific text format, and the Prometheus server scrapes this endpoint at regular intervals. This pull model means your application does not need to know where the monitoring server is, and adding new services to monitoring is just a configuration change in Prometheus.
-
-There are four metric types. **Counters** are monotonically increasing values (total requests, total errors) used to compute rates. **Gauges** go up and down (active WebSocket connections, memory usage). **Histograms** distribute values into configurable buckets (request latency: how many requests took 0-10ms, 10-50ms, etc.) and enable percentile calculations like p99. **Summaries** compute percentiles on the client side but cannot be aggregated across instances.
-
-This project uses `prom-client` (`src/services/metrics.ts`) with metrics specific to a collaborative whiteboard: HTTP request duration histograms, active WebSocket connection gauges, WebSocket message counters by type (shape-add, shape-update, cursor-move, etc.), drawing creation counters, auth attempt counters, and circuit breaker state gauges. The WebSocket-specific metrics are particularly important because connection count directly impacts memory usage (each connection holds ~50KB of state) and message throughput determines server CPU load. Monitoring these in real-time allows operators to scale WebSocket servers before they become overloaded.
-
-### Structured Logging
-
-Structured logging means writing log entries as JSON objects with named fields rather than free-form text strings. Instead of `"2024-01-16 12:00:00 INFO User alice joined drawing abc123"`, a structured log emits `{"timestamp":"2024-01-16T12:00:00Z","level":"info","event":"user_joined","userId":"user456","username":"alice","drawingId":"abc123","traceId":"req-789"}`. Each field is independently searchable and filterable by log aggregation systems.
-
-The critical advantage in a collaborative system like this is correlation. When a user reports that their drawing changes disappeared, you need to trace the full lifecycle: the WebSocket message received, the CRDT merge applied, the debounced save triggered (or not triggered), and the PostgreSQL write completed (or failed). With structured logs, you filter by `drawingId=abc123` to see all events for that drawing, then by `traceId` to follow a specific operation through the system. With unstructured text logs, this requires regex parsing across millions of log lines.
-
-This project uses Pino (`src/services/logger.ts`) for JSON logging with request tracing via `x-trace-id` headers. Each request gets a unique ID that is included in all log lines produced during that request's lifecycle, enabling end-to-end tracing from HTTP request through database queries and WebSocket operations.
-
-### Rate Limiting
-
-Rate limiting controls the number of requests a client can make within a time window. In a collaborative whiteboard, rate limiting serves two purposes beyond basic protection. First, it prevents abuse of the authentication system -- without rate limiting on login attempts, an attacker could try millions of passwords per hour using automated tools (credential stuffing). Second, it prevents a single user or script from overwhelming the drawing API with rapid save or create operations that would consume database connections and disk I/O at the expense of other users.
-
-The sliding window algorithm works by tracking a counter per client (identified by IP or session) that increments on each request. When the counter exceeds the limit, the server responds with HTTP 429 (Too Many Requests). The counter resets after the window expires. Redis is used as the counter store so that rate limits work consistently across multiple API server instances.
-
-This project implements Redis-backed sliding window rate limiting (`src/services/rateLimiter.ts`) with separate limits for authentication endpoints (stricter, to prevent brute-force login attacks) and drawing operations (more generous, to allow normal collaborative use). Rate limiting is applied as Express middleware, so it runs before any business logic, rejecting excess requests immediately without consuming database connections or compute resources.
-
-### Health Checks
-
-A health check is an HTTP endpoint that reports whether a service is functioning correctly. Health checks serve as the connective tissue between your application and the infrastructure that manages it. A load balancer polls health check endpoints to decide which server instances should receive traffic -- if a server fails its health check, the load balancer stops routing requests to it, preventing users from hitting a broken server. Kubernetes uses health checks to decide whether to restart a container (if the liveness check fails) or stop sending it traffic (if the readiness check fails).
-
-There are two levels of health checking. A **basic liveness** check returns 200 if the HTTP server is responsive -- if this fails, the process is likely crashed or deadlocked. A **detailed readiness** check verifies all dependencies: can the service connect to PostgreSQL? Is Redis reachable? These checks distinguish between "the process is running" and "the process can actually serve requests" -- an important distinction during startup (database connections not yet established) or during a dependency outage.
-
-This project provides `GET /api/health` (basic liveness) and `GET /api/health/detailed` (checks PostgreSQL and Redis connectivity). The detailed check returns per-component status, so operators can immediately see which dependency is causing problems rather than debugging from error logs.
-
-### Idempotency
-
-An idempotent operation produces the same result regardless of how many times it is executed. This property is essential in distributed systems where network failures cause uncertainty: if a client sends a request and the connection drops before receiving a response, the client does not know whether the server processed the request. If the client retries, an idempotent operation guarantees correctness. A non-idempotent retry could create duplicate data, charge a credit card twice, or send a notification twice.
-
-In this project, idempotency is built into the CRDT conflict resolution model. Every shape operation carries a client-generated element ID and a monotonically increasing version number. If a WebSocket message is retried due to a reconnection, the CRDT merge logic on the server compares versions: an add for an existing element ID is treated as an update, and an update with a version equal to or lower than the existing element is silently discarded. This means duplicate deliveries never create phantom shapes or revert edits. For REST API operations, database constraints enforce idempotency -- the `UNIQUE(drawing_id, user_id)` constraint on `drawing_collaborators` prevents duplicate entries on retry.
+Omitted mechanisms include WebSocket authorization/revocation, canonical command receipts/sequences, a fenced room owner, durable pending-client recovery, safe snapshot/tombstone retention, cross-server fan-out/replay, autosave retries, room draining, actual exports, history restore, undo/redo, group selection, and fully accessible object navigation. Backend tests mock dependencies/session behavior; smoke tests cover login and drawing-list rendering, while screenshot configuration additionally opens seeded canvases. Neither establishes collaboration correctness. This review used source inspection and isolated mocked protocol/merge/renderer checks, not a live-stack run or benchmark.

@@ -1,352 +1,377 @@
 # Facebook Post Search — Frontend System Design Answer
 
-## 45–50 minute interview walkthrough
+A 45-minute proposal for a social-post search experience. It extends the local demo; the
+final checkpoint identifies the actual implementation boundary.
 
-| Segment | What I cover | Time |
-|---|---|---:|
-| Opening | Search experience, constraints, success criteria | 2 min |
-| Requirements | User flows, ranking assumptions, non-functional goals | 4 min |
-| Architecture | Routes, stores, search pipeline, rendering boundaries | 8 min |
-| Data model | Query state, result state, filters, pagination, ownership | 6 min |
-| Interfaces | API contracts, component contracts, URL state | 8 min |
-| Optimizations | Debouncing, cancellation, virtualization, caching, resilience | 18–20 min |
-| Wrap-up | Trade-offs, scaling path, risks | 3 min |
+## 🎯 Start With the Searcher's Intent — 4 minutes
 
-## Opening — 2 minutes
+> “The user is trying to find a post they remember, or discover something relevant. My job is to keep their query and results understandable while requests, permissions, and filters change.”
 
-I am designing the frontend for searching posts in a large social graph. A user enters a query, selects filters such as author, date, group, or media type, and receives ranked posts with highlighted matches. The page must feel immediate while the search backend handles indexing, ranking, permissions, and pagination.
+I would start with keyword and hashtag search, date/type/author filters, suggestions,
+highlighted snippets, and a way to continue through results. Public posts can be searched
+anonymously; signed-in users can also retrieve posts permitted by their relationships.
 
-I will treat ranking and authorization as server responsibilities. My frontend responsibility is to make query intent explicit, prevent stale responses from replacing newer results, render large result sets efficiently, and preserve accessibility when results change.
+I would clarify exact-phrase behavior and what Friends means. For this design, it means an
+accepted relationship. Friends-of-friends and groups are extensions because they change
+the authorization and suggestion contracts, not merely the filter menu.
 
-The main design tension is that search is both an input interaction and a server-state problem. Keystrokes are frequent and disposable; result pages are useful and cacheable. I will separate those lifecycles rather than place everything in one global store.
+The first version uses suggestions while typing and submits the full search on Enter,
+suggestion selection, or Apply. That keeps expensive result retrieval tied to an explicit
+intent. Search-as-you-type can be a later product choice with its own traffic budget.
 
-## R — Requirements — 4 minutes
+| Requirement | Meaning in the proposal |
+|-------------|-------------------------|
+| Typing | Immediate local feedback, independent of requests |
+| First results | Target within one second on a defined device/network |
+| Correctness | Old requests cannot replace a newer search |
+| Privacy | Current server checks; account-scoped client state |
+| Pagination | Continue a bounded stable search session |
+| Recovery | A page failure preserves already accepted results |
+| Accessibility | Keyboard operation, clear labels, useful announcements |
+| Resources | Bound pages, snippets, requests, and media work |
 
-### Clarifying questions
+These are goals, not measured performance. I would ask whether Back must restore the same
+result or merely rerun the query, and whether query URLs should be shareable. A shared
+query represents intent; it never grants another viewer access to the same results.
 
-I would ask whether search is scoped to the current user, a page, a group, or the whole platform. I would ask which filters are required for the first release and whether filter changes should update results automatically or require an Apply action.
+Media previews, post details, and saved searches can follow the core search flow. I would
+avoid spending the first interview on a full social-network composer or video platform.
 
-I would clarify whether results are ranked by relevance only or whether the user can switch to newest-first. I would ask whether posts can contain images, videos, links, and comments, and whether snippets must highlight matching terms.
-
-I would ask for the expected query length, supported languages, maximum result count, and whether users need search history or saved searches. I would also clarify whether the URL must be shareable and whether browser back/forward must restore the exact result page.
-
-### Functional requirements
-
-- Search posts by free-text query.
-- Apply filters for author, group, date range, post type, and sort order.
-- Show highlighted snippets, author identity, timestamps, media previews, and permission-safe actions.
-- Support cursor pagination or infinite scrolling without duplicate results.
-- Preserve a search in the URL so it can be shared and restored.
-- Show loading, empty, partial, and error states independently.
-- Allow the user to retry a failed page without losing the successful pages already displayed.
-- Support keyboard navigation and screen-reader announcements for result updates.
-
-### Non-functional requirements
-
-- The input should acknowledge local typing immediately.
-- A settled query should normally show the first result page within one second on a healthy network.
-- A stale response must never overwrite a newer query.
-- Initial rendering should stay responsive while result cards contain images or rich text.
-- The UI should remain useful when media, a later page, or a suggestion request fails.
-- Search state should be observable without logging private post content.
-- The frontend must respect server authorization and never infer visibility from cached results.
-
-### Out of scope
-
-I will not design the inverted index, relevance model, crawler, ranking features, permission join, or media transformation service. I will define their client-facing response shape and failure behavior.
-
-## A — Architecture — 8 minutes
-
-### High-level diagram
+## 🏗️ Architecture and State Ownership — 5 minutes
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         React SPA (Vite + TypeScript)                       │
-│ Routes: /search → search page · /search?q=... → shareable query            │
-│         /search/people and /search/groups → scoped suggestions             │
-│                                                                            │
-│ ┌──────────────┐ ┌────────────────┐ ┌────────────────┐ ┌───────────────┐ │
-│ │ authStore    │ │ queryStore     │ │ resultStore    │ │ filterStore   │ │
-│ │ session and  │ │ raw input,     │ │ pages, cursors,│ │ date, author, │ │
-│ │ capabilities │ │ debounced term │ │ snippets       │ │ type, sort    │ │
-│ └──────────────┘ └───────▲────────┘ └──────▲─────────┘ └──────▲────────┘ │
-│                          │ input            │ response           │ URL      │
-│ ┌────────────────────────┴──────────────────┐ ┌───────────────┴─────────┐ │
-│ │ Search coordinator                         │ │ Render adapters          │ │
-│ │ debounce · cancel · request identity       │ │ virtual list · cards     │ │
-│ │ cache · retry · pagination                 │ │ highlights · media       │ │
-│ └────────────────────────────────────────────┘ └─────────────────────────┘ │
-│ Typed API client: search · suggestions · next page · telemetry             │
-└────────────────────────────────────┬───────────────────────────────────────┘
-                                     │ HTTPS
-                         ┌───────────▼───────────┐
-                         │ Search API boundary    │
-                         │ ranking · permissions  │
-                         │ cursors · snippets     │
-                         └───────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ Query + filter drafts / accessible suggestions             │
+│ Committed route intent + account generation                │
+└─────────────────────────────┬──────────────────────────────┘
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│ Request controller: identity / pages / bounded cache       │
+│ Safe snippets + result list + reading anchor               │
+└─────────────────────────────┬──────────────────────────────┘
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│ Search API: fixed session / current access / ranking       │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### Shell and routes
+I would use React and TypeScript with a router and a small store or query-cache layer. The
+framework choice matters less than identifying who owns draft input, committed intent,
+request identity, and result pages.
+
+| State | Owner | Lifetime |
+|-------|-------|----------|
+| Raw query and filter edits | Controls | Until commit or discard |
+| Committed query/filter/sort | Route/controller | One search intent |
+| Viewer and auth generation | Auth boundary | One account session |
+| Search-session cursor/pages | Result controller | Bounded server/client session |
+| Suggestion request/options | Combobox | Current input generation |
+| Focus and reading anchor | View state | Current navigation context |
+
+The API owns ranking, authorization, query parsing, and pagination semantics. Cards
+display safe snippets and return interaction intent; they do not construct cursors or
+decide who may read a post.
+
+A normalized result model can separate post identity from page order. However, a search
+snippet is query-specific: two searches for the same post can highlight different text.
+Keep match fragments associated with their query/page context rather than overwriting one
+global snippet field by post ID.
+
+The URL can hold committed query and filters. Keep access tokens, private result payloads,
+and PIT identifiers out of it. Sort multi-select filter values deterministically so
+equivalent intent has the same key; do not lowercase or discard punctuation if that
+changes the chosen query language.
+
+I would commit browser history for explicit searches and use a deliberate policy for
+filter refinements. Every keystroke should not create a Back entry. Raw text stays local
+until the user commits.
+
+## 🔍 Deep Dive 1: Request Identity Is the Correctness Boundary — 10 minutes
+
+### Debounce and cancellation solve different problems
+
+Typing “co” then “coffee” can create overlapping requests. If the older response is
+slower, it can overwrite the newer suggestions or results. A debounce reduces request
+count, but does not decide which response is allowed to update the screen.
+
+I would debounce suggestions by roughly 200 ms, starting with that as a tuning value.
+Enter bypasses the suggestion timer and submits the full query. During IME composition,
+wait for committed composition rather than treating every intermediate input as a complete
+search term.
+
+Cancellation reduces wasted network/server work when supported. It is still possible for a
+completed response or application callback to race with abort. Every commit therefore
+checks an explicit generation.
+
+| Identity part | Why it is needed |
+|---------------|------------------|
+| Account generation | A response from the previous viewer must be discarded |
+| Committed search key | Query, filters, locale, and ranking mode travel together |
+| Search generation | A newer repetition of the same query can supersede an older one |
+| Page/session cursor | Continuation belongs to the current search |
+| Suggestion generation | Options must match the current draft text |
+
+An account switch increments the generation, aborts pending requests, and clears protected
+pages/history. Merely emptying an array is insufficient if an old request can populate it
+again a moment later.
+
+### Draft filters must not change an existing page request
+
+Suppose the user searched for coffee, opened Filters, and selected Photos without pressing
+Apply. If the store immediately changes the filters used by Load More, page two can use
+Photos with the cursor from the old unfiltered search.
+
+The client now has a mixed list even though both responses were individually valid. This
+is not a network race; it is an ownership mistake.
+
+I would keep draft filter choices separate. Apply commits a new intent and resets the
+search session. Cancel restores the committed selections. Load More always captures the
+committed query/filter tuple and its cursor.
+
+The same rule applies to a person suggestion. If it means “posts by this person,” it
+should commit a stable author ID filter. Sending only their display name as ordinary query
+text expresses a different search.
+
+### Keep request states independent
+
+A new search, the next page, and typeahead have different purposes. One global
+isLoading/error pair is too coarse: a failed suggestion should not hide a successful
+result list, and a failed next page should not erase page one.
+
+| State | Display |
+|-------|---------|
+| No committed search | Welcome/recent-search surface |
+| First page loading | Query heading and progress state |
+| First page empty | No matches for this committed intent |
+| First page unavailable | Retry/edit query; not “no results” |
+| Next page loading | Existing cards plus inline progress |
+| Next page failed | Existing cards plus retry for that cursor |
+| Suggestions failed | Full search remains available |
+
+For a new query, I would initially replace the result area with a clearly labeled loading
+state. Retaining old results is also possible, but their old query must remain visible;
+otherwise the new heading appears to describe unrelated content.
+
+Allow one next-page request per active cursor. Repeated clicks should not launch duplicate
+appends. On a definite page error, retry the same cursor within the same valid session; an
+expired session requires a new search.
 
-The shell owns authentication context, theme, global navigation, responsive layout, and shared announcements. The search route owns query parameters, page composition, and the lifetime of the active search session.
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| ✅ Explicit result submission + debounced suggestions | Predictable intent and request volume | One deliberate action before full results |
+| ✅ Identity checks plus cancellation | Correct under reordered responses | More lifecycle state |
+| ❌ Cancellation alone | Small implementation | Completed callbacks can still race |
+| ❌ Mutable filters shared with pending pagination | Fewer state fields | Pages can belong to different searches |
 
-The URL is a canonical representation of committed search intent. I keep transient input separate from the URL while the user is typing. After debounce, or after the user presses Enter depending on product choice, the route writes the normalized query and filters to history or replaces the current entry.
+> “I can change the debounce duration without changing correctness. I cannot remove the account/search identity check and still promise that the visible result belongs to the current intent.”
 
-This separation prevents every keystroke from creating a browser history entry. It also means opening a shared URL can reconstruct the query without reconstructing ephemeral focus or in-progress composition state.
+## 🔍 Deep Dive 2: Search Privacy Includes the Browser and Suggestions — 10 minutes
 
-### Search coordinator
+### A result cache is not an access grant
 
-The search coordinator accepts query intent from the route and produces a request identity. The identity includes the normalized query, filters, sort, and page cursor. It debounces only the first-page request; loading the next page is an explicit action and should not be delayed by typing behavior.
+The backend can use indexed visibility tokens to reduce candidate work, but it must verify
+current access before returning protected content. The browser should not infer
+authorization from a Friends icon or an old successful response.
 
-The coordinator cancels work that is no longer useful, but cancellation is an optimization rather than a correctness guarantee. The result reducer also checks request identity before committing a response because an HTTP response can race with cancellation.
+I would scope retained state by viewer and search session. On navigation/resume,
+revalidate protected cached results before displaying them again. On a known
+removal/revocation event, remove affected content immediately and reconcile the active
+session.
 
-### Rendering boundary
+A server cannot recall bytes the user already downloaded. The useful contract is current
+checks for new responses, prompt active-view removal where possible, and no deliberate
+replay of stale private data from a persistent offline cache.
 
-React renders the search controls and result-card semantics. A virtual list controls which cards are mounted. Media components own lazy loading, aspect-ratio reservation, and failed-preview fallbacks. Highlight rendering consumes trusted structured match ranges rather than injecting server-provided HTML.
+This is why I would start with a small in-memory result cache rather than persisting
+private result JSON in a service worker or localStorage. Losing instant offline results is
+a reasonable cost for a simpler privacy lifecycle in the first version.
 
-### Why not one global store?
+### The same boundary applies to suggestions and counts
 
-A single store is tempting because query, filters, results, and authentication are visible on the same page. It becomes difficult to reason about ownership, however. Search results are disposable server state, input is local interaction state, and auth is session state. Separate slices with explicit transitions make invalidation and testing clearer.
+A hidden post can leak through a suggested hashtag even when its result card is filtered
+out. Similarly, turning every user's query into a public trending term can disclose
+sensitive search intent.
 
-## D — Data Model — 6 minutes
+I would ask the API to label suggestion scope and type. Shared suggestions come from an
+explicitly public-safe corpus. Personal history is per viewer; directory results follow a
+defined directory policy. A single prefix-only cache is insufficient if signed-in and
+anonymous responses differ.
 
-### Server-originated entities
+An exact-looking total is also a response about content. If the server excludes
+stale/private hits after retrieval, it should not display the earlier candidate count as
+the number of posts the viewer can actually read. “20 results loaded” and a continuation
+affordance are often enough.
 
-| Entity | Important fields | Owner | Freshness |
-|---|---|---|---|
-| `SearchResult` | post ID, author, snippet, highlights, media, permission hints | result cache | query session |
-| `SearchPage` | result IDs, next cursor, total estimate, received time | result store | cursor page |
-| `SearchSuggestion` | label, type, destination, score | suggestion cache | short TTL |
-| `FacetCounts` | filter value, count, selected availability | result store | query-specific |
-| `ViewerContext` | user ID, capabilities, locale, privacy context | auth store | session |
+Thresholds and time windows can improve a public trend pipeline, but a simple popularity
+threshold is not a proof that private terms are safe to publish. The product needs a
+policy for what enters that corpus.
 
-The server remains authoritative for post visibility and action permissions. A cached result may be displayed, but actions such as opening a private group or deleting a post must still be checked by the destination and mutation API.
+### Highlights are untrusted data
 
-### Client-owned entities
+A post author controls the text being highlighted. Wrapping matching terms in em tags does
+not sanitize the rest of the snippet. A raw fallback substring can be just as unsafe as
+highlighted HTML.
 
-| Entity | Important fields | Lifetime |
-|---|---|---|
-| `SearchDraft` | raw input, focused field, composition status | component/session |
-| `CommittedQuery` | normalized term, filters, sort, URL key | route |
-| `RequestState` | request ID, status, started time, error kind | coordinator |
-| `ResultListState` | ordered IDs, pages, dedupe set, next cursor | route/session |
-| `SelectionState` | focused result, keyboard mode, active filter | local UI |
-| `MediaLoadState` | image/video status, retry count | result card |
+I would prefer a response with text plus typed highlight spans or fragments. The client
+validates bounds, ordering, and the agreed offset unit, then renders text nodes with
+marked ranges. UTF-16 offsets and Unicode code-point offsets are not interchangeable for
+every character.
 
-### Ownership rules
+If ranges are invalid or the content version changed, display escaped plain text without
+highlights. Do not apply offsets from an old indexed revision to newly edited canonical
+text. The server should keep content and highlights tied to one authorized revision.
 
-The input owns raw text. The route owns committed query parameters. The coordinator owns request lifecycle. The result store owns pages and deduplication. Cards own media loading and presentation state. No card should mutate the canonical query or append directly to the result array.
+An encoded/allowlisted HTML contract is an alternative when integrating an existing search
+engine. It requires the encoder, sanitizer policy, and fallback path to be covered
+together; “the HTML came from our server” is not a sufficient trust argument.
 
-### State machine
+| Decision | Why it fits | Cost |
+|----------|-------------|------|
+| ✅ Viewer-scoped in-memory results | Clear invalidation and account boundaries | Less offline reuse |
+| ✅ Structured snippets | Untrusted text stays text | Range/version contract and validation |
+| ❌ Persistent private stale-while-revalidate cache | Instant redisplay | Can expose content after access changes |
+| ❌ Trust search filtering for all suggestions/counts | Simple endpoints | Auxiliary responses can reveal hidden information |
 
-The first-page state transitions from idle to debouncing, loading, success, empty, or error. A new committed query resets the page list but preserves the input and filter controls. Loading the next cursor has an independent state so existing results remain interactive.
+### Accessibility makes the state understandable
 
-For an identical query, a cached success can render immediately while a background refresh marks the result stale. For a different query, the previous results can remain visible with a “refreshing” indicator, or the product can clear them; I would choose the first option when continuity matters and label the content clearly.
+The input has a visible label and combobox semantics when suggestions are present. Arrow
+keys move an active option, Enter chooses it or submits the draft, Escape closes the
+popup, and focus remains in the input while options change.
 
-## I — Interfaces — 8 minutes
+Use stable option identities rather than array position. A late refresh should not
+silently change the meaning of the currently active option. Announce concise
+loading/result status politely, not every suggestion arrival or all snippet text.
 
-### Server-facing API
+Filter selections need native checked/pressed semantics and meaningful date labels. A
+mobile dialog has a predictable focus return and explicit Apply/Cancel; a visual popover
+alone does not establish keyboard behavior.
+
+> “Privacy and accessibility both depend on honest state. The UI should make clear whose query is committed, what is loading, and which content the current response actually permits us to display.”
 
-```
-GET  /api/v1/search/posts?q=&filters=&sort=&limit=       → first page
-GET  /api/v1/search/posts?cursor=&q=&filters=&sort=      → next page
-GET  /api/v1/search/suggestions?q=&scope=                → suggestions
-GET  /api/v1/search/facets?q=&filters=                   → facet counts
-GET  /api/v1/posts/:postId                              → canonical post view
-POST /api/v1/search/telemetry                            → aggregated interaction events
-```
+## 🔍 Deep Dive 3: Stable Continuation and Bounded Rendering — 9 minutes
+
+### A cursor string does not establish stable ranking
 
-The search response includes a stable result ID, a server-issued next cursor, query echo, normalized filters, highlights as offsets or tokens, and a partial-data indicator. The response does not include arbitrary executable markup.
+An API can call the string “20” a cursor while still implementing offset paging. New index
+refreshes can shift the list between requests, causing repeated or omitted posts.
 
-The cursor is opaque to the client. The client stores it and sends it back unchanged. If the server reports an expired cursor, the UI offers a restart from the first page rather than guessing how to reconstruct a page boundary.
+A score-plus-ID cursor resolves equal-score ties but does not freeze a changing ranking.
+Client deduplication can hide repeated IDs; it cannot recover a result the server skipped
+before sending it.
+
+For this proposal, the server gives a short-lived search session backed by a point in time
+and fixed query/ranking context. The browser treats its next cursor as opaque and
+preserves returned order. New query, filter, account, or ranking-mode changes start a new
+session.
 
-### Client interfaces
+Permissions remain current, so some old candidates may disappear. The server advances
+through examined positions and reports explicit expiry/reset or partial work rather than
+silently interpreting an old cursor against a new ranking.
 
-| Interface | Inputs | Outputs | Responsibility |
-|---|---|---|---|
-| Search route | URL state, viewer context | page model | lifecycle and composition |
-| Query controls | draft, committed filters | query intent | input and validation |
-| Search coordinator | query intent | request states, pages | debounce, cancel, identity |
-| Result list | ordered result IDs | visible cards | virtualization and keyboard path |
-| Result card | normalized result | accessible post summary | highlighting and media fallback |
-| Filter panel | facet data, selected values | filter intent | mobile and desktop controls |
+The client should distinguish the end of this selected search session from an assertion
+that no matching post exists anywhere. Suggest refinement when the result horizon or work
+budget is reached.
 
-### URL and browser history
+### Start with a bounded list; virtualize when measured cost warrants it
 
-The serializer must be deterministic: the same filter set produces the same URL ordering. Unknown filters are ignored or surfaced as unsupported rather than silently changing meaning. Back restores the committed query and starts a request if the cache has expired.
+The first page is twenty text snippets. That is a reasonable ordinary list. As users
+accumulate pages or media previews are added, measure DOM/layout cost and introduce
+windowing if it materially helps.
 
-### Request lifecycle
+Virtualization bounds mounted rows, not stored arrays, decoded images, or every query ever
+visited. I would separately cap retained pages, for example five pages near the reading
+anchor, with controlled reload within the same valid session.
 
-1. The user edits `SearchDraft` without making a network request on every keystroke.
-2. The coordinator normalizes whitespace, locale-sensitive text, and filter values.
-3. The route commits the query and creates a request identity.
-4. The coordinator checks a cache, starts the request, and records loading state.
-5. The response is accepted only if its identity matches the active first-page request.
-6. Pages are merged by stable post ID while preserving server order.
-7. The next cursor is enabled only when the server returns one.
+| Resource | Initial policy to validate |
+|----------|----------------------------|
+| Working result pages | Five pages around the anchor |
+| Query cache | Small viewer-scoped memory budget, no private persistent payloads |
+| Mounted rows if virtualized | Viewport plus a small measured overscan |
+| Media | Known dimensions, responsive sources, lazy loading |
+| Next-page requests | One per active cursor |
+| Abandoned search sessions | Close or expire promptly |
 
-### Component contract details
+If cards vary in height, reserve image aspect ratios and measure actual row heights. Key
+measurements by stable post/result identity, not by array index. Keep query-specific
+snippets associated with that search even if post metadata is normalized globally.
 
-The result list receives an ordered list and a resolver for result records. It does not receive the full raw API response. This keeps pagination metadata out of card components and allows a virtualizer to render placeholders without changing the server model.
+Windowing removes off-screen content from the DOM, affecting find-in-page and
+screen-reader navigation. Retain a focused row within a small explicit budget or
+deliberately move focus before disposal. Do not retain every previously focused card
+forever.
 
-The card exposes a semantic article or list item, a heading, author link, timestamp, snippet, and action menu. The media slot receives a constrained resource descriptor and must provide a fallback label when loading fails.
+### Back should return to content, not just a number
 
-## O — Optimizations and Deep Dives — 18–20 minutes
+When opening a future detail route, save the committed intent, session identity, page
+references, anchor result ID, and offset within it. A bare scrollTop value is unreliable
+after images load or rows disappear.
 
-### Deep dive 1: Debounce, cancellation, and stale responses
+On return, restore compatible retained pages after any required access revalidation, then
+measure around the anchor. If the server session expired, rerun the query and explain the
+reset. A shared URL should rerun under the recipient's identity rather than recover the
+sender's private session.
 
-I would use a short debounce for free-text search, but not rely on debounce as the only load-control mechanism. A user may type rapidly, paste a long query, or change filters while a request is in flight.
+This costs more state than discarding the list on every navigation. It pays off when
+readers inspect multiple candidate posts and need to compare them without repeatedly
+scrolling from the top.
 
-The coordinator assigns a monotonically increasing request identity. Every response carries the identity it started with. The reducer commits only the active identity, so a slow response for “cat” cannot replace a newer response for “caterpillar.” Abort signals reduce server and browser work, but the identity guard protects correctness even if the transport ignores abort.
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| ✅ Server session + opaque cursor | Explainable ranked continuation | Expiry and bounded server resources |
+| ✅ Bounded pages with content anchor | Predictable memory and Back behavior | Reload/remeasurement logic |
+| ❌ Cursor name alone | Simple API surface | May hide offset instability |
+| ❌ Keep every page/card mounted | Easy local state | Unbounded long-session resources |
 
-The trade-off is that keeping previous results visible can confuse the user if the new query is not visually obvious. I would show the committed query in the heading and a non-blocking refresh state, rather than show unlabelled stale content.
+## 🧪 Contracts, Tests, and Scaling — 5 minutes
 
-### Deep dive 2: Search-as-you-type versus submit
+| API concept | What the frontend needs |
+|-------------|--------------------------|
+| Search intent | Canonical query/filter echo and search identity |
+| Page | Ordered results, session cursor, expiry, continuation/partial state |
+| Result | Stable ID, authorized revision, safe snippet, action hints |
+| Suggestion | Stable option ID, type, scope, display text, committed action |
+| Error | Unavailable, invalid input, expired session, or permission change |
 
-Search-as-you-type is responsive for short queries and useful for discovery, but it creates request volume and can produce noisy ranking changes. Submit-only search reduces load and makes URL history predictable, but adds a deliberate interaction step.
+The client should not need raw ranking features or database schema to render a useful
+search result. A raw score is useful in a diagnostic tool, but not a product explanation
+of relevance or a probability of correctness.
 
-I would use a hybrid: suggestions can update as the user types, while full post results require a minimum query length and a debounce. Pressing Enter bypasses the remaining debounce. This keeps the high-frequency endpoint lightweight and reserves expensive ranking work for committed intent.
+I would test sequences, not just whether a static result appears:
 
-### Deep dive 3: Pagination and virtualization
+1. An old query completes after a new one: only the new identity commits.
+2. A filter draft changes before Apply: Load More still uses committed filters.
+3. Logout occurs during a private search: the response cannot repopulate state.
+4. Page two fails: page one remains and retry targets the same cursor.
+5. A snippet contains markup or mismatched ranges: text stays safe and readable.
+6. A session expires during Back: the UI explains a restart.
+7. Keyboard focus sits on a result during page eviction: navigation stays coherent.
 
-The API should return cursor pages because relevance ranking and new posts make offset pages unstable. The frontend deduplicates by post ID because a result can move between pages after an index refresh or filter transition.
+Use store-level assertions for request identity and merging, and browser tests for focus,
+layout, and navigation. Virtualization tests should control viewport and scroll instead of
+assuming every result is mounted.
 
-I would use virtualization after measuring card cost, not as a blanket rule. Variable-height cards require an estimated height, measurement, and overscan. Overscan must be bounded because mounting a dozen video-heavy cards can cost more than rendering a modest non-virtualized page.
+Measure typing delay, suggestion latency, request-to-result time, commit-to-paint, memory
+growth, and page retries separately. Avoid raw queries/snippets in ordinary telemetry;
+hashing a predictable search term does not make it anonymous.
 
-Infinite scrolling is convenient but can hide the end of results and make footer actions inaccessible. I would use an intersection sentinel for loading while retaining a visible “load more” control and a keyboard-accessible status region.
+At scale, suggestions can outnumber submitted searches. With four suggestion requests per
+submission, optimizing the small endpoint can matter as much as optimizing the full result
+query. Debounce, coalescing, and scoped cache keys reduce unnecessary work without
+weakening correctness.
 
-### Deep dive 4: Caching and invalidation
+## 📝 Close and Local Checkpoint — 2 minutes
 
-The cache key includes normalized query text, filters, sort, locale, and viewer scope. Results are not shared across users unless the server explicitly guarantees that visibility is identical. A short TTL is appropriate because search results may change, but cache reuse should not bypass authorization.
+> “I separate draft input from committed search intent, protect every response with account/search identity, and rely on the server for stable continuation and current access. Rendering stays bounded, and snippets remain untrusted text.”
 
-The first page has more value than deep pages, so I would cache it longer and evict old cursor pages first. A successful response can be shown while a refresh runs in the background. A permission change or account switch clears the cache immediately.
+The local demo has Enter-to-search, per-keystroke suggestions, filters, a Load More list,
+and an admin dashboard. It has no debounce/cancellation, query URL state, request
+generations, bounded page cache, virtualizer, or structured highlight contract.
 
-### Deep dive 5: Highlighting and safe rendering
+Filters mutate the store before Apply, late responses can replace newer results, and
+logout leaves search state behind. Snippets enter dangerouslySetInnerHTML directly. User
+suggestions submit display-name text, and the recent-history SQL is invalid.
 
-The server should return token offsets or typed match fragments. The client validates offsets against the displayed text and renders marked spans. It should not render an HTML snippet from the search service because that creates an unnecessary trust boundary and complicates sanitization.
-
-If stemming or normalization means the match is not a literal substring, the server should return display-ready token ranges. The client can show a fallback snippet without highlights when ranges are invalid.
-
-### Deep dive 6: Media and rich result cards
-
-Card layout reserves media dimensions before the asset loads to avoid layout shift. Images use responsive sources and lazy loading. Video previews are muted, do not autoplay on reduced-motion preferences, and stop when the card leaves the viewport.
-
-A failed image should not fail the result. The card keeps text, author, and timestamp available and exposes a retry action only when retry is useful. Media requests use their own concurrency budget so a search response is not blocked by thumbnails.
-
-### Deep dive 7: Accessibility and mobile behavior
-
-The search field has a visible label, keyboard shortcut only as an enhancement, and a clear button that is reachable by keyboard. Filter controls use native semantics where possible. On mobile, the filter panel becomes a modal or drawer with focus trapping and an explicit Apply action.
-
-When a new result page arrives, I would announce a concise count or status without moving focus. Keyboard users can move through results using normal document order, and a focused result remains stable when virtualization recycles DOM nodes.
-
-### Failure matrix
-
-| Failure | User-visible behavior | Recovery |
-|---|---|---|
-| First page timeout | Keep query and show retry state | Retry with backoff or edit query |
-| Stale response | Ignore response | Active request continues |
-| Next page failure | Preserve prior pages | Inline retry for that cursor |
-| Cursor expired | Explain page restart | Restart first page |
-| Suggestions fail | Keep full search usable | Retry on next edit |
-| Thumbnail fails | Text card remains | Lazy retry or placeholder |
-| Permission changes | Revalidate destination | Remove unauthorized result |
-
-### Scope growth and extension decisions
-
-I would start with one result type, posts, and a route-scoped search coordinator. People, groups, pages, and media can later become result adapters behind the same query contract. Each adapter should declare its card renderer, accessibility summary, and canonical destination rather than forcing the result list to know every type.
-
-This is a useful module boundary, but it does not require an iframe per result card. Cards share virtualization, keyboard order, query cancellation, and media budgets. A local registry or independently deployed module is sufficient for first-party result families. An iframe is reserved for untrusted third-party content, where hard isolation matters more than shared rendering efficiency.
-
-The result contract should include a stable type, record ID, display text, match ranges, destination, and capability-scoped actions. It should not expose raw ranking features or a broad API client. The shell can render a fallback card when a result family is unavailable.
-
-### Testing and observability
-
-I would test request races, URL round trips, cursor expiry, duplicate pages, filter changes during loading, media failure, keyboard navigation, and permission changes after caching. An end-to-end test should type a query, navigate back, restore it from the URL, and verify that the stale response is ignored.
-
-Telemetry records debounce-to-request time, first-result latency, result commit-to-paint, scroll frame time, cursor retries, media failure rate, and request-race suppression. It should avoid raw query text, snippets, and post content in ordinary analytics.
-
-### Alternative architecture review
-
-The simplest search page fetches in the input handler and renders every result. It is easy to demo, but it creates request races, makes browser history noisy, and lets rich cards dominate the main thread.
-
-A global store for every search query would improve reuse but also risks retaining private result pages and mixing viewer scopes. Route-scoped result state with a disciplined cache is safer. A shared cache can be introduced after its key includes identity, permissions, locale, and query semantics.
-
-Search result families are a natural module boundary. A local registry or independently deployed first-party module can provide a card renderer and accessibility summary. An iframe per card is not appropriate because cards share virtualization, keyboard order, media budgets, and query lifecycle. Hard isolation is reserved for untrusted embeds.
-
-### API semantics worth making explicit
-
-- Search requests echo normalized query, filters, sort, and request identity.
-- Cursors are opaque and tied to a query version.
-- Results include stable IDs, structured highlights, and capability-scoped actions.
-- Facets are query-specific and do not imply that a value is globally visible.
-- A next-page failure does not discard successful pages.
-- Expired cursors restart from the first page with an explanation.
-- Canonical post routes revalidate permission.
-- Telemetry omits raw query text and post content.
-
-### Presentation checkpoints
-
-I begin with the user journey: type a query, refine filters, open a result, scroll, navigate back, and retry a failed page.
-
-I trace that journey through draft input, committed URL state, request identity, result pages, virtualized cards, and canonical post navigation.
-
-I pause on stale-response protection because it is the most important correctness rule in a fast search UI.
-
-I close by explaining how result families can grow without coupling the search coordinator to every card implementation.
-
-### Implementation sequence
-
-1. Build the search route, accessible controls, and URL serializer.
-2. Add a typed first-page request with request-identity protection.
-3. Add filters, suggestions, cursor pagination, and independent retry states.
-4. Add normalized result records, deduplication, and bounded card rendering.
-5. Add structured highlights, media fallbacks, and keyboard navigation.
-6. Add cache policy, telemetry, and permission revalidation.
-7. Add new result families through a registry after the core contract is stable.
-
-### Design review questions
-
-The first question is whether a late response can replace the current query. If it can, cancellation is being mistaken for correctness.
-
-The second is whether a next-page failure discards successful results. If it does, page lifecycle is coupled too tightly to the first request.
-
-The third is whether the cache key includes viewer scope and normalized filters. If it does not, private results can leak across sessions.
-
-The fourth is whether a broken card family leaves the result list navigable. If it does not, the rendering boundary is too broad.
-
-### What I would validate first
-
-I would test slow and out-of-order responses, URL back/forward, duplicate cursors, failed thumbnails, and a permission change after caching. The result list should preserve the query contract and remain keyboard navigable.
-
-The success criteria are no stale result replacement, bounded card work, safe structured highlighting, and privacy-safe cache and telemetry behavior.
-
-### Performance and scaling
-
-The first bottleneck is usually not the request itself but the combined cost of parsing, image decoding, DOM layout, and rich cards. I would measure input-to-request, request-to-first-result, result commit-to-paint, and scroll frame time separately.
-
-The result model should avoid copying large arrays for every keystroke. Store records by ID and keep ordered IDs per page. Memoized selectors let a single result update rerender one card rather than the whole list.
-
-If query traffic grows, the server can provide suggestions from a cheaper endpoint, while the frontend coalesces identical requests across tabs only when privacy permits. A SharedWorker is not necessary for the first version because search is user-specific and short-lived; it is more valuable for shared public market data than private search.
-
-### Security and privacy
-
-Search terms may contain sensitive personal information. Telemetry should use hashed or categorized values where possible, and logs should avoid raw query text. The client must not expose hidden filter options based on guessed API fields. Capability flags should come from the authenticated session and remain advisory; the server enforces access.
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|---|---|---|---|
-| Query trigger | Debounced hybrid | Every keystroke | Preserves discovery without ranking overload |
-| Pagination | Cursor | Offset | Stable under changing ranked results |
-| Result state | Route-scoped cache | One global store | Matches disposable search sessions |
-| Correctness guard | Request identity | Abort only | Abort is not guaranteed to stop races |
-| Rendering | Virtualized cards | Render all | Bounds DOM cost for long result sets |
-| Highlighting | Structured ranges | Server HTML | Safer and easier to validate |
-| Media | Lazy, isolated | Block on media | Text search remains usable |
-| URL state | Committed query | Raw draft | Shareable and history-friendly |
-
-## Closing — 3 minutes
-
-The design separates raw input, committed route state, server search state, and card presentation state. The combined architecture keeps concrete React routes and stores visible while making the important runtime boundaries explicit: a search coordinator owns debounce, cancellation, caching, and cursor lifecycle; render adapters own virtualization and media; the API owns ranking and permissions.
-
-The first production risks I would validate are stale-response handling, variable-height virtualization, privacy-safe telemetry, and the behavior of permission changes after a result is cached. If those are correct, the frontend can scale from a simple search page to scoped search, richer filters, and multiple result types without making every component aware of transport details.
+The backend returns an offset string, trusts indexed privacy, and uses inconsistent rules
+on other post endpoints. The [architecture](./architecture.md#implementation-notes)
+documents those source findings; the [README](./README.md) describes actual setup and
+fixtures. This review did not benchmark or run the full application.

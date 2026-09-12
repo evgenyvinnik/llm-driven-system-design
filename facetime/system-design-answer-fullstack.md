@@ -1,394 +1,363 @@
-# FaceTime - System Design Answer (Full-Stack Focus)
+# FaceTime: Full-Stack System Design Interview
 
-## 45-minute system design interview format - Full-Stack Engineer Position
+## 🎯 Scope and Success Criteria — 4 minutes
 
-## Opening Statement (1 minute)
+> “I’ll follow one video call from Alice pressing Call, through Bob accepting on one device,
+> to both browsers exchanging media. The design needs a reliable call decision and a working
+> media path; neither proves the other.”
 
-"I'll design FaceTime as a full-stack system, focusing on the integration between the signaling server and the WebRTC-powered frontend. The key challenges span both layers: the backend must handle WebSocket signaling with proper state management and multi-device ringing, while the frontend must manage peer connection lifecycle and render video streams. I'll emphasize the signaling protocol design, call state synchronization, and how ICE candidates flow between peers through the server."
+This is a FaceTime-inspired browser service, not a claim about Apple's implementation. I
+would support one-to-one audio/video, a contact list, multi-device ringing, mute/video
+controls, hangup, and private call history. Group calling can extend the media topology
+through an SFU after the basic lifecycle is sound.
 
-## Requirements Clarification (3 minutes)
+I would defer screen sharing, effects, recording, shared playback, and device transfer. Each
+adds meaningful resource, negotiation, and permission work. Drawing a button for one of
+those features is much easier than making its lifecycle reliable.
 
-### Functional Requirements
-- **1:1 Calls**: Video and audio calls between two users
-- **Group Calls**: Multi-party video with up to 32 participants
-- **Multi-Device Ring**: Incoming calls ring on all user devices
-- **Call Transfer**: Hand off active call to another device
-- **Call Controls**: Mute, video toggle, speaker selection
+The initial policy permits one accepted call per user. Decline rejects that user's
+invitation across their devices; a local notification dismiss would be a different action. A
+caller cancelling while the callee is accepting must produce one explainable final outcome.
 
-### Non-Functional Requirements
-- **Latency**: < 150ms end-to-end for media
-- **Setup Time**: < 3 seconds from dial to connected
-- **Reliability**: 99.9% signaling availability
-- **Scale**: Support millions of concurrent calls
+| Concern | Initial target or invariant |
+|---------|-----------------------------|
+| Online ringing | p95 below two seconds from request to an online device’s ring |
+| Media setup | p95 below three seconds after acceptance on supported networks |
+| Media delay | Aim below 200 ms one-way in a defined regional profile |
+| Availability | Proposed 99.9% regional call-control availability |
+| Device selection | One accepted device per invited seat |
+| Retry behavior | One durable outcome for the same actor, operation ID, and body |
+| Cleanup | An ended attempt cannot later acquire or attach media |
 
-### Full-Stack Scope
-- WebSocket signaling protocol
-- REST API for call history and user management
-- React frontend with WebRTC integration
-- PostgreSQL for persistence, Redis for presence
+These are design targets. Human time spent deciding whether to answer is separate from
+signaling or media setup latency. I would also measure one-way media delay separately from
+network round-trip time.
 
-## High-Level Architecture (5 minutes)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     React Frontend                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │  Call Store │  │   WebRTC    │  │    Video Components     │  │
-│  │  (Zustand)  │  │    Hook     │  │                         │  │
-│  └──────┬──────┘  └──────┬──────┘  └─────────────────────────┘  │
-│         │                │                                       │
-│  ┌──────┴────────────────┴──────────────────────────────────┐   │
-│  │              WebSocket Signaling Client                   │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  WebSocket Signaling Server                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │  Connection │  │    Call     │  │    ICE Candidate        │  │
-│  │   Manager   │  │   Router    │  │      Relay              │  │
-│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────────┘  │
-│         │                │                     │                 │
-│  ┌──────┴────────────────┴─────────────────────┴─────────────┐  │
-│  │                    State Manager                           │  │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-          │                │                     │
-          ▼                ▼                     ▼
-   ┌────────────┐   ┌────────────┐       ┌────────────┐
-   │ PostgreSQL │   │   Redis    │       │   Coturn   │
-   │            │   │ (Presence) │       │   (TURN)   │
-   └────────────┘   └────────────┘       └────────────┘
-```
-
----
-
-## Deep Dive: Signaling Protocol (8 minutes)
-
-### WebSocket Message Schema
-
-The signaling protocol uses a typed union of message types shared between frontend and backend:
+## 🏗️ Architecture and Shared Contract — 6 minutes
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                    Signaling Message Types                      │
-├────────────────────────────────────────────────────────────────┤
-│  register          │ deviceId                                   │
-│  initiate_call     │ calleeId, callType, idempotencyKey        │
-│  ring              │ callId, caller info, callType             │
-│  answer_call       │ callId, SDP payload                       │
-│  call_answered     │ callId, SDP payload                       │
-│  decline_call      │ callId                                    │
-│  ice_candidate     │ callId, candidate                         │
-│  end_call          │ callId                                    │
-│  call_ended        │ callId, reason                            │
-│  offer             │ callId, SDP payload                       │
-│  error             │ code, message                             │
-└────────────────────────────────────────────────────────────────┘
+┌──────────────────────┐     ┌──────────────────────┐
+│ React call interface │────▶│ Client call owner    │
+└──────────────────────┘     └──────────┬───────────┘
+                                        │ Control
+                                        ▼
+┌──────────────────────┐     ┌──────────────────────┐
+│ Device routing       │◀────│ Call authority       │
+└──────────────────────┘     └──────────┬───────────┘
+                                        ▼
+                             ┌──────────────────────┐
+                             │ SQL state + outbox   │
+                             │ Claims and receipts  │
+                             └──────────────────────┘
+
+┌──────────────────────┐     ┌──────────────────────┐
+│ Browser A media      │◀───▶│ Browser B media      │
+└──────────────────────┘     └──────────────────────┘
+        Direct candidate pair or TURN relay
 ```
 
-### Backend: WebSocket Handler Architecture
+The client call owner manages the peer connection, streams, negotiation queues, and attempt
+identity. React renders the call’s status and controls. The backend authenticates devices,
+commits call transitions, and routes messages to the intended endpoints. PostgreSQL stores
+decisions and receipts; Redis can cache connection routes and presence.
 
-The signaling server manages connections and routes messages between peers:
+The media path is separate from HTTP and WebSocket signaling. STUN helps discover candidate
+addresses, ICE tests connectivity, and TURN can relay packets when appropriate. A group SFU
+would become a separate media endpoint rather than an extra database or signaling handler.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SignalingServer Class                         │
-├─────────────────────────────────────────────────────────────────┤
-│  connections: Map<deviceId, Connection>                          │
-│  userDevices: Map<userId, Set<deviceId>>                         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│  handleRegister │  │ handleInitiate  │  │  handleAnswer   │
-│                 │  │     Call        │  │      Call       │
-│ - Store conn    │  │ - Idempotency   │  │ - Atomic state  │
-│ - Track devices │  │ - Create call   │  │   transition    │
-│ - Redis presence│  │ - Ring all      │  │ - Stop other    │
-│                 │  │   devices       │  │   device rings  │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ handleIce       │  │   handleEnd     │  │ handleDisconnect│
-│ Candidate       │  │     Call        │  │                 │
-│ - Deduplicate   │  │ - Update DB     │  │ - Clean up      │
-│ - Relay to peer │  │ - Notify all    │  │ - Remove from   │
-│                 │  │ - Clean Redis   │  │   presence      │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
-```
+The state model distinguishes authoritative call decisions from local media conditions:
 
-### Call State Flow
+| State | Authority | Example |
+|-------|-----------|---------|
+| Invitation and deadline | Server | Bob may answer until a specified deadline |
+| Winning device and call revision | Server | Bob's phone accepted revision 4 |
+| Peer negotiation phase | Client controller | Offer sent; waiting for remote description |
+| Media health | Browser observations | Incoming audio is flowing; video stalled |
+| Pending command outcome | Client plus durable server receipt | Accept was sent but its response was lost |
+| Capture and playback resources | Client controller | Owns microphone track and remote media element |
 
-"The server determines call state transitions atomically. When a call is initiated, we use an idempotency key to prevent duplicate calls from network retries."
+An accepted call is not yet a connected media session. The interface can say “Connecting”
+after acceptance and transition to active media when the browser observes a usable path. A
+socket's open event should not trigger either of those states.
 
-```
-┌─────────┐    initiate    ┌─────────┐    answer     ┌───────────┐
-│  idle   │ ─────────────▶ │ ringing │ ────────────▶ │ connected │
-└─────────┘                └─────────┘               └───────────┘
-     │                          │                          │
-     │                          │ timeout/decline          │ end_call
-     │                          ▼                          ▼
-     │                    ┌───────────┐              ┌─────────┐
-     └───────────────────▶│  missed/  │              │  ended  │
-                          │ declined  │              └─────────┘
-                          └───────────┘
-```
+| Proposed interface | Contract |
+|--------------------|----------|
+| Authenticated device registration | Establish account, device ownership, connection generation |
+| Initiate command | Recipients, modality, stable actor-scoped operation ID |
+| Accept/decline/end command | Call ID, expected state/revision, stable retry identity |
+| Call snapshot/resume | Current revision, terminal status, accepted endpoint claims |
+| Offer/answer/ICE | Authorized endpoint pair and negotiation generation |
+| TURN credential request | Current relay configuration and bounded credential lifetime |
+| History query | Only calls visible to the current account, with a stable cursor |
 
-### Register Flow
+This is a proposed contract. The local project has a smaller and less reliable API, which I
+would identify explicitly at the end of the interview.
 
-- Store connection in Map with deviceId as key
-- Track user's devices in userDevices Map
-- Update Redis presence with 60s TTL
-- Add device to user's device set in Redis
+## 📱 Deep Dive: From Call Button to One Answering Device — 10 minutes
 
-### Initiate Call Flow
+> “I’ll make the call command durable and retry-safe, then make device acceptance an atomic
+> server decision. The browser can provide immediate feedback without pretending it already
+> knows the winner.”
 
-- Check idempotency key in Redis (5 min TTL)
-- Create call record in PostgreSQL with state 'ringing'
-- Get callee's online devices from Redis
-- Send 'ring' message to all callee devices
-- Store call state in Redis hash for quick access
-- Set 30 second ring timeout
+Alice presses Video Call. The frontend records the selected contact and starts a new attempt
+generation. It acquires media through the user action, while showing permission/preparation
+status. A cancelled or superseded attempt cannot proceed when a delayed permission result
+arrives.
 
-### Answer Call Flow
+Once the attempt is ready to initiate, it sends the recipients, modality, and a stable
+operation ID. The server derives Alice's identity from authentication and validates the
+request. It does not trust a user ID supplied by an arbitrary socket as proof of identity.
 
-- Atomic state update: UPDATE calls WHERE state = 'ringing'
-- First device to answer wins (concurrent-safe)
-- Stop ringing on other devices via 'call_ended' message
-- Update Redis call state with answering device
-- Send SDP to initiator device
+One transaction reserves the caller's active slot, creates the call and invitations, and
+writes both the retry receipt and ring outbox entries. The response identifies a committed
+call. If the response disappears, Alice retries the same operation and body and receives the
+same recorded result.
 
-### ICE Candidate Flow
+This transaction prevents two different partial-success cases. A key written before the call
+could point to a nonexistent record. A call written before an unrelated notification send
+could exist without ever ringing Bob. The receipt and outbox give both the client and
+delivery worker a recoverable boundary.
 
-- Hash candidate to detect duplicates
-- Use Redis SETNX for atomic dedup check
-- Relay to other peer in the call
-- 5 minute TTL on dedup keys
+| Initiation approach | What it solves | Cost or failure |
+|---------------------|----------------|-----------------|
+| ✅ Transactional call, receipt, and outbox | Recovers creation and delivery after lost responses or crashes | Receipt retention and an event delivery worker |
+| ❌ Separate Redis key and SQL insert | Suppresses some sequential retries | Still races and can return a dead call ID |
+| ❌ Retry every tap as a new call | Simple client behavior | Duplicate invitations and phantom ringing |
 
----
+The delivery worker rings Bob's currently registered connections with the same call ID,
+revision, and deadline. A delayed or duplicated ring is harmless only if the recipient
+checks that the invitation is still current. A transport delivery acknowledgment is not
+evidence that Bob saw or accepted it.
 
-## Deep Dive: Frontend Integration (7 minutes)
+Bob presses Accept on the phone while the laptop also sends acceptance. Both may have
+acquired media locally, but the server atomically claims one invited seat. It commits the
+winner, participant state, busy slot, retry receipt, and sibling-dismiss events together.
 
-### Signaling Client Hook Architecture
+The winning device proceeds to negotiation. The other device receives the canonical winner,
+stops its capture, and shows “Answered on another device.” A missing response can be
+resolved by the receipt; the losing device must not claim success merely because its button
+was pressed first locally.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      useSignaling Hook                           │
-├─────────────────────────────────────────────────────────────────┤
-│  wsRef: WebSocket reference                                      │
-│  webRTCRef: WebRTC hook reference                                │
-├─────────────────────────────────────────────────────────────────┤
-│  connect()       │ Establish WS, register device                 │
-│  handleMessage() │ Route incoming messages to handlers           │
-│  sendMessage()   │ Send JSON message to server                   │
-│  initiateCall()  │ Start outgoing call with idempotency key      │
-│  answerCall()    │ Accept incoming call, create offer            │
-│  declineCall()   │ Reject incoming call                          │
-│  hangup()        │ End active call                               │
-│  sendIceCandidate() │ Relay ICE candidate to peer                │
-└─────────────────────────────────────────────────────────────────┘
-```
+The busy slot must cover different calls as well as different devices. If Alice is invited
+to call X and call Y at the same time, locking only each call row can still allow two
+independent acceptances. The account-wide active claim prevents that outcome under our
+initial policy.
 
-### Message Handler Logic
+Cancel and timeout use the same conditional transitions. If cancellation wins, a later
+acceptance returns the terminal result. If acceptance wins, a later hangup becomes a
+termination request for the accepted call. An old timer cannot blindly overwrite current
+state as missed.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   Message Handler Switch                      │
-├──────────────────────────────────────────────────────────────┤
-│  'ring'          ──▶ receiveIncomingCall() in store          │
-│  'offer'         ──▶ webRTC.createAnswer() ──▶ answer_call   │
-│  'call_answered' ──▶ webRTC.handleAnswer() ──▶ setConnected  │
-│  'ice_candidate' ──▶ webRTC.addIceCandidate()                │
-│  'call_ended'    ──▶ endCall() in store                      │
-│  'error'         ──▶ console.error()                         │
-└──────────────────────────────────────────────────────────────┘
-```
+For group calls, each invited user has a separate seat. A room can become active after one
+participant joins while others are still invited. Reusing a single “ringing versus
+connected” flag as the admission check for every invitee would block the rest of the group.
 
-### Call Manager Component
+The frontend also scopes every event to the current attempt. A late call_end from an old
+invitation cannot close the current call. An incoming call during an active conversation
+follows the busy policy rather than replacing the global call object and leaving the old
+media running.
 
-The CallManager orchestrates WebRTC and signaling:
+The trade-off is more server coordination and client outcome handling. That complexity gives
+a precise answer to two questions a user actually cares about: “Did my call start?” and
+“Which device answered?”
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      CallManager Component                       │
-├─────────────────────────────────────────────────────────────────┤
-│  Reads from:                                                     │
-│    - callState (idle/outgoing/connecting/connected)             │
-│    - currentCallId                                               │
-│    - incomingCall                                                │
-├─────────────────────────────────────────────────────────────────┤
-│  useWebRTC hook configured with:                                 │
-│    - isInitiator: callState === 'outgoing'                      │
-│    - onRemoteStream: add to store                               │
-│    - onConnectionStateChange: update quality indicator          │
-│    - onIceCandidate: send via signaling                         │
-├─────────────────────────────────────────────────────────────────┤
-│  Renders:                                                        │
-│    - IncomingCallOverlay (when incomingCall exists)             │
-│    - ActiveCallView (when connecting or connected)              │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 🎥 Deep Dive: Negotiating and Owning the Media Path — 9 minutes
 
----
+> “The client needs one owner for capture, descriptions, candidates, and playback. I’ll keep
+> it outside incidental React renders and tag all async work with the current attempt.”
 
-## Deep Dive: TURN Credential Flow (5 minutes)
+Before constructing the peer connection, obtain ICE configuration from the real backend
+route. A successful request to the wrong origin can return an HTML page rather than
+credentials, so both status and payload need validation. If only STUN is available, that is
+a degraded capability, not operational TURN fallback.
 
-### Backend: TURN Credential Endpoint
+The call owner creates the peer for the accepted endpoint pair, installs handlers, and adds
+current local tracks. One side is the designated initial offerer. The offer and answer
+travel through authorized signaling; media begins after compatible descriptions and a usable
+ICE path are established.
 
-"TURN credentials are time-limited using HMAC-SHA1 signatures. The username includes a timestamp, and the credential is derived from a shared secret with the Coturn server."
+Trickle ICE sends candidates as they are discovered instead of waiting for every possible
+interface and relay allocation. The recipient may receive a candidate before installing the
+remote description. It queues candidates only for that peer and negotiation generation, then
+drains the matching queue after the description is ready.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    GET /api/turn/credentials                     │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Extract userId from session                                  │
-│  2. Calculate expiry = now + 300 seconds                        │
-│  3. Create username = "{timestamp}:{userId}"                    │
-│  4. Generate credential = HMAC-SHA1(secret, username) → base64  │
-│  5. Return:                                                      │
-│     - urls: [turn:host:3478?transport=udp, ...tcp]             │
-│     - username                                                   │
-│     - credential                                                 │
-│     - ttl: 300                                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Negotiation choice | Benefit | Cost or limit |
+|--------------------|---------|---------------|
+| ✅ Trickle ICE with scoped ordered queues | Starts checking useful paths early | More ordering and generation handling |
+| ❌ Always wait for gathering to finish | Simpler first message bundle | Slow discovery can delay the entire connection |
+| ❌ Shared unscoped candidate array | Convenient prototype | Old calls and restarts can contaminate a new peer |
 
-### Frontend: ICE Server Configuration
+The server checks membership and accepted device generations before relaying SDP or
+candidates. A valid call ID is not a bearer credential. A candidate's text hash is also not
+proof that it belongs to the current media section or negotiation generation.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    getIceServers() Function                      │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Fetch /api/turn/credentials (with cookies)                  │
-│  2. If successful, return:                                       │
-│     ┌───────────────────────────────────────────────────────┐   │
-│     │ { urls: 'stun:stun.l.google.com:19302' }              │   │
-│     │ { urls: turn.urls, username, credential }             │   │
-│     └───────────────────────────────────────────────────────┘   │
-│  3. If failed, return STUN only (fallback)                      │
-└─────────────────────────────────────────────────────────────────┘
-```
+On the frontend, a callback installed on an existing peer cannot rely on a later React
+render to update its captured variables. I would bind it to the immutable attempt identity
+or a controlled current reference. Otherwise the caller can create the peer before receiving
+a call ID and silently drop all later trickle candidates through a stale empty-ID closure.
 
----
+Subsequent renegotiations need a collision policy. A designated initial caller does not
+solve simultaneous offers caused by later media changes. I would serialize description
+operations and use a documented glare-handling pattern, with a bounded restart path if
+negotiation cannot recover.
 
-## Deep Dive: Call History API (5 minutes)
+The same ownership rule protects camera lifetime. If getUserMedia resolves after hangup,
+stop the newly returned tracks. Ending a call invalidates its generation, closes the peer,
+clears queues and timers, detaches elements, and stops owned tracks. Local release should
+not wait for the server to acknowledge the end command.
 
-### Backend: Call History Query
+Native video/audio elements handle decoding and playback. The local preview is muted to
+avoid feedback and can be mirrored visually. A remote autoplay rejection needs an actionable
+UI response. An audio-only call should intentionally show participant identity and audio
+state rather than an empty video placeholder.
 
-The call history endpoint returns paginated calls with computed direction and duration:
+Mute and camera-off also need clear semantics. Disabling a track is not the same as stopping
+and releasing its device. I would define what the product promises, show the local state
+accurately, and tell peers when a stream is intentionally unavailable. Re-enabling a
+released camera may require a new acquisition.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   GET /api/calls/history                         │
-├─────────────────────────────────────────────────────────────────┤
-│  Query Parameters:                                               │
-│    - limit (default 50, max 100)                                │
-│    - offset (default 0)                                          │
-├─────────────────────────────────────────────────────────────────┤
-│  Returns for each call:                                          │
-│    - id, call_type, state, timestamps                           │
-│    - direction: 'outgoing' if user is initiator, else 'incoming'│
-│    - other_party: { id, name, avatar_url }                      │
-│    - duration_seconds: ended_at - connected_at                  │
-├─────────────────────────────────────────────────────────────────┤
-│  WHERE: initiator_id = userId OR user in call_participants      │
-│  ORDER BY: created_at DESC                                       │
-└─────────────────────────────────────────────────────────────────┘
-```
+Media topology introduces another trade-off. Direct one-to-one paths can avoid relay
+bandwidth, but some networks need TURN and some users may prefer relay-only address privacy.
+Direct is not universally faster, and neither path has zero operational cost.
 
-### Frontend: Call History Component
+For groups, a mesh makes each endpoint send to every peer. An SFU reduces that upload
+fan-out and supports selective subscriptions. It adds server egress, media operations, and a
+different encryption boundary. Merely rendering a grid does not implement those backend
+capabilities.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CallHistory Component                         │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │ CallHistoryItem                                           │  │
-│  │ ┌─────────┐ ┌───────────────────────────────┐ ┌─────────┐│  │
-│  │ │ Avatar  │ │ Name                          │ │ Time    ││  │
-│  │ │         │ │ ↗ Video (Missed) - 2:34       │ │ 2h ago  ││  │
-│  │ └─────────┘ └───────────────────────────────┘ └─────────┘│  │
-│  │                                               ┌─────────┐│  │
-│  │                                               │  Call   ││  │
-│  │                                               │  Button ││  │
-│  │                                               └─────────┘│  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  - Direction indicator: ↗ outgoing, ↙ incoming                  │
-│  - Missed/declined calls shown in red                           │
-│  - Duration formatted for connected calls                        │
-│  - Click phone button to call again                              │
-└─────────────────────────────────────────────────────────────────┘
-```
+Normal browser-to-browser WebRTC encrypts media even when TURN relays it. An SFU normally
+terminates each transport leg; hiding media content from it needs an additional
+endpoint-controlled frame-encryption layer and authenticated group-key management. Account
+authentication remains necessary in either topology.
 
----
+The cost of the client owner is explicit lifecycle and negotiation state. It prevents
+resource leaks and cross-call interference while letting React remain focused on a small,
+understandable interface.
 
-## Trade-offs and Alternatives (5 minutes)
+## 🔄 Deep Dive: Recovering Control and Media Separately — 9 minutes
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| Signaling Protocol | WebSocket | Socket.io | Less abstraction, smaller bundle, more control |
-| Call State Storage | Redis + PostgreSQL | Redis only | Durability for call history, speed for active calls |
-| Multi-device Ring | Push to all devices | First-online only | Better UX, user chooses which device |
-| ICE Trickle | Immediate relay | Batch candidates | Lower latency, more resilient |
-| State Sync | Server authoritative | Client-driven | Prevents race conditions in multi-device scenario |
-| TURN Credentials | Time-limited HMAC | Static credentials | Security, prevents credential abuse |
+> “I’ll recover the failed part of a call instead of assuming that every socket interruption
+> means the entire conversation is gone.”
 
-### Error Handling Strategy
+Consider an active direct audio call whose WebSocket disconnects. The media path may remain
+healthy. I would show that control is reconnecting and preserve media for a bounded grace
+period. Hangup still releases local resources immediately, even if the termination command
+must be retried later.
 
-| Error | Backend Response | Frontend Behavior |
-|-------|------------------|-------------------|
-| Call already answered | `CALL_UNAVAILABLE` | Show "Answered on another device" |
-| User offline | Empty device list | Show "User unavailable" |
-| ICE failure | N/A (client-side) | Retry with TURN-only, then show error |
-| WebSocket disconnect | N/A | Auto-reconnect with backoff |
-| Invalid state transition | Reject update | Log warning, sync state from server |
+Reconnection starts with authentication and registration acknowledgment, then retrieves the
+current call revision and accepted endpoint claim. Re-registering a device is not itself
+call recovery. The call may have ended, been revoked, or moved to a different device while
+this connection was absent.
 
-### Database Schema
+If the same endpoint still owns the seat and media works, the client can resume control
+without replacing the peer. If the server reports a terminal state or a newer endpoint
+generation, the client tears down the old attempt. Pending lifecycle commands are reconciled
+through their recorded outcomes.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         users                                    │
-├─────────────────────────────────────────────────────────────────┤
-│ id (UUID PK), name, avatar_url, created_at                      │
-└─────────────────────────────────────────────────────────────────┘
+Now consider the opposite: signaling works, but media fails after a network change.
+Heartbeats cannot repair that path. A bounded ICE restart can use refreshed configuration
+and a later negotiation generation. Old descriptions and candidates must not leak into that
+new generation.
 
-┌─────────────────────────────────────────────────────────────────┐
-│                         calls                                    │
-├─────────────────────────────────────────────────────────────────┤
-│ id (UUID PK), initiator_id (FK), call_type                      │
-│ state: ringing | connected | ended | missed | declined          │
-│ answered_by (device_id), created_at, connected_at, ended_at     │
-├─────────────────────────────────────────────────────────────────┤
-│ INDEX: initiator_id + created_at DESC                           │
-│ INDEX: state WHERE state = 'ringing'                            │
-└─────────────────────────────────────────────────────────────────┘
+| Failure policy | Benefit | Trade-off |
+|----------------|---------|-----------|
+| ✅ Separate control and media recovery | Preserves healthy audio during brief signaling loss | More state and explicit reconciliation |
+| ❌ End every call on socket close | Simple implementation | Unnecessarily interrupts a working media path |
+| ❌ Keep every call alive indefinitely | Avoids immediate interruption | Stale membership, stuck UI, and leaked resources |
 
-┌─────────────────────────────────────────────────────────────────┐
-│                    call_participants                             │
-├─────────────────────────────────────────────────────────────────┤
-│ call_id (FK), user_id (FK), device_id                           │
-│ state, joined_at, left_at                                        │
-│ PRIMARY KEY (call_id, user_id, device_id)                       │
-├─────────────────────────────────────────────────────────────────┤
-│ INDEX: user_id                                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+Transient disconnected states need deadlines and observations. A short interruption can
+recover, but an endless Connecting label is not a recovery strategy. The controller should
+track attempts, show useful status, and eventually release resources with a clear reason.
 
----
+Logout must disable reconnection before closing the socket. It also cancels pending retry
+timers, invalidates callback generations, clears account-scoped call state, and disposes
+media. Otherwise a normal close handler can reopen the connection using the identity the
+person just signed out of.
 
-## Closing Summary (1 minute)
+Presence similarly belongs to connections. Several tabs can share one browser device ID, and
+several devices can share an account. A close from one connection must not remove another’s
+live lease. The UI consumes explicit presence state; it should not treat a stored device row
+as evidence of a reachable socket.
 
-"The FaceTime full-stack system is built around three integration points:
+Server recovery requires durable deadlines. A thirty-second in-process timer can make the
+common case responsive, but a restart destroys it. A scheduled worker or indexed sweeper
+must find eligible ringing invitations and apply conditional timeout transitions.
 
-1. **WebSocket Signaling Protocol** - A typed message schema shared between frontend and backend ensures type safety. The server handles call state transitions atomically in PostgreSQL while using Redis for presence and active call lookup. Idempotency keys prevent duplicate call initiations from network retries.
+Outbox delivery is at least once. Events carry revisions and expiry so duplicates and stale
+rings can be discarded. Redis pub/sub can help route live events, but it cannot recover a
+missed publish or decide who won an acceptance by itself.
 
-2. **WebRTC Orchestration** - The frontend's `useWebRTC` hook manages peer connection lifecycle, while `useSignaling` handles message routing. ICE candidates are relayed through the server with deduplication, and TURN credentials are generated with time-limited HMAC signatures.
+The durable history records the control outcome. Media-quality telemetry can separately
+record how much of the accepted session carried useful audio/video. An acceptance timestamp
+alone cannot prove that the users ever heard each other.
 
-3. **Multi-device Coordination** - When a call comes in, the server rings all registered devices. The first to answer wins via atomic database update, and other devices receive a 'call_ended' message. This pattern ensures consistent state across all user devices.
+The trade-off is temporary uncertainty during recovery. We make that uncertainty bounded and
+visible, then reconcile with the authority. Pretending a reconnect succeeded because the
+socket opened would hide the decision that actually matters: whether this endpoint still
+belongs in this call.
 
-The main trade-off is complexity vs. reliability. The server-authoritative model requires more round trips but prevents race conditions that would occur with client-driven state."
+## 📈 Capacity, Quality, and Verification — 5 minutes
+
+Assume 100,000 concurrent one-to-one calls lasting five minutes on average. At steady
+occupancy, about 333 calls begin each second. With thirty application signaling messages per
+completed call, that is roughly 10,000 call-related messages per second, separate from
+idle-device heartbeats.
+
+If 20% use TURN and each endpoint sends 1.5 Mb/s, the relay fleet sees 60 Gb/s ingress and
+60 Gb/s egress. We should measure the actual relay share. A credential endpoint returning
+JSON is not evidence that the browser selected a relay candidate.
+
+For a group of 32, a mesh has 496 total peer pairs and 31 peers per endpoint. At 1.5 Mb/s
+per outgoing peer, each endpoint uploads 46.5 Mb/s. An SFU reduces endpoint connection
+fan-out, but forwarding every sender to every receiver still creates large aggregate egress.
+
+The group UI should request useful visible streams and layers. Hiding a tile does not
+automatically stop receiving or decoding it. Simulcast can involve multiple outgoing
+encodings, so “one connection to the SFU” should not be mistaken for one fixed-bitrate
+stream.
+
+Quality metrics should separate signaling latency, acceptance, first usable media,
+loss/jitter, selected candidate type, and actual media progress. Use bounded client sampling
+and sustained trends. Preserve audio under pressure, then adjust video policy around browser
+congestion control and receiver capabilities.
+
+| Scenario | End-to-end evidence |
+|----------|---------------------|
+| Lost creation response | Retrying returns the same durable call ID |
+| Two devices answer | One winner; the loser stops capture and ringing |
+| Permission resolves after cancellation | No camera/microphone resource survives the ended attempt |
+| Late SDP or call_end from an old call | Current call remains unchanged |
+| Signaling interruption with healthy media | Audio continues during bounded control recovery |
+| Forced TURN path | Relay candidate selected and bidirectional media counters advance |
+| Server restarts during ringing | Durable deadline produces a final invitation outcome |
+| Logout with a scheduled retry | Old account cannot silently reconnect |
+
+I would test controller races in isolation, call claims with real database concurrency, and
+two browser contexts with controlled media/network conditions. A single login-container
+smoke test is useful for rendering, but cannot establish any of those call guarantees.
+
+Accessibility belongs in the same validation: labeled controls, pressed states for
+mute/video, meaningful call announcements, focus handling on incoming calls, and reduced
+motion. Audio-only and blocked-playback states need understandable interfaces rather than a
+generic error or silent spinner.
+
+## 🏁 Local Implementation Boundary — 2 minutes
+
+The repository has a React contact/call UI, one peer connection per browser, public HTTP
+routes, process-local socket maps, and separate PostgreSQL/Redis writes. It has no
+authenticated membership, atomic device winner, durable command receipt/outbox, or group
+SFU.
+
+Isolated checks confirmed that named circuit breakers retain the first request closure,
+concurrent answers can both succeed, and unrelated registered clients can inject call
+signaling. The browser misses TURN credentials under the default Vite proxy, can retain an
+empty caller call ID in its candidate callback, and reconnects after explicit logout.
+
+The [architecture document](architecture.md#implementation-notes) maps these actual limits
+to source and separates them from this proposal. No claim of tested media quality or working
+group calls follows from the local interface alone.
+
+> “My first full-stack milestone would be one call whose creation survives a retry, whose
+> invitation has one device winner, whose media path is measured, and whose resources are
+> released after every exit. That gives us a reliable base for group calling and more
+> advanced features.”

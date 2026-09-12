@@ -1,724 +1,546 @@
-# Design Apple Maps - Architecture
+# Apple Maps architecture
 
 ## System Overview
 
-Apple Maps is a navigation platform with real-time traffic and routing. Core challenges involve route computation, traffic processing, and map data management.
+A navigation platform combines three workloads: rendering a map, finding a legal
+route through a road graph, and estimating travel time from noisy observations.
+Search connects a user's destination intent to that graph. The learning goals are
+spatial modeling, in-memory pathfinding, traffic freshness, and coordination between
+an interactive map and asynchronous requests.
 
-**Learning Goals:**
-- Build graph-based routing algorithms
-- Design real-time traffic aggregation
-- Implement tile-based map serving
-- Handle GPS data at scale
-
----
+The production design below is **proposed**, with explicit planning assumptions.
+The final [Implementation Notes](#implementation-notes) describe the current local
+code: a synthetic San Francisco-area grid, basic A*, a timer-driven traffic
+simulator, PostgreSQL/PostGIS, Valkey, and a React/Leaflet frontend. It is not an
+implementation of Apple's proprietary mapping or navigation services.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Route**: Calculate routes between points with turn-by-turn directions
-2. **Navigate**: Real-time turn-by-turn navigation with rerouting
-3. **Traffic**: Show real-time traffic conditions and incidents
-4. **Search**: Find places and addresses with full-text search
-5. **Offline**: Download maps for offline use
+- Browse map data, find places/addresses, and select an origin and destination.
+- Calculate a legal driving route with geometry, maneuvers, and an estimated duration.
+- Apply supported road restrictions and route preferences consistently.
+- Present route progress from sufficiently recent position observations and request
+  rerouting when evidence supports a deviation.
+- Produce traffic estimates with observation time, coverage, and confidence.
+- Continue displaying the accepted route during brief connectivity loss.
 
-### Non-Functional Requirements
+Global offline routing, transit, voice guidance, and predictive ML are later
+extensions. Retaining a route and some rendered tiles is not equivalent to having
+an offline road graph, search index, or current closure feed.
 
-- **Latency**: p95 < 500ms for route calculation, p99 < 1s
-- **Accuracy**: ETA within 10% of actual arrival time
-- **Scale**: 10M+ concurrent navigators, 500M daily route requests
-- **Availability**: 99.99% uptime (< 4.3 minutes downtime/month)
-- **Coverage**: Global map data, 200+ countries
-- **Throughput**: 1M+ GPS probe ingestions per second
+### Non-functional requirements
 
----
+| Concern | Proposed target / invariant |
+|---------|-----------------------------|
+| Routing latency | p99 below 500 ms for ordinary regional journeys |
+| Availability | 99.99% monthly routing availability, with explicit degraded responses |
+| Traffic freshness | Normal processing lag below one minute; confidence/coverage reported separately |
+| Route validity | Honor direction, access, and turn restrictions for the selected profile |
+| Data coherence | One compatible graph/weight version per route calculation |
+| Client identity | Display results only for the request/route generation that produced them |
+| Probe effects | Redelivery does not contribute the same observation twice |
+| Privacy | Minimize raw trace retention and linkability; pseudonyms are not anonymity |
+
+ETA accuracy needs evaluation against actual completed journeys, segmented by
+region, trip length, and traffic conditions. A universal “within 10%” statement is
+not established by a travel-time formula or by a synthetic demonstration.
+
+## Capacity Estimation
+
+Assume 500 million daily route requests: approximately 5,787/s average, or about
+58,000/s at a 10× peak. Ten million concurrent navigators reporting once every ten
+seconds would produce one million observations/s. These are deliberately separate
+capacity assumptions; the route request rate does not imply that every position
+update recomputes a route.
+
+At 200 bytes of application payload per observation, raw ingestion is about
+200 MB/s or 17.28 TB/day before replication, indexes, and envelope overhead.
+A one-hour deduplication window at that rate contains 3.6 billion observation IDs.
+An unpartitioned Redis key per observation is therefore not automatically a cheap
+solution; bounded stream state and durable effect identity need deliberate sizing.
+
+Graph memory depends on vertices, directed edges, turn-expanded states, geometry,
+and routing indexes. Database sequence IDs need not be dense: an import can map
+external IDs to compact in-memory offsets. Geographic partitions must preserve
+boundary connectivity; independent closed tiles cannot route across their borders.
+
+### Local Development Scale
+
+The seed creates 400 nodes and 760 two-way segments, represented as 1,520 directed
+adjacency entries, plus 35 randomly positioned POIs. Each API process writes 760
+traffic rows every ten seconds: about 6.57 million rows/day, assuming each pass
+finishes before the next tick. No retention task bounds that growth.
+
+One PostGIS instance and one Valkey instance are sufficient for the small graph,
+but “small graph” does not imply that an indefinitely running history stays small.
+There are no runtime benchmarks or resource measurements in this review.
 
 ## High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                │
-│          iPhone │ CarPlay │ Apple Watch │ Mac                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    CDN / Edge Network                            │
-│         (Map tiles, static assets, geo-distributed)             │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                   │
-│             (Auth, Rate Limiting, Geo-routing)                  │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│Routing Service│    │Traffic Service│    │  Map Service   │
-│               │    │               │    │                │
-│ - A* / CH     │    │ - Aggregation │    │ - Vector tiles │
-│ - ETA         │    │ - Incidents   │    │ - Search       │
-│ - Alternatives│    │ - Prediction  │    │ - Geocoding    │
-│ - Maneuvers   │    │ - Map-match   │    │ - POIs         │
-└───────┬───────┘    └───────┬───────┘    └───────┬────────┘
-        │                    │                     │
-        ▼                    ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                  │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │   Kafka / Stream  │     Object Storage (S3)   │
-│   + PostGIS     │   - GPS probes    │     - Map tiles           │
-│   - Road graph  │   - Traffic events│     - Offline packs       │
-│   - POI data    │                   │                           │
-├─────────────────┼───────────────────┼───────────────────────────┤
-│   Redis/Valkey  │   ClickHouse      │     Elasticsearch         │
-│   - Tile cache  │   - Traffic hist. │     - POI full-text       │
-│   - Sessions    │   - Analytics     │     - Geocoding           │
-│   - Rate limits │   - Probe archive │     - Address search      │
-└─────────────────┴───────────────────┴───────────────────────────┘
+Proposed production boundaries:
+
+```text
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Map / navigation client  │───────▶│ CDN: versioned map data  │
+└────────────┬─────────────┘        └────────────▲─────────────┘
+             ▼                                   │
+┌──────────────────────────┐        ┌────────────┴─────────────┐
+│ API gateway              │        │ Map build + object store │
+└────────────┬─────────────┘        └──────────────────────────┘
+             ▼
+┌──────────────────────────┐        ┌──────────────────────────┐
+│ Routing + place search   │◀───────│ Published graph snapshot │
+│ Workers with local graph │        │ Spatial source/importer  │
+└────────────▲─────────────┘        └──────────────────────────┘
+             │
+┌────────────┴─────────────┐        ┌──────────────────────────┐
+│ Traffic weight snapshots │◀───────│ Matcher + aggregation    │
+│ Age/coverage/confidence  │        └────────────▲─────────────┘
+└──────────────────────────┘                     │
+                                    ┌────────────┴─────────────┐
+                                    │ Durable probe stream     │
+                                    │ Validated observations   │
+                                    └──────────────────────────┘
 ```
 
----
+The tile-delivery path does not depend on a route query. The routing query uses a
+compatible graph and traffic snapshot, not a database lookup for every edge it
+expands. Traffic processing owns a separate write workload and publishes derived
+weights for routers and visual overlays.
 
-## Core Components
+## Core Components / Request Flows
 
-### 1. Routing Engine
+### Road graph and routing
 
-The routing engine uses A* with Contraction Hierarchies (CH) for sub-second route calculation across millions of road segments.
+The map importer produces directed road edges, geometry, supported travel profiles,
+and turn/access restrictions. Snapping selects a reachable directed road position
+within a bounded distance, using heading/access information when available.
+An origin near an overpass should not snap to an inaccessible road merely because
+its centerline is closest in two dimensions.
 
-**Algorithm Pipeline:**
-1. Snap origin/destination to nearest road nodes using a KNN spatial query on a GIST index
-2. Load the road graph into memory (nodes as array indices, edges with time-based weights)
-3. Apply real-time traffic weights to edge costs (distance / current_speed)
-4. Execute bidirectional A* with hierarchical shortcuts (Contraction Hierarchies)
-5. Reconstruct path and generate turn-by-turn maneuvers from bearing changes
-6. Calculate ETA using traffic-adjusted edge travel times
-7. Find alternatives using edge penalty method (penalize primary route edges by 2x, re-run A*)
+A query pins graph and weight versions, computes the route, reconstructs actual
+edge geometry, and generates instructions at junctions. Totals include defined
+access/egress connectors. A no-route or out-of-coverage result is distinct from
+an infrastructure failure.
 
-**Contraction Hierarchies** precompute shortcut edges that skip intermediate nodes. At query time, the search only expands upward in the hierarchy from both directions, reducing visited nodes from millions to thousands. The trade-off is preprocessing time (hours for a continental graph) and storage (2-3x more edges), but query time drops from seconds to milliseconds.
+For a small region, A* over adjacency lists is a useful baseline. Its heuristic
+must lower-bound the cost under the same units and supported speeds. Nonnegative
+edge costs, valid geometry/lengths, and enforced speed bounds are part of that
+correctness argument. An assumed maximum speed is not sufficient by itself.
 
-**Maneuver Generation** classifies turns by computing the bearing difference between consecutive edges: < 15 degrees = straight, 15-45 = slight turn, 45-120 = normal turn, 120-160 = sharp turn, > 160 = U-turn. Each maneuver includes a human-readable instruction referencing the next street name.
+At larger scale, choose a routing index with an explicit traffic-update path.
+Customizable Contraction Hierarchies separate topology preprocessing from weight
+customization; ordinary static shortcuts cannot be left unchanged when their
+underlying costs change. See the [CCH paper](https://arxiv.org/abs/1402.0402).
+OSRM's [MLD workflow](https://project-osrm.org/docs/v26.6.1/tools#osrm-customize)
+also applies speed/turn updates through a customization step. Neither is implemented here.
 
-**Heuristic**: Haversine distance divided by maximum road speed (130 km/h highway) provides an admissible, consistent heuristic for A*.
+### Traffic ingestion and materialization
 
-### 2. Traffic Service
+1. Validate observation identity, coordinates, time, units, and source limits.
+2. Acknowledge only after durable acceptance into a partitioned stream.
+3. Match a short ordered trace to candidate road positions using geometry,
+   heading, connectivity, and observation uncertainty.
+4. Aggregate unique observations by directed segment and event-time window.
+5. Publish a versioned estimate with sample coverage, observation age, and confidence.
+6. Customize route weights or atomically replace a compatible routing snapshot.
 
-Processes millions of anonymous GPS probes per second into real-time traffic conditions.
+A nearest-line lookup is a spatial candidate search, not full map matching.
+Parallel roads, tunnels, stops, and sparse samples require temporal reasoning.
+An exponential moving average smooths noise but is order-dependent and not
+idempotent: applying the same observation twice generally changes the result twice.
 
-**Probe Ingestion Pipeline:**
-1. GPS probes arrive via Kafka (partitioned by geographic region, H3 cell)
-2. Map-matching snaps each probe to the nearest road segment using a Hidden Markov Model with Viterbi decoding, considering heading, speed, and road connectivity
-3. Probes are aggregated per segment using an exponential moving average (alpha = 0.1) for smoothing
-4. Congestion level is derived from the ratio of observed speed to free-flow speed: > 80% = free, 50-80% = light, 25-50% = moderate, < 25% = heavy
-5. Anomaly detection triggers incident creation when 5+ probes report < 30% free-flow speed within 5 minutes
+Historical patterns may fill uncovered segments, with their provenance labeled.
+“Missing observation” does not mean “free-flow traffic.” A reported road closure
+also needs a policy distinct from merely assigning a slow positive speed.
 
-**Traffic Freshness**: Segments with no probes in the last 10 minutes fall back to historical speed patterns (day-of-week + hour-of-day averages from ClickHouse). The response includes a `confidence` field: high (> 5 recent samples), medium (1-5 samples), low (historical only).
+### Search and tiles
 
-### 3. Map Tile Service
+Search combines textual intent with geography. A location bias is not always a
+hard radius; the product should distinguish “near me” from searching another city.
+Place identity, entrance/access location, and address display are related but
+not interchangeable. Public search can use an eventually consistent index while
+authoritative graph data determines route connectivity.
 
-Serves vector tiles in Mapbox Vector Tile (MVT/protobuf) format.
+Versioned tile URLs allow caching of immutable geometry/style assets. Vector tiles
+support client styling and rotation; raster tiles reduce client rendering work.
+Payload size and frame rate depend on layer density, styling, zoom, and hardware,
+so neither a fixed compression ratio nor guaranteed 60 FPS follows from the format.
 
-**Tile generation** follows the standard z/x/y slippy map scheme. Layers are filtered by zoom level: roads always visible, buildings at z >= 15, labels at z >= 12, POIs at z >= 14. Geometry is simplified using the Douglas-Peucker algorithm with tolerance proportional to 1/2^zoom.
+### Navigation client
 
-**Caching strategy**: Tiles are content-addressed and cached at multiple layers -- CDN edge (7 days, immutable), Redis/Valkey (LRU, 10K tiles), and client-side (persistent cache). Tile invalidation is rare since road geometry changes infrequently; when it does, tile hashes change and CDN serves fresh versions.
+The client owns the accepted route, local progress, and camera-follow state.
+A route response includes request generation, geometry, maneuver positions, graph
+version, traffic version/as-of time, and degradation metadata.
+Late responses for an old destination or route generation are discarded.
 
-### 4. Search and Geocoding
-
-POI search combines full-text search (PostgreSQL GIN index on `to_tsvector('english', name)`) with spatial proximity ranking. Results are scored by a weighted combination of text relevance, distance penalty (km), rating bonus, and popularity (log of review count).
-
-Geocoding (address to coordinates) uses a structured address parser with fallback to full-text search. Reverse geocoding (coordinates to address) uses the nearest POI or road segment within a radius.
-
----
+Position handling uses observation timestamp and accuracy. Progress is measured
+along the accepted route, not only by straight-line distance to the next turn.
+Rerouting requires evidence of deviation and hysteresis to avoid repeated route
+changes from GPS noise. A newly computed route replaces the accepted one atomically.
 
 ## Database Schema
 
-### Entity-Relationship Diagram
+The complete current SQL is [backend/src/db/init.sql](./backend/src/db/init.sql).
+It creates tables directly, so rerunning it against an existing schema fails.
+This inventory describes the supplied schema, not the proposed production additions.
 
-```
-                                ROAD NETWORK GRAPH
-    ┌─────────────────────────────────────────────────────────────┐
-    │                                                             │
-    │   ┌──────────────────┐        ┌──────────────────────┐     │
-    │   │   road_nodes     │        │   road_segments      │     │
-    │   ├──────────────────┤        ├──────────────────────┤     │
-    │   │ PK id (BIGSERIAL)│◄───────┤ FK start_node_id     │     │
-    │   │    location      │◄───────┤ FK end_node_id       │     │
-    │   │    lat, lng      │        │ PK id (BIGSERIAL)    │     │
-    │   │    is_intersection│       │    geometry          │     │
-    │   └──────────────────┘        │    street_name       │     │
-    │                               │    road_class        │     │
-    │                               │    length_meters     │     │
-    │                               │    free_flow_speed   │     │
-    │                               │    is_toll, is_one_way│    │
-    │                               │    turn_restrictions  │     │
-    │                               └──────────┬───────────┘     │
-    └──────────────────────────────────────────┼─────────────────┘
-                                               │
-                 ┌─────────────────────────────┼──────────────┐
-                 ▼                             ▼              │
-    ┌──────────────────────┐      ┌──────────────────────┐    │
-    │   traffic_flow       │      │   incidents          │    │
-    ├──────────────────────┤      ├──────────────────────┤    │
-    │ PK id                │      │ PK id (UUID)         │    │
-    │ FK segment_id        │      │ FK segment_id        │    │
-    │    timestamp          │      │    type, severity    │    │
-    │    speed_kph         │      │    location (geo)    │    │
-    │    congestion_level  │      │    lat, lng          │    │
-    │    sample_count      │      │    description       │    │
-    └──────────────────────┘      │    is_active         │    │
-                                  └──────────────────────┘    │
-                                                              │
-    ┌──────────────────────┐      ┌──────────────────────┐    │
-    │   pois               │      │ navigation_sessions  │    │
-    ├──────────────────────┤      ├──────────────────────┤    │
-    │ PK id (UUID)         │      │ PK id (UUID)         │    │
-    │    name              │      │    user_id           │    │
-    │    category          │      │    origin/dest lat/lng│   │
-    │    location (geo)    │      │    route_data (JSONB) │   │
-    │    lat, lng          │      │    status            │    │
-    │    address, rating   │      │    started_at        │    │
-    │    hours (JSONB)     │      │    completed_at      │    │
-    └──────────────────────┘      └──────────────────────┘    │
-```
+| Table | Important fields / indexes | Current use and constraint |
+|-------|----------------------------|----------------------------|
+| `road_nodes` | BIGSERIAL ID, geography point, lat/lng; GiST and coordinate indexes | In-memory graph loading and nearest-node lookup |
+| `road_segments` | Start/end FK, geography line, length, speed, toll/one-way, turn JSON; GiST and endpoint indexes | Graph loader ignores turn restrictions and line geometry |
+| `traffic_flow` | ID, segment FK, timestamp, speed, congestion, sample count; segment/time indexes | Append-only simulator writes; no unique segment/window key |
+| `incidents` | UUID, segment FK, geography point, scalar coordinates, type, severity, status/time | Missing fields required by reporting service |
+| `pois` | UUID, name/category, geography, coordinates, address/rating; GiST, category, name GIN | Public spatial/name search and map markers |
+| `navigation_sessions` | UUID, user string, endpoints, route JSON, status/time | Schema only; no API writes or reads |
 
-### Table Definitions
+Incident foreign keys use the default delete behavior, not `ON DELETE SET NULL`.
+There are no confidence, sample-count, last-reported, or idempotency columns on
+incidents. Speeds, lengths, coordinate consistency, and status values lack the
+production validation/constraints needed for trustworthy routing.
 
-```sql
--- Enable PostGIS extension
-CREATE EXTENSION IF NOT EXISTS postgis;
+### Proposed production records
 
--- Road Nodes (graph vertices)
-CREATE TABLE road_nodes (
-  id BIGSERIAL PRIMARY KEY,
-  location GEOGRAPHY(Point, 4326) NOT NULL,
-  lat DOUBLE PRECISION NOT NULL,
-  lng DOUBLE PRECISION NOT NULL,
-  is_intersection BOOLEAN DEFAULT FALSE
-);
+| Record | Identity / rule | Why |
+|--------|-----------------|-----|
+| Graph build | Immutable version, supported profile, coverage, validation result | Publish coherent topology and restrictions |
+| Directed road state | Graph version plus edge/turn identity | Preserve access and turn semantics |
+| Traffic window | Segment/direction/window/version, samples and age | Replayable, correctable estimates |
+| Observation receipt | Source session plus sequence or durable observation ID | Prevent duplicate contribution within the supported replay horizon |
+| Incident report | Unique report ID, source, location, type, observed time | Separate report identity from merged incident identity |
+| Current incident | Incident ID, policy state, confidence, decision history | Support verified closure and later resolution |
+| Route response | Request generation, graph/weight versions, maneuver geometry | Keep client results coherent and diagnosable |
 
-CREATE INDEX idx_nodes_location ON road_nodes USING GIST(location);
-CREATE INDEX idx_nodes_lat_lng ON road_nodes(lat, lng);
-
--- Road Segments (graph edges)
-CREATE TABLE road_segments (
-  id BIGSERIAL PRIMARY KEY,
-  start_node_id BIGINT NOT NULL REFERENCES road_nodes(id),
-  end_node_id BIGINT NOT NULL REFERENCES road_nodes(id),
-  geometry GEOGRAPHY(LineString, 4326) NOT NULL,
-  street_name VARCHAR(200),
-  road_class VARCHAR(50),
-  length_meters DOUBLE PRECISION,
-  free_flow_speed_kph INTEGER DEFAULT 50,
-  is_toll BOOLEAN DEFAULT FALSE,
-  is_one_way BOOLEAN DEFAULT FALSE,
-  turn_restrictions JSONB DEFAULT '[]'
-);
-
-CREATE INDEX idx_segments_nodes ON road_segments(start_node_id, end_node_id);
-CREATE INDEX idx_segments_geo ON road_segments USING GIST(geometry);
-CREATE INDEX idx_segments_start ON road_segments(start_node_id);
-CREATE INDEX idx_segments_end ON road_segments(end_node_id);
-
--- Traffic Flow (time-series traffic conditions)
-CREATE TABLE traffic_flow (
-  id BIGSERIAL PRIMARY KEY,
-  segment_id BIGINT REFERENCES road_segments(id),
-  timestamp TIMESTAMP DEFAULT NOW(),
-  speed_kph DOUBLE PRECISION,
-  congestion_level VARCHAR(20),
-  sample_count INTEGER DEFAULT 1
-);
-
-CREATE INDEX idx_traffic_segment ON traffic_flow(segment_id);
-CREATE INDEX idx_traffic_timestamp ON traffic_flow(timestamp);
-
--- Incidents
-CREATE TABLE incidents (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  segment_id BIGINT REFERENCES road_segments(id),
-  type VARCHAR(50),
-  severity VARCHAR(20),
-  location GEOGRAPHY(Point, 4326),
-  lat DOUBLE PRECISION,
-  lng DOUBLE PRECISION,
-  description TEXT,
-  reported_at TIMESTAMP DEFAULT NOW(),
-  resolved_at TIMESTAMP,
-  is_active BOOLEAN DEFAULT TRUE
-);
-
-CREATE INDEX idx_incidents_location ON incidents USING GIST(location);
-CREATE INDEX idx_incidents_active ON incidents(is_active) WHERE is_active = TRUE;
-
--- Points of Interest
-CREATE TABLE pois (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name VARCHAR(200) NOT NULL,
-  category VARCHAR(100),
-  location GEOGRAPHY(Point, 4326) NOT NULL,
-  lat DOUBLE PRECISION NOT NULL,
-  lng DOUBLE PRECISION NOT NULL,
-  address TEXT,
-  phone VARCHAR(50),
-  hours JSONB,
-  rating DOUBLE PRECISION,
-  review_count INTEGER DEFAULT 0
-);
-
-CREATE INDEX idx_pois_location ON pois USING GIST(location);
-CREATE INDEX idx_pois_category ON pois(category);
-CREATE INDEX idx_pois_name ON pois USING gin(to_tsvector('english', name));
-
--- Navigation Sessions
-CREATE TABLE navigation_sessions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id VARCHAR(100),
-  origin_lat DOUBLE PRECISION,
-  origin_lng DOUBLE PRECISION,
-  destination_lat DOUBLE PRECISION,
-  destination_lng DOUBLE PRECISION,
-  route_data JSONB,
-  started_at TIMESTAMP DEFAULT NOW(),
-  completed_at TIMESTAMP,
-  status VARCHAR(20) DEFAULT 'active'
-);
-
-CREATE INDEX idx_nav_sessions_user ON navigation_sessions(user_id);
-CREATE INDEX idx_nav_sessions_status ON navigation_sessions(status);
-```
-
-### Schema Design Rationale
-
-**Dual Coordinate Storage (lat/lng + GEOGRAPHY)**: Both `road_nodes` and `pois` store coordinates twice. The `GEOGRAPHY` column is required for accurate spatial queries (ST_Distance, ST_DWithin) via GIST indexes. The separate `lat`/`lng` columns allow fast bounding-box queries without PostGIS overhead and direct JSON serialization. The ~16 bytes per row trade-off is negligible given read frequency.
-
-**BIGSERIAL for Graph IDs, UUID for User-Facing Entities**: Graph algorithms need dense sequential IDs for array indexing in memory. POIs, incidents, and sessions use UUIDs to prevent sequential enumeration attacks in API responses and support distributed ID generation.
-
-**JSONB for Flexible Data**: `turn_restrictions` (variable per segment), `hours` (highly variable structure), and `route_data` (opaque client payload) all use JSONB because their schemas vary and they are rarely queried directly.
-
-**Partial Index for Active Incidents**: `WHERE is_active = TRUE` keeps the index 10-50x smaller than a full index. Since 99% of queries filter for active incidents, resolved ones are excluded automatically.
-
-**Denormalized congestion_level**: Pre-computed at write time from speed_kph / free_flow_speed to avoid JOINs with road_segments on every traffic query. Adds ~20 bytes per row but saves a JOIN on high-frequency reads.
-
-### Foreign Key Relationships
-
-| Child Table | Column | Parent Table | ON DELETE | Rationale |
-|-------------|--------|--------------|-----------|-----------|
-| `road_segments` | `start_node_id` | `road_nodes` | NO ACTION | Prevent accidental cascading deletion of road network graph |
-| `road_segments` | `end_node_id` | `road_nodes` | NO ACTION | Same -- graph integrity requires explicit cleanup |
-| `traffic_flow` | `segment_id` | `road_segments` | NO ACTION | Preserve historical traffic data for analytics |
-| `incidents` | `segment_id` | `road_segments` | SET NULL | Incident remains valid at its geographic point even if road geometry changes |
-
-### Data Retention
-
-| Table | Retention | Strategy |
-|-------|-----------|----------|
-| road_nodes, road_segments | Permanent | Core graph data |
-| traffic_flow | 7 days live + 1 year aggregated | Roll up to hourly after 7 days |
-| incidents | 90 days active + archive | Move resolved to cold storage |
-| navigation_sessions | 30 days | Delete or anonymize |
-| pois | Permanent | Soft delete for removed POIs |
-
-### Scalability Patterns
-
-**Time-Based Partitioning for traffic_flow**: Partition by timestamp (monthly) to enable fast time-range queries and efficient retention cleanup. Old partitions can be detached and archived.
-
-**Geographic Sharding for road_nodes/road_segments**: At global scale, partition by H3 or S2 cell. Each region's graph is self-contained for routing within that region; cross-region routes use a coarser inter-region graph.
-
-**Read Replicas for POI Search**: POI data is read-heavy with infrequent writes. Route search queries to read replicas to offload the primary.
-
----
+Raw observations need bounded retention and restricted access. Aggregates can be
+retained longer when their purpose and privacy properties justify it. Replacing
+an account ID with a stable device ID does not make a travel trace anonymous.
 
 ## API Design
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/routes/calculate` | Calculate route between origin and destination |
-| GET | `/api/routes/:id` | Get route details by session ID |
-| GET | `/api/search` | Search POIs by name, category, and location |
-| GET | `/api/search/geocode` | Convert address to coordinates |
-| POST | `/api/traffic/probe` | Submit GPS probe (idempotent) |
-| GET | `/api/traffic/flow` | Get traffic conditions for bounding box |
-| GET | `/api/traffic/incidents` | Get active incidents in area |
-| POST | `/api/traffic/incidents` | Report a traffic incident (idempotent) |
-| GET | `/api/map/nodes` | Get road nodes in bounding box |
-| GET | `/api/map/segments` | Get road segments in bounding box |
-| GET | `/api/map/pois` | Get POIs in bounding box |
-| GET | `/health` | Full system health check |
-| GET | `/health/live` | Liveness probe |
-| GET | `/health/ready` | Readiness probe |
-| GET | `/metrics` | Prometheus metrics endpoint |
+These are the actual local endpoints. The frontend uses `/api`, not `/api/v1`.
 
----
+| Method | Path | Current behavior |
+|--------|------|------------------|
+| POST | `/api/routes` | Origin/destination/options to one route |
+| POST | `/api/routes/alternatives` | Primary route only; alternatives helper returns an empty array |
+| GET | `/api/search` | POI-name search, optional category/location/radius/limit |
+| GET | `/api/search/geocode` | Substring POI/address lookup, then street lookup |
+| GET | `/api/search/reverse` | Nearest POI or named road, without a maximum distance |
+| GET | `/api/search/places/:id`, `/api/search/categories` | Place details / category counts |
+| GET | `/api/traffic` | Latest stored speed for segments intersecting bounds |
+| POST | `/api/traffic/probe` | Attempt local EMA update; no durable traffic effect |
+| GET / POST | `/api/traffic/incidents` | Bounding-box listing / incomplete reporting |
+| DELETE | `/api/traffic/incidents/:id` | Mark resolved without authentication |
+| GET | `/api/map/nodes`, `/api/map/segments`, `/api/map/pois` | Map data; no tile generation |
+| GET | `/health`, `/health/live`, `/health/ready`, `/metrics`, `/ping` | Diagnostics |
+
+The route response contains raw coordinate objects, distance, duration, maneuvers,
+and edge metadata. It has no encoded polyline, route/session ID, graph version,
+traffic timestamp, confidence, or degradation field. There is no route lookup,
+position-update, map-tile, or offline-package endpoint.
+
+The production contract should add those version/freshness fields and bounded
+input validation. No route, unsupported coverage, bad input, rate limiting, and
+dependency failure should have distinct responses and client presentation.
 
 ## Key Design Decisions
 
-### 1. Contraction Hierarchies vs Plain A*
+### In-memory routing with coherent versions
 
-Precomputing hierarchical shortcuts reduces route calculation from O(n log n) to O(k log k) where k << n. A continental graph with 100M nodes can be queried in under 100ms. The trade-off is preprocessing time (2-4 hours for a full rebuild) and 2-3x storage for shortcut edges. Traffic updates are handled by adjusting edge weights at query time rather than rebuilding the hierarchy -- this works because the topology is static; only the weights change.
+Fetching neighbors from a database during every graph expansion adds many network
+round trips to one interactive request. Keeping the regional adjacency structure
+in worker memory makes pathfinding CPU work with predictable data access.
 
-### 2. GPS Probe Aggregation vs Fixed Sensors
+The cost is memory, import/version management, and explicit partition boundaries.
+A graph database can help other graph-query workloads, but it does not eliminate
+the need for a routing-specific index. Sequence IDs also need not serve as array
+positions; compact remapping is an import concern.
 
-Crowd-sourced GPS probes from millions of devices provide far greater coverage than fixed sensor infrastructure. The trade-off is data quality -- probes from consumer devices have GPS errors of 5-15 meters, requiring map-matching to snap to road segments. We mitigate this with a Hidden Markov Model that considers road connectivity and heading. The aggregate statistics converge to accurate values with as few as 5 probes per segment per minute.
+Traffic-aware shortcuts require customization that preserves their meaning under
+the new weights. Publish a completed compatible snapshot and pin it for a request.
+Updating base edges independently of shortcut costs can produce an incorrect route,
+even when the visible road topology did not change.
 
-### 3. Vector Tiles vs Raster Tiles
+### Durable observation identity before aggregation
 
-Vector tiles (MVT/protobuf) are 3-5x smaller than raster PNGs, support client-side styling (dark mode, accessibility), and maintain sharpness at any zoom/rotation. The trade-off is client-side rendering complexity -- the client needs a GPU-accelerated renderer. For Apple Maps, this is acceptable since all target platforms (iOS, macOS) have Metal-capable GPUs.
+Crowdsourced observations can extend coverage, but each source carries noise,
+selection bias, privacy cost, and potential manipulation. Multiple samples from
+one device are not independent confirmation of an incident.
 
----
+The proposed pipeline acknowledges durable input, deduplicates within a defined
+replay horizon, and applies versioned aggregate effects. Redis can accelerate
+checks, but a claim before a nontransactional effect can suppress an observation
+that was never processed. A weighted-average UPSERT alone does not eliminate
+repeated contributions.
+
+This design costs stream state, replay handling, and retention operations.
+At local scale, a durable unique observation table plus a transaction is a simpler
+starting point than introducing a million-events-per-second architecture immediately.
+
+### Local navigation progress with bounded server refresh
+
+The client can advance along a saved route without waiting for a round trip on
+every position sample. Server requests refresh route options, traffic estimates,
+and reroutes when needed. This improves responsiveness during intermittent service.
+
+The cost is coordinating route generations and defining degraded guidance.
+A route can remain displayable while live traffic becomes unavailable; it cannot
+claim current closures or support arbitrary offline rerouting without more data.
+Persisting every GPS sample in a strongly consistent trip row would add latency
+and sensitive history without being necessary for local progress display.
 
 ## Consistency and Idempotency
 
-### Write Consistency Model
+Graph builds are immutable snapshots. A route query pins a compatible weight
+snapshot; changes arrive through a new generation. The response identifies the
+generations used so the client and diagnostics can reason about freshness.
 
-| Data Type | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Road graph | Strong (PostgreSQL transactions) | Infrequent writes, correctness critical |
-| Traffic flow | Eventual (last-write-wins) | High write volume, stale data acceptable for seconds |
-| Incidents | Eventual with merge | Multiple sources may report same incident |
-| POIs | Strong (PostgreSQL transactions) | User-facing data, consistency matters |
-| Navigation sessions | Strong | Must not lose active navigation state |
+Traffic windows use event time and an explicit allowed-lateness policy. A late
+observation can create a newer aggregate revision, while an older revision cannot
+overwrite a newer materialized result. Checkpointed processing and sink identity
+must cover crashes between accepting input and applying output.
 
-### Idempotency Implementation
+Incident reporting distinguishes retrying one report from merging independent
+reports of the same event. A transaction or spatially serialized decision prevents
+concurrent nearby reports from both creating separate incidents. Merge policy
+considers type, time, road/direction, and location, not distance alone.
 
-**GPS Probe Ingestion**: Each probe is identified by a composite key of `deviceId + timestamp`. Redis stores a deduplication window with 1-hour TTL. Duplicate probes return the cached result without reprocessing. The PostgreSQL UPSERT aggregates duplicate probes by averaging speeds weighted by sample count.
+The local Redis helper provides claims and cached responses, but has no durable
+probe receipt and incomplete retry recovery. Incident reporting additionally
+claims the same standard header key in two layers. These limitations are detailed below.
 
-**Incident Reports**: Multiple users may report the same incident. Reports within 100m radius of an existing active incident are merged by incrementing the confidence score and sample count. New incidents use a client-provided `idempotencyKey` with a PostgreSQL `ON CONFLICT DO NOTHING` to prevent duplicates.
+## Security / Auth
 
-### Replay Handling
+The proposed system validates observation ranges, units, timestamps, plausible
+motion, and source limits before they influence traffic. It treats location data
+as sensitive even when identified by a rotating pseudonym. Logging and retention
+must follow the same minimization rules as the ingestion path.
 
-For queue-based processing (GPS probes via Kafka):
-1. **At-least-once delivery** with manual offset commits
-2. **Deduplication window** in Redis (24h TTL) for probe IDs
-3. **Idempotent writes** via PostgreSQL UPSERT for traffic_flow
+The local API is public, has permissive CORS, and has no authentication or ownership
+model. Any caller can submit probes or attempt report/resolve actions. Coordinates,
+speeds, limits, and timestamps have only partial presence checks. Some zero values
+are rejected by truthiness tests, while malformed values reach SQL or arithmetic.
 
----
+Rate limiting exists, but uses per-process memory and trusts the first raw
+`X-Forwarded-For` value. It is not a shared authenticated-device quota or a source
+independence check. The simulator and public probe endpoint are not a trustworthy
+real-world traffic feed.
 
 ## Observability
 
-### Metrics (Prometheus)
+Proposed indicators include route latency and CPU, snapped-endpoint distance,
+restriction violations in reference tests, graph/weight age, observation-to-weight
+lag, coverage/confidence, and route-generation rejection on the client.
+ETA error must be measured against actual trip outcomes rather than simulator values.
 
-**Routing Metrics:**
-- `routing_calculation_duration_seconds` -- histogram with buckets 50ms to 5s, labels by route_type and status
-- `routing_requests_total` -- counter with success/no_route/error status
-- `routing_nodes_visited_total` -- gauge for algorithm efficiency tracking
+The current API exposes Pino HTTP logs and Prometheus metrics. Route calculation
+latency, nodes visited (a histogram), cache hits/misses, probe outcomes, breaker
+state, and some traffic counters are wired. Database query timing is declared but
+not applied to ordinary queries. The staleness gauge is set to zero on a simulator
+pass and does not increase as data ages.
 
-**Traffic Metrics:**
-- `traffic_probes_ingested_total` -- counter, regional breakdown
-- `traffic_probes_duplicates_total` -- counter for dedup monitoring
-- `traffic_incidents_detected_total` -- counter by type
-
-**Infrastructure Metrics:**
-- `http_request_duration_seconds` -- histogram by method, route, status_code
-- `cache_hits_total` / `cache_misses_total` -- counter by cache_name
-- `circuit_breaker_state` -- gauge (0=closed, 1=open, 2=half-open)
-
-### Alert Thresholds
-
-| Metric | Warning | Critical | Action |
-|--------|---------|----------|--------|
-| Route p95 latency | > 500ms | > 1000ms | Scale routing workers |
-| Route error rate | > 1% | > 5% | Page on-call, check DB |
-| Probe ingestion lag | > 1 min | > 5 min | Check Kafka, scale consumers |
-| Postgres connections | > 80% | > 95% | Investigate connection leaks |
-| Redis memory | > 80% | > 95% | Evict stale keys, add capacity |
-
-### Structured Logging
-
-JSON-formatted logs with consistent fields: `timestamp`, `level`, `service`, `requestId`, `event`. Request middleware attaches a correlation ID for tracing across log entries. Sensitive data (cookies, auth headers) is automatically redacted. Development uses pretty-printing; production emits raw JSON for log aggregators.
-
-### Health Checks
-
-Three-tier health check system:
-- **`GET /health/live`** -- liveness probe, returns 200 if process is running
-- **`GET /health/ready`** -- readiness probe, checks PostgreSQL and Redis connectivity
-- **`GET /health`** -- full check including routing graph loaded, traffic freshness, circuit breaker states
-
----
+Health checks test PostgreSQL/Redis connectivity, count graph rows, and inspect
+latest stored traffic timestamps. They do not inspect a loaded graph or prove that
+restrictions/routing work. Freshness uses only segments with traffic rows as its
+denominator, so missing coverage can look healthy. HTTP metrics normalize some
+IDs but not arbitrary unknown paths; global rate limits also affect probes and scrapes.
 
 ## Failure Handling
 
-### Circuit Breaker Pattern
+| Failure | Proposed behavior |
+|---------|-------------------|
+| Traffic unavailable | Use labeled historical/free-flow estimates if policy allows; report age/confidence |
+| New graph fails validation | Keep the previous compatible snapshot; expose its age |
+| Search unavailable | Show a search error; preserve current route and map |
+| Position stale or inaccurate | Hold progress conservatively and show position uncertainty |
+| Reroute response arrives late | Reject it if its request generation is obsolete |
+| Probe processing interrupted | Replay durable input without duplicate aggregate effects |
+| Brief connection loss | Retain accepted route; explicitly limit live-data claims |
 
-Separate circuit breakers isolate failures across dependencies:
-- **Routing Graph Load**: protects against database overload during graph queries, fallback returns cached stale graph
-- **Geocoding**: isolates geocoding failures from routing, 5s timeout
-- **Nearest Node**: separate breaker for expensive spatial queries
+A stale graph is not automatically safe indefinitely: topology and closure policy
+still need age limits. A fallback also cannot promise availability if the request
+continues to require other unavailable dependencies.
 
-State machine: CLOSED --(5 failures)--> OPEN --(30s timeout)--> HALF-OPEN --(3 successes)--> CLOSED. A single failure in HALF-OPEN returns to OPEN.
-
-### Graceful Degradation
-
-When the traffic service is unavailable, the routing engine falls back to historical traffic patterns (day-of-week + hour averages from ClickHouse). The response includes a `degraded: { traffic: "historical" }` field so the client can display a warning. When hierarchical routing times out, it falls back to basic A* which is slower but more reliable.
-
-### Retry Strategy
-
-HTTP retries use exponential backoff (100ms base, 2x multiplier, 5s max) with jitter. Only 5xx and 408/429 status codes are retried. All retryable operations include idempotency keys to ensure safe replay. Queue consumer retries use a dead-letter queue after 3 failed attempts.
-
-### Graceful Shutdown
-
-On SIGTERM/SIGINT: stop accepting new requests, wait for in-flight requests to complete (max 10s timeout), close database pool, disconnect Redis, then exit.
-
----
+Locally, graph loading has an Opossum stale-memory fallback, but nearest-node
+queries still require PostgreSQL and traffic reads still require Redis. There is
+no historical traffic store, queue retry/DLQ system, HTTP retry loop, or A* fallback
+from a hierarchy. The CPU-bound search has no query deadline or cancellation.
 
 ## Scalability Considerations
 
-### What Breaks First
+First separate large tile delivery from API work and bound spatial query outputs.
+Then measure routing CPU, graph memory, and traffic write growth independently.
+A stateless API replica is not a substitute for a coherent graph snapshot or an
+owned traffic partition.
 
-1. **Route calculation CPU** -- A* is CPU-bound. Horizontal scaling by adding routing worker instances behind a load balancer. Each instance loads the graph into memory independently.
-2. **Traffic flow write volume** -- At 1M probes/second, a single PostgreSQL becomes a bottleneck. Solution: Kafka for buffering, geographic partitioning (H3 cells), and ClickHouse for historical analytics.
-3. **Tile serving bandwidth** -- Vector tiles at global scale require a CDN with edge caching. Origin servers handle cache misses only.
-4. **POI search latency** -- Full-text search with spatial filtering is expensive. Solution: Elasticsearch cluster with geographic sharding, read replicas for PostgreSQL fallback.
+At larger scale, geographic stream partitioning can colocate matching/window state,
+while query workers load relevant graph partitions plus validated boundary links.
+Use completed weight generations rather than mutable partial reloads. Move historical
+traffic analysis away from the latency-sensitive route store when measured load warrants it.
 
-### Horizontal Scaling Path
-
-- **Routing**: Stateless workers, each loads full graph into memory (~4GB for a country). Shard by geographic region for global scale.
-- **Traffic**: Kafka partitions by H3 cell, consumers process in parallel. ClickHouse for historical roll-ups.
-- **Tiles**: CDN absorbs 99%+ of reads. Origin is a stateless tile renderer reading from PostGIS.
-- **Search**: Elasticsearch cluster with index sharding by region.
-
----
+The local simulator is especially misleading as a scaling example: every replica
+starts another writer over every segment. A production feed needs partition ownership
+or leader coordination, and historical storage needs retention/rollups.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Routing algorithm | Contraction Hierarchies | Plain Dijkstra/A* | Orders-of-magnitude faster queries; worth preprocessing cost |
-| Traffic source | GPS probe aggregation | Fixed sensors | Coverage at scale, self-updating |
-| Map format | Vector tiles (MVT) | Raster tiles (PNG) | 3-5x smaller, client-side styling, rotation-safe |
-| ETA prediction | ML model + historical patterns | Simple distance/speed | 10% accuracy target requires traffic prediction |
-| Traffic consistency | Eventual (last-write-wins) | Strong | High write throughput, seconds of staleness acceptable |
-| Probe deduplication | Redis with TTL | Database unique constraint | Sub-ms check at ingestion rate of 1M/s |
-| Graph ID type | BIGSERIAL | UUID | Array indexing in memory, sequential inserts |
-| Spatial queries | PostGIS GEOGRAPHY | Application-level Haversine | Accurate distance on spheroid, GIST index support |
-
----
-
-## Frontend Architecture
-
-This section documents the React frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
-
-### Component Hierarchy
-
-```
-App
-├── MapView ─── Leaflet map container (full viewport)
-│   ├── MapViewController ─── syncs map center/zoom with store
-│   ├── MapEventHandler ─── click-to-set origin/destination
-│   ├── DataLoader ─── loads traffic/POIs/incidents on map move
-│   ├── RouteLayer ─── Polyline rendering of calculated route
-│   ├── TrafficLayer ─── Polyline rendering of traffic congestion
-│   ├── POIMarkers ─── Marker + Popup for points of interest
-│   ├── IncidentMarkers ─── CircleMarker + Popup for incidents
-│   └── RouteMarkers ─── draggable origin/destination markers
-├── SearchBar ─── debounced search with autocomplete dropdown
-├── MapControls ─── traffic/POI/incident toggle buttons
-└── RoutePanel ─── directions panel (bottom sheet)
-    ├── Origin/Destination inputs
-    ├── Route options (avoid tolls, avoid highways)
-    ├── Calculate button / route summary
-    ├── Navigation status bar (during active navigation)
-    └── Maneuver list (turn-by-turn directions)
-```
-
-Unlike the other Apple projects that use TanStack Router for multi-page navigation, Apple Maps uses a single-page architecture where all components are rendered simultaneously. The map fills the entire viewport, and UI elements (search bar, controls, route panel) are absolutely positioned overlays. This mirrors the real Apple Maps app where the map is always visible and UI elements float on top.
-
-### Zustand Store
-
-The entire frontend state is managed by a single `mapStore` -- the largest Zustand store in the repository. It is organized into functional sections:
-
-**Map view state** -- `center` (LatLng, defaults to San Francisco), `zoom` (defaults to 14). `setCenter` and `setZoom` sync the Leaflet map with the store.
-
-**Route state** -- `origin`, `destination` (LatLng or null), `route` (the calculated route with coordinates, maneuvers, distance, duration), `alternativeRoutes`, `isLoadingRoute`, `routeError`. The `calculateRoute` action calls the backend's `/api/routes/calculate` endpoint with origin, destination, and route options (avoid tolls/highways). `clearRoute` resets all route-related state.
-
-**Search state** -- `searchQuery`, `searchResults` (Place array), `isSearching`. The `search` action calls `/api/search` with the query text and the current map center as a proximity bias, returning ranked results within a 10km radius.
-
-**Traffic state** -- `trafficData` (array of traffic flow objects with geometry and congestion levels), `showTraffic` (toggle). `loadTraffic` fetches traffic data for the current map bounding box from `/api/traffic/flow`.
-
-**Incident state** -- `incidents` (array with type, severity, location, description), `showIncidents` (toggle, defaults to on). `loadIncidents` fetches active incidents in the current bounding box.
-
-**POI state** -- `pois` (Place array), `showPOIs` (toggle, defaults to on). `loadPOIs` fetches points of interest in the current bounding box from `/api/map/pois`.
-
-**Navigation state** -- `navigation` object with `isNavigating`, `currentManeuverIndex`, `distanceToNextManeuver`, and `eta`. `startNavigation` calculates the ETA from the route duration, `stopNavigation` resets the state, and `updateNavigation` advances through maneuvers based on the current position using a simple Euclidean distance threshold (50 meters).
-
-**Route options** -- `routeOptions` with `avoidTolls` and `avoidHighways` booleans, passed to the backend when calculating routes.
-
-### Data Fetching
-
-API calls go through `services/api.ts`, which exports a single `api` object with methods: `calculateRoute`, `searchPlaces`, `geocode`, `getTraffic`, `getIncidents`, `getPOIs`, `getNodes`, `getSegments`, and `submitProbe`. Unlike the other Apple projects, there is no authentication -- the Maps project focuses on routing algorithms and traffic, not auth.
-
-Data loading is event-driven rather than page-load-driven. The `DataLoader` component inside the map subscribes to `moveend` events from Leaflet and loads traffic, POI, and incident data for the new bounding box with a 300ms debounce. This ensures data is refreshed as the user pans the map without flooding the server with requests during smooth scrolling.
-
-### Key UI Pattern: Map Rendering
-
-The map is rendered using **Leaflet** via `react-leaflet`, which provides React component wrappers around the Leaflet API. The choice of Leaflet over Mapbox GL or Google Maps was deliberate: Leaflet is open-source, supports OpenStreetMap tiles without API keys, and has a well-documented React integration.
-
-**Tile rendering:**
-The `MapContainer` component initializes a Leaflet map instance filling the entire viewport. `TileLayer` loads raster tiles from OpenStreetMap's tile servers. In the production architecture, these would be custom vector tiles served from the CDN, but Leaflet's raster tiles are sufficient for the development prototype.
-
-**Layer composition:**
-Multiple map layers are rendered as sibling React components inside `MapContainer`:
-1. `TrafficLayer` -- renders `Polyline` components for each road segment with traffic data. Color encodes congestion: green (free), yellow (light), orange (moderate), red (heavy). Lines are 4px wide with 80% opacity.
-2. `RouteLayer` -- renders a single `Polyline` for the calculated route in blue (#007AFF), 6px wide, with rounded line caps and joins for a smooth appearance.
-3. `POIMarkers` -- renders `Marker` components with category-specific colored dot icons (orange for restaurants, brown for coffee shops, red for gas stations, etc.). Each marker has a `Popup` showing name, category, rating, address, and a "Directions" button that sets the POI as the destination.
-4. `IncidentMarkers` -- renders `CircleMarker` components colored by incident type (red for accidents/closures, orange for construction, yellow for hazards). Popups show incident type, description, and report time.
-5. `RouteMarkers` -- renders draggable `Marker` components for origin (blue dot) and destination (red dot). Dragging a marker updates the store, which can trigger a route recalculation.
-
-**Map interaction:**
-The `MapEventHandler` component uses Leaflet's `useMapEvents` hook to handle clicks. Clicking the map sets the origin if none exists, then the destination on the second click. The `MapViewController` syncs the Leaflet map view with the Zustand store bidirectionally: store changes drive `map.setView()`, and user pan/zoom events update the store via `moveend`/`zoomend` handlers.
-
-**Route panel interaction:**
-The `RoutePanel` component appears as a bottom sheet when origin and destination are set. It shows coordinate displays for origin/destination, a swap button, route option checkboxes (avoid tolls, avoid highways), and a "Get Directions" button. After calculation, it shows a route summary (duration and distance formatted) and a scrollable list of turn-by-turn maneuvers with directional icons. During navigation, a blue status bar shows the current maneuver instruction, distance to next turn, and ETA.
-
-**Search interaction:**
-The `SearchBar` debounces input by 300ms before calling the search API. Results appear in a dropdown overlay with category icons, name, address, rating, and distance from the map center. Selecting a result sets it as the destination and centers the map on it. Clicking outside the dropdown closes it via a `mousedown` event listener.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers who may not have encountered these patterns before.
-
-### Redis Cache-Aside
-
-**What it is:** Cache-aside (also called "lazy loading") is a caching strategy where the application checks a cache (typically Redis) before querying the primary database. If the data is in the cache (a "hit"), the cached value is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL, and returns it. The cache is never written to directly by the database -- the application manages the cache population.
-
-**How it works in this project:** POI data is cached in Redis because POIs rarely change but are queried on every map move. When a user pans the map, the frontend requests POIs for the visible bounding box. The backend first checks Redis for cached results for that bounding box (quantized to a grid to improve cache hit rates). On a miss, PostgreSQL is queried using the GIST spatial index, the results are cached with a 5-minute TTL, and returned. Traffic data is not cached with cache-aside because it changes every few seconds -- instead, the latest aggregated values are written directly to Redis by the traffic simulation timer.
-
-**Why it matters at scale:** A maps application has extremely high read frequency. Every pan and zoom generates a new request for the visible area's data. Without caching, each of the millions of concurrent users would generate multiple PostGIS spatial queries per second. Redis absorbs this read load, serving results in sub-millisecond time. The TTL ensures that new POIs (e.g., a newly opened restaurant) appear within minutes without requiring explicit cache invalidation.
-
-### Circuit Breaker (Opossum)
-
-**What it is:** A circuit breaker prevents an application from repeatedly trying to execute an operation that is likely to fail. When failures exceed a threshold, the circuit "opens" and calls fail immediately. After a timeout, a few test requests are allowed through ("half-open"). If they succeed, normal operation resumes ("closed").
-
-The three states:
-- **Closed** (normal): requests pass through. High failure rate triggers opening.
-- **Open** (failing fast): all requests immediately return a fallback without contacting the dependency.
-- **Half-open** (testing): limited test requests allowed. Success closes the circuit; failure reopens it.
-
-**How it works in this project (`backend/src/shared/circuitBreaker.ts`):** Separate circuit breakers protect three expensive operations: routing graph load (protects against database overload when loading the full road graph into memory), geocoding (isolates geocoding failures from routing), and nearest-node queries (separate breaker for spatial queries that can be expensive). The state machine transitions on 5 failures to OPEN, waits 30 seconds, then allows 3 test requests in HALF-OPEN. A single failure in HALF-OPEN returns to OPEN.
-
-**Fallback strategies:**
-When the routing graph load circuit opens, the system serves routes using a cached (potentially stale) version of the graph. When geocoding fails, the search endpoint returns an error for address queries while POI search continues working. When nearest-node fails, the routing endpoint returns an error with a specific message indicating the spatial query service is degraded.
-
-**Why it matters at scale:** The routing engine loads the entire road graph into memory for performance. If the database is temporarily overloaded, the graph load query fails. Without a circuit breaker, every subsequent routing request would attempt this expensive query, further overloading the database and creating a feedback loop. The circuit breaker stops all graph load attempts for 30 seconds, giving the database time to recover, while serving routes using the last successfully loaded graph.
-
-### Structured Logging (Pino)
-
-**What it is:** Structured logging means emitting log entries as machine-parseable JSON objects instead of free-form text. Each entry contains consistent fields (`timestamp`, `level`, `service`, `requestId`, `message`) that log aggregation systems can index and search.
-
-**How it works in this project (`backend/src/shared/logger.ts`):** Pino outputs JSON with request correlation via `requestId`. Express middleware creates a child logger per request, binding HTTP method, path, and query parameters. Route handlers add context as they execute (e.g., origin/destination coordinates, route calculation time, number of nodes visited). Sensitive data (cookies, auth headers) is automatically redacted. Development mode uses pretty-printing for readability; production emits raw JSON for log aggregators.
-
-**Why it matters at scale:** A routing service processes millions of requests per second. When a user reports "my route was wrong," the engineer needs to find the exact request, see which graph version was loaded, what traffic weights were applied, and how many nodes the A* algorithm visited. With structured logging and the `requestId` field, they can correlate all log entries for that specific routing request. With text logs, this investigation would require parsing inconsistent log formats across multiple routing worker instances.
-
-### Prometheus Metrics
-
-**What it is:** Prometheus is a time-series monitoring system that scrapes metrics from application endpoints. Applications expose a `/metrics` endpoint with metric values. Prometheus stores these time series and enables queries and alerting.
-
-**How it works in this project (`backend/src/shared/metrics.ts`):** Routing-specific metrics include: `routing_calculation_duration_seconds` (histogram with buckets from 50ms to 5s, labeled by route type and status), `routing_requests_total` (counter with success/no_route/error status), and `routing_nodes_visited_total` (gauge for tracking algorithm efficiency). Traffic metrics include: `traffic_probes_ingested_total` (counter with regional breakdown), `traffic_probes_duplicates_total` (counter for dedup monitoring), and `traffic_incidents_detected_total` (counter by type). Infrastructure metrics include: `http_request_duration_seconds` (histogram by method, route, status), `cache_hits_total` / `cache_misses_total` (by cache name), and `circuit_breaker_state` (gauge per dependency).
-
-**Why it matters at scale:** Route calculation is CPU-bound, and monitoring `routing_calculation_duration_seconds` reveals when the system needs more routing workers. The `routing_nodes_visited_total` metric is particularly valuable for algorithm optimization: if the A* heuristic is poorly calibrated, it visits too many nodes and the histogram shifts right. Traffic probe ingestion rate monitoring (`traffic_probes_ingested_total`) detects when GPS probe coverage drops below the threshold needed for accurate traffic estimates. Alert thresholds (route p95 > 500ms, probe lag > 5 minutes) provide early warning before users experience degraded ETAs.
-
-### Rate Limiting
-
-**What it is:** Rate limiting restricts how many requests a client can make within a time window. When exceeded, the server returns 429 (Too Many Requests) with a `Retry-After` header.
-
-**How it works in this project (`backend/src/shared/rateLimit.ts`):** Four rate limit tiers are configured: routing (30 req/min) since route calculations are CPU-intensive, search (60 req/min) since each query involves a PostGIS spatial query plus full-text search, traffic probe submission (600 req/min) to accept high-frequency GPS probes while preventing abuse, and general traffic data reads (120 req/min). Redis backs the store for consistency across server instances.
-
-**Why it matters at scale:** Route calculation is the most expensive operation in the system -- each request loads a graph into memory and runs A*. A single client requesting routes in a tight loop could monopolize CPU resources and starve other users. The 30 req/min routing limit ensures no single client can degrade service for others. The traffic probe limit of 600 req/min is deliberately high because legitimate GPS probes arrive every few seconds per device, but it still prevents a malfunctioning device from flooding the ingestion pipeline.
-
-### Idempotency
-
-**What it is:** An idempotent operation produces the same result whether executed once or multiple times. For APIs, this means retrying a request does not cause duplicate side effects.
-
-**How it works in this project (`backend/src/shared/idempotency.ts`):** GPS probe ingestion is idempotent by design: each probe is identified by a composite key of `deviceId + timestamp`. Redis stores a deduplication window with 1-hour TTL. Duplicate probes return the cached result without reprocessing. The PostgreSQL `UPSERT` for traffic flow data aggregates duplicates by averaging speeds weighted by sample count, so even if a duplicate slips through Redis, the database handles it correctly. Incident reports use a client-provided `idempotencyKey` with `ON CONFLICT DO NOTHING` to prevent duplicate incident creation. Reports near an existing active incident (within 100m) are merged rather than creating duplicates.
-
-**Why it matters at scale:** At 1M GPS probes per second, network retries and at-least-once delivery guarantees from Kafka mean some probes will arrive more than once. Without deduplication, duplicate probes would skew traffic speed estimates (a slow probe counted twice would bias the average downward). The Redis deduplication window is much cheaper than a database uniqueness check at this ingestion rate. For incident reports, idempotency prevents the same road closure from appearing as 50 separate incidents when 50 users report it simultaneously.
-
-### Health Checks
-
-**What it is:** Health checks are HTTP endpoints consumed by infrastructure systems to determine whether an application instance can serve traffic. Liveness checks verify the process is running; readiness checks verify dependencies are reachable.
-
-**How it works in this project (`backend/src/routes/health.ts`):** Three endpoints: `GET /health/live` returns 200 if the process is running. `GET /health/ready` checks PostgreSQL connectivity (executes `SELECT 1`) and Redis connectivity (executes `PING`), returning 503 if either is unreachable. `GET /health` performs a deep check including whether the routing graph is loaded in memory, whether traffic data is fresh (last update within 2 minutes), and the state of all circuit breakers. This enables the monitoring system to distinguish between "completely down" and "running but unable to calculate routes because the graph failed to load."
-
-**Why it matters at scale:** Routing workers load the road graph into memory on startup, which takes several seconds. During this loading period, the worker is running (liveness: OK) but cannot serve route requests (readiness: NOT OK). Without separate health checks, a load balancer might route traffic to a worker that has not finished loading its graph, resulting in errors. The deep health check additionally detects stale traffic data -- if the traffic simulation or probe ingestion has stopped, routes will use free-flow speeds instead of current conditions, producing inaccurate ETAs. This degraded state is not a crash, but it should trigger an alert.
-
----
+| Route traversal | Regional in-memory graph | Database query per expansion | Avoid many network round trips |
+| Dynamic routing index | Explicit weight customization | Static shortcuts with changed base weights | Preserve route-cost correctness |
+| Traffic acceptance | Durable identified observations | Redis claim before volatile update | Recover interrupted processing |
+| Traffic publication | Versioned windows and confidence | Unqualified latest speed | Handle late data and missing coverage |
+| Client progress | Local accepted-route state | Server round trip per position | Remain responsive during connection loss |
+| Tile format | Select by rendering/product needs | Fixed vector-is-always-smaller rule | Costs depend on actual content and devices |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.
+### Runtime, setup, and data
 
-### Local Architecture
+[backend/src/index.ts](./backend/src/index.ts) starts Express without waiting for
+schema/data readiness and starts one traffic simulator in its listen callback.
+`npm run dev` sets port 3001; `npm start` runs TypeScript through `tsx` with the
+entry point's port-3000 default. Vite proxies `/api` to 3001. No `.env` loader is present.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  React Frontend (:5173)                       │
-│     MapView (Leaflet) + SearchBar + RoutePanel + Controls   │
-│     State: Zustand (mapStore)                                │
-└────────────────────────┬────────────────────────────────────┘
-                         │ HTTP (fetch)
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Express Backend (:3000)                          │
-│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌───────────┐ │
-│  │ /api/    │  │ /api/     │  │ /api/    │  │ /api/map/ │ │
-│  │ routes/* │  │ traffic/* │  │ search/* │  │ nodes,    │ │
-│  │          │  │           │  │          │  │ segments, │ │
-│  │          │  │           │  │          │  │ pois      │ │
-│  └──────────┘  └───────────┘  └──────────┘  └───────────┘ │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Shared: logger, metrics, circuitBreaker,            │  │
-│  │          idempotency, rateLimit, health               │  │
-│  └──────────────────────────────────────────────────────┘  │
-└──────────┬─────────────────────────┬────────────────────────┘
-           │                         │
-           ▼                         ▼
-┌────────────────────┐    ┌────────────────────┐
-│  PostGIS (:5432)   │    │  Valkey (:6379)     │
-│  postgis/postgis   │    │  valkey/valkey      │
-│  DB: apple_maps    │    │  Cache, rate limits, │
-│  User: maps        │    │  idempotency keys   │
-└────────────────────┘    └────────────────────┘
-```
+The API and seed use `DB_HOST/PORT/USER/PASSWORD/NAME`, while
+[db/migrate.ts](./backend/src/db/migrate.ts) uses `DATABASE_URL` with different
+fallback credentials. Compose initializes SQL on fresh volumes only. The schema
+is not rerunnable, and the seed deletes all project data without a transaction.
+It does not reset sequences or invalidate Redis keys. See [README](./README.md).
 
-### Production Patterns Actually Implemented
+The real basemap and CSS come from external OSM/UNPKG services. The synthetic road
+grid and randomized POIs do not align with real streets or business locations.
+No incident is seeded. The fixture has no highway, toll, one-way, or turn-restriction
+case, so the corresponding routing behavior is not validated by viewing the demo.
 
-| Pattern | File | Why It Matters at Scale |
-|---------|------|------------------------|
-| Structured logging (Pino) | `backend/src/shared/logger.ts` | JSON logs enable ELK/Splunk ingestion; request correlation IDs trace issues across services |
-| Prometheus metrics | `backend/src/shared/metrics.ts` | RED method (Rate/Errors/Duration) with histograms for p95/p99 latency tracking; `/metrics` endpoint for scraping |
-| Circuit breakers (Opossum) | `backend/src/shared/circuitBreaker.ts` | Separate breakers for routing graph load, geocoding, nearest-node queries; prevents cascading failures |
-| Idempotency | `backend/src/shared/idempotency.ts` | Redis-based dedup for GPS probes and incident reports; safe retries with cached responses |
-| Rate limiting | `backend/src/shared/rateLimit.ts` | Per-endpoint limits: routing 30/min, search 60/min, traffic 120/min, GPS probes 600/min |
-| Health checks | `backend/src/routes/health.ts` | Three-tier: `/health/live` (liveness), `/health/ready` (readiness with DB/Redis check), `/health` (full with graph and traffic freshness) |
-| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT handling: stop traffic simulation, drain connections, close pool |
-| A* routing | `backend/src/services/routingService.ts` | Binary min-heap priority queue, Haversine heuristic, traffic-aware edge weights |
-| Traffic simulation | `backend/src/services/trafficService.ts` | Simulated GPS probes with rush-hour patterns, exponential moving average aggregation |
-| POI full-text search | `backend/src/routes/search.ts` | PostgreSQL GIN index on `to_tsvector('english', name)` with spatial proximity ranking |
+### Routing and geometry
 
-### Simplifications from Production Design
+[routingService.ts](./backend/src/services/routingService.ts) loads all nodes and
+segments into Maps, adds reverse edges for two-way segments, and caches the graph
+for 60 seconds. Those two database reads are not one snapshot transaction, and
+concurrent cache misses are not coalesced. A stale fallback resets the cache age.
 
-| Production | Local Substitute | Why |
-|------------|-----------------|-----|
-| Kafka for GPS probe ingestion | In-process traffic simulation timer | No need for distributed streaming at dev scale |
-| Contraction Hierarchies | Basic A* with priority queue | CH requires preprocessing pipeline; A* sufficient for grid-based test network |
-| ClickHouse for traffic analytics | PostgreSQL traffic_flow table | Single time-series table fits local workload |
-| Elasticsearch for POI search | PostgreSQL GIN full-text index | GIN index handles dev-scale POI corpus |
-| CDN for tile serving | Leaflet loading OpenStreetMap tiles directly | No local tile generation pipeline |
-| PostGIS spatial queries | Bounding-box queries on lat/lng columns | Simpler, sufficient for grid-based test data |
-| Geographic sharding (H3) | Single PostgreSQL instance | One city-sized test dataset |
-| OAuth / JWT auth | No authentication | Learning project focused on routing, not auth |
-| Vector tile generation (MVT) | Leaflet raster tiles from OSM | Client-side rendering not in scope |
+A* uses the binary heap in [utils/geo.ts](./backend/src/utils/geo.ts), time weights,
+and Haversine distance divided by **100 km/h**. Turn restrictions and actual segment
+line geometry are not loaded. There is no enforced positive finite cost/speed bound,
+so the heuristic's admissibility is not guaranteed for arbitrary stored inputs.
+The small seed's speeds are below that bound, but this is not a general guarantee.
 
-### What Was Omitted
+Every calculation snaps endpoints through separate PostGIS nearest-node queries
+with no distance cap, collects all segment IDs, then reads a whole-graph traffic
+map. Redis `traffic:current` lasts 30 seconds; on a miss the router selects the latest
+stored row per segment with no age cutoff. Missing data uses free-flow speed; stale
+data does not switch to historical patterns. Redis failures propagate.
 
-- **CDN and edge caching** -- no multi-POP deployment
-- **Multi-region deployment** -- single local instance
-- **Kubernetes orchestration** -- Docker Compose only
-- **ML-based ETA prediction** -- simple distance/speed calculation
-- **Offline map download** -- not implemented
-- **Voice navigation** -- not implemented
-- **Rerouting on deviation** -- detected but not acted upon
-- **Contraction Hierarchies preprocessing** -- basic A* only
-- **Alternative routes** -- penalty method described but not implemented
+Path coordinates connect original endpoints to snapped nodes and then node-to-node,
+but distance/time totals include only graph edges. Arbitrarily long off-graph
+connectors can therefore be drawn without counted travel cost. Equal snapped nodes
+can produce zero graph distance and only a depart instruction. Maneuver distances
+reset after each emitted turn, rather than being cumulative route offsets.
+
+No route-result cache, contraction hierarchy, routing worker pool, alternative
+route algorithm, session persistence, or incident closure constraint is connected.
+The synchronous A* loop occupies the Node event loop and has no search budget.
+
+### Traffic and incident defects
+
+[trafficService.ts](./backend/src/services/trafficService.ts) scans every segment
+every ten seconds, assigns a random speed using server-local rush-hour bands, and
+performs one awaited INSERT per segment. This is not a batch, EMA, or real-probe
+simulation. Overlapping interval passes are possible; each API has its own Map and
+writes the shared Redis value. Rows have no cleanup or unique time-window constraint.
+
+The probe endpoint applies a 0.1 EMA to process-local memory only. Heading is ignored;
+matching chooses the nearest segment within 50 metres. Observation time is used for
+the key, not event-time ordering. No PostgreSQL or immediate Redis update records
+the effect, and the next simulator pass replaces it. A processed acknowledgement
+therefore does not mean a durable or consistently visible traffic contribution.
+
+Incident reporting references missing `confidence`, `sample_count`,
+`last_reported_at`, and `idempotency_key` fields, so it cannot complete against the
+supplied schema. Its insert also constructs geography with longitude in both
+coordinate arguments. Scalar coordinates can disagree with the geography even if
+the missing columns are added. Nearby lookup ignores incident type/direction and
+has no concurrency protocol; there is no automatic slowdown-to-incident detector.
+
+### Idempotency, breakers, and limits
+
+[shared/idempotency.ts](./backend/src/shared/idempotency.ts) uses Redis SET NX and
+cached responses. Probe claims last one hour, but completion uses the default
+24-hour TTL. No-match/error paths retain their claim; a 60-second logical processing
+timeout does not remove the key, so a new NX still fails. Redis errors fail open.
+There is no durable observation uniqueness or payload binding.
+
+The incident middleware claims `Idempotency-Key`, then the service tries to claim
+the same operation/key again. The service returns duplicate before a real insert,
+and middleware caches that response. A body-only key avoids this double claim but
+still reaches the broken SQL. Failure-state keys can also block retries until TTL
+expiry despite `checkIdempotency` saying they may proceed.
+
+[shared/circuitBreaker.ts](./backend/src/shared/circuitBreaker.ts) wires graph load,
+nearest-node, geocode, and reverse-geocode breakers. Graph-load options are a
+10-second timeout, 60% error threshold, volume threshold 3, and 60-second reset;
+nearest-node uses a five-second timeout. These are percentage/volume settings,
+not a rule of five failures and three recovery successes. A timeout does not cancel
+an underlying database query or preempt the A* loop.
+
+[shared/rateLimit.ts](./backend/src/shared/rateLimit.ts) supplies in-memory IP limits:
+general 100/minute, routing 30, search 60, traffic 120, map data 200, incidents 10.
+The probe limiter is 600 with successful requests excluded, but all requests still
+pass the stricter global 100 limit. Geocode/strict helper instances are unused.
+Raw forwarded-header trust permits spoofed identities and counters are not shared
+across API processes.
+
+### Browser behavior and observability limits
+
+[MapView.tsx](./frontend/src/components/MapView.tsx) displays raster tiles and React
+Leaflet layers. Data loads on mount/toggle and after a 300 ms move-end debounce,
+with no stationary polling, cancellation, request-generation guard, or timeout cleanup.
+Route lines are added before traffic lines, so enabled traffic can overlay the route.
+There is no fitting of a calculated route into the available map area.
+
+Camera synchronization writes a new center object on every `moveend`, then an
+effect calls `setView` again. In [Leaflet 1.9.4's source](https://github.com/Leaflet/Leaflet/blob/v1.9.4/src/map/Map.js),
+a zero-offset pan also emits `moveend`. This creates a source-derived feedback-loop
+risk requiring an equality/origin guard; no browser reproduction was run here.
+
+[mapStore.ts](./frontend/src/stores/mapStore.ts) keeps all layers, requests, and
+navigation state together without persistence. Endpoint/option edits keep the old
+route; the panel hides Get Directions while a route exists. A cleared request can
+later restore its stale route. Search errors become empty results, and selecting a
+result triggers another debounced search for its name, reopening the dropdown.
+
+Start sets the initial maneuver and ETA. `updateNavigation` has no caller, and
+there is no `watchPosition` or probe sender. The one-time My location action only
+recenters the map. The unused progress helper uses rough Euclidean degrees rather
+than route distance. Origin/destination displays are not editable search inputs.
+Incident timestamps arrive as `reported_at`, while the UI reads `reportedAt`.
+
+[routes/health.ts](./backend/src/routes/health.ts) implements the health checks:
+connectivity timeouts use Promise.race without canceling queries; Redis INFO and
+other deep checks are outside those timeouts. Traffic health uses five-minute
+freshness, not the older document's two-minute claim. Graph health counts stored
+rows, not a loaded/validated in-memory snapshot.
+
+[shared/metrics.ts](./backend/src/shared/metrics.ts) and
+[shared/logger.ts](./backend/src/shared/logger.ts) wire useful HTTP/route telemetry,
+but base service logs do not consistently carry the HTTP request ID. URLs and some
+error objects can contain coordinates or raw probes. An audit logger's retention
+label is not implemented retention, and its helper has no callers.
+
+Shutdown stops the interval and closes database/Redis resources, but never closes
+the HTTP listener or waits for in-flight requests/simulation passes before exit.
+The one smoke test checks the Leaflet container; it does not exercise these flows.
+
+### Simplifications and omissions
+
+One PostGIS instance replaces a managed spatial source/read tier, Valkey holds
+small caches, and generated data replaces real roads/probes. Leaflet raster tiles
+replace a custom versioned vector pipeline. There is no authentication or operator UI.
+
+Durable stream ingestion, trace matching, traffic history rollups, verified closures,
+customizable routing indexes, bounded offline packages, live navigation/rerouting,
+privacy controls, multi-region deployment, and distributed snapshot publication are
+omitted. This source/documentation review did not run the stack or repair app code.

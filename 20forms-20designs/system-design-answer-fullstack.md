@@ -1,701 +1,388 @@
-# 20 Forms, 40 Designs - System Design Answer (Full-Stack Focus)
+# Form Library Comparison — Fullstack System Design
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+*A 45-minute interview discussion. The design below is a proposal for a robust
+comparison product. See [architecture.md](./architecture.md) for the verified
+implementation and the features it simplifies or omits.*
 
----
+## 🎯 Start with the user journey — 5 minutes
 
-## 📋 Problem Statement
+> “A developer wants to compare the same form in several UI libraries. They choose
+> a form, pick two or three libraries, try the controls, switch themes, and send
+> the comparison to a colleague. I would design that complete journey before adding
+> infrastructure, because the hardest requirements cross the browser boundaries.”
 
-Design a platform that renders identical forms across 41 React design systems for comparison. This answer covers the end-to-end architecture, emphasizing the integration between:
-- Shell application (host) and library applications (iframes)
-- Build orchestration and deployment pipeline
-- State management and URL synchronization
+I would clarify whether the forms are demonstrations or submit real data, whether
+examples are curated or user-uploaded, and whether a link must reproduce the exact
+selection on another device.
 
----
+For this discussion, forms are curated demonstrations. There are twenty form types
+and about fifty library entries, including an unstyled baseline. We support multiple
+form and library selections, two grouping modes, and light/dark themes where the
+library provides them.
 
-## 🎯 Requirements Clarification
+We do not need account creation, payment processing, shared document editing, or a
+server-side comparison database. Typed form values remain transient in each preview.
+Comparison settings can be represented in a URL.
 
-### Functional Requirements
+This makes the serving workload static, but the frontend is still interactive.
+There is substantial engineering in the contracts between the shell, each library
+application, and the artifact that delivers them together.
 
-1. **Form Comparison**: Display 20 common forms across 41 design system libraries
-2. **Library Selection**: Toggle visibility of any library combination
-3. **Theme Support**: Light/dark mode for supported libraries
-4. **Deep Linking**: Shareable URLs to specific form/library comparisons
+### Requirements and their consequences
 
-### Non-Functional Requirements
+| Requirement | Design consequence |
+|-------------|--------------------|
+| Faithful native controls | Give each library an independent styling boundary |
+| Interactive comparisons | Preserve input during ordinary theme changes |
+| Exact share links | Specify URL state independently of saved preferences |
+| Many possible previews | Bound the number of live documents |
+| A dependable catalog | Deploy matching shell and preview artifacts |
+| Accessible browsing | Label frames and preserve focus during lifecycle changes |
 
-| Requirement | Target | Rationale |
-|-------------|--------|-----------|
-| CSS Isolation | Complete | Zero style bleed between design systems |
-| Build Time | < 5 minutes | Full 42-app build on CI |
-| Load Time | < 2 seconds | Fast navigation between comparisons |
-| Hosting | Static | GitHub Pages, no server required |
+I would propose shell interactions around 200 ms and first useful content within a
+few seconds on an agreed device/network profile. These are targets to measure, not
+promises based on framework choice.
 
-### Scale Estimates
-
-| Metric | Value |
-|--------|-------|
-| Total applications | 42 (1 shell + 41 libraries) |
-| Average app size (gzipped) | ~150KB |
-| Total dist size | ~18MB |
-| Daily visitors | 1K-10K |
-| Workload type | Read-only (static assets) |
-
----
-
-## 🏗️ High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Monorepo Structure                               │
-│  apps/                                                                   │
-│  ├── shell/          (Host application - Vite + React)                  │
-│  ├── mui/            (MUI forms - Vite + React + MUI)                   │
-│  ├── chakra/         (Chakra forms - Vite + React + Chakra)             │
-│  └── ... (39 more)                                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  │ Build Pipeline
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         GitHub Actions CI/CD                             │
-│  1. Checkout → 2. Install → 3. Parallel Build (4 concurrent)            │
-│  4. Assemble dist/ → 5. Deploy to GitHub Pages                          │
-└─────────────────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Browser (Shell Application)                           │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                     Control Panel                                  │  │
-│  │  [Form: Login ▼]  [Libraries: ✓MUI ✓Chakra ...]  [🌙/☀️]          │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                     Preview Grid                                   │  │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │  │
-│  │  │   <iframe>   │  │   <iframe>   │  │   <iframe>   │             │  │
-│  │  │  src="/mui/  │  │ src="/chakra │  │ src="/antd/  │             │  │
-│  │  │  ?form=login │  │ ?form=login" │  │ ?form=login" │             │  │
-│  │  │  &theme=dark"│  │ &theme=dark" │  │ &theme=dark" │             │  │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘             │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                     Zustand Store                                  │  │
-│  │  selectedForm | selectedLibraries[] | theme                       │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📊 Data Model
-
-### Static Data Structures
+## 🏗️ Draw one end-to-end picture — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Data Types                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Form:                                                                   │
-│  ├── id: string         ("login", "signup", "checkout", etc.)           │
-│  ├── name: string       ("User Login", "Sign Up", etc.)                 │
-│  └── fields: Field[]    (Field definitions for form)                    │
-│                                                                          │
-│  Field:                                                                  │
-│  ├── name: string       (Field identifier)                              │
-│  ├── type: enum         ("text" | "email" | "password" | "select")      │
-│  ├── label: string      (Display label)                                 │
-│  └── required: boolean                                                   │
-│                                                                          │
-│  Library:                                                                │
-│  ├── id: string         ("mui", "chakra", "antd")                       │
-│  ├── name: string       ("Material UI", "Chakra UI")                    │
-│  ├── supportsTheme: boolean                                             │
-│  └── url: string        (Documentation URL)                             │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────┐       ┌─────────────────────┐
+│ Source + catalog    │──────▶│ Build, validate,    │
+│ library applications│       │ publish release     │
+└─────────────────────┘       └──────────┬──────────┘
+                                        ▼
+                              ┌─────────────────────┐
+                              │ Static origin + CDN │
+                              └──────────┬──────────┘
+                                         │ assets
+                                         ▼
+┌──────────────────────────────────────────────────┐
+│ Browser                                          │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Shell: controls, URL state, preview lifecycle│ │
+│ └──────────────┬─────────────────┬─────────────┘ │
+│                ▼                 ▼               │
+│       ┌────────────────┐ ┌────────────────┐      │
+│       │ Library A frame│ │ Library B frame│      │
+│       │ Native form    │ │ Native form    │      │
+│       └────────────────┘ └────────────────┘      │
+└──────────────────────────────────────────────────┘
 ```
 
-### URL State Format
+The build process produces static entry documents and assets for the shell and each
+library. A CDN serves reusable objects, and its origin handles cache misses. There
+is no application server deciding which form to render on each request.
+
+The shell runs as a React app. It owns comparison state and uses a small shared store
+for controls and preview descriptors. A library app has its own React root and owns
+its component state, styles, and theme provider.
+
+I would keep the catalog static initially. Adding a library requires a release;
+that is acceptable for a curated showcase. A remotely editable catalog would need
+to ensure it only advertises artifacts that are already available.
+
+### Trace the first comparison
+
+1. The browser loads the shell and its catalog.
+2. The shell validates the URL and resolves the requested comparison.
+3. It lays out cards for the selected form/library pairs.
+4. Nearby cards load independent preview documents.
+5. Each preview reads its initial configuration and renders the native form.
+6. The user interacts locally; a share action captures comparison settings only.
+
+That flow tells us where the three difficult decisions are: the document boundary,
+the state contract, and release consistency.
+
+## 💾 Define the contracts — 4 minutes
+
+I would use a small table rather than draw a database that the workload does not
+need. Stable IDs connect the shell's catalog to library routes and build artifacts.
+
+| Entity | Important fields | Owner |
+|--------|------------------|-------|
+| Library | ID, display name, entry path, theme support | Catalog |
+| Form | ID, label, expected behavior | Form specification |
+| Comparison | Library IDs, form IDs, theme, grouping | Shell URL and store |
+| Preview instance | Library/form identity, readiness | Browser preview manager |
+| Release | Revision, advertised previews, artifact references | Build pipeline |
+
+The catalog should describe availability explicitly. A library name in a dropdown
+is a promise that its selected form can be opened; it should not be an unrelated
+hard-coded list maintained separately from release validation.
+
+### External interfaces
+
+| Interface | Purpose |
+|-----------|---------|
+| Shell GET with comparison parameters | Open a saved comparison in any browser |
+| Library GET with form and theme parameters | Open an independent example |
+| Static asset GET | Load scripts, styles, fonts, and images |
+| Child-ready message | Announce that an embedded application can receive updates |
+| Absolute theme-setting message | Update presentation without toggling ambiguously |
+
+For example, the shell can request `forms=user-login`, `libraries=mui,chakra`, and
+`theme=dark`. Its MUI frame then opens that library's entry document with
+`form=user-login` and the initial theme.
+
+Form data is not part of either sharing or messaging. This avoids turning a simple
+comparison contract into an accidental mechanism for collecting entered credentials.
+
+## 🔧 Deep dive 1: isolation that remains usable — 9 minutes
+
+> “I would use iframe documents to preserve each library's native appearance, then
+> put a resource budget around active previews. The trade-off is extra browser work
+> in exchange for a much more trustworthy comparison.”
+
+Imagine a library whose reset changes every input and another whose popup is styled
+through rules injected into the page head. Rendering both in one document can change
+what the user sees depending on stylesheet order.
+
+A CSS module around our own components does not automatically contain those rules.
+Shadow DOM can help, but it requires library-specific integration for inherited
+properties, injected styles, and document-level overlay targets.
+
+I would not reject Shadow DOM because of an assumed React-context limitation.
+Context follows the React tree, including through portals. The practical issue is
+whether the library's styling and DOM assumptions fit the boundary we provide.
+
+An iframe gives each example an independent document and cascade. That is a close
+match to how the library would run in a standalone application and lets developers
+open the same preview directly when debugging.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Separate iframe documents | Faithful styling with fewer library-specific adaptations | More documents, runtime state, and focus boundaries |
+| ❌ Combine all libraries in one document | Less repeated initialization | Global styles and overlays need compatibility work |
+| ❌ Adapt all libraries to Shadow DOM | Potentially lighter boundary | Continuous integration effort as libraries change |
+
+### Distinguish build count from preview count
+
+Fifty library builds can support twenty forms each. Selecting everything creates
+one thousand possible documents, even though it reuses about fifty sets of built
+assets. Browser caching can reduce repeated transfers without eliminating repeated
+DOM creation, event handlers, or layout.
+
+Suppose six nearby previews each need an illustrative 150 KB of JavaScript. That is
+about 900 KB before other assets. I would use this as an initial budget discussion,
+then profile actual libraries instead of claiming a specific load-time improvement.
+
+### Load only the useful working set
+
+The shell starts with a small default comparison, reserves space for selected cards,
+and makes nearby cards eligible to load. A small queue limits simultaneous starts
+when the user scrolls quickly or expands a large selection.
+
+I would retain a bounded number of recently used previews. Lazy loading alone only
+delays the problem if every visited document remains alive forever.
+
+A preview that becomes far away can be removed when we need its resource budget.
+The focused frame remains mounted. We should not erase a document while someone is
+filling a field, even if a resize makes it technically fall outside the viewport.
+
+The cost is that an evicted demo can lose its transient input when revisited. I would
+accept that for a comparison playground before building a system to persist arbitrary
+fields across dozens of unrelated form implementations.
+
+Keeping all visited frames alive would preserve more input, but memory would grow
+throughout the browsing session. Destroying every frame immediately on scroll would
+cause repeated initialization and surprising resets. Bounded retention provides a
+middle ground whose budget we can measure.
+
+### Comparable behavior and accessible navigation
+
+Independent rendering does not guarantee that forms are equivalent. A shared form
+specification should describe required fields, labels, and expected error behavior.
+The library implementations keep their native controls and layout choices.
+
+I would test a representative invalid submission and keyboard journey as well as a
+visual comparison. A screenshot cannot tell us whether an error is announced or a
+popup traps focus.
+
+The shell uses ordinary labeled controls, headings, and descriptive frame titles.
+A visual row of cards does not require a spreadsheet-style ARIA grid. Users should
+be able to move into a preview and back to the comparison controls predictably.
+
+If the product later allows untrusted uploaded code, I would change the trust model.
+Same-origin scripted frames are not a strong malicious-code sandbox simply because
+their CSS is separate. That expansion requires origin and permission decisions.
+
+## 🔧 Deep dive 2: make sharing and live state agree — 9 minutes
+
+> “I would define comparison state once, serialize it deterministically, and give
+> each child a small configuration contract. URL initialization makes an example
+> reproducible; live messages make theme changes less disruptive.”
+
+The shell owns selected IDs, requested theme, and grouping. The preview owns typed
+values and validation. That separation keeps the parent from trying to manage the
+internal state of every component library.
+
+On an ordinary visit without explicit configuration, saved browser preferences are
+useful. On a shared comparison, the URL must win. Otherwise two developers can open
+the same link and see different libraries or themes.
+
+### Be precise about missing values
+
+There are three different meanings for a list: the user selected nothing, selected
+all entries, or did not specify a value. Treating all three as an omitted parameter
+makes the result depend on local defaults.
+
+The same issue appears with theme. If we omit light theme because it is the default,
+a recipient with a saved dark preference may restore dark instead. A share action
+should encode every comparison-defining field, even when it equals a default.
+
+I would validate both URL values and stored values against the current catalog.
+Unknown entries should be reported clearly or handled with an explicit fallback.
+A renamed or removed library must not produce an undefined component or blank page.
+
+The shell can replace the current history entry as filters change. If stepping
+through past comparisons with Back is a requirement, we should create deliberate
+entries and handle browser history events. A debounce is useful only for reducing
+work; it does not create correct history semantics on its own.
+
+### Initialize first, then synchronize
+
+A newly opened library document reads the form and initial theme from its URL.
+Once its application is ready, it announces readiness. The parent responds with
+the latest absolute theme value.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         URL Patterns                                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Shell URL (browser address bar):                                        │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  /?form=login&theme=dark&libs=mui,chakra,antd                     │  │
-│  │   │          │           │                                         │  │
-│  │   │          │           └── Comma-separated library IDs           │  │
-│  │   │          └── "light" or "dark"                                 │  │
-│  │   └── Form identifier (one of 20 forms)                            │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  Library iframe src:                                                     │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  /mui/?form=login&theme=dark                                       │  │
-│  │   │         │           │                                          │  │
-│  │   │         │           └── Theme for this library                 │  │
-│  │   │         └── Which form to render                               │  │
-│  │   └── Library path                                                 │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+Shell                          Preview
+  │ ── URL: form + theme ─────▶ │
+  │                            │ render and install receiver
+  │ ◀────── ready ──────────── │
+  │ ── set current theme ─────▶ │
+  │                            │ preserve local form input
 ```
 
----
-
-## 🔗 Deep Dive: Shell-Iframe Communication
-
-### URL-Based Configuration Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   Shell ↔ Library Communication                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Shell Application                                                       │
-│       │                                                                  │
-│       │  1. User changes form selection or theme                        │
-│       │                                                                  │
-│       ▼                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Zustand Store Update                                            │    │
-│  │  selectedForm: "login" → "checkout"                              │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│       │                                                                  │
-│       │  2. Computed iframe URLs change                                 │
-│       │                                                                  │
-│       ▼                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  PreviewCard Component                                           │    │
-│  │  Builds URL: /{libraryId}/?form={form}&theme={theme}            │    │
-│  │                                                                  │    │
-│  │  Example: /mui/?form=checkout&theme=dark                        │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│       │                                                                  │
-│       │  3. Iframe src attribute updates                                │
-│       │                                                                  │
-│       ▼                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Library App (inside iframe)                                     │    │
-│  │                                                                  │    │
-│  │  1. Parse URLSearchParams from window.location.search           │    │
-│  │  2. Extract formId and themeMode                                 │    │
-│  │  3. Initialize theme provider with themeMode                     │    │
-│  │  4. Render FormRouter with formId                                │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Why URL Parameters Over postMessage?
-
-| Factor | URL Parameters | postMessage |
-|--------|---------------|-------------|
-| Deep linking | Automatic | Manual state sync |
-| Browser history | Works natively | Requires custom handling |
-| Debugging | Visible in DevTools | Hidden |
-| Complexity | Simple | Coordination logic needed |
-| Bookmarkable | Yes | No |
-
-> "URL parameters make the shell-iframe relationship stateless. Each library app can be loaded independently with the correct configuration, which simplifies debugging and enables direct linking to any comparison."
-
----
-
-## 🗂️ Deep Dive: State Management Flow
-
-### Zustand Store Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Zustand Comparison Store                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                          State                                     │  │
-│  │  ├── selectedForm: string           "login" (default)             │  │
-│  │  ├── selectedLibraries: Set<string> {"mui", "chakra"} (default)   │  │
-│  │  └── theme: "light" | "dark"        "light" (default)             │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                          Actions                                   │  │
-│  │  ├── setForm(formId)         Update selected form                 │  │
-│  │  ├── toggleLibrary(libId)    Add/remove from Set                  │  │
-│  │  └── toggleTheme()           Switch light ↔ dark                  │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                       Persistence                                  │  │
-│  │  persist() middleware ──▶ localStorage["comparison-store"]        │  │
-│  │  Serializes state for page refresh survival                       │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### URL Synchronization
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Bidirectional URL Sync                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Page Load:                                                              │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  1. Parse URL query parameters                                   │    │
-│  │     ├── form = params.get('form')                               │    │
-│  │     ├── theme = params.get('theme')                             │    │
-│  │     └── libs = params.get('libs')?.split(',')                   │    │
-│  │                                                                  │    │
-│  │  2. Hydrate Zustand store from URL values                        │    │
-│  │     (Override localStorage defaults if URL has values)           │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  State Change:                                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  1. User toggles library or changes form                         │    │
-│  │                                                                  │    │
-│  │  2. Debounce 300ms (prevents history spam from rapid clicks)     │    │
-│  │                                                                  │    │
-│  │  3. Update URL via history.replaceState()                        │    │
-│  │     ?form=checkout&theme=dark&libs=mui,chakra,antd              │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Result: URL always reflects current state, shareable links work        │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔨 Deep Dive: Build Pipeline
-
-### Parallel Build with Memory Management
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Build Orchestration                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Configuration:                                                          │
-│  ├── BATCH_SIZE = 4         (concurrent builds per batch)               │
-│  ├── BUILD_TIMEOUT = 120s   (2 minutes per app max)                     │
-│  └── MAX_RETRIES = 2        (retry failed builds once)                  │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Build Flow (42 apps)                                            │    │
-│  │                                                                  │    │
-│  │  Batch 1: [shell, mui, chakra, antd]                            │    │
-│  │     ├── Build 4 apps in parallel                                │    │
-│  │     ├── Wait for all to complete                                 │    │
-│  │     └── Force garbage collection                                 │    │
-│  │                                                                  │    │
-│  │  Batch 2: [blueprint, evergreen, carbon, gestalt]               │    │
-│  │     └── (repeat process)                                         │    │
-│  │                                                                  │    │
-│  │  ... (8 more batches)                                            │    │
-│  │                                                                  │    │
-│  │  Total: 11 batches × ~30s = ~3 minutes                          │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Memory Management:                                                      │
-│  ├── 4 concurrent × 500MB = ~2GB peak usage                            │
-│  ├── GC between batches prevents accumulation                           │
-│  └── Fits within GitHub Actions 7GB runner                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Retry Logic
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Build Retry Strategy                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  buildWithRetry(library, attempt = 1):                                  │
-│       │                                                                  │
-│       ├── Try: Execute build command with timeout                       │
-│       │                                                                  │
-│       ├── Success: Return { lib, success: true }                        │
-│       │                                                                  │
-│       └── Failure:                                                       │
-│             ├── If attempt < 2:                                          │
-│             │     ├── Wait 2 seconds                                    │
-│             │     └── Retry with attempt + 1                            │
-│             │                                                            │
-│             └── If attempt >= 2:                                         │
-│                   └── Return { lib, success: false, error }             │
-│                                                                          │
-│  After all batches:                                                      │
-│  ├── Count failures                                                      │
-│  ├── If any failed: Exit with code 1 (fail CI)                          │
-│  └── If all passed: Continue to assembly                                │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Distribution Assembly
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Dist Assembly Script                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Step 1: Clean dist/ directory                                          │
-│       │                                                                  │
-│       ▼                                                                  │
-│  Step 2: Copy apps/shell/dist ──▶ dist/                                 │
-│          (Shell becomes the root)                                        │
-│       │                                                                  │
-│       ▼                                                                  │
-│  Step 3: For each library (except shell):                               │
-│          Copy apps/{lib}/dist ──▶ dist/{lib}/                           │
-│       │                                                                  │
-│       ▼                                                                  │
-│  Result:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  dist/                                                           │    │
-│  │  ├── index.html          (Shell app entry)                       │    │
-│  │  ├── assets/             (Shell bundles)                         │    │
-│  │  ├── mui/                                                        │    │
-│  │  │   ├── index.html      (MUI app entry)                        │    │
-│  │  │   └── assets/         (MUI bundles)                          │    │
-│  │  ├── chakra/             (Same pattern)                          │    │
-│  │  └── ... (39 more libraries)                                     │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔒 Deep Dive: CSS Isolation Strategy
-
-### The Problem
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      CSS Collision Scenario                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Single React App with Multiple Providers:                              │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  <MuiThemeProvider>                                              │    │
-│  │    <MuiButton>Save</MuiButton>                                  │    │
-│  │  </MuiThemeProvider>                                             │    │
-│  │  <ChakraProvider>                                                │    │
-│  │    <ChakraButton>Cancel</ChakraButton>  ← Broken by MUI styles  │    │
-│  │  </ChakraProvider>                                               │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Conflicts:                                                              │
-│  ├── MUI's CssBaseline resets Chakra's defaults                        │
-│  ├── CSS custom properties (--chakra-colors-*) clash with MUI          │
-│  ├── Both inject styles into <head>                                     │
-│  └── Both modify body and html element styles                          │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### The Solution: Iframe Isolation
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Iframe Isolation Model                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─────────────────────────┐    ┌─────────────────────────┐             │
-│  │  Iframe: /mui/          │    │  Iframe: /chakra/       │             │
-│  │                         │    │                         │             │
-│  │  ┌───────────────────┐  │    │  ┌───────────────────┐  │             │
-│  │  │ Separate document │  │    │  │ Separate document │  │             │
-│  │  │ Own <head>        │  │    │  │ Own <head>        │  │             │
-│  │  │ Own stylesheets   │  │    │  │ Own stylesheets   │  │             │
-│  │  │ Own CSS cascade   │  │    │  │ Own CSS cascade   │  │             │
-│  │  │ Own React tree    │  │    │  │ Own React tree    │  │             │
-│  │  └───────────────────┘  │    │  └───────────────────┘  │             │
-│  │                         │    │                         │             │
-│  │  MUI CssBaseline ──────┼────┼──▶ Cannot reach Chakra  │             │
-│  └─────────────────────────┘    └─────────────────────────┘             │
-│                                                                          │
-│  Each iframe = separate browsing context = complete isolation           │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Why Other Approaches Failed
-
-| Approach | Issue |
-|----------|-------|
-| Single SPA | Styles clash immediately |
-| CSS Modules | Only scopes class names, not resets/variables |
-| Shadow DOM | CSS custom properties leak, React context breaks |
-| **Iframe** | Complete isolation (chosen) |
-
-> "Shadow DOM seemed promising but CSS custom properties inherit through the shadow boundary, and React context doesn't cross shadow roots. Iframes are the only true isolation mechanism."
-
----
-
-## 📦 Deep Dive: Library App Structure
-
-### Vite Configuration
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Library App Vite Config                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Key Settings:                                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  base: '/20forms-20designs/mui/'                                 │    │
-│  │  │                                                               │    │
-│  │  └── Required for GitHub Pages subdirectory hosting             │    │
-│  │      Assets resolve to /20forms-20designs/mui/assets/...        │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Output Configuration:                                                   │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  build.rollupOptions.output:                                     │    │
-│  │  ├── entryFileNames: 'assets/[name]-[hash].js'                  │    │
-│  │  ├── chunkFileNames: 'assets/[name]-[hash].js'                  │    │
-│  │  └── assetFileNames: 'assets/[name]-[hash][extname]'            │    │
-│  │                                                                  │    │
-│  │  Content hashing enables immutable caching                       │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Form Router Pattern
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Form Router Architecture                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Form Registry (lazy-loaded components):                                │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  "login"     ──▶ lazy(() => import('./forms/LoginForm'))        │    │
-│  │  "signup"    ──▶ lazy(() => import('./forms/SignupForm'))       │    │
-│  │  "checkout"  ──▶ lazy(() => import('./forms/CheckoutForm'))     │    │
-│  │  "contact"   ──▶ lazy(() => import('./forms/ContactForm'))      │    │
-│  │  ... (16 more forms)                                            │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  FormRouter Component:                                                   │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  1. Look up formId in registry                                   │    │
-│  │  2. Default to "login" if not found                              │    │
-│  │  3. Wrap in Suspense with skeleton fallback                      │    │
-│  │  4. Render lazy component                                        │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Benefits:                                                               │
-│  ├── Code splitting: Only requested form loads                         │
-│  ├── Fast initial load: Other forms load on demand                     │
-│  └── Graceful fallback: Skeleton during chunk fetch                    │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Standardized Form Interface
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Form Interface Contract                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  All 41 libraries implement identical interfaces:                       │
-│                                                                          │
-│  LoginFormProps:                                                         │
-│  └── onSubmit: (data: { email: string; password: string }) => void     │
-│                                                                          │
-│  SignupFormProps:                                                        │
-│  └── onSubmit: (data: { name, email, password, confirm }) => void      │
-│                                                                          │
-│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─    │
-│                                                                          │
-│  Same Structure, Different Components:                                  │
-│                                                                          │
-│  MUI LoginForm:           Chakra LoginForm:       Ant LoginForm:        │
-│  ├── TextField            ├── FormControl         ├── Form.Item         │
-│  │   (email)              │   └── Input           │   └── Input         │
-│  ├── TextField            ├── FormControl         ├── Form.Item         │
-│  │   (password)           │   └── Input           │   └── Input.Password│
-│  └── Button               └── Button              └── Button            │
-│      (contained)              (colorScheme)           (type=primary)    │
-│                                                                          │
-│  Result: Identical functionality, library-native appearance             │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## ⚡ Lazy Loading Strategy
-
-### Intersection Observer for Iframes
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Lazy Loading Implementation                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  PreviewCard State:                                                      │
-│  ├── isVisible: boolean    (Has card entered viewport?)                 │
-│  └── isLoaded: boolean     (Has iframe finished loading?)               │
-│                                                                          │
-│  Lifecycle:                                                              │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  1. Component mounts with isVisible = false                      │    │
-│  │                                                                  │    │
-│  │  2. IntersectionObserver watches container                       │    │
-│  │     rootMargin: "100px" (start loading before visible)          │    │
-│  │                                                                  │    │
-│  │  3. When entry.isIntersecting:                                   │    │
-│  │     ├── setIsVisible(true)                                       │    │
-│  │     └── observer.disconnect()                                    │    │
-│  │                                                                  │    │
-│  │  4. Render iframe (src attribute set)                            │    │
-│  │                                                                  │    │
-│  │  5. iframe onLoad:                                                │    │
-│  │     └── setIsLoaded(true) ──▶ Fade in content                   │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Render Logic:                                                           │
-│  ├── !isVisible: Show skeleton placeholder                             │
-│  ├── isVisible && !isLoaded: Show loading spinner over iframe          │
-│  └── isVisible && isLoaded: Show fully loaded iframe                   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Performance Impact
-
-| Scenario | Initial Load | Memory Usage |
-|----------|-------------|--------------|
-| Eager (41 iframes) | 6MB + 41 React apps | ~500MB |
-| Lazy (3-6 visible) | 450KB + 3 React apps | ~75MB |
-
-> "Lazy loading reduces initial payload by 13x and memory usage by 7x. Users scrolling through all libraries will eventually load everything, but the perceived performance is dramatically better."
-
----
-
-## 🚀 CI/CD Pipeline
-
-### GitHub Actions Workflow
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      CI/CD Pipeline Stages                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Trigger: Push to main branch                                           │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  BUILD JOB (timeout: 15 minutes)                                  │  │
-│  │  ├── actions/checkout@v4                                          │  │
-│  │  ├── oven-sh/setup-bun@v1                                        │  │
-│  │  ├── actions/cache@v4 (key: bun.lockb hash)                      │  │
-│  │  ├── bun install --frozen-lockfile                               │  │
-│  │  ├── node --expose-gc scripts/build-all.mjs                      │  │
-│  │  ├── node scripts/copy-builds-to-dist.mjs                        │  │
-│  │  └── actions/upload-artifact@v4 (retention: 14 days)             │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                              │                                           │
-│                              ▼ needs: build                              │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  DEPLOY JOB                                                       │  │
-│  │  ├── actions/download-artifact@v4                                 │  │
-│  │  └── peaceiris/actions-gh-pages@v4                               │  │
-│  │      └── publish_dir: ./dist                                      │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 💾 Caching Strategy
-
-### Content-Hashed Assets
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Cache Strategy                                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Asset Naming:                                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  dist/                                                           │    │
-│  │  ├── index.html                  (no-cache, always fresh)       │    │
-│  │  ├── assets/                                                     │    │
-│  │  │   ├── shell-a1b2c3d4.js      (immutable, 1 year cache)       │    │
-│  │  │   └── shell-e5f6g7h8.css     (immutable, 1 year cache)       │    │
-│  │  ├── mui/                                                        │    │
-│  │  │   ├── index.html             (no-cache)                      │    │
-│  │  │   └── assets/                                                 │    │
-│  │  │       └── mui-m3n4o5p6.js    (immutable)                     │    │
-│  │  └── ... (40 more libraries)                                     │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Hash changes when content changes ──▶ Perfect cache invalidation       │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Cache Headers
-
-| Asset Type | Cache-Control | TTL |
-|------------|---------------|-----|
-| `*.html` | `no-cache, must-revalidate` | 0 |
-| `*-[hash].js` | `public, max-age=31536000, immutable` | 1 year |
-| `*-[hash].css` | `public, max-age=31536000, immutable` | 1 year |
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Pros | Cons |
-|----------|------|------|
-| Iframe isolation | Complete CSS isolation | Duplicated React bundles (~40KB × 41) |
-| URL-based communication | Deep linking, history works | Limited to string data |
-| Batched parallel builds | Memory efficient (~2GB peak) | Slower than unlimited parallel |
-| Static hosting | Free, simple, CDN-backed | No server-side logic |
-| Zustand with persistence | Survives refresh | Storage sync complexity |
-| Lazy loading iframes | Fast initial load (13x smaller) | Brief loading states on scroll |
-| Content hashing | Perfect cache invalidation | New hash on every change |
-
----
-
-## 🔮 Scalability Path
-
-### Current Architecture
-
-```
-GitHub Repo ──▶ GitHub Actions ──▶ GitHub Pages (Fastly CDN)
-```
-
-### Future Enhancements
-
-| Enhancement | Complexity | Value |
-|-------------|------------|-------|
-| Incremental builds | Medium | Only rebuild changed apps |
-| Visual regression | Medium | Screenshot comparison per library |
-| Bundle analysis | Low | Display library sizes |
-| Mobile viewport | Medium | Compare form responsiveness |
-| Accessibility audit | High | WCAG compliance scoring |
-| Drag & drop ordering | Medium | Rearrange comparison layout |
-| Side-by-side diff | High | Highlight visual differences |
-| Export comparison | Medium | Generate shareable image/PDF |
-
----
-
-## 🎤 Interview Wrap-up
-
-> "We've designed a full-stack architecture for comparing 41 design system libraries with complete CSS isolation via iframes. The shell application communicates with library apps through URL parameters, enabling deep linking and browser history support. A batched parallel build pipeline handles 42 Vite applications in under 3 minutes while staying within CI memory limits. Lazy loading with Intersection Observer reduces initial load from 6MB to 450KB. The entire system deploys as static assets to GitHub Pages at zero cost, with content-hashed filenames providing perfect cache invalidation. The main trade-off is duplicated React bundles across iframes, but this is acceptable for achieving true style isolation between competing design systems."
+This avoids a race where the parent sends a theme update before the child has
+installed a message handler. If the user changed theme during loading, the parent
+sends the current state rather than replaying obsolete transitions.
+
+An absolute “set dark” operation is idempotent. Repeating it does not reverse the
+state. Repeating “toggle” would, so I would not use toggle messages at the boundary.
+
+The receiver validates the origin, sending window, message type, and allowed value.
+The protocol stays small: a readiness signal and a theme setting are enough for
+this journey. We do not need arbitrary remote function calls.
+
+The parent must avoid updating the loaded frame's `src` for the same theme change.
+Changing `src` is a navigation even if a theme message is also sent. Navigation can
+reset the document and its input, which defeats the user-experience goal.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ URL initialization and live theme messages | Shareable examples with less input loss | A small validated readiness protocol |
+| ❌ URL-only theme updates | Simple and independently reproducible | Reloads repeat work and can reset input |
+| ❌ Message-only initialization | Flexible live control | Direct opening needs a separate bootstrap mechanism |
+
+For a light-only library, the requested theme remains part of the comparison state,
+but its effective presentation stays light with a clear indicator. We should show
+a library's actual capability instead of inventing a dark appearance for it.
+
+### Failure behavior belongs in the contract
+
+An iframe's document load event does not prove successful application rendering.
+A readiness timeout can show an unavailable card while other comparisons continue.
+The user can retry or open the example by itself.
+
+If browser storage fails, the URL and in-memory settings still work. If the URL is
+invalid, the shell provides a useful correction path. Neither should require an
+application backend or make every preview unavailable.
+
+## 🔧 Deep dive 3: keep the delivered catalog consistent — 8 minutes
+
+> “The frontend contract depends on the release artifact. If the shell advertises a
+> library whose build failed, the page can look healthy while its main feature is
+> broken. I would publish a validated set of matching shell and preview assets.”
+
+I would build each library independently. This allows its dependency and styling
+setup to evolve without forcing every library into a single application bundle.
+The cost is repeated dependencies and build orchestration.
+
+A worker pool bounds the number of simultaneous compiler processes. The right size
+comes from measured peak memory and CPU. Launching every compiler together risks
+out-of-memory failures; doing everything sequentially can make feedback too slow.
+
+For example, fifty thirty-second jobs need about twenty-five minutes sequentially.
+Four ideal workers need roughly six and a half minutes before other work. I would
+use that arithmetic to discuss a build target, not assert an unmeasured three-minute
+pipeline.
+
+### Validate what the browser will actually load
+
+Successful outputs go into a clean staging area for one release. A manifest maps
+advertised library IDs to their entry documents. We verify those documents and their
+asset references under the production base path.
+
+This avoids copying stale per-library output after a failed rebuild. It also catches
+an easy local-development mistake: the shell server is healthy, but it does not
+serve the independently built library paths that the production shell references.
+
+The smoke test should open the assembled site and wait for actual preview content,
+not merely check for an iframe element. A missing document can still occupy a
+perfectly visible frame container.
+
+My initial release rule would require every advertised library to succeed. An
+explicit partial release is possible, but the shell catalog must then reflect the
+reduced available set. Silent partial success is a poor fit for a comparison tool.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Publish one complete validated release | Shell and preview availability agree | One required failure can delay publication |
+| ❌ Copy whatever outputs exist | Simple assembly | Missing or stale previews can be advertised |
+| Alternative: manifest-driven partial catalog | Releases can proceed with unavailable libraries | More product states and release coordination |
+
+### Caching is part of release correctness
+
+Content-hashed asset names let browsers reuse unchanged bytes and fetch changed
+ones under new URLs. HTML needs an appropriate revalidation or short-freshness
+policy where the host supports it.
+
+Hashes do not make deleting old files safe immediately. A browser holding an old
+entry document can still request one of its old assets after deployment. We should
+retain referenced assets for a defined compatibility window or use release-specific
+paths and a recovery strategy for stale clients.
+
+The host's actual cache behavior needs verification. I would not claim that choosing
+GitHub Pages automatically configures custom immutable headers or instantly updates
+every user's document.
+
+Publishing a complete artifact should leave the previous complete artifact available
+for rollback. If validation fails, keep the old release serving. If two builds race,
+prevent an older revision from becoming current after a newer one.
+
+These release controls cost artifact storage and validation time. They are justified
+because static delivery removes many runtime failure modes but still leaves real
+cross-version and missing-asset failures.
+
+## 📊 Verify the journey and discuss growth — 4 minutes
+
+I would validate the system with a few cross-boundary scenarios:
+
+- A comparison link opened in a clean browser reproduces the sender's selection.
+- A theme change during loading and after typing ends in the correct presentation.
+- Scrolling through many selections leaves a bounded number of live documents.
+- A failed preview renders an actionable card without disabling the shell.
+- A broken library build cannot publish a catalog that silently links to it.
+- An old open document still works, or recovers predictably, after a new release.
+
+I would track shell interaction latency, preview readiness, active document count,
+and asset failures by release. On the build side, I would track duration and failures
+by library. Those signals tell us whether to optimize the browser, compilation,
+or distribution.
+
+The first growth problem is likely to be browser resources or the maintenance cost
+of equivalent forms. More CDN capacity helps traffic, but it does not fix too many
+active React roots in a tab. More build workers help only while the runner has
+resources and the work can execute independently.
+
+If users later need saved team comparisons, I would add a small server-owned record
+for a named comparison and its access rules. The static preview architecture could
+remain. I would not add that database before the user journey requires it.
+
+> “The design connects three guarantees: each library renders faithfully, a link
+> and live updates express the same comparison, and a release contains the previews
+> its shell promises. Iframes, bounded preview loading, a small state protocol, and
+> complete static artifacts support those guarantees. Each has a cost, but the
+> boundaries keep the product understandable and give us clear places to measure
+> failures before adding more infrastructure.”

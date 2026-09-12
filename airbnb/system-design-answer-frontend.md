@@ -1,498 +1,376 @@
-# Airbnb - System Design Answer (Frontend Focus)
+# Airbnb — Frontend System Design
 
-*45-minute system design interview format - Frontend Engineer Position*
+*A 45-minute discussion of discovery, date selection and trustworthy booking feedback.*
 
----
+This answer proposes a production frontend. The checked-in React application is a
+smaller teaching implementation; [architecture.md](./architecture.md) distinguishes
+its working flows, missing screens and correctness gaps.
 
-## 📋 Problem Statement
+## 📋 Clarify the experience — 5 minutes
 
-Design the frontend architecture for a property rental marketplace like Airbnb.
+> “I would focus on a guest finding a place, understanding whether the dates work,
+> and making a reservation without losing their choices. I would also cover the
+> host's calendar because that is the other side of the same inventory.”
 
-**Key Frontend Challenges:**
-- Complex search interface with maps, filters, and date pickers
-- Responsive listing gallery with image optimization
-- Interactive calendar components for date selection
-- Two-sided user experience (guest and host dashboards)
+The primary journey is destination search, results, listing details, date and guest
+selection, price review, then a pending or confirmed reservation. A host creates a
+listing and manages availability and requests.
 
----
+I would ask whether a map is required and whether the product supports instant
+booking, host approval, or both. For this discussion, I support both booking modes
+and treat a map as a useful alternate view of the same search results.
 
-## 🎯 Requirements Clarification
+I would leave payment-provider UI internals, recommendations and a complete support
+console outside this first whiteboard. Payment status still affects the reservation
+screen if payments are added to the product.
 
-### Functional Requirements
+The frontend has three different promises to communicate:
 
-| Feature | Description |
-|---------|-------------|
-| Search | Location search with map, date pickers, filters |
-| Listing View | Photo galleries, amenities, reviews, booking widget |
-| Booking Flow | Date selection, guest count, pricing breakdown |
-| Host Dashboard | Listing management, calendar, reservations |
-| Messaging | Real-time host-guest communication |
+- A search result is a candidate matching the current query.
+- A quote describes a price for specific dates and guests.
+- A reservation is a server-confirmed claim on inventory or a pending request.
 
-### Non-Functional Requirements
+Confusing these creates expensive user mistakes. Seeing an available card cannot
+mean the dates will remain available while the guest compares other properties.
 
-| Requirement | Target |
-|-------------|--------|
-| Performance | First Contentful Paint < 1.5s |
-| Responsiveness | Mobile-first with desktop optimization |
-| Accessibility | WCAG 2.1 AA compliance |
-| Offline | Service worker for saved listings |
+I would target immediate feedback for local interactions and useful results within
+roughly a second under normal conditions. Those are experience goals to validate on
+real devices, not a promise that every network request takes the same time.
 
-### Scale Estimates
-
-- Monthly visitors: 50M unique
-- Peak concurrent users: 200K
-- Average session: 8 minutes
-- Mobile traffic: 60%
-
----
-
-## 🏗️ High-Level Architecture
+## 🏗️ Draw the frontend boundaries — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    React Application                            │
-│              TanStack Router + Zustand + TailwindCSS            │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│    Routes     │    │   Components  │    │    Stores     │
-│               │    │               │    │               │
-│ Search        │    │ SearchBar     │    │ authStore     │
-│ Listing       │    │ Calendar      │    │ searchStore   │
-│ Host/*        │    │ ListingCard   │    │ bookingStore  │
-│ Trips         │    │ BookingWidget │    │               │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        └─────────────────────┴─────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Services Layer                             │
-│              API Client + WebSocket + LocalStorage              │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────┐        ┌───────────────────────────┐
+│ Search route       │───────▶│ Query/data layer          │
+│ Filters, cards, map│◀───────│ Identity, cache, requests │
+└────────────────────┘        └─────────────┬─────────────┘
+                                          │
+┌────────────────────┐                    ▼
+│ Listing / booking  │◀──────────▶┌───────────────────────┐
+│ Calendar, quote    │            │ Marketplace APIs      │
+└────────────────────┘            └───────────────────────┘
+                                          ▲
+┌────────────────────┐                    │
+│ Host workspace     │────────────────────┘
+│ Drafts, calendar   │
+└────────────────────┘
 ```
 
-> "I'm choosing a layered architecture where routes define page-level concerns, components handle UI, and stores manage shared state. This separation makes the codebase navigable and testable."
-
----
-
-## 🔍 Deep Dive: Search Interface
-
-### SearchBar Component Structure
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         SearchBar                               │
-├───────────────┬─────────────┬─────────────┬─────────────┬───────┤
-│    Where      │  Check in   │  Check out  │    Who      │  🔍   │
-│ destinations  │  Add dates  │  Add dates  │  Add guests │Search │
-└───────────────┴─────────────┴─────────────┴─────────────┴───────┘
-        │               │             │             │
-        ▼               └──────┬──────┘             ▼
-┌───────────────┐    ┌─────────────────┐    ┌───────────────┐
-│ Location      │    │ Calendar Modal  │    │ Guest Picker  │
-│ Autocomplete  │    │ (2-month view)  │    │ (+/- buttons) │
-└───────────────┘    └─────────────────┘    └───────────────┘
-```
-
-> "Each segment of the search bar opens its own popover. I debounce location searches at 300ms to avoid hammering the API while the user types."
-
-### Search Results Layout
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        FilterBar                                │
-│ [Price ▼] [Property Type ▼] [Bedrooms ▼] [Amenities ▼] [+More]  │
-└─────────────────────────────────────────────────────────────────┘
-┌────────────────────────────┬────────────────────────────────────┐
-│       Listing Grid         │              Map                   │
-│         (50%)              │             (50%)                  │
-├────────────────────────────┤                                    │
-│ ┌──────────┐ ┌──────────┐  │    ┌─────────────────────────┐     │
-│ │ Listing  │ │ Listing  │  │    │         $150            │     │
-│ │   Card   │ │   Card   │  │    │           •             │     │
-│ │  $150/nt │ │  $95/nt  │  │    │      $95    $120        │     │
-│ │  ★ 4.8   │ │  ★ 4.2   │  │    │       •      •          │     │
-│ └──────────┘ └──────────┘  │    └─────────────────────────┘     │
-│                            │                                    │
-│     [Load More...]         │    Markers show prices             │
-└────────────────────────────┴────────────────────────────────────┘
-```
-
-### Map-List Synchronization
-
-```
-Hover on ListingCard ──────────────────▶ Highlight map marker
-Click on Map Marker  ──────────────────▶ Navigate to listing
-Pan/zoom map         ──────────────────▶ Update search bounds
-```
-
-> "The split view creates a strong mental model: the list is for comparison, the map is for location context. Synchronizing hover states between them reinforces that they represent the same data."
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Split view (list + map) | Both comparison and spatial context | Complex state sync |
-| ❌ Map-only with popups | Immersive, spatial-first | Hard to compare properties |
-| ❌ List-only | Simple implementation | Lose geographic context |
-
----
-
-## 📅 Deep Dive: Calendar Component
-
-### Date Range Selection States
-
-```
-State 1: No selection
-┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐
-│  1  │  2  │  3  │  4  │  5  │  6  │  7  │
-│  8  │  9  │ 10  │ 11  │ 12  │ 13  │ 14  │
-│ 15  │ 16  │ 17  │ 18  │ 19  │ 20  │ 21  │
-└─────┴─────┴─────┴─────┴─────┴─────┴─────┘
-All dates clickable (except past + blocked)
-
-State 2: Check-in selected (15th)
-┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐
-│ 15  │ 16  │ 17  │ 18  │ 19  │ 20  │ 21  │
-│[██] │     │     │     │     │     │     │
-└─────┴─────┴─────┴─────┴─────┴─────┴─────┘
-Dark circle on 15th, waiting for checkout
-
-State 3: Range selected (15-20)
-┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐
-│ 15  │ 16  │ 17  │ 18  │ 19  │ 20  │ 21  │
-│[██──│─────│─────│─────│─────│──██]│     │
-└─────┴─────┴─────┴─────┴─────┴─────┴─────┘
-Dark circles on endpoints, light fill between
-```
-
-### Blocked Date Handling
-
-```
-Scenario: Days 18-19 are blocked (booked by someone else)
-
-┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐
-│ 15  │ 16  │ 17  │ 18  │ 19  │ 20  │ 21  │
-│[██] │     │     │ ╳╳  │ ╳╳  │     │     │
-└─────┴─────┴─────┴─────┴─────┴─────┴─────┘
-             ▲           ▲
-        available    blocked
-
-User tries to click 20:
-→ BLOCKED! Range 15-20 contains blocked dates
-→ Reset selection, user must pick 15-17 OR 20+
-```
-
-> "Calendar state management is trickier than it looks. I track two pieces of local state: which month we're viewing and the tentative start date. The parent component owns the final checkIn/checkOut values."
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Custom calendar | Full control, lightweight | More dev effort |
-| ❌ react-dates | Battle-tested, accessible | Heavy bundle, styling fights |
-| ❌ date-picker library | Fast to implement | Limited customization |
-
----
-
-## 🛒 Deep Dive: Booking Widget
-
-### Booking Widget Layout
-
-```
-┌─────────────────────────────────────────┐
-│  $150 /night                    ★ 4.92  │
-│                           (127 reviews) │
-├─────────────────────────────────────────┤
-│ ┌─────────────┬─────────────┐           │
-│ │ CHECK-IN    │ CHECKOUT    │           │
-│ │ 06/15/2025  │ 06/20/2025  │           │
-│ └─────────────┴─────────────┘           │
-│ ┌───────────────────────────┐           │
-│ │ GUESTS              2 ▼   │           │
-│ └───────────────────────────┘           │
-├─────────────────────────────────────────┤
-│ ┌───────────────────────────────────┐   │
-│ │         Reserve                   │   │
-│ └───────────────────────────────────┘   │
-│         You won't be charged yet        │
-├─────────────────────────────────────────┤
-│ $150 x 5 nights              $750       │
-│ Cleaning fee                  $75       │
-│ Service fee                   $98       │
-├─────────────────────────────────────────┤
-│ Total                        $923       │
-└─────────────────────────────────────────┘
-```
-
-### Booking Flow State Machine
-
-```
-┌─────────────────┐
-│ Initial State   │
-│ (no dates)      │
-└────────┬────────┘
-         │ User clicks date picker
-         ▼
-┌─────────────────┐
-│ Selecting Dates │
-│ (calendar open) │
-└────────┬────────┘
-         │ Dates selected
-         ▼
-┌─────────────────┐
-│ Ready to Book   │◄──────────────────┐
-│ (show pricing)  │                   │
-└────────┬────────┘                   │
-         │ Click Reserve              │
-         ▼                            │
-┌─────────────────┐                   │
-│ Check Auth      │                   │
-└────────┬────────┘                   │
-    ┌────┴────┐                       │
-    ▼         ▼                       │
-Not logged   Logged in                │
-    │         │                       │
-    ▼         ▼                       │
-┌───────┐  ┌─────────────────┐        │
-│Login  │  │ Submit Booking  │        │
-│Modal  │  │ API call        │        │
-└───┬───┘  └────────┬────────┘        │
-    │          ┌────┴────┐            │
-    │       Success    Error          │
-    │          │         │            │
-    │          ▼         └────────────┘
-    │    ┌─────────┐
-    │    │Redirect │
-    │    │to trips │
-    │    └─────────┘
-    │
-    └──▶ Redirect back after login
-```
-
-### Instant Book vs Request
-
-```
-                    Booking Submission
-                          │
-         ┌────────────────┴────────────────┐
-         ▼                                 ▼
-┌─────────────────────┐         ┌─────────────────────┐
-│ instant_book = true │         │ instant_book = false│
-├─────────────────────┤         ├─────────────────────┤
-│ Button: "Reserve"   │         │ Button: "Request    │
-│                     │         │          to book"   │
-│ → Confirmed booking │         │ → Pending booking   │
-│ → Payment processed │         │ → Host has 24h      │
-└─────────────────────┘         └─────────────────────┘
-```
-
-> "The booking widget is deceptively complex. It needs to handle auth interruption gracefully—if the user isn't logged in, we store their booking intent, show the login modal, then resume where they left off."
-
----
-
-## 📷 Deep Dive: Photo Gallery
-
-### Gallery Grid Layout
-
-```
-┌─────────────────────────────┬───────────────────────────────────┐
-│                             │ ┌───────────────┬───────────────┐ │
-│                             │ │   Photo 2     │   Photo 3     │ │
-│       Primary Photo         │ │               │               │ │
-│           (50%)             │ ├───────────────┼───────────────┤ │
-│                             │ │   Photo 4     │   Photo 5     │ │
-│                             │ │               │               │ │
-└─────────────────────────────┴─┴───────────────┴───────────────┴─┘
-                                            ┌───────────────────┐
-                                            │ Show all photos   │
-                                            └───────────────────┘
-```
-
-### Image Loading Strategy
-
-```
-Page Load Priority:
-
-1. Primary photo       → loading="eager"  (load immediately)
-2. Photos 2-5          → loading="lazy"   (load when visible)
-3. Remaining photos    → loaded in lightbox only
-
-Progressive Loading:
-
-1. Show gray placeholder (aspect ratio preserved)
-2. Load image in background
-3. Fade in when loaded (opacity transition)
-```
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Native lazy loading | Simple, good browser support | Less control |
-| ❌ Intersection Observer | Fine-grained control | More code, same result |
-| ❌ Eager load all | Simpler logic | Terrible performance |
-
-> "Image optimization is critical for Airbnb—listings are sold by their photos. I use srcset for retina displays and server-side resizing to serve appropriately sized images."
-
----
-
-## 🏠 Deep Dive: Host Calendar Management
-
-### Availability Calendar Editor
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Manage Availability                          │
-├─────────────────────────────────────┬───────────────────────────┤
-│                                     │                           │
-│        Calendar View                │     Selection Panel       │
-│                                     │                           │
-│    ◄ June 2025 ►                    │  3 dates selected         │
-│                                     │                           │
-│  Su Mo Tu We Th Fr Sa               │  ┌─────────────────────┐  │
-│      1  2  3  4  5  6               │  │  Block dates        │  │
-│   7  8  9 10 11 12 13               │  └─────────────────────┘  │
-│  14 15[██ ██ ██]19 20               │  ┌─────────────────────┐  │
-│  21 22 23 24 25 26 27               │  │  Unblock dates      │  │
-│  28 29 30                           │  └─────────────────────┘  │
-│                                     │                           │
-│  Legend:                            │  Custom price:            │
-│  [██] Selected                      │  ┌──────────────┬─────┐  │
-│  [//] Booked                        │  │ $175         │ Set │  │
-│  [XX] Blocked                       │  └──────────────┴─────┘  │
-└─────────────────────────────────────┴───────────────────────────┘
-```
-
-### Bulk Date Selection Methods
-
-```
-1. Click individual dates: Toggle each date
-2. Click and drag: Select range
-3. Shift-click: Select from last clicked to current
-```
-
-> "Hosts need efficient bulk operations. A single shift-click should select a month of blocked dates, not 30 individual clicks. The backend groups consecutive dates into ranges to minimize API payload."
-
----
-
-## 🗃️ State Management Strategy
-
-### Store Responsibilities
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        authStore                                │
-│  User session, login/logout, profile                            │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                       searchStore                               │
-│  Location, dates, guests, filters, results, loading state       │
-│  URL sync: filters ↔ query params                               │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                       bookingStore                              │
-│  Current listing, selected dates, guest count, pricing          │
-│  Cleared when navigating away from listing                      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-> "I keep stores focused on specific domains. The search store syncs with URL params so users can share search links. The booking store holds ephemeral state for the current booking attempt."
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Zustand | Minimal boilerplate, hooks-based | Smaller ecosystem |
-| ❌ Redux Toolkit | Mature, devtools | More setup, more concepts |
-| ❌ React Context | Built-in, no deps | Re-render performance issues |
-
----
-
-## ⚡ Performance Optimizations
-
-### Image Loading
-
-| Load Stage | Images | Method |
-|------------|--------|--------|
-| Initial | Primary photo | Eager loading |
-| Above fold | Photos 2-5 | Lazy loading |
-| Lightbox | All remaining | On-demand |
-
-### Skeleton Loading
-
-```
-Loading State:                    Loaded State:
-
-┌──────────────────────┐         ┌──────────────────────┐
-│ ████████████████████ │         │ [Actual Image]       │
-│ ████████████████████ │  ───▶   │                      │
-├──────────────────────┤         ├──────────────────────┤
-│ ████████████   ████  │         │ Cozy Apartment ★4.8  │
-│ ███████████          │         │ San Francisco        │
-│ ████████             │         │ $150 / night         │
-└──────────────────────┘         └──────────────────────┘
-
-Gray animated pulse               Actual content fades in
-```
-
-### Debouncing
-
-```
-Without debounce:                 With debounce (300ms):
-
-User types "S-a-n F-r-a"          User types "S-a-n F-r-a"
-      │                                 │
-      ▼                                 ▼
-7 API calls                       1 API call after 300ms pause
-```
-
-> "Every keystroke triggering an API call would overwhelm both the user's network and our servers. A 300ms debounce feels responsive while preventing request spam."
-
----
-
-## 📈 Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Routing | ✅ TanStack Router | ❌ React Router | Type-safe routes, file-based |
-| State | ✅ Zustand | ❌ Redux | Simpler API, less boilerplate |
-| Styling | ✅ TailwindCSS | ❌ styled-components | Faster dev, smaller bundle |
-| Dates | ✅ date-fns | ❌ Moment.js | Tree-shakeable, smaller |
-| Maps | ✅ Mapbox GL | ❌ Google Maps | Better customization, pricing |
-| Calendar | ✅ Custom | ❌ react-dates | Full control, lighter weight |
-
----
-
-## ♿ Accessibility Considerations
-
-| Feature | Implementation |
-|---------|----------------|
-| Keyboard nav | Arrow keys for calendar, Escape closes modals |
-| Focus management | Focus trap in modals, restore on close |
-| Screen readers | ARIA labels on interactive elements |
-| Color contrast | WCAG AA compliant colors |
-| Reduced motion | Respects prefers-reduced-motion |
-| Skip links | Skip to main content link |
-
-> "The calendar is particularly tricky for accessibility. Arrow keys should move between days, and we announce selected ranges to screen readers as users navigate."
-
----
-
-## 🚀 Scaling Considerations
-
-### Client-Side Bottlenecks
-
-| Bottleneck | Solution |
-|------------|----------|
-| Large search results | Virtual scrolling for 100+ listings |
-| Dense map markers | Clustering at low zoom levels |
-| Image bandwidth | Responsive images with srcset |
-| Memory on mobile | Unload off-screen listing cards |
-
-### Future Enhancements
-
-| Enhancement | Benefit |
-|-------------|---------|
-| Offline support | Service worker for saved listings |
-| Real-time updates | WebSocket for live availability |
-| Animation library | Framer Motion for micro-interactions |
-| i18n support | Multi-language with react-i18next |
-
-> "With 60% mobile traffic, memory management matters. Virtual scrolling ensures we don't hold hundreds of listing cards in the DOM—only what's visible plus a buffer."
+The router owns navigable identity: destination, applied filters, listing ID and
+booking ID. Components own temporary interaction details. A shared data layer owns
+server responses and the keys that distinguish them.
+
+I would use React and TypeScript, with route-level modules for search, listing,
+booking, trips and host tools. Zustand can hold small shared client state such as
+an unfinished search draft. Server data needs explicit fetching, freshness and
+invalidation behavior rather than an unstructured collection of global variables.
+
+A query library could implement that data layer. The important decision is its
+contract, not its brand: the same query must have one identity and older responses
+must not overwrite newer intent.
+
+For public listing pages, server rendering or prerendering is useful for search
+visibility and an early meaningful page. Date availability and personalized actions
+then load separately. Host tools can be client-rendered behind authentication.
+
+I would avoid putting private booking data into a shared public page cache. The
+rendering boundary also acts as a data visibility boundary.
+
+## 💾 State ownership and API contract — 4 minutes
+
+| State | Owner | Lifetime |
+|-------|-------|----------|
+| Applied destination, dates, guests, filters | Validated URL query | Shareable; survives reload and navigation |
+| Open filter drawer and incomplete edits | Local component draft | Until Apply, Cancel or route exit |
+| Listing cards, details and calendar response | Data layer with complete query key | Until stale or invalidated |
+| Quote | Server identity plus matching local inputs | Until input change or expiry |
+| Reservation attempt | Durable server operation identity | Until outcome is resolved |
+| Host listing draft | Local draft plus server draft/version | Across steps and recoverable reloads |
+
+The server owns price, inventory, authorization and booking state. The client can
+check obvious input errors for responsiveness, but it cannot grant availability.
+
+I would negotiate a few focused endpoints with backend engineers:
+
+| Operation | Contract needed by the UI |
+|-----------|---------------------------|
+| Search | Applied query identity, cards, continuation and degradation state |
+| Listing details | Public information, photo variants, rules and booking mode |
+| Calendar | Date-only occupancy/rules for a bounded window and version |
+| Quote | Dates, guests, itemized amount, currency, expiry and quote ID |
+| Create or recover reservation | Operation key, durable booking ID and current state |
+| Host calendar update | Edited interval, expected version, accepted result or conflict |
+
+These are proposed contracts. The current project combines some of them, including
+availability and price preview, and lacks quote and operation-status resources.
+
+I would make validation errors addressable to fields and separate them from service
+failure. A failed search should not look identical to a successful search with zero
+properties; a stale host edit should not appear to have saved.
+
+## 🔧 Deep dive: Search that follows user intent — 8 minutes
+
+> “I would make the applied URL query the source of navigable search state. The
+> tricky part is keeping the controls, cards and map on the same version of the
+> search while requests return in an unpredictable order.”
+
+### Separate editing from applying
+
+Typing a destination or changing several filters is a draft interaction. I would
+let the user finish that interaction before committing one normalized query.
+The Apply action updates the URL and starts a request for that exact query.
+
+For example, changing guests from two to four and adding a price ceiling should
+produce one coherent search. Fetching after each individual state assignment can
+briefly request combinations the user never intended to apply.
+
+Normalize empty filters, sort order, date format and geographic bounds before
+building the query identity. Include every result-affecting field; otherwise a
+cached two-person search can be reused for an eight-person trip.
+
+Browser Back restores the previous applied query, its controls and, where feasible,
+its results and scroll position. Local draft state must not immediately overwrite
+that restored URL with an older store value.
+
+### Control asynchronous responses
+
+Suppose the user searches Paris, then quickly searches Rome. The Paris request may
+finish last. I would cancel it when possible and also check response identity before
+committing it to the visible Rome screen.
+
+Cancellation saves work; identity protects correctness. The same rule applies to
+destination suggestions, result pages, calendar windows and quotes.
+
+Suggestions should distinguish typed text from a resolved destination. If the user
+edits a previously selected city, clear its old coordinates. Do not silently search
+the old city because its hidden latitude survived the text edit.
+
+A short debounce reduces suggestion traffic. Keyboard navigation, a labelled list
+of options and an explicit selection preserve usability beyond mouse clicks.
+A failed suggestion request needs a retry state rather than an invented destination.
+
+### Coordinate cards, pagination and a map
+
+Cards and map markers refer to the same listing IDs and applied query. Hovering a
+card may highlight a marker, but hover should not trigger a new search or reorder
+the card list.
+
+For map movement, I prefer an explicit “Search this area” action. Automatically
+searching every small pan can flood requests and move results while someone is
+trying to inspect a marker. Debounced automatic search is reasonable if the product
+values continuous exploration and clearly shows when results are updating.
+
+Pagination tokens belong to the query that created them. If dates change, discard
+the old continuation. Deduplicate appended cards by listing ID and do not merge a
+late page from a previous destination into the new result set.
+
+An exact total is optional. “More places available” can be a better contract than
+waiting for an expensive count the user does not need to make the next decision.
+
+### Trade-off
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Applied URL with separate draft | Shareable searches and predictable navigation | Requires normalization and explicit synchronization |
+| ❌ Independent URL and global-store copies | Convenient local updates initially | Back, reload and delayed requests can show contradictory searches |
+
+The cost of the chosen approach is more deliberate state ownership. It earns its
+place because comparison shopping involves many back-and-forth navigations; losing
+a guest's dates or changing the result set unexpectedly breaks that workflow.
+
+I would retain old results during an update only with a clear updating indication.
+If the new request fails, label the old set as belonging to the previous search and
+preserve the draft so the user can retry without re-entering everything.
+
+## 🔧 Deep dive: Dates, quotes and uncertain booking outcomes — 8 minutes
+
+> “I would design booking as a small state machine. The frontend can be optimistic
+> about button feedback, but the success screen must come from a durable server
+> outcome.”
+
+### Make the calendar semantics explicit
+
+A stay from September 10 to September 12 occupies the nights of the 10th and 11th.
+September 12 can be another guest's check-in. The calendar must distinguish a day
+that cannot be slept on from a boundary that can still be selected as checkout.
+
+I would send dates as date-only values in the property's calendar. Converting a
+selected date into a UTC timestamp and back in the traveler's time zone can change
+which day it represents. The API contract must prevent that ambiguity.
+
+The interaction starts with check-in, then chooses checkout subject to minimum stay,
+maximum stay and blocked nights between them. A range cannot jump across an occupied
+night merely because its two endpoints look selectable.
+
+Rules should explain disabled choices. “Minimum three nights” is more useful than
+a silently disabled date. Typed inputs and keyboard calendar navigation should use
+the same validation as pointer selection.
+
+Fetch a bounded set of months and load more when needed. If a calendar request fails,
+show availability as unknown; an empty response and a failed response have different
+meanings. Unknown nights must not be painted as confirmed availability.
+
+### Bind the quote to the chosen trip
+
+Changing dates or guests invalidates the previous quote. Keep an input fingerprint
+alongside each response and accept it only if it matches the current selection.
+While recalculating, show that the previous amount is being replaced.
+
+A server quote returns nightly charges, other fees, currency and a validity deadline.
+The browser formats the amount; it does not independently invent a second rounding
+policy or treat the card's nightly price as the total.
+
+Quote expiry and inventory availability are separate. A valid quote can still lose
+its dates to another guest unless the server explicitly grants an inventory hold.
+If the price changes before submission, show the revised total for acceptance.
+
+### Recover after submission
+
+| UI state | What the guest should understand |
+|----------|---------------------------------|
+| Ready | Dates and quote are valid enough to submit |
+| Submitting | One identified reservation attempt is in progress |
+| Pending host response | The request exists; confirmation is still outstanding |
+| Confirmed | The server returned a confirmed booking identity |
+| Conflict | Dates or rules changed; preserve inputs for revision |
+| Outcome unknown | The response was lost; recover the existing attempt |
+
+Disable duplicate clicks while submitting, but also send a stable operation key.
+A reload, mobile reconnection or impatient retry can bypass a disabled button. Only
+the server can make repeated submissions resolve to one logical booking.
+
+If the response times out, query the operation or retry with the same key. Do not
+immediately show “Booking failed” and generate a fresh request. The database may
+already have committed the first reservation.
+
+After login, restore the intended listing and date draft, then revalidate it. A
+return URL should identify an allowed in-app destination. Restoring inputs is not
+permission to silently book with an old quote.
+
+### Trade-off
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Server-confirmed booking with recoverable pending state | Honest outcomes and safe retries | More UI states and a recovery endpoint |
+| ❌ Immediate optimistic confirmation | Fast-looking success screen | Can promise unavailable dates or conceal an unresolved request |
+
+I would use optimistic behavior for low-risk display actions, such as opening the
+price breakdown. Inventory commitment has a different cost of error, so a short
+visible wait is justified. Failure should preserve the guest's work, not their
+incorrect assumption that the reservation succeeded.
+
+## 🔧 Deep dive: Host editing without losing newer changes — 7 minutes
+
+> “A host calendar is a collaborative editor in miniature. The host can have two
+> tabs open while guests are booking, so saving a stale whole calendar is unsafe.”
+
+### Edit an interval, not a month-sized snapshot
+
+A host may block September 10–12 while a guest books September 20–22. Sending the
+entire month from the browser risks overwriting the newer booking with an older
+available cell. I would send the intended interval change and its expected version.
+
+The server validates ownership, rules and current occupancy in its inventory
+transaction. If the edited interval conflicts, return the current relevant data
+and a conflict explanation. The browser keeps the unsaved draft for review.
+
+A server can use a whole-calendar version initially. That may reject harmless edits
+to different dates, but it is simple. If false conflicts become common, use finer
+interval-aware checks without letting the client decide which booking rows to erase.
+
+After saving, replace the affected cache from the accepted server response and
+invalidate related availability reads. A green “Saved” label means the server
+accepted the edit, not merely that local state changed.
+
+### Make the listing wizard recoverable
+
+A multi-step listing form needs a draft identity, field validation and a clear
+publish boundary. Save progress at meaningful points and show whether changes are
+local, saving or saved. Keep the user's text after a request fails.
+
+Photos have their own upload lifecycle: selected, uploading, processed, failed and
+ready. Temporary browser previews are useful, but should not be mistaken for images
+that the server has stored successfully.
+
+Bound concurrent uploads so a large selection does not monopolize the connection.
+Allow individual retries and removal. Publish only after required fields and required
+photos are accepted, then navigate to a route that actually exists for that listing.
+
+A retry must reuse the same draft or upload identity where appropriate. Otherwise a
+lost response can create duplicate listings or multiple photo records.
+
+### Make conflicts usable
+
+Do not replace the entire form with an error page when one field is rejected.
+Place field errors near their controls, move focus to an error summary on submission,
+and preserve the draft. Permission loss is a distinct state from invalid input.
+
+For calendar conflicts, show the affected dates and accepted server state. A generic
+“Something went wrong” forces a host to guess whether a guest now owns the dates or
+whether the network is simply unavailable.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Versioned interval edits and recoverable drafts | Protects new reservations and preserves host work | Conflict handling and draft lifecycle |
+| ❌ Replace the server calendar from browser state | Simple first implementation | A stale tab can erase newer inventory changes |
+
+I would accept occasional explicit conflict resolution over silent lost updates.
+For a host, a minute spent reviewing one conflict is preferable to discovering a
+calendar mistake after two parties have made travel plans.
+
+## ⚡ Rendering, accessibility and communication — 4 minutes
+
+Listing photos dominate bandwidth. Serve responsive variants, reserve image space
+to prevent layout jumps, load the first visible image promptly, and lazy-load images
+below the fold. Avoid downloading full gallery originals for every result card.
+
+Render a bounded result page first. If the experience accumulates hundreds of cards,
+virtualize the scrolling list and preserve scroll position by stable listing ID.
+I would measure before adding virtualization to a small twenty-card page.
+
+Load the map and host editor only when needed. Map markers should cluster at broad
+zoom levels, and the list remains the accessible alternative for selecting a place.
+The map must not be the only way to discover a property's price or details.
+
+Calendars need meaningful day labels, visible focus, keyboard movement and an
+announcement of the selected range. A modal must manage focus and return it to the
+control that opened it. Color alone cannot communicate unavailable or conflicted dates.
+
+Messages need a different data flow from search. Paginate history, assign message
+identities and reconcile acknowledgements with local pending messages. Live delivery
+can use a persistent connection, but reopening the conversation must recover missed
+messages from the server regardless of connection history.
+
+Review visibility belongs to server policy. The browser can show that a review was
+submitted without exposing a hidden counterpart. It should not run its own timer
+and reveal content the server has not authorized.
+
+## 🧪 Validate the important boundaries — 4 minutes
+
+I would prioritize tests that exercise ordering and recovery, not only whether a
+page contains a header. The most revealing scenarios are:
+
+1. A slower old destination response arrives after a new one.
+2. Back restores the previous filters, results and scroll position.
+3. Checkout on an existing stay's departure day remains valid.
+4. A stale quote returns after the guest changes party size.
+5. A reservation commits but its HTTP response is lost.
+6. A host saves from an old tab after a guest books the affected dates.
+
+Component tests can exercise calendar keyboard behavior and validation. Integration
+tests need controlled response ordering. A real backend concurrency test establishes
+whether inventory is protected; a frontend mock cannot prove that invariant.
+
+Measure search interaction latency, image loading, layout shifts, quote errors,
+reservation outcome recovery and host save conflicts. Separate successful empty
+searches from backend failures so the dashboard reflects the user's experience.
+
+For the repository, I would first close the gaps between search state and responses,
+calendar boundaries and booking feedback. The current implementation has no map,
+no synchronized search URL, no booking idempotency and no complete host edit route.
+Those omissions should be visible in the implementation documentation.
+
+> “The frontend's job is to preserve intent and tell the truth about progress.
+> Search, quote and reservation each have their own identity and freshness. Keeping
+> those boundaries clear lets the interface stay responsive without promising
+> inventory that the server has not committed.”

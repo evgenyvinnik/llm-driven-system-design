@@ -1,308 +1,375 @@
-# Dropbox - System Design Answer (Backend Focus)
+# Dropbox — backend system design interview
 
-*45-minute system design interview format - Backend Engineer Position*
+A 45-minute production design discussion for cloud file storage. The architecture is a proposal, not
+a claim about Dropbox Inc. or this repository's deployed capabilities. The local implementation is
+compared at the end.
 
-## Problem Statement
+## 🎯 Requirements and invariants — 4 minutes
 
-Design the backend infrastructure for a cloud file storage and synchronization service that allows users to:
-- Upload and download files with resumable chunked transfers
-- Deduplicate content across users and files
-- Sync changes across multiple devices
-- Share files and folders with access control
-- Maintain version history for file recovery
+> “I would separate the file users see from the bytes we store. A file has an identity, a place in a namespace, permissions, and a current version. A version is an immutable ordered manifest of byte chunks.”
 
-## Requirements Clarification
+The functional scope is folder navigation, resumable upload, consistent download, version recovery,
+named-user sharing, public links, and change propagation across devices. I would assume files up to
+10 GiB and explicitly leave collaborative document editing and desktop filesystem monitoring outside
+this interview.
 
-### Functional Requirements
-1. **File Upload/Download**: Support files up to 10GB with chunked, resumable transfers
-2. **Deduplication**: Content-addressed storage to avoid storing duplicate data
-3. **Sync Across Devices**: Real-time notifications when files change
-4. **Version History**: Track and restore previous file versions
-5. **Sharing**: Public links and user-specific folder sharing with permissions
+The system should publish a new file only after every referenced byte is verified and protected by
+the storage durability policy. An interrupted transfer may leave temporary objects, but it must not
+create a visible file with missing content.
 
-### Non-Functional Requirements
-1. **Durability**: 99.999999999% (11 nines) - no data loss
-2. **Availability**: 99.9% uptime for read operations
-3. **Sync Latency**: Changes visible within 2 seconds
-4. **Bandwidth Efficiency**: Minimize data transfer through deduplication and delta sync
-5. **Scalability**: Support petabytes of storage and millions of users
+The second invariant is that a stale client cannot silently replace a newer version. The third is
+authorization: neither knowledge of an object hash nor receipt of an old notification grants access
+to somebody else's bytes.
 
-### Scale Estimates
-- 500M users, 100M daily active
-- 10 billion files, average 1MB each = 10 PB
-- Peak: 50K operations/sec (uploads, downloads, metadata)
-- Daily upload: 1 PB new data
-- Deduplication savings: ~30% storage reduction
+Quota is a product rule we need to settle early. I would charge logical bytes for every retained
+version, reserve capacity during upload, and release it when retention ends. Physical deduplication
+savings are an infrastructure metric, not an unpredictable change in a user's quota.
 
-## High-Level Architecture
+I would propose 99.9% monthly regional availability for metadata and download admission, p95 folder
+pages below 300 ms, and connected-device visibility within two seconds of commit. Finalization
+should usually finish within 500 ms after verified staging is complete. These are targets to
+validate, not benchmark results.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Load Balancer (nginx)                           │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-            │ API Server  │ │ API Server  │ │ API Server  │
-            │   (Node)    │ │   (Node)    │ │   (Node)    │
-            └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-                   │               │               │
-                   └───────────────┼───────────────┘
-                                   │
-            ┌──────────────────────┼──────────────────────┐
-            │                      │                      │
-            ▼                      ▼                      ▼
-    ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-    │  PostgreSQL  │      │    Valkey    │      │   RabbitMQ   │
-    │  (Metadata)  │      │   (Cache +   │      │  (Sync Notif │
-    │              │      │   Sessions)  │      │  + Jobs)     │
-    └──────────────┘      └──────────────┘      └──────────────┘
-                                                       │
-                                                       ▼
-                          ┌──────────────┐      ┌──────────────┐
-                          │    MinIO     │      │ Sync Workers │
-                          │ (S3 Chunks)  │      │ (Background) │
-                          └──────────────┘      └──────────────┘
-```
+For durability, I would specify replicated objects, database backups, integrity checks, and tested
+recovery procedures. Quoting many nines without a failure model would not establish that metadata
+and bytes can actually be restored together.
 
-## Deep Dive: File Chunking and Deduplication
+## 🏗️ Capacity, architecture, and data model — 5 minutes
 
-### Chunking Strategy
+Assume one million daily active users, one uploaded version per active user per day, and an average
+of 20 MiB per version. At ten metadata reads per user per day, metadata and bytes have very
+different scaling characteristics.
 
-Files are split into fixed-size chunks (4MB default) for several benefits:
+| Quantity | Working estimate |
+|----------|------------------|
+| Finalization rate | 11.6/s average, about 116/s at tenfold peak |
+| Metadata reads | 116/s average, about 1,160/s peak |
+| Chunk writes | Five 4 MiB chunks/version: about 58/s average, 580/s peak |
+| Incoming logical bytes | About 19.1 TiB/day before deduplication |
+| Thirty-day incoming versions | About 572 TiB before retention deletion and replication |
+| Concurrent connections | Assume 100,000; gateway capacity must be measured |
+
+I would not assume a 30% storage saving. Reuse depends on the actual file population, and downloads
+may dominate network cost. The estimates mainly tell us to keep file bytes off the metadata
+service's critical path.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Chunking Benefits                          │
-├─────────────────────────────────────────────────────────────┤
-│  1. Resumable uploads - only retransmit failed chunks         │
-│  2. Deduplication - same content = same hash = stored once    │
-│  3. Delta sync - only upload chunks that changed              │
-│  4. Parallel transfer - multiple chunks simultaneously        │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ Clients          │────▶│ Metadata API     │────▶│ SQL authority    │
+└──────────────────┘     └──────────────────┘     │ + durable changes│
+        │                         │               └──────────────────┘
+        ▼                         ▼                         │
+┌──────────────────┐     ┌──────────────────┐               ▼
+│ Upload service   │────▶│ Private objects  │     ┌──────────────────┐
+│ Verified staging │     │ Immutable chunks │     │ Change relay     │
+└──────────────────┘     └──────────────────┘     └──────────────────┘
+                                                            │
+                                                            ▼
+                                                  ┌──────────────────┐
+                                                  │ Socket gateways  │
+                                                  └──────────────────┘
 ```
 
-### Database Schema
+The metadata service owns namespace mutations and permissions. Upload services manage resumable
+staging and verify receipts. A relay moves committed changes to gateways. These are responsibility
+boundaries; a first implementation can keep several within one deployable service.
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| **users** | id (UUID PK), email (unique), password_hash, storage_quota_bytes (default 10GB), storage_used_bytes | — | Users with storage quota tracking |
-| **folders** | id (UUID PK), owner_id (FK), parent_id (self-ref FK), name, path (materialized path), deleted_at (soft delete) | idx_folders_path (path) | Hierarchical folder structure; unique constraint on (owner_id, parent_id, name) where not deleted |
-| **files** | id (UUID PK), owner_id (FK), folder_id (FK), name, size_bytes, current_version (default 1), deleted_at | — | File metadata only; unique constraint on (owner_id, folder_id, name) where not deleted |
-| **chunks** | hash (SHA-256, VARCHAR(64) PK), size_bytes, reference_count (default 1), storage_location (S3 bucket/key) | — | Content-addressed chunk storage; reference counting enables garbage collection |
-| **file_versions** | id (UUID PK), file_id (FK cascade), version_number, size_bytes | — | Each version references an ordered list of chunks; unique on (file_id, version_number) |
-| **version_chunks** | version_id + chunk_index (composite PK), chunk_hash (FK to chunks) | — | Maps versions to their ordered chunks |
-| **upload_sessions** | id (UUID PK), user_id (FK), folder_id (FK), filename, total_size, chunk_size (default 4MB), total_chunks, received_chunks (integer array), status (default 'pending'), expires_at (24 hours) | — | Tracks resumable upload progress |
+A namespace is the transaction and sharding boundary. It can be a personal drive or a shared
+workspace. Sharding only by the currently authenticated user would scatter shared-folder operations
+and make ownership semantics difficult to preserve.
 
-### Deduplication Algorithm
+| Record | Important fields and constraints | Purpose |
+|--------|----------------------------------|---------|
+| Namespace | ID, revision, owner/account, quota policy | Authority and ordering scope |
+| Entry | ID, namespace, parent, name, kind, current version, deletion state | Stable identity and folder hierarchy |
+| Version | ID, entry, revision, size, manifest, creator | Immutable file contents |
+| Upload/session slots | Actor, operation, manifest, base version, expiry; unique session/index receipt | Resumability and verified bytes |
+| Quota reservation | Namespace/account, bytes, expiry, state | Prevent concurrent oversubscription |
+| Permission/link | Namespace or entry, principal/capability, actions, expiry | Authorization |
+| Receipt/change | Actor-operation identity, payload digest, result; namespace sequence | Retry resolution and synchronization |
 
-When a client initiates an upload, it sends the filename, size, folder ID, and an array of SHA-256 hashes for all chunks (computed client-side). The server then:
+Large manifests can use separate ordered slot rows. Chunk storage is content-addressed within an
+authorized scope. The metadata database should not use an object key as a substitute for a
+permission relationship.
 
-1. **Check which chunks already exist** - Query the chunks table for any matching hashes from the provided list.
-2. **Determine needed chunks** - Build a set of existing hashes and filter the chunk list to identify only those that need uploading, preserving their index positions.
-3. **Create an upload session** - Insert a new upload_sessions row with the file metadata and total chunk count, using the default 4MB chunk size.
-4. **Return the session** - Respond with the upload ID, chunk size, the list of chunk indices that need uploading, and the count of chunks that were deduplicated (already exist in storage).
+## 🔧 Deep Dive 1: publishing complete files despite retries — 10 minutes
 
-> "This approach saves significant bandwidth. If the user uploads a file that is 50% identical to existing content, we skip half the chunks entirely. The client only transfers what is genuinely new."
+> “I would stage bytes first and publish the manifest in a short SQL transaction. That makes temporary unreferenced bytes an expected cleanup problem, while a visible incomplete file remains a correctness violation.”
 
-### Why Content-Addressed Storage?
+A client begins with a target namespace and parent, file identity or new name, expected base
+version, declared size, ordered chunk digests, and stable operation ID. Validate integer bounds,
+file limits, slot count, digest format, and the sum of lengths before creating a session.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Content-addressed (chosen)** | Automatic deduplication, immutable chunks | Hash computation overhead |
-| Per-file storage | Simple implementation | No deduplication |
-| File-level dedup | Simpler than chunk | Misses partial duplicates |
+Creation reserves prospective logical quota transactionally. Reservations have expiry and ownership;
+active sessions cannot reserve unlimited capacity indefinitely. Rechecking quota only before
+transfer lets several clients each spend the same remaining capacity.
 
-**Decision**: Content-addressed storage with SHA-256 hashes provides:
-1. Automatic deduplication across all users
-2. Immutable chunks simplify caching
-3. 30%+ storage savings in practice
+Each slot is identified by session and index. A receipt records verified digest, length, and durable
+object identity. If the same slot arrives again with the same content, return its receipt. If it
+arrives with different content, reject the mismatch. Incrementing a generic uploaded-count field on
+every request is not resume tracking.
 
-## Deep Dive: Chunk Storage with MinIO
+The upload service can issue short-lived signed transfer capabilities. Those capabilities must be
+scoped to the intended object and session, with length/integrity verification before accepting the
+receipt. A successful object request is not sufficient evidence that it belongs in this user's
+manifest.
 
-### Storage Architecture
+Initially choose fixed 4 MiB chunks. This limits retransmission cost and makes range mapping
+straightforward. Content-defined boundaries can preserve reuse after insertions, but require more
+hashing and a more complex client/server agreement. I would add that only after measuring a workload
+where shifted boundaries materially increase costs.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     MinIO Bucket Layout                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  dropbox-chunks/                                              │
-│    chunks/                                                    │
-│      {sha256-hash}     # Raw chunk data                       │
-│                        # Path: chunks/a1b2c3d4e5f6...         │
-│                                                               │
-│  dropbox-temp/                                                │
-│    uploads/                                                   │
-│      {session-id}/                                            │
-│        {chunk-index}   # Temp storage during upload           │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
-```
+Do not offer unrestricted global hash membership. A client may know the digest of a sensitive
+document without being allowed to read it. Reuse within an authorized namespace avoids that
+disclosure and attachment problem, at the cost of reduced cross-namespace deduplication.
 
-### Chunk Upload with Verification
+Finalization does the following in one metadata transaction:
 
-Each chunk upload follows this process:
+1. Look up the actor-scoped operation receipt and verify the payload identity.
+2. Lock or otherwise serialize the relevant namespace/file and reservation state.
+3. Recheck current permission, live parent, entry type, name constraints, and base version.
+4. Require a complete ordered set of valid slot receipts with matching total bytes.
+5. Publish an immutable version, advance the current pointer, and convert reserved quota to retained usage.
+6. Record the committed operation result and a durable namespace change/outbox entry.
 
-1. **Verify hash integrity** - Compute the SHA-256 hash of the received data and compare it against the hash declared by the client. If they do not match, reject the chunk with a hash mismatch error.
-2. **Check for deduplication** - Query the chunks table to see if this hash already exists in storage.
-3. **If chunk exists** - Increment the reference_count on the existing chunk row (no data upload needed).
-4. **If chunk is new** - Upload the raw data to MinIO at the path `chunks/{hash}` in the "dropbox-chunks" bucket, then insert a new row into the chunks table with the hash, size, and storage location.
-5. **Update upload session** - Append the chunk index to the received_chunks array in the upload_sessions table.
-6. **Return result** - Indicate the hash and whether this chunk was deduplicated.
+The transaction also ensures the staging objects remain protected from reclamation as they become
+referenced. A collector must not inspect the database before commit and delete those objects while
+finalization is using them.
 
-### Circuit Breaker for Storage
+The object upload does not run while holding a file lock. A slow connection can take minutes,
+whereas the transaction should only validate existing facts and publish references. SQL and object
+storage do not become atomic merely because a function calls both sequentially.
 
-MinIO upload operations are wrapped in a circuit breaker (using the consecutive breaker pattern). After 5 consecutive failures, the breaker opens and rejects all requests immediately. After 30 seconds, it transitions to half-open and allows a single test request through. If that succeeds, the breaker closes and normal traffic resumes. When the breaker opens, the event is logged and a Prometheus metric is updated.
+There are three important crash points. Before any bytes arrive, the reservation expires. After
+bytes arrive but before publication, protected staging eventually becomes reclaimable. After
+publication but before the response, the operation receipt returns the original result on retry.
 
-## Deep Dive: Sync Protocol
+Post-commit notification failure should not change a successful publication into an unresolvable
+failure. The outbox was committed with the version; a relay retries delivery. Metrics and logging
+must also be prevented from throwing away the successful response path.
 
-### Change Notification Flow
+An operation key needs an actor and payload boundary. Reusing it with a different manifest or target
+returns a conflict. Receipt retention must be long enough for the supported retry window; an expired
+operation should have an explicit terminal response rather than silently becoming a new write.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Sync Notification Flow                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  1. Client A uploads file                                     │
-│         │                                                     │
-│         ▼                                                     │
-│  2. API Server publishes to RabbitMQ                          │
-│     Exchange: sync.events, Key: user.{userId}.change          │
-│         │                                                     │
-│         ▼                                                     │
-│  3. Sync Worker consumes message                              │
-│         │                                                     │
-│         ▼                                                     │
-│  4. Worker broadcasts via WebSocket                           │
-│         │                                                     │
-│         ▼                                                     │
-│  5. Client B receives notification, fetches updates           │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
-```
+A generic Redis cache around the endpoint cannot independently guarantee one publication. The result
+and the metadata effect must share the transaction, or there must be another equivalent durable
+uniqueness mechanism. Otherwise a crash can happen between effect and cached response.
 
-### RabbitMQ Topology
+| Approach | Why it works here | What it costs |
+|----------|-------------------|---------------|
+| ✅ Verified staging plus metadata transaction | Small retries; atomic visible file and receipt | Session ledger, quota leases, and cleanup coordination |
+| ❌ One whole-file request | Simple first implementation | Large retransmission and ambiguous timeout outcome |
+| ❌ Publish the manifest before verifying objects | Fast metadata acknowledgment | Readers can encounter missing or unauthorized bytes |
 
-The sync system uses a topic exchange called "sync.events" with durable queues. The "sync.notifications" queue is bound with the routing pattern `user.*.change`, has a dead-letter exchange for failed messages, and a 5-minute message TTL.
+## 🔧 Deep Dive 2: concurrent versions and safe reclamation — 8 minutes
 
-When a file change occurs, the API server publishes a persistent message to the exchange with routing key `user.{userId}.change`. The message payload contains the event type, user ID, file ID, action performed, and ISO timestamp.
+> “I would make conflict handling explicit and garbage collection conservative. Recoverable history is valuable only if we preserve the manifests and bytes that history references.”
 
-### WebSocket Connection Management
+Suppose devices A and B edit version 7. A publishes version 8. B's request still names base version
+7, so its publication is rejected as a conflict while its staged content remains temporarily
+retained. B can create a conflict copy or deliberately replace the revision the user has now
+reviewed.
 
-The server maintains an in-memory map of user IDs to their active WebSocket connections (a user may have multiple devices connected simultaneously). When a new WebSocket connects, it is registered in the user's connection set. On disconnect, it is removed.
+Last arrival wins is simpler, but it lets transport timing decide whose work becomes visible.
+Keeping history softens that failure without making it obvious to the person whose edit disappeared.
+For a file-storage product, a visible conflict is a reasonable cost to protect intent.
 
-The sync worker consumes messages from RabbitMQ and broadcasts them to all active WebSocket connections for the target user. Only connections in the OPEN state receive the message. This ensures all of a user's devices receive real-time file change notifications.
+A unique version number is not the same as a conflict protocol. A uniqueness exception may stop one
+database transaction, but it does not communicate a recoverable user decision or preserve a stable
+operation outcome. The API should return current revision and staged-upload identity.
 
-## Deep Dive: Version History and Garbage Collection
+Restore uses the same publication rules. It creates a new version pointing to a retained manifest
+and checks the current base version. Under our retained-logical-byte policy, it consumes logical
+quota for that new version even if no physical chunk is uploaded.
 
-### Version Storage Strategy
+Downloads pin an immutable version at authorization time. Read the ordered manifest for that version
+and stream its chunks with backpressure. A resumed range must identify the same version; reading
+current metadata and then a separately changing current manifest can otherwise mix generations.
 
-Versions share chunks through deduplication -- only new or changed chunks consume additional storage. To retrieve all chunks for a specific version, the system joins version_chunks with chunks on the hash, filtered by version ID, and orders by chunk_index. Restoring a previous version is a simple update to the files table, setting current_version to the desired version number.
+Range mapping needs chunk lengths, particularly for the final chunk and any future variable-size
+chunking. Validate retrieved lengths and integrity; a missing object is a storage failure to repair,
+not a successful empty download.
 
-### Garbage Collection
+The namespace tree has independent integrity rules. Entry creation must prove the parent is a live
+folder in the same namespace. Name uniqueness must also work at the root, where a nullable parent
+can otherwise weaken a unique constraint. Stable entry IDs survive rename and move.
 
-A periodic garbage collection process runs every hour to clean up orphaned chunks:
+A single-request “is destination a descendant?” check does not handle two concurrent moves into each
+other. Start with serialized structural mutations within a namespace, with a consistent lock order
+or equivalent transaction mechanism. This limits write concurrency in hot shared folders, but
+prevents a cycle that could break every recursive traversal.
 
-1. **Find orphaned chunks** - Query for chunks with reference_count <= 0 that were created more than 1 day ago (the delay prevents race conditions with in-progress uploads).
-2. **Delete from object storage** - Remove the chunk data from MinIO using the stored storage_location path.
-3. **Delete metadata** - Remove the chunk row from the database.
-4. **Log** - Record each garbage-collected chunk hash for auditing.
+Now consider deleting a file. With retention, deletion hides the entry while older versions remain
+recoverable. Logical quota is released at the retention boundary we defined. The object collector
+cannot simply delete chunks referenced by the removed current file, because other versions or files
+may share them.
 
-## API Design
+The liveness roots are:
 
-### Core Endpoints
+- Current file manifests.
+- Retained historical versions, including deleted files still inside retention.
+- Active upload sessions and their verified staging slots.
+- Any explicitly retained download/repair work covered by the delivery policy.
 
-```
-Authentication:
-POST   /api/v1/auth/register     Create account
-POST   /api/v1/auth/login        Create session
-POST   /api/v1/auth/logout       Destroy session
+I would mark candidates that are unreachable, wait through a grace interval, and recheck under a
+reclamation protocol that excludes new attachment. Finalization must reject or revive a candidate
+safely before attaching it. Grace time alone does not prevent a new reference from racing with
+deletion.
 
-Upload (Chunked):
-POST   /api/v1/upload/init       Start upload, get chunks needed
-POST   /api/v1/upload/:id/check  Check existing chunks (dedup)
-PUT    /api/v1/upload/:id/chunk/:index  Upload single chunk
-POST   /api/v1/upload/:id/complete      Finalize upload
+Delete the object idempotently and retain a retryable reclamation record until metadata cleanup
+completes. If the process crashes after deleting the object but before the final database update,
+repeating an absent-object delete is safe. If storage fails first, the candidate remains available
+for retry.
 
-Files:
-GET    /api/v1/files             List files in folder
-GET    /api/v1/files/:id         Get file metadata
-GET    /api/v1/files/:id/download  Stream file download
-DELETE /api/v1/files/:id         Soft delete
+Reference counts can accelerate candidate discovery, but every attachment, version copy, restore,
+cancellation, and retention purge must maintain them correctly. Reconcile counts against
+reachability. A counter incremented per upload request is neither a logical-version count nor a
+reliable liveness count.
 
-Versions:
-GET    /api/v1/files/:id/versions        List versions
-POST   /api/v1/files/:id/versions/:v/restore  Restore version
+| Decision | Benefit | Cost |
+|----------|---------|------|
+| ✅ Base-version publication | Stale writes become explicit recoverable conflicts | Clients must handle conflict and staging expiry |
+| ❌ Silent latest-arrival replacement | Fewer user prompts | Network timing can hide another device's work |
+| ✅ Coordinated reachability and delayed deletion | Protects current, historical, and staged bytes | Extra retention space, scans, and deletion states |
+| ❌ Delete from approximate reference counts | Cheap query and simple worker | Incorrect counts can leak storage or destroy reachable bytes |
 
-Sharing:
-POST   /api/v1/files/:id/share   Create share link
-GET    /api/v1/share/:token      Access shared file
+## 🔧 Deep Dive 3: sharing and recoverable change delivery — 8 minutes
 
-Sync:
-WS     /api/v1/sync/ws           WebSocket for sync events
-```
+> “I would put permission checks at every admission point and durable revisions underneath notifications. Neither a socket connection nor an object hash is a permanent authorization grant.”
 
-### Request/Response Examples
+Named-user sharing belongs to a namespace or an explicit inherited folder grant. Evaluate ownership,
+ancestor grants, deletion state, and requested action using a well-defined rule. Cache effective
+permissions only with a revision/invalidation strategy and recheck on mutations and byte admission.
 
-**Upload Init with Deduplication**:
+Shared namespaces are why I prefer namespace sharding to user sharding. The owner and recipient
+should reach one authority for that folder's version and permission decisions. A move across
+namespaces is an explicit copy-and-delete workflow with independently authorized steps.
 
-A POST request to `/api/v1/upload/init` sends the filename, file size, folder ID, and an array of chunk hashes (computed client-side). The server responds (201 Created) with an upload ID, chunk size (4MB), total chunk count, the list of chunk indices that actually need uploading (chunks not already stored), the count of deduplicated chunks, and a session expiration timestamp.
+Public links are capabilities with high-entropy tokens, optional password verification, expiry,
+allowed actions, and a chosen file/version policy. For example, a link may follow the current file,
+but each admitted download pins a particular version. State that behavior so overwrites do not
+surprise recipients.
 
-## Caching Strategy
+A limited-download counter needs an atomic admission transaction. Checking count and incrementing
+later allows several simultaneous requests to all pass. Define whether the product limits
+admissions, started transfers, or completed deliveries; exact completion is difficult when a client
+disconnects at the end.
 
-### Cache Layers
+I would count admitted transfers and disclose that rule. A retry should reuse its admission when
+permitted, without issuing unlimited independent capabilities. Passwords should not travel in URL
+query strings, and logs must exclude them and capability tokens.
 
-| Cache Key Pattern | Purpose | TTL |
-|-------------------|---------|-----|
-| `folder:{folderId}:listing` | Folder listing cache | 5 min |
-| `file:{fileId}:meta` | File metadata cache | 10 min |
-| `user:{userId}:quota` | User storage quota | 1 min |
-| `upload:{uploadId}:session` | Upload session state | 25 hours |
+Keep the object bucket private. A signed URL remains usable within its validity window even if its
+parent link is revoked afterward. If immediate revocation is required, route delivery through an
+online permission check; otherwise use short validity and clearly define that boundary.
 
-### Cache-Aside Pattern
+Notifications include a namespace revision and affected entry identities. The SQL commit records the
+change durably. A relay may deliver it more than once, and clients must handle duplicates. The
+gateway does not need to maintain the sole authoritative copy of every event.
 
-**Folder listing read path:** Check Redis for the cached folder listing. On cache miss, query PostgreSQL for all files and subfolders in the folder (excluding soft-deleted items), ordered by type (folders first) then name. Cache the result in Redis with a 300-second TTL.
+For initial synchronization, obtain a snapshot tied to revision R and then apply changes after R.
+For reconnect, request changes after the last applied cursor. If that cursor is older than the
+retained feed, reload a snapshot. This closes the gap between taking a snapshot and establishing a
+live connection.
 
-**Cache invalidation on write:** When a file is created or modified in a folder, delete the folder listing cache key for that folder, forcing the next read to fetch fresh data from the database.
+Folder pagination must preserve the snapshot/revision semantics. Otherwise an item moved between
+pages can be skipped or duplicated. A stable continuation token can encode the snapshot or cause a
+clean restart when the server cannot preserve it.
 
-## Scalability Considerations
+Permission changes also produce changes for affected recipients, but the feed itself must be
+authorized. A former member must not keep receiving file names because a socket was authenticated
+before revocation. Gateways need session/membership invalidation or bounded reauthorization, plus
+checks when granting subscriptions.
 
-### Database Scaling Path
+With 100,000 mostly idle clients, frequent fixed polling wastes requests. WebSocket hints improve
+latency, while durable cursors make missed hints recoverable. Redis Pub/Sub can serve the hint
+layer, but it does not retain messages for disconnected clients; its [delivery
+documentation](https://redis.io/docs/latest/develop/pubsub/) makes that limitation explicit.
 
-1. **Current**: Single PostgreSQL instance
-2. **Read replicas**: Route folder listings to replicas
-3. **Sharding by user_id**: All user's files on same shard
-4. **Partition chunks table**: By hash prefix
+Bound outgoing queues, coalesce revision advances, and disconnect slow clients with a resync
+instruction. A reconnect storm should receive paginated catch-up with admission control rather than
+exhaust the database through simultaneous full-drive snapshots.
 
-The chunks table can be hash-partitioned for horizontal scaling. Using PostgreSQL declarative partitioning with HASH on the hash column, the table is split into N partitions (e.g., 4 partitions using MODULUS 4, REMAINDER 0-3). This distributes chunks evenly across partitions since SHA-256 hashes are uniformly distributed.
+| Approach | Fit for this problem | Trade-off |
+|----------|----------------------|-----------|
+| ✅ Private bytes and scoped admission | Authorization governs access rather than hash knowledge | URL expiry and revocation semantics must be explicit |
+| ❌ Public chunk bucket behind a protected metadata API | Easy object delivery | Object access bypasses application permissions |
+| ✅ Durable namespace feed plus socket hints | Recovers after gaps without polling every idle client rapidly | Outbox relay, cursor retention, and resync paths |
+| ❌ Pub/Sub as the only change history | Small infrastructure footprint | Disconnected clients cannot replay missed changes |
 
-### Estimated Capacity
+## ⚙️ Scaling and operational failure handling — 5 minutes
 
-| Component | Single Node | Scaled (4x) |
-|-----------|-------------|-------------|
-| PostgreSQL writes | 1K/sec | 4K/sec (sharded) |
-| PostgreSQL reads | 10K/sec | 40K/sec (replicas) |
-| MinIO throughput | 1 Gbps | 4 Gbps (cluster) |
-| WebSocket connections | 10K | 40K |
+I would first measure finalization contention, object throughput, and folder size distributions. The
+initial metadata rate is modest compared with byte volume; splitting every function into a
+microservice would not fix a process that buffers whole files in memory.
 
-## Trade-offs Summary
+Scale upload admission and object transfer separately from metadata workers. Add per-account
+concurrency, size limits, bounded queues, and deadlines that propagate cancellation. Retries need
+jitter and an overall budget; a finite attempt count does not bound a network call that never
+returns.
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Fixed-size chunks | Simple implementation | Insertion shifts boundaries |
-| SHA-256 hashing | Collision-resistant | CPU overhead |
-| Reference counting | Enables garbage collection | Must maintain accurately |
-| PostgreSQL sessions | Transactional with user data | Slower than Redis |
-| WebSocket sync | Real-time notifications | Connection management complexity |
-| Last-write-wins conflicts | Simple resolution | May lose data |
+Use replicas for reads only when staleness is acceptable or a minimum revision is enforced.
+Immediately after saving, route the client to an authority that can see its committed version. A
+replica returning the old file should not make a successful upload appear to vanish.
 
-## Future Backend Enhancements
+A hot shared workspace can become a namespace bottleneck. Isolate it on a shard, page large folders,
+and measure structural-mutation serialization. Partitioning one table inside one database does not
+by itself distribute writes across machines.
 
-1. **Content-defined Chunking**: Rabin fingerprinting for better delta sync
-2. **Client-side Encryption**: End-to-end encryption with user-held keys
-3. **Delta Sync**: rsync-style block-level differencing
-4. **Edge Caching**: CDN integration for popular shared files
-5. **Compression**: LZ4 compression for text-heavy files
-6. **Rate Limiting**: Per-user upload/download quotas
+Object storage should verify integrity and keep sufficient replicas or erasure-coded fragments under
+a documented durability policy. Backups need recovery drills that restore both namespace metadata
+and reachable bytes. Cross-region failover requires writer fencing; accepting writes in two isolated
+authorities can recreate the conflict problem at a larger scale.
+
+Important alerts include oldest undelivered change, unresolved operation outcomes, missing objects,
+quota drift, retention backlog, and repeated reclamation failures. Process liveness is separate from
+readiness to authorize or finalize a transfer.
+
+| Failure | Response |
+|---------|----------|
+| Object upload unavailable | Retry within budget; retain session; do not publish |
+| Finalization response lost | Query durable receipt for the same operation |
+| Notification relay down | Keep changes in outbox; monitor lag |
+| Quota reservation expires | Reauthorize and reserve again before publication |
+| Missing object on download | Fail explicitly and repair from a valid replica |
+| Collector crashes | Resume its durable deletion state safely |
+
+## 🧪 Validation and implementation comparison — 5 minutes
+
+The strongest initial check is a fault-injected upload: lose the response after commit and show that
+retry returns one file version, one quota conversion, and the same manifest. Then download and
+compare bytes. Page rendering alone cannot establish any of those properties.
+
+Next I would race two finalizations against the same base version, two quota reservations against
+the remaining capacity, and a structural move against another move. Exercise collector/finalization
+interleavings and revocation during download admission. These tests target invariants rather than
+the number of API handlers.
+
+The local implementation has one Express process, PostgreSQL's ten-table schema, MinIO chunks, and
+Valkey sessions/Pub/Sub. It has a real SQL transaction for completion and history updates, plus
+Cockatiel, Pino, and Prometheus helpers. There is no RabbitMQ worker or durable change feed.
+
+Its browser uses whole-file multipart uploads with an 8 MiB default limit. Upload sessions record
+only counts, and completion does not bind the original manifest, validate object existence, enforce
+expiry/status, or guard the base version. Repeating completion can create another version and
+increment usage again.
+
+Default PostgreSQL BIGINT strings also break quota comparisons. A metric increment rejects the
+string size after commit, preventing the successful response and notification path. Isolated source
+execution reproduced that outcome; no full-stack runtime test is claimed here.
+
+Folder grants do not authorize normal file operations, and shared-with-me is shadowed by the earlier
+token route. Compose enables anonymous bucket downloads. The server has WebSockets but the browser
+does not subscribe. Downloads buffer every chunk and return empty bytes for seeded metadata without
+chunk rows.
+
+Reference counts are not maintained as reachability, cleanup removes SQL rows before object
+deletion, and there is no scheduled retention collector. Folder caching and idempotency helpers are
+not wired into file routes. A detailed mapping appears in
+[architecture.md](./architecture.md#implementation-notes).
+
+I would therefore implement verified slots, durable completion receipts, and exact quota handling
+before claiming reliable sync or scaling the number of API instances. Those changes establish what
+“saved” means; the remaining delivery and recovery design can then depend on a trustworthy published
+version.

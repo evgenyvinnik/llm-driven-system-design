@@ -1,337 +1,209 @@
-# Design Apple Pay - Secure Mobile Payments
+# Apple Pay: wallet and payment simulation
 
-## Codebase Stats
+This learning project models a wallet with device registration, provisioned cards, payment history, and a merchant view. A React application talks to one Express API backed by PostgreSQL and Valkey. It is useful for studying token lifecycle, authentication, and the difference between retry protection and payment correctness.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 9,994 |
-| Source Files | 63 |
-| .ts | 5,338 |
-| .md | 2,133 |
-| .tsx | 1,843 |
-| .sql | 271 |
-| .json | 158 |
+All credentials and authorization decisions are simulated. There is no Apple Pay JS, PassKit, NFC radio, Secure Element, issuer connection, or movement of money. Use the supplied test cards only: the provisioning form sends the entered PAN and CVV to the local server as JSON.
 
-## Overview
+## What the implementation supports
 
-A simplified Apple Pay-like platform demonstrating secure tokenized payments, NFC transactions, and biometric authentication. This educational project focuses on building a mobile payment system with hardware security integration.
+| Area | Current behavior |
+|------|------------------|
+| Account | Register, sign in, restore a Redis session, and sign out |
+| Devices | Register and list devices; removal and lost-device reporting also have API endpoints |
+| Wallet | Display cards, device names, status, and default markers; forms/buttons exist for provisioning and lifecycle operations |
+| Payments | An HTTP simulation with card selection, merchant, amount, and a simulated biometric modal |
+| History | Date-grouped records; Load More refetches a larger prefix of history |
+| Merchant | Select a merchant and view recent transactions; a button requests a sample checkout session |
+| Backend instrumentation | Request logging, metrics, dependency health, and selected audit events |
 
-## Key Features
+**The browser currently omits the required `Idempotency-Key` header.** Consequently, adding/managing cards, starting biometric authentication, and creating merchant sessions return HTTP 400. A payment submitted with a verified biometric session also requires this header. The UI is useful for browsing seeded data, but the advertised purchase sequence does not currently run end to end through the checked-in client.
 
-### 1. Card Tokenization
-- Card provisioning with device-specific tokens
-- Simulated Token Service Provider (TSP) integration
-- Dynamic Device PAN (DPAN) generation
-- Token lifecycle management (suspend, reactivate, remove)
+The API's Redis middleware demonstrates response caching and concurrent-request exclusion; it does not guarantee durable duplicate prevention. The [architecture](./architecture.md#consistency-and-idempotency) traces the failure windows and distinguishes implemented code from unused helpers.
 
-### 2. Payment Methods
-- In-app payments with biometric authentication
-- Simulated NFC contactless payments
-- Web checkout simulation
-- Payment session management
+## Stack and ports
 
-### 3. Security
-- Simulated Secure Element storage
-- Biometric authentication (Face ID/Touch ID simulation)
-- Device-specific tokens
-- Payment cryptogram generation
-- Luhn algorithm validation
+| Component | Implementation | Default |
+|-----------|----------------|---------|
+| Frontend | React 19, TypeScript, Vite 5, TanStack Router, Zustand 4, Tailwind 3 | 5173 |
+| API | Express 4, TypeScript, `tsx`, Node built-in crypto | 3000 |
+| Database | PostgreSQL 16 | 5432; database/user `applepay` |
+| Redis protocol | Valkey 7 with append-only persistence in Compose | 6379 |
 
-### 4. Merchant Integration
-- Payment session creation
-- Transaction processing
-- Refund handling
-- Transaction history
+Use Node.js **20 or newer**. The Vite proxy targets port **3000** in both checked-in Vite configurations. There is no queue, object store, external payment service, or admin dashboard. `express-session` and `crypto-js` are declared dependencies but are not used for sessions or cryptograms.
 
-## Tech Stack
+## Option A: Docker Compose (recommended)
 
-- **Frontend:** TypeScript, Vite, React 19, Tanstack Router, Zustand, Tailwind CSS
-- **Backend:** Node.js, Express, TypeScript
-- **Database:** PostgreSQL
-- **Cache:** Redis
-- **Containerization:** Docker Compose
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js 18+
-- Docker and Docker Compose
-- npm or yarn
-
-### Option 1: Docker Setup (Recommended)
+Run these commands from `apple-pay/`. Start Docker Desktop first, and avoid competing projects on the same ports.
 
 ```bash
-# Clone and navigate to project
-cd apple-pay
-
-# Start infrastructure (PostgreSQL + Redis)
-docker-compose up -d
-
-# Install backend dependencies
-cd backend
-npm install
-
-# Start backend server
-npm run dev
-# Server runs on http://localhost:3000
-
-# In another terminal, install frontend dependencies
-cd frontend
-npm install
-
-# Start frontend dev server
-npm run dev
-# App runs on http://localhost:5173
+docker compose up -d
+docker compose ps
 ```
 
-### Option 2: Native Services
+PostgreSQL runs [init.sql](./backend/src/db/init.sql) automatically only when its data volume is new. Wait for the database to become healthy, then explicitly load the fixtures:
 
-If you prefer to run PostgreSQL and Redis natively:
-
-#### PostgreSQL Setup
 ```bash
-# macOS with Homebrew
-brew install postgresql@16
+docker compose exec -T postgres psql -U applepay -d applepay \
+  -v ON_ERROR_STOP=1 --single-transaction < backend/db-seed/seed.sql
+```
+
+The schema contains some unconditional index creation, so rerunning the complete initialization file against an initialized database is not a migration procedure. Neither `db:migrate` nor `db:seed` exists in the backend package scripts.
+
+Inspect or stop the infrastructure with:
+
+```bash
+docker compose logs postgres redis
+docker compose down
+```
+
+`docker compose down -v` additionally deletes the project's database and Redis volumes. Use it only when intentionally discarding local data; then initialize and seed again.
+
+## Option B: native installation (macOS, no Docker)
+
+From `apple-pay/`, install and start the two services:
+
+```bash
+brew install postgresql@16 valkey
 brew services start postgresql@16
-
-# Create database and user
-createdb applepay
-psql -d applepay -c "CREATE USER applepay WITH PASSWORD 'applepay_secret';"
-psql -d applepay -c "GRANT ALL PRIVILEGES ON DATABASE applepay TO applepay;"
-psql -d applepay -c "GRANT ALL ON SCHEMA public TO applepay;"
-
-# Initialize schema
-psql -U applepay -d applepay -f backend/src/db/init.sql
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
 ```
 
-#### Redis Setup
+Create the application role with `createuser -P`; enter `applepay_secret` when prompted. These commands assume a fresh role/database and a working local PostgreSQL administrator connection:
+
 ```bash
-# macOS with Homebrew
-brew install redis
-brew services start redis
+createuser -P applepay
+createdb -O applepay applepay
+PGPASSWORD=applepay_secret psql -h localhost -U applepay -d applepay \
+  -v ON_ERROR_STOP=1 --single-transaction -f backend/src/db/init.sql
+PGPASSWORD=applepay_secret psql -h localhost -U applepay -d applepay \
+  -v ON_ERROR_STOP=1 --single-transaction -f backend/db-seed/seed.sql
 ```
 
-#### Run the Application
+Verify the services:
+
 ```bash
-# Backend
+PGPASSWORD=applepay_secret psql -h localhost -U applepay -d applepay \
+  -c 'SELECT count(*) FROM merchants;'
+valkey-cli ping
+```
+
+A fresh seed has seven merchants. Stop native services with `brew services stop postgresql@16` and `brew services stop valkey` when finished.
+
+## Run the application
+
+In one terminal, starting from `apple-pay/`:
+
+```bash
 cd backend
 npm install
 npm run dev
+```
 
-# Frontend (in another terminal)
+In another terminal, starting from `apple-pay/`:
+
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-### Environment Variables (Optional)
+Open [the wallet](http://localhost:5173). Check the API directly at [readiness](http://localhost:3000/health/ready) or [metrics](http://localhost:3000/metrics); Vite proxies `/api`, not these diagnostic routes.
 
-Create `.env` files if using non-default settings:
+The backend connects to both dependencies before listening. Connectivity checks do not verify that the schema and fixtures exist.
 
-**backend/.env**
-```env
-PORT=3000
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_USER=applepay
-POSTGRES_PASSWORD=applepay_secret
-POSTGRES_DB=applepay
-REDIS_HOST=localhost
-REDIS_PORT=6379
-FRONTEND_URL=http://localhost:5173
-```
+### Configuration
 
-## Usage
+The code reads process environment variables. It does **not** load a `.env` file automatically. Export overrides in the backend terminal before starting it.
 
-### Demo Account
+| Variable | Default |
+|----------|---------|
+| `PORT` | `3000` |
+| `POSTGRES_HOST` | `localhost` |
+| `POSTGRES_PORT` | `5432` |
+| `POSTGRES_USER` | `applepay` |
+| `POSTGRES_PASSWORD` | `applepay_secret` |
+| `POSTGRES_DB` | `applepay` |
+| `REDIS_HOST` | `localhost` |
+| `REDIS_PORT` | `6379` |
+| `FRONTEND_URL` | `http://localhost:5173` |
+| `LOG_LEVEL` | `info` |
+| `NODE_ENV` | Unset; enables pretty development logging |
 
-Pre-configured demo account:
-- **Email:** demo@example.com
-- **Password:** password123
+The application does not read `DATABASE_URL`, `REDIS_URL`, or a session-cookie secret. Authentication uses an explicit `X-Session-Id` header with a one-hour sliding Redis expiry.
 
-### Adding Cards
+## Fixtures and walkthrough
 
-Test card numbers that work with Luhn validation:
-- **Visa:** 4111111111111111
-- **Mastercard:** 5555555555554444
-- **Amex:** 378282246310005
+The [SQL seed](./backend/db-seed/seed.sql) provides four users, seven devices, seven merchants, seven cards, ten transactions, six ATC rows, and six example audit events. It does not provision Redis token or Secure Element records, and the SQL ATC table is unused by payment processing.
 
-### Making Payments
+| Email | Password | Role |
+|-------|----------|------|
+| `alice@example.com` | `password123` | User |
+| `bob@example.com` | `password123` | User |
+| `charlie@example.com` | `password123` | User |
+| `admin@applepay.local` | `password123` | Admin value in the account record; no admin UI |
 
-1. Go to the **Pay** tab
-2. Select a card
-3. Choose a merchant
-4. Enter an amount
-5. Click "Pay with Apple Pay"
-6. Complete biometric simulation
+The shared seed hash was checked against `password123`. The login form's prefilled `demo@example.com` / `demo123` credentials are stale: replace them with a seeded account.
 
-### Test Scenarios
+1. Sign in as Alice and inspect her devices and cards.
+2. Open History to see approved and pending fixtures.
+3. Open Merchant and switch merchants to inspect their records.
+4. Register a new simulated device from Wallet if desired.
+5. Inspect the card/payment forms with the known header integration gap in mind.
 
-Special amounts for testing:
-- **$666.66** - Insufficient funds
-- **$999.99** - Card declined
-- **>$10,000** - Transaction limit exceeded
+Some fixtures have expired card dates. As of September 2026, Alice's June 2026 Mastercard and Bob's September 2025 Visa are expired. Alice's December 2027 Visa is a better starting card. Alice also has two default markers because the seed assigns defaults on two devices, while the service treats default selection as user-wide.
 
-## API Endpoints
+The seed skips conflicts on selected natural keys; it is not a general reset. Repeating it appends audit rows and rewrites sample suspension/ATC values. Existing users with matching emails but different IDs can cause later foreign-key inserts to fail.
 
-### Authentication
-```
-POST /api/auth/login       - Login
-POST /api/auth/register    - Register new user
-POST /api/auth/logout      - Logout
-GET  /api/auth/me          - Get current user
-POST /api/auth/devices     - Register device
-GET  /api/auth/devices     - List devices
-```
+### Simulated decisions
 
-### Cards
-```
-GET  /api/cards            - List user's cards
-POST /api/cards            - Provision new card
-GET  /api/cards/:id        - Get card details
-POST /api/cards/:id/suspend    - Suspend card
-POST /api/cards/:id/reactivate - Reactivate card
-POST /api/cards/:id/default    - Set as default
-DELETE /api/cards/:id          - Remove card
-```
+These rules apply to the authenticated `/api/payments/pay` service after its middleware requirements are met:
 
-### Payments
-```
-POST /api/payments/biometric/initiate  - Start biometric auth
-POST /api/payments/biometric/verify    - Verify biometric
-POST /api/payments/biometric/simulate  - Simulate success (demo)
-POST /api/payments/pay                 - Process payment
-GET  /api/payments/transactions        - List transactions
-GET  /api/payments/transactions/:id    - Get transaction
-```
+| Amount | Result |
+|--------|--------|
+| `666.66` | Insufficient funds |
+| `999.99` | Card declined |
+| Greater than `10000` | Limit exceeded |
+| Other positive values | Expiry check, then a 1% simulated network-error decline; otherwise approval |
 
-### Merchants
-```
-GET  /api/merchants                    - List merchants
-GET  /api/merchants/:id                - Get merchant
-POST /api/merchants/:id/sessions       - Create payment session
-POST /api/merchants/:id/process        - Process payment
-POST /api/merchants/:id/refund         - Refund transaction
-GET  /api/merchants/:id/transactions   - Merchant transactions
-```
+Expiry is incorrectly tested at the **start** of the expiry month. Amounts use JavaScript numbers and are stored in a two-decimal SQL column; the API does not enforce currency-specific precision.
 
-## Project Structure
+The separate merchant `/process` endpoint uses different rules: any amount **below** `10000` is approved, without looking up a card, checking a cryptogram, or recording a transaction. A merchant session is just a returned object with an expiry field; there is no persisted checkout or session consumption.
 
-```
-apple-pay/
-├── docker-compose.yml      # PostgreSQL + Redis
-├── backend/
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── src/
-│       ├── index.ts        # Express server
-│       ├── db/
-│       │   ├── index.ts    # PostgreSQL connection
-│       │   ├── redis.ts    # Redis connection
-│       │   └── init.sql    # Schema
-│       ├── middleware/
-│       │   └── auth.ts     # Auth middleware
-│       ├── routes/
-│       │   ├── auth.ts     # Auth routes
-│       │   ├── cards.ts    # Card routes
-│       │   ├── payments.ts # Payment routes
-│       │   └── merchants.ts # Merchant routes
-│       ├── services/
-│       │   ├── auth.ts         # Auth service
-│       │   ├── tokenization.ts # Card tokenization
-│       │   ├── payment.ts      # Payment processing
-│       │   └── biometric.ts    # Biometric auth
-│       ├── types/
-│       │   └── index.ts    # TypeScript types
-│       └── utils/
-│           └── crypto.ts   # Crypto utilities
-└── frontend/
-    ├── package.json
-    ├── vite.config.ts
-    ├── tailwind.config.js
-    └── src/
-        ├── main.tsx        # App entry
-        ├── index.css       # Global styles
-        ├── components/     # UI components
-        ├── routes/         # Page routes
-        ├── stores/         # Zustand stores
-        ├── services/       # API client
-        └── types/          # TypeScript types
-```
+## API map
 
-## Key Technical Challenges
+All paths below are implemented. Merchant endpoints currently have no merchant authentication or ownership checks.
 
-1. **Tokenization**: Secure token generation simulating network TSP integration
-2. **Security**: Simulated hardware-backed key storage in Secure Element
-3. **Biometric**: Face ID/Touch ID authentication flow simulation
-4. **Cryptograms**: Dynamic per-transaction cryptogram generation
-5. **Privacy**: Merchant never sees real card number (only token)
+| Group | Routes | Access / notable behavior |
+|-------|--------|---------------------------|
+| Account | `POST /api/auth/register`, `/login`; `GET /api/auth/me`; `POST /api/auth/logout` | Login returns a session ID; protected routes require `X-Session-Id` |
+| Devices | `GET/POST /api/auth/devices`; `DELETE /api/auth/devices/:deviceId`; `POST /api/auth/devices/:deviceId/lost` | User session; no idempotency requirement |
+| Cards | `GET/POST /api/cards`; `GET/DELETE /api/cards/:cardId`; `POST .../:cardId/suspend`, `/reactivate`, `/default` | User session; every mutation requires `Idempotency-Key` |
+| Biometrics | `POST /api/payments/biometric/initiate`, `/verify`, `/simulate`; `GET /api/payments/biometric/:sessionId` | Session; initiate/verify require an idempotency key |
+| Payment | `POST /api/payments/pay` | Session, verified `X-Biometric-Session`, then idempotency key |
+| User history | `GET /api/payments/transactions`, `/transactions/:transactionId` | User session; list supports limit, offset, card_id, status |
+| Merchant reads | `GET /api/merchants`, `/:merchantId`, `/:merchantId/transactions` | Public, including merchant transaction history |
+| Merchant mutations | `POST /api/merchants/:merchantId/sessions`, `/process`, `/refund` | Public; idempotency key required |
 
-## Architecture
+The exact header is **`Idempotency-Key`**, not `X-Idempotency-Key`; accepted length is 16–128 characters. A client must retain an operation's key across retries. Adding this header alone would not resolve the durability, authorization, and refund gaps described in the architecture.
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+## Checks and known limitations
 
-## Development Notes
-
-See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
-
-## Running Multiple Backend Instances
-
-For load balancing testing:
+Build/type-check commands exist in each frontend/backend directory:
 
 ```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
+npm run type-check
+npm run build
 ```
 
-## Troubleshooting
+The project root also has `npm run test:e2e`; those Playwright tests need the running stack and suitable fixture credentials. See the repository's [runtime tooling](../AGENTS.md#screenshot--smoke-test-automation). This documentation review traced source/configuration and checked the seed password; it did not start the application or claim an end-to-end test pass.
 
-### Docker Issues
-```bash
-# Reset containers and volumes
-docker-compose down -v
-docker-compose up -d
-```
+Other material limitations include reusable simulated biometric authorization, no replay validation, non-atomic payment/refund writes, public merchant operations, and no rate limiting. Removing a default card commits its deletion before a PostgreSQL-incompatible fallback-default query fails. Network breakers are instantiated and reported in health, but the actual payment path never invokes them.
 
-### Database Connection Issues
-```bash
-# Check if PostgreSQL is running
-docker-compose ps
-# or
-brew services list | grep postgresql
-```
+## Reading guide
 
-### Redis Connection Issues
-```bash
-# Check if Redis is responding
-redis-cli ping
-```
-
-## Implementation Status
-
-- [x] Initial architecture design
-- [x] Card tokenization
-- [x] In-app payments with biometric
-- [x] Transaction processing
-- [x] Merchant integration demo
-- [x] Frontend implementation
-- [ ] NFC payment simulation
-- [ ] Admin dashboard
-- [ ] Fraud detection simulation
-
-## References & Inspiration
-
-- [Apple Pay Security and Privacy Overview](https://support.apple.com/en-us/HT203027) - Apple's documentation on Apple Pay security architecture
-- [Apple Pay Developer Documentation](https://developer.apple.com/documentation/passkit/apple_pay) - PassKit integration for Apple Pay
-- [EMV Payment Tokenization Specification](https://www.emvco.com/emv-technologies/payment-tokenisation/) - Industry standard for payment token generation
-- [Secure Element Overview](https://developer.apple.com/documentation/security/certificate_key_and_trust_services) - Hardware-backed key storage on Apple devices
-- [NFC Payment Standards (ISO 14443)](https://www.iso.org/standard/70121.html) - Contactless payment communication protocols
-- [PCI DSS Compliance Guide](https://www.pcisecuritystandards.org/) - Payment Card Industry Data Security Standard
-- [Google Pay Architecture](https://developers.google.com/pay/api/web/overview) - Comparison mobile payment platform design
+- [Architecture](./architecture.md): proposed production design and source-backed local implementation.
+- [Frontend interview](./system-design-answer-frontend.md): payment UI state, privacy, and recoverable interactions.
+- [Backend interview](./system-design-answer-backend.md): provisioning, durable operation identity, and network uncertainty.
+- [Full-stack interview](./system-design-answer-fullstack.md): one checkout across client, merchant, wallet, and processor.
+- [Development history](./CLAUDE.md): earlier reasoning; some historical implementation claims are superseded by the source audit in the architecture.

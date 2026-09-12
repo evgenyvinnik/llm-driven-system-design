@@ -1,77 +1,166 @@
 # Ad Click Aggregator
 
-A real-time analytics system for aggregating ad clicks with fraud detection, designed to demonstrate high-volume event processing and real-time aggregation patterns.
+A local learning project that records advertising clicks, flags suspicious activity,
+and displays time-series analytics. It demonstrates the interaction between a
+transactional audit store, a columnar analytics database, and temporary Redis state.
 
-## Codebase Stats
+The implementation uses **PostgreSQL, ClickHouse, and Valkey/Redis together**.
+It is useful for exploring aggregation and failure scenarios, but its current
+multi-store write path does **not** guarantee exactly-once counts or billing accuracy.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 7,638 |
-| Source Files | 56 |
-| .ts | 3,403 |
-| .md | 2,177 |
-| .tsx | 1,270 |
-| .sql | 453 |
-| .json | 142 |
+## What you can use
 
-## Features
+- Submit a single click or a batch of up to 1,000 clicks through the API.
+- Inspect raw events, campaigns, ads, and system statistics from PostgreSQL.
+- Query ClickHouse minute, hour, and day rollups by time range and entity IDs.
+- Group analytics by country and device type.
+- Inspect rule-based fraud flags and generate synthetic clicks in the dashboard.
+- Observe JSON logs, Prometheus metrics, and dependency readiness checks.
 
-- **Click Event Ingestion**: High-throughput API for recording ad clicks
-- **Real-time Aggregation**: Per-minute, hourly, and daily click aggregations
-- **Deduplication**: Exactly-once semantics using Redis-based deduplication
-- **Fraud Detection**: Real-time fraud detection based on click velocity and patterns
-- **Analytics Dashboard**: Interactive dashboard with charts and metrics
-- **Query API**: Flexible aggregation queries with filtering and grouping
+There is no authentication, advertiser authorization, invoice generation, Kafka
+pipeline, or implemented archival/reconciliation worker. Fraud flags are teaching
+heuristics; flagged clicks remain included in total click counts.
 
-## Architecture Overview
+## Local architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Ad Servers    │────▶│  Click API      │────▶│     Redis       │
-│                 │     │  (Express)      │     │  (Dedup/Cache)  │
-└─────────────────┘     └────────┬────────┘     └─────────────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │   PostgreSQL    │
-                        │  (Aggregates)   │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │   Dashboard     │
-                        │   (React)       │
-                        └─────────────────┘
+┌──────────────────┐       ┌──────────────────────┐
+│ React dashboard  │──────▶│ Express API          │
+│ Vite :5173       │       │ :3000 by default     │
+└──────────────────┘       └────┬──────┬──────┬───┘
+                               │      │      │
+                    ┌──────────┘      │      └─────────┐
+                    ▼                 ▼                ▼
+             ┌────────────┐    ┌────────────┐    ┌────────────┐
+             │ PostgreSQL │    │ Valkey     │    │ ClickHouse │
+             │ raw + ads  │    │ dedup/state│    │ analytics  │
+             └────────────┘    └────────────┘    └────────────┘
 ```
 
-## Tech Stack
+The backend is one Express process with ingestion, analytics, and admin route groups.
+Ingestion writes PostgreSQL first, then Redis state, then submits a ClickHouse insert.
+Those steps do not form one transaction. Analytics reads ClickHouse; there is no
+fallback to the older PostgreSQL aggregate tables.
 
-- **Backend**: Node.js + Express + TypeScript
-- **Frontend**: React 19 + Vite + TanStack Router + Zustand + Tailwind CSS
-- **Database**: PostgreSQL (aggregations and raw events)
-- **Cache**: Redis (deduplication, rate limiting, real-time counters)
-- **Charts**: Recharts
+The frontend uses React 19, Vite, TanStack Router, Zustand, Tailwind CSS, and Recharts.
+The home dashboard refreshes every **30 seconds**. ClickHouse insertion also has its
+own buffering delay, so successful ingestion need not appear in a chart immediately.
 
 ## Prerequisites
 
-- Node.js 20+
-- Docker and Docker Compose
-- npm or yarn
+Use Node.js 20+ and npm. Run commands from `ad-click-aggregator` unless another
+working directory is specified. Choose one infrastructure option below.
 
-## Quick Start
-
-### 1. Start Infrastructure (Docker)
+## Option A: Docker Compose (recommended)
 
 ```bash
-# From the project root directory
-docker-compose up -d
+docker compose up -d
+docker compose ps
 ```
 
-This starts:
-- PostgreSQL on port 5432
-- Redis on port 6379
+[The Compose file](./docker-compose.yml) configures these services and named volumes:
 
-### 2. Start Backend
+| Service | Host ports | Development credentials | Database |
+|---------|------------|-------------------------|----------|
+| PostgreSQL 16 | 5432 | `adclick` / `adclick123` | `adclick_aggregator` |
+| Valkey 7 | 6379 | No password | Default logical database |
+| ClickHouse 23.8 | 8123 HTTP, 9000 native | `adclick` / `adclick123` | `adclick` |
+
+The PostgreSQL schema is mounted for first-volume initialization. After services
+are ready, explicitly apply both idempotent schemas to cover existing volumes too:
+
+```bash
+docker compose exec -T postgres psql -U adclick -d adclick_aggregator -v ON_ERROR_STOP=1 < backend/src/db/init.sql
+docker compose exec -T clickhouse clickhouse-client --user adclick --password adclick123 --multiquery < backend/db/clickhouse-init.sql
+```
+
+Create one consistent advertiser/campaign/ad hierarchy for the test page:
+
+```bash
+docker compose exec -T postgres psql -U adclick -d adclick_aggregator -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO advertisers (id, name) VALUES ('adv_001', 'Demo advertiser') ON CONFLICT DO NOTHING;
+INSERT INTO campaigns (id, advertiser_id, name) VALUES ('camp_001', 'adv_001', 'Demo campaign') ON CONFLICT DO NOTHING;
+INSERT INTO ads (id, campaign_id, name) VALUES ('ad_001', 'camp_001', 'Demo ad') ON CONFLICT DO NOTHING;
+SQL
+```
+
+Verify connectivity and tables:
+
+```bash
+docker compose exec postgres psql -U adclick -d adclick_aggregator -c 'SELECT count(*) FROM ads;'
+docker compose exec redis redis-cli ping
+docker compose exec clickhouse clickhouse-client --user adclick --password adclick123 --query 'SHOW TABLES FROM adclick'
+```
+
+Stop the services with `docker compose down`. To deliberately remove the project's
+stored development data as well, use `docker compose down -v`. An ordinary container
+restart preserves named-volume data; it is not a database backup strategy.
+
+## Option B: Native installation on macOS (no Docker)
+
+Install PostgreSQL, Valkey, and the
+[ClickHouse Homebrew cask](https://formulae.brew.sh/cask/clickhouse):
+
+```bash
+brew install postgresql@16 valkey
+brew install --cask clickhouse
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+brew services start postgresql@16
+brew services start valkey
+```
+
+For a fresh local PostgreSQL installation, create the project role and database.
+Use the installation's existing administrative account if it differs from your
+macOS account; skip creation when the role/database already exist.
+
+```bash
+psql postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE adclick LOGIN PASSWORD 'adclick123';"
+createdb -O adclick adclick_aggregator
+PGPASSWORD=adclick123 psql -h localhost -U adclick -d adclick_aggregator -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+```
+
+Start ClickHouse in a dedicated terminal and data directory. The native binary can
+run a persistent server from its current directory, as described in the
+[ClickHouse local setup guide](https://clickhouse.com/docs/get-started/setup/self-managed/quick-install).
+
+```bash
+mkdir -p /tmp/adclick-native-clickhouse
+cd /tmp/adclick-native-clickhouse
+clickhouse server
+```
+
+From a second terminal in the project directory, initialize the schema and create
+the application user using the fresh server's local default administrator:
+
+```bash
+clickhouse client --multiquery < backend/db/clickhouse-init.sql
+clickhouse client --multiquery <<'SQL'
+CREATE USER IF NOT EXISTS adclick IDENTIFIED WITH sha256_password BY 'adclick123';
+GRANT ALL ON adclick.* TO adclick;
+SQL
+```
+
+Homebrew installs its available ClickHouse version, which may differ from the
+Compose image. Use the Compose option when reproducing behavior specific to 23.8.
+For an existing native server, use its configured administrative credentials and
+ports instead of assuming an unauthenticated default account.
+
+Create demo metadata and verify the native services:
+
+```bash
+PGPASSWORD=adclick123 psql -h localhost -U adclick -d adclick_aggregator -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO advertisers (id, name) VALUES ('adv_001', 'Demo advertiser') ON CONFLICT DO NOTHING;
+INSERT INTO campaigns (id, advertiser_id, name) VALUES ('camp_001', 'adv_001', 'Demo campaign') ON CONFLICT DO NOTHING;
+INSERT INTO ads (id, campaign_id, name) VALUES ('ad_001', 'camp_001', 'Demo ad') ON CONFLICT DO NOTHING;
+SELECT count(*) FROM ads;
+SQL
+valkey-cli ping
+clickhouse client --user adclick --password adclick123 --query 'SHOW TABLES FROM adclick'
+```
+
+## Start the application
+
+In one terminal, from the project directory:
 
 ```bash
 cd backend
@@ -79,9 +168,11 @@ npm install
 npm run dev
 ```
 
-Backend runs on http://localhost:3000
+The backend defaults to [localhost:3000](http://localhost:3000). Startup requires
+ClickHouse connectivity and attempts to apply its schema. Schema-application errors
+are logged without necessarily blocking startup, so verify actual tables as above.
 
-### 3. Start Frontend
+In another terminal, from the project directory:
 
 ```bash
 cd frontend
@@ -89,232 +180,101 @@ npm install
 npm run dev
 ```
 
-Frontend runs on http://localhost:5173
+Open [localhost:5173](http://localhost:5173). The Vite `/api` proxy targets backend
+port 3000. The backend has no `db:migrate` script; use the SQL files shown above.
 
-## Alternative: Native Services
+### Environment configuration
 
-If you prefer to run PostgreSQL and Redis natively:
+These are the connection variables actually read by the backend:
 
-### macOS (Homebrew)
+| Variable | Default |
+|----------|---------|
+| `PORT` | `3000` |
+| `POSTGRES_HOST` / `POSTGRES_PORT` | `localhost` / `5432` |
+| `POSTGRES_DB` | `adclick_aggregator` |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | `adclick` / `adclick123` |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` |
+| `CLICKHOUSE_HOST` | `http://localhost:8123` |
+| `CLICKHOUSE_DATABASE` | `adclick` |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `adclick` / `adclick123` |
+| `NODE_ENV` | `development` |
 
-```bash
-# Install services
-brew install postgresql@16 redis
-
-# Start services
-brew services start postgresql@16
-brew services start redis
-
-# Create database
-createdb adclick_aggregator -U postgres
-
-# Run schema migration
-psql -d adclick_aggregator -U postgres -f backend/init.sql
-```
-
-### Linux (Ubuntu/Debian)
+The dev script does not automatically load a `.env` file. Export overrides in the
+terminal, or load a trusted local `.env` before starting the backend:
 
 ```bash
-# Install services
-sudo apt update
-sudo apt install postgresql-16 redis-server
-
-# Start services
-sudo systemctl start postgresql
-sudo systemctl start redis-server
-
-# Create database
-sudo -u postgres createdb adclick_aggregator
-
-# Run schema migration
-sudo -u postgres psql -d adclick_aggregator -f backend/init.sql
+set -a
+source .env
+set +a
+npm run dev
 ```
 
-### Environment Variables
+## Exercise the system
 
-Create a `.env` file in the backend directory:
-
-```env
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=adclick_aggregator
-POSTGRES_USER=adclick
-POSTGRES_PASSWORD=adclick123
-REDIS_HOST=localhost
-REDIS_PORT=6379
-PORT=3000
-```
-
-## API Endpoints
-
-### Click Ingestion
+Open [Test Clicks](http://localhost:5173/test), select the demo ad, and send a single
+click or batch. The dashboard pages are `/`, `/analytics`, `/campaigns`, `/clicks`,
+and `/test`. A single manual API call is also enough to populate the ingestion path:
 
 ```bash
-# Single click
-POST /api/v1/clicks
-{
-  "ad_id": "ad_001",
-  "campaign_id": "camp_001",
-  "advertiser_id": "adv_001",
-  "device_type": "mobile",
-  "country": "US"
-}
-
-# Batch clicks
-POST /api/v1/clicks/batch
-{
-  "clicks": [
-    { "ad_id": "ad_001", "campaign_id": "camp_001", "advertiser_id": "adv_001" },
-    { "ad_id": "ad_002", "campaign_id": "camp_001", "advertiser_id": "adv_001" }
-  ]
-}
+curl -X POST http://localhost:3000/api/v1/clicks \
+  -H 'Content-Type: application/json' \
+  -d '{"ad_id":"ad_001","campaign_id":"camp_001","advertiser_id":"adv_001","device_type":"mobile","country":"US"}'
+curl http://localhost:3000/health/ready
 ```
 
-### Analytics
+A new single click returns 202; a click-ID duplicate detected in Redis returns 200.
+The optional `Idempotency-Key` header caches a response for five minutes. Stable
+client-generated `click_id` values are useful when exploring retries, but the current
+implementation has the consistency gaps described below.
 
-```bash
-# Aggregate query
-GET /api/v1/analytics/aggregate?start_time=2024-01-01T00:00:00Z&end_time=2024-01-02T00:00:00Z&granularity=hour&group_by=country
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/v1/clicks/batch` | Sequential processing of up to 1,000 events, with per-event results |
+| `GET /api/v1/analytics/aggregate` | Required ISO `start_time`/`end_time`; optional entity filters, granularity, and grouping |
+| `GET /api/v1/analytics/realtime?minutes=60` | Recent ClickHouse minute rollups |
+| `GET /api/v1/analytics/realtime/global` | Redis counters, a separate data source |
+| `GET /api/v1/analytics/campaign/:id/summary` | ClickHouse campaign totals and breakdowns; requires time range |
+| `GET /api/v1/admin/stats` | PostgreSQL event and entity counts |
+| `GET /api/v1/admin/recent-clicks` | PostgreSQL raw events with limit and optional fraud filter |
+| `GET /api/v1/admin/campaigns`, `/ads`, `/advertisers` | List metadata under the admin prefix |
+| `GET /health`, `/health/live` | Process responses; do not verify all tables |
+| `GET /health/ready` | PostgreSQL, Redis, and ClickHouse connectivity |
+| `GET /metrics` | Prometheus exposition endpoint |
 
-# Real-time stats
-GET /api/v1/analytics/realtime?minutes=60
+For multiple API instances, run `npm run dev:server1`, `dev:server2`, and
+`dev:server3` from separate backend terminals. They use ports 3001–3003 and share
+stores; update the frontend proxy or provide a load balancer to route UI requests
+to them. No load balancer is included.
 
-# Campaign summary
-GET /api/v1/analytics/campaign/:campaignId/summary?start_time=...&end_time=...
-```
+## Known implementation limits
 
-### Admin
+- Dedup is an `EXISTS` check followed later by `SETEX`, so concurrent requests can
+  pass together. PostgreSQL's unique click ID prevents duplicate rows there, but
+  downstream counters and ClickHouse writes still run after an ignored insert.
+- PostgreSQL, Redis, and ClickHouse can diverge after partial failure. There is no
+  outbox, replay worker, reconciliation job, or PostgreSQL analytics fallback.
+- ClickHouse uses asynchronous inserts without waiting for flush. An API success
+  does not confirm that its analytics copy is durable or queryable.
+- Distinct-user values are not correctly composable in the current rollups. Do not
+  interpret their sums as an exact distinct count for an entire campaign or range.
+- Fraud rules flag IP/user velocity, timestamps at millisecond 0 or 500, and missing
+  device/OS/browser metadata. These can produce false positives and do not reject
+  requests. Batch clicks do not receive the single route's automatic IP hash.
+- The API is open, permits broad CORS, trusts forwarded client addresses, and has
+  ClickHouse queries built with interpolated filters. It needs security work before
+  exposure to untrusted traffic.
+- The historical [seed file](./backend/db-seed/seed.sql) writes only PostgreSQL and
+  contains an overlong `country='unknown'` value for a `VARCHAR(3)` column. Use the
+  minimal metadata setup and API-generated clicks above for this documented flow.
 
-```bash
-# System stats
-GET /api/v1/admin/stats
+For local source checks, use `npm run type-check` in the backend and `npm run build`
+in the frontend. The project-level Playwright suite requires the running stack;
+there is no backend unit-test script. This documentation review checked source and
+configuration, not runtime throughput or billing correctness.
 
-# Recent clicks
-GET /api/v1/admin/recent-clicks?limit=100&fraud_only=true
-
-# List campaigns
-GET /api/v1/admin/campaigns
-
-# List ads
-GET /api/v1/admin/ads
-```
-
-## Running Multiple Backend Instances
-
-For testing distributed scenarios:
-
-```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
-```
-
-## Testing
-
-Use the built-in Test Clicks page in the dashboard to generate test data:
-
-1. Open http://localhost:5173/test
-2. Select an ad
-3. Click "Send Single Click" or "Send 10 Clicks"
-4. View results on the Dashboard
-
-Or use curl:
-
-```bash
-# Send 100 test clicks
-for i in {1..100}; do
-  curl -X POST http://localhost:3000/api/v1/clicks \
-    -H "Content-Type: application/json" \
-    -d '{"ad_id":"ad_001","campaign_id":"camp_001","advertiser_id":"adv_001","device_type":"mobile","country":"US"}'
-done
-```
-
-## Fraud Detection
-
-The system detects fraud based on:
-
-- **IP Click Velocity**: More than 100 clicks/minute from same IP
-- **User Click Velocity**: More than 50 clicks/minute from same user
-- **Suspicious Patterns**: Missing device info, suspiciously regular timing
-
-Fraudulent clicks are flagged but still stored for analysis.
-
-## Dashboard Pages
-
-- **Dashboard** (`/`): Overview with key metrics and real-time chart
-- **Campaigns** (`/campaigns`): Campaign-level analytics with breakdowns
-- **Analytics** (`/analytics`): Custom aggregate queries
-- **Recent Clicks** (`/clicks`): Raw click event log
-- **Test Clicks** (`/test`): Generate test click data
-
-## Implementation Status
-
-- [x] Click event ingestion API
-- [x] Deduplication with Redis
-- [x] Real-time aggregation (minute/hour/day)
-- [x] Fraud detection (velocity-based)
-- [x] Query API for analytics
-- [x] React dashboard with charts
-- [x] Campaign analytics
-- [x] Test click generator
-- [ ] Kafka integration (optional)
-- [ ] Advanced ML fraud detection
-- [ ] User authentication
-
-## Architecture Decisions
-
-### Why PostgreSQL over ClickHouse?
-
-For this learning project, PostgreSQL provides:
-- Simpler setup and operation
-- Familiar SQL interface
-- Good enough performance for local development
-- Built-in UPSERT for aggregation updates
-
-In production at scale, ClickHouse would be preferred for:
-- Columnar storage with 10-20x compression
-- Faster analytical queries on billions of rows
-- Native time-series support
-
-### Why Redis for Deduplication?
-
-- Sub-millisecond lookups
-- Automatic TTL for click IDs
-- HyperLogLog for unique user estimation
-- Real-time counters for dashboards
-
-## Future Improvements
-
-1. Add Kafka for event streaming
-2. Implement ML-based fraud detection
-3. Add geo-velocity fraud detection
-4. Implement data archival to S3/Parquet
-5. Add A/B testing analytics
-6. Implement user authentication
-
-## License
-
-MIT
-
----
-
-See [architecture.md](./architecture.md) for detailed system design documentation.
-See [claude.md](./claude.md) for development insights and iteration history.
-
-## References & Inspiration
-
-- [The Unified Logging Infrastructure for Data Analytics at Twitter](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2021/logging-at-twitter-updated) - How Twitter handles high-volume event streaming and analytics
-- [Scaling Ads Analytics at LinkedIn](https://engineering.linkedin.com/blog/2020/ads-analytics-platform) - Real-time advertising analytics architecture
-- [Lambda Architecture](http://lambda-architecture.net/) - Nathan Marz's approach to batch and real-time processing
-- [Questioning the Lambda Architecture](https://www.oreilly.com/radar/questioning-the-lambda-architecture/) - Jay Kreps on Kappa architecture as an alternative
-- [How Facebook Counts](https://www.meta.com/blog/engineering/real-time-analytics-at-facebook/) - Real-time counting at Facebook scale
-- [ClickHouse for Real-Time Analytics](https://clickhouse.com/blog/real-time-analytics-with-clickhouse) - Columnar database for analytics workloads
-- [Exactly-Once Semantics in Apache Kafka](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/) - Achieving exactly-once in stream processing
-- [Redis HyperLogLog](https://redis.io/docs/data-types/hyperloglog/) - Probabilistic counting for unique users
-- [Real-Time Fraud Detection at Scale](https://netflixtechblog.com/real-time-fraud-detection-at-netflix-aec0af7ea9e1) - Netflix's approach to fraud detection patterns
-- [Druid: A Real-time Analytical Data Store](http://druid.io/druid.pdf) - Academic paper on real-time OLAP systems
+See [architecture.md](./architecture.md) for the proposed production design and a
+source-based account of the local implementation. Interview walkthroughs:
+[frontend](./system-design-answer-frontend.md),
+[backend](./system-design-answer-backend.md),
+[fullstack](./system-design-answer-fullstack.md).
+Development history is in [CLAUDE.md](./CLAUDE.md).

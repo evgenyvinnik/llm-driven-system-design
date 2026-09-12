@@ -1,351 +1,438 @@
-# Bitly (URL Shortener) - System Design Answer (Fullstack Focus)
+# 🔗 Design a URL shortener: fullstack interview
 
-*45-minute system design interview format - Fullstack Engineer Position*
+> “I would follow one link from the owner's form to a visitor's redirect and then back
+> to the owner's activity report. Each step needs a clear meaning of success: a
+> committed mapping, an allowed redirect, and a report with known coverage.”
 
-## Problem Statement
+This is a proposed design for a 45-minute interview, not a reconstruction of Bitly's
+private system. The repository implements a smaller teaching application. Its actual
+behavior and gaps are documented in
+[architecture.md](./architecture.md#implementation-notes).
 
-Design a complete URL shortening service that:
-- Provides seamless URL shortening with instant feedback
-- Delivers sub-50ms redirect latency at scale
-- Tracks and visualizes click analytics in real-time
-- Supports custom short codes with live availability checking
+| Time | Discussion |
+|------|------------|
+| 5 minutes | Product scope, scale, and promises |
+| 5 minutes | Architecture and browser/server contracts |
+| 9 minutes | Deep dive: one creation result across failures |
+| 7 minutes | Deep dive: expiration and deactivation end to end |
+| 8 minutes | Deep dive: from redirect observation to useful report |
+| 7 minutes | Account state, performance, and failure isolation |
+| 4 minutes | Verification and evolution |
 
-## Requirements Clarification
+## 🎯 Product scope, scale, and promises — 5 minutes
 
-### Functional Requirements
-1. **URL Shortening**: Generate 7-character short codes from long URLs
-2. **Fast Redirects**: Redirect with < 50ms latency using multi-tier caching
-3. **Custom Codes**: User-specified codes with live validation
-4. **Analytics**: Click tracking with referrer, device, and geographic data
-5. **Link Management**: Dashboard for viewing, searching, and deleting URLs
-6. **User Authentication**: Session-based auth with admin capabilities
+The owner pastes a destination URL, optionally chooses a custom alias and expiration,
+and receives a short link to share. The owner can later list and deactivate links or
+inspect their activity. An administrator can handle abuse and inspect system health.
 
-### Non-Functional Requirements
-1. **Performance**: < 50ms redirect latency, < 100ms UI interactions
-2. **Scalability**: Handle 100:1 read-to-write ratio
-3. **Consistency**: Strong for URL creation, eventual for analytics
-4. **Reliability**: 99.99% uptime for redirect service
+A recipient should open the short link without signing in or loading the dashboard.
+The backend sends the redirect, and the browser navigates to the destination. I would
+keep that path independently available when management or reporting is degraded.
 
-### Scale Estimates
-- 100M URLs/month (40 writes/second)
-- 10B redirects/month (4,000 reads/second)
-- 100:1 read-to-write ratio
+Anonymous creation can be supported, but ownership must be explicit. An anonymous link
+does not automatically become part of whichever account later signs in on the same
+browser. A future claim feature would need a separate proof-of-ownership contract.
 
-## High-Level Architecture
+I would leave target editing, custom domains, QR-code generation, billing, and
+estimated unique people outside the first version. Basic request counts are enough to
+expose the main analytics problem without pretending to solve attribution.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         React Frontend (Vite)                           │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐        │
-│  │ URLShortener│  │  URLList   │  │ Analytics  │  │   Admin    │        │
-│  └────────────┘  └────────────┘  └────────────┘  └────────────┘        │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Load Balancer (nginx)                               │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-            │ API Server  │ │ API Server  │ │ API Server  │
-            │   (Node)    │ │   (Node)    │ │   (Node)    │
-            └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-                   │               │               │
-            ┌──────┴───────────────┴───────────────┴──────┐
-            │                                             │
-    ┌───────▼───────┐  ┌───────────────┐  ┌──────────────▼─────┐
-    │    Valkey     │  │  PostgreSQL   │  │     RabbitMQ       │
-    │ (Cache/Session)│  │  (Primary DB) │  │ (Analytics Queue)  │
-    └───────────────┘  └───────────────┘  └────────────────────┘
-```
+Assume 50 million creations and five billion redirect requests per day. The averages
+are roughly 580 and 58,000 per second; representative peaks might reach 5,000 and
+200,000. I would call these planning assumptions, not claim that the local demo has
+been measured at that scale.
 
-## Deep Dive: Shared Type Definitions
+Redirects get a proposed regional p99 budget below 50 ms and 99.99% availability.
+Creation can take several hundred milliseconds. Reports can normally lag by a minute,
+provided the interface makes freshness and known collection gaps visible.
 
-### API Types
+Seven base62 characters offer about 3.52 trillion possible codes, around 193 years of
+allocations at the assumed creation rate. That arithmetic does not eliminate random
+collisions. It tells me that keeping retired codes reserved is practical relative to
+the risk of sending an old bookmark to a new owner.
 
-**URL Types:**
-- `ShortenedUrl`: Core URL entity with id, shortCode, shortUrl, longUrl, userId, isCustom, isActive, expiresAt, clickCount, timestamps
-- `ShortenRequest`: Input with long_url (required), custom_code and expires_at (optional)
-- `ShortenResponse`: Output with short_url, short_code, long_url, expires_at, created_at
+The product also needs an explicit deactivation promise. I would propose a five-second
+bound for normal propagation, with stronger enforcement tracking for emergency
+administrative takedowns. The UI cannot truthfully promise immediate global removal if
+the backend only updates one database row.
 
-**Analytics Types:**
-- `ClickEvent`: Individual click with urlId, shortCode, referrer, userAgent, deviceType, countryCode, clickedAt
-- `AnalyticsData`: Aggregated data with totalClicks, uniqueVisitors, clicksByDay, topReferrers, devices breakdown, countries
-- `DailyClicks`: Date and count pair for time-series charts
-- `DeviceBreakdown`: Object with mobile, desktop, tablet counts
+> “I would agree on those promises before choosing a cache TTL or writing a success
+> toast. They determine what both sides of the application have to implement.”
 
-**Auth Types:**
-- `User`: id, email, role (user/admin), createdAt
-- `AuthState`: user object and isAuthenticated boolean
-- `LoginRequest/RegisterRequest`: email and password
+## 🏗️ Architecture and browser/server contracts — 5 minutes
 
-**Admin Types:**
-- `SystemStats`: totalUrls, totalClicks, totalUsers, urlsToday, clicksToday, keyPoolAvailable, cacheHitRate
-
-**API Response Wrappers:**
-- `ApiResponse<T>`: Success with data property
-- `ApiError`: Failure with error object (message, code, details)
-- `ApiResult<T>`: Union type for type-safe error handling
-
-### Validation Schemas (shared between frontend and backend)
-
-URL validation uses Zod schema:
-- `long_url`: Required, valid URL format, max 2048 chars, HTTP/HTTPS only
-- `custom_code`: Optional, 4-20 chars, alphanumeric plus dash/underscore only
-- `expires_at`: Optional, ISO datetime, must be in future
-
-**Reserved Codes:** api, admin, auth, login, signup, register, logout, health, metrics, static, assets
-
-## Deep Dive: API Client Layer
-
-### Axios Configuration with Interceptors
-
-The API client class provides:
-- Base URL from environment variable (defaults to localhost:3000/api/v1)
-- Credentials mode enabled for cookie-based session auth
-- JSON content type headers
-
-**Request Interceptor:**
-- Adds Idempotency-Key header (UUID) for POST requests to prevent duplicate submissions
-
-**Response Interceptor:**
-- Catches 401 errors, clears auth store, redirects to login
-
-**Convenience Methods:** get, post, put, delete with type-safe generics
-
-### URL Service
-
-Service functions for URL operations:
-- `shorten(request)`: POST /shorten - Create short URL
-- `getUserUrls()`: GET /user/urls - List user's URLs
-- `getUrl(shortCode)`: GET /urls/:code - Get URL metadata
-- `checkAvailability(code)`: GET /urls/:code/available - Real-time availability check
-- `getAnalytics(shortCode, params)`: GET /urls/:code/stats - Analytics with date range
-- `deleteUrl(shortCode)`: DELETE /urls/:code - Deactivate URL
-
-## Deep Dive: Backend API Routes
-
-### URL Shortening Endpoint
-
-POST /api/v1/shorten flow:
+I would use one diagram to keep the discussion connected:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  1. Generate idempotency key (header or fingerprint)            │
-│  2. Check idempotency cache → return cached if duplicate        │
-│  3. Validate input with Zod schema                              │
-│  4. If custom_code provided:                                    │
-│     - Check reserved words → reject if reserved                 │
-│     - Check urls + key_pool tables → reject if taken            │
-│  5. Else: Get code from pre-generated key pool                  │
-│  6. INSERT into urls table                                      │
-│  7. Write-through to Redis cache                                │
-│  8. Store in idempotency cache                                  │
-│  9. Return short_url, short_code, long_url, expires_at          │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────┐       ┌────────────────┐
+│ Owner UI       │──────▶│ Management API │──────▶ Mapping store
+│ Form + reports │◀──────│ and reports    │
+└────────────────┘       └───────▲────────┘
+                                 │ summaries
+                         ┌────────────────┐
+                         │ Analytics      │
+                         │ workers/store  │
+                         └───────▲────────┘
+                                 │ retained observations
+┌────────────────┐       ┌────────────────┐
+│ Visitor        │──────▶│ Resolver/cache │──────▶ Destination
+└────────────────┘       └────────────────┘
 ```
 
-**Error Responses:**
-- 400 VALIDATION_ERROR: Invalid input with field-level details
-- 400 RESERVED_CODE: Custom code is reserved
-- 409 CODE_TAKEN: Custom code already exists
-- 500 INTERNAL_ERROR: Unexpected failure
+The management API validates and commits link ownership. The resolver reads an
+eligible cached mapping or asks the authoritative store. A retained event pipeline
+feeds report projections. These are logical responsibilities; the first deployment can
+share application code while keeping their capacity budgets distinct.
 
-### Redirect Endpoint
+PostgreSQL is a reasonable initial mapping authority because code uniqueness, account
+ownership, and creation receipts fit transactions. At the planned sustained scale,
+partitioning becomes necessary, but I would first establish the write and recovery
+contract on one authority.
 
-GET /:shortCode flow:
+The browser uses React for the form, history, and report view. Local component state
+owns draft inputs, open panels, and focus. Account-scoped server data uses a query
+layer keyed by resource and filters. Persistent operation references are separate from
+both.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  RedirectService.getLongUrl(shortCode)                          │
-├─────────────────────────────────────────────────────────────────┤
-│  Tier 1: Local LRU Cache (in-memory)                            │
-│  ├─ Hit (~0.1ms) → Return immediately                           │
-│  └─ Miss → Continue                                             │
-│                                                                  │
-│  Tier 2: Redis Cache                                            │
-│  ├─ Hit (~1ms) → Populate local cache, return                   │
-│  └─ Miss → Continue                                             │
-│                                                                  │
-│  Tier 3: PostgreSQL (with circuit breaker)                      │
-│  ├─ Found → Check expiration, populate caches, return           │
-│  └─ Not Found → Return null                                     │
-├─────────────────────────────────────────────────────────────────┤
-│  Response:                                                       │
-│  - 302 redirect to long URL (not 301 for accurate analytics)   │
-│  - 404 if not found                                             │
-│  - 410 if expired                                               │
-├─────────────────────────────────────────────────────────────────┤
-│  Async Analytics (non-blocking via setImmediate):               │
-│  → RabbitMQ queue → Analytics Worker → PostgreSQL click_events  │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Contract | Information the caller needs |
+|----------|-------------------------------|
+| Create link | Operation identity, submitted destination, optional alias/expiry, confirmed result |
+| Link record | Code, owner-visible target, status, expiration, revision, creation time |
+| Link list | Stable cursor, explicit lifecycle fields, account scope |
+| Deactivation | Accepted revision and enforcement status or documented propagation bound |
+| Analytics report | Code, time range, timezone, metric definition, buckets, freshness, gaps |
 
-**Metrics Recorded:**
-- redirectsTotal counter (status: success/not_found/expired/error, cached: hit/miss)
-- redirectLatency histogram
+The checked-in APIs use `/api/v1/urls` for management and
+`/api/v1/analytics/:shortCode` for reports. I would retain that resource shape while
+extending the response contracts. Operation recovery and propagation status are
+proposed additions, not existing endpoints disguised as documentation.
 
-### Analytics Endpoint
+A redirect remains a direct request to the short-link service. The dashboard bundle is
+not involved. Serving static assets through a CDN therefore does not automatically
+mean caching redirect responses through that CDN; those are separate decisions.
 
-GET /api/v1/urls/:code/stats flow:
+I would make error categories part of the contract: invalid input, alias conflict,
+unauthenticated access, unavailable dependency, and unknown operation outcome. A
+generic failure message cannot tell the browser whether it should correct input or
+recover a possibly committed link.
 
-1. Verify ownership (user_id match or admin role)
-2. Parse date range (defaults to last 30 days)
-3. Execute parallel queries:
-   - Total clicks and unique visitors (COUNT, COUNT DISTINCT ip_hash)
-   - Clicks by day (GROUP BY DATE)
-   - Top 10 referrers (GROUP BY referrer, ORDER BY count)
-   - Device breakdown (GROUP BY device_type)
-   - Top 20 countries (GROUP BY country_code)
-4. Transform and return aggregated response
+## 🔧 Deep dive: one creation result across failures — 9 minutes
 
-## Deep Dive: Full URL Creation Flow
+Start with a concrete failure: the server commits a new link, then the owner's network
+drops before the response arrives. The owner presses retry. A naïve second POST can
+allocate another code, leaving the same campaign split across two links and two
+reports.
 
-### Frontend to Backend Flow
+I would bind a submitted draft to a stable creation operation. The browser records the
+destination, alias, expiration, and operation identity as one snapshot. A transport
+retry reuses that snapshot. A deliberate edit is a new attempt rather than a mutation
+of a request that may already have committed.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  1. User Input (URLShortener Component)                         │
-│     - User types long URL                                       │
-│     - useUrlValidation hook validates format                    │
-│     - Optional: enters custom code (debounced availability)     │
-├─────────────────────────────────────────────────────────────────┤
-│  2. Form Submission (urlStore.shortenUrl)                       │
-│     - Sets isShortening = true                                  │
-│     - Generates idempotency key                                 │
-│     - Calls urlService.shorten()                                │
-├─────────────────────────────────────────────────────────────────┤
-│  3. API Request                                                  │
-│     POST /api/v1/shorten                                        │
-│     Headers: { Idempotency-Key: <uuid> }                        │
-│     Body: { long_url, custom_code?, expires_at? }               │
-├─────────────────────────────────────────────────────────────────┤
-│  4. Backend Processing                                          │
-│     a. Check idempotency cache                                  │
-│     b. Validate with Zod schema                                 │
-│     c. Get short code (custom or key pool)                      │
-│     d. Insert into PostgreSQL                                   │
-│     e. Write-through to Redis cache                             │
-│     f. Store in idempotency cache                               │
-├─────────────────────────────────────────────────────────────────┤
-│  5. Response Handling (urlStore continued)                      │
-│     - Adds new URL to urls array (optimistic)                   │
-│     - Sets isShortening = false                                 │
-│     - Returns ShortenedUrl                                      │
-├─────────────────────────────────────────────────────────────────┤
-│  6. UI Update (ShortenedResult Component)                       │
-│     - Animated entrance (framer-motion)                         │
-│     - Copy button with feedback                                 │
-│     - Screen reader announcement                                │
-└─────────────────────────────────────────────────────────────────┘
-```
+The API scopes the operation to the caller and binds it to a digest of the inputs. Its
+transaction claims the short code, writes the mapping, and records the resulting code
+in a durable receipt. A repeated request with the same identity returns that result;
+different contents under that identity are rejected.
 
-## Deep Dive: Authentication Flow
+An anonymous caller needs an unguessable, narrowly scoped way to recover its own
+attempt. I would not expose a public operation lookup that reveals other people's
+destinations. A signed-in caller's receipt is authorized through its account.
 
-### Session-Based Auth Implementation
+The frontend shows a pending card containing the submitted destination while the
+server works. It should not invent a short URL and label it ready. A custom alias can
+still lose a concurrent ownership race, and a generated candidate is not usable until
+the authoritative transaction commits.
 
-**Login Flow:**
-1. Find user by email (lowercase)
-2. Verify password with bcrypt
-3. Generate session token (32 random bytes, hex encoded)
-4. Store in PostgreSQL sessions table (backup)
-5. Store in Redis with 7-day TTL (primary)
-6. Set httpOnly cookie with token
+I would preserve the user's newer draft if they keep typing while submission is
+pending. One option is to temporarily lock the fields; another is to separate the
+draft from the submitted snapshot. What matters is that an old successful response
+cannot clear unrelated new input.
 
-**Session Cookie Configuration:**
-- Name: bitly_session
-- httpOnly: true (prevents XSS)
-- secure: production only
-- sameSite: lax (CSRF protection)
-- maxAge: 7 days
+After a timeout, the page shows that it is checking the result. It retries or queries
+the original operation rather than creating a fresh one. If the service is still
+unavailable, it preserves enough context for later recovery and avoids claiming that
+the server definitely failed.
 
-**Logout Flow:**
-1. Delete from Redis
-2. Delete from PostgreSQL
-3. Clear cookie
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ One durable operation and confirmed result | Predictable recovery after response loss | Receipt storage and a few additional UI states |
+| ❌ Retry with a new request identity | Simple POST handling | Duplicate links and fragmented analytics |
+| ❌ Treat a local pending code as published | Instant-looking completion | Users may share an unowned or nonexistent alias |
 
-**Session Verification (GET /me):**
-1. Check Redis for session (fast path)
-2. Fallback to PostgreSQL JOIN with users table
-3. If found in DB but not Redis, repopulate Redis
-4. Return user data or 401
+The browser's disabled submit button is still useful, but it solves accidental
+repeated interaction within one mounted component. It cannot coordinate another tab, a
+reload, or a response lost after commit. The durable server receipt is the correctness
+mechanism.
 
-### Frontend Auth Integration
+For generated codes, I would begin with a cryptographic random candidate and a bounded
+retry on the namespace's unique constraint. At this creation rate, that is a sensible
+baseline to benchmark. Randomness reduces predictable ordering, but public short codes
+still are not secrets.
 
-App component checks session on mount via authStore.checkSession(). Routes are organized:
-- Public: /login, /register
-- Protected (requires auth): /, /urls, /analytics/:code
-- Admin (requires admin role): /admin
+The local project explores a preallocated pool. That can amortize reservations and
+provide local headroom, but it adds refill and abandoned-allocation handling. A
+crashed holder's keys cannot safely be reclaimed just because a timer expired if that
+holder can later resume and publish them.
 
-ProtectedRoute component redirects to /login if not authenticated, preserving the intended destination in location state.
+Custom aliases use the same namespace as generated codes. Availability hints can
+improve the form but do not reserve a name. If two owners submit the same alias, the
+final unique claim chooses one winner and returns a conflict to the other.
 
-## Deep Dive: Custom Code Availability Check
+Both browser and server must agree on allowed characters and length. The database
+constraint is not a substitute for a useful form message. Conversely, a correct form
+is not enough when callers can use the API directly.
 
-### Debounced Frontend Check
+For expiration, the form can accept days, while the API returns the actual deadline.
+The confirmed result displays that deadline and the exact destination. I would avoid
+normalizing away URL query information that might be meaningful to the destination.
 
-CustomCodeInput component provides real-time feedback:
-1. Debounce input by 300ms
-2. Skip check if < 4 characters
-3. Check reserved words locally first (instant rejection)
-4. Call urlService.checkAvailability
-5. Display status indicator (spinner, checkmark, X)
+Copy is an independent success state. The user might have created a valid link but
+denied clipboard access. Keep the short URL selectable and report copy failure
+directly, instead of leaving the person to infer success from a button click.
 
-**Input Sanitization:** Strips non-alphanumeric characters (except dash/underscore) on change
+> “This design accepts a little more persistence and UI state because creation has a
+> durable effect. It makes the difficult failure case understandable without making
+> the normal form complicated.”
 
-### Backend Availability Endpoint
+## 🔧 Deep dive: expiration and deactivation end to end — 7 minutes
 
-GET /api/v1/urls/:code/available checks:
-1. Format validation (4-20 chars, alphanumeric/-/_)
-2. Reserved words list
-3. URLs table (existing short codes)
-4. Key pool table (pre-generated codes)
+Now the owner deactivates a link that has become popular. The database update
+succeeds, the dashboard removes the row, and the user assumes sharing has stopped. But
+a resolver still has yesterday's target string in cache and keeps redirecting
+visitors.
 
-Returns `{ available: boolean, reason?: string }`
+I would fix the product contract at both ends. In the UI, deactivation is a lifecycle
+transition with pending and accepted states, not the disappearance of history. In the
+resolver, the cached record includes status, expiration, revision, and a fixed
+freshness deadline.
 
-## Deep Dive: Error Handling
+Expiration is checked on every hit. The cached record cannot extend the link's own
+lifetime. A link created with a deadline five minutes away must not remain usable for
+a day just because the mapping cache has a one-day default TTL.
 
-### Unified Error Handling
+For deactivation, the management transaction commits a newer revision and an outbox
+record. Propagation workers distribute the change. Normal serving decisions are
+bounded by the proposed five-second freshness policy, even if the notification is
+delayed.
 
-**AppError Class:** Custom error with message, code, statusCode, and optional details object
+There is a subtle race: a lookup starts before deactivation, pauses, then writes its
+old result into the cache after the invalidation. Deleting a key once does not prevent
+that refill. Cache writes need revision checks against newer state or tombstones.
 
-**Error Handler Middleware:**
-1. Log with structured logging (path, method, error, stack)
-2. If AppError: Return structured response with code
-3. If ZodError: Return VALIDATION_ERROR with flattened field errors
-4. Else: Return generic INTERNAL_ERROR (hide implementation details)
+An old authoritative read also carries its original freshness deadline. It must not
+receive a new lifetime merely because its response arrived late. This bounds stale
+decisions when invalidation has not yet been observed, with a margin for clock
+uncertainty.
 
-### Frontend Error Display
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Cache complete lifecycle records with a bound | Fast redirects with a clear stale-data policy | Revision propagation and careful refill handling |
+| ❌ Cache a destination string for a fixed day | Minimal lookup logic | Expiration and deactivation can be bypassed |
+| ❌ Always query the database | Simpler immediate status decisions | Popular links and database outages dominate navigation |
 
-**ErrorBoundary Component:**
-- Wraps application with ReactErrorBoundary
-- Renders centered error message with retry button
-- Calls resetErrorBoundary to attempt recovery
+The mutation response tells the UI what has actually happened. It can state that
+deactivation was accepted and is propagating, then confirm enforcement where the
+product exposes that distinction. An emergency takedown should show regions that have
+not yet enforced it rather than a misleading universal success.
 
-**useApiError Hook:**
-- Provides handleError callback
-- Extracts message from Axios errors or standard Error
-- Shows toast notification via useToastStore
+If a serving region is partitioned, stronger takedown guarantees require it to stop
+serving once its control state is too old or be withdrawn from traffic. Continuing
+indefinitely with stale data is a different availability choice, not immediate
+revocation.
 
-## Trade-offs Summary
+I would use a 302 with an explicit HTTP policy for mutable links. The proposal sends
+`no-store` to compliant browser and shared caches while using an internal cache whose
+lifecycle we control. The HTTP directive is defined in [RFC
+9111](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.5).
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Shared Zod schemas | Single source of truth, type-safe | Build complexity |
-| Session-based auth | Simple, revocable | Requires Redis |
-| Debounced availability check | Reduces API calls | Slight UX delay |
-| 302 redirects | Accurate analytics | More server load |
-| Optimistic UI updates | Instant feedback | Rollback complexity |
-| Write-through cache | Consistent reads | Extra write latency |
+Back in the dashboard, an older list response must not restore the active badge after
+deactivation. Query invalidation and resource revisions prevent that. Selection is
+keyed by code, so a reorder does not silently switch an open report to another link.
 
-## Future Fullstack Enhancements
+I would retain deactivated rows in history with a clear status and filter. Reusing the
+code or hiding all evidence of the old link would create a different product behavior.
+The current demo's soft-delete action and status-free owner response illustrate why
+naming and data shape need to agree.
 
-1. **Real-time Analytics**: WebSocket for live click updates
-2. **Bulk Operations**: Create/delete multiple URLs via CSV
-3. **Link Previews**: Server-side OG image generation
-4. **A/B Testing**: Split traffic between multiple destinations
-5. **API Keys**: Third-party integration with rate limits
-6. **Webhooks**: Notify on click thresholds
-7. **Multi-tenancy**: Organization accounts with team members
-8. **Mobile App**: React Native with shared business logic
+## 🔧 Deep dive: from redirect observation to useful report — 8 minutes
+
+A visitor opens the short URL. The resolver decides it is eligible and sends the
+redirect. What can we now promise to show the owner? At most, we have observed a
+request; we have not proved that the visitor was human or that the destination loaded.
+
+I would name the primary metric accordingly. Preview bots, repeated requests, and
+client retries need a stated inclusion policy. “Unique people” would require a
+separate approach, additional privacy decisions, and an explanation of uncertainty.
+
+Assign an event ID at the observation boundary and retain it before claiming durable
+admission. Retrying publication keeps the same ID. Scheduling work after sending the
+response is fast, but a process crash before retention creates a permanent collection
+gap.
+
+For this product, I would favor redirect availability during an admission outage and
+disclose reduced analytics coverage. If every successful redirect had to retain an
+event, the resolver would need to wait for durable acknowledgement and fail or use
+another durable path when that acknowledgement was unavailable.
+
+A broker acknowledgement and a worker acknowledgement concern different stages.
+Neither makes a separate database counter update duplicate-safe. [RabbitMQ's
+acknowledgement guide](https://www.rabbitmq.com/docs/confirms) distinguishes
+publication confirmation from consumer completion.
+
+A worker can commit an event's effect and crash before acknowledging it. The event
+will be delivered again. I would make duplicate detection and aggregate contribution
+atomic, so replay of the same retained identity does not increase the report twice.
+
+This is not the same as suppressing two genuine HTTP requests from one browser. The
+first problem is repeated processing of one observation; the second is how the product
+defines its audience metric. Keeping those separate prevents an attractive but false
+exactly-once claim.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Delayed aggregates with coverage metadata | Scalable reports with understandable freshness | Event identity, replay rules, and visible lag |
+| ❌ Update one mapping counter for every click | Simple first implementation | Hot-row contention and partial-write inconsistencies |
+| ❌ Stream every click into a client counter | Appears live | Reconnect gaps, duplicate handling, and browser overload |
+
+At the assumed five billion requests per day, 200 bytes per raw event means about 1 TB
+daily before indexes and replicas. I would use time-partitioned analytics storage,
+bounded detailed retention, and compact projections for common report ranges.
+
+A viral link should not force all workers to serialize updates to its mapping row.
+Separate bucketed analytics from link ownership. A report API reads those projections
+and returns the processed-through watermark, metric definition, requested range, and
+any known admission gaps.
+
+The browser stores that response under its full query identity: account, code, range,
+and timezone. If the user switches links while a request is pending, a late response
+cannot replace the new selection's report.
+
+I would keep a last successful report visible during refresh and label it
+appropriately. A failed first load is an error state, not zero activity. An empty
+bucket becomes zero only when it is known to be covered; an unprocessed interval
+remains incomplete.
+
+Timezone belongs in the aggregate query. Formatting an already grouped UTC day in
+another zone does not produce that zone's daily total. Hourly buckets likewise need
+full timestamps rather than just an hour number that repeats on another date.
+
+Polling aggregated reports while visible is a good initial choice. Stop or slow
+polling when hidden, back off on errors, and refresh on return. If live monitoring
+becomes necessary, push aggregate versions or invalidations and recover from snapshots
+after reconnect.
+
+For visualization, I would start with daily bars and small referrer/device tables.
+They are easier to interpret and make accessible than an animated event stream. The
+server should not send raw IP-bearing event records merely to draw a chart.
+
+> “The useful report is one whose number, time range, and completeness belong
+> together. A faster animation cannot repair missing or duplicate observations
+> upstream.”
+
+## ⚙️ Account state, performance, and failure isolation — 7 minutes
+
+There are two authorities for private UI state: the server decides access, and the
+browser decides whether a response still belongs to the visible context. Both are
+needed.
+
+Suppose Alice's report request is in flight when she logs out and Bob signs in. The
+old response was authorized for Alice, but it must not render in Bob's session. I
+would scope queries to the account, increment a session generation on account changes,
+and reject responses from old generations.
+
+Abort signals reduce unnecessary work, but a response may already be complete. The
+context check remains necessary. Logout also clears account-derived caches and
+selections rather than only hiding the user's name in the header.
+
+A persisted user object can help the initial shell render, but the app should
+reconcile it with the server before exposing privileged actions. An expired session
+produces a clear login state while preserving any safe recoverable draft or operation
+reference.
+
+Server analytics routes check link ownership independently of the UI. A short code is
+public by design, so knowing it cannot authorize a raw activity query. Administrative
+role changes should take effect on subsequent requests, with suitable protection
+against accidental loss of all administrative access.
+
+For sessions, cache authorization only within the authoritative expiry. Logout and
+revocation need to account for old cache fills in flight. These are the same general
+stale-response concerns we saw with links, applied to a different resource and
+stricter access policy.
+
+The dashboard's rendering load is not the service's redirect rate. Most owners view a
+small page of links and one report. I would begin with stable server pagination,
+bounded aggregates, and ordinary rows; virtualize only if a measured continuous-list
+use case warrants it.
+
+Route-load heavy admin or chart code. Keep the basic shortening form responsive on a
+modest device. Long URLs need readable wrapping or truncation with a way to inspect
+the full destination. Loading one report should not disable an unrelated form through
+a global busy flag.
+
+Accessibility work follows the user journey: associate validation errors with fields,
+announce creation and copy results, preserve keyboard focus, and make a detail panel
+escapable with focus restored to its opener. The report should have a text or table
+representation alongside color and bars.
+
+On the backend, separate budgets for creation, redirect misses, and analytics. A Redis
+outage should not release unrestricted fallback traffic onto PostgreSQL. Coalesce
+popular misses, cap concurrency, and return controlled errors when the fallback budget
+is exhausted.
+
+A breaker helps reduce repeated failing dependency calls, but a timeout does not
+necessarily cancel a database query. The caller can see failure after the transaction
+later commits. The creation receipt remains necessary for recovery.
+
+The event pipeline needs progress monitoring, not merely connection monitoring. After
+a broker reconnect, restore the consumer and verify committed progress. Quarantine
+malformed events after bounded retries; immediate requeue loops consume capacity
+without repairing bad data.
+
+At larger scale, partition mappings by code and maintain an owner-list index. Keep
+custom and generated claims under the same namespace authority. Multi-region reads
+need a deliberate new-link visibility policy, otherwise the owner can receive success
+and immediately get a regional miss.
+
+Operational measurements should connect to the experience: creation outcomes recovered
+after timeout, redirect latency by cache outcome, deactivation enforcement age,
+admitted or dropped observations, and report lag. Use bounded metric labels rather
+than individual URLs or short codes.
+
+I would add destination abuse handling and shared creation/report quotas before
+exposing the system broadly. Syntactic URL validation does not establish a safe
+destination. Logs should avoid raw tokens and sensitive query parameters, and raw
+analytics should have a defined retention policy.
+
+## 🧪 Verification and evolution — 4 minutes
+
+I would verify the complete creation journey under response loss: commit the link,
+interrupt the response, recover the attempt, and confirm that the user receives the
+same code. Concurrent custom-alias claims should produce one winner with a useful
+conflict for the other caller.
+
+For lifecycle correctness, expire a warm link and verify that it stops resolving.
+Pause an old lookup, deactivate the link, then release the lookup and check that it
+cannot resurrect the old state. Confirm that the dashboard reports acceptance and
+enforcement according to the agreed contract.
+
+For analytics, crash a worker after commit but before acknowledgement and replay the
+event. The report should gain one contribution. Interrupt collection and ensure the UI
+shows incomplete coverage rather than silently filling missing buckets with zero.
+
+For account isolation, release Alice's delayed response after Bob signs in. For report
+identity, rapidly change code, range, and timezone. No old result should replace the
+current context, even if request cancellation arrives too late.
+
+Load tests should include a single viral link, random invalid-code scans, and backlog
+recovery alongside ordinary traffic. These stress different shared resources.
+Page-render smoke tests alone cannot establish those properties.
+
+The local implementation currently has direct fetch state, a target-only cache,
+disconnected creation idempotency middleware, and separate click/counter writes. Its
+admin changes do not invalidate cached links, and broker reconnect does not restore
+consumption. The proposed design addresses those gaps; this documentation does not
+claim they are already fixed.
+
+> “I would evolve the system by first making creation recoverable, then enforcing
+> lifecycle changes through the cache, and then making report effects repeatable and
+> coverage visible. Those changes improve a real owner and visitor journey before
+> adding more features.”

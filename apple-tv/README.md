@@ -1,266 +1,179 @@
-# Design Apple TV+ - Video Streaming Service
+# Apple TV+ learning project
 
-## Codebase Stats
+A streaming-service **catalog and player-interface simulation**, built with React and Express. Explore movie and series discovery, household profiles, watchlists, progress records, recommendations, and an admin dashboard. The player advances a clock; it does not play video or audio. Its image component and quality menu also lack the metadata expected from the playback response. This project is not affiliated with Apple.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 12,160 |
-| Source Files | 84 |
-| .ts | 5,473 |
-| .tsx | 4,059 |
-| .md | 1,840 |
-| .sql | 364 |
-| .json | 161 |
+The [architecture](./architecture.md) separates a proposed production streaming platform from the code here. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) answers explain that proposed design as 45-minute interviews. [CLAUDE.md](./CLAUDE.md) records development history; some historical completion claims exceed the current implementation.
 
-## Overview
+## What you can explore
 
-A premium video streaming service delivering high-quality original content with adaptive bitrate streaming, multi-device sync, and offline downloads. This educational project focuses on building a video-on-demand platform with focus on content delivery, recommendation, and cross-device experience.
+| Area | Implemented behavior | Boundary |
+|------|----------------------|----------|
+| Discovery | Featured titles, movies, shows, details and episode lists | Header search has no handler; API search uses PostgreSQL ILIKE |
+| Accounts | Registration, cookie sessions, profile creation/selection/deletion | Kids filtering is partial; profile changes do not reliably clear old client data |
+| My List | Add/remove from cards, details and watchlist page | Hero My List button is inert; card checks make one request per card |
+| Player | Timer, seek, play/pause, volume/quality state and fullscreen | No media element, HLS engine, ABR, actual audio or subtitle selection |
+| Progress | Profile/title SQL upserts, resume lookup, Continue Watching and history | Timer resets interfere with periodic saves; batch route is shadowed |
+| Recommendations | Genres from completed history, popularity and release-date rules | No collaborative filtering or ML; ratings are stored but not used in ranking |
+| Subscription | Demo monthly/yearly expiry updates and playback-route checks | No billing provider, actual renewals or persisted cancellation |
+| Administration | Statistics, content/user tables and featured toggle | Create/update/delete metadata are API-only; no uploader or encoding worker |
+| Streaming scaffolding | Generated playlist text and fixed subtitle sample | Video/audio segments are empty; MinIO contains no seeded media |
 
-## Key Features
+DRM, offline downloads, device/concurrent-stream enforcement, transcoding, CDN delivery, and native TV/mobile applications are unimplemented. Database tables and plan feature labels are not evidence that those features work.
 
-### 1. Video Streaming
-- Adaptive bitrate streaming (HLS)
-- Multiple quality tiers (4K HDR, 1080p, 720p, 480p)
-- HLS manifest generation
-- Playback continuity
+## Stack and prerequisites
 
-### 2. Content Delivery
-- MinIO for video/thumbnail storage
-- HLS segment delivery
-- Content catalog management
+Node.js **20+**, npm, PostgreSQL 16, Valkey/Redis, and MinIO. The frontend uses React 19, Vite 6, TypeScript, TanStack Router, Zustand 5, Tailwind CSS and Lucide. The backend uses Express, pg, express-session/connect-redis, bcryptjs, Opossum, Pino and prom-client. There is no RabbitMQ, FFmpeg worker or HLS.js dependency.
 
-### 3. Personalization
-- Watch history tracking
-- Continue watching
-- Personalized recommendations by genre
-- Watchlist (My List)
+Run the infrastructure using **one** option below. Both use the same local defaults. Keep the standard ports free of other repository projects.
 
-### 4. Multi-Profile
-- Multiple profiles per account
-- Kids profile support
-- Profile-specific watch history
-- Family sharing
+## Option A: Docker Compose (recommended)
 
-### 5. Subscription Management
-- Free, Monthly, and Yearly tiers
-- Subscription status tracking
-- Content access control
-
-## Tech Stack
-
-- **Frontend:** TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
-- **Backend:** Node.js + Express
-- **Database:** PostgreSQL
-- **Cache:** Redis
-- **Object Storage:** MinIO
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js 18+
-- Docker and Docker Compose
-- npm or yarn
-
-### 1. Start Infrastructure
+From the repository root:
 
 ```bash
 cd apple-tv
-docker-compose up -d
+docker compose up -d
+docker compose ps
 ```
 
-This starts:
-- PostgreSQL on port 5432
-- Redis on port 6379
-- MinIO on ports 9000 (API) and 9001 (Console)
+Compose starts PostgreSQL on 5432, Valkey on 6379, MinIO on 9000 and its console on 9001. PostgreSQL loads [init.sql](./backend/src/db/init.sql) only when its data volume is first created. The schema uses ordinary CREATE TABLE/INDEX statements and is not a repeatable migration.
 
-### 2. Install Backend Dependencies
+```bash
+docker compose exec postgres pg_isready -U appletv -d appletv
+docker compose exec redis redis-cli ping
+curl -f http://localhost:9000/minio/health/live
+```
+
+The MinIO initializer creates private `videos` and publicly downloadable `thumbnails` buckets. It does not upload objects. Check its output with `docker compose logs minio-init`; the shell exits successfully even if an earlier command fails.
+
+```bash
+docker compose down
+# Only for a deliberate fresh start: deletes this project's database/cache/media volumes.
+docker compose down -v
+```
+
+## Option B: Native installation (no Docker)
+
+Install and start PostgreSQL and Valkey with Homebrew:
+
+```bash
+brew install postgresql@16 valkey minio minio-mc
+brew services start postgresql@16
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+psql postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE appletv LOGIN PASSWORD 'appletv_secret';"
+createdb -O appletv appletv
+```
+
+These user/database creation commands are for a fresh installation; reuse matching existing resources instead of rerunning CREATE. The [MinIO server](https://formulae.brew.sh/formula/minio) and [client](https://formulae.brew.sh/formula/minio-mc) Homebrew formulas are deprecated but currently available.
+
+Start MinIO in a separate terminal:
+
+```bash
+mkdir -p "$HOME/.local/share/appletv-minio"
+export MINIO_ROOT_USER=minioadmin
+export MINIO_ROOT_PASSWORD=minioadmin
+minio server "$HOME/.local/share/appletv-minio" --console-address ':9001'
+```
+
+From `apple-tv/`, initialize the schema once and create buckets:
+
+```bash
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+PGPASSWORD=appletv_secret psql -h localhost -U appletv -d appletv -v ON_ERROR_STOP=1 -1 -f backend/src/db/init.sql
+mc alias set appletv-local http://localhost:9000 minioadmin minioadmin
+mc mb --ignore-existing appletv-local/videos
+mc mb --ignore-existing appletv-local/thumbnails
+mc anonymous set download appletv-local/thumbnails
+pg_isready -h localhost -U appletv -d appletv
+valkey-cli ping
+mc ls appletv-local
+```
+
+## Configuration
+
+[Backend configuration](./backend/src/config/index.ts) reads process environment variables directly. There is no dotenv loader: export overrides in the terminal that starts the backend or seed. No overrides are needed for the local defaults.
+
+| Variable | Default |
+|----------|---------|
+| DB_HOST / DB_PORT | localhost / 5432 |
+| DB_USER / DB_PASSWORD / DB_NAME | appletv / appletv_secret / appletv |
+| REDIS_URL | redis://localhost:6379 |
+| MINIO_ENDPOINT / MINIO_PORT / MINIO_USE_SSL | localhost / 9000 / false |
+| MINIO_ACCESS_KEY / MINIO_SECRET_KEY | minioadmin / minioadmin |
+| SESSION_SECRET | appletv-session-secret-change-in-production |
+| PORT | 3000; development scripts explicitly set 3001–3003 |
+| NODE_ENV / LOG_LEVEL | Production mode enables secure cookies; log level defaults to info |
+
+`DATABASE_URL` is not read. `MINIO_ENDPOINT` is a hostname, without scheme or port. Session cookie `appletv.sid` has a 24-hour maximum age, HttpOnly and SameSite=Lax. All API instances must share Redis and SESSION_SECRET. Production HTTPS/proxy configuration needs additional work; use normal development mode for the local HTTP walkthrough.
+
+## Seed and start the application
+
+From `apple-tv/`, after the schema exists:
 
 ```bash
 cd backend
 npm install
-```
-
-### 3. Seed the Database
-
-```bash
 npm run seed
-```
-
-This creates sample users, profiles, series, episodes, and movies.
-
-**Demo Credentials:**
-- User: `user@appletv.local` / `password123`
-- Admin: `admin@appletv.local` / `password123`
-
-### 4. Start the Backend
-
-```bash
 npm run dev
 ```
 
-Backend runs on http://localhost:3001
+The [TypeScript seed](./backend/src/db/seed.ts) is recommended for the interactive walkthrough. On a fresh database it creates two accounts, three profiles, three series, twelve episodes and four movies, with variant/audio/subtitle metadata. It creates no media objects or segment rows and no initial progress/history/watchlist. Images use external Picsum URLs; seeded avatar paths have no matching image assets.
 
-### 5. Install Frontend Dependencies
+| Account | Password | Seeded access |
+|---------|----------|---------------|
+| user@appletv.local | user123 | Monthly, expires 30 days after initial seed; adult and Kids profiles |
+| admin@appletv.local | admin123 | Yearly, expires 365 days after initial seed; admin profile |
+
+Seed once: existing emails keep their passwords and expiry, while random IDs cause additional profiles and duplicate titles on subsequent runs. Inserts are not one transaction, so a failure can leave partial data.
+
+In another terminal, from the repository root:
 
 ```bash
-cd ../frontend
+cd apple-tv/frontend
 npm install
-```
-
-### 6. Start the Frontend
-
-```bash
 npm run dev
 ```
 
-Frontend runs on http://localhost:5173
+Open [the app](http://localhost:5173), sign in, and explicitly select a profile. Open a movie or select an episode from a series detail page to explore the timer player. The series-level Play button passes the zero-duration series itself; it does not choose an episode. Visit [Account](http://localhost:5173/account) to simulate a plan change, or [Admin](http://localhost:5173/admin) with the admin account.
 
-## Running Multiple Backend Instances
+The API development port is [3001](http://localhost:3001/health). Vite proxies `/api` to that port. `npm start` defaults to 3000, so use `PORT=3001 npm start` if you want it behind the existing Vite proxy. Health and metrics paths must be accessed on the API port.
 
-For testing load balancing and distributed scenarios:
+### Alternative SQL screenshot fixture
+
+[backend/db-seed/seed.sql](./backend/db-seed/seed.sql) is a different dataset. Use it **instead of** the TypeScript seed on a fresh schema when exploring the existing screenshot configuration. From `apple-tv/` with Docker:
 
 ```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
+docker compose exec -T postgres psql -U appletv -d appletv -v ON_ERROR_STOP=1 -1 < backend/db-seed/seed.sql
 ```
 
-## API Endpoints
+For native PostgreSQL:
 
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
-- `POST /api/auth/profile/:id/select` - Select profile
-
-### Content
-- `GET /api/content` - Browse content
-- `GET /api/content/featured` - Get featured content
-- `GET /api/content/:id` - Get content details
-- `GET /api/content/:id/seasons` - Get series seasons
-
-### Streaming
-- `GET /api/stream/:id/playback` - Get playback info
-- `GET /api/stream/:id/master.m3u8` - HLS master playlist
-- `GET /api/stream/:id/variant/:variantId.m3u8` - Quality variant playlist
-
-### Watch Progress
-- `GET /api/watch/continue` - Continue watching list
-- `POST /api/watch/progress/:id` - Update progress
-- `GET /api/watch/history` - Watch history
-
-### Watchlist
-- `GET /api/watchlist` - Get watchlist
-- `POST /api/watchlist/:id` - Add to watchlist
-- `DELETE /api/watchlist/:id` - Remove from watchlist
-
-### Recommendations
-- `GET /api/recommendations` - Personalized recommendations
-- `GET /api/recommendations/trending` - Trending content
-- `GET /api/recommendations/genre/:genre` - Genre recommendations
-
-### Subscription
-- `GET /api/subscription/status` - Get subscription status
-- `GET /api/subscription/plans` - Get available plans
-- `POST /api/subscription/subscribe` - Subscribe to plan
-
-### Admin
-- `GET /api/admin/stats` - Dashboard statistics
-- `GET /api/admin/users` - List users
-- `GET /api/admin/content` - List content
-- `POST /api/admin/content/:id/feature` - Toggle featured
-
-## Project Structure
-
-```
-apple-tv/
-├── docker-compose.yml        # PostgreSQL, Redis, MinIO
-├── backend/
-│   ├── package.json
-│   └── src/
-│       ├── index.js          # Express server
-│       ├── config/           # Configuration
-│       ├── db/               # Database, Redis, MinIO clients
-│       ├── middleware/       # Auth middleware
-│       ├── routes/           # API routes
-│       └── services/         # Business logic
-├── frontend/
-│   ├── package.json
-│   ├── vite.config.ts
-│   └── src/
-│       ├── main.tsx          # Entry point
-│       ├── router.ts         # Tanstack Router
-│       ├── components/       # UI components
-│       ├── routes/           # Page components
-│       ├── stores/           # Zustand stores
-│       ├── services/         # API client
-│       ├── types/            # TypeScript types
-│       └── utils/            # Helpers
-└── README.md
+```bash
+PGPASSWORD=appletv_secret psql -h localhost -U appletv -d appletv -v ON_ERROR_STOP=1 -1 -f backend/db-seed/seed.sql
 ```
 
-## Implementation Status
+This creates Alice, Bob, Charlie and `admin@appletv.local`, all with **password123** (verified against the stored hash). Alice/Bob have expiring paid tiers; Charlie is free. Admin has no seeded profile, so create one after login. The login page's displayed credentials apply to the TypeScript seed, not this fixture.
 
-- [x] Initial architecture design
-- [x] Database schema
-- [x] User authentication with sessions
-- [x] Profile management
-- [x] Content catalog API
-- [x] HLS manifest generation
-- [x] Watch progress tracking
-- [x] Continue watching
-- [x] Watchlist (My List)
-- [x] Recommendation engine
-- [x] Subscription management
-- [x] Admin dashboard
-- [x] Frontend browse interface
-- [x] Video player UI
-- [x] Profile selection
-- [ ] Actual video transcoding/encoding
-- [ ] Real HLS segment delivery
-- [ ] Offline downloads
-- [ ] DRM protection
+The SQL fixture has fifteen catalog entries, but only two movies have variant/audio/subtitle rows. It supplies progress, history, watchlist, ratings, device and download records; device/download records have no working feature behind them. Fixed 2023–2024 release dates age out of the 90-day New Releases query. The fixture is not rerunnable: catalog inserts lack conflict handling, and other randomly generated IDs can duplicate rows. Mixing seeds retains whichever admin password/expiry was inserted first, while adding the other catalog and additional profiles. Keep the datasets separate for a predictable walkthrough.
 
-## Key Technical Challenges
+## Known integration limits
 
-1. **Video Encoding**: Multi-codec, multi-resolution transcoding at scale
-2. **Streaming Quality**: Adaptive bitrate with minimal buffering
-3. **Global Delivery**: Low-latency content delivery worldwide
-4. **DRM Protection**: Secure content with FairPlay
-5. **Recommendations**: Personalized content discovery
+- The player stores a manifest URL but never fetches it. Playback-info returns only id/title/duration/status, omitting artwork, variants, audio and subtitles; the player image has no source and its quality menu is empty. Quality and volume state have no media effect; the subtitle button has no handler. Generated playlists do not establish playable assets or DRM protection.
+- The ten-second save interval is recreated whenever position changes, so continuous one-second playback can keep postponing it. Back/unmount saves are best effort; parent cleanup resets the player and can erase state before a child save. There is no unload/offline queue. Pause and wait to inspect a saved position; do not assume reliable cross-device handoff.
+- The browser sends neither client timestamps nor Idempotency-Key. Server arrival time therefore orders ordinary browser updates; generic replay middleware is optional and has incomplete key binding/recovery.
+- Selected profile is persisted locally, while the authoritative selection is in the cookie session. Restoration does not reconcile them, and switching/logout leaves other stores or in-flight requests intact. Kids filtering applies to some recommendations, not catalog or playback authorization.
+- `/api/watch/progress/batch` is declared after `/progress/:contentId`, so ordinary batch requests enter the single-title handler. It does not provide usable offline batch synchronization.
+- Most page/mutation failures are logged in the console. Subscription cancel returns a message without changing data; its client helper has no screen control.
 
-## Architecture
+See [Implementation Notes](./architecture.md#implementation-notes) for the source-backed boundaries and failure cases.
 
-See [architecture.md](./architecture.md) for detailed system design documentation.
+## Development and verification commands
 
-## Development Notes
+From `apple-tv/backend/`: `npm run type-check`, `npm run lint`, `npm run dev:server1`, `npm run dev:server2`, or `npm run dev:server3`. There is no backend build, migration or unit-test script. Multiple instances share SQL/Redis; no load balancer is included, and process-local stream counts/breakers are independent.
 
-See [claude.md](./claude.md) for development insights and design decisions.
+From `apple-tv/frontend/`: `npm run build`, `npm run type-check`, `npm run lint`, `npm run preview`. Preview does not inherit the development `/api` proxy; provide an API reverse proxy for built assets.
 
-## MinIO Console
+From the repository root, `npm run test:smoke apple-tv` uses the SQL fixture's Alice account and a running stack. These are page-load checks, not playback tests. The profiles smoke test incorrectly expects a `main` element absent from that page; screenshot login also expects `main` immediately after login, which lands on Profiles. Automated capture/test failures here need inspection rather than assuming they prove a streaming defect.
 
-Access the MinIO console at http://localhost:9001
-
-- Username: `minioadmin`
-- Password: `minioadmin`
-
-Buckets:
-- `videos` - Video content storage
-- `thumbnails` - Thumbnail images
-
-## References & Inspiration
-
-- [HLS Authoring Specification for Apple Devices](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices) - Apple's HTTP Live Streaming requirements
-- [FairPlay Streaming Documentation](https://developer.apple.com/streaming/fps/) - Apple's DRM technology for content protection
-- [AVFoundation Framework](https://developer.apple.com/documentation/avfoundation) - Apple's framework for audiovisual media
-- [FFmpeg Documentation](https://ffmpeg.org/documentation.html) - Open-source video transcoding toolkit
-- [Netflix Tech Blog: Video Encoding](https://netflixtechblog.com/optimized-shot-based-encodes-now-streaming-4b9464c7e7f8) - Netflix's approach to per-title encoding
-- [Building a Scalable Video Service](https://www.youtube.com/watch?v=bJOWRsCjO4c) - YouTube's video delivery architecture
-- [Adaptive Bitrate Streaming](https://developer.apple.com/documentation/http-live-streaming) - Apple's guide to HLS adaptive streaming
+Documentation verification covered source, configuration, links and the SQL password hash. No application stack or real media playback was run during this review.

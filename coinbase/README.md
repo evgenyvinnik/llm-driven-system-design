@@ -1,186 +1,186 @@
-# Coinbase - Crypto Exchange
+# Coinbase: a simulated spot exchange
 
-A cryptocurrency exchange platform with real-time price feeds, order matching engine, candlestick charts, and portfolio management. Built to explore 24/7 market operations, DECIMAL precision accounting, and order book data structures.
+A local learning project with a market overview, candlestick chart, order book, buy/sell form, portfolio, and order history. Prices and deposits are simulated; there is no connection to Coinbase, a blockchain, a bank, or a real market-data provider.
 
-## Codebase Stats
+The project demonstrates price-time sorting, conditional wallet reservation, WebSocket broadcasting, and relational order records. It does **not** provide consistent exchange accounting: matching, order updates, and wallet settlement can diverge, and monetary calculations use JavaScript numbers despite decimal database columns. [Implementation Notes](./architecture.md#implementation-notes) explain these limits.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 7,216 |
-| Source Files | 79 |
-| .ts | 3,506 |
-| .md | 1,657 |
-| .tsx | 1,431 |
-| .sql | 251 |
-| .json | 151 |
+## What you can explore
 
+- Browse twelve configured trading pairs, including ten USD pairs and two crypto-to-crypto pairs.
+- Register or sign in, place market/limit orders, and inspect or cancel open orders.
+- View simulated prices, an in-memory order book, and stored candlesticks. The seed supplies one-minute candles for BTC-USD, ETH-USD, and SOL-USD only.
+- Inspect wallet totals, available balances, and a portfolio allocation bar. Portfolio history and transaction history have API endpoints but no corresponding history screens.
+- Add simulated funds through the authenticated deposit API. There is no deposit button, withdrawal API, custody, or administrator interface.
 
-## Screenshots
+Stop orders are accepted by the API but never triggered or added to the book. Do not use them as a working feature; a cancelled buy stop also fails to release its reserve. The timeframe buttons include intervals for which neither the seed nor the worker produces candles.
 
-_Run the application to see the dark-themed exchange UI with live price charts, order book depth visualization, and trading interface._
+![Trading view](./screenshots/04-trade-btc.png)
 
-## Features
+The screenshot is a checked-in visual example, not evidence of current accounting correctness or live market prices.
 
-- **Market Overview** - Real-time prices for 12+ trading pairs with 24h change, volume, and sparklines
-- **Trading Interface** - Candlestick charts (TradingView lightweight-charts), order book depth, market/limit orders
-- **Order Matching Engine** - In-memory order book with price-time priority matching
-- **Price Simulation** - Geometric Brownian Motion for realistic price movement
-- **Portfolio Management** - Holdings summary with allocation breakdown
-- **Wallet System** - Per-currency wallets with balance/reserved tracking
-- **Real-time Updates** - WebSocket price streaming every 2 seconds
-- **Order History** - View and cancel open orders
+## Stack and documentation
 
-## Tech Stack
+| Layer | Implementation |
+|-------|----------------|
+| Frontend | React 19, TypeScript, Vite 6, TanStack Router, Zustand 5, Tailwind CSS 3 |
+| Charts | TradingView Lightweight Charts 5; SVG sparklines with generated data |
+| API | Node.js 20+, Express 4, TypeScript/tsx, ESM |
+| Data | PostgreSQL 16; numeric(28,18) columns with floating-point application calculations |
+| Sessions | Valkey 7, ioredis, connect-redis, express-session |
+| Streaming | ws for browser prices; KafkaJS publishes optional events |
+| Operations | Pino, prom-client, express-rate-limit, Vitest |
 
-| Layer | Technology |
-|-------|-----------|
-| Frontend | React 19, TypeScript, TanStack Router, Zustand, Tailwind CSS, lightweight-charts |
-| Backend | Node.js, Express, TypeScript |
-| Database | PostgreSQL 16 (DECIMAL(28,18) precision) |
-| Cache | Valkey/Redis (sessions, idempotency) |
-| Messaging | Kafka (price events, trade events) |
-| Real-time | WebSocket (ws library) |
+[architecture.md](./architecture.md) separates a proposed production design from the source. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) answers provide spoken interview discussions. [CLAUDE.md](./CLAUDE.md) records development history; several historical implementation claims are outdated.
 
-## Quick Start
+## Infrastructure
 
-### Prerequisites
+Start in the repository root and choose one option. Subsequent setup terminals start in `coinbase` unless stated otherwise. Other projects may already occupy the default infrastructure ports.
 
-- Node.js >= 20.0.0
-- Docker Desktop
-
-### Option A: Docker Compose (Recommended)
+### Option A: Docker Compose (recommended)
 
 ```bash
-# Start infrastructure
-docker-compose up -d
+cd coinbase
+docker compose up -d
+docker compose ps
+```
 
-# Wait for services to be healthy
-docker-compose ps
+| Service | Address | Development credentials |
+|---------|---------|-------------------------|
+| PostgreSQL | localhost:5432, database coinbase | coinbase / coinbase123 |
+| Valkey | localhost:6379 | No authentication |
+| Kafka | localhost:9092 | Plaintext, no authentication |
+| ZooKeeper | localhost:2181 | Used by this Compose Kafka deployment |
 
-# Run database migrations
+On a fresh PostgreSQL volume, Compose applies [init.sql](./backend/src/db/init.sql), creating nine tables, thirteen currencies, twelve pairs, and indexes. It does not create users, wallets, orders, or candles. **Do not run db:migrate after this initialization:** the script reexecutes non-idempotent CREATE TABLE statements and fails on existing tables.
+
+PostgreSQL and Valkey have named volumes; Valkey enables AOF. Kafka and ZooKeeper have no persistent volume mounts, and Kafka uses a single broker. Their container replacement is not durable event recovery.
+
+```bash
+docker compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list
+docker compose down
+# Deliberately reset PostgreSQL and Valkey data as well:
+docker compose down -v
+```
+
+The broker has no Compose health check; container presence is not broker readiness. The API does not consume Kafka events, and its browser price loop works independently.
+
+### Option B: Native installation on macOS
+
+```bash
+cd coinbase
+brew install postgresql@16 valkey kafka
+brew services start postgresql@16
+brew services start valkey
+brew services start kafka
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+psql postgres -c "CREATE USER coinbase WITH PASSWORD 'coinbase123';"
+createdb -O coinbase coinbase
+PGPASSWORD=coinbase123 psql -h localhost -U coinbase -d coinbase -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+pg_isready -h localhost -p 5432
+valkey-cli ping
+kafka-topics --bootstrap-server localhost:9092 --list
+```
+
+These commands assume the current macOS account can administer PostgreSQL. Skip role/database creation if they exist, and apply initialization only to an empty database.
+
+The current [Homebrew Kafka package](https://formulae.brew.sh/formula/kafka) uses Kafka 4 and KRaft rather than this Compose deployment's ZooKeeper arrangement. Its [formula](https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/k/kafka.rb) initializes fresh storage and starts the supplied server configuration. Do not add a ZooKeeper service or reformat existing Kafka storage as part of ordinary startup.
+
+## Start the API and frontend
+
+API terminal, initially in `coinbase`:
+
+```bash
 cd backend
 npm install
-npm run db:migrate
-
-# Seed demo data
-PGPASSWORD=coinbase123 psql -h localhost -U coinbase -d coinbase -f db-seed/seed.sql
-
-# Start backend (Terminal 1)
 npm run dev
+```
 
-# Start price broadcaster worker (Terminal 2)
-npm run dev:worker:price
+Frontend terminal, initially in `coinbase`:
 
-# Start frontend (Terminal 3)
-cd ../frontend
+```bash
+cd frontend
 npm install
 npm run dev
 ```
 
-### Option B: Native Installation
+Open [localhost:5173](http://localhost:5173). The API and WebSocket endpoint use port **3001**; Vite proxies `/api` and `/ws` there. Anonymous browsing works without a user account. Registration creates a zero-balance USD wallet, so import the optional fixture for a funded demo.
+
+### Optional workers
+
+In separate terminals initially in `coinbase/backend`:
 
 ```bash
-# PostgreSQL
-brew install postgresql@16
-brew services start postgresql@16
-createuser -s coinbase
-createdb -O coinbase coinbase
-psql -U coinbase -d coinbase -c "ALTER USER coinbase PASSWORD 'coinbase123'"
-
-# Valkey (Redis-compatible)
-brew install valkey
-brew services start valkey
-
-# Kafka (requires Java)
-brew install kafka
-brew services start zookeeper
-brew services start kafka
+npm run dev:worker:price
 ```
-
-### Demo Accounts
-
-| Username | Password | Starting Balance |
-|----------|----------|-----------------|
-| alice | password123 | $100,000 + 1.5 BTC + 10 ETH + 100 SOL + more |
-| bob | password123 | $100,000 + 0.5 BTC + 5 ETH + 50 SOL + more |
-
-## Architecture
-
-See [architecture.md](./architecture.md) for the full system design document.
-
-## Available Scripts
-
-### Backend
 
 ```bash
-npm run dev              # Start API server on port 3001
-npm run dev:server1      # Port 3001
-npm run dev:server2      # Port 3002
-npm run dev:server3      # Port 3003
-npm run dev:worker:price # Price broadcaster (every 2s)
-npm run dev:worker:portfolio # Portfolio snapshots (every 60s)
-npm run test             # Run tests
-npm run db:migrate       # Run database migrations
+npm run dev:worker:portfolio
 ```
 
-### Frontend
+The price worker runs its own random price simulation, publishes `price-updates`, and attempts to persist completed one-minute candles. It is not the source of the API's displayed prices. Its current-candle rollover can discard a candle before the persistence timer reads it.
+
+The portfolio worker writes snapshots immediately and every 60 seconds using a third, independently initialized price map that it never ticks or updates from Kafka. The UI does not display these history snapshots. Both workers use asynchronous interval callbacks without overlap prevention.
+
+### Configuration
+
+The API and workers load `.env` from their working directory through dotenv, or use exported variables. Defaults:
 
 ```bash
-npm run dev              # Start dev server on port 5173
-npm run build            # Production build
-npm run lint             # ESLint
+export PGHOST=localhost PGPORT=5432 PGDATABASE=coinbase
+export PGUSER=coinbase PGPASSWORD=coinbase123
+export REDIS_HOST=localhost REDIS_PORT=6379
+export KAFKA_BROKERS=localhost:9092 KAFKA_CLIENT_ID=coinbase-api
+export SESSION_SECRET=coinbase-dev-secret-key-change-in-production
+export PORT=3001 NODE_ENV=development
 ```
 
-## Environment Variables
+`DATABASE_URL` and `REDIS_URL` are not read. The migration runner reads PG* environment variables directly and does not load dotenv. The active database pool has 20 connections and a two-second connection timeout.
+
+`npm run dev` explicitly sets port 3001. The `dev:server2` and `dev:server3` scripts call it after setting another port, so the inner command resets both to 3001. For an isolated port experiment, `PORT=3002 NODE_ENV=development npx tsx src/index.ts` uses that port, but it also creates an independent price simulation and order book. Multiple API instances are not a coherent shared exchange, and no load balancer is provided.
+
+## Optional demo data
+
+After fresh initialization, run one of these commands from `coinbase`:
 
 ```bash
-# Backend
-DATABASE_URL=postgresql://coinbase:coinbase123@localhost:5432/coinbase
-REDIS_URL=redis://localhost:6379
-KAFKA_BROKERS=localhost:9092
-SESSION_SECRET=coinbase-dev-secret-key
-PORT=3001
-
-# Frontend
-# Configured via Vite proxy (vite.config.ts)
+# Docker:
+docker compose exec -T postgres psql -U coinbase -d coinbase -v ON_ERROR_STOP=1 < backend/db-seed/seed.sql
+# Native alternative:
+PGPASSWORD=coinbase123 psql -h localhost -U coinbase -d coinbase -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql
 ```
 
-## API Endpoints
+Use the command for your chosen infrastructure. [The fixture](./backend/db-seed/seed.sql) creates two verified demo accounts and fifteen wallets, 180 one-minute candles across BTC/ETH/SOL on a fresh import, and five sample deposit records. It creates no orders, trades, resting liquidity, or portfolio snapshots.
 
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| POST | /api/v1/auth/register | No | Register new user |
-| POST | /api/v1/auth/login | No | Login |
-| POST | /api/v1/auth/logout | Yes | Logout |
-| GET | /api/v1/auth/me | Yes | Get current user |
-| GET | /api/v1/markets/pairs | No | All trading pairs with prices |
-| GET | /api/v1/markets/currencies | No | All currencies |
-| GET | /api/v1/markets/:symbol/price | No | Current price for pair |
-| GET | /api/v1/markets/:symbol/orderbook | No | Order book depth |
-| GET | /api/v1/markets/:symbol/candles | No | Candlestick data |
-| POST | /api/v1/orders | Yes | Place order |
-| DELETE | /api/v1/orders/:id | Yes | Cancel order |
-| GET | /api/v1/orders | Yes | User's orders |
-| GET | /api/v1/portfolio | Yes | Portfolio summary |
-| GET | /api/v1/wallets | Yes | Wallet balances |
-| POST | /api/v1/wallets/deposit | Yes | Simulate deposit |
-| GET | /api/v1/transactions | Yes | Transaction history |
+| Username | Password | Example starting balances |
+|----------|----------|---------------------------|
+| alice | password123 | 100,000 USD, 1.5 BTC, 10 ETH, 100 SOL, plus five other assets |
+| bob | password123 | 100,000 USD, 0.5 BTC, 5 ETH, 50 SOL, 25,000 DOGE, 10,000 XRP |
 
-## WebSocket
+The shared bcrypt hash was verified in isolation. Login uses username, not email. Repeated seeding preserves existing wallet balances, may add newly timed candles, and appends duplicate deposit-history records. If these usernames already belong to different UUIDs, the fixed wallet references can fail; import before registering those names.
 
-Connect to `ws://localhost:3001/ws` (or via Vite proxy at `ws://localhost:5173/ws`).
+The deposit-history fixture is not a complete journal of every seeded wallet. A new user can instead call the authenticated deposit API with a currency and amount; amounts are simulated, capped at 1,000,000 per request, and have no funding-provider verification or idempotency.
 
-```json
-// Subscribe to price updates
-{"type": "subscribe", "channels": ["ticker:BTC-USD"]}
-
-// Receive price updates every 2 seconds
-{"type": "prices", "data": {"BTC-USD": {"price": 65123.45, ...}}}
-```
-
-## Cleanup
+## Verification
 
 ```bash
-docker-compose down      # Stop services
-docker-compose down -v   # Stop and remove volumes
+curl -s http://localhost:3001/api/v1/health
+curl -s http://localhost:3001/metrics
 ```
+
+Health returns a fixed healthy response without checking the database, Redis, Kafka, book recovery, or settlement consistency. It also runs behind session middleware and the general API rate limiter.
+
+Backend scripts include `npm run build`, `npm test`, and `npm run lint`. Frontend scripts include `npm run build`, `npm run lint`, and `npm run preview`. The backend's fifteen mocked HTTP tests cover route shape, validation, and unauthenticated access; they do not exercise successful settlement, concurrent matching, or database recovery.
+
+From the repository root, `npm run test:smoke coinbase` runs seven page checks against an already running stack and seeded Alice account. Their container assertions do not prove trading or chart correctness. The project-level `test:e2e` can start Vite but does not start infrastructure or the API.
+
+## Important implementation boundaries
+
+- Reservation and order insertion are separate writes. Matching mutates the in-memory book before trade insertion, order updates, and wallet settlement complete. Failures can leave orphan reserves or divergent records; restart does not rebuild open orders into the book.
+- Matched buyer fees are computed in quote currency and subtracted directly from base quantity. Market fallback creates a synthetic fill without a counterparty or trade row and leaves the already filled order in the book. Limit-price improvements can leave unused reserves locked.
+- Price, quantity, fee, and valuation calculations use floating point. Decimal columns and some string responses do not make the full path exact. Crypto-to-crypto prices are incorrectly labelled with dollar signs in several views.
+- Idempotency uses a global unbound Redis response key without a lock or durable result lookup. The browser creates a new timestamp/random key for each submission rather than preserving an attempt through recovery.
+- Browser prices, persisted candles, and portfolio-worker valuations come from separate process-local price maps. “24h” statistics are synthetic cumulative/process-lifetime values, and overview sparklines are newly generated on render.
+- The development StrictMode effect cleanup removes the WebSocket price handler, while a ref prevents it from being registered again. Other request races can mix symbols or accounts. The chart is recreated when its candle array changes; it does not receive live candle updates.
+- WebSocket auth trusts a supplied user ID and arbitrary channel subscriptions. No private order/book events are currently published, but those helpers are not an authorization boundary. HTTP cookies remain insecure even in production configuration; no admin or account-verification workflow exists.
+
+This review inspected source/configuration and ran isolated password, matching, arithmetic, and candle-lifecycle checks. It did not start the exchange, execute its SQL fixture, run browser tests, or validate live settlement. The detailed architecture records these findings without treating proposed production mechanisms as implemented features.

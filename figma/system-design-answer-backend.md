@@ -1,351 +1,387 @@
-# Figma Backend — System Design Answer
+# Figma — backend system design interview
 
-## 45–50 minute interview walkthrough
+A proposed collaborative editor backend, designed to fit a 45-minute whiteboard
+conversation. Production guarantees here are design choices, not measured behavior of the
+repository's local implementation.
 
-| Segment | Focus | Time |
-|---|---|---:|
-| Requirements | Files, editing, collaboration, publishing | 4 min |
-| Architecture | API, operation service, storage, presence | 8 min |
-| Data model | Scene objects, operations, snapshots, assets | 6 min |
-| Interfaces | REST, WebSocket, operation protocol | 8 min |
-| Deep dives | CRDT choice, realtime, assets, recovery | 20 min |
-| Trade-offs and close | Scale, isolation, rollout | 4 min |
+## 🎯 Requirements and scope — 4 minutes
 
-## Opening — 2 minutes
+> “I’ll focus on one document being edited by several people. The hard question is
+> what we promise when an edit is acknowledged, especially if the server crashes,
+> the client retries, or someone restores an older version.”
 
-I am designing the backend for a collaborative design editor. Users create files, manipulate a scene graph, upload assets, collaborate in real time, and share or publish a read-only representation.
+I would scope the product to files, pages, basic design objects, online collaborative
+editing, cursor presence, personal undo, and named versions. Viewers can read; editors can
+change the document. Sharing changes must affect already-open sockets. Assets, comments,
+components, plugins, and prototyping are extensions.
 
-The difficult backend problem is not storing rectangles. It is preserving a coherent operation history while users edit concurrently, reconnect, undo, and load large files. Presence is useful but not durable. Document operations are durable and permission-checked.
+I assume that brief interruptions can be recovered, but unrestricted offline multi-writer
+editing is not a launch requirement. Text can be replaced as an object property;
+simultaneous editing inside a paragraph is outside this initial scope. Those choices make
+a server-ordered operation model a reasonable starting point.
 
-## R — Requirements — 4 minutes
+We want p95 committed changes delivered to regional collaborators within 200 ms at
+admitted load and 99.9% regional availability. The client's local preview does not wait
+for this round trip. I would measure commit latency and peer delivery separately because a
+fast database write does not prove a collaborator received it.
 
-### Clarifying questions
+The strongest invariant is that every accepted operation has one durable outcome and one
+place in the file's order. An ACK means the transaction committed to the specified
+replicated storage policy. It does not mean every client rendered it, nor does it imply
+zero data loss under an unspecified multi-region disaster.
 
-I would ask whether offline editing and character-level text collaboration are launch requirements. I will support online collaborative editing with reconnect and bounded local queues, and I will describe where CRDT or OT becomes necessary.
+| Requirement | Backend consequence |
+|---|---|
+| Concurrent object edits | One committed order with defined property/structural semantics |
+| Safe retries | Stable operation IDs and durable receipts |
+| Short disconnects | Snapshot plus bounded log replay |
+| Named restore | New ordered document state, visible to all clients |
+| Shared access | Current authorization on reads, edits, versions, and streams |
+| Presence | Separate expiring state that can be dropped |
 
-I would ask whether plugins can be untrusted and whether files require pixel-perfect export. I will treat first-party tools as trusted clients of a capability API and isolate untrusted extensions separately.
+## 📏 Capacity and partitioning — 4 minutes
 
-### Functional requirements
+For discussion, assume one million daily editors and 100,000 connected clients at peak. Of
+those, 20,000 are actively manipulating objects. At five durable batches per active editor
+per second, we receive 100,000 batches per second across files. This is an assumed peak
+workload, not a benchmark or a daily average.
 
-- Create files, pages, layers, and design objects.
-- Apply transforms, style, text, grouping, and reorder operations.
-- Collaborate with multiple users in one file.
-- Show presence cursors and selections.
-- Upload and reference image, font, and other assets.
-- Undo and redo through the operation protocol.
-- Share read-only files and publish stable versions.
-- Recover after disconnect and support operation replay.
+At 500 bytes per batch, the log receives about 50 MB/s before indexes, replication, and
+protocol overhead. Sustaining that peak all day would produce 4.32 TB; actual retention
+sizing needs a measured activity curve. Presence and binary assets are additional
+workloads, not included in that figure.
 
-### Non-functional requirements
+If each edit reaches three peers, there are about 300,000 outgoing edit deliveries per
+second. A heavily shared file can dominate a single process even when fleet averages look
+healthy. File-level queue depth and fan-out are therefore important admission signals.
 
-- Operations for one file or partition have a deterministic order.
-- A committed edit is durable before acknowledgement.
-- Presence can be dropped without affecting document correctness.
-- Large files load through snapshots and visible ranges, not unlimited payloads.
-- Assets are verified and access-controlled.
-- One malformed plugin or renderer does not corrupt scene state.
+Writing a 5 MB scene for every batch would imply 500 GB/s of logical scene writes at this
+peak. That motivates an operation log and asynchronous snapshots. It does not imply that
+JSONB is unsuitable for a small prototype or for snapshot storage.
 
-### Out of scope
+I would partition by file ID. One logical owner serializes a file's mutations, while many
+owners share an application process or shard. Different files progress independently. The
+first version caps editors and incoming work per file rather than promising unlimited
+collaborative fan-out.
 
-I will not design the GPU renderer, full export pipeline, font licensing, or a complete universal CRDT. I will define the operation and storage boundaries.
+Splitting one file by page can come later. It complicates moving objects between pages,
+permission scope, and file-wide restore. I would not introduce that boundary until a
+measured hot-file limit justifies the coordination cost.
 
-## A — Architecture — 8 minutes
-
-### High-level architecture
+## 🏗️ Architecture and flows — 5 minutes
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ Editor clients                                                              │
-│ file route · scene store · tool intents · renderer · local operation queue  │
-└──────────────────────────────┬─────────────────────────────────────────────┘
-                               │ HTTPS / WebSocket
-┌──────────────────────────────▼─────────────────────────────────────────────┐
-│ Collaboration API Gateway                                                   │
-│ auth · file permissions · operation validation · connection lifecycle       │
-├───────────────────────┬───────────────────────┬────────────────────────────┤
-│ File and scene service │ Operation sequencer   │ Presence service            │
-│ snapshots · metadata  │ ordering · ack · log  │ ephemeral cursors          │
-├───────────────────────┴───────────────────────┴────────────────────────────┤
-│ Operation log · snapshot store · metadata DB · object storage · event bus   │
-└────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
+│     Editor clients     │ ──▶ │     Gateway / auth     │ ──▶ │       File owner       │
+└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+
+┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
+│ Durable operation log  │ ──▶ │    Snapshot worker     │ ──▶ │    Snapshot storage    │
+└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
 ```
 
-### File ownership and partitioning
+The first row is the interactive path. The file owner commits to the durable log shown
+below it; snapshot workers later materialize that log into immutable versions. A broker
+notifies subscribed gateways of accepted sequences. Presence uses a separate ephemeral
+topic and does not pass through the durable operation log.
 
-A file or hot document partition has one logical operation sequencer at a time. API gateways route operations to the owner. The owner assigns a monotonically increasing sequence and broadcasts accepted operations.
+The gateway authenticates a session and resolves the file's owner. The owner checks
+current permission, validates the semantic operation, decides its effective change, and
+commits before acknowledging. The gateway can then deliver that committed change to the
+origin and other subscribers.
 
-This does not mean one server stores every file. Ownership is distributed by file ID. A coordinator moves ownership through a lease or handoff protocol and ensures the new owner starts from a verified snapshot and log position.
+The owner keeps an in-memory projection for low-latency decisions. It is rebuilt from a
+verified snapshot and log after failure. This projection is a cache of the committed
+prefix; the durable log is the recovery authority. A speculative state must never be used
+to acknowledge a later operation after an earlier commit fails.
 
-### Persistence path
+Opening a file needs a synchronization barrier. The service chooses a committed sequence
+N, loads a snapshot at S, and supplies replay through N while buffering later events
+within a bound. A current snapshot fetched independently of a live stream can miss or
+double-apply edits around the subscription boundary.
 
-The sequencer validates permission and operation shape, appends the operation to a durable log or transactional store, then acknowledges and broadcasts. Periodic snapshots compact history. A snapshot includes revision, scene graph, pages, and object order.
+I would start with one regional writer for each file and replicated storage in that
+region. On an owner outage, clients display pending/read-only state briefly while takeover
+completes. Acknowledging conflicting histories in two regions would create a harder
+problem than this product scope requires.
 
-Asset metadata is stored with the file, while binary content lives in object storage. The API issues signed upload and download URLs after permission checks.
+## 💾 Data and API contracts — 5 minutes
 
-### Presence path
-
-Presence messages are routed through a low-latency broker and expire. They are not appended to the document log. A user reconnecting receives current presence where available but reconstructs document state from snapshot and operation history.
-
-## D — Data Model — 6 minutes
-
-| Entity | Important fields | Authority |
+| Record | Key fields and constraints | Purpose |
 |---|---|---|
-| `File` | file ID, owner, permissions, revision | file service |
-| `Page` | page ID, file, object order | document state |
-| `SceneObject` | ID, type, parent, transform, style, content | document state |
-| `Operation` | ID, author, base revision, payload, sequence | operation log |
-| `Snapshot` | file, revision, serialized scene, checksum | snapshot store |
-| `Asset` | ID, object key, checksum, dimensions, status | asset service |
-| `Presence` | user, cursor, selection, expiry | presence service |
-| `PublishedVersion` | file, revision, renderer compatibility | immutable read model |
+| File head | File ID, sequence, generation, owner epoch, access revision | Current coordination boundary |
+| Operation | File, unique operation ID, sequence, effective patch, actor | Deterministic replay |
+| Receipt | Operation ID, payload digest, status, canonical result | Resolve ambiguous outcomes and retries |
+| Snapshot | File, sequence, generation, schema, checksum, storage reference | Bounded recovery |
+| Object projection | Stable ID, parent/order, property groups/revisions, deletion state | Validate edits and inverses |
+| Permission | File/principal, role, permission revision | Current access control |
+| Named version | Name, creator, immutable snapshot reference | Human-readable history |
+| Presence | File/page, connection ID, position, expiry | Replaceable collaboration hints |
 
-### Operation types
+Operations describe create, property change, delete, reorder/reparent, inverse, and
+restore. They do not permit arbitrary paths into an unvalidated JSON object. Related
+fields such as x/y are one position group. Fill can remain independent, so changing color
+does not conflict with moving the same object.
 
-Operations are semantic: create object, update property, delete object, reparent, reorder, set text, attach asset, and restore snapshot. A semantic operation is easier to authorize, audit, invert, and merge than an arbitrary serialized scene replacement.
+Reparenting preserves object identity and validates the resulting tree. Parent and sibling
+placement change together. A simple initial policy uses before/after object anchors
+resolved by the owner; a missing anchor produces an explicit conflict. Array offsets
+supplied against an old client list are ambiguous.
 
-### Revision and sequence
-
-The file revision increases with accepted durable operations. The base revision tells the server what the client observed. The sequence is the canonical order assigned by the sequencer. IDs make retries safe; revision makes conflicts visible.
-
-### Asset integrity
-
-An asset descriptor stores expected checksum and ownership. Upload completion verifies size and checksum before the asset becomes usable. A missing or failed asset does not remove the scene object; it produces a render placeholder.
-
-## I — Interfaces — 8 minutes
-
-### REST API
-
-```
-POST /api/v1/files                         → create file
-GET  /api/v1/files/:id                    → metadata and permissions
-GET  /api/v1/files/:id/snapshot            → snapshot at visible revision
-POST /api/v1/files/:id/upload-url          → signed asset upload
-POST /api/v1/files/:id/publish             → immutable published version
-GET  /api/v1/files/:id/versions            → published versions
-POST /api/v1/files/:id/resync              → snapshot and operation cursor
-PATCH /api/v1/files/:id/permissions        → share policy
-```
-
-### WebSocket protocol
-
-```
-CONNECT /api/v1/files/:id/stream
-JOIN    page:<pageId>
-SEND    operation { operationId, baseRevision, payload }
-EVENT   acknowledgement { operationId, sequence, revision }
-EVENT   operation { sequence, operation }
-EVENT   presence { user, cursor, selection, expiresAt }
-EVENT   resync-required { revision, reason }
-```
-
-The gateway checks the session and file capability during connection and operation submission. A connection never grants more permissions than the authenticated file membership.
-
-### Internal contracts
-
-| Boundary | Input | Output | Guarantee |
-|---|---|---|---|
-| Sequencer | valid operation | sequence and revision | one order per file |
-| Snapshotter | operation range | verified snapshot | bounded recovery |
-| Presence broker | cursor update | ephemeral broadcast | expiry and best effort |
-| Asset service | upload completion | verified asset | checksum and ownership |
-| Publish service | file revision | immutable version | stable read path |
-
-### Retry semantics
-
-The client retries an operation with the same operation ID. If the server already accepted it, the acknowledgement is replayed. If the base revision is stale, the server returns canonical context or resync requirement.
-
-## O — Optimizations and Deep Dives — 20 minutes
-
-### Deep dive 1: CRDT or operation sequencing
-
-For online collaborative editing, I would begin with a server sequencer, operation IDs, base revisions, and explicit conflict handling. A single file owner creates deterministic order and makes replay and audit straightforward.
-
-A CRDT supports offline and multi-writer convergence, but it adds metadata, tombstone cleanup, merge semantics, and difficult debugging. I would choose a CRDT for core offline or character-level collaboration, not merely because concurrent editing exists.
-
-The trade-off is availability during an owner outage. The file may briefly become read-only while ownership fails over. That is preferable to acknowledging two conflicting sequences and repairing a design document later.
-
-### Deep dive 2: Operation storage and snapshots
-
-Every accepted operation enters a durable log. Snapshots periodically materialize the scene and record the last included sequence. Recovery loads the latest verified snapshot and replays subsequent operations.
-
-Full scene saves are simpler for clients but create large writes, lose operation-level audit, and make collaboration conflicts coarse. Operation logs cost more replay and compaction work, but they support undo, incremental sync, and diagnostics.
-
-### Deep dive 3: Realtime fan-out
-
-The collaboration gateway maintains connection-to-file subscriptions. The sequencer publishes accepted operations to the file topic. Gateways send operations in sequence and use backpressure for slow clients.
-
-Presence is throttled, expires, and can be coalesced. Durable operations are never replaced by presence updates. A slow presence client can miss cursors; a slow operation client must resync or disconnect.
-
-### Deep dive 4: Undo and inverse operations
-
-Undo creates an inverse semantic operation using the original object and property context. It enters the normal permission, revision, and sequence path. The server can reject an inverse if a collaborator changed the same property.
-
-Directly reverting local state feels simpler but can erase another user’s change and bypass audit. Collaborative undo is more complex, but it preserves the same authority path as a normal edit.
-
-### Deep dive 5: Assets and large files
-
-Large assets upload directly to object storage through signed URLs. The API verifies checksum, size, ownership, and scan status before publication. A file snapshot stores descriptors, not binary content.
-
-Large files load metadata and page structure first, then visible scene ranges or chunks. A published read-only version can use a stable snapshot and CDN-friendly asset URLs.
-
-### Deep dive 6: Permissions and plugins
-
-File roles control read, comment, edit, publish, and asset capabilities. The server checks operation types against role, not only the client’s UI mode. Plugins receive scoped tool and renderer capabilities rather than raw storage credentials.
-
-Trusted first-party modules can share the editor runtime. Untrusted extensions require a sandbox or separate origin. An iframe adds hard isolation but complicates selection, keyboard focus, resize, and operation coordination.
-
-### Deep dive 7: Failure matrix
-
-| Failure | Backend behavior | Client behavior |
+| Method | Proposed endpoint | Meaning |
 |---|---|---|
-| Owner fails | controlled failover | reconnect/resync state |
-| Operation timeout | idempotent lookup | pending edit |
-| Stale revision | reject or rebase context | conflict review |
-| Snapshot corrupt | reject checksum | recover prior snapshot |
-| Asset upload fails | asset remains unverified | retry/resume |
-| Presence lost | expire cursor | durable editing continues |
-| Permission revoked | close or downgrade stream | read-only state |
+| GET | `/api/v1/files/:id/bootstrap` | Authorized snapshot/stream boundary and file metadata |
+| WebSocket | `/api/v1/files/:id/stream` | Edit batches, receipts, replay, and presence |
+| GET | `/api/v1/files/:id/versions` | Paginated version metadata |
+| POST | `/api/v1/files/:id/versions` | Name a specified committed revision |
+| POST | `/api/v1/files/:id/restore` | Restore against an expected current revision |
+| PATCH | `/api/v1/files/:id/permissions` | Change sharing and invalidate active capabilities |
 
-## Capacity, rollout, and review checkpoints
+A mutation includes a stable operation ID, base revision, generation, and immutable
+payload. The server returns accepted sequence/effective patch or a typed rejection. The
+base revision provides context; it does not require rejecting every edit because an
+unrelated property changed in the meantime.
 
-### Capacity assumptions
+Replay requests identify the last applied sequence. The server bounds item count, bytes,
+and retained age. It returns a reset requirement when history is unavailable. Returning a
+plausible partial history without a gap indication would be unsafe.
 
-I would test a file with thousands of objects, nested groups, large assets, several collaborators, and a hot shared page. The capacity budget includes operation fan-out, snapshotting, asset bandwidth, presence traffic, and recovery time.
+## 🔧 Deep Dive 1: Sequencing, concurrency, and durable acceptance — 7 minutes
 
-### What I would measure
+> “For online design editing, I would choose a server sequencer with explicit
+> conflict rules. Convergence comes from applying one committed history, not from
+> attaching a timestamp to an arbitrary patch.”
 
-- Operation acknowledgement and sequencer queue depth.
-- Broadcast lag and slow-client disconnect rate.
-- Snapshot creation, checksum, and replay duration.
-- Conflict and resync rate.
-- Asset upload verification and CDN failure rate.
-- Presence messages per active file.
-- Published-version load time.
+Consider Alice changing the fill while Bob moves a rectangle. Those property groups are
+independent, so both can be accepted against the current scene. If both set its position,
+the later committed position wins. This can lose one person's intended placement, but the
+result is deterministic and explainable.
 
-### Rollout sequence
+The server returns the effective accepted patch to the sender too. A client that ignores
+its own canonical event may keep a prediction that differs from every other client. A user
+ID is also not a sufficient deduplication key: one person may have several devices editing
+the file.
 
-1. Ship file metadata, permissions, and snapshot reads.
-2. Add semantic operations with a single file sequencer.
-3. Add durable replay and periodic snapshots.
-4. Add WebSocket operation broadcast and presence.
-5. Add signed assets, publishing, and read-only versions.
-6. Add hot-file capacity, offline CRDT work, and plugin isolation after measurement.
+Each file owner has a serial mutation queue. Before accepting an operation, it checks the
+schema, current permission, generation, object existence, and relevant structural
+invariants. Unknown properties, non-finite dimensions, excessive batches, and cyclic
+parent updates are rejected before touching persistent state.
 
-### Alternative architecture review
+The transaction is the critical boundary:
 
-Full-scene saves are easier to implement but make conflicts and undo coarse. Operation logs require compaction but preserve history, incremental sync, and semantic authorization.
+1. Lock or conditionally update the file head under the active fencing epoch.
+2. Check current access under the same serialization policy as permission changes.
+3. Look up the operation ID and compare its payload digest with any prior receipt.
+4. For a new valid edit, allocate the next sequence and write its effective patch
+and committed result atomically.
+5. Commit, update the owner's projection, and then acknowledge and publish.
 
-A CRDT gives offline convergence but adds metadata, merge rules, tombstones, and debugging complexity. A sequencer with bounded local queues is a better first step when online collaboration is the primary requirement.
+A repeated ID with the same payload returns the original outcome. Reusing it with a
+different payload is a conflict, not a request to reinterpret the previous edit. An
+in-progress request can wait briefly or receive pending status. It must not start a second
+execution merely because the cached result is not ready.
 
-An iframe per tool can isolate untrusted code but makes selection, focus, resize, and shared undo harder. Trusted tools should use capability modules; separate origins are reserved for untrusted extensions.
+Suppose storage commits and the network drops before the ACK. The client still holds the
+same ID; its retry finds the durable receipt. Suppose the process crashes before commit:
+the transaction rolls back, and a later attempt can execute once. These are
+effectively-once durable effects built on retries, not exactly-once network delivery.
 
-### Backend interview checkpoints
+Redis can cache receipts, but an evicted key or outage cannot determine whether an edit
+already committed. A durable unique constraint plus receipt result is the backstop. A
+primary-key error alone is insufficient because the client needs the accepted sequence and
+effective result to finish reconciliation.
 
-I trace a transform from operation submission through permission validation, sequencing, persistence, broadcast, snapshotting, and undo.
+A routing lease chooses an owner, but it is not enough to prevent split ownership. An old
+process can pause, lose its lease, and resume. A monotonically increasing fencing epoch
+checked on every commit prevents that stale owner from writing after a replacement takes
+over. Recovery verifies the log prefix before admitting work.
 
-I explain why a presence cursor never enters the durable document log and why an operation timeout uses the same operation ID.
+The owner serializes structural changes too. Two reciprocal reparent requests cannot both
+create a cycle. Deleting an object makes subsequent ordinary updates fail; an update must
+not implicitly recreate the object. Explicit restore/undo uses a defined identity policy
+and runs through validation again.
 
-I close by returning to deterministic replay, scoped asset access, and file-level failure isolation.
+| Choice | Why it fits | Cost |
+|---|---|---|
+| ✅ Fenced file sequencer | One order, clear rejection rules, straightforward replay | Per-file throughput ceiling and failover pause |
+| ❌ Independent read/modify/write snapshots | Very simple single-writer persistence | Concurrent writes can lose unrelated edits |
+| ❌ Decentralized CRDT from day one | Useful for unrestricted disconnected merging | More metadata, deletion/tree semantics, and operational complexity |
 
-## Scalability and operations
+A CRDT would not eliminate authentication, persistence, or product choices about undo. If
+offline work becomes central, I would revisit the model with those requirements
+explicitly, rather than describe our sequenced patches as a CRDT.
 
-Partition files by file ID and route hot files to dedicated sequencer capacity. Snapshot frequently enough to bound recovery while retaining operation history for audit and sync. Store assets separately behind CDN and use object lifecycle policies.
+## 🔧 Deep Dive 2: Snapshots, recovery, and ordered restore — 7 minutes
 
-The first bottleneck is hot-file fan-out. The second is snapshot and operation-log storage. The third is asset bandwidth and image processing. Metrics must identify file hotness without exposing document content.
+> “I would use snapshots to bound recovery time, but the operation log still
+> explains every accepted change after the snapshot. Both must identify exactly
+> which committed prefix they represent.”
 
-## Security and observability
+A snapshot worker reads a complete operation range and builds the state at sequence S. It
+writes immutable bytes, verifies the checksum, and only then publishes a manifest. The
+manifest includes file, generation, schema version, and S. A worker crash before
+publication leaves an unreferenced object that can be cleaned later.
 
-Operations are authorized server-side and sanitized by type. Signed asset URLs are short-lived. Published versions are immutable and can have separate sharing permissions. Logs exclude private text, asset secrets, and document payloads unless protected diagnostics explicitly require them.
+Recovery selects the latest verified snapshot and replays the contiguous suffix. If the
+snapshot is corrupt, use an earlier verified one and its retained log. Do not combine a
+scene captured halfway through a mutation with a sequence obtained afterward; that would
+skip or repeat a change even if the checksum is valid.
 
-Metrics include operation acknowledgement latency, sequencer queue depth, stream lag, resync rate, snapshot age, replay duration, asset verification latency, and conflict rate. Correlation IDs connect client operation, gateway, sequencer, storage, and broadcast.
+Snapshot frequency balances write/storage cost against replay latency. For an illustrative
+hot file at 50 batches per second and a five-minute interval, recovery may replay 15,000
+batches. I would measure the interpreter and choose a bound on both operation count and
+elapsed time. A universal fixed interval ignores hot and cold file differences.
 
-## Testing and correctness review
+Log retention must respect recovery and the advertised reconnect window. A cleanup job
+cannot delete all operations older than 30 days without checking whether a usable snapshot
+covers them. Durable retry receipts may need a different horizon from the replay log,
+especially if clients retain pending edits for longer.
 
-I would test operation duplication, concurrent transforms, reorder conflict, snapshot checksum failure, owner failover, reconnect replay, asset checksum mismatch, signed URL expiry, and permission changes during editing.
+Once a retry horizon expires, the protocol must not silently accept an ancient operation
+ID as a new action. Session/generation checks and explicit outcome-expired responses let
+the client ask for review. Tombstone/identity retention follows the same rule: stale
+updates must not recreate deleted objects after compaction.
 
-Backend tests verify deterministic sequence, inverse-operation behavior, snapshot replay, presence expiry, and published-version immutability. Integration tests connect two clients and verify that durable operations converge while cursors may disappear.
+Named versions reference immutable state, not a mutable current-file row. Saving one
+specifies the revision the user intends to name. The client waits for its pending edits to
+resolve first, or the API clearly identifies the older revision being saved. Version
+metadata is paginated separately from full snapshot bodies.
 
-The acceptance criteria are replayable files, scoped operations, safe asset access, isolated presence, and a read-only fallback when editor features are unavailable.
+Restore is a new edit affecting the entire document. The requester provides the selected
+version and expected current revision. If another edit changes the head before commit,
+require a refreshed preview/confirmation rather than overwrite unseen work under an old
+confirmation.
 
-## Implementation sequence
+The owner orders the restore and advances a document generation. Connected clients install
+its state at the new sequence. Disconnected clients with old-generation operations receive
+a review requirement when they reconnect. Those edits remain recoverable as intent, but
+cannot automatically reintroduce content the team just removed by restoring a version.
 
-1. Build file metadata, permissions, and verified snapshots.
-2. Add semantic operations with one file sequencer.
-3. Add durable log replay and snapshot compaction.
-4. Add WebSocket operation broadcast and acknowledgement.
-5. Add expiring presence and signed asset uploads.
-6. Add published immutable versions and read-only fallback.
-7. Add CRDT or hot-file specialization only after offline needs are proven.
+For a large snapshot, the log can reference verified immutable content rather than embed
+megabytes in every broadcast. That reference must be durable before the restore
+transaction commits. Receivers cannot skip the restore event and apply later patches to an
+old scene while the snapshot is still downloading.
 
-The sequence keeps document state recoverable before adding more availability and extension complexity.
+Undo is narrower than restore. A gesture inverse carries the original effect and expected
+property revisions. Undoing a move can preserve a subsequent fill change; it conflicts if
+another user already changed the position. Redo is derived from the accepted inverse
+result, so it does not blindly replay stale values.
 
-## Interview walkthrough: one collaborative transform
+| Choice | Benefit | Cost or failure |
+|---|---|---|
+| ✅ Log plus verified snapshots | Small edit writes and bounded recovery | Snapshotter, manifests, compaction, schema compatibility |
+| ❌ Log forever with no snapshots | Simple append authority | Recovery time grows with document age |
+| ❌ Direct full-file overwrite for restore | Easy endpoint implementation | Bypasses order and leaves clients on incompatible states |
 
-The client sends a semantic transform operation with object ID and base revision. The file sequencer checks permission, assigns sequence, persists it, and broadcasts the operation. The renderer updates from the accepted scene projection.
+I would retain old schema interpreters or migrate snapshots through a tested, versioned
+path. A new deployment must not replay an older operation with different meaning and still
+call the result the same committed document.
 
-An undo command creates an inverse operation through the same path. Presence cursors are broadcast separately and can expire. A reconnect uses snapshot plus operation cursor rather than trusting a local scene alone.
+## 🔧 Deep Dive 3: Fan-out, presence, and overload — 7 minutes
 
-This scenario demonstrates deterministic ordering, collaborative undo, ephemeral presence, and bounded recovery.
+> “An edit and a cursor can share a socket, but they should not share the same
+> reliability budget. A stale cursor can be replaced; a missing edit needs replay.”
 
-## Further design decisions
+Gateways hold connection-to-file subscriptions and deliver committed events in sequence
+order. The owner can publish a lightweight notification after commit, and gateways fetch
+the durable range if they detect a gap. If notifications are lost entirely, periodic head
+checks or resumable log consumption discover the gap.
 
-The operation payload should be semantic enough to authorize and invert, but not so broad that it becomes arbitrary document replacement. This keeps audit and conflict behavior explainable.
+This avoids depending on a fragile database-write-plus-publish dual write. The operation
+log itself is the source to tail. If we use a separate outbox or streaming system, its
+checkpoint must advance only after committed events are available and recoverable. Pub/sub
+notification alone is not durable history.
 
-Snapshots include checksum and revision. A corrupt or partial snapshot is rejected rather than used as a plausible scene.
+Each gateway bounds pending bytes per connection. Presence uses a latest-value slot rather
+than an unlimited queue. Durable edit events can queue only to a configured limit; beyond
+it, disconnect with a resync requirement or downgrade an appropriate spectator to
+snapshots. Silently dropping an edit would leave an apparently connected client with an
+incorrect scene.
 
-Assets are not embedded into every operation. The scene references verified descriptors, while object storage and CDN handle binary delivery.
+Acknowledging persistence to the sender does not require every spectator to read the
+event. A slow spectator must not hold a document transaction open. If the product needs
+delivery receipts, they are a separate observable state with their own timeout and fan-out
+cost.
 
-Published versions pin a compatible scene representation and renderer contract. A tool deployment cannot silently alter an existing shared prototype.
+Presence keys include connection ID, user, file, and page. That prevents one tab closing
+from removing another tab's cursor. A small heartbeat refreshes expiry even when a user is
+idle. Receivers expire stale entries independently, so a lost leave message cannot leave a
+permanent collaborator badge.
 
-The production review asks whether a file can recover after owner failure, whether a revoked editor can still submit through an open socket, and whether presence traffic can be dropped without affecting durable operations.
+I would initially coalesce active pointer updates to about 10 Hz and transmit only the
+latest position. Presence is not written to the operation log or saved in named versions.
+During a Redis/broker outage, cursors can disappear while the durable edit path remains
+available if its own dependencies are healthy.
 
-### Final questions
+Admission happens before work piles up. Enforce per-connection payload bounds, per-user
+and per-file operation budgets, and a bounded owner queue. Large restore or snapshot loads
+should have separate concurrency limits. Otherwise a single shared file can consume all
+database connections and affect unrelated files.
 
-- Who assigns operation order?
-- How is a snapshot verified?
-- What does undo submit?
-- Can presence be lost?
-- How are assets scoped?
+Hot files need measurements of queue delay, collaborator count, and egress. A dedicated
+owner can isolate a hotspot. Read-only spectators can use additional gateways while still
+consuming the same sequence. More owners cannot independently write one file without a new
+coordination model.
 
-The answers should point to the sequencer, checksummed snapshots, semantic inverse operations, and signed asset capabilities.
+Permission changes also cross the fan-out boundary. Serialize the access revision with the
+file's mutations, reject later writes from revoked editors, and notify or close existing
+streams. A gateway must refresh permissions before serving a replay or snapshot after
+reconnect. Hiding controls in the browser does not enforce any of those rules.
 
-### Launch gate
+Historical versions are private content too. Knowing a snapshot ID or possessing an old
+file link is not a permanent read capability. Authorized downloads may use short-lived
+URLs with an explicit revocation policy; previously delivered bytes cannot be withdrawn
+from a client's memory.
 
-The launch gate is deterministic replay, permission-checked operations, verified snapshots, scoped assets, and independent presence failure.
+| Choice | Why it works | What it costs |
+|---|---|---|
+| ✅ Durable edit stream and lossy presence | Protects document correctness while dropping replaceable traffic | Separate queues, expiry, and recovery logic |
+| ❌ Persist every cursor movement | Gives one uniform message path | Storage and queue pressure without durable product value |
+| ❌ Require every peer ACK before commit | Strong-looking delivery boundary | One slow or disconnected peer blocks editing |
 
-I would not launch CRDT offline editing until merge, tombstone, and garbage-collection behavior is observable and recoverable.
+## 🧪 Failure handling and validation — 4 minutes
 
-### Final handoff
+I would test the boundaries around commit and replay rather than only a healthy two-client
+session. Terminate the owner before commit, after commit, and after ACK but before
+fan-out. Each test should recover the same accepted sequence and receipt.
 
-- The sequencer owns document order.
-- Snapshots and logs make recovery bounded.
-- Assets are verified outside the scene log.
-- Presence is ephemeral and permission-scoped.
-- Published versions are immutable.
-- Untrusted extensions require stronger isolation.
+| Scenario | Expected outcome |
+|---|---|
+| Same ID arrives twice concurrently | One effect and the same durable result |
+| Same ID arrives with different content | Explicit conflict |
+| Old owner resumes after takeover | Fencing check rejects its commit |
+| Snapshot fails checksum | Recover a verified earlier prefix or fail clearly |
+| Reorder races deletion of its anchor | Defined rejection, never a corrupt tree |
+| Restore races an edit | Expected revision or generation rule prevents silent loss |
+| Presence broker fails | Cursors expire without corrupting durable state |
+| Viewer becomes revoked | Future stream/read/mutation access is denied |
 
-The presentation closes by returning to deterministic replay and capability-scoped collaboration.
+Useful metrics include commit and queue latency, pending bytes per connection, sequence
+gaps, replay duration, snapshot age, retry outcomes, and authorization failures. Keep
+labels bounded; unbounded per-file metric series do not scale across millions of
+documents. Sample diagnostics by controlled identifiers without logging private scene text
+or whole operation bodies.
 
-The launch decision favors correctness and recovery over maximum offline availability.
+Readiness checks the ability to admit the required durable path, not just whether an HTTP
+handler answers. Shutdown stops new admissions, drains bounded in-flight commits, tells
+clients to reconnect, and releases ownership only under the fencing protocol. A log line
+saying “graceful shutdown” is not that protocol.
 
-That boundary remains explicit in both the API and the storage model.
+## ⚖️ Trade-offs and close — 2 minutes
 
-It is the final criterion I would use before adding CRDT complexity.
+| Decision | Chosen approach | Alternative |
+|---|---|---|
+| Order | ✅ Fenced owner per file | ❌ Independent writers with wall-clock timestamps |
+| Recovery | ✅ Verified snapshot and contiguous log | ❌ Unversioned canvas replacement |
+| Retry | ✅ Durable receipt and payload digest | ❌ Temporary cache key alone |
+| Presence | ✅ Expiring connection state | ❌ Durable cursor history |
 
-## Trade-offs Summary
+> “The backbone is one recoverable order per file. That gives edits, retries,
+> reconnect, undo, and restore a common authority. I would prove the commit and
+> failover boundaries before increasing the number of editors or introducing
+> unrestricted offline merging.”
 
-| Decision | Chosen | Alternative | Rationale |
-|---|---|---|---|
-| Ordering | file-owned sequencer | multi-writer active-active | deterministic replay |
-| Collaboration | semantic operations | full scene saves | conflicts and undo |
-| Offline | bounded queue first | CRDT immediately | lower complexity initially |
-| Presence | ephemeral channel | durable operation log | cursors can drop |
-| Assets | direct signed upload | API proxy | bandwidth and scale |
-| Recovery | snapshots plus log | full reload | bounded failover |
-| Plugins | capability API | unrestricted code | security and ownership |
-
-## Closing — 3 minutes
-
-The backend treats the scene document as a revisioned operation stream with verified snapshots. The sequencer owns order, the document store owns durable state, the presence broker owns ephemeral collaboration, and object storage owns assets.
-
-I would build one-file sequencing, snapshots, operation retry, basic presence, and signed assets first. I would add CRDT offline editing, hot-file partitioning, richer plugin isolation, and export workers only after measuring real collaboration and asset workloads.
+The repository currently uses independent operation inserts and full JSONB writes, with no
+authenticated browser identity, durable receipt replay, fenced owner, or cross-server
+broadcast. Those limitations are documented in [architecture.md](./architecture.md). The
+system described here is the proposed design beyond that learning demo.

@@ -1,162 +1,144 @@
-# Design DocuSign - Architecture
+# DocuSign architecture
 
 ## System Overview
 
-An electronic signature platform with document workflow automation. Core challenges involve document processing pipelines, workflow state machine orchestration, tamper-proof audit trails for legal compliance, and multi-party signing flows with configurable routing orders.
+This learning project models an electronic signature envelope: a sender prepares documents and recipient fields, recipients review and complete their assigned actions, and the system records the resulting workflow. The design challenge is keeping document identity, recipient authority, recorded actions, and the final downloadable artifact consistent through retries and failures.
 
-**Learning Goals:**
-- Build document processing pipelines
-- Design workflow state machines
-- Implement tamper-proof audit trails
-- Handle multi-party signing flows
+The production sections below are a proposal. The repository has one Express API, a React application, PostgreSQL, Valkey/Redis, MinIO, and an incompatible RabbitMQ worker. It does not implement the full production workflow or demonstrate legal compliance. The **Database Schema** reproduces the actual initialization SQL; the final **Implementation Notes** trace current behavior and defects to source. Setup and fixture instructions are in [README.md](./README.md).
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — production proposal
 
-1. **Upload**: Upload PDF documents for signing
-2. **Prepare**: Add signature fields (signature, initial, date, text, checkbox) and assign recipients
-3. **Route**: Send to recipients in configurable order (serial or parallel)
-4. **Sign**: Capture legally binding electronic signatures (draw, type, upload)
-5. **Complete**: Generate signed document with audit trail and certificate of completion
+1. A sender uploads PDFs, places fields, assigns recipients to serial or parallel stages, and explicitly sends an immutable document revision.
+2. Each signer reviews the exact revision, completes required fields, explicitly confirms their action, and can decline. Authority is checked again when recording an action.
+3. Only the active signing stage may proceed. Completion, decline, expiration, and sender withdrawal have deterministic ordering under concurrency.
+4. A sender can track workflow progress and delivery attempts. Participants can retrieve an authorized final artifact and its evidence manifest when generation succeeds.
+5. Administrators can investigate failures through controlled access, with their actions recorded separately from participant actions.
 
-### Non-Functional Requirements
+Templates, collaborative editing, identity-provider integrations, payment collection, and offline submission are outside the initial production scope. Retention, consent language, and identity assurance must be specified for the intended product and jurisdiction; a hash chain alone does not establish those requirements.
 
-- **Availability**: 99.99% for signing ceremonies (users may have legal deadlines)
-- **Durability**: Documents stored for 10+ years with tamper-evidence
-- **Compliance**: ESIGN Act, UETA, eIDAS compliant
-- **Security**: End-to-end encryption, SOC 2 compliant
-- **Consistency**: Strong consistency for state transitions; no double-signing
-- **Latency**: Signature capture < 500ms p99; document rendering < 2s
+### Non-functional requirements — proposed targets
+
+| Requirement | Target and boundary |
+|-------------|---------------------|
+| Availability | 99.9% monthly for authenticated metadata reads and action submission within the home region; storage/provider outages tracked separately |
+| API latency | p95 under 300 ms for small metadata operations; file transfer, parsing, and artifact generation have separate budgets |
+| Recording correctness | One accepted effect per scoped operation ID, with immutable receipts; a timeout can leave the outcome unknown until reconciliation |
+| Document identity | Every accepted field action identifies an immutable document revision, page geometry version, and input digest |
+| Rendering | Usable first page within 2 seconds for an assumed 2 MiB ordinary PDF on the agreed reference device/network; measure larger/scanned documents separately |
+| Artifact readiness | p95 under 60 seconds after all signers finish for bounded documents; workflow completion and artifact availability are distinct |
+| Recovery | Acknowledgment requires the selected database replication policy; cross-region RPO/RTO are explicit deployment choices, not implied by an object store |
+
+These are design objectives, not measurements of this repository.
+
+## Capacity Estimation
+
+Assume 100,000 envelopes/day, three recipients per envelope, two 2 MiB documents per envelope, and three recorded field actions per recipient. Use a tenfold daily-average peak for an initial estimate, then validate actual business-hour and batch-send bursts.
+
+| Item | Calculation | Implication |
+|------|-------------|-------------|
+| Envelope creation | 100,000 / 86,400 ≈ 1.16/s average; 11.6/s assumed peak | No immediate reason to shard workflow metadata |
+| Field writes | 900,000/day ≈ 10.4/s average; 104/s assumed peak | Short SQL transactions are practical; contention is per envelope |
+| Original bytes | 100,000 × 2 × 2 MiB ≈ 391 GiB/day | Object transfer/storage dominates request counts |
+| One year of originals | About 139 TiB before replication, artifacts, versions, and overhead | Retention policy and storage class affect cost substantially |
+| Audit events | Assume 30/envelope: 3 million/day | Approximately 2.9 GiB/day at 1 KiB/event, excluding indexes/replicas |
+| Signature images | 900,000 × 20 KiB ≈ 17.2 GiB/day if every action were an image | An upper planning scenario; dates/text are smaller |
+
+### Local Development Scale
+
+One API and one browser are enough for fixture inspection. Compose supplies four backing services but no API/frontend container. Each API process permits up to 20 PostgreSQL connections. A 25 MiB upload is buffered and parsed inside the API, so concurrency multiplies memory consumption. The repository has no measured memory budget or load benchmark; running three APIs does not prove ordered workflow behavior.
 
 ## High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Client Layer                                  │
-│           Web App │ Mobile App │ API Integration                     │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                       API Gateway                                    │
-│               (Auth, Rate Limiting, TLS, WAF)                        │
-└──────────────────────────────┬──────────────────────────────────────┘
-              │                │                │
-              ▼                ▼                ▼
-   ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-   │ Document Service │ │ Workflow Engine  │ │ Signing Service  │
-   │                  │ │                  │ │                  │
-   │ - PDF processing │ │ - State machine  │ │ - Capture sigs   │
-   │ - Field placement│ │ - Routing logic  │ │ - Verify ID      │
-   │ - Templates      │ │ - Reminders      │ │ - Audit logging  │
-   │ - Page rendering │ │ - Notifications  │ │ - Idempotency    │
-   └────────┬─────────┘ └────────┬─────────┘ └────────┬─────────┘
-            │                    │                    │
-            └────────────────────┼────────────────────┘
-                                 │
-    ┌───────────────┬────────────┼────────────┬───────────────┐
-    ▼               ▼            ▼            ▼               ▼
-┌────────┐   ┌──────────┐  ┌─────────┐  ┌──────────┐  ┌──────────┐
-│Postgres│   │  Redis    │  │RabbitMQ │  │   S3     │  │Elastic   │
-│        │   │           │  │         │  │          │  │search    │
-│- Envlps│   │- Sessions │  │- Workflw│  │- Docs    │  │- Audit   │
-│- Recips│   │- Idemptncy│  │- Notifs │  │- Sigs    │  │  logs    │
-│- Fields│   │- Cache    │  │- Email  │  │- Certs   │  │- Search  │
-│- Audit │   │           │  │- PDF    │  │          │  │          │
-│- Idemp │   │           │  │- DLQ    │  │          │  │          │
-└────────┘   └──────────┘  └─────────┘  └──────────┘  └──────────┘
-```
-
-## Core Components
-
-### 1. Document Processing
-
-The document pipeline handles PDF upload, validation, page rendering for the field placement UI, and field coordinate storage. On upload, documents are validated and page-counted with pdf-lib (`backend/src/routes/documents.ts`) and the raw PDF is stored in MinIO. Page rendering for both the field-placement UI and the signing ceremony is done **client-side** with react-pdf (a PDF.js wrapper); fields are absolutely-positioned overlays keyed to page coordinates. (A production system might pre-render page images server-side to S3, but this implementation renders in the browser.)
-
-Field types include signature, initial, date, text, and checkbox. Each field is positioned at specific coordinates on a page and assigned to a recipient. Required fields must be completed before a recipient can finish their signing session.
-
-### 2. Workflow Engine (State Machine)
-
-The envelope lifecycle follows an explicit state machine with defined transitions:
+Production proposal: one home region owns mutations for each envelope. Boxes represent responsibilities that can begin as modules; drawing a box does not require an independently deployed service.
 
 ```
-                 ┌──────────────────────────────┐
-                 │           draft               │
-                 └──────┬──────────────┬─────────┘
-                        │              │
-                        ▼              ▼
-                 ┌──────────┐    ┌──────────┐
-                 │   sent   │    │  voided  │
-                 └─────┬────┘    └──────────┘
-                       │
-                       ▼
-                 ┌──────────┐
-                 │ delivered│
-                 └──┬───┬───┘
-                    │   │
-                    ▼   ▼
-            ┌────────┐ ┌─────────┐
-            │ signed │ │declined │
-            └───┬────┘ └─────────┘
-                │
-                ▼
-            ┌──────────┐
-            │completed │
-            └──────────┘
+┌───────────────────┐     ┌────────────────────┐
+│ Sender and signer │────▶│ Edge / API gateway │
+│ browser clients   │     │ Auth, admission    │
+└───────────────────┘     └────────────────────┘
+                                   │
+                                   ▼
+                          ┌────────────────────┐
+                          │ Envelope authority │
+                          │ Fields and stages  │
+                          └────────────────────┘
+                              │           │
+                              ▼           ▼
+                    ┌──────────────┐  ┌──────────────┐
+                    │ PostgreSQL   │  │ Private      │
+                    │ State, audit │  │ object store │
+                    │ Receipts,    │  │ Immutable    │
+                    │ outbox       │  │ versions     │
+                    └──────────────┘  └──────────────┘
+                           │                  ▲
+                           ▼                  │
+                    ┌──────────────┐  ┌───────────────┐
+                    │ Outbox relay │─▶│ Queue workers │
+                    │ Confirmed    │  │ PDF/evidence  │
+                    │ publication  │  │ Notifications │
+                    └──────────────┘  └───────────────┘
 ```
 
-**State transitions:**
-- `draft` -> `sent`, `voided`
-- `sent` -> `delivered`, `voided`
-- `delivered` -> `signed`, `declined`, `voided`
-- `signed` -> `completed`
-- `declined`, `voided`, `completed` -> (terminal states)
+Static application assets can use a CDN. Document bytes require authorized, version-bound delivery through a private storage gateway or narrowly scoped signed URLs. Email delivery and artifact generation are asynchronous; neither sits inside a workflow database lock. A protected evidence archive receives canonical records and signed checkpoints through retryable jobs.
 
-**Routing logic**: Recipients are ordered by `routing_order`. All recipients at the same routing order sign in parallel. When all recipients at one order complete, the next group is notified. When all signers complete, the envelope transitions to `completed`.
+## Core Components / Request Flows
 
-### 3. Signature Capture
+### Prepare and send
 
-Electronic signatures support three capture modes:
-- **Draw**: Canvas-based freehand drawing using `signature_pad` library
-- **Type**: Text rendered to canvas with cursive font
-- **Upload**: User uploads a signature image
+The document component validates upload size/type, quarantines and parses the PDF under resource limits, and records its object version, digest, page boxes, and rotation. The sender edits a draft revision with optimistic version checks. A send transaction locks the envelope, verifies that documents are ready and recipients/fields belong to that revision, freezes the revision, activates the first stage, and records audit, receipt, and outbox rows together.
 
-All modes produce base64-encoded PNG images stored in a separate S3 bucket with encryption. Each signature is linked to a specific field and recipient, with full audit trail recording IP address, user agent, and timestamp.
+Every draft mutation must acquire the same envelope guard or compare its draft version inside that transaction. Locking only the send method leaves a concurrent field update free to commit after the supposedly frozen snapshot. File uploads happen before the transaction; unattached objects need delayed cleanup that cannot delete a newly attached object.
 
-### 4. Tamper-Proof Audit Trail (Hash Chain)
+**Local mapping:** uploads use `pdf-lib` synchronously and a 25 MiB Multer memory buffer. There is no quarantine job, object digest, geometry metadata, or immutable revision. The send method locks an envelope, while validation reads use the general pool and other draft routes do not participate in that lock protocol.
 
-Every envelope action is recorded as an append-only audit event with a cryptographic hash chain. Each event includes a SHA-256 hash of its contents plus the hash of the previous event, forming a blockchain-like structure that makes any tampering immediately detectable.
+### Open, review, and record an action
 
-Chain verification walks the entire event history, recalculating hashes and verifying each link. A valid chain proves no events were inserted, deleted, or modified after the fact.
+A proposed token exchange validates the invite and creates a narrowly scoped signer session. Possession of an email link is an authentication signal, not proof of a person's identity. The session response identifies the recipient, envelope revision, available actions, and all assigned fields. The backend checks live workflow authority again on every write; a cached status or disabled button cannot authorize a signature.
 
-This provides the evidence trail required by ESIGN Act, UETA, and eIDAS for electronic signatures to be legally binding. In contract disputes, the audit chain serves as admissible evidence of who signed what, when, and from where.
+A signature image is staged under a new immutable object key and its bytes are validated. A short SQL transaction checks the current envelope/stage, claims the operation ID, locks the relevant field, references the staged object digest, records the action and audit event, and commits the receipt. The server returns success only for the recorded action. Required-field completion does not automatically imply that the recipient has confirmed Finish.
 
-### 5. Recipient Authentication
+**Local mapping:** the UI waits for an HTTP success before adding a checkmark, but sends no stable operation key. Session GET writes a camelcase Redis shape while authentication expects database column names. The resulting ordinary field submission fails ownership validation. Under the database fallback path, signing still lacks a transaction, field lock, uniqueness constraint, revision binding, and stage/expiration checks.
 
-Multi-factor verification based on envelope security level:
-- **Email link**: Default; access token in signing URL
-- **SMS verification**: One-time code sent to recipient's phone (5-minute expiry)
-- **Knowledge-based auth (KBA)**: Identity verification questions
-- **ID verification**: Government ID verification via third-party service
+### Finish and advance stages
+
+In the proposal, Finish serializes on the envelope and rechecks required values and the active stage. All signers sharing a stage may record independent field actions, but the short stage-advancement transaction decides once whether the next stage becomes active. Observers do not block a signer quorum; in-person signing requires its own expressly modeled authority if later added. The transaction appends notification and artifact jobs to the outbox.
+
+A competing Void and Finish is ordered by the same authority. If Void commits first, Finish is rejected; if all signatures are committed first, withdrawal follows the product's explicit terminal-state rule. The client presents the committed outcome, including after an ambiguous timeout.
+
+**Local mapping:** completion, decline, and void use separate unconditional updates. Selecting the next notification group filters `role = 'signer'`, but checking completion of its siblings includes every role, which can stall progress. All recipients receive tokens at send time; later-stage tokens are not prevented from authorizing an action.
+
+### Generate the final artifact and notify
+
+A proposed artifact job consumes the frozen revision, accepted field values/signature digests, and a specified audit sequence. It creates an output under a new immutable object key, verifies its digest, then conditionally marks the artifact ready for that generation ID. Duplicate workers cannot replace a newer generation. A downloadable manifest identifies every original and final document, accepted actions, canonical event hashes, and the protected checkpoint used to verify completeness.
+
+Notify participants only when the relevant artifact is available. Track queued, provider-accepted, delivered/bounced, and artifact-ready independently. An email provider accepting a request is not proof that the recipient received or read it.
+
+**Local mapping:** there is no flattening or artifact worker. Completion emails point to a frontend download route that does not exist. The certificate API creates a JSON report and verification boolean, selects one document name from an unordered join, and reads events and verification in separate queries.
 
 ## Database Schema
 
+The following is the complete checked-in [initialization schema](./backend/src/db/init.sql), not a proposed migration. Comments such as “append-only” are labels: the SQL does not enforce append-only access. The final seed-path comment is stale; the real seed is [seed-envelopes.ts](./backend/src/db/seed-envelopes.ts).
+
 ```sql
+-- DocuSign Database Schema
+
+-- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Users
+-- Users table
 CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email VARCHAR(200) UNIQUE NOT NULL,
   name VARCHAR(100) NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
-  role VARCHAR(30) DEFAULT 'user',
+  role VARCHAR(30) DEFAULT 'user', -- 'user', 'admin'
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Sessions
+-- Sessions table
 CREATE TABLE sessions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -170,8 +152,8 @@ CREATE TABLE envelopes (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   sender_id UUID REFERENCES users(id),
   name VARCHAR(200) NOT NULL,
-  status VARCHAR(30) DEFAULT 'draft',
-  authentication_level VARCHAR(30) DEFAULT 'email',
+  status VARCHAR(30) DEFAULT 'draft', -- 'draft', 'sent', 'delivered', 'signed', 'declined', 'voided', 'completed'
+  authentication_level VARCHAR(30) DEFAULT 'email', -- 'email', 'sms', 'knowledge', 'id_verification'
   message TEXT,
   expiration_date TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW(),
@@ -185,9 +167,9 @@ CREATE TABLE recipients (
   envelope_id UUID REFERENCES envelopes(id) ON DELETE CASCADE,
   name VARCHAR(100) NOT NULL,
   email VARCHAR(200) NOT NULL,
-  role VARCHAR(50) DEFAULT 'signer',
+  role VARCHAR(50) DEFAULT 'signer', -- 'signer', 'cc', 'in_person'
   routing_order INTEGER DEFAULT 1,
-  status VARCHAR(30) DEFAULT 'pending',
+  status VARCHAR(30) DEFAULT 'pending', -- 'pending', 'sent', 'delivered', 'completed', 'declined'
   access_token VARCHAR(255) UNIQUE,
   access_code VARCHAR(100),
   phone VARCHAR(50),
@@ -204,7 +186,7 @@ CREATE TABLE documents (
   name VARCHAR(200) NOT NULL,
   page_count INTEGER,
   s3_key VARCHAR(500) NOT NULL,
-  status VARCHAR(30) DEFAULT 'processing',
+  status VARCHAR(30) DEFAULT 'processing', -- 'processing', 'ready', 'error'
   file_size INTEGER,
   created_at TIMESTAMP DEFAULT NOW()
 );
@@ -214,7 +196,7 @@ CREATE TABLE document_fields (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
   recipient_id UUID REFERENCES recipients(id) ON DELETE CASCADE,
-  type VARCHAR(30) NOT NULL,
+  type VARCHAR(30) NOT NULL, -- 'signature', 'initial', 'date', 'text', 'checkbox'
   page_number INTEGER NOT NULL,
   x DECIMAL NOT NULL,
   y DECIMAL NOT NULL,
@@ -233,16 +215,18 @@ CREATE TABLE signatures (
   recipient_id UUID REFERENCES recipients(id) ON DELETE CASCADE,
   field_id UUID REFERENCES document_fields(id) ON DELETE CASCADE,
   s3_key VARCHAR(500) NOT NULL,
-  type VARCHAR(30) NOT NULL,
+  type VARCHAR(30) NOT NULL, -- 'draw', 'typed', 'upload'
   ip_address VARCHAR(50),
   user_agent TEXT,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Add foreign key for signature_id in document_fields
 ALTER TABLE document_fields
-ADD CONSTRAINT fk_signature FOREIGN KEY (signature_id) REFERENCES signatures(id);
+ADD CONSTRAINT fk_signature
+FOREIGN KEY (signature_id) REFERENCES signatures(id);
 
--- Audit Events (append-only, never delete)
+-- Audit Events (append-only)
 CREATE TABLE audit_events (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   envelope_id UUID REFERENCES envelopes(id) ON DELETE CASCADE,
@@ -255,15 +239,15 @@ CREATE TABLE audit_events (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Email notifications (simulated in local, real in production)
+-- Email notifications (simulated)
 CREATE TABLE email_notifications (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   recipient_id UUID REFERENCES recipients(id) ON DELETE CASCADE,
   envelope_id UUID REFERENCES envelopes(id) ON DELETE CASCADE,
-  type VARCHAR(50) NOT NULL,
+  type VARCHAR(50) NOT NULL, -- 'signing_request', 'reminder', 'completed', 'declined', 'voided'
   subject VARCHAR(255),
   body TEXT,
-  status VARCHAR(30) DEFAULT 'pending',
+  status VARCHAR(30) DEFAULT 'pending', -- 'pending', 'sent', 'failed'
   sent_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW()
 );
@@ -280,16 +264,18 @@ CREATE TABLE templates (
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Idempotency keys (prevents duplicate signatures)
+-- Idempotency keys for preventing duplicate operations
+-- Critical for legal document signing to prevent double-signing
 CREATE TABLE idempotency_keys (
   key VARCHAR(255) PRIMARY KEY,
   response JSONB NOT NULL,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Index for cleaning up old idempotency keys
 CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
 
--- Performance indexes
+-- Indexes
 CREATE INDEX idx_envelopes_sender ON envelopes(sender_id);
 CREATE INDEX idx_envelopes_status ON envelopes(status);
 CREATE INDEX idx_recipients_envelope ON recipients(envelope_id);
@@ -302,436 +288,174 @@ CREATE INDEX idx_audit_envelope ON audit_events(envelope_id, timestamp);
 CREATE INDEX idx_audit_type ON audit_events(event_type);
 CREATE INDEX idx_sessions_token ON sessions(token);
 CREATE INDEX idx_sessions_user ON sessions(user_id);
+
+-- Seed data is in db-seed/seed.sql
 ```
+
+The proposed production design needs additional schema work: document/revision digests and page geometry, envelope versions and explicit stages, unique accepted field actions, scoped operation IDs with request digests and immutable responses, per-envelope audit sequence/head, transactional outbox/consumer receipts, and separately versioned artifact records. It also needs stronger NOT NULL, enum/range, and same-envelope constraints. None of those additions should be inferred from the SQL above.
+
+The local `sessions` and `templates` tables have no active corresponding persistence/API flow. Authentication uses Redis. `signatures.field_id` is not unique, `recipient_id` and `document_id` can reference different envelopes, and timestamp ordering does not provide a unique audit sequence. `DECIMAL` geometry can arrive from PostgreSQL as strings; the viewer's `toPx` helper converts it to a CSS number, not to a normalized coordinate.
+
+## API Design
+
+Actual paths use `/api/v1`. This table summarizes the wire surface; permissions still have the implementation gaps listed below. In contrast, the operation/status, token-exchange, artifact, and revision APIs described in the production flows are proposed additions.
+
+| Method | Path after `/api/v1` | Purpose / authority |
+|--------|----------------------|---------------------|
+| POST | `/auth/register`, `/auth/login`, `/auth/logout` | Account/session operations |
+| GET | `/auth/me` | Current authenticated user |
+| PUT | `/auth/password` | Change password; existing sessions are not revoked |
+| GET / POST | `/envelopes` | Sender's paginated list / new draft |
+| GET / PUT / DELETE | `/envelopes/:id` | Sender detail / draft edits / draft deletion |
+| POST | `/envelopes/:id/send`, `/envelopes/:id/void` | Sender lifecycle actions |
+| GET | `/envelopes/stats/summary` | Sender counters |
+| POST | `/documents/upload/:envelopeId` | Multipart field `document`, PDF up to 25 MiB |
+| GET | `/documents/:id`, `/documents/:id/view`, `/documents/:id/download` | Metadata with presigned URL / original bytes |
+| GET / DELETE | `/documents/envelope/:envelopeId` / `/documents/:id` | List / delete draft document metadata |
+| POST | `/recipients/:envelopeId` | Add recipient to draft |
+| GET | `/recipients/envelope/:envelopeId` | List recipients |
+| PUT / DELETE | `/recipients/:id` | Change / remove recipient |
+| POST | `/recipients/envelope/:envelopeId/reorder` | Sequential draft order updates |
+| POST | `/fields/:documentId`, `/fields/bulk/:documentId` | Add one or several draft fields |
+| GET / PUT / DELETE | `/fields/document/:documentId` / `/fields/:id` / `/fields/:id` | List / change / remove fields |
+| GET | `/signing/session/:accessToken` | Token session bootstrap; currently caches incompatible identifier names |
+| GET | `/signing/document/:accessToken/:documentId` | Token-scoped original PDF; no lifecycle/expiration check here |
+| POST | `/signing/sign/:accessToken`, `/signing/complete-field/:accessToken` | Image capture / non-signature field completion |
+| POST | `/signing/finish/:accessToken`, `/signing/decline/:accessToken` | Recipient decision |
+| GET | `/signing/signature-image/:signatureId/:accessToken` | Presigned image URL after signer middleware |
+| GET | `/audit/envelope/:id`, `/audit/verify/:id`, `/audit/certificate/:id` | Sender audit data / check / completed-envelope JSON certificate |
+| GET | `/audit/public/verify` | Unauthenticated envelope/hash lookup exposing selected workflow/participant data |
+| GET | `/admin/stats`, `/admin/users`, `/admin/envelopes`, `/admin/envelopes/:id`, `/admin/emails`, `/admin/emails/envelope/:id` | Administrator data |
+| PUT / DELETE | `/admin/users/:id/role` / `/admin/users/:id` | Administrator user management |
+
+For example, the actual single-field POST accepts `recipientId`, `type`, `pageNumber`, `x`, `y`, optional `width`/`height`, and `required`; it returns `{ field }`. These values are viewer pixels. The signing POST accepts `fieldId`, `signatureData`, and `type`. Responses are route-specific objects and `{ error }` failures, not a shared validated envelope. The JSON body limit is 50 MB as configured in Express, separate from the multipart PDF limit.
 
 ## Key Design Decisions
 
-### 1. Hash Chain for Audit Trail vs Simple Logging
+### Serialize workflow authority, then dispatch effects
 
-**Decision**: Link audit events with cryptographic hash chain.
+Choose short PostgreSQL transactions on the envelope aggregate. At the assumed peak, a few hundred small writes per second are manageable without distributing an individual envelope's authority. A last-signer race and a concurrent sender withdrawal become ordered decisions rather than independently emitted events that need compensation after acceptance.
 
-Each event's SHA-256 hash includes the previous event's hash, forming an immutable chain. Simple append-only logging provides no tamper evidence -- a database administrator could modify, insert, or delete records without detection. The hash chain makes any modification immediately detectable by walking the chain and recalculating hashes. Under ESIGN Act and eIDAS, the ability to prove document integrity in court is not optional -- it is a compliance requirement.
+An event-driven implementation can still use a state machine, but independently updating state and publishing notifications creates a concrete crash gap: the state commits, the process dies, and the next signer is never invited. A transactional outbox closes that gap for job creation; a relay publishes confirmed messages and may deliver duplicates. The costs are outbox lag, cleanup, and consumer deduplication. Avoid making the signing request wait for email or PDF generation.
 
-The trade-off: hash chain verification is O(N) in the number of events per envelope. For typical envelopes (5-50 events), this is negligible. For bulk verification across thousands of envelopes, a background job handles the cost.
+### Use one geometry contract for authoring, viewing, and output
 
-### 2. Explicit State Machine vs Event Sourcing
+Choose a versioned page coordinate convention and use the PDF viewport transform in both directions. For example, store rectangles in the immutable PDF page's native coordinates, with the page box, rotation, and user-unit interpretation supplied by its parser. Convert pointer coordinates relative to the rendered page, not its padded container. Convert a rectangle using its corners so rotation is handled correctly.
 
-**Decision**: Explicit state machine with allowed transitions stored in code.
+Plain CSS pixels match only the original layout. Normalized top-left fractions also work if the normalized page view, rotation, and crop-box semantics are specified; they are not inherently more correct than PDF coordinates. CSS display size and canvas device-pixel ratio are different inputs. [PDF.js's rendering example](https://mozilla.github.io/pdf.js/examples/) illustrates viewport transforms and separate output scaling. Choosing the native-page contract costs transform testing but allows the final artifact renderer to reproduce the placement.
 
-Event sourcing would provide a complete history of state changes and enable temporal queries, but adds significant complexity: event stores, projections, eventual consistency between read and write models, and snapshot management. For document signing, the workflow is well-defined with a small number of states and transitions. An explicit state machine provides clear business rules, prevents invalid states at the code level, maps directly to UI states, and is dramatically easier to debug. The trade-off: we lose the ability to replay events to reconstruct state, but the audit trail provides equivalent historical visibility.
+### Bind evidence to immutable content and an independent reference
 
-### 3. Separate Signature Storage
+A per-envelope hash chain can expose accidental changes only if its payload encoding, sequence, and expected head are trustworthy. Serialize a canonical, versioned payload containing actor, action, document/field revision, image/value digests, consent version, and authoritative recording time. Append under the same transaction/sequence guard as the business event.
 
-**Decision**: Store signatures in a separate S3 bucket from documents.
-
-Documents and signatures have different security, retention, and access patterns. Signatures contain biometric-like data (handwriting patterns) requiring enhanced protection. Separate buckets enable independent encryption keys, retention policies, and access controls. The trade-off: downloading a complete signed document requires fetching from two sources, adding latency. For the signing ceremony (where speed matters), signatures are uploaded to the signature bucket and only composited into the final PDF during the completion step.
-
-### 4. Idempotency for Signature Operations
-
-**Decision**: Two-layer idempotency (Redis fast path + PostgreSQL durable backup).
-
-For electronic signatures, idempotency is legally critical. A duplicate signature due to a network retry could invalidate a document, break the audit chain, or create ambiguous legal standing. Redis provides sub-millisecond duplicate detection for the fast path; PostgreSQL ensures idempotency survives Redis restarts. The idempotency key format (`sig:{fieldId}:{recipientId}:{hourBucket}`) uses 1-hour time buckets to allow legitimate re-signs after genuine failures while catching rapid duplicates.
+A chain stored beside mutable application data can be rewritten or truncated with that data. Export signed checkpoints containing the expected sequence count and head digest to separately controlled storage, and retain verification keys and serialization versions. This adds operational and key-management costs; a signature image or a green hash badge alone cannot substitute for those controls. It also does not by itself prove the person's identity or legal enforceability.
 
 ## Consistency and Idempotency
 
-### Consistency Model
+The production operation key is scoped to actor/session, envelope revision, action, and operation ID. Associate it with a request digest; reusing a key with different input is a conflict. A unique receipt and the business mutation commit together. A repeated operation returns its stored result, while a different operation racing for an already completed field returns a meaningful conflict that the client reconciles. Never treat every HTTP 409 as success.
 
-**Strong Consistency (PostgreSQL):**
-- All envelope state transitions use `SELECT ... FOR UPDATE` row locks
-- Signature capture locks the field row to prevent concurrent double-signing
-- Recipient completion and workflow advancement run in a single transaction
+A staged object upload cannot share the SQL transaction. Use immutable object keys, validate the stored content before accepting its reference, and collect unattached objects after a safe retention window. A provider or object-store timeout may mean the side effect occurred; use known object IDs or provider receipts to reconcile instead of blindly issuing a new logical action.
 
-**Eventual Consistency:**
-- Redis session/idempotency cache invalidation propagates within 100ms
-- Notification delivery is async via RabbitMQ (at-least-once semantics)
+The current [idempotency helper](./backend/src/shared/idempotency.ts) performs Redis lookup, SQL lookup, the operation, and independent cache/SQL receipt writes. There is no atomic reservation or payload/actor binding. Redis failures skip SQL lookup because both are inside one try block; failures warming Redis also discard a SQL hit. Concurrent checks can both miss and execute. Generated keys include the current hour, while cache/lookup retention is 24 hours; those are different concepts. SQL `ON CONFLICT DO NOTHING` can retain an old response while Redis is overwritten, and old rows are not automatically cleaned up.
 
-### Idempotent Operations
+The signature route checks field completion before looking for a receipt, so a normal replay can return 400 before it reaches a previously stored result. The middleware-generated key is assigned to the request but the critical routes use a header or their own generated keys. The frontend sends neither a stable key nor a revision. None of these paths provides an end-to-end exactly-once guarantee.
 
-| Operation | Key Format | Replay Behavior |
-|-----------|-----------|-----------------|
-| Send envelope | `send:{envelopeId}:{userId}:{hourBucket}` | Return original response |
-| Capture signature | `sig:{fieldId}:{recipientId}:{hourBucket}` | Return existing signature |
-| Complete recipient | `complete:{recipientId}:{hourBucket}` | Return existing completion |
+## Security / Auth
 
-## Async Queue Architecture (RabbitMQ)
+Production controls include secure sender sessions, expiring and revocable signer invitations, live authorization on every action, upload resource limits, private versioned objects, and actor-scoped administrative permissions. Rate limits belong at the edge and expensive parsing/signing endpoints. Remove invite credentials from logs and referrers; a proposed token exchange should not consume the only usable invitation merely because an email scanner fetched a URL.
 
-### Queue Topology
+Local sender authentication uses bcrypt and a Redis session lasting 24 hours. Cookies are HttpOnly, SameSite=Lax, and secure only under `NODE_ENV=production`; login/register responses also include the token. User roles are loaded from SQL on authenticated requests. Recipient access tokens are separate from account sessions and remain in URLs and database rows. SMS helpers and authentication-level fields have no active verification flow. No rate limiter, request-schema validation layer, invite expiration enforcement, or document security review is implemented.
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│                     RabbitMQ Exchanges                          │
-├──────────────────┬────────────────────┬────────────────────────┤
-│  docusign.direct │  docusign.fanout   │  docusign.dlx          │
-│  (direct)        │  (fanout)          │  (dead letter)         │
-└────────┬─────────┴────────┬───────────┴──────────┬─────────────┘
-         │                  │                      │
-    ┌────▼────┐        ┌────▼────┐           ┌────▼────┐
-    │workflow │        │  notif  │           │   DLQ   │
-    │  queue  │        │  queue  │           │         │
-    └────┬────┘        └────┬────┘           └─────────┘
-         │                  │
-    ┌────▼────┐        ┌────▼────┐
-    │Workflow │        │Notifier │
-    │ Worker  │        │ Worker  │
-    └─────────┘        └─────────┘
-```
+A draft field's single-create route checks type, page range, sender, and recipient-envelope membership. Updates omit some type/page checks; bulk inserts omit recipient-envelope/type/page validation and run sequentially without a transaction. Sender draft checks race with sending. Signing accepts an image on field types beyond signatures, and non-signature completion validates completion flags more strongly than actual required values. These are authority/validation gaps, not UI features.
 
-### Delivery Semantics
-
-| Queue | Semantics | Reasoning |
-|-------|-----------|-----------|
-| workflow | At-least-once | State transitions are idempotent |
-| notifications | At-least-once | Duplicate notification is acceptable |
-| email | At-least-once | External email APIs handle dedup |
-| pdf | At-least-once | PDF generation is idempotent |
-
-Messages are persistent (survive broker restart). Failed messages retry with exponential backoff (1s, 2s, 4s, max 60s) up to 3 times before routing to DLQ via dead-letter exchange. Consumer prefetch limits concurrent processing for backpressure.
-
-## Security
-
-### Authentication
-
-- **Senders**: Session-based auth with Redis-backed cookies (24-hour TTL)
-- **Signers**: Access token in URL, generated per-recipient on envelope send
-- **Admin**: Session-based with `role = 'admin'`
-
-### Signing Session Security
-
-Each recipient gets a unique, single-use access token. The signing session captures IP address and user agent, recorded in the audit trail. Field-level locking (`SELECT ... FOR UPDATE`) prevents concurrent signing of the same field.
-
-### Document Security
-
-Documents encrypted at rest in S3 (server-side encryption). Separate buckets for documents and signatures with independent access policies. Audit events are append-only with hash chain tamper evidence.
+Compose grants anonymous object download. The signer PDF route checks token membership but not current envelope state, so withdrawing an envelope is not equivalent to revoking byte access. Public audit lookup exposes the envelope name/status, participant names, partially masked emails, and times; it is not document-byte verification. Logs can contain full token paths. PDF.js and a browser worker are parsing mechanisms, not an assurance that arbitrary uploads are harmless.
 
 ## Observability
 
-### Metrics (Prometheus)
+The API exposes `/metrics`, `/health`, `/health/live`, and `/health/ready`. [metrics.ts](./backend/src/shared/metrics.ts) registers HTTP, signature, envelope, audit, idempotency, storage-breaker, and database/queue gauges; [logger.ts](./backend/src/shared/logger.ts) supplies Pino request and audit children. Instrumentation is partial: the shared audit helper increments counters while the other writer does not, storage wrapper duration timers finish on success only, and route labels can fall back to raw paths. Dashboard totals and background gauges are not one consistent snapshot.
 
-| Metric | Type | Labels |
-|--------|------|--------|
-| `docusign_documents_total` | Counter | - |
-| `docusign_envelopes_by_status` | Gauge | status |
-| `docusign_signatures_captured_total` | Counter | - |
-| `docusign_signatures_pending` | Gauge | - |
-| `docusign_http_request_duration_seconds` | Histogram | method, route, status_code |
-| `docusign_queue_messages_published_total` | Counter | queue |
-| `docusign_queue_messages_processed_total` | Counter | queue, status |
-| `docusign_circuit_breaker_state` | Gauge | name |
-| `docusign_storage_operation_duration_seconds` | Histogram | operation, bucket |
-| `docusign_idempotency_hits_total` | Counter | operation |
-| `docusign_audit_events_total` | Counter | event_type |
+The comprehensive health endpoint probes SQL, Redis, MinIO, and queue state. Readiness checks only SQL and Redis. The MinIO probe treats a non-throwing `bucketExists` result as healthy even if false. Queue health is based partly on stored channel references, which can survive a failed/closed connection; queue-detail errors can be reported as null under a connected status. Startup logs “RabbitMQ connected” even when queue initialization returned false. Thus green health is not a test of signing or email delivery.
 
-### Health Checks
-
-Three levels of health endpoints:
-- **`/health/live`**: Liveness probe -- process running (always 200)
-- **`/health/ready`**: Readiness probe -- PostgreSQL and Redis connectivity
-- **`/health`**: Comprehensive -- all dependencies with latency and circuit breaker states
-
-### Logging
-
-Structured JSON via Pino with separate audit logger. Compliance-sensitive events tagged with `type: "audit"` for segregated log streams. Development mode uses pino-pretty.
+Production metrics should follow outcomes: accepted actions, unknown outcomes resolved, authorization rejections, oldest outbox age, notification provider receipt age, artifact-generation lag, and evidence verification failures. Use aggregate labels, with restricted access to detailed event records. Alert on work age and stuck states, not only process liveness.
 
 ## Failure Handling
 
-### Circuit Breaker Pattern
+| Failure | Proposed behavior | Current implementation |
+|---------|-------------------|------------------------|
+| Timeout after action commit | Query/replay scoped receipt | UI gets generic error; receipt may be absent despite state changes |
+| Object storage unavailable | Bound the call, preserve user input, reconcile staged upload | Only signature upload/image URL use wired breakers; document routes call raw helpers |
+| Redis unavailable | Reject session-dependent actions; read durable operation receipts where appropriate | Required user sessions fail; idempotency helper treats failure as a miss |
+| Broker unavailable | SQL outbox retains jobs for retry | Startup continues; selected notifications synchronously simulate email |
+| Worker crash or poison message | Durable retry, consumer receipt, verified quarantine routing | Payload/schema mismatch; direct worker nacks without requeue |
+| Concurrent finish/void | One guarded transition wins | Separate updates can produce inconsistent terminal states or duplicate notifications |
+| Audit append fails | Roll back the business transaction | One writer throws after effects; the shared writer logs and returns null |
+| Process shutdown | Stop admission and drain bounded work | API signal handler exits immediately |
 
-Opossum circuit breakers protect MinIO/S3 storage operations. Configuration: 30-second timeout, 50% error threshold, 30-second reset. When open, non-critical storage reads return cached data; critical writes are queued for retry.
-
-### Retry Strategy
-
-| Operation | Max Retries | Backoff | Dead Letter |
-|-----------|------------|---------|-------------|
-| Storage upload | 3 | Exponential: 1s, 2s, 4s | Queue for retry |
-| Notification delivery | 3 | Exponential: 1s, 2s, 4s | DLQ |
-| Workflow event | 3 | Exponential: 1s, 2s, 4s, max 60s | DLQ |
-| Signature capture | 0 (fail fast) | N/A | Return error |
-
-### Graceful Degradation
-
-| Component Failure | Degradation Strategy |
-|-------------------|---------------------|
-| Redis down | Idempotency falls back to PostgreSQL-only checks |
-| RabbitMQ down | Notifications sent synchronously (slower but functional) |
-| MinIO down | Circuit breaker opens; existing documents served from cache |
+Registered Opossum storage breakers have 50% error thresholds, a 30-second reset, and minimum volume five; wrapper-specific timeouts range from 5 to 30 seconds. Only signature upload and signature URL retrieval are imported by signing routes. No fallback queues uploads or serves cached documents. A breaker timeout does not cancel an already initiated storage write.
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+At the stated envelope rate, start with one regional PostgreSQL authority and stateless API replicas. Keep uploads and parsing out of locks, bound file-processing concurrency, and deliver bytes from authorized object storage. Add indexes/pagination based on observed access patterns before sharding. A global sender with a very large recipient list needs product limits, not an unbounded transaction.
 
-1. **API Servers**: Stateless, add instances behind load balancer
-2. **Workers**: Add notification/workflow workers, each consumes from shared queue
-3. **PostgreSQL**: Read replicas for envelope listings and audit queries
-4. **S3/MinIO**: Inherently scalable object storage
-5. **RabbitMQ**: Clustering for high availability
+Partition audit history and outbox maintenance by time while preserving per-envelope sequence. Retention must consider original objects, generated artifacts, signatures, event manifests, receipts, and verification material together. Removing a metadata row is not an object-deletion policy. Cross-region failover must fence the old writer and specify which acknowledgments remain durable before accepting new mutations.
 
-### Document Storage Scaling
-
-At production scale (millions of envelopes), storage is organized by envelope ID prefix for S3 listing performance: `envelopes/{id-prefix}/{id}/documents/`. Separate lifecycle policies archive completed envelopes to cold storage after 1 year while maintaining the legally required 10-year retention.
-
-### Audit Trail at Scale
-
-For high-volume deployments, audit events are also indexed in Elasticsearch for fast search across millions of envelopes. The PostgreSQL table remains the source of truth for chain verification; Elasticsearch provides the search/analytics layer.
+On the browser, render one page or a small visible window, keep the field checklist independent of mounted pages, and bound canvas pixel area. Backend list pagination and frontend pagination controls are separate work: the current UI discards list pagination metadata. Sender status updates can begin with bounded visible-page polling; use SSE only if measured freshness needs justify connection management and resynchronization.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Audit integrity | Hash chain | Simple logging | Legal compliance, tamper evidence |
-| Document storage | S3 with KMS encryption | Database BLOBs | Scale, durability, independent retention |
-| Workflow | Explicit state machine | Event sourcing | Clarity, simpler debugging, maps to UI |
-| Authentication | Multi-factor per level | Email only | Security, eIDAS compliance |
-| Idempotency | Redis + PostgreSQL dual-layer | Redis only | Durability across restarts |
-| Notifications | Async queue with fallback | Synchronous only | Decouples signing from delivery |
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-The frontend is a React SPA built with Vite, TypeScript, and Tailwind CSS. It provides two distinct user experiences: the **sender flow** (creating envelopes, adding documents, placing fields, managing recipients) and the **signing ceremony** (recipients opening a link, viewing the document, and signing fields).
-
-```
-__root.tsx (RootComponent)
-├── Header (DocuSign logo, nav: Dashboard, Envelopes, Admin [role-gated])
-├── checkAuth() on mount to restore session
-└── <Outlet /> renders child routes:
-    ├── /login ──────────────── Login (email + password)
-    ├── /register ──────────── Register (email, name, password)
-    ├── / ──────────────────── Dashboard (envelope stats summary)
-    ├── /envelopes ─────────── Envelope List (filterable by status)
-    ├── /envelopes/new ─────── Create Envelope (name + message form)
-    ├── /envelopes/$envelopeId ── Envelope Detail (tabbed interface)
-    │   ├── DocumentsTab
-    │   │   └── PdfViewer (react-pdf rendering with page navigation)
-    │   ├── RecipientsTab (add/remove recipients, set routing order)
-    │   ├── FieldsTab
-    │   │   ├── PdfViewer (with click-to-add field overlay)
-    │   │   └── FieldsSidebar (field type selector, recipient assignment)
-    │   └── AuditTab (hash chain event timeline with verification)
-    ├── /sign/$accessToken ─── Signing Ceremony (token-based, no login required)
-    │   ├── SigningHeader (envelope info, Finish/Decline buttons)
-    │   ├── SigningPdfViewer (document with clickable field overlays)
-    │   ├── SigningSidebar (field completion checklist)
-    │   └── SignatureModal (draw with signature_pad / type with preview)
-    ├── /signing-complete ──── Signing Complete (confirmation page)
-    ├── /signing-declined ──── Signing Declined (confirmation page)
-    ├── /admin ────────────── Admin Dashboard (stats, user list, envelope inspector, email log)
-    │
-    └── Components organized by feature:
-        ├── components/common/ → LoadingSpinner, MessageBanner, StatusBadge (barrel export)
-        ├── components/envelope/ → DocumentsTab, PdfViewer, RecipientsTab, FieldsTab, FieldsSidebar, AuditTab
-        ├── components/signing/ → SignatureModal, SigningPdfViewer, SigningSidebar, SigningHeader, error/loading states
-        └── components/icons/ → CheckIcon, CloseIcon, PdfIcon, WarningIcon (SVG components with barrel export)
-```
-
-### Zustand Stores
-
-**`authStore`**: Manages user session state. Stores `User` object, `isAuthenticated` flag, loading state, and error. Actions: `login()`, `register()`, `logout()`, `checkAuth()`, `clearError()`. The `checkAuth()` action is called on mount in `__root.tsx` via `useEffect` to restore sessions from the HTTP-only cookie. The `isAuthenticated` flag drives conditional rendering of navigation links and the admin tab (which also checks `user.role === 'admin'`).
-
-**`envelopeStore`**: Central state for the entire envelope workflow. Stores the envelope list, current envelope detail, documents array, recipients array, and fields array. This single store coordinates all CRUD operations across four entity types:
-- **Envelope actions**: `fetchEnvelopes()`, `fetchEnvelope()` (loads envelope + documents + recipients + fields in one call), `createEnvelope()`, `updateEnvelope()`, `sendEnvelope()`, `voidEnvelope()`, `deleteEnvelope()`
-- **Document actions**: `uploadDocument()` (uses FormData for file upload, not JSON), `deleteDocument()` (also removes associated fields from local state)
-- **Recipient actions**: `addRecipient()`, `updateRecipient()`, `deleteRecipient()` (also removes associated fields)
-- **Field actions**: `addField()`, `updateField()`, `deleteField()`
-- **Cleanup**: `clearCurrent()` resets current envelope, documents, recipients, and fields when navigating away
-
-The store's optimistic local state updates (e.g., filtering out deleted items from arrays without refetching) provide a responsive UI. Error handling sets the store's `error` field, which components can display via `MessageBanner`.
-
-### Routing
-
-Uses TanStack Router with file-based routing. Notable routing patterns:
-- **Nested dynamic route**: `/envelopes/$envelopeId` extracts the envelope UUID from the URL for detail views
-- **Token-based signing route**: `/sign/$accessToken` is accessible without authentication -- the access token in the URL serves as the auth credential for the signing ceremony
-- **Role-gated admin route**: `/admin` checks `user.role === 'admin'` in the component and shows an "Access Denied" message for non-admin users
-- **Post-signing confirmation routes**: `/signing-complete` and `/signing-declined` are simple static pages shown after the signing ceremony
-
-### Data Fetching
-
-API calls use a centralized `fetchWithAuth()` function with `credentials: 'include'` for session cookies. The API service is organized into seven domain objects: `authApi`, `envelopeApi`, `documentApi`, `recipientApi`, `fieldApi`, `signingApi`, and `auditApi`, plus `adminApi` for admin operations.
-
-The signing API (`signingApi`) is unique: it uses raw `fetch()` calls instead of `fetchWithAuth()` because signing sessions authenticate via the access token in the URL rather than session cookies. This allows external signers (who are not registered users) to sign documents.
-
-Document uploads use `FormData` instead of JSON, which is the standard approach for file uploads. The `documentApi.upload()` method creates a `FormData` object and omits the `Content-Type` header (letting the browser set the multipart boundary automatically).
-
-Document viewing uses URL construction rather than fetch: `documentApi.view(id)` returns a URL string that can be set as the `src` of react-pdf's Document component. This avoids loading entire PDFs into JavaScript memory.
-
-### Key UI Patterns
-
-- **Tabbed envelope detail**: The envelope detail page uses tab navigation (Documents, Recipients, Fields, Audit) rather than separate routes. Each tab is a component that reads from the shared `envelopeStore`. This keeps all envelope data in one store and avoids re-fetching when switching tabs.
-- **Click-to-add field placement**: On the Fields tab, the `PdfViewer` renders the document, and clicking on the PDF calculates page-relative coordinates for field placement. The `FieldsSidebar` selects the field type and target recipient. Fields are rendered as CSS absolute-positioned overlays on top of the PDF canvas.
-- **Signature capture modal**: `SignatureModal` offers two modes -- draw (using the `signature_pad` library for canvas-based freehand input) and type (rendering typed text with a cursive font). Both produce a base64 PNG that is sent to the API.
-- **PDF rendering with react-pdf**: Uses `react-pdf` (a React wrapper for PDF.js) for in-browser PDF rendering. Pages are rendered individually with navigation controls. The same component is used in both the sender view (field placement) and the signing ceremony (field completion).
-- **Hash chain audit display**: The `AuditTab` shows a timeline of all envelope events with their SHA-256 hashes and verification status. Users can click "Verify Chain" to confirm tamper evidence.
-- **Status badges**: The `StatusBadge` component in `components/common/` renders color-coded pills for envelope statuses (draft=gray, sent=blue, delivered=yellow, signed=green, completed=green, declined=red, voided=red).
-- **Component organization with barrel exports**: Components are grouped by feature area (`common/`, `envelope/`, `signing/`, `icons/`) with `index.ts` barrel files for clean imports.
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern used in this project. Each explanation assumes no prior familiarity with the pattern.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of maintaining per-user permission lists, you define roles (e.g., "user", "admin") with specific allowed actions, and check the user's role at each protected endpoint.
-
-In this project, users have a `role` column (default `'user'`). Admin users can access the admin dashboard, view all envelopes across all users, manage user roles, and inspect email notifications. Regular users can only manage their own envelopes. The frontend gates the admin nav link with `user.role === 'admin'`, and the backend verifies the role in admin route middleware. This two-layer check (frontend hides the UI, backend enforces the rule) ensures that even if someone crafts a direct API request, they cannot access admin operations without the admin role.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks a fast cache before querying the database. On a cache miss, the database is queried, the result is stored in the cache with a TTL, and then returned. On a cache hit, the cached value is returned directly.
-
-In this project, Valkey stores two types of cached data: sessions (24-hour TTL, used for sender authentication) and idempotency keys (for the fast-path of duplicate signature detection). The idempotency system uses a dual-layer approach: Redis provides sub-millisecond duplicate detection, and PostgreSQL provides durable backup. When checking for a duplicate signature, the system first checks Redis. If Redis is down, it falls back to querying the PostgreSQL `idempotency_keys` table.
-
-The cache-aside pattern is particularly important for the signing ceremony, where multiple recipients may be signing concurrently. Each signature capture must check for duplicates quickly -- a 5ms database query multiplied by 20 fields across 5 recipients adds up. The Redis check completes in under 1ms.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that wraps calls to external services and monitors their reliability. It has three states: **Closed** (normal, requests flow through), **Open** (too many failures, requests immediately rejected with an error), and **Half-Open** (after a cooldown, one test request is allowed to check if the service recovered).
-
-In this project, Opossum circuit breakers protect MinIO/S3 storage operations. Configuration: 30-second timeout, 50% error threshold, 30-second reset period. When the storage circuit breaker opens, the system degrades gracefully: non-critical storage reads return cached data (if available), while critical writes are queued for retry. This is important because document upload and signature storage are the most I/O-intensive operations -- if MinIO becomes slow or unreachable, without a circuit breaker, every document view and signature capture would hang for 30 seconds before timing out, making the entire platform unusable.
-
-The circuit breaker state is also exposed as a Prometheus metric (`docusign_circuit_breaker_state`), enabling operators to see when storage is degraded and for how long.
-
-Files: `backend/src/shared/circuitBreaker.ts`, `backend/src/shared/storageWithBreaker.ts`
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable JSON objects with named fields, rather than free-form text. Instead of `"Signature captured for field abc on envelope xyz"`, the system emits `{"event": "signature.captured", "fieldId": "abc", "envelopeId": "xyz", "recipientId": "def", "type": "draw", "ip": "1.2.3.4"}`.
-
-In this project, structured logging is especially critical because of legal compliance requirements. The ESIGN Act and eIDAS require that electronic signature platforms maintain detailed records of signing activities. Structured logs with fields like `event_type`, `envelope_id`, `recipient_id`, `ip_address`, and `user_agent` enable both operational debugging and compliance auditing.
-
-Pino produces JSON logs with a separate audit logger. Compliance-sensitive events are tagged with `type: "audit"` for segregated log streams -- this means audit logs can be routed to a separate, immutable storage system (WORM storage) that satisfies regulatory retention requirements, while operational logs can have shorter retention.
-
-File: `backend/src/shared/logger.ts`
-
-### Prometheus Metrics
-
-Prometheus is a pull-based monitoring system. The application exposes numeric measurements at `GET /metrics`. A Prometheus server scrapes this endpoint periodically, stores the time series, and Grafana visualizes them.
-
-This project exposes 11+ metrics spanning business events and infrastructure health: `docusign_documents_total` (counter for document uploads), `docusign_envelopes_by_status` (gauge per status showing current distribution -- useful for spotting stuck envelopes), `docusign_signatures_captured_total` (counter for the primary business action), `docusign_signatures_pending` (gauge showing how many signatures are waiting -- a rising count may indicate signing ceremony problems), `docusign_http_request_duration_seconds` (histogram for API latency SLOs), `docusign_queue_messages_published_total` and `processed_total` (counters for RabbitMQ health), `docusign_circuit_breaker_state` (gauge showing 0=closed, 1=open for storage health), `docusign_storage_operation_duration_seconds` (histogram for MinIO performance), `docusign_idempotency_hits_total` (counter for duplicate detection rate), and `docusign_audit_events_total` (counter by event type for compliance monitoring).
-
-File: `backend/src/shared/metrics.ts`
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. Without it, a single client could overwhelm the server, degrading performance for all users, or an attacker could brute-force signing tokens.
-
-In a document signing platform, rate limiting serves specific purposes: preventing brute-force attacks on access tokens (which are the signing ceremony's only authentication), protecting the document processing pipeline (PDF parsing and storage are CPU/IO intensive), and ensuring fair access during peak signing periods (e.g., end-of-quarter when thousands of contracts need signatures).
-
-The implementation uses express middleware that checks request counts per IP or per user. When the limit is exceeded, the server returns HTTP 429 (Too Many Requests). The signing ceremony endpoints are particularly sensitive because they are publicly accessible (no login required, just an access token in the URL).
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. For electronic signatures, this is legally critical: a duplicate signature due to a network retry could invalidate a document, break the audit chain, or create ambiguous legal standing about which signature is authoritative.
-
-The implementation uses two layers. The fast path checks Redis: before processing a signature capture, the server looks up the key format `sig:{fieldId}:{recipientId}:{hourBucket}` in Redis. If found, the previously stored response is returned. The durable path checks PostgreSQL: the `idempotency_keys` table ensures that even if Redis loses data (restart, eviction), duplicates are caught.
-
-The hour-bucket in the key format is a deliberate design choice. It allows legitimate re-signs (a recipient returns the next day to re-sign after a genuine failure) while catching rapid duplicates (two identical requests within the same hour). Without the time bucket, a recipient could never retry a failed signing session because the idempotency key would permanently block the operation.
-
-File: `backend/src/shared/idempotency.ts`
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether the service is functioning correctly. They are consumed by load balancers (to route traffic away from sick instances), container orchestrators (to restart failed processes), and monitoring systems (to alert operators).
-
-This project implements three levels of health checks, each serving a different consumer:
-- **`/health/live`** (liveness probe): Returns 200 if the process is running. This is the most basic check -- if it fails, the process should be killed and restarted. It always returns 200 because if the HTTP server can respond at all, the process is alive.
-- **`/health/ready`** (readiness probe): Tests PostgreSQL and Redis connectivity. A newly started server that has not yet established database connections returns unhealthy on this endpoint, preventing the load balancer from sending traffic before the server is ready.
-- **`/health`** (comprehensive): Checks all dependencies with latency measurements and circuit breaker states. This endpoint is for operators and dashboards, not for load balancers (it is too expensive to call every second).
-
-For a document signing platform with legal deadlines, health checks are critical. If a signing ceremony fails because the server is unhealthy, the recipient may miss a legal deadline. Proactive health detection prevents this by routing traffic to healthy instances before failures become user-visible.
-
-File: `backend/src/index.ts`
+| Workflow authority | Short per-envelope SQL transactions | Independently updated lifecycle events | Orders finish, withdrawal, and stage activation |
+| Side effects | Transactional outbox and duplicate-safe workers | Publish after a state commit | Retains work across a process crash |
+| Geometry | Versioned PDF-page coordinates | Viewer-container pixels | Reproduces placement across devices and final output |
+| Action retries | Scoped durable receipt plus request digest | Redis response cache alone | Binds a retry to one authorized operation |
+| Evidence | Canonical chain plus protected signed checkpoints | Mutable database chain alone | Provides an external reference for rewrite/truncation checks |
+| Completion display | Separate accepted actions and artifact readiness | One success flag for everything | Makes asynchronous failure understandable |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the local Docker + Node.js setup actually built.
+### Patterns present, with their actual boundaries
 
-### Local Setup Diagram
+The local path is React on Vite → Express routes → PostgreSQL/Redis/MinIO, with RabbitMQ publication attempted from workflow methods. There are no separately deployed document, signing, or audit services. [index.ts](./backend/src/index.ts) owns all API routes. [workflowEngine.ts](./backend/src/services/workflowEngine.ts) and [auditService.ts](./backend/src/services/auditService.ts) are modules in that process.
 
-```
-┌──────────────────┐
-│  React Frontend  │
-│ (localhost:5173)  │
-│  react-pdf,      │
-│  signature_pad   │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐          ┌──────────────────┐
-│  API Server      │          │ Notification     │
-│ (localhost:3001)  │          │ Worker           │
-│  Express + Prom  │          │ (separate proc)  │
-└────────┬─────────┘          └────────┬─────────┘
-         │                             │
-    ┌────┴─────────────────────────────┴────┐
-    │                                       │
-    ▼              ▼              ▼         ▼
-┌────────┐  ┌──────────┐  ┌─────────┐  ┌────────┐
-│Postgres│  │  Valkey   │  │  MinIO  │  │RabbitMQ│
-│  :5432 │  │  :6379   │  │:9000/:9001│ │ :5672  │
-│        │  │          │  │          │  │        │
-│DB:     │  │Sessions, │  │Documents,│  │Notifs, │
-│docusign│  │idempotency│ │Signatures│  │Workflow│
-└────────┘  └──────────┘  └─────────┘  └────────┘
-```
+- **Transactional send:** `sendEnvelope` uses `BEGIN` and `SELECT ... FOR UPDATE` for the envelope. This demonstrates serialization of competing sends, but validation queries and other edits do not share its transaction. Audit and notification work occurs after commit, so an error can follow a successful state change.
+- **Idempotency cache:** [shared/idempotency.ts](./backend/src/shared/idempotency.ts) caches receipts in Redis and SQL. It illustrates response replay, not an atomic decision protocol; the specific races are described above.
+- **Circuit breakers:** [shared/storageWithBreaker.ts](./backend/src/shared/storageWithBreaker.ts) wraps MinIO calls through [circuitBreaker.ts](./backend/src/shared/circuitBreaker.ts). The active signature upload uses `await uploadSignature(s3Key, signatureBuffer, 'image/png')`; the original-PDF upload/view/download routes use [utils/minio.ts](./backend/src/utils/minio.ts) directly.
+- **Metrics and logging:** [shared/metrics.ts](./backend/src/shared/metrics.ts) and [shared/logger.ts](./backend/src/shared/logger.ts) provide Prometheus/Pino patterns. They help diagnose requests and selected storage calls; they do not certify business outcomes or prevent secrets in paths from reaching logs.
+- **Publisher confirmation:** [shared/queue.ts](./backend/src/shared/queue.ts) publishes persistent wrapped messages on a confirm channel. This demonstrates broker acknowledgment, without a database outbox, mandatory-route handling, or end-to-end delivery receipt.
 
-### Production Patterns Actually Implemented
+### Confirmed signing and completion defects
 
-| Pattern | Library | File Path | Purpose |
-|---------|---------|-----------|---------|
-| Circuit breaker | Opossum | `backend/src/shared/circuitBreaker.ts` | Storage operation protection |
-| Storage + breaker | Opossum + MinIO | `backend/src/shared/storageWithBreaker.ts` | MinIO uploads/downloads with fallback |
-| Idempotency | Redis + PostgreSQL | `backend/src/shared/idempotency.ts` | Dual-layer duplicate detection for signatures |
-| Audit hash chain | crypto (SHA-256) | `backend/src/shared/auditLogger.ts` | Tamper-evident event log with chain verification |
-| Prometheus metrics | prom-client | `backend/src/shared/metrics.ts` | 15+ metrics: documents, signatures, queue, circuit |
-| Structured logging | Pino | `backend/src/shared/logger.ts` | JSON logs with audit segregation, pino-pretty dev |
-| Async queue | amqplib | `backend/src/shared/queue.ts` | RabbitMQ notifications with sync fallback |
-| Workflow state machine | Custom | `backend/src/services/workflowEngine.ts` | Envelope lifecycle with routing logic |
-| Audit service | Custom | `backend/src/services/auditService.ts` | Event logging with hash chain |
-| Health checks | Custom endpoints | `backend/src/index.ts` | `/health`, `/health/live`, `/health/ready` |
-| Metrics middleware | prom-client | `backend/src/shared/metrics.ts` | HTTP duration histograms |
-| Notification worker | amqplib consumer | `backend/src/workers/notification-worker.ts` | Async email processing |
-| Idempotency middleware | Custom | `backend/src/shared/idempotency.ts` | X-Idempotency-Key header extraction |
-| PDF validation | pdf-lib | `backend/src/routes/documents.ts` | PDF integrity check on upload |
+[Session GET](./backend/src/routes/signing.ts) stores `{ recipientId, envelopeId, envelope_status, status }`. [authenticateSigner](./backend/src/middleware/auth.ts) uses the cached object as a `SignerData` whose downstream consumers read `id` and `envelope_id`. An isolated execution of the actual route/middleware sequence returns 403 for the correctly assigned field. Finish and decline can subsequently operate on undefined IDs and fail; the cache is not invalidated on transitions. Fixing the shape alone would still leave stale authorization and the missing stage/expiration guards.
 
-### Frontend Implementation
+`completeEnvelope` writes `completed`, then notifies recipients and the sender. It passes the sender's **user ID** into `email_notifications.recipient_id`, which references **recipients**. With ordinary distinct IDs, this fails after the status update. The isolated check confirmed that ordering and identifier use; no transaction rolls back the already committed state. The fixture's completed envelope does not exercise this path.
 
-The frontend uses React + TypeScript + Vite + Tailwind CSS with modular component architecture:
+### Audit implementation is internally inconsistent
 
-| Feature Area | Key Libraries | Components |
-|--------------|---------------|------------|
-| PDF rendering | react-pdf (PDF.js) | `PdfViewer`, `SigningPdfViewer` |
-| Signature capture | signature_pad | `SignatureModal` (draw/type modes) |
-| Field placement | CSS absolute positioning | `FieldsTab`, `FieldsSidebar` |
-| State management | Zustand | `authStore`, `envelopeStore` |
-| Routing | TanStack Router | File-based routes (`/envelopes/:id`, `/sign/:token`) |
-| Styling | Tailwind CSS | Responsive layouts |
+[shared/auditLogger.ts](./backend/src/shared/auditLogger.ts) hashes a separate `context` property but stores context inside `data`. Its verifier reconstructs the stored `data` including that context and also supplies a separate context, producing a different hash. The service writer uses another payload format without that separate property; many signing/workflow events call both writers. An isolated test rejected one unchanged shared event using both verifiers.
 
-### Simplifications from Production Design
+The service hash omits actor and depends on ordinary object-key insertion order. PostgreSQL [JSONB does not preserve object-key order](https://www.postgresql.org/docs/current/datatype-json.html); reserializing database JSON is therefore not a canonical hashing scheme. Timestamps are stored without a timezone contract, ordering has no tie-break sequence, and both writers fetch the previous head without a lock. These defects can create a failed verification without tampering. Conversely, mutable rows and no externally protected expected head permit rewrites/truncation to evade a local-only check. Hardcoded consent text in audit metadata is not an implemented consent collection flow.
 
-| Production | Local Substitute | Impact |
-|------------|-----------------|--------|
-| AWS S3 with KMS encryption | MinIO (S3-compatible) | No server-side encryption, no lifecycle policies |
-| Real email delivery (SendGrid/SES) | Emails stored in DB `email_notifications` table | No actual notification delivery |
-| Elasticsearch for audit search | PostgreSQL queries | Slower audit search at scale |
-| SMS verification (Twilio) | Not implemented | Email-link only authentication |
-| PDF flattening (embed signatures) | Signatures stored separately | Completed PDFs don't contain embedded sigs |
-| Multi-region replication | Single PostgreSQL instance | No geographic redundancy |
-| API Gateway + CDN | Direct frontend-to-backend | No TLS termination, no WAF |
-| Load balancer | Run manually on :3001-:3003 | No automatic failover |
-| Template system | Not implemented | Each envelope created from scratch |
+### Queue and email limitations
 
-### What Was Omitted
+The actual exchanges are direct `docusign.direct` and direct `docusign.dlx`. Four durable queues handle notifications, email, workflow, and reminders. The DLQ binds with an empty routing key, while dead letters retain nonempty original routing keys unless overridden. Under the supplied topology they will not reach that binding; this follows [RabbitMQ's dead-letter routing rules](https://www.rabbitmq.com/docs/dlx).
 
-- PDF flattening with embedded signatures
-- Real email/SMS delivery
-- OAuth, MFA, access code authentication
-- Knowledge-based authentication (KBA) and ID verification
-- Template system for recurring documents
-- Bulk send capabilities
-- Real-time signing status via WebSocket
-- Mobile-responsive signing experience
-- CDN for document/page image delivery
-- Multi-region deployment and Kubernetes
-- Document expiration enforcement
-- Distributed locking for concurrent signing sessions
+The [worker](./backend/src/workers/notification-worker.ts) consumes bare payloads, while the publisher sends `{ id, type, data, timestamp, idempotencyKey }`. It also queries absent `notifications`, `email_log`, and `workflow_events` tables, uses a nonexistent `recipients.user_id`, and expects different event names. It defaults to guest credentials and needs API-created queues. Exporting the correct broker URL only fixes the credential mismatch. Prefetch is ten; errors nack without requeue, and reminder handling does not wait for `scheduledFor`.
+
+The exported `createConsumer` helper is not used by that worker. Its retries nack first, then use process timers and unconfirmed republishing; a crash can lose work. Queue reference checks do not reconnect closed channels. No fanout exchange, PDF queue, consumed-message deduplication, or reliable delayed-reminder scheduler is wired.
+
+[EmailService](./backend/src/services/emailService.ts) only inserts simulated records and prints part of their bodies. A queued notification and a simulated `sent` row are different paths, neither an actual email delivery. Completion links refer to a missing frontend route. No signed PDF or PDF certificate generation is present.
+
+### Frontend and local substitutions
+
+[envelopeStore.ts](./frontend/src/stores/envelopeStore.ts) holds server responses in Zustand and updates after success. It has one loading/error state, no cancellation or request generation, and late fetches can overwrite a newer envelope. Several pages omit store errors, yielding stale content, an empty list, or an indefinite spinner. Lists request only their first page; there is no polling, SSE, React Query, shared runtime validation, or offline persistence.
+
+[Envelope detail](./frontend/src/routes/envelopes/$envelopeId.tsx) saves each placement click immediately using the container's pointer offset. Both viewers render a 700-pixel page; [format.ts](./frontend/src/utils/format.ts) merely converts SQL numeric strings. Centered canvas offsets, different container widths, crop/rotation, and responsive scaling are not modeled. Changing/deleting documents can also leave a selected index/page stale. There is no drag, resize, zoom, or upload progress UI.
+
+[SigningPage](./frontend/src/routes/sign/$accessToken.tsx) keeps completed IDs in a component Set, waits for successful writes, and displays a checkmark. It does not render captured images or field values, bind responses to a request generation, gate Finish on PDF render success, or disable concurrent submissions. Optional completed fields inflate the numerator relative to required-field count. Signature capture offers drawing and typing only; modal focus/keyboard behavior and canvas display scaling are incomplete. CSS hides PDF text and annotation layers, and clickable field divs lack keyboard controls.
+
+MinIO substitutes for private production object storage, Redis holds simple sessions, and email is simulated. Compose starts infrastructure with persistent volumes but no production backup/restore plan. Metadata deletion does not remove stored objects. Seed PDFs and completion flags are illustrative data. Local commands and current credentials are maintained in the README.
+
+### Omitted production capabilities and verification scope
+
+No immutable revision/manifest, safe operation receipt transaction, outbox, compatible notification worker, final signed artifact, enforceable retention, independent evidence anchor, MFA flow, rate limiting, distributed workflow fencing, CDN document authorization, or multi-region recovery is implemented. This review changed documentation only. Isolated mocked source checks confirmed the signing cache, audit, idempotency, and sender-notification defects; no full application run or production performance/compliance claim follows from those checks.

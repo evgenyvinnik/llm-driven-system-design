@@ -1,246 +1,131 @@
-# Calendly - Meeting Scheduling Platform - Architecture Design
+# Calendly architecture
 
 ## System Overview
 
-A meeting scheduling platform that allows users to share their availability and let others book meetings without back-and-forth email coordination. The system handles availability computation across time zones, prevents double-bookings under concurrent access, and delivers reliable notifications for all booking lifecycle events.
+A scheduling service lets hosts publish working hours and event types, lets guests reserve a meeting without an account, and supports later cancellation or rescheduling. Its core responsibility is to convert a proposed time into one durable reservation while keeping the displayed date, timezone, and lifecycle understandable.
+
+The sections before Implementation Notes describe a proposed production design. The final section traces the actual local Express/React implementation, including its limitations. This is an independent learning project, not a description of Calendly's private infrastructure.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Availability Management**
-   - Users define working hours and availability (recurring weekly schedules)
-   - Support for multiple meeting types (1-on-1, group, round-robin)
-   - Buffer time before/after meetings
-   - Maximum bookings per day limits
+Support one-to-one meetings, recurring weekly working hours, event duration, prep/recovery buffers, daily limits, public guest booking, and host management. Guests can recover a booking outcome and later manage that booking through a separate scoped capability. Notifications and reminders follow accepted booking revisions.
 
-2. **Meeting Booking**
-   - Invitees view available time slots and book meetings
-   - Real-time availability checking with conflict prevention
-   - Instant booking confirmation
-   - Reschedule and cancel meetings
+External-calendar synchronization is a proposed extension with an explicit freshness policy. Group capacity, round-robin assignment, recurring appointment series, payments, and arbitrary scheduling questionnaires are outside the initial design.
 
-3. **Calendar Integration**
-   - Sync with Google Calendar, Outlook, iCal
-   - Check calendar for existing events during availability calculation
-   - Create calendar events on booking
-   - Two-way sync for updates/cancellations
+### Non-functional requirements
 
-4. **Time Zone Handling**
-   - Automatic time zone detection for invitees
-   - Display times in invitee's local time zone
-   - All storage in UTC, conversion at display layer
+Planning targets are availability p95 below 200 ms, booking p99 below 500 ms, and 99.9% booking availability under the stated load. These are not local measurements. Displayed availability is a recent proposal; the booking transaction is authoritative.
 
-5. **Notifications**
-   - Email confirmations, reminders, cancellation/rescheduling notifications
-   - Asynchronous delivery via message queue
-   - Dead-letter queue for failed deliveries
+Two active reservations managed by this service must not overlap the same host's occupied interval. Daily limits and working-hour eligibility must be checked at acceptance. Rescheduling must atomically release the old interval and reserve the new interval, with no loss of the old reservation if the new choice fails.
 
-6. **Booking Management**
-   - Reschedule and cancel meetings
-   - Custom booking questions and notes
-   - Booking archival for data lifecycle management
-
-### Non-Functional Requirements
-
-- **Low Latency**: Availability checks < 200ms p95
-- **High Availability**: 99.9% uptime for booking system
-- **Consistency**: No double-bookings (strong consistency required)
-- **Scalability**: Handle millions of users with varying booking frequencies
-- **Security**: Secure calendar access tokens, prevent unauthorized access
+A successful reservation does not imply email delivery or a committed external-calendar write. The service cannot guarantee global absence of conflicts with an independently writable calendar provider that does not participate in its transaction. Detect and reconcile those conflicts rather than describing a polling interval as an absolute guarantee.
 
 ## Capacity Estimation
 
-### Production Scale
+| Assumption | Estimate | Implication |
+|------------|----------|-------------|
+| One million active hosts, three bookings/week | About 430,000 bookings/day; 5/s average, 50/s assumed peak | Short per-host transactions are plausible; measure hot-host contention |
+| 100 availability lookups per booking | About 43 million/day; 500/s average, 5,000/s peak | Cache bounded ranges and coalesce repeated calculations |
+| Booking plus retained metadata averages 10 KB | About 1.6 TB/year raw | Retention, indexes, and backups matter even at modest write rates |
+| Five event types/host at 5 KB each | About 25 GB raw | Versioned policy records fit ordinary relational access |
+| 100 external events/host at 5 KB each | About 500 GB raw, if integration is added | Bound synchronization horizon and stored fields |
 
-| Metric | Value |
-|--------|-------|
-| Daily Active Users (DAU) | 1M |
-| Bookings per day | ~430K (3 bookings/user/week) |
-| Availability checks per day | ~43M (100 checks per booking) |
-| Peak availability RPS | ~5,000 |
-| Peak booking RPS | ~50 |
+The read/write ratio is a workload assumption, not evidence that write scaling will never matter. A public release of office hours can concentrate requests on one host even when platform-wide throughput is modest. Control lock waits and admission per host.
 
-### Storage Requirements (Production)
+### Local Development Scale
 
-| Data Type | Estimate |
-|-----------|----------|
-| User data | 1M users x 10KB = 10GB |
-| Meeting types | 1M users x 5 types x 5KB = 25GB |
-| Bookings (annual) | 430K/day x 365 x 10KB = ~1.5TB/year |
-| Calendar cache | 1M users x 100 events x 5KB = 500GB |
+One API, one notification worker, PostgreSQL, Valkey, and RabbitMQ are sufficient. Multiple API/worker scripts share the same infrastructure; no load balancer is supplied. The optional valid fixture prefix contains four hosts, eight meeting types, and twenty weekly rules. The full historical fixture cannot populate its bookings as written.
 
 ## High-Level Architecture
 
-```
-┌───────────────┐   ┌───────────────┐
-│   Invitee     │   │   Host        │
-│   (Browser)   │   │   (Browser)   │
-└───────┬───────┘   └───────┬───────┘
-        │                   │
-        └─────────┬─────────┘
-                  ▼
-┌─────────────────────────────────────────────────┐
-│               CDN / Edge Cache                  │
-│          (Static assets, booking pages)         │
-└─────────────────────┬───────────────────────────┘
-                      ▼
-┌─────────────────────────────────────────────────┐
-│             API Gateway / Load Balancer          │
-│   (Rate limiting, SSL termination, routing)     │
-└─────────────────────┬───────────────────────────┘
-                      │
-      ┌───────────────┼───────────────┐
-      ▼               ▼               ▼
-┌───────────┐   ┌───────────┐   ┌───────────┐
-│ API       │   │ API       │   │ API       │
-│ Server 1  │   │ Server 2  │   │ Server N  │
-└─────┬─────┘   └─────┬─────┘   └─────┬─────┘
-      │               │               │
-      └───────────────┼───────────────┘
-                      │
-    ┌─────────────────┼─────────────────┐
-    │                 │                 │
-    ▼                 ▼                 ▼
-┌─────────┐    ┌───────────┐    ┌──────────────┐
-│PostgreSQL│    │Redis/     │    │  RabbitMQ    │
-│ Primary  │    │Valkey     │    │              │
-│          │    │           │    │  Queues:     │
-│ Users    │    │ Sessions  │    │  - Notifs    │
-│ Meetings │    │ Avail.    │    │  - Reminders │
-│ Bookings │    │   cache   │    │  - DLQ       │
-│ Notifs   │    │ Idempot.  │    └──────┬───────┘
-└────┬─────┘    │   keys    │           │
-     │          └───────────┘           ▼
-     │                          ┌──────────────┐
-     │                          │ Notification │
-     │                          │   Workers    │
-     │                          │ (1..N)       │
-     │                          └──────────────┘
-     ▼
-┌─────────┐
-│PostgreSQL│
-│ Read     │
-│ Replicas │
-└──────────┘
-
-┌──────────────────────────────────────────────┐
-│         External Calendar APIs               │
-│   Google Calendar  │  Microsoft Graph (O365) │
-└──────────────────────────────────────────────┘
+```text
+┌────────────────┐       ┌────────────────┐
+│ Guest / host UI│──────▶│ Scheduling API │
+└────────────────┘       └───────┬────────┘
+                                 ▼
+                         ┌────────────────┐
+                         │ Booking store  │
+                         │ Rules + outbox │
+                         └───────┬────────┘
+                                 │ committed changes
+                 ┌───────────────┴──────────────┐
+                 ▼                              ▼
+         ┌────────────────┐             ┌────────────────┐
+         │ Availability   │             │ Notification   │
+         │ cache          │             │ jobs / workers │
+         └────────────────┘             └───────┬────────┘
+                                                ▼
+                                        Email / calendar
+                                        providers
 ```
 
-### Core Components
-
-1. **API Gateway / Load Balancer** - Request routing, SSL termination, rate limiting, authentication
-2. **Booking Service** - Booking creation with double-booking prevention (pessimistic locking), idempotency, trigger notifications via queue
-3. **Availability Service** - Compute available time slots by merging working hours, existing bookings, and external calendar events; cache results
-4. **Integration Service** - OAuth flows for calendar providers, sync calendar events, create/update/delete external events
-5. **Notification Service** - Async email delivery via RabbitMQ workers, scheduled reminders, dead-letter queue for failures
+A CDN serves static assets and public page metadata with appropriate cache policy. Guest availability and private management data have separate keys and access rules. Logical availability, booking, and integration services can begin in one application; scale their capacity independently as their workloads diverge.
 
 ## Core Components / Request Flows
 
-### 1. Creating a Booking
+### Time model and availability
 
-```
-Client                  API Server              PostgreSQL              Redis           RabbitMQ
-  │                        │                       │                     │                │
-  │──POST /api/bookings───▶│                       │                     │                │
-  │   (idempotency_key)    │                       │                     │                │
-  │                        │──Check idempotency────▶│                     │                │
-  │                        │   key in Redis         │                     │                │
-  │                        │◀──────────────────────▶│                     │                │
-  │                        │                        │                     │                │
-  │                        │──BEGIN TRANSACTION────▶│                     │                │
-  │                        │                        │                     │                │
-  │                        │──SELECT availability_rules                   │                │
-  │                        │   WHERE user_id = ?    │                     │                │
-  │                        │◀──────────────────────▶│                     │                │
-  │                        │                        │                     │                │
-  │                        │──SELECT bookings       │                     │                │
-  │                        │   WHERE host_user_id   │                     │                │
-  │                        │   AND status='confirmed'│                    │                │
-  │                        │   FOR UPDATE           │  (Row-level lock)   │                │
-  │                        │◀──────────────────────▶│                     │                │
-  │                        │                        │                     │                │
-  │                        │──INSERT INTO bookings──▶│                    │                │
-  │                        │   (partial unique index prevents duplicates) │                │
-  │                        │◀──────────────────────▶│                     │                │
-  │                        │                        │                     │                │
-  │                        │──COMMIT───────────────▶│                     │                │
-  │                        │                        │                     │                │
-  │                        │──Cache idempotency result──────────────────▶│                │
-  │                        │   (1 hour TTL)         │                     │                │
-  │                        │                        │                     │                │
-  │                        │──Publish notification──▶│──────────────────▶│──────────────▶│
-  │                        │                        │                     │                │
-  │◀─────201 Created───────│                        │                     │                │
-```
+Store weekly rules as local wall-clock intervals tied to the host's IANA zone. Store confirmed booking instants and their occupied intervals as timestamps, retaining host/guest zone context and the accepted policy revision. A recurring “Monday at 09:00” is not a fixed UTC hour across daylight-saving transitions. IANA's database changes as civil-time rules change; runtime timezone data must be maintained. [IANA Time Zone Database](https://www.iana.org/time-zones).
 
-**Double-Booking Prevention (Multi-Layer):**
-1. **Optimistic**: Check available slots before attempting insert
-2. **Pessimistic**: `SELECT FOR UPDATE` locks conflicting rows during transaction
-3. **Database Constraint**: Partial unique index `(host_user_id, start_time) WHERE status = 'confirmed'`
-4. **Idempotency**: Same request with same key returns cached result
+For an invitee-local date or range, first compute its actual instant boundaries in the selected zone. Fetch every host-local day that intersects those boundaries. Convert host rules for those dates, merge overlapping working intervals, subtract all overlapping occupied intervals, and generate candidates using an explicitly defined grid.
 
-### 2. Checking Availability
+Busy intervals must be clipped to each working window before gap calculation. Fetch by overlap, not by whether a booking starts within the day: a meeting or its buffer can cross midnight. Use the next local midnight as the exclusive day end rather than assuming every day lasts 24 hours.
 
-```
-Client                  API Server              PostgreSQL              Redis
-  │                        │                       │                     │
-  │──GET /availability────▶│                       │                     │
-  │   ?meeting_type=X      │                       │                     │
-  │   &date=2024-01-15     │──Check cache──────────▶│                    │
-  │                        │   (availability:X:date)│                    │
-  │                        │                        │                     │
-  │                        │  (If cache miss)       │                     │
-  │                        │──SELECT meeting_types──▶│                    │
-  │                        │──SELECT avail_rules───▶│                     │
-  │                        │──SELECT bookings──────▶│                     │
-  │                        │                        │                     │
-  │                        │  [Calculate slots]     │                     │
-  │                        │  - Merge busy periods  │                     │
-  │                        │  - Apply buffers       │                     │
-  │                        │  - Generate slots      │                     │
-  │                        │                        │                     │
-  │                        │──Cache result (5 min TTL)─────────────────▶│
-  │◀─────Available slots───│                        │                     │
-```
+Define buffer semantics once. Here each booking reserves its own interval from start minus prep time to end plus recovery time, using a snapshot of that booking's policy. Compare candidate occupancy against existing occupancy. A later event-type edit does not retroactively change already accepted reservations.
 
-### 3. Archiving Old Bookings
+Reject nonexistent local-time candidates and define how repeated local times are offered. If both fall-back occurrences are eligible, return distinct instants and labels that include their offset. An ordinary local-time string alone cannot distinguish them.
 
-```
-Cron Job (daily)        PostgreSQL
-  │                        │
-  │──BEGIN TRANSACTION────▶│
-  │──INSERT INTO bookings_archive
-  │   SELECT * FROM bookings
-  │   WHERE status IN ('completed','cancelled')
-  │   AND end_time < NOW() - 90 days
-  │──DELETE FROM bookings (same filter)
-  │──COMMIT
-```
+Daily capacity limits the number of reservations, not the number of alternatives a guest may see. With one reservation remaining, show all eligible choices and arbitrate the final selection at write time. Cache results with policy/booking revisions and computation time; remove choices that have aged past the booking cutoff even on cache hits.
+
+### Booking acceptance
+
+Validate the guest request and operation identity. In one transaction, acquire the host's stable lock, read the current event policy/rules, check the requested instant and occupied interval, enforce the host-local daily cap, and insert the booking with a durable operation result and outbox entries. Return the committed booking, not merely the submitted slot.
+
+Every writer of managed reservations uses the same host authority, including rescheduling, imports, and administrator actions. A range exclusion constraint is a backstop against overlapping occupied intervals. The displayed slot list, an earlier availability precheck, and a Redis operation lock do not reserve time.
+
+### Reschedule and cancel
+
+Rescheduling updates one booking's interval and revision atomically while keeping its lifecycle active. It revalidates the same rules as creation, excluding its own old reservation from conflict checks. Failure leaves the original time intact. Treat “rescheduled” as an event in history rather than a status that removes the meeting from the active reservation set.
+
+Cancellation transitions an active reservation to cancelled and records a notification event. A repeated identical cancellation can return the current cancelled result. Compare the caller's expected revision when a stale view could overwrite an intervening change; a server-internal version reread alone does not detect stale user intent.
+
+### Notifications and reminders
+
+Commit notification intent with the reservation through an outbox. Workers deliver using identities scoped to booking revision, notification kind, and recipient. Provider acceptance, mailbox delivery, and a local simulated record are distinct outcomes.
+
+Maintain reminder jobs by booking revision and due time. A scheduler can claim a bounded set of due rows through an indexed query and leases; multiple schedulers can share that work. This avoids a durable broker queue per individual delay. At dispatch, check that the booking is still active at the expected revision and time.
+
+Rescheduling invalidates old reminder jobs and creates replacements in the same authoritative change. Cancellation invalidates pending jobs. Delayed notifications must not overwrite newer lifecycle state or announce an obsolete confirmation as current.
+
+### External-calendar extension
+
+Synchronize provider changes into a local busy-event projection with cursors, retry budgets, and visible last-success time. Push notifications are hints to fetch changes; periodic reconciliation recovers missed hints. Poll frequency is a target under healthy operation, not a staleness bound through an outage.
+
+Route imported busy changes through the same host coordination when updating local reservations. However, an independent external event can still be created after a fresh check. Choose a product policy for stale calendars and conflicts discovered after acceptance, and expose it to the host. Outbound calendar writes use durable jobs and provider-supported identities; they do not share the PostgreSQL booking transaction.
 
 ## Database Schema
 
-All times are stored in UTC.
+### Current local schema
+
+This is the checked-in [initialization SQL](./backend/src/db/init.sql), with full-line comments removed. It is evidence of the teaching implementation, not the production schema proposed above. The confirmed-start unique index does not prevent arbitrary overlaps. There is no stored occupied interval, outbox, guest capability, external calendar table, or durable reminder job.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Users table
+
 CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email VARCHAR(255) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
   name VARCHAR(255) NOT NULL,
   time_zone VARCHAR(50) NOT NULL DEFAULT 'UTC',
-  role VARCHAR(20) NOT NULL DEFAULT 'user',
+  role VARCHAR(20) NOT NULL DEFAULT 'user', -- 'user' or 'admin'
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Meeting Types table
 CREATE TABLE meeting_types (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -258,20 +143,20 @@ CREATE TABLE meeting_types (
   UNIQUE(user_id, slug)
 );
 
--- Availability Rules table (weekly schedule)
 CREATE TABLE availability_rules (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  day_of_week INTEGER NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
+  day_of_week INTEGER NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6), -- 0=Sunday, 6=Saturday
   start_time TIME NOT NULL,
   end_time TIME NOT NULL,
   is_active BOOLEAN DEFAULT true,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   CONSTRAINT valid_time_range CHECK (end_time > start_time)
 );
+
 CREATE INDEX idx_availability_user_day ON availability_rules(user_id, day_of_week, is_active);
 
--- Bookings table
+
 CREATE TABLE bookings (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   meeting_type_id UUID NOT NULL REFERENCES meeting_types(id) ON DELETE CASCADE,
@@ -281,26 +166,28 @@ CREATE TABLE bookings (
   start_time TIMESTAMP WITH TIME ZONE NOT NULL,
   end_time TIMESTAMP WITH TIME ZONE NOT NULL,
   invitee_timezone VARCHAR(50) NOT NULL,
-  status VARCHAR(20) NOT NULL DEFAULT 'confirmed',
+  status VARCHAR(20) NOT NULL DEFAULT 'confirmed', -- confirmed, cancelled, rescheduled
   cancellation_reason TEXT,
   notes TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   version INTEGER DEFAULT 1,
+  -- Migration 002: Idempotency key for duplicate prevention
   idempotency_key VARCHAR(255),
   CONSTRAINT valid_booking_time CHECK (end_time > start_time)
 );
 
--- UNIQUE partial index prevents double-booking
 CREATE UNIQUE INDEX idx_bookings_no_double ON bookings(host_user_id, start_time)
   WHERE status = 'confirmed';
+
 CREATE INDEX idx_bookings_host_time ON bookings(host_user_id, start_time, end_time);
 CREATE INDEX idx_bookings_status ON bookings(status);
 CREATE INDEX idx_bookings_meeting_type ON bookings(meeting_type_id);
-CREATE UNIQUE INDEX idx_bookings_idempotency_key
-  ON bookings(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
--- Bookings archive table (completed/cancelled bookings older than 90 days)
+CREATE UNIQUE INDEX idx_bookings_idempotency_key
+  ON bookings(idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+
 CREATE TABLE bookings_archive (
   id UUID PRIMARY KEY,
   meeting_type_id UUID NOT NULL,
@@ -316,529 +203,303 @@ CREATE TABLE bookings_archive (
   created_at TIMESTAMP WITH TIME ZONE,
   updated_at TIMESTAMP WITH TIME ZONE,
   version INTEGER DEFAULT 1,
+  -- Migration 002: Idempotency key for consistency with bookings table
   idempotency_key VARCHAR(255),
   archived_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-CREATE INDEX idx_bookings_archive_host_time ON bookings_archive(host_user_id, start_time);
-CREATE INDEX idx_bookings_archive_archived_at ON bookings_archive(archived_at);
 
--- Email notifications log
+CREATE INDEX idx_bookings_archive_host_time
+  ON bookings_archive(host_user_id, start_time);
+
+CREATE INDEX idx_bookings_archive_archived_at
+  ON bookings_archive(archived_at);
+
+
 CREATE TABLE email_notifications (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   booking_id UUID REFERENCES bookings(id) ON DELETE CASCADE,
   recipient_email VARCHAR(255) NOT NULL,
-  notification_type VARCHAR(50) NOT NULL,
+  notification_type VARCHAR(50) NOT NULL, -- confirmation, reminder, cancellation, reschedule
   subject VARCHAR(500) NOT NULL,
   body TEXT NOT NULL,
   sent_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  status VARCHAR(20) NOT NULL DEFAULT 'sent'
+  status VARCHAR(20) NOT NULL DEFAULT 'sent' -- sent, failed
 );
+
 CREATE INDEX idx_email_booking ON email_notifications(booking_id);
 
--- Sessions table (fallback for when Redis is unavailable)
+
 CREATE TABLE sessions (
   sid VARCHAR(255) PRIMARY KEY,
   sess JSON NOT NULL,
   expire TIMESTAMP WITH TIME ZONE NOT NULL
 );
+
 CREATE INDEX idx_sessions_expire ON sessions(expire);
 ```
 
-### Key Design Rationale
+Weekly `TIME` values are wall times, so “all times stored in UTC” is inaccurate. `timestamptz` preserves an instant, not the original IANA zone; those zone names live in separate fields. Booking and archive status values are not checked by the database. The archive omits foreign keys but also omits snapshots of host and meeting-type names.
 
-- **`time_zone` on users**: Stored as IANA identifier for accurate DST handling
-- **`slug` on meeting_types**: Enables clean booking URLs (`/user/demo/30-min-call`)
-- **Buffer times on meeting_types**: Prevents back-to-back meetings, allows travel/prep
-- **Partial unique index on bookings**: Only confirmed bookings participate in uniqueness, cancelled bookings may share the same slot
-- **Archive table has no foreign keys**: Allows parent record deletion without affecting historical data
-- **`version` on bookings**: Enables optimistic locking for concurrent modifications
-- **`idempotency_key` on bookings**: Prevents duplicate bookings from network retries
+### Proposed schema extensions
+
+| Record/constraint | Purpose |
+|-------------------|---------|
+| Occupied start/end and accepted policy revision | Preserve each reservation's buffer and duration semantics |
+| Per-host range exclusion for active occupancy | Reject overlapping intervals, including different start times |
+| Caller/operation receipt with input digest | Recover one result across retries and lifecycle changes |
+| Booking history and expected revision | Preserve reschedule/cancel intent and detect stale modifications |
+| Outbox and per-recipient delivery record | Retain notification intent and recover partial processing |
+| Reminder job keyed by booking revision and kind | Replace/cancel due work without relying on old payloads |
+| Hashed guest capability with scope/expiry | Authorize one guest's management actions separately from public IDs |
+| Policy and host availability revision | Invalidate every affected event type consistently |
+
+A representative production constraint would use an occupied timestamp range plus host equality, with `btree_gist` for the scalar host key. PostgreSQL documents range exclusion constraints for this purpose. [PostgreSQL range constraints](https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT).
+
+```sql
+-- Proposed columns and constraint; not present in the local schema.
+ALTER TABLE bookings ADD COLUMN occupied_start timestamptz;
+ALTER TABLE bookings ADD COLUMN occupied_end timestamptz;
+-- Backfill, make these NOT NULL, and check occupied_end > occupied_start first.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE bookings ADD CONSTRAINT no_active_host_overlap
+EXCLUDE USING gist (
+  host_user_id WITH =,
+  tstzrange(occupied_start, occupied_end, '[)') WITH &&
+) WHERE (status = 'confirmed');
+```
+
+The production lifecycle keeps rescheduled reservations confirmed; otherwise this predicate would repeat the local status bug. Ordinary policy edits must not rewrite occupied intervals without revalidation. A daily-count limit is a separate invariant and still needs coordinated checks.
 
 ## API Design
 
-### Public Booking URL Pattern
+### Current routes
 
-```
-/john-doe/30min-x7k2m9
-```
+The application uses `/api`, not `/api/v1`. Responses normally wrap results in `success` and `data`, with `error` on failure.
 
-Combines human-readable prefix with security token suffix to prevent URL enumeration while keeping URLs shareable.
+| Method | Path | Current access and behavior |
+|--------|------|-----------------------------|
+| POST | `/api/auth/register`, `/login` | Register and auto-login, or sign in |
+| POST | `/api/auth/logout` | Destroy Redis session; no explicit cookie clearing |
+| GET | `/api/auth/me` | Session lookup plus cached user read |
+| GET/POST | `/api/meeting-types` | Host lists or creates types |
+| GET | `/api/meeting-types/:id` | Public active type plus host name/email/zone |
+| PUT/DELETE | `/api/meeting-types/:id` | Owner update or hard delete; deletion cascades bookings |
+| GET/POST | `/api/availability/rules` | Host reads or replaces rules |
+| DELETE | `/api/availability/rules/:id` | Owner deletes one rule |
+| GET | `/api/availability/slots` | Public slots for one date; validates but does not use invitee zone in calculation |
+| GET | `/api/availability/dates` | Public dates over a default 30-day horizon; no bounded days-ahead schema |
+| GET | `/api/bookings`, `/api/bookings/stats` | Host list or dashboard statistics |
+| GET | `/api/bookings/:id` | Public full booking details |
+| POST | `/api/bookings` | Public creation; optional X-Idempotency-Key |
+| PUT | `/api/bookings/:id/reschedule` | Anonymous caller with UUID, or authenticated host |
+| DELETE | `/api/bookings/:id` | Anonymous caller with UUID, or authenticated host |
+| GET | `/api/admin/stats`, `/users`, `/bookings`, `/emails` | Session-copied admin role required |
+| DELETE | `/api/admin/users/:id` | Admin deletion; prevents deleting self |
+| GET | `/api/admin/bookings/recent` | Creation/cancellation counts grouped by creation day |
 
-### Core Endpoints
+The public frontend routes are `/book/<meeting-type UUID>` and `/bookings/<booking UUID>`. There is no username/slug-token resolver, slot-check endpoint, signed management token, or Google OAuth route.
 
-```
-Authentication
-  POST   /api/auth/register        Create user account
-  POST   /api/auth/login           Login (creates session)
-  POST   /api/auth/logout          Logout (destroys session)
-  GET    /api/auth/me              Get current user
+Example slot request and response shape:
 
-Meeting Types
-  POST   /api/meeting-types        Create meeting type
-  GET    /api/meeting-types        List user's meeting types
-  GET    /api/meeting-types/:id    Get meeting type details
-  PUT    /api/meeting-types/:id    Update meeting type
-  DELETE /api/meeting-types/:id    Delete meeting type
+```http
+GET /api/availability/slots?meeting_type_id=<UUID>&date=2026-09-14&timezone=America%2FLos_Angeles
 
-Availability
-  POST   /api/availability/rules   Set availability rules
-  GET    /api/availability/rules   Get user's availability rules
-  GET    /api/availability/slots   Get available slots (with caching)
-
-Bookings
-  POST   /api/bookings             Create booking (idempotent)
-  GET    /api/bookings             List user's bookings
-  GET    /api/bookings/:id         Get booking details
-  PUT    /api/bookings/:id/reschedule   Reschedule booking
-  DELETE /api/bookings/:id         Cancel booking
-
-Admin
-  GET    /api/admin/stats          Platform statistics
-  GET    /api/admin/bookings       List all bookings
-  GET    /api/admin/users          List all users
-
-Calendar Integration (future)
-  GET    /api/integrations/google/oauth      Initiate Google OAuth
-  GET    /api/integrations/google/callback   Handle OAuth callback
-  POST   /api/integrations/:id/sync          Trigger calendar sync
+{"success":true,"data":{"date":"2026-09-14","timezone":"America/Los_Angeles","slots":[{"start":"2026-09-14T16:00:00.000Z","end":"2026-09-14T16:30:00.000Z"}]}}
 ```
 
-### Availability API Response Format
+The timestamp is illustrative, not a promised result for the sample policy. Creation accepts meeting type, UTC start, invitee name/email/zone, and optional notes; the server derives the end from the current event type. Local booking conflicts and most business failures return 400, not 409 with suggested alternatives.
 
-Returns UTC timestamps only, enabling instant timezone switching without re-fetching:
-
-```json
-{
-  "slots": {
-    "2025-01-15": [
-      { "start_time": "2025-01-15T19:00:00Z", "end_time": "2025-01-15T19:30:00Z" }
-    ]
-  }
-}
-```
+The proposed contract adds range coverage, policy revision, operation recovery, expected mutation revision, and scoped guest authorization. It returns a complete authoritative booking and separately reports notification/calendar progress.
 
 ## Key Design Decisions
 
-### 1. Preventing Double Bookings
+### Stable host locking versus locking matching bookings
 
-**Chose**: Multi-layered prevention (unique index + row-level locking + idempotency)
+Lock the host before checking occupancy. It is a row that exists even when the host has no bookings. Locking only currently overlapping bookings does not protect the absence of such a row, so two concurrent inserts can both observe an empty range.
 
-**Why this works**: A scheduling platform cannot tolerate overlapping meetings. A single layer is insufficient because database unique indexes catch static conflicts but not time-range overlaps, while application-level checks are vulnerable to race conditions. The combination of `SELECT FOR UPDATE` (serializes concurrent writes) with a partial unique index (catches anything the application misses) provides defense in depth.
+The host lock serializes nonconflicting bookings for that host too. Short transactions and bounded waits are the price of a simple common authority. A version on a host schedule, serializable transactions with bounded retries, or a range exclusion constraint are credible alternatives; they are not intrinsically unable to handle scheduling. The proposed design uses the lock for policy/count coordination and the range constraint as a backstop, rather than claiming an exact-start unique index covers all overlaps.
 
-**Alternative**: Optimistic locking with version fields and retry loops. Rejected because retry storms during popular slot contention would degrade user experience, and the booking-to-search ratio (1:100) means lock contention is rare enough that pessimistic locking latency is acceptable.
+### Local recurrence plus instants versus a UTC-only rule model
 
-**Trade-off**: Slightly higher booking latency (~10-20ms for lock acquisition) in exchange for guaranteed consistency.
+A host's weekly 09:00 working time should remain 09:00 after an offset change. Store that intent with an IANA zone and resolve it for each date. A confirmed meeting also needs one unambiguous instant and a policy for later timezone-rule changes.
 
-### 2. Availability Calculation Algorithm
+A UTC-only recurrence can shift host working hours seasonally; a local-time-only booking cannot distinguish repeated fall-back times. The cost of the combined model is explicit date/zone handling, DST tests, and versioned policy. Browser formatting remains useful, but changing the selected timezone can change which instants belong to the visible calendar date, requiring additional range coverage.
 
-**Chose**: Compute slots on-demand with 5-minute caching in Redis
+### Durable scheduled jobs versus queue-per-delay reminders
 
-The algorithm:
-1. Fetch user's availability rules for the requested date
-2. Fetch existing confirmed bookings from database
-3. Fetch cached calendar events from external providers
-4. Merge all "busy" periods into a sorted interval list
-5. Generate available slots from gaps between busy periods
-6. Apply buffer times and meeting duration constraints
-7. Cache result in Redis (5-minute TTL)
+An indexed due-job table supports multiple claiming schedulers, revision checks, and retries without maintaining one queue for each millisecond delay. It adds a polling interval and lease/recovery logic. That interval is a controllable scheduling delay, not a reason a scheduler must be a single point of failure.
 
-**Alternative**: Pre-compute availability nightly for all users. Rejected because availability changes frequently (new bookings, calendar updates) and pre-computation wastes resources for users who rarely receive bookings.
-
-**Trade-off**: 5-minute cache means a small window where a slot may appear available after being booked. Mitigated by server-side verification before booking creation and 409 Conflict response with alternative suggestions.
-
-### 3. Time Zone Handling
-
-**Chose**: Store all times in UTC, convert at display layer
-
-- Database stores UTC timestamps (TIMESTAMP WITH TIME ZONE)
-- User's IANA time zone stored in profile for host-side display
-- Invitee's time zone detected client-side and sent with booking
-- API returns UTC; client converts using `date-fns-tz`
-
-**Alternative**: Store times in the host's local time zone. Rejected because it makes cross-timezone queries error-prone and DST transitions can create invalid stored times.
-
-### 4. Notification Architecture
-
-**Chose**: Asynchronous delivery via RabbitMQ with dedicated workers
-
-Booking creation publishes a notification message to the queue. Separate worker processes consume messages and send emails. Failed deliveries go to a dead-letter queue for investigation and replay.
-
-**Why not synchronous**: If the email provider is slow or down, booking creation would block. Users care about the booking confirmation, not whether the email was sent instantly. Async delivery also enables scheduled reminders by setting message TTL.
-
-**Alternative**: Direct email sending in the request handler. Rejected because a 3-second email provider timeout would make booking creation feel unresponsive.
-
-### 5. Calendar Sync Strategy
-
-**Chose**: 10-minute polling + webhooks where supported
-
-- Pull-based sync: Background job syncs calendars every 10 minutes
-- Push-based sync: Google Calendar push notifications for near-real-time
-- On-demand sync: When user requests availability, trigger sync if stale
-- Caching: Calendar events cached for 10 minutes in Redis
-
-**Trade-off**: Up to 10 minutes of staleness vs. API quota management. Acceptable because calendar events rarely change minute-to-minute, and the booking creation flow re-checks availability server-side.
+TTL/dead-letter routing can defer messages, but it is not a complete reminder lifecycle or an exact timer. Queue expiration concerns unused queues, and dead-lettering can have delivery limitations. The local implementation uses delay queues; the proposed design chooses durable due jobs with explicit dispatch state. [RabbitMQ TTL](https://www.rabbitmq.com/docs/ttl), [dead-letter behavior](https://www.rabbitmq.com/docs/dlx).
 
 ## Consistency and Idempotency
 
-### Idempotency for Booking Creation
+A creation operation is distinct from a slot. Two guests choosing the same interval are competing reservations; one guest retrying a committed attempt should recover the same result. A shared host lock handles occupancy, while a caller-scoped operation record handles retries.
 
-Every booking request includes an idempotency key, either client-provided (`X-Idempotency-Key` header) or auto-generated from `meeting_type_id + start_time + invitee_email`.
+Bind the operation identity to normalized input and retain its result independently of the booking's mutable lifecycle. A cancelled booking can still be the result of an earlier creation attempt. Rebooking the same time is a new operation, not a reason to replay a stale confirmed object forever.
 
-**Flow:**
-1. Check Redis for existing result with this key (fast path)
-2. Acquire distributed lock for this key (prevents concurrent processing)
-3. If no prior result, process booking and store result in Redis (1-hour TTL)
-4. Store idempotency key in database column for audit durability
-5. Return cached result for duplicate requests
-
-This prevents double-bookings from network retries, double-clicks, and load balancer retries.
-
-### Optimistic Locking for Updates
-
-Bookings include a `version` field. Reschedule and cancel operations use `UPDATE ... WHERE version = $current_version`. If the version has changed (concurrent modification), the operation fails with 409 Conflict.
+Outbox entries commit with each lifecycle revision. Notification and reminder workers reconcile the current revision before sending, and duplicate processing must not generate an unbounded number of effects. A provider timeout can leave send outcome uncertain; database uniqueness alone cannot guarantee exactly one physical email without a compatible provider contract.
 
 ## Security / Auth
 
-### Authentication
+Hosts use opaque server-managed sessions; private reads and mutations check current account access. Guests receive separate, scoped management capabilities rather than using a public identifier as unrestricted proof of ownership. Email verification, when required, is a distinct state and does not happen merely because a syntactically valid address was submitted.
 
-Session-based authentication with Redis-backed session store. Sessions are prefixed with `calendly:session:` in Redis with 24-hour TTL. HTTP-only, secure cookies prevent XSS token theft.
-
-### Authorization (RBAC)
-
-| Role | Permissions |
-|------|-------------|
-| `user` | Manage own meeting types, availability, bookings |
-| `admin` | All user permissions + platform statistics, user management |
-
-### Rate Limiting
-
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| `/api/auth/*` | 10 requests | 1 minute |
-| `/api/availability/*` | 30 requests | 1 minute |
-| `/api/bookings` (POST) | 10 requests | 1 minute |
-| All other endpoints | 100 requests | 1 minute |
-
-### Data Protection
-
-- Passwords hashed with bcrypt (cost factor 10)
-- Calendar access tokens encrypted at rest
-- SQL injection prevented via parameterized queries
-- No PII in logs (emails masked)
+Protect public availability and booking endpoints with bounded date horizons, request sizes, and actor/network quotas. Avoid exposing unrelated guest details, raw idempotency keys, password hashes, or notification bodies in logs. Administrative account deletion needs an explicit retention and cascade policy.
 
 ## Observability
 
-### Metrics (Prometheus)
+Measure accepted bookings, ordinary slot conflicts, recovered attempts, lock wait, stale-policy rejections, availability age, calculation latency, outbox age, reminder lateness, and notification outcomes. A prevented conflict is expected when two guests compete; it is not evidence that a double booking occurred.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `calendly_booking_operations_total{operation,status}` | Counter | Track create/cancel/reschedule |
-| `calendly_booking_creation_duration_seconds{status}` | Histogram | Booking latency (p50/p95/p99) |
-| `calendly_double_booking_prevented_total` | Counter | Should remain zero |
-| `calendly_availability_checks_total{cache_hit}` | Counter | Cache effectiveness |
-| `calendly_availability_calculation_duration_seconds` | Histogram | Calculation time |
-| `calendly_cache_operations_total{operation,cache_type}` | Counter | Hit/miss/set/delete |
-| `calendly_http_request_duration_seconds{method,route,status_code}` | Histogram | RED metrics |
-| `calendly_email_notifications_total{type,status}` | Counter | Notification delivery |
-| `calendly_db_pool_connections{state}` | Gauge | Connection pool health |
-
-### Structured Logging
-
-JSON-formatted logs with Pino, including correlation IDs, user context, and operation metadata. Custom log levels by response status (error for 5xx, warn for 4xx).
-
-### Health Checks
-
-| Endpoint | Purpose | Components Checked |
-|----------|---------|-------------------|
-| `GET /health` | Load balancer | Database, Redis, RabbitMQ (quick) |
-| `GET /health/detailed` | Debugging | All components with latency, pool sizes, memory |
-| `GET /health/live` | K8s liveness | Process running |
-| `GET /health/ready` | K8s readiness | Ready to accept traffic |
-
-**Health Status Levels**: healthy / degraded / unhealthy. RabbitMQ is optional (degraded if unavailable, not unhealthy), since notifications can be retried.
-
-### Alerting Thresholds
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| Booking latency high | p95 > 500ms | Warning |
-| Cache hit rate low | < 70% | Warning |
-| Notification queue backup | > 100 messages | Warning |
-| Notification queue critical | > 500 messages | Critical |
-| Dead-letter queue growing | > 10 messages | Warning |
-| Database pool exhausted | waiting > 0 | Warning |
+Alert separately on actual overlapping active reservations or mismatched occupancy state. Use route templates and bounded labels. Report fresh user-visible confirmation independently of provider delivery. Health and worker-progress checks must remain useful during dependency failures.
 
 ## Failure Handling
 
-### Circuit Breaker (Calendar API)
-
-Calendar API calls are wrapped in a circuit breaker pattern. After 3 consecutive failures, the circuit opens and calendar sync falls back to cached data. After 30 seconds, half-open state allows a test request. Two consecutive successes close the circuit.
-
-### RabbitMQ Reconnection
-
-The queue service implements automatic reconnection with exponential backoff (5s, 10s, 20s... up to 10 attempts). Messages are published with `persistent: true` for durability. Dead-letter exchange routes failed messages to a DLQ for investigation.
-
-### Graceful Degradation
-
-| Failure | Degraded Behavior |
-|---------|------------------|
-| Redis down | Sessions fall back to PostgreSQL table, skip availability cache |
-| RabbitMQ down | Notifications queued in-memory, retried on reconnection |
-| Calendar API down | Use cached calendar events, warn user of potential conflicts |
-| Database read replica down | All reads go to primary |
+| Failure | Proposed response | Local limitation |
+|---------|-------------------|------------------|
+| Stale displayed slot | Revalidate under host authority; preserve guest details on conflict | Creation checks overlaps/cap but not full working-hour or future eligibility |
+| Lost creation response | Recover durable operation result | Redis replay only; unique DB key is not queried for recovery |
+| Redis unavailable | Controlled cache bypass; explicit session behavior | Most caches and session store fail; no SQL session fallback |
+| Cache invalidation fails after commit | Return committed result, retry propagation from outbox | Can return failure after booking/rules already committed |
+| Broker unavailable | Retain notification intent and retry later | Fire-and-forget publication, no outbox or in-memory replay buffer |
+| Worker replay | Reconcile revision and per-recipient delivery | Duplicate SQL email logs; old payloads can be processed later |
+| External calendar stale | Apply stated acceptance policy and expose sync status | External calendars are not integrated |
+| Interrupted archival | Move an exact locked cohort atomically | Separate broad INSERT/DELETE predicates can see different eligible rows |
 
 ## Scalability Considerations
 
-### Database Scaling Path
+Optimize availability misses before adding distributed writes. Compute bounded ranges in batches, avoid repeated per-day metadata queries, coalesce cache fills, and key results by host/policy revision. Invalidate every event type whose shared host occupancy changed, not only the type just booked.
 
-1. **Current**: Single PostgreSQL instance
-2. **Next**: Read replicas for availability queries (read-heavy path)
-3. **Future**: Partition bookings table by date range (monthly partitions), archive to cold storage
+Read replicas can serve browsing projections when their age is acceptable. They must not arbitrate booking acceptance. Cache age plus replica lag plus notification delay determine visible freshness; replica lag is not free merely because browsing tolerates some staleness.
 
-### Application Scaling
+Partition by host when one mapping/booking authority is insufficient so that host occupancy and policy remain colocated. Cross-host group scheduling needs additional coordination. Time partitioning alone can split a meeting and its conflicts across day/month boundaries and complicate a global exclusion constraint; do not assume it preserves the invariant automatically.
 
-- **Horizontal scaling**: Stateless API servers behind load balancer
-- **Service isolation**: Notification workers scale independently from API servers
-- **Caching**: Aggressive caching of availability (5 min), calendar events (10 min), meeting types (10 min)
-
-### Performance Optimizations
-
-- Composite indexes on hot query paths (`user_id, day_of_week`, `host_user_id, start_time`)
-- Connection pooling with `pg` Pool
-- Batch calendar event fetches to minimize API calls
-
-## Data Lifecycle
-
-| Data Type | Retention | Storage | Notes |
-|-----------|-----------|---------|-------|
-| Active bookings | Until completed/cancelled | PostgreSQL | Primary working set |
-| Completed bookings | 90 days in active table | PostgreSQL | For rescheduling reference |
-| Archived bookings | 2 years | PostgreSQL archive table | Legal/audit requirements |
-| Availability cache | 5 minutes | Redis | Invalidated on booking |
-| Session data | 24 hours | Redis | Auto-expire with TTL |
-| Notification queue | 7 days | RabbitMQ | DLQ for failures |
-| Idempotency keys | 1 hour | Redis | Auto-expire with TTL |
+Retain active reservations until their lifecycle is complete. Archive an exact set of locked rows and preserve operation/delivery identities for the recovery horizon. Policies for archives and personal data should be requirements, not invented legal obligations.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Primary database | PostgreSQL | MongoDB/Cassandra | ACID transactions critical for double-booking prevention |
-| Session storage | Redis + cookie | JWT | Immediate revocation, simpler |
-| Booking concurrency | Pessimistic locking | Optimistic locking | Higher success rate, acceptable throughput |
-| Notification delivery | RabbitMQ (async) | Synchronous email | Non-blocking booking creation |
-| Calendar sync | Polling + webhooks | Real-time only | API quota management |
-| Availability caching | 5-min Redis TTL | No cache / pre-compute | Balance between freshness and DB load |
-| Time storage | UTC everywhere | Host local time | Avoids DST bugs, simpler cross-TZ queries |
-| Booking archival | 90-day active + 2-year archive | Keep all in one table | Keeps active table fast |
+| Occupancy arbitration | Host lock plus range backstop | Lock only matching bookings | An empty interval has no row to lock |
+| Time model | Local recurring rules plus instants | UTC-only recurrence | Preserve host wall-clock intent across offset changes |
+| Availability cache | Bounded versioned proposal | Treat cached slots as reservations | Correctness belongs to the commit transaction |
+| Reschedule lifecycle | Active booking with a new revision | Nonblocking rescheduled status | The moved meeting must still reserve time |
+| Notification intent | Transactional outbox | Post-commit publish alone | Recover process/broker failures after booking success |
+| Reminders | Durable due jobs | Queue per unique delay | Make revision, cancellation, and recovery explicit |
 
 ## Implementation Notes
 
-This section documents the actual local implementation: what production patterns are implemented, what was simplified, and what was omitted.
+### Runtime, setup, and fixtures
 
-### Local Setup Diagram
+[The entry point](./backend/src/index.ts) mounts all API routes in one Express process on port 3000 by default. [The worker](./backend/src/workers/notification-worker.ts) logs simulated emails through a separate process. [Compose](./docker-compose.yml) provides PostgreSQL 16, Valkey 7, and RabbitMQ 3. Only PostgreSQL and Valkey have named data volumes; AOF is not explicitly enabled and RabbitMQ data is not retained across ordinary container replacement.
 
-```
-┌──────────────────┐
-│  React Frontend  │
-│  localhost:5173   │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Express API     │
-│  localhost:3000   │
-│  (or 3001-3003)  │
-└──┬─────┬─────┬───┘
-   │     │     │
-   ▼     ▼     ▼
-┌──────┐ ┌──────┐ ┌──────────┐
-│Pg    │ │Redis/│ │RabbitMQ  │
-│:5432 │ │Valkey│ │:5672     │
-│      │ │:6379 │ │:15672    │
-│      │ │      │ │(mgmt)   │
-└──────┘ └──────┘ └──────────┘
+The schema creates seven tables but no accounts. It is not rerunnable on an initialized schema. The full [SQL fixture](./backend/db-seed/seed.sql) references absent demo records and invalid `bk...`/`ar...` UUIDs. With stop-on-error it leaves the preceding four users, eight types, and twenty weekly rules committed, then stops at the first booking statement. Repeating the valid prefix duplicates rules because there is no uniqueness constraint on weekly intervals. Existing matching emails with different UUIDs can also break its fixed foreign-key references.
+
+All four sample users have role user and password123, verified by an isolated bcrypt comparison. There is no administrator or demo@example.com account. The README gives registration and a valid-prefix option plus explicit local promotion. Application startup does not seed, migrate, or repair the fixture.
+
+The API logs failed database/Redis startup checks and continues listening. The worker exits if PostgreSQL, Redis, or its initial broker setup fails. Broker connection variables are separate host/port/user/password fields, not RABBITMQ_URL. There is no `.env` loader or load balancer. `WORKER_ID` is set by scripts but unused in the worker.
+
+### Booking authority and lifecycle
+
+[Creation](./backend/src/services/booking/create.ts) acquires a database client, begins a transaction, fetches active meeting metadata through a separate pool query, then explicitly locks the host:
+
+```sql
+SELECT id FROM users WHERE id = $1 FOR UPDATE;
 ```
 
-### Production Patterns Actually Implemented
+The subsequent confirmed-booking overlap check uses the candidate's expanded interval. This serializes ordinary creates for a host; it is stronger than locking only existing bookings. However, the policy was read before the lock, and creation never verifies working-hour membership, slot-grid membership, a future start, minimum notice, or a maximum horizon. It expands only the candidate by its current type's buffers, without reserving each existing meeting's own buffer snapshot.
 
-| Pattern | File Path | Description |
-|---------|-----------|-------------|
-| **Idempotency** | `backend/src/shared/idempotency.ts` | Redis-backed idempotency keys with distributed locks; prevents duplicate bookings from retries |
-| **Structured Logging** | `backend/src/shared/logger.ts` | Pino JSON logging with request correlation IDs and custom log levels |
-| **Prometheus Metrics** | `backend/src/shared/metrics.ts` | 15+ business and infrastructure metrics exposed at `/metrics` |
-| **Health Checks** | `backend/src/shared/health.ts` | Multi-level health checks (basic, detailed, liveness, readiness) checking DB, Redis, RabbitMQ |
-| **Message Queue** | `backend/src/shared/queue.ts` | RabbitMQ integration with dead-letter exchange, durable queues, prefetch=1 |
-| **Notification Workers** | `backend/src/workers/notification-worker.ts` | Separate process consuming from RabbitMQ queues |
-| **Booking Archival** | `backend/src/services/archivalService.ts` | Data lifecycle management with configurable retention |
-| **Session Auth** | `backend/src/index.ts` | Redis-backed sessions via connect-redis |
-| **Availability Calculation** | `backend/src/services/availabilityService.ts` | Slot computation with buffer times and cache |
+The daily cap counts this meeting type's confirmed starts within the API process's local midnight boundaries. Availability uses host-zone boundaries instead. Neither the partial index nor the host lock reconciles those different definitions.
 
-### What Was Simplified or Substituted
+[Reschedule](./backend/src/services/booking/reschedule.ts) and [cancel](./backend/src/services/booking/cancel.ts) select a join of booking, type, and host with unqualified `FOR UPDATE`. This locks participating rows from all three tables, including the host; it is incorrect to describe rescheduling as having no host lock. PostgreSQL specifies that scope for a locking clause without an `OF` table list. [SELECT locking clauses](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE).
 
-| Production Design | Local Substitute | Reason |
-|-------------------|------------------|--------|
-| CDN for static assets | Vite dev server serves directly | No CDN needed for local dev |
-| API Gateway (Kong/Envoy) | Express handles routing directly | Single process is sufficient |
-| Multiple API instances + nginx LB | Single instance (or 3 via `dev:server1/2/3`) | Can demo load balancing manually |
-| Google Calendar OAuth integration | Simulated email notifications | No external API keys needed |
-| Encrypted calendar token storage | No calendar tokens stored | Calendar integration not implemented |
-| Rate limiting middleware | Not implemented | Low traffic in dev |
-| bcrypt cost factor 12 | bcrypt cost factor 10 | Faster login in dev |
+The major reschedule defect is the update to `status = 'rescheduled'`. All occupancy queries, daily-cap counts, the exact-start unique index, upcoming statistics, and reminders use only confirmed rows. The moved booking therefore stops reserving time. Reschedule also omits daily-cap, working-hour, future-time, and active-type checks, uses the current type duration, and does not schedule new reminders.
 
-### What Was Omitted
+Its version condition uses the version just read under lock; callers supply no expected version. Cancellation increments version without a version predicate, rejects an already cancelled booking, and can cancel past/rescheduled records through the API. These are not the documented optimistic client-conflict and idempotent-cancel semantics.
 
-- **CDN / Edge caching** - No static asset distribution
-- **Multi-region deployment** - Single-machine setup
-- **Kubernetes orchestration** - Docker Compose only
-- **Real calendar API integration** - No Google/Outlook OAuth flows
-- **SMS notifications** - Email only (simulated)
-- **Bot detection / CAPTCHA** - Not needed for local dev
-- **Database read replicas** - Single PostgreSQL instance
-- **Redis Sentinel / Cluster** - Single Redis instance
-- **Automated schema migrations** - Uses init.sql loaded at container start
-- **Real email delivery** - Notifications logged to database, not sent via SMTP
+Post-commit cache invalidation is awaited inside the same try/catch. Redis failure can cause an attempted rollback after commit and return 400 despite a durable booking change. Create can cache its result before invalidation fails, so a later replay may return success while notifications were never started. There are no transaction/lock statement deadlines or automatic deadlock retries.
 
----
+### Idempotency behavior
 
-## Frontend Architecture
+[Booking idempotency](./backend/src/services/booking/idempotency.ts) uses [shared/idempotency.ts](./backend/src/shared/idempotency.ts). The browser sends no key; the service derives one from meeting type, the literal start string, and lowercased/trimmed email. Name, notes, timezone, operation scope, and a complete request digest are not included. A supplied key is global and unbound to its payload or caller.
 
-### Component Hierarchy
-
-```
-__root.tsx (Navbar + <Outlet>)
-├── / ─── LandingPage (unauthenticated welcome)
-├── /login ─── LoginPage
-├── /register ─── RegisterPage
-├── /dashboard ─── DashboardPage (auth-guarded)
-│   ├── Stats grid (upcoming, this week, this month, event types)
-│   ├── Upcoming bookings list
-│   └── Quick actions (links to meeting types, availability, bookings)
-├── /meeting-types ─── MeetingTypesPage (auth-guarded)
-│   ├── MeetingTypeCard[] (with edit/delete/activate/deactivate)
-│   ├── MeetingTypeModal (create/edit form)
-│   └── MeetingTypesEmptyState
-├── /availability ─── AvailabilityPage (auth-guarded)
-│   └── Day-of-week schedule editor (checkboxes + time selects)
-├── /bookings ─── BookingsPage (auth-guarded)
-│   └── Booking list with status filtering
-├── /bookings/$bookingId ─── BookingDetailPage (auth-guarded)
-│   └── Reschedule/cancel actions
-├── /book/$meetingTypeId ─── BookingPage (public, no auth required)
-│   ├── Meeting type info sidebar (name, duration, timezone selector)
-│   ├── CalendarPicker (month navigation, available date highlighting)
-│   ├── TimeSlotPicker (scrollable time slot buttons)
-│   └── Booking confirmation form (name, email, notes)
-└── /admin ─── AdminPage (auth-guarded, admin role)
-    └── Platform statistics + user/booking management
+```typescript
+return `booking:${meetingTypeId}:${startTime}:${normalizedEmail}`;
 ```
 
-The root layout (`__root.tsx`) renders a `Navbar` and `<Outlet>` without any auth logic -- unlike the other projects, auth guards are applied per-route using TanStack Router's `beforeLoad` hook. The booking page (`/book/$meetingTypeId`) is intentionally public -- invitees do not need an account to book a meeting.
+Results are cached for one hour by default. Locks contain the constant value `1`, expire after 30 seconds, are not renewed, and are deleted without checking ownership. Cache/lock errors fail open. Database-client acquisition occurs outside the try/finally, so an acquisition failure leaves the Redis lock until expiry.
 
-### Routing (TanStack Router, File-Based)
+The database's unique idempotency column can prevent a second stored key, but no path queries it to recover the prior result. After cache loss/expiry, retries can fail with overlap or uniqueness errors instead of returning the booking. Equivalent start-time string representations can derive different keys. Replay can return an old confirmed object after cancellation or reschedule, and a deliberately new booking with the same derived identity is indistinguishable from retry. Archival removes the live unique-key record and has no coordinated receipt retention.
 
-Two dynamic route segments exist: `/book/$meetingTypeId` (public booking flow) and `/bookings/$bookingId` (booking detail for authenticated hosts). Auth guards use an async `beforeLoad` hook that calls `checkAuth()` if the user is not yet authenticated, then redirects to `/login` if the check fails. This pattern handles both direct navigation (typing a URL) and page refreshes (where the Zustand store has not yet been hydrated from the session cookie).
+### Availability calculation and time defects
 
-### Zustand Store: `useAuthStore`
+[AvailabilityService](./backend/src/services/availabilityService.ts) first queries active type/host metadata, then reads `slots:<type>:<date>`. A cache hit still requires PostgreSQL and returns stored slots without filtering those now in the past. The `_inviteeTimezone` argument is ignored; its validation does not make the date an invitee-local day.
 
-A single Zustand store (`frontend/src/stores/authStore.ts`) manages authentication state: `user`, `isAuthenticated`, and `isLoading`. Unlike the other projects in this repository, this store does not use Zustand's `persist` middleware -- session state relies entirely on the server-side session cookie (set with `credentials: 'include'` on fetch requests). The `checkAuth` action calls `GET /api/auth/me` and populates the user object if the session is valid. This means a page refresh triggers a round-trip to the server to validate the session, which is more secure (no client-side token storage) but slightly slower.
+For weekday selection, it parses the date as midnight in the process zone and converts that instant to the host zone. In an isolated UTC-process check, Monday 2026-09-14 becomes weekday Sunday for a Los Angeles host. Working intervals are then constructed from the original date label, so the chosen weekday's rules can be applied to another date.
 
-The store provides `login`, `register`, `logout`, and `checkAuth` actions. All auth API calls return an `ApiResponse<T>` wrapper with `success` and `data` fields, so the store checks `response.success` before updating state.
+The dates endpoint generates labels in the invitee zone but feeds them into this host-date calculation. It performs a sequential slot query per day, with an unbounded days-ahead parameter. It does not return coverage for a genuine invitee-local instant range.
 
-### Data Fetching Pattern
+[Time helpers](./backend/src/utils/time.ts) use date-fns/date-fns-tz. They do not detect ambiguous or nonexistent civil times. An isolated call for New York 2026-03-08 02:30 returned 06:30Z, which formats back as 01:30, while 2026-11-01 01:30 selects one occurrence without an explicit policy. These checks exercised the installed helper/library, not the live booking API. The library's [conversion documentation](https://github.com/marnusw/date-fns-tz#fromzonedtime) describes converting civil values and instants; application-level disambiguation is still required.
 
-API calls are organized into domain-specific objects in `frontend/src/services/api.ts`: `authApi`, `meetingTypesApi`, `availabilityApi`, `bookingsApi`, and `adminApi`. A generic `fetchApi<T>()` wrapper includes `credentials: 'include'` on every request (required for session cookies to be sent cross-origin during development with Vite's proxy), sets the `Content-Type: application/json` header, and returns the parsed JSON response.
+Booking lookup selects confirmed rows whose starts fall between host-local 00:00 and 23:59. It misses meetings beginning earlier and overlapping the day, buffers crossing into it, and starts in the final minute after 23:59:00. The slot calculator expands every booking using the candidate type's buffers, then adds candidate padding again while generating slots; this differs from creation's raw-existing-interval predicate and ignores other types' own buffer policy.
 
-All API responses are wrapped in an `ApiResponse<T>` type with `success: boolean`, `data?: T`, and `error?: string`. This differs from the other projects which throw on errors -- here, the caller checks `response.success` and handles failures explicitly. This pattern makes error handling more predictable at the cost of more boilerplate in each caller.
+`findGaps` merges busy intervals but does not clip them to the working window. A direct check of a 09:00–12:00 window with a 15:00–16:00 busy interval produced a 09:00–15:00 gap and a final 14:30 slot. Multiple working rules are not merged, so duplicates/overlapping rules can also emit repeated choices.
 
-Data fetching uses local component state (`useState` + `useEffect`) rather than Zustand stores. Only auth state is global. This is appropriate because Calendly's pages are largely independent -- the availability page does not need the bookings list, and the booking flow does not need the meeting types list. Each page fetches its own data on mount.
+Daily-cap handling truncates alternatives to the first remaining-count slots, incorrectly hiding later valid choices. Booking mutations invalidate only `slots:<changed type>:*`; the host ID argument is unused, so caches for the host's other types remain stale. Rule changes invalidate all types found through a cached list, using blocking Redis KEYS. Late computations can refill old results after deletion; there are no generation checks.
 
-### Key UI Patterns
+[Meeting-type creation](./backend/src/services/meetingTypeService.ts) deletes `meeting_types:<user>` while reads use keys ending in `:true` or `:false`, leaving existing lists stale. Updates clear type/list caches but not computed slots. Deactivation is checked by the fresh active-type query before a slot-cache read. Hard deletion cascades bookings/email logs; it does not perform cancellation or notify guests. Empty updates return cached details without checking ownership.
 
-**Multi-Step Booking Wizard (BookingPage):** The public booking page (`/book/$meetingTypeId`) is the most complex UI in the project, implementing a three-step wizard: (1) select date and time, (2) enter contact details, (3) confirmation. State is tracked via a `step` discriminated union (`'select-time' | 'enter-details' | 'confirmed'`). The page is split into a sidebar (meeting type info + timezone selector) and a main area (wizard steps).
+### Notification and reminder behavior
 
-**Calendar Picker Component:** A custom calendar widget (`frontend/src/components/CalendarPicker.tsx`) built entirely with `date-fns`. It renders a month grid with day buttons, supports month navigation (previous/next arrows), highlights today with a border, marks the selected date with a filled primary color, and disables past dates. When `availableDates` is provided, only those dates are clickable -- other dates are greyed out and disabled. This is critical for the booking flow because it prevents invitees from selecting dates with no available slots.
+[Booking notifications](./backend/src/services/booking/notifications.ts) always invoke both a queued path and a direct [email simulation](./backend/src/services/emailService.ts). With a functioning worker, ordinary confirmation produces two records per recipient; cancel/reschedule produces two guest records and one host record. The direct path is not a fallback selected only when RabbitMQ fails. Both write status sent and print bodies; neither contacts an email provider, and host messages use the invitee timezone too.
 
-**Time Slot Picker:** After selecting a date, the `TimeSlotPicker` component renders a scrollable list of available time slots as buttons. Each slot shows the start time formatted in the invitee's selected timezone. Selecting a slot highlights it and enables the "Continue" button. Slots are fetched from the API when the selected date changes, with a loading spinner during the fetch.
+[QueueService](./backend/src/shared/queue.ts) declares durable booking-notifications, reminders, and notifications-dlq queues. Main/reminder failures dead-letter through a correctly bound direct exchange. Publication uses persistent messages on a plain channel without confirms or backpressure handling. There is no outbox, retained in-memory retry buffer, payload schema validation, or event/revision identity for duplicate suppression.
 
-**Timezone Handling in the UI:** The booking page includes a timezone selector dropdown populated with common IANA timezone names (via a `commonTimezones` array in `frontend/src/utils/time.ts`). The selected timezone is auto-detected from the browser on first load (`getLocalTimezone()` wraps `Intl.DateTimeFormat().resolvedOptions().timeZone`). Changing the timezone re-fetches available dates and slots, and all displayed times update to the new timezone. The `formatInTimezone` utility uses `date-fns-tz` for timezone-aware formatting.
+Connection setup is lazy in the API. Concurrent publishers can call connect while setup is in progress; connect returns immediately rather than awaiting the existing initialization, allowing a publisher to access a null channel. Creation launches confirmation and reminder scheduling together, exposing this cold-connection race.
 
-**Availability Schedule Editor (AvailabilityPage):** A weekly schedule editor showing 7 day rows (Sunday through Saturday). Each row has a checkbox to enable/disable the day, and two time select dropdowns (start and end) with 30-minute granularity (48 options from 00:00 to 23:30, displayed in 12-hour format via `formatTime12Hour`). Enabled days are highlighted with a background color. The save button sends all enabled rules to the backend in a single POST. An info box at the bottom shows the user's detected timezone and tips about buffer times.
+Reminders use one durable `reminders-delay-<milliseconds>` queue per delay, with message TTL and dead-letter routing through the default exchange into reminders. Queue expiry is based on being unused, not a guaranteed exact deletion timer after delivery. There is no per-booking cancel/update operation for these queues. Scheduled reminders check only current confirmed status and use their old payload; rescheduled meetings are skipped and get no replacements.
 
-**Dashboard (DashboardPage):** A summary page with a stats grid (4 cards: upcoming bookings, this week, this month, event types) and two content panels: upcoming bookings list (clickable, navigates to booking detail) and quick actions (links to meeting types, availability, and bookings pages). Data is loaded in parallel via `Promise.all` on mount.
+The worker inserts recipient logs separately and then writes a seven-day Redis notification-status marker. A failure after one recipient or after both sends can dead-letter a partially applied job; replay duplicates prior records. It does not reject stale lifecycle notification payloads. Unknown notification types are logged and acknowledged. Prefetch 1 limits consumer delivery, not end-to-end exactly-once work.
 
-**Meeting Type Management (MeetingTypesPage):** A card-based layout where each meeting type is rendered as a `MeetingTypeCard` with a colored left border, name, duration, slug, and action buttons (edit, delete, activate/deactivate). A modal (`MeetingTypeModal`) handles both creation and editing, with fields for name, slug, description, duration, buffer times, max bookings per day, and color picker. An empty state component encourages users to create their first meeting type.
+Reconnect creates queues/channel but does not restore either consumer. Connection error and close events can schedule multiple attempts; the timer calls an async connect without handling its rejection. Shutdown closes connections without first canceling and draining consumers, and connection-close handling can schedule reconnect during shutdown. The API has no graceful-shutdown handler.
 
-### Type Safety
+### Authentication and frontend behavior
 
-Domain types are defined in `frontend/src/types/index.ts`: `User` (with `time_zone`), `MeetingType` (with `user_name` for display), `Booking` (with `meeting_type_name`, `invitee_timezone`), `AvailabilityRule`, `TimeSlot` (with UTC `start` and `end`), `DashboardStats`, and the generic `ApiResponse<T>` wrapper. The `TimeSlot` type is particularly important -- it carries UTC timestamps that are converted to the display timezone only at render time, maintaining the "store UTC, display local" principle throughout the stack.
+[Login](./backend/src/services/userService.ts) validates bcrypt with 10 rounds, but destructures `_password_hash` rather than `password_hash`. The real hash remains in the returned user, HTTP login response, and session. An isolated object-shape check confirmed that property remains. Registration returns a narrower user shape. Emails are case-sensitive, and registration does not validate that the host timezone is a real IANA zone.
 
----
+Sessions use connect-redis with prefix calendly:session:, default connect.sid cookies, HttpOnly/SameSite=Lax, a 24-hour cookie max age, and Secure only in production. The SQL sessions table is unused. Login/registration do not regenerate the session ID. Authorization checks session userId and the copied role rather than refreshing the user on every request; `/me` uses a one-hour user cache and does not update the copied role. User deletion clears that user cache but not existing sessions.
 
-## Deep Pattern Explanations
+Public booking details include guest/host emails, notes, and other booking fields. Anonymous cancel/reschedule accepts a booking UUID without a separate token; adding a session restricts these actions to the host, but omitting the cookie removes that check. No rate limiter or calendar-token encryption is wired because calendar integration is absent.
 
-This section explains each production-grade backend pattern implemented in this project. Each explanation assumes no prior knowledge of the pattern.
+[The browser](./frontend/src/main.tsx) checks auth on mount without persist storage. However, ordinary host route guards skip the check while auth isLoading is true and do not recheck automatically after it finishes. There is no universal HTTP-status interceptor, account-generation guard, or cancellation of outstanding requests. Logout clears browser identity even if the parsed response reports failure; a network exception leaves it intact.
 
-### Idempotency
+[Guest booking](./frontend/src/routes/book.$meetingTypeId.tsx) uses local state and direct fetch. Changing timezone reloads dates/slots and clears selection even in the details step. Meeting-type changes do not reset the wizard or include the new type in the slot effect dependencies. Late type/date/slot responses can overwrite newer context. Errors often log only to the console and look like empty availability.
 
-**What it is:** Idempotency is a property of an operation where performing it multiple times produces the same result as performing it once. For a scheduling platform, it means that if an invitee clicks "Schedule Event" and the network drops, retrying the request will not create a duplicate booking for the same time slot.
+[CalendarPicker](./frontend/src/components/CalendarPicker.tsx) uses browser-local Date values for day labels, minimum date, and month navigation. An empty available-date set enables all nonpast dates, including while loading or after a failed lookup. Month navigation does not request new coverage beyond the initially loaded 30 days. Formatting selected local midnight in another zone can change the displayed date independently of the selected label.
 
-**Why it matters for booking creation:** Without idempotency, a network retry could create two confirmed bookings for the same time slot with the same invitee -- an embarrassing double-booking that requires manual cleanup and damages the host's professional image. Even worse, the partial unique index (`idx_bookings_no_double`) would prevent the second insert, but without proper idempotency handling, the second request would return an error rather than the original booking confirmation, leaving the invitee confused about whether they are actually booked.
+The confirmation stores only the returned booking ID, then displays draft name/time/duration instead of the complete committed record. The ID is not exposed as a management link. The success page claims email delivery even though it only has booking acceptance. There is no calendar export or reschedule UI. Public [booking details](./frontend/src/routes/bookings.$bookingId.tsx) do allow cancellation; after the mutation's plain booking response replaces joined details, host/type display fields disappear until reload.
 
-**How it works here:** Every booking request includes an idempotency key, either explicitly provided via the `X-Idempotency-Key` header or auto-generated from `meeting_type_id + start_time + invitee_email`. The server first checks Redis for an existing result with this key. If found, the cached response is returned immediately. If not found, a distributed lock is acquired for the key (preventing concurrent processing of the same request), the booking is created, the result is cached in Redis with a 1-hour TTL, and the idempotency key is also stored in the `bookings` table for audit durability. The implementation is in `backend/src/shared/idempotency.ts`.
+[The availability editor](./frontend/src/routes/availability.tsx) displays the browser timezone rather than the saved host timezone and retains one interval per day, overwriting additional rules on save. [Event editing](./frontend/src/components/meeting-types/MeetingTypeModal.tsx) lacks a daily-cap field; blank description becomes undefined and cannot clear an existing description. Copy Link announces success before awaiting the clipboard operation. Host lists are unpaginated, dashboard data is sliced to five after full fetch, and filters have no stale-response guard.
 
-### Redis Cache-Aside (Availability Cache)
+### Operational patterns and lifecycle tooling
 
-**What it is:** Cache-aside is a caching strategy where the application checks the cache before performing an expensive computation or database query. On a cache miss, the computation runs, the result is stored in the cache, and then returned. On a cache hit, the cached result is returned instantly.
+| Pattern | Actual evidence | Limit |
+|---------|-----------------|-------|
+| Host locking | booking/create.ts and joined mutation selects | No range exclusion or complete shared policy validation |
+| Idempotency helper | shared/idempotency.ts | Redis result cache plus unbound lock; no durable-result recovery |
+| Metrics | [shared/metrics.ts](./backend/src/shared/metrics.ts), HTTP finish hooks | Raw fallback paths can be unbounded; DB-query and calendar metrics are declared but unused |
+| Structured logging | [shared/logger.ts](./backend/src/shared/logger.ts) | Request context is not propagated into service/queue logs; emails and full simulated bodies remain visible |
+| Health | [shared/health.ts](./backend/src/shared/health.ts) | SQL and Redis checks lack overall deadlines; broker object/depth checks do not prove consumer progress |
+| Archival | [archivalService.ts](./backend/src/services/archivalService.ts) | Manual only, broken aggregate maintenance, unsafe broad cohort deletion |
 
-**Why it matters:** Availability calculation is the most expensive operation in the system. For each request, the server must: (1) fetch the user's availability rules, (2) fetch all confirmed bookings for the date range, (3) optionally fetch cached external calendar events, (4) merge all busy periods into a sorted interval list, (5) generate available slots from the gaps, and (6) apply buffer times and meeting duration constraints. This involves 2-3 database queries and an O(n log n) interval merge algorithm. At production scale with 5,000 availability checks per second, running this computation for every request would overwhelm the database.
+Metrics count a prevented create conflict as normal conflict handling, not a stored double booking. Success is recorded before post-commit invalidation, so a subsequent failure can also record failed latency. Replays bypass creation timing. The active-bookings gauge updates on create/cancel only and does not age with time or update on reschedule. Worker email simulation does not update the API process's notification metric. There is no circuit-breaker implementation, even though the old architecture described one.
 
-**How it works here:** After computing available slots, the result is cached in Redis with a 5-minute TTL (keyed by `availability:{meetingTypeId}:{date}`). Subsequent requests for the same meeting type and date return the cached slots in < 1ms. The cache is invalidated when a new booking is created (since that booking reduces available slots) by deleting relevant cache keys. The 5-minute TTL means a newly created booking might still appear as an available slot for up to 5 minutes -- but this is mitigated by server-side verification during booking creation, which returns 409 Conflict if the slot is no longer available. The `calendly_availability_checks_total{cache_hit}` Prometheus counter tracks the hit rate -- the alerting threshold triggers a warning below 70%.
+Health treats SQL, Redis, and heap-used/heap-total ratio as critical; RabbitMQ failure only degrades the overall result. It queries queue depths only after that process has a broker connection. Basic health still performs Redis INFO and queue checks; RabbitMQ's latency measurement is taken before those queue operations. SQL health releases its client only on success, so a failed query can leak it. Pool-size metrics use in-memory pool values and do not require a business query.
 
-### Circuit Breaker
+Archival selects completed/cancelled records older than the completed-retention setting, default 90 days. The separate cancelled-retention setting is unused, and there is no automatic completed transition: old confirmed/rescheduled bookings remain live. Copy and deletion use separate broad predicates under ordinary isolation; a record becoming eligible between statements can be deleted without being in the copied cohort when other rows were archived. Cascading deletion removes its email logs.
 
-**What it is:** A circuit breaker stops an application from repeatedly calling a service that is failing. It has three states: CLOSED (requests pass through), OPEN (requests fail immediately), and HALF_OPEN (a single test request is allowed after a timeout period to check if the service has recovered). This prevents cascading failures where a slow or down dependency drags down the entire application.
+Restore has a similar broad-delete pattern, and can fail when original parents no longer exist. Archive purge uses archived_at plus 730 days by default; no scheduler runs it. Full maintenance invokes operations in parallel, including cleanup of nonexistent calendar_events_cache, then its package command catches the error and exits without a failing exit code. Other operations may already have committed or be interrupted by process exit. Storage stats hide missing/inaccessible archive/calendar queries as zero.
 
-**Why it matters:** Calendly integrates with external calendar APIs (Google Calendar, Microsoft Graph) for availability checking and event creation. These APIs can be slow (rate limited), temporarily unavailable (maintenance windows), or permanently unreachable (expired OAuth tokens). Without a circuit breaker, every availability check that involves a calendar sync would wait for the API timeout (potentially 10-30 seconds) before falling back to cached data. With 5,000 availability checks per second, this would exhaust the server's connection pool in under a second.
+### Simplifications, omissions, and verification
 
-**How it works here:** Calendar API calls are wrapped in a circuit breaker pattern. After 3 consecutive failures, the circuit opens. All subsequent calendar sync requests fail immediately and fall back to cached calendar events (which are refreshed every 10 minutes during normal operation). After 30 seconds, the circuit enters the half-open state and allows a single test request. Two consecutive successes close the circuit and resume normal calendar syncing. The circuit breaker state is logged for operational visibility.
+The local system uses one PostgreSQL database, one Valkey, RabbitMQ, and direct SQL/console email simulation. It omits external calendars, provider token storage, a transactional outbox, durable reminder records, guest capability tokens, shared quotas, read replicas, sharding, CDN, and region failover. Prototype defects above are separate from those deliberate scope reductions.
 
-### Structured Logging
-
-**What it is:** Structured logging produces log entries as JSON objects with consistent fields (timestamp, level, service, requestId, userId, etc.) rather than free-form text strings. This makes logs machine-parseable, enabling automated querying, filtering, and alerting via log aggregation platforms.
-
-**Why it matters:** When a user reports "I tried to book a meeting and it said the slot was unavailable, but I can see it on the calendar", the support engineer needs to trace the exact sequence of events: Was the availability cache stale? Did a concurrent booking take the slot? Did the calendar sync fail? Structured logs with a consistent `requestId` field allow correlating all log entries for that specific booking attempt across the availability service, booking service, and notification service.
-
-**How it works here:** Pino is configured (`backend/src/shared/logger.ts`) with JSON output and correlation IDs. Each incoming request is assigned a unique request ID, and all log entries within that request carry the ID. Custom log levels are mapped by response status: 5xx responses log at `error` level, 4xx at `warn`, and 2xx at `info`. User context (user ID, email) is attached to log entries for authenticated requests, but emails are masked in log output for privacy compliance.
-
-### Prometheus Metrics
-
-**What it is:** Prometheus is a monitoring system that collects numeric metrics from applications by scraping an HTTP endpoint at regular intervals. Metrics quantify system behavior over time: how many bookings were created, how fast availability was calculated, how many cache hits versus misses occurred. Prometheus stores these as time-series data and enables dashboard visualization (Grafana) and threshold-based alerting.
-
-**Why it matters:** For a scheduling platform, the most important question is "are bookings working?" -- but this decomposes into sub-questions that only metrics can answer: "How many double-booking attempts were prevented?" (should be zero under normal operation, and the `calendly_double_booking_prevented_total` counter tracks this). "Is availability calculation getting slower as the user base grows?" (the `calendly_availability_calculation_duration_seconds` histogram reveals the latency distribution). "Are notifications being delivered?" (the `calendly_email_notifications_total` counter by status tracks delivery vs. failure).
-
-**How it works here:** The implementation uses `prom-client` (`backend/src/shared/metrics.ts`) with 15+ metrics. Booking metrics include `calendly_booking_operations_total{operation,status}` (counter for create/cancel/reschedule), `calendly_booking_creation_duration_seconds{status}` (histogram for booking latency), and `calendly_double_booking_prevented_total`. Availability metrics include `calendly_availability_checks_total{cache_hit}` and `calendly_availability_calculation_duration_seconds`. Infrastructure metrics include `calendly_http_request_duration_seconds{method,route,status_code}` (RED metrics), `calendly_cache_operations_total{operation,cache_type}`, `calendly_email_notifications_total{type,status}`, and `calendly_db_pool_connections{state}`.
-
-### Rate Limiting
-
-**What it is:** Rate limiting restricts how many requests a client can make to an API within a time window. When the limit is exceeded, the server responds with HTTP 429 (Too Many Requests). Limits are typically tracked per IP address or per authenticated user using a sliding window algorithm.
-
-**Why it matters:** The booking page (`/book/$meetingTypeId`) is public -- anyone with the URL can access it without authentication. Without rate limiting, an attacker could flood the availability endpoint with thousands of requests per second, overwhelming the database and preventing legitimate invitees from booking. Rate limiting also prevents brute-force attacks on the login endpoint (trying thousands of password combinations) and abuse of the booking creation endpoint (creating hundreds of fake bookings to exhaust a host's available slots).
-
-**How it works here:** Rate limits are specified per endpoint category: authentication endpoints (10 requests/minute -- strict to prevent brute force), availability checks (30 requests/minute -- generous because legitimate booking flows involve multiple checks), booking creation (10 requests/minute -- prevents slot exhaustion attacks), and all other endpoints (100 requests/minute). In the local implementation, rate limiting is not yet wired in, but the architecture specifies Redis-based sliding window counters for production deployment.
-
-### RBAC (Role-Based Access Control)
-
-**What it is:** RBAC assigns permissions based on user roles rather than individual user identities. Each user has a role (e.g., "user" or "admin"), and each role has a predefined set of permissions. The system checks the user's role when authorizing access to resources or actions.
-
-**Why it matters:** A scheduling platform has two distinct user types: regular users (hosts who manage their availability and meeting types) and administrators (platform operators who view system-wide statistics, manage user accounts, and investigate issues). Without RBAC, either every user would have admin access (security risk) or admin functionality would require a separate application (operational overhead). RBAC enables a single application with role-appropriate access.
-
-**How it works here:** Users have a `role` column with values `user` or `admin`. The user role can manage their own meeting types, availability rules, and bookings. The admin role has all user permissions plus access to `/api/admin/*` endpoints: platform statistics (total users, bookings, emails sent), user listing and deletion, booking listing across all users, and email notification logs. Admin endpoints check the role in middleware and return 403 Forbidden for non-admin users.
-
-### Health Checks
-
-**What it is:** Health checks are HTTP endpoints that report whether an application and its dependencies are operational. Load balancers use them to route traffic to healthy instances. Orchestrators use them to restart unhealthy containers.
-
-**Why it matters:** A Calendly instance that cannot reach PostgreSQL cannot create bookings, but it might still serve cached availability from Redis. An instance that cannot reach RabbitMQ cannot send notification emails, but it can still create bookings. Health checks report the status of each dependency independently, allowing infrastructure to make nuanced routing and restart decisions.
-
-**How it works here:** Four health endpoints are implemented (`backend/src/shared/health.ts`). `/health` performs a quick check of database, Redis, and RabbitMQ connectivity -- suitable for load balancer polling at 5-second intervals. `/health/detailed` runs deeper checks with latency measurements, pool sizes, and memory usage -- used for debugging and capacity planning. `/health/live` returns 200 if the process is running (Kubernetes liveness probe). `/health/ready` returns 200 only if all critical dependencies are reachable (Kubernetes readiness probe -- prevents routing traffic to an instance that started but has not yet connected to its dependencies). RabbitMQ is treated as optional: if it is unreachable, the health status is "degraded" (notifications are delayed) rather than "unhealthy" (booking creation still works).
+The eight [smoke tests](./tests/smoke.spec.ts) and screenshot configuration mostly assert page containers. The booking-detail case uses an invalid UUID and can succeed on an error page. This review inspected source and ran isolated bcrypt, interval, date/DST, and object-property checks. It did not execute the SQL fixture, start the application stack, run browser/concurrency tests, or measure the proposed production targets.

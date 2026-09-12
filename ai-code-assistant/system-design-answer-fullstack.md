@@ -1,533 +1,370 @@
-# AI Code Assistant - System Design Answer (Fullstack Focus)
+# AI Code Assistant — Fullstack System Design
 
-*45-minute system design interview format - Fullstack Engineer Position*
+*A 45-minute discussion connecting terminal interaction to model and tool execution.*
 
-## Problem Statement
+This is a proposed production-quality local assistant. The repository's prototype
+implements the basic completion/tool loop. Its missing streaming, recovery, and
+execution safeguards are documented in [architecture.md](./architecture.md).
 
-Design an AI-powered command-line coding assistant that enables developers to interact with an LLM to read, write, and debug code in their local environment. Key challenges include:
-- Agentic loop orchestration between LLM and tools
-- End-to-end streaming from API to terminal
-- Safe tool execution with layered permissions
-- Session state management across restarts
-- Extensibility via plugins and MCP (Model Context Protocol)
+## 📋 Frame the task — 5 minutes
 
-## Requirements Clarification
+> “I would use one concrete workflow: a developer asks the assistant to fix a
+> failing test. The assistant investigates, proposes a change, applies authorized
+> edits, runs validation, and explains the result. We need the terminal and runtime
+> to agree about what actually happened at every step.”
 
-### Functional Requirements
-1. **Conversational Interface**: Natural language interaction in terminal
-2. **File Operations**: Read, write, and edit files with AI assistance
-3. **Code Understanding**: Analyze and explain codebases
-4. **Command Execution**: Run shell commands through the AI
-5. **Context Retention**: Remember conversation history within session
-6. **Safety Controls**: Permission system for sensitive operations
+I would confirm that we are designing a local coding agent, not an autocomplete
+service or a shared browser IDE. The first version has one active task in a
+workspace and uses a remote model through a provider adapter.
 
-### Non-Functional Requirements
-1. **Low Latency**: First token in <500ms, streaming throughout
-2. **Portability**: Works across macOS, Linux, Windows
-3. **Extensibility**: Plugin system for custom tools
-4. **Provider Agnostic**: Support multiple LLM providers
+Local execution keeps integration with the developer's tools straightforward.
+It does not imply that code stays local: selected source and tool output are sent
+to the provider. That boundary must be clear in the product.
 
-### Scale Estimates
-- Context window: 128K-200K tokens depending on model
-- Response latency: First token <500ms, full response <30s
-- File handling: Support files up to 10MB
-- Session history: Thousands of messages across sessions
+The main user needs are straightforward:
 
-## High-Level Architecture
+- Start with a natural-language request and see immediate acknowledgement.
+- Follow meaningful progress through multiple model and tool calls.
+- Review any operation that needs approval.
+- Know which files changed and which checks actually ran.
+- Stop a task and continue later without losing its intent or repeating effects.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           AI Code Assistant                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐              │
-│  │     CLI      │───▶│    Agent     │───▶│   LLM API    │              │
-│  │   Interface  │    │  Controller  │    │   (Claude)   │              │
-│  └──────────────┘    └──────────────┘    └──────────────┘              │
-│         │                   │                    │                       │
-│         │                   ▼                    │                       │
-│         │           ┌──────────────┐             │                       │
-│         │           │    Tool      │             │                       │
-│         │           │   Router     │             │                       │
-│         │           └──────────────┘             │                       │
-│         │                   │                    │                       │
-│         │     ┌─────────────┼─────────────┐     │                       │
-│         │     ▼             ▼             ▼     │                       │
-│         │  ┌──────┐    ┌──────┐    ┌──────┐    │                       │
-│         │  │ Read │    │ Edit │    │ Bash │    │                       │
-│         │  │ Tool │    │ Tool │    │ Tool │    │                       │
-│         │  └──────┘    └──────┘    └──────┘    │                       │
-│         │     │             │             │     │                       │
-│         ▼     ▼             ▼             ▼     ▼                       │
-│  ┌────────────────────────────────────────────────────┐                │
-│  │              Permission & Safety Layer              │                │
-│  └────────────────────────────────────────────────────┘                │
-│         │             │             │                                    │
-│         ▼             ▼             ▼                                    │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                              │
-│  │   File   │  │  Shell   │  │ Session  │                              │
-│  │  System  │  │ Sandbox  │  │  Store   │                              │
-│  └──────────┘  └──────────┘  └──────────┘                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+I would exclude dynamic plugins, shared sessions, and advanced terminal layouts
+from the initial scope. Each adds another trust or interaction boundary.
 
-## Deep Dive: The Agentic Loop
+I would also establish whether edits affect the current checkout immediately.
+My proposed default is a separate task workspace and a reviewable apply step.
+A direct-edit mode is possible but needs explicit coordination with external
+editors and clear partial-change behavior.
 
-This is the heart of the system - the loop that enables autonomous tool use.
+The quality bar is not “the model returns plausible code.” It is a traceable path
+from request to authorized action to observed outcome.
 
-### Loop Flow
+## 🏗️ Draw the system — 5 minutes
 
 ```
-User Input
-    │
-    ▼
-┌─────────────────────────────────────┐
-│         Add to Context              │
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────┐
-│         LLM Inference               │◀──────┐
-│   - Generate text (stream to UI)    │       │
-│   - Decide tool calls               │       │
-└─────────────────────────────────────┘       │
-    │                                         │
-   Has tool calls?                            │
-    │                                         │
-   Yes                                        │
-    │                                         │
-    ▼                                         │
-┌─────────────────────────────────────┐       │
-│      Check Permissions              │       │
-│   - Auto-approve reads              │       │
-│   - Prompt for writes/commands      │       │
-└─────────────────────────────────────┘       │
-    │                                         │
-    ▼                                         │
-┌─────────────────────────────────────┐       │
-│      Execute Tools                  │       │
-│   - Run in parallel if independent  │       │
-│   - Collect results                 │       │
-└─────────────────────────────────────┘       │
-    │                                         │
-    ▼                                         │
-┌─────────────────────────────────────┐       │
-│      Add Results to Context         │───────┘
-└─────────────────────────────────────┘
-
-   No tool calls?
-    │
-    ▼
-   Done (wait for next user input)
+┌──────────────┐      ┌──────────────────┐      ┌────────────────┐
+│ Terminal UI  │◀────▶│ Task coordinator │◀────▶│ Model adapter  │
+└──────────────┘      └────────┬─────────┘      └───────┬────────┘
+                              │                        ▼
+                    ┌─────────▼──────────┐      ┌────────────────┐
+                    │ Policy + executor  │      │ Provider API   │
+                    └─────────┬──────────┘      └────────────────┘
+                              │
+                    ┌─────────▼──────────┐      ┌────────────────┐
+                    │ Task workspace     │      │ Task journal   │
+                    └────────────────────┘      └────────────────┘
 ```
 
-### Agent Controller Design
-
-**AgentState Structure:**
-- conversationId: unique session identifier
-- messages: array of conversation messages
-- toolCalls: pending tool invocations
-- pendingApprovals: operations awaiting user consent
-- context: managed context window
-
-**Run Loop Logic:**
-1. Add user message to context
-2. Enter agentic loop (while true)
-3. Get LLM response with streaming enabled
-4. Stream text content to terminal as it arrives
-5. Check for tool calls in response
-6. If no tool calls: break loop, wait for next user input
-7. Execute tools (may require user approval)
-8. Add tool results to context
-9. Continue loop for next LLM turn
-
-**Tool Execution Strategy:**
-- Group tool calls by approval requirements
-- Auto-approved tools (reads) execute in parallel via Promise.all
-- Tools needing approval execute sequentially with prompts
-- Denied tools return error result instead of executing
-
-### Key Design Decisions
-
-1. **Single-threaded loop** - Simple, predictable execution
-2. **Streaming-first** - Text streams to terminal as generated
-3. **Parallel tool execution** - Multiple safe tools run concurrently
-4. **Explicit approval** - Dangerous operations require consent
-
-## Deep Dive: End-to-End Data Flow
-
-### User Input to Response
-
-```
-User types: "Fix the bug in auth.ts"
-            │
-            ▼
-┌─────────────────────────────┐
-│     CLI Interface           │
-│  - Parse input              │
-│  - Add to context           │
-└─────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────┐
-│     Agent Controller        │
-│  - Build messages array     │
-│  - Send to LLM              │
-└─────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────┐
-│     LLM Provider            │
-│  - Stream response          │
-│  - Parse tool calls         │
-└─────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────┐
-│     Tool Execution          │
-│  - Read auth.ts             │
-│  - Analyze code             │
-│  - Edit with fix            │
-└─────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────┐
-│     Permission Check        │
-│  - Prompt for edit approval │
-│  - Execute if approved      │
-└─────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────┐
-│     Result Display          │
-│  - Show changes made        │
-│  - Stream explanation       │
-└─────────────────────────────┘
-```
-
-### Streaming Pipeline
-
-**Processing stream chunks:**
-
-| Chunk Type | Action |
-|------------|--------|
-| text | Write directly to stdout via renderer |
-| tool_call_start | Store id/name, show spinner |
-| tool_call_delta | Accumulate params JSON |
-| tool_call_end | Push to toolCalls array |
-
-After stream completes:
-- If toolCalls non-empty: execute them, add results to context, recurse
-- If no tool calls: return control to user
-
-### Sequence Diagram
-
-```
-┌──────┐          ┌───────┐          ┌─────┐          ┌───────┐
-│ User │          │ Agent │          │ LLM │          │ Tools │
-└──┬───┘          └───┬───┘          └──┬──┘          └───┬───┘
-   │                  │                 │                 │
-   │  "Fix auth bug"  │                 │                 │
-   │─────────────────▶│                 │                 │
-   │                  │  messages[]     │                 │
-   │                  │────────────────▶│                 │
-   │                  │  [Read auth.ts] │                 │
-   │                  │◀────────────────│                 │
-   │                  │                 │  Read auth.ts   │
-   │                  │────────────────────────────────▶│
-   │                  │                 │  file contents  │
-   │                  │◀────────────────────────────────│
-   │                  │  messages[] +   │                 │
-   │                  │  tool result    │                 │
-   │                  │────────────────▶│                 │
-   │                  │  [Edit auth.ts] │                 │
-   │                  │◀────────────────│                 │
-   │  Approve edit?   │                 │                 │
-   │◀─────────────────│                 │                 │
-   │  Yes             │                 │  Edit file      │
-   │─────────────────▶│────────────────────────────────▶│
-   │                  │                 │  success        │
-   │                  │◀────────────────────────────────│
-   │                  │  messages[] +   │                 │
-   │                  │  edit result    │                 │
-   │                  │────────────────▶│                 │
-   │                  │  "Fixed the bug"│                 │
-   │◀─────────────────│◀────────────────│                 │
-```
-
-## Deep Dive: Tool System Integration
-
-### Tool Interface
-
-**Tool Structure:**
-- name: identifier for LLM
-- description: explains capability
-- parameters: JSON Schema for inputs
-- requiresApproval: boolean or function(params) => boolean
-- execute(params, context): performs the operation
-
-**ToolContext Provides:**
-- workingDirectory: current path
-- permissions: granted permission set
-- abortSignal: for cancellation
-
-**ToolResult Returns:**
-- success: boolean
-- output: string (on success)
-- error: string (on failure)
-- metadata: optional extra data
-
-### Core Tools
-
-| Tool | Purpose | Approval |
-|------|---------|----------|
-| Read | Read file contents | Auto |
-| Write | Create new file | Required |
-| Edit | Modify existing file | Required |
-| Glob | Find files by pattern | Auto |
-| Grep | Search file contents | Auto |
-| Bash | Run shell command | Pattern-based |
-
-### Edit Tool - String Replacement
-
-**Execution flow:**
-1. Read file content from disk
-2. If not replace_all, check uniqueness:
-   - 0 occurrences: return "String not found" error
-   - >1 occurrences: return "String appears N times, use replace_all or provide more context"
-3. Perform replacement (replaceAll or single replace)
-4. Write updated content to file
-5. Return success
-
-> "Why string replacement over line numbers? Line numbers change as you edit. String matching is more robust and forces LLM to provide sufficient context."
-
-### Bash Tool - Safety Patterns
-
-**Auto-approve patterns (safe reads):**
-- `ls`, `pwd`, `cat`, `head`, `tail`
-- `git status`, `git log`, `git diff`
-- `npm run (dev|build|test|lint)`
-
-**Execution:**
-- Run with exec, respecting timeout (default 120000ms)
-- Capture stdout and stderr
-- Respect maxBuffer (10MB)
-- Honor abortSignal for cancellation
-
-## Deep Dive: Permission System
-
-### Layered Defense
-
-```
-┌─────────────────────────────────────┐
-│   Layer 1: Path Restrictions        │
-│   - Only access working directory   │
-│   - Block ~/.ssh, .env, credentials │
-└─────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│   Layer 2: Command Filtering        │
-│   - Block rm -rf /                  │
-│   - Block sudo, chmod 777           │
-│   - Block fork bombs                │
-└─────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│   Layer 3: User Approval            │
-│   - Show exactly what will happen   │
-│   - Require explicit consent        │
-│   - Remember session permissions    │
-└─────────────────────────────────────┘
-```
-
-### Permission Manager
-
-**Check flow:**
-1. Check if request matches existing grant - return true
-2. Check if previously denied - return false
-3. Prompt user for approval
-4. On approval: store grant
-5. On denial: store denial
-6. Return decision
-
-### Permission Levels
-
-| Level | Description | Examples |
-|-------|-------------|----------|
-| Auto-approve | Always allowed | File reads, safe commands |
-| Session-approve | Ask once per session | File writes to specific dirs |
-| Always-ask | Prompt every time | Arbitrary shell commands |
-| Deny | Never allow | Destructive operations |
-
-### File System Guard
-
-**Blocked patterns:**
-- `.env$` - Environment files
-- `.ssh/` - SSH keys
-- `credentials` (case-insensitive)
-- `secrets?.` (case-insensitive)
-- `.git/config$` - Git credentials
-
-**Access check:**
-1. Resolve to absolute path
-2. Check against blocked patterns - reject if match
-3. Check if path is within allowed directories
-4. Return true only if all checks pass
-
-### Command Sandbox
-
-**Blocked commands (explicit):**
-- `rm -rf /`
-- `sudo`
-- `chmod 777`
-- `:(){:|:&};:` (fork bomb)
-- `curl | sh`, `wget | sh`
-
-**Dangerous patterns (regex):**
-- `rm\s+-rf?\s+[\/~]` - Recursive delete from root/home
-- `>\s*\/dev\/sd` - Write to block devices
-- `mkfs` - Format filesystems
-- `dd\s+if=` - Direct disk access
-
-## Deep Dive: Session and Context Management
-
-### Context Window Strategy
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│            Context Window Budget (128K tokens)               │
-├─────────────────────────────────────────────────────────────┤
-│  System prompt:      2K (fixed)                              │
-│  Recent messages:   30K (last 10 turns)                      │
-│  Tool definitions:   5K (fixed)                              │
-│  Context summary:   10K (compressed history)                 │
-│  File cache:        40K (recently read files)                │
-│  Response buffer:   40K (for LLM output)                     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Context Compression
-
-**Compression triggers:**
-- When currentTokens + newMessage > maxTokens * 0.9
-
-**Compression strategies:**
-
-1. **Summarize old messages:**
-   - Keep last 10 messages intact
-   - Summarize earlier messages via summarizer
-   - Replace old messages with summary as system message
-
-2. **Truncate large tool outputs:**
-   - If tool result > 10000 chars
-   - Keep first 5000 + "[truncated]" + last 2000
-
-### Session Persistence
-
-**Session Structure:**
-- id: UUID
-- workingDirectory: absolute path
-- startedAt: timestamp
-- messages: conversation history
-- permissions: granted permissions
-- settings: user preferences
-
-**Storage location:** `~/.ai-assistant/sessions/{id}.json`
-
-**Operations:**
-- create(workingDir): Initialize new session
-- resume(sessionId): Load existing session from disk
-- save(session): Persist to JSON file
-
-## Deep Dive: Plugin and MCP Integration
-
-### Plugin System
-
-**Plugin Structure:**
-- name, version: identification
-- tools: array of Tool definitions
-- hooks: lifecycle callbacks
-- commands: slash commands
-
-**Plugin Hooks:**
-- onSessionStart: initialization
-- onBeforeToolCall: modify/intercept calls
-- onAfterToolCall: post-processing
-- onMessage: message transformation
-
-**Loading a plugin:**
-1. Import from plugin path
-2. Register tools with toolRegistry
-3. Register hooks with hookRegistry
-4. Store in plugins map
-
-### MCP (Model Context Protocol) Support
-
-**Transport types:**
-- stdio: spawn child process, communicate via stdin/stdout
-- http: connect to HTTP endpoint
-
-**Operations:**
-- connect(server): Establish connection based on transport type
-- listTools(): Aggregate tools from all connected servers (namespaced as `server:tool`)
-- callTool(name, params): Route to appropriate server, return result
-
-## Deep Dive: Error Handling
-
-### Error Types
-
-| Error | Cause | Contains |
-|-------|-------|----------|
-| ToolExecutionError | Tool failure | tool name, params, cause |
-| ContextOverflowError | Token limit exceeded | currentTokens, maxTokens |
-| PermissionDeniedError | User declined | PermissionRequest |
-
-### Error Recovery in Agent Loop
-
-**ContextOverflowError:**
-1. Force compress context
-2. Retry the loop
-
-**ToolExecutionError:**
-1. Add error message to context as tool result
-2. Continue loop (LLM will see error and adapt)
-
-**Other errors:**
-- Re-throw for caller to handle
-
-## Trade-offs Summary
-
-| Decision | Pros | Cons |
-|----------|------|------|
-| Streaming-first | Better UX, user sees progress | More complex error handling, can't "unsay" errors |
-| String-based edits | Robust to line changes, forces context | Fails if string not unique |
-| Fine-grained tools | LLM can compose primitives, clear responsibility | More tool calls, higher latency |
-| Local-only storage | Privacy, no account needed, works offline | No cross-device sync |
-| Single model per session | Consistent behavior, simpler | Can't use cheap model for simple tasks |
-| Layered permissions | Defense in depth, flexible policies | More prompts for user |
-
-## Future Enhancements
-
-1. **Autonomous Mode**: Let agent run multi-step tasks without approval
-2. **Git Integration**: Automatic commits, branch management
-3. **IDE Integration**: VS Code extension for visual interface
-4. **MCP Ecosystem**: Connect external tool servers
-5. **Model Routing**: Use cheaper models for simple tasks (Haiku for search, Opus for reasoning)
-6. **Learning Mode**: Track successful patterns, improve over time
-7. **Team Collaboration**: Shared sessions, pair programming
-8. **Offline Mode**: Local LLM fallback
-
-## Closing Summary
-
-> "The AI Code Assistant is built around an agentic loop where the LLM orchestrates tool calls to interact with the local file system and shell. Key design decisions include:
->
-> 1. **Streaming-first** for responsive UX
-> 2. **Layered permissions** for safety
-> 3. **Context compression** to stay within token limits
-> 4. **Provider abstraction** for flexibility
-> 5. **String-based edits** for robustness
->
-> The main trade-off is between autonomy and safety - we lean toward explicit user approval for destructive operations while auto-approving reads and safe commands."
+I would explain the arrows verbally. The coordinator sends context to the model,
+receives text and proposed tools, and passes complete operations to the executor.
+The executor checks policy, applies allowed effects, and returns observed results.
+
+The coordinator and executor record task transitions in the journal. The UI renders
+those events and sends input or identified approval decisions back to the runtime.
+
+The journal is drawn separately from the workspace because a transcript save and
+a file edit are different writes. A crash between them is a central recovery case.
+
+The model adapter preserves provider-specific system instructions, tool-call IDs,
+and stop reasons. It can normalize events without pretending every provider has
+the same capabilities.
+
+The terminal has one input owner and one output owner. Concurrent tools publish
+events rather than competing to print over a prompt.
+
+This architecture can begin within a small local application. The executor needs
+an enforceable resource boundary; the other boxes do not need to become remote
+microservices simply to justify the word fullstack.
+
+## 💾 Shared state and contracts — 4 minutes
+
+The UI and runtime should share a vocabulary for task and operation state.
+
+| Object | Essential information | Meaning |
+|--------|-----------------------|---------|
+| Task | ID, workspace, request, constraints, status | The work the user authorized |
+| Response attempt | Task ID, attempt ID, completion state | One provider generation, possibly interrupted |
+| Operation | ID, tool, validated arguments, state | A concrete action with a trackable outcome |
+| Proposal | Operation ID, target revision, scope | What the user can approve |
+| Event | Task ID, sequence, type, payload reference | Ordered evidence for display and recovery |
+| Artifact | Location, identity, size | Full log or diff outside a bounded preview |
+
+A tool success comes from its execution result. Assistant prose explaining an
+intended change is not a substitute. Likewise, “tests started” and “tests passed”
+are separate events.
+
+The model-facing transcript contains complete tool-use/result pairs. A response
+with tool calls and no prose is still a real assistant response and must be saved.
+
+The UI may retain more history than the next model request includes. Durable task
+history, model context, and visible screen content have different lifetimes.
+
+For scale, 20 requests averaging 20,000 input tokens consume 400,000 input tokens
+across a task. Context selection, output limits, and task budgets therefore affect
+both responsiveness and cost. No fixed model window is assumed in the core design.
+
+## 🔧 Deep dive 1: A streamed proposal becomes an authorized change — 10 minutes
+
+> “The first hard boundary is turning a partial model response into a real action.
+> I would allow text to appear early, but I would only execute a complete validated
+> operation that still matches the user's authority.”
+
+The developer submits the failing-test request. The terminal immediately shows a
+running task, while the coordinator selects relevant context and calls the model.
+Text fragments can stream through a small renderer buffer.
+
+Tool arguments may arrive in pieces. The adapter assembles them by call identity,
+then the runtime validates types, sizes, target paths, and requested capabilities.
+Incomplete or malformed arguments produce an error state, never a partial write.
+
+The model first reads the relevant code and test output. Known independent reads
+can run concurrently within byte and operation limits. A read followed by an edit
+of the same file may be ordered; approval requirements do not establish independence.
+
+The next response proposes a code replacement. The runtime prepares a concrete
+diff against an identified file revision. The UI can now show what will change,
+not merely the model's description of what it hopes to change.
+
+### Design the approval contract
+
+The prompt displays the target, diff, scope, and proposal identity. For a command,
+it shows the actual command, working directory, and requested access.
+
+A large diff may need a separate viewer, but the full proposal remains inspectable.
+The interface labels any shortened preview so the user understands its limits.
+
+Approving once binds to that proposal. A session grant is an explicit broader
+choice. The runtime checks the decision's operation and revision before execution.
+If the file changed while the user was reading, the proposal is stale.
+
+The terminal gives one approval ownership of input. Independent authorized work
+may continue, with progress buffered so it cannot replace or obscure the decision.
+An asynchronous queue is fine if each response is tied to the displayed proposal.
+
+### Enforce beyond the prompt
+
+A user approval does not itself constrain the process. Tools need authorized file
+roots, network policy, controlled environment variables, and bounded resources.
+The particular OS mechanism can vary; its configuration must enforce the policy.
+
+A separate Git workspace is useful for change isolation but is not a shell sandbox.
+A command can still access other files or the network if the process is allowed to.
+
+Repository content is also untrusted input. A file may contain instructions that
+look relevant to the task. Those instructions are evidence for the model, not a
+new permission grant from the developer.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Revision-bound proposal with scoped execution | Approval matches the applied action | More proposal and policy state |
+| ❌ Ask only “allow file edit?” | Simple dialog | User cannot evaluate the actual change |
+| ❌ Trust model-generated safety descriptions | Less execution machinery | No enforceable authority boundary |
+
+The cost of the chosen design is friction when additional access is needed. The
+system should explain the concrete missing capability so the user can make a
+meaningful decision instead of repeatedly approving vague warnings.
+
+### Apply and report
+
+The executor records intent, applies the prepared change, and records the result.
+The terminal updates from pending to running to succeeded or failed using those
+operation events.
+
+Exact-text replacement avoids fragile unversioned line offsets, but it still needs
+revision checks. A unique substring can remain in a file that changed elsewhere.
+
+In the task workspace, assistant writers can be coordinated. Applying to the user's
+checkout needs conflict detection against current contents and a coordinated apply
+step. An internal lock does not protect against an editor that ignores that lock.
+
+The final assistant explanation can cite the observed change and validation. It
+cannot claim success just because the edit proposal was approved.
+
+## 🔧 Deep dive 2: Make long tasks usable without losing their meaning — 9 minutes
+
+A long task stresses two different systems: the terminal accumulates output, and
+the model repeatedly receives a growing conversation. Solving one does not solve
+the other.
+
+I would keep a durable record of the task and select a bounded working context for
+each model request. The UI independently decides how much of that record to show.
+
+For the model, retain the current goal, explicit constraints, recent complete
+exchanges, and relevant file evidence. Large or stale tool outputs can become
+references to local artifacts, with targeted retrieval when needed.
+
+For the terminal, show a bounded preview of long logs and a way to inspect the full
+artifact. State clearly whether output was truncated. A short preview cannot prove
+that an unseen section contains no error.
+
+### Preserve intent while reducing context
+
+Suppose the user said at the beginning, “Keep the public API unchanged.” Twenty
+messages later, a last-N-messages policy may discard that constraint while keeping
+pages of build output.
+
+A compact task summary can preserve that instruction and the decisions already
+made. It should remain linked to the original history and be treated as fallible.
+The runtime's permission state stays authoritative outside that summary.
+
+The summary must not promote instructions found inside a source file into trusted
+user instructions. It also must not discard tool-use records while leaving their
+results orphaned in the provider conversation.
+
+Summarization itself consumes a model call and context. Trigger it before the
+request becomes oversized, and retain enough budget for the summary response.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Selected context plus durable task history | Bounded input with recoverable evidence | Retrieval and summary management |
+| ❌ Send the entire transcript every time | Simple early implementation | Growing cost and abrupt context failure |
+| ❌ Keep only a fixed recent message count | Cheap and predictable | Can forget user constraints and protocol links |
+
+The selected-context approach may require rereading files. That is acceptable:
+file contents are often re-derivable, whereas a lost user restriction is not.
+Use current revisions when retrieving code; an old cached result is not today's
+workspace just because the task still references the same path.
+
+### Bound the renderer
+
+An incremental transcript lets the user read early output without redrawing every
+historical line. Buffer a small active tail for incomplete formatting and fall back
+to plain text for malformed or oversized content.
+
+Batch text writes and respect output backpressure. A slow terminal or redirected
+pipe should not create an unlimited in-memory queue.
+
+Transient spinner updates can be coalesced. Approval requests and authoritative
+operation outcomes must retain their identity and order. Tool workers never emit
+terminal controls directly into the active prompt.
+
+Sanitize control sequences in model text and command logs. Otherwise untrusted
+output could move the cursor and make generated text resemble an application prompt.
+
+A full TUI framework remains an option if persistent panes or navigation become
+requirements. It is not inherently too slow; a transcript is simply sufficient for
+the initial sequential workflow and preserves familiar scrollback.
+
+### Bound the task as well as each request
+
+The coordinator enforces total model usage, elapsed time, tool concurrency, and
+output budgets. A fixed iteration cap alone cannot bound a single huge read or a
+long-running command.
+
+Repeated failures can trigger a pause, but include the relevant input revision.
+Running the same test after changing code is a useful new attempt.
+
+The UI exposes budget exhaustion as an incomplete task with completed effects and
+remaining work. It should not print a success banner merely because the model loop
+stopped generating output.
+
+## 🔧 Deep dive 3: Cancel, crash, and resume without inventing certainty — 8 minutes
+
+> “I would define cancellation as stopping further work and reconciling what
+> already happened. The task may have changed three files before the developer
+> interrupts it. Those changes do not disappear when the spinner stops.”
+
+An interrupt asks the runtime to cancel model requests and owned processes. The UI
+enters a cancelling state while completed and running operations are reconciled.
+
+Every event retains its task ID. A delayed result from the old task cannot complete
+a new request or answer a different approval prompt.
+
+The recovery record needs operation intent and state, not just chat text. Pending,
+approved, running, succeeded, failed, and unknown are useful distinctions.
+
+A crash with an operation marked running is the difficult case. We inspect effects
+before deciding whether it can be retried.
+
+### Recover a file edit
+
+A proposed replacement records the before and after revisions. Write the prepared
+content separately and install it atomically on the same filesystem. If durability
+across power loss is required, define the necessary flushing behavior as well.
+
+After restart, a file matching the intended after revision is evidence that the
+replacement is present. A file matching neither revision requires conflict handling,
+not blind overwrite.
+
+Atomic replacement prevents partial single-file content. It does not turn a refactor
+across ten files into one transaction. Record each outcome and preserve the diff.
+Restoring assistant changes must not erase unrelated developer work.
+
+### Recover a command
+
+A read can be repeated as a fresh observation. A command may have modified a local
+service or sent a network request before its response was lost.
+
+A local journal cannot atomically commit arbitrary external effects. If the outcome
+is unknown, inspect the external state or request a new decision before retrying.
+An empty result is not proof that nothing happened.
+
+| Approach | Benefit | Cost |
+|----------|---------|------|
+| ✅ Reconcile operations by effect | Avoids silently repeating consequential work | Some outcomes remain unknown |
+| ❌ Retry every unfinished operation | Fast-looking recovery | May execute an effect twice |
+| ❌ Restore only the transcript | Easy persistence | Runtime lacks authority and operation state |
+
+The cost is that recovery sometimes pauses. That pause should explain what is known,
+what is uncertain, and what evidence would resolve it.
+
+### Reconstruct the task
+
+On resume, load the workspace identity, user constraints, operation records, and
+complete model exchanges. Revalidate pending proposals because files and policy
+may have changed while the application was closed.
+
+The frontend reconstructs its transcript from events and renders for the current
+terminal width. It does not replay old spinner frames or assume historical test
+results validate the current checkout.
+
+Provider retries also need attempt identity. If some response text was shown before
+a disconnect, a retry may generate a different continuation. Label the attempt and
+retain the completed operation records instead of replaying tools from scratch.
+
+This is why saving a JSON conversation and having a `--resume` flag are not enough.
+The restored state must reach both the agent and the interface that reports its
+progress.
+
+## 🧪 Verify the boundaries — 4 minutes
+
+I would use a deterministic provider for repeatable failure scenarios, then verify
+the real adapter's protocol separately. A mock that always returns prose before a
+tool call will never expose a bug in handling tool-only responses.
+
+The most important end-to-end tests are:
+
+1. Stream partial arguments; no tool runs until the complete operation is validated.
+2. Return only a tool call; preserve its record and matching result on the next call.
+3. Change the target while its proposal is displayed; reject the stale approval.
+4. Interrupt after an edit but before result persistence; reconcile the saved state.
+5. Lose a command response; retain an unknown outcome instead of automatic replay.
+6. Compact a long task; preserve its explicit user constraints and valid exchanges.
+7. Resume in another terminal; restore the correct workspace and task state.
+8. Slow stdout or deliver late events; keep approvals and task identity correct.
+
+I would also test plaintext output and keyboard-only use. Color improves scanning
+but cannot be the sole indication that a tool failed or needs a decision.
+
+Operational measurements separate provider wait, tool time, approval wait, and
+rendering delay. Useful traces identify operations and outcomes without uploading
+raw source or secrets as default telemetry.
+
+For growth, improve targeted retrieval and resource bounds before introducing more
+concurrent tasks or remote infrastructure. A later GUI can reuse the same event,
+proposal, and recovery contracts with a different renderer.
+
+## ⚖️ Decisions to leave on the whiteboard
+
+| Decision | Choice | Cost accepted |
+|----------|--------|---------------|
+| Actions | ✅ Concrete proposals with enforced scope | More state than a simple confirmation |
+| Long tasks | ✅ Selected context and durable history | Retrieval and summary overhead |
+| Recovery | ✅ Per-operation reconciliation | Explicit unknown and conflict states |
+| Interaction | ✅ Ordered events with one input owner | Deliberate prompt scheduling |
+
+> “The end-to-end design connects user intent to a concrete proposal, authorized
+> execution, and an observed result. Bounded context keeps the task coherent,
+> a readable transcript keeps the developer informed, and recovery preserves the
+> difference between what the model intended and what the tools actually did.”
